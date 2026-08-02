@@ -1,0 +1,74 @@
+[workspace]
+members = ["crates/cm-core", "crates/cm-server", "crates/cm-client"]
+
+# Metadata every member inherits with `<key>.workspace = true`, so the version,
+# license, and repo URL can't drift between the four packages.
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hyperlogue/captain-miao"
+# 1.88 is the real floor: ratatui 0.30 declares it, and `logo.rs` uses
+# `u32::is_multiple_of` (stable 1.87). Edition 2024 alone would only need 1.85.
+rust-version = "1.88"
+
+[package]
+name = "captain-miao"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "TUI dashboard to monitor and manage multiple Claude Code and Codex sessions in Kitty or zellij"
+
+# The `captain-miao` dashboard: the ratatui TUI client. It never hosts a pty pool
+# (no libshpool) — the per-host daemon that does is the separate
+# `captain-miao-server` binary (crates/cm-server), which cross-compiles to Linux.
+# Shared logic (state, protocol, agents, launcher, hooks) lives in `cm-core`.
+[dependencies]
+cm-core = { path = "crates/cm-core" }
+ratatui = "0.30"
+crossterm = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+libc = "0.2"
+notify = "8"
+toml = "1.1"
+unicode-width = "0.2"
+emojis = "0.6"
+# Encodes raw-RGBA image payloads into kitty graphics-protocol escapes for the
+# header paw + cat. Already in the tree transitively; pinned here as a direct dep.
+base64 = "0.22"
+
+[features]
+default = []
+# Remote (SSH) hosts — the federated multi-host dashboard (docs/remote-sessions.md).
+# **Work in progress**, so it is OFF by default: the full lifecycle is implemented
+# but has not been verified end-to-end against a real remote host, and restart /
+# fork are still local-only. The gate is deliberately a *runtime* const
+# (`app::REMOTE_ENABLED`) rather than `#[cfg]` on ~240 references across the
+# dashboard: the same code compiles either way (so both configurations stay
+# type-checked, clippy-clean, and covered by the same tests), and with the
+# feature off the dashboard simply never reads `hosts.json` and never constructs
+# a `Backend::Remote`, leaving it local-only.
+remote = []
+
+# Dev-only: the logo/cat alpha-mask assets are generated once by
+# `examples/gen_logo_assets` (pure-Rust 2D rasteriser) and committed under
+# `assets/logo/`. tiny-skia never ships in the dashboard binary — the runtime only
+# embeds the finished `.gray` masks (the `.png` outputs are eyeball previews).
+[dev-dependencies]
+tiny-skia = "0.11"
+
+[profile.release]
+# Strip symbols from the release binary (~0.9 MB smaller); we ship the binary,
+# not a debugger target.
+strip = true

@@ -1,0 +1,1023 @@
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+use crate::agent::{AgentControl, ResumeCandidate};
+use crate::backend::ConnState;
+use crate::state::{HostId, SessionStatus};
+use crate::terminal::TabTarget;
+
+use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS, collapse_tilde, expand_tilde};
+use super::keymap::{Chord, Command};
+use super::picker::{PickerEvent, TextInputEvent};
+use super::{
+    Action, App, DirEditFocus, DragTarget, HostField, HostRow, InputMode, PickerKind, SessionFlag,
+};
+
+/// Max gap between two left-clicks on the same row to count as a double-click.
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
+
+impl App {
+    pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Ctrl+c always quits, regardless of current mode.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return None;
+        }
+        match self.input_mode {
+            InputMode::Normal => self.handle_normal_key(key),
+            InputMode::Search => self.handle_search_key(key),
+            InputMode::Picker => self.handle_picker_key(key),
+            InputMode::Help => self.handle_help_key(key),
+            InputMode::Confirm => self.handle_confirm_key(key),
+            InputMode::DirEdit => self.handle_dir_edit_key(key),
+            InputMode::HostEdit => self.handle_host_edit_key(key),
+        }
+    }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        // Only process mouse events in Normal mode; inputs/pickers consume keys only.
+        if self.input_mode != InputMode::Normal {
+            return None;
+        }
+        let pt = (mouse.column, mouse.row);
+        let in_logo = self
+            .logo_rect
+            .map(|r| r.contains(pt.into()))
+            .unwrap_or(false);
+        let in_table = self
+            .last_table_rect
+            .map(|r| r.contains(pt.into()))
+            .unwrap_or(false);
+        let in_preview = self
+            .last_preview_rect
+            .map(|r| r.contains(pt.into()))
+            .unwrap_or(false);
+
+        // Border hit-test for resize drags (±1 tolerance). The narrow layout
+        // stacks the panels vertically with an auto-sized detail height, so its
+        // borders aren't draggable — the wide-only split resize stays inert.
+        let vsplit_border_col = self.last_detail_rect.map(|r| r.x.saturating_sub(1));
+        let hsplit_border_row = self.last_preview_rect.map(|r| r.y.saturating_sub(1));
+        let on_vsplit = !self.narrow_layout
+            && vsplit_border_col.is_some_and(|c| {
+                (mouse.column as i32 - c as i32).abs() <= 1
+                    && self
+                        .last_detail_rect
+                        .is_some_and(|r| mouse.row >= r.y && mouse.row < r.y + r.height)
+            });
+        let on_hsplit = !self.narrow_layout
+            && hsplit_border_row.is_some_and(|r0| {
+                (mouse.row as i32 - r0 as i32).abs() <= 1
+                    && self
+                        .last_preview_rect
+                        .is_some_and(|r| mouse.column >= r.x && mouse.column < r.x + r.width)
+            });
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if in_logo => {
+                // Clicking the paw logo kicks off its little celebration.
+                self.start_logo_anim();
+                return None;
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_vsplit => {
+                self.drag = Some(DragTarget::VerticalSplit);
+                return None;
+            }
+            MouseEventKind::Down(MouseButton::Left) if on_hsplit => {
+                self.drag = Some(DragTarget::HorizontalSplit);
+                return None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag.is_some() => {
+                match self.drag {
+                    Some(DragTarget::VerticalSplit) => {
+                        // Detail panel width = right-edge of top area - mouse column.
+                        // Use table rect's right edge as a proxy for top_area.right().
+                        if let Some(tbl) = self.last_table_rect {
+                            let right = tbl.x + tbl.width;
+                            let new_width = right.saturating_sub(mouse.column);
+                            let min_detail: u16 = 20;
+                            let min_table: u16 = 30;
+                            let max_detail = (tbl.width + self.detail_width)
+                                .saturating_sub(min_table)
+                                .max(min_detail);
+                            self.detail_width = new_width.clamp(min_detail, max_detail);
+                        }
+                    }
+                    Some(DragTarget::HorizontalSplit) => {
+                        if let Some(prev) = self.last_preview_rect {
+                            let bottom = prev.y + prev.height;
+                            let new_height = bottom.saturating_sub(mouse.row);
+                            let min_preview: u16 = 4;
+                            let total = prev.height
+                                + (prev
+                                    .y
+                                    .saturating_sub(self.last_table_rect.map_or(prev.y, |t| t.y)));
+                            let max_preview = total.saturating_sub(6).max(min_preview);
+                            self.preview_height = new_height.clamp(min_preview, max_preview);
+                        }
+                    }
+                    None => {}
+                }
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.drag.is_some() => {
+                self.drag = None;
+                return None;
+            }
+            _ => {}
+        }
+
+        // If a drag is in progress, swallow other mouse events to avoid interference.
+        if self.drag.is_some() {
+            return None;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if in_table => {
+                let rect = self.last_table_rect?;
+                let Some(idx) = self.visible_index_at(mouse.row, rect) else {
+                    self.last_click = None;
+                    return None;
+                };
+                self.table_state.select(Some(idx));
+
+                let now = Instant::now();
+                let is_double = self.last_click.is_some_and(|(t, r)| {
+                    r == idx && now.duration_since(t) <= DOUBLE_CLICK_THRESHOLD
+                });
+                if is_double {
+                    self.last_click = None;
+                    // Same focus-or-attach decision as Enter (the first click
+                    // already selected this row), so double-clicking a running
+                    // remote row with no local window attaches it over ssh.
+                    return self.focus_selected();
+                }
+                self.last_click = Some((now, idx));
+                None
+            }
+            MouseEventKind::ScrollUp if in_preview => {
+                self.scroll_preview_up();
+                None
+            }
+            MouseEventKind::ScrollDown if in_preview => {
+                self.scroll_preview_down();
+                None
+            }
+            MouseEventKind::ScrollUp if in_table => {
+                self.select_prev();
+                None
+            }
+            MouseEventKind::ScrollDown if in_table => {
+                self.select_next();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Capture any half-typed chord and clear both flags up front, so an
+        // unrelated key seen mid-sequence cancels it rather than being invisible
+        // to it.
+        let pending_prefix = self.pending_prefix.take();
+        let was_g = std::mem::take(&mut self.pending_g);
+        let chord = Chord::from_event(key);
+
+        // Completing a leader/prefix sequence (e.g. `Space e`). On a miss the
+        // second key is swallowed — this is what keeps `Space` + an unbound key
+        // from falling through to a destructive single-key command like `x`.
+        if let Some(prefix) = pending_prefix {
+            return match self.keymap.lookup_pair(prefix, chord) {
+                Some(cmd) => self.run_command(cmd),
+                None => None,
+            };
+        }
+
+        // `g g` (jump to top) is a fixed prefix kept outside the keymap: unlike
+        // the leader, a non-`g` key after `g` falls *through* to normal handling
+        // (`g` then `j` still navigates down), which the generic prefix can't
+        // express. The keymap takes precedence, so binding a two-chord sequence
+        // starting with `g` would shadow this.
+        if was_g && key.code == KeyCode::Char('g') && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if self.visible_len() != 0 {
+                self.table_state.select(Some(0));
+            }
+            return None;
+        }
+
+        // A configured prefix (the leader, by default `Space`): wait for the
+        // second chord.
+        if self.keymap.is_prefix(chord) {
+            self.pending_prefix = Some(chord);
+            return None;
+        }
+
+        // Start a `g g` sequence (only when `g` isn't itself a configured key).
+        if key.code == KeyCode::Char('g')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.keymap.lookup_single(chord).is_none()
+        {
+            self.pending_g = true;
+            return None;
+        }
+
+        if let Some(cmd) = self.keymap.lookup_single(chord) {
+            return self.run_command(cmd);
+        }
+
+        // Digit selectors are fixed (not remappable): plain `1..9` move the
+        // cursor to the N-th visible row; `Ctrl+1..9` also focus its window.
+        if let KeyCode::Char(c @ '1'..='9') = key.code {
+            let idx = (c as u8 - b'1') as usize;
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                return self.focus_visible_by_index(idx);
+            }
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+            {
+                return self.select_visible_by_index(idx);
+            }
+        }
+
+        None
+    }
+
+    /// Execute a resolved keymap command. Split out from key dispatch so the
+    /// same body serves any key (default or remapped) bound to the command.
+    fn run_command(&mut self, cmd: Command) -> Option<Action> {
+        match cmd {
+            Command::SelectNext => {
+                self.select_next();
+                None
+            }
+            Command::SelectPrev => {
+                self.select_prev();
+                None
+            }
+            Command::JumpBottom => {
+                // Jump to last un-muted session. If the cursor is already
+                // at/past that row, fall through to the true last row.
+                let len = self.visible_len();
+                if len > 0 {
+                    let last_unmuted = self.last_unmuted_index();
+                    let current = self.table_state.selected().unwrap_or(0);
+                    let target = match last_unmuted {
+                        Some(idx) if current < idx => idx,
+                        _ => len - 1,
+                    };
+                    self.table_state.select(Some(target));
+                }
+                None
+            }
+            Command::FocusSelected => self.focus_selected(),
+            Command::NewSession => {
+                match self.selected_cwd() {
+                    Some(cwd) => Some(Action::NewSessionSplit {
+                        agent: self.new_session_agent,
+                        cwd,
+                        // Quick same-cwd new session opens on the *selected
+                        // session's* host, so `o` on a remote row starts another
+                        // session on that server (its pty pool) in the same
+                        // workdir. Falls back to local when nothing's selected.
+                        host: self
+                            .selected_session_ref()
+                            .map(|s| s.host.clone())
+                            .unwrap_or_else(HostId::local),
+                    }),
+                    None => {
+                        self.open_workdir_picker();
+                        None
+                    }
+                }
+            }
+            Command::NewSessionPrompt => {
+                self.open_workdir_picker();
+                None
+            }
+            Command::ResumePicker => Some(Action::FetchResumeList),
+            Command::OpenBrowser => Some(Action::FetchBrowser),
+            Command::ForkSession => {
+                let s = self.selected_session()?;
+                // Fork spawns a *local* agent; a remote session can't be forked
+                // from here until the remote attach/spawn path lands.
+                if !s.host.is_local() {
+                    self.set_status("Only local sessions can be forked".to_string(), true);
+                    return None;
+                }
+                let session_id = self.session_index.live_session_id(&s)?.to_string();
+                // The fork lands per the current layout (`resolve_spawn_target`),
+                // not next to the session's window.
+                Some(Action::ResumeSession {
+                    agent: s.agent,
+                    cwd: s.cwd,
+                    session_id,
+                    fork: true,
+                    host: s.host,
+                })
+            }
+            Command::CopySessionId => {
+                // Yank the selected session's id to the clipboard. The id isn't
+                // known until the backend writes it (early in startup), so give
+                // explicit feedback rather than silently doing nothing.
+                let s = self.selected_session()?;
+                match self.session_index.live_session_id(&s) {
+                    Some(sid) => Some(Action::CopySessionId(sid.to_string())),
+                    None => {
+                        self.set_status("No session id available yet".to_string(), true);
+                        None
+                    }
+                }
+            }
+            Command::KillSelected => {
+                let s = self.selected_session()?;
+                // The local window to close alongside the signal, resolved through
+                // the binding: a local session's own window, an attached remote's
+                // `ssh attach` window, or `None` for a remote we aren't attached to
+                // (signal only) — §15.3.
+                let window_id = self.window_id_for_session(&s);
+                Some(Action::KillSession {
+                    host: s.host,
+                    child_pid: s.child_pid.unwrap_or(s.launcher_pid),
+                    window_id,
+                })
+            }
+            Command::DetachRemote => {
+                let s = self.selected_session()?;
+                // Detach only makes sense for a remote session we're attached to:
+                // a local session *is* its window (closing it would lose the
+                // session — that's `x`). Close the `ssh attach` window but leave
+                // the pooled session running; the row stays and Enter re-attaches.
+                if s.host.is_local() {
+                    self.set_status(
+                        "Detach is for remote sessions; use x to kill a local one".to_string(),
+                        true,
+                    );
+                    return None;
+                }
+                match (self.window_id_for_session(&s), s.pool_session.clone()) {
+                    (Some(window_id), Some(token)) => Some(Action::DetachRemote {
+                        host: s.host,
+                        token,
+                        window_id,
+                    }),
+                    _ => {
+                        self.set_status("Not attached to this session".to_string(), true);
+                        None
+                    }
+                }
+            }
+            Command::MoveToTab => {
+                // zellij can't reparent a pane across tabs; the key is offered
+                // only when the backend supports the move.
+                if !self.capabilities.move_to_tab {
+                    self.set_status(
+                        "Moving to another tab is not supported by this terminal backend"
+                            .to_string(),
+                        true,
+                    );
+                    return None;
+                }
+                self.selected_window_id().map(Action::FetchTabsForMove)
+            }
+            Command::ShellTab => {
+                let s = self.selected_session()?;
+                Some(Action::OpenShellTab {
+                    host: s.host,
+                    cwd: s.cwd,
+                })
+            }
+            Command::JumpAttention => {
+                self.jump_to_next_attention();
+                None
+            }
+            Command::RefreshPreview => {
+                self.request_preview_refresh();
+                self.set_status("Refreshing preview…".to_string(), false);
+                None
+            }
+            Command::ScrollPreviewUp => {
+                self.scroll_preview_up();
+                None
+            }
+            Command::ScrollPreviewDown => {
+                self.scroll_preview_down();
+                None
+            }
+            Command::ScrollPreviewLeft => {
+                self.scroll_preview_left();
+                None
+            }
+            Command::ScrollPreviewRight => {
+                self.scroll_preview_right();
+                None
+            }
+            Command::ToggleMute => {
+                self.toggle_session_flag(SessionFlag::Mute);
+                None
+            }
+            Command::TogglePin => {
+                self.toggle_session_flag(SessionFlag::Pin);
+                None
+            }
+            Command::ToggleFollowUp => {
+                // Only allow toggling "needs input" on sessions that are Idle
+                // (nothing else is happening, so marking makes sense) or already
+                // carry the needs-input overlay (so the user can clear it).
+                let allowed = self.selected_session_ref().is_some_and(|s| {
+                    self.is_follow_up(&super::flag_key(s))
+                        || matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted)
+                });
+                if allowed {
+                    self.toggle_session_flag(SessionFlag::FollowUp);
+                } else {
+                    self.set_status(
+                        "needs-input only works on idle or needs-input sessions".to_string(),
+                        false,
+                    );
+                }
+                None
+            }
+            Command::Search => {
+                self.input_mode = InputMode::Search;
+                self.search_input.clear();
+                None
+            }
+            Command::ClearSearch => {
+                self.set_search_filter(None);
+                self.status_msg = None;
+                None
+            }
+            Command::Help => {
+                self.input_mode = InputMode::Help;
+                None
+            }
+            Command::Quit => {
+                self.should_quit = true;
+                None
+            }
+            Command::TogglePreview => {
+                self.preview_visible = !self.preview_visible;
+                None
+            }
+            Command::ToggleDetail => {
+                self.detail_visible = !self.detail_visible;
+                None
+            }
+            Command::RestartSelected => {
+                self.request_restart_selected();
+                None
+            }
+            Command::RestartAll => {
+                self.request_restart_all();
+                None
+            }
+            Command::EditDir => {
+                self.open_dir_edit();
+                None
+            }
+            Command::ToggleKeepAwake => {
+                self.toggle_prevent_sleep();
+                None
+            }
+            Command::DefaultAgent => {
+                self.open_default_agent_picker();
+                None
+            }
+            Command::SessionsLayout => {
+                self.toggle_sessions_layout();
+                None
+            }
+            Command::ManageHosts => {
+                if super::REMOTE_ENABLED {
+                    self.open_host_edit();
+                } else {
+                    self.set_status(
+                        "Remote hosts are a work in progress — rebuild with `--features remote`"
+                            .to_string(),
+                        true,
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.set_search_filter(None);
+                self.search_input.clear();
+                self.reset_selection();
+                None
+            }
+            KeyCode::Enter => {
+                self.input_mode = InputMode::Normal;
+                let filter = self.current_search_filter();
+                self.set_search_filter(filter);
+                self.search_input.clear();
+                self.reset_selection();
+                None
+            }
+            // Editing (insert, backspace, cursor motion, readline keys) is
+            // delegated to the shared `TextInput`, which — unlike the old bare
+            // buffer — guards its Char arm against Ctrl/Alt, so a stray Ctrl-U
+            // no longer types a literal `u` into the filter. Re-apply the live
+            // filter only when the buffer actually changed.
+            _ => {
+                if matches!(self.search_input.handle_key(key), TextInputEvent::Changed) {
+                    let filter = self.current_search_filter();
+                    self.set_search_filter(filter);
+                    self.reset_selection();
+                }
+                None
+            }
+        }
+    }
+
+    /// The current Search-mode buffer as a filter: `None` when empty.
+    fn current_search_filter(&self) -> Option<String> {
+        (!self.search_input.is_empty()).then(|| self.search_input.text().to_string())
+    }
+
+    /// Whether `path` is a directory on `host`. Local uses the injected
+    /// `dir_exists` (real fs in production, a stub in tests); remote makes a
+    /// blocking RPC to the host's server (`false` if unreachable).
+    fn host_dir_exists(&self, host: &HostId, path: &str) -> bool {
+        if host.is_local() {
+            (self.dir_exists)(path)
+        } else {
+            tokio::task::block_in_place(|| self.backend_for(host).dir_exists(path))
+        }
+    }
+
+    /// Resolve a workdir-picker submission into a launch, choosing between the
+    /// highlighted recent and the typed text and rejecting anything that isn't
+    /// an existing directory.
+    ///
+    /// `idx` is the highlighted recent (`Some`, from `Submit`) or `None` when
+    /// the user submitted raw text with no filter match (`SubmitFree`).
+    ///
+    /// Disambiguation: a typed string that already names a directory is taken
+    /// literally (so a full path that merely substrings a recent cwd still
+    /// wins); otherwise the text is treated as a filter and the highlighted
+    /// recent is launched (so typing `sys` + Enter opens the matched
+    /// `~/.system-config`, not a bogus `sys`). Explicit Up/Down navigation
+    /// always honors the highlight. A path that doesn't resolve to a directory
+    /// is rejected: the picker stays open with an inline error.
+    fn submit_workdir(&mut self, idx: Option<usize>) -> Option<Action> {
+        let active = self.picker.as_ref()?;
+        let PickerKind::Workdir { agent, host } = &active.kind else {
+            return None;
+        };
+        let agent = *agent;
+        let host = host.clone();
+        // Extract everything from the picker up front so its borrow ends before we
+        // call `&mut self` (set_error) and the blocking host RPCs below.
+        let typed = active.picker.input.text().trim().to_string();
+        let user_selected = active.picker.user_selected;
+        let item_path = idx
+            .and_then(|i| active.picker.items.get(i))
+            .and_then(|it| it.payload.clone());
+
+        // Paths resolve against the *selected host*: `~` expands to that host's
+        // home (`workdir_host_home`) and existence checks hit that host's fs.
+        let home = self.workdir_host_home.clone();
+
+        // Fast-fail a not-fully-connected remote BEFORE any blocking RPC: the
+        // checks go over the wire and `request()` would queue (freezing the TUI on
+        // `block_in_place`) through the whole connect attempt. Show "unreachable"
+        // and keep the picker open, rather than "not a directory" (misleading — we
+        // just can't reach it).
+        if !host.is_local() && self.backend_for(&host).conn_state() != ConnState::Connected {
+            if let Some(active) = self.picker.as_mut() {
+                active.picker.set_error(format!("{} unreachable", host.0));
+            }
+            return None;
+        }
+
+        // Disambiguation: a typed string that already names a directory on the
+        // host is taken literally; otherwise it's a filter and the highlighted
+        // recent wins. We consult the host fs only when it can affect the choice —
+        // an explicit selection skips the typed check entirely — and remember when
+        // the typed path was confirmed a dir so we don't re-check it below.
+        let typed_expanded = expand_tilde(&typed, &home);
+        let (chosen_raw, typed_known_dir) = if user_selected && let Some(p) = &item_path {
+            (p.clone(), false)
+        } else {
+            let typed_is_dir =
+                !typed_expanded.is_empty() && self.host_dir_exists(&host, &typed_expanded);
+            if typed_is_dir {
+                (typed.clone(), true)
+            } else if let Some(p) = &item_path {
+                (p.clone(), false)
+            } else if !typed.is_empty() {
+                (typed.clone(), false)
+            } else {
+                // Nothing typed and nothing highlighted — keep the picker open.
+                return None;
+            }
+        };
+
+        let cwd = expand_tilde(chosen_raw.trim(), &home);
+        if cwd.is_empty() {
+            return None;
+        }
+        // Validate, skipping a second round-trip when we already confirmed this
+        // exact path is a directory (typed_known_dir ⇒ cwd == typed_expanded).
+        if !typed_known_dir && !self.host_dir_exists(&host, &cwd) {
+            let shown = collapse_tilde(&cwd, &home);
+            if let Some(active) = self.picker.as_mut() {
+                active.picker.set_error(format!("Not a directory: {shown}"));
+            }
+            return None;
+        }
+
+        self.picker = None;
+        self.workdir_completion = None;
+        self.input_mode = InputMode::Normal;
+        Some(Action::NewSessionSplit { agent, cwd, host })
+    }
+
+    /// Build the `ResumeSession` action shared by the resume picker and the
+    /// browser's resumable rows: resume `c` on `host`, no fork. The resumed
+    /// session lands per the current layout (`resolve_spawn_target`).
+    fn resume_action(&self, host: HostId, c: ResumeCandidate) -> Action {
+        Action::ResumeSession {
+            agent: c.agent,
+            cwd: c.cwd,
+            session_id: c.session_id,
+            fork: false,
+            host,
+        }
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let Some(active) = self.picker.as_mut() else {
+            self.input_mode = InputMode::Normal;
+            return None;
+        };
+        // Ctrl-D in the workdir picker forgets the highlighted recent cwd.
+        // Intercept before the picker forwards it to TextInput as readline
+        // delete-forward, which would otherwise be mostly a no-op here.
+        if matches!(active.kind, PickerKind::Workdir { .. })
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d'))
+        {
+            self.delete_selected_recent_cwd_in_picker();
+            return None;
+        }
+        // Ctrl-T in the workdir picker cycles the backend this launch will use
+        // — a per-launch override of the Space-a default — and updates the
+        // picker title in place. (Not Ctrl-A: that's readline beginning-of-line
+        // for the path input.)
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t'))
+            && let PickerKind::Workdir { agent, host, .. } = &mut active.kind
+        {
+            let all = AgentControl::ALL;
+            let cur = all.iter().position(|a| a == agent).unwrap_or(0);
+            *agent = all[(cur + 1) % all.len()];
+            active.picker.title = super::format::workdir_picker_title(*agent, host);
+            return None;
+        }
+        // Ctrl-H in the workdir picker cycles the host this launch opens on —
+        // local, then each configured remote — a per-launch choice. A remote
+        // host opens the session in its pty pool and attaches over ssh (§8), and
+        // the picker re-seeds its recent dirs / completion / validation against
+        // that machine (`reseed_workdir_for_host`).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h'))
+            && let PickerKind::Workdir { agent, host, .. } = &mut active.kind
+        {
+            let hosts: Vec<HostId> = self.backends.iter().map(|b| b.host_id()).collect();
+            let cur = hosts.iter().position(|h| h == host).unwrap_or(0);
+            *host = hosts[(cur + 1) % hosts.len()].clone();
+            active.picker.title = super::format::workdir_picker_title(*agent, host);
+            // Drop the `active` borrow before the reseed (it re-borrows self).
+            self.reseed_workdir_for_host();
+            return None;
+        }
+        match active.picker.handle_key(key) {
+            PickerEvent::Noop => None,
+            PickerEvent::Cancel => {
+                // Take the picker out (releasing the `active` borrow) before
+                // touching `self.input_mode`. Cancelling the emoji picker drops
+                // back into the still-open directory editor; every other picker
+                // returns to Normal.
+                let active = self.picker.take().expect("picker was Some just above");
+                self.workdir_completion = None;
+                self.input_mode = if matches!(active.kind, PickerKind::Emoji) {
+                    InputMode::DirEdit
+                } else {
+                    InputMode::Normal
+                };
+                None
+            }
+            PickerEvent::TabComplete => {
+                self.complete_workdir_in_picker();
+                None
+            }
+            PickerEvent::Submit(idx) => {
+                // The workdir picker needs a filesystem check and may keep the
+                // popup open on a bad path, so it must not consume the picker
+                // up front. Hand it off before taking ownership.
+                if matches!(
+                    self.picker.as_ref().map(|a| &a.kind),
+                    Some(PickerKind::Workdir { .. })
+                ) {
+                    return self.submit_workdir(Some(idx));
+                }
+                // Take the picker out before calling `&self` methods below.
+                let active = self.picker.take().expect("picker was Some just above");
+                self.workdir_completion = None;
+                self.input_mode = InputMode::Normal;
+                match active.kind {
+                    PickerKind::MoveTab { window_id, tabs } => {
+                        let target = if idx < tabs.len() {
+                            TabTarget::Existing(tabs[idx].id.clone())
+                        } else {
+                            TabTarget::New
+                        };
+                        Some(Action::MoveWindow(window_id, target))
+                    }
+                    PickerKind::Resume { mut candidates } => {
+                        if idx >= candidates.len() {
+                            return None;
+                        }
+                        let (host, c) = candidates.swap_remove(idx);
+                        Some(self.resume_action(host, c))
+                    }
+                    // Handled above via `submit_workdir` before the take.
+                    PickerKind::Workdir { .. } => None,
+                    PickerKind::Browser { mut entries } => {
+                        if idx >= entries.len() {
+                            return None;
+                        }
+                        match entries.swap_remove(idx) {
+                            // Running → the same focus-or-attach decision as Enter.
+                            super::BrowserEntry::Running(s) => self.focus_or_attach(&s),
+                            // Resumable → resume on its host.
+                            super::BrowserEntry::Resumable(host, c) => {
+                                Some(self.resume_action(host, c))
+                            }
+                        }
+                    }
+                    PickerKind::DefaultAgent => {
+                        let chosen = active
+                            .picker
+                            .items
+                            .get(idx)
+                            .and_then(|it| it.payload.as_deref())
+                            .and_then(AgentControl::from_cli);
+                        if let Some(a) = chosen {
+                            self.new_session_agent = a;
+                            self.save_overrides();
+                            self.set_status(format!("Default backend: {}", a.label()), false);
+                        }
+                        None
+                    }
+                    PickerKind::Emoji => {
+                        // The chosen emoji rides in `payload`; drop it into the
+                        // editor's icon field and return there (not Normal).
+                        if let Some(emoji) = active
+                            .picker
+                            .items
+                            .get(idx)
+                            .and_then(|it| it.payload.clone())
+                        {
+                            self.apply_emoji_pick(&emoji);
+                        } else {
+                            self.input_mode = InputMode::DirEdit;
+                        }
+                        None
+                    }
+                }
+            }
+            PickerEvent::SubmitFree => {
+                // Free input is only enabled for the workdir picker, which
+                // resolves and validates the path itself (and may keep the
+                // popup open on a bad one) by re-reading the picker text.
+                if matches!(
+                    self.picker.as_ref().map(|a| &a.kind),
+                    Some(PickerKind::Workdir { .. })
+                ) {
+                    return self.submit_workdir(None);
+                }
+                self.picker = None;
+                self.workdir_completion = None;
+                self.input_mode = InputMode::Normal;
+                None
+            }
+        }
+    }
+
+    fn handle_host_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ncol = super::format::DIR_COLORS.len();
+        let editing = self.host_edit.as_ref()?.editing;
+
+        // List-mode globals: save / cancel (in field-edit these are text/Esc-back).
+        if !editing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.cancel_host_edit();
+                    return None;
+                }
+                KeyCode::Char('s') => {
+                    self.commit_host_edit();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        let state = self.host_edit.as_mut()?;
+        if state.editing {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => state.editing = false,
+                KeyCode::Tab => {
+                    state.focus = match state.focus {
+                        HostField::Label => HostField::Target,
+                        HostField::Target => HostField::Color,
+                        HostField::Color => HostField::Label,
+                    }
+                }
+                KeyCode::Char('t') if ctrl && state.focus == HostField::Target => {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        r.is_socket = !r.is_socket;
+                    }
+                }
+                KeyCode::Left if state.focus == HostField::Color => {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        r.color_idx = (r.color_idx + ncol - 1) % ncol;
+                    }
+                }
+                KeyCode::Right if state.focus == HostField::Color => {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        r.color_idx = (r.color_idx + 1) % ncol;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        match state.focus {
+                            HostField::Label => {
+                                r.label.pop();
+                            }
+                            HostField::Target => {
+                                r.target.pop();
+                            }
+                            HostField::Color => {}
+                        }
+                    }
+                }
+                // Guard Alt too, not just Ctrl: an Alt-modified char (e.g. a
+                // stray readline reflex) must not insert its literal letter.
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        match state.focus {
+                            HostField::Label => r.label.push(c),
+                            HostField::Target => r.target.push(c),
+                            HostField::Color => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            let n = state.rows.len();
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => state.cursor = state.cursor.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => state.cursor = (state.cursor + 1).min(n),
+                KeyCode::Char('a') => {
+                    state.rows.push(HostRow::default());
+                    state.cursor = state.rows.len() - 1;
+                    state.editing = true;
+                    state.focus = HostField::Label;
+                }
+                KeyCode::Char('e') | KeyCode::Enter => {
+                    if state.cursor == n {
+                        state.rows.push(HostRow::default());
+                        state.cursor = state.rows.len() - 1;
+                    }
+                    state.editing = true;
+                    state.focus = HostField::Label;
+                }
+                KeyCode::Char('d') if state.cursor < n => {
+                    state.rows.remove(state.cursor);
+                    if state.cursor >= state.rows.len() {
+                        state.cursor = state.cursor.saturating_sub(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn handle_dir_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // Esc and Enter are unconditional — even with the text row focused
+        // they should close / commit, not get inserted as text.
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_dir_edit();
+                return None;
+            }
+            KeyCode::Enter => {
+                self.commit_dir_edit();
+                return None;
+            }
+            _ => {}
+        }
+
+        // `r` resets the override only when Color is focused, so a future
+        // third focus mode is opt-in instead of inheriting the reset bind.
+        let focus = self.dir_edit.as_ref()?.focus;
+        if matches!(key.code, KeyCode::Char('r')) && focus == DirEditFocus::Color {
+            self.reset_dir_edit();
+            return None;
+        }
+
+        // Ctrl-E from the icon field opens the searchable emoji picker. The
+        // field is at most a few cells, so shadowing readline's end-of-line
+        // here costs nothing. Intercept before TextInput consumes it.
+        if focus == DirEditFocus::Custom
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('e'))
+        {
+            self.open_emoji_picker();
+            return None;
+        }
+
+        let s = self.dir_edit.as_mut()?;
+        // Tab/↑/↓ toggle focus. j/k are reserved for text input — binding
+        // them here would let the user *enter* Custom but never *leave* it.
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                s.focus = match s.focus {
+                    DirEditFocus::Custom => DirEditFocus::Color,
+                    DirEditFocus::Color => DirEditFocus::Custom,
+                };
+                return None;
+            }
+            _ => {}
+        }
+
+        match s.focus {
+            DirEditFocus::Color => {
+                let len = DIR_COLORS.len();
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        s.color_idx = if s.color_idx == 0 {
+                            len - 1
+                        } else {
+                            s.color_idx - 1
+                        };
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        s.color_idx = (s.color_idx + 1) % len;
+                    }
+                    _ => {}
+                }
+            }
+            DirEditFocus::Custom => {
+                // Post-hoc width cap (revert on overrun) instead of pre-check
+                // so paste / multi-byte input still goes through TextInput's
+                // normal handling first.
+                let prev = s.custom.text().to_string();
+                let evt = s.custom.handle_key(key);
+                if matches!(evt, TextInputEvent::Changed) {
+                    use unicode_width::UnicodeWidthStr;
+                    if s.custom.text().width() > DIR_ICON_MAX_CHARS {
+                        s.custom.set_text(prev);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn handle_help_key(&mut self, _key: KeyEvent) -> Option<Action> {
+        // Any key dismisses the help overlay.
+        self.input_mode = InputMode::Normal;
+        None
+    }
+
+    fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.input_mode = InputMode::Normal;
+                self.pending_confirm.take().map(|p| p.action)
+            }
+            _ => {
+                self.input_mode = InputMode::Normal;
+                self.pending_confirm = None;
+                None
+            }
+        }
+    }
+}

@@ -1,0 +1,121 @@
+//! Tracing setup shared by both binaries. Routes logs to files under the state
+//! dir (never stderr, which the launcher shares with the agent's TUI and the
+//! dashboard takes over via the alt-screen).
+
+use crate::{config, state};
+
+/// Initialize tracing for one of: "launcher", "dashboard", "hook", "daemon". The
+/// launcher always gets its own per-pid file (so its routine logs don't drown
+/// out the shared sink). When `[debug]` mode is on, every role also appends to a
+/// single shared `debug.log` so events from multiple processes can be correlated.
+/// A "launch separator" line is emitted right after init so a reader can find
+/// where each process started.
+pub fn init_tracing(role: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // The launcher shares stderr with the Claude process it spawns
+    // (Stdio::inherit), so any log written to stderr would paint over Claude's
+    // TUI. Route tracing to files under the state dir instead.
+    // Owner-only: with `[debug]` on these logs carry prompt text and command
+    // lines (see `state::create_dir_all_private`).
+    let log_dir = state::state_dir().join("logs");
+    if state::create_dir_all_private(&log_dir).is_err() {
+        return;
+    }
+
+    // Per-pid launcher log layer (existing behavior).
+    let launcher_layer = if role == "launcher" {
+        sweep_dead_launcher_logs(&log_dir);
+        let log_path = log_dir.join(format!("launcher-{}.log", std::process::id()));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok()
+            .map(|f| {
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(f))
+                    .with_ansi(false)
+            })
+    } else {
+        None
+    };
+
+    // NB: the daemon deliberately does NOT install its own subscriber here. With
+    // the pty-pool feature it runs the libshpool daemon on a thread, and libshpool
+    // installs the *global* tracing subscriber itself — a second `set_global`
+    // would panic (killing the pool thread). libshpool's subscriber captures our
+    // `captain_miao::*` events too, and the daemon's stdio is redirected to
+    // `daemon.log`, so the daemon's logs land there without a layer of our own.
+
+    // Shared debug.log layer for every role when debug mode is on.
+    let debug_layer = if config::debug_enabled() {
+        let path = log_dir.join(&config::get().debug.log_file);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+            .map(|f| {
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(f))
+                    .with_ansi(false)
+            })
+    } else {
+        None
+    };
+
+    if launcher_layer.is_none() && debug_layer.is_none() {
+        return;
+    }
+
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("captain_miao=debug".parse().unwrap());
+
+    let initialized = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(launcher_layer)
+        .with(debug_layer)
+        .try_init()
+        .is_ok();
+    if !initialized {
+        return;
+    }
+
+    // Launch separator. Across-process appends to debug.log are atomic for
+    // POSIX writes <= PIPE_BUF (4 KiB), so this line lands intact even when
+    // multiple processes start near-simultaneously.
+    tracing::info!(
+        target: "captain_miao::launch",
+        "===== {} START pid={} =====",
+        role.to_uppercase(),
+        std::process::id()
+    );
+}
+
+/// Remove `launcher-{pid}.log` files for launchers that have exited. Runs
+/// on every launcher startup so logs don't accumulate indefinitely, while
+/// logs for active (or very recently crashed) launchers stay available for
+/// inspection until the next one starts.
+fn sweep_dead_launcher_logs(log_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid_str) = name
+            .strip_prefix("launcher-")
+            .and_then(|s| s.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if !state::is_process_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}

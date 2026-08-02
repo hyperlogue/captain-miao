@@ -1,0 +1,131 @@
+name: build
+
+# Reusable build matrix used by the release workflow. Compiles an optimized
+# binary for every supported macOS / Linux target and uploads each as a tarball
+# artifact. captain-miao is Unix-only — it relies on
+# Unix-domain sockets, $XDG_RUNTIME_DIR, and caffeinate/systemd-inhibit — and
+# Kitty itself has no native Windows build, so there is no Windows target.
+#
+# Ships ONLY the `captain-miao` dashboard package (`-p captain-miao`), not the
+# whole workspace: the dashboard carries the `claude`/`codex`/`hook`/`focus`
+# entrypoints a local install needs, and building it alone keeps libshpool (the
+# `captain-miao-server` pty pool) out of the cross-build — cross-compiling
+# libshpool to a portable binary is a separate, unsolved spike (docs/crate-split.md),
+# and the server is deployed to remote hosts by its own path, not this tarball.
+#
+# Linux builds run on **ubuntu-22.04**, not ubuntu-latest, purely to set the glibc
+# floor: a binary linked against 24.04's glibc 2.39 dies with a cryptic loader
+# error on Debian 12 / RHEL 9 / Ubuntu 22.04. 22.04's glibc 2.35 covers those.
+# The npm packages published from these same artifacts inherit that floor, so it
+# is a distribution decision, not just a CI one.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string baked into the artifact names (e.g. v1.2.3).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# `shell: bash` (vs the unspecified default) adds -o pipefail.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Third-party actions are pinned to commit SHAs (the trailing comment is the
+# tag): a tag can be force-moved to malicious code, a SHA can't.
+#
+# No `run:` block below interpolates a `${{ }}` expression into its script body;
+# values reach the shell through `env:` instead. Expressions are substituted into
+# the script *text* before bash parses it, so an input carrying `$( )`, a
+# backtick, or `;` would become executable code rather than a string — and
+# `inputs.version` is a git tag, which git happily allows all three in.
+# release.yml also pins the tag to plain SemVer before calling this workflow;
+# the indirection here is what keeps that true for any other caller.
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `native` marks a target whose binary runs on its own runner, so the
+          # smoke test can exec it. Both Linux targets build on their own arch
+          # (GitHub's arm64 runners are free for public repos), which both drops
+          # the gcc cross toolchain bundled SQLite would otherwise need and makes
+          # the aarch64 binary testable instead of shipping unexecuted. Only
+          # x86_64 macOS is still cross-built — macos-latest is arm64, and Apple
+          # ships both SDKs, so that cross is native-toolchain and reliable.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            native: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            native: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            native: true
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      # Pinned to master (a moving branch, so it can't be a version tag); the
+      # channel it installs is set explicitly via `toolchain:` since the ref no
+      # longer names it.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET" -p captain-miao
+
+      # `--version` is handled by clap at parse time (exit 0) before the
+      # terminal gate, so it's a safe exit-0 probe that the binary at least
+      # links and runs. Only on natively-runnable targets.
+      - name: Smoke-test the binary
+        if: matrix.native
+        run: ./target/"$TARGET"/release/captain-miao --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="captain-miao-$VERSION-$TARGET"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          cp "target/$TARGET/release/captain-miao" "$stage/"
+          # README + LICENSE only. CLAUDE.md is `@AGENTS.md` plus agent tooling
+          # tips — an import that would dangle here, and not user-facing docs.
+          cp README.md LICENSE "$stage/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+
+      # No .sha256 sidecar: GitHub already hashes this twice over. upload-artifact
+      # records a SHA-256 digest that download-artifact verifies on the way back
+      # out, and a release asset carries a `digest: "sha256:…"` field in the REST
+      # API — so a sidecar would be a third copy of the same number, trusted no
+      # more than the tarball beside it.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: captain-miao-${{ matrix.target }}
+          path: captain-miao-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,26 @@
+# Nix
+result
+result-*
+.direnv
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# npm release staging (scripts/stage-npm-packages.sh output + the README/LICENSE
+# it copies into the launcher package at publish time)
+/dist/
+/npm/README.md
+/npm/LICENSE
+
+# OS
+.DS_Store
+
+# Environment
+.env
+
+# Local AI-tooling config
+/CLAUDE.local.md
+/AGENTS.local.md
+/.beads

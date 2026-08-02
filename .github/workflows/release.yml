@@ -1,0 +1,287 @@
+name: release
+
+# Tag-driven release: push a `v*` tag (e.g. `git tag v0.2.0 && git push --tags`)
+# to build every target, publish a GitHub Release with the binaries attached,
+# then publish the npm packages — the four per-platform binary packages FIRST,
+# then the launcher that pins them. That order matters: a user must never resolve
+# a launcher whose platform dependency isn't on the registry yet.
+#
+# A pre-release tag (a SemVer `-` suffix, e.g. `v0.2.0-rc.1`) is marked prerelease
+# so it never becomes the repo's "Latest", and goes to npm's `next` dist-tag so
+# `latest` never resolves an RC.
+#
+# The `verify` job gates everything: the tag must be a plain SemVer v-tag AND
+# must match Cargo.toml's [workspace.package] version. Every npm version is then
+# stamped from that one Cargo source by stage-npm-packages.sh, so the launcher's
+# pins can't drift from the packages they name.
+#
+# Requires an `NPM_TOKEN` repository secret (an npm automation token with publish
+# rights on the @hyperlogue scope).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Never cancel a half-finished publish — queue instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+# Third-party actions are pinned to commit SHAs (the trailing comment is the
+# tag): a tag can be force-moved to malicious code, a SHA can't — and this job
+# holds the npm token.
+#
+# No `run:` block in this workflow interpolates a `${{ }}` expression into its
+# script body. Expressions are substituted into the script text *before* bash
+# parses it, so a value carrying `$( )`, a backtick, or `;` becomes code. Values
+# reach scripts through `env:` instead, where bash treats them as data.
+jobs:
+  # Gate the whole release on the tag before a single build runner starts.
+  #
+  # (1) SHAPE. `github.ref_name` flows downstream into artifact names and shell
+  #     scripts, and git accepts `$( )`, backticks, quotes, `;`, `&` and `|` in a
+  #     ref name (only space and `*` are rejected) — so an unvalidated tag is a
+  #     script-injection vector. Pinning it to plain SemVer kills the class at the
+  #     source; the env indirection everywhere downstream is the second layer.
+  # (2) VERSION. The tag must equal Cargo.toml's [workspace.package] version.
+  #     Never auto-fixed — the tag is the human's assertion, so drift means a
+  #     mistake: fail and make them re-tag. Costs seconds, before anything ships.
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      - name: Verify the tag shape and the Cargo workspace version
+        id: tag
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not a plain SemVer v-tag (vMAJOR.MINOR.PATCH[-prerelease]). Delete it and re-tag."
+            exit 1
+          fi
+
+          # Parsed straight out of Cargo.toml rather than via `cargo metadata` so
+          # this runs without a Rust toolchain. Matches `version = "x"` with or
+          # without surrounding spaces. Keep in sync with the identical parse in
+          # scripts/stage-npm-packages.sh.
+          CARGO_V=$(awk '
+            /^\[workspace\.package\]/     { ws = 1; next }
+            /^\[/                         { ws = 0 }
+            ws && /^[ \t]*version[ \t]*=/ {
+              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+            }
+          ' Cargo.toml)
+
+          if [ -z "$CARGO_V" ]; then
+            echo "::error::no [workspace.package] version found in Cargo.toml."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "v$CARGO_V" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != Cargo.toml v$CARGO_V — fix the version, delete the tag, re-tag."
+            exit 1
+          fi
+
+          # (3) NOTES. The release description is CHANGELOG.md's section for this
+          #     version. Checked here, before a single build runner starts, so a
+          #     forgotten entry costs seconds rather than shipping a release page
+          #     that is silently blank. Keep the extraction in sync with the
+          #     identical awk in the publish job.
+          NOTES=$(awk -v v="$CARGO_V" '
+            index($0, "## [" v "]") == 1 { f = 1; next }
+            /^## \[/                     { f = 0 }
+            /^\[[^]]+\]:[ \t]/           { f = 0 }
+            f
+          ' CHANGELOG.md | sed '/./,$!d')
+
+          if [ -z "$NOTES" ]; then
+            echo "::error::CHANGELOG.md has no populated '## [$CARGO_V]' section. Add the entry, amend the commit, delete the tag, re-tag."
+            exit 1
+          fi
+
+          echo "version=$CARGO_V" >> "$GITHUB_OUTPUT"
+          echo "verified $GITHUB_REF_NAME against Cargo.toml v$CARGO_V"
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    # The verified value, not the raw ref: the string is identical (verify proved
+    # it) but sourcing it from the guard's output means an unvalidated tag can't
+    # reach the build matrix even if this workflow is edited later.
+    with:
+      version: v${{ needs.verify.outputs.version }}
+
+  publish:
+    name: publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # This job holds the npm token, and a tag push bypasses branch protection —
+    # so anyone with write access (or any workflow holding contents:write) could
+    # otherwise tag an arbitrary commit into a signed publish. Configure this
+    # environment in repo settings with required reviewers, and add a tag ruleset
+    # on `v*`. GitHub creates the environment implicitly if it doesn't exist yet,
+    # so the workflow still runs — it just isn't gated until you configure it.
+    environment: release
+    permissions:
+      contents: write # create the GitHub Release + upload assets
+      id-token: write # npm provenance attestation
+    env:
+      # Read by stage-npm-packages.sh; already validated against the tag above.
+      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
+      # Same value, named for the release-notes extraction that also reads it.
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      # `pattern` scopes the download to the build matrix's own artifacts, so a
+      # stray artifact uploaded by some future job in this run can't ride along
+      # into the release assets or the npm packages.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: captain-miao-*
+          path: artifacts
+          merge-multiple: true
+
+      # The release description is CHANGELOG.md's section for this version — the
+      # human-written account, rather than a commit list nobody edited. `verify`
+      # already proved this section exists and is non-empty, so this can't
+      # silently produce a blank release page.
+      - name: Extract the release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { f = 1; next }
+            /^## \[/                     { f = 0 }
+            /^\[[^]]+\]:[ \t]/           { f = 0 }
+            f
+          ' CHANGELOG.md | sed '/./,$!d' > "$RUNNER_TEMP/relnotes.md"
+          echo "--- release notes ---"
+          cat "$RUNNER_TEMP/relnotes.md"
+
+      # GitHub Release FIRST (reversible, and the curl/manual channel) — npm is
+      # effectively irreversible, so it goes last. Globbed by extension rather
+      # than `artifacts/*` so only the intended asset kinds are ever attached.
+      # generate_release_notes stays on: GitHub appends its auto-generated
+      # commit/contributor list *below* body_path, so the changelog leads and the
+      # mechanical detail follows.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          body_path: ${{ runner.temp }}/relnotes.md
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      # Unpacks each tarball into dist/npm/<pkg>/ and stamps the launcher's
+      # version + optionalDependencies from the Cargo version.
+      - name: Stage npm platform packages
+        run: scripts/stage-npm-packages.sh artifacts
+
+      # npm preserves tarball file modes, so a 0644 binary would EACCES on every
+      # install — verify the staged package kept the exec bit. Deliberately does
+      # NOT exec the binary: build.yml already smoke-tests every natively-runnable
+      # target, and running an unverified artifact inside the job that holds
+      # NPM_TOKEN would let a poisoned binary rewrite the other three platform
+      # packages before they're published.
+      - name: Check the staged binaries
+        run: |
+          set -euo pipefail
+          for d in dist/npm/*/; do
+            test -x "$d/bin/captain-miao"
+            echo "  ok $d"
+          done
+
+      # setup-node wires NODE_AUTH_TOKEN for the registry. Node 24 for npm >= 11:
+      # that's the floor for npm Trusted Publishing (OIDC), which this job's
+      # existing `id-token: write` already satisfies. Once the packages are linked
+      # to this workflow on npmjs.com, npm uses OIDC automatically and the
+      # long-lived NPM_TOKEN secret can be deleted; until then it falls back to
+      # the token, so this is safe to land ahead of that one-time registry config.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      # Publish the four per-platform binary packages BEFORE the launcher: the
+      # launcher's optionalDependencies pin them at this exact version, so a user
+      # must never resolve a launcher whose platform package isn't on the registry
+      # yet. Each publish is idempotent (skip if this version already exists) so a
+      # re-run after a partial failure converges. --provenance attests the actual
+      # binary bytes, not just the launcher shim. --ignore-scripts because a
+      # package lifecycle hook would otherwise run with the token in its env; no
+      # package declares one today, and this keeps it that way.
+      - name: Publish platform binary packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm --version
+          for d in dist/npm/*/; do
+            NAME=$(jq -r .name "$d/package.json")
+            V=$(jq -r .version "$d/package.json")
+            if [ -n "$(npm view "$NAME@$V" version 2>/dev/null || true)" ]; then
+              echo "$NAME@$V already published — skipping (idempotent re-run)."
+              continue
+            fi
+            ( cd "$d" && npm publish --provenance --access public --ignore-scripts )
+          done
+
+      # npm's read path can lag a successful publish by seconds; wait until all
+      # four platform packages are visible before publishing the launcher, so the
+      # first post-release `npx` can't 404 on a platform dependency. A package
+      # still missing after the timeout FAILS the run — publishing the launcher
+      # anyway would ship exactly the broken resolve this step exists to prevent
+      # (a re-run converges once the registry catches up).
+      - name: Wait for platform packages to be visible
+        run: |
+          set -euo pipefail
+          for d in dist/npm/*/; do
+            NAME=$(jq -r .name "$d/package.json")
+            V=$(jq -r .version "$d/package.json")
+            SEEN=""
+            for i in $(seq 1 30); do
+              [ -n "$(npm view "$NAME@$V" version 2>/dev/null || true)" ] && { echo "$NAME@$V visible."; SEEN=1; break; }
+              echo "waiting for $NAME@$V to appear ($i/30)…"; sleep 5
+            done
+            if [ -z "$SEEN" ]; then
+              echo "::error::$NAME@$V not visible after 150s — not publishing the launcher against a missing platform package."
+              exit 1
+            fi
+          done
+
+      # The launcher LAST, after its platform packages. Skip if this exact version
+      # is already on npm so a re-run after a transient failure converges.
+      # Prerelease versions go to the `next` dist-tag so `latest` never resolves an
+      # RC. --provenance (needs id-token: write) gives users a verifiable build
+      # attestation — free for a public repo whose repository URL already matches.
+      - name: Publish npm launcher
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          V=$(jq -r .version package.json)
+          if [ -n "$(npm view "@hyperlogue/captain-miao@$V" version 2>/dev/null || true)" ]; then
+            echo "@hyperlogue/captain-miao@$V already published — skipping (idempotent re-run)."
+            exit 0
+          fi
+          TAG=latest
+          [[ "$V" == *-* ]] && TAG=next
+          npm publish --provenance --access public --ignore-scripts --tag "$TAG"

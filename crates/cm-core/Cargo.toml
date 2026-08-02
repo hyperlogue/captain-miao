@@ -1,0 +1,31 @@
+[package]
+name = "cm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "captain-miao shared core: state, wire protocol, agent backends, launcher, hooks"
+
+# Shared by both binaries (the `captain-miao` dashboard and `captain-miao-server`).
+# Deliberately free of ratatui/crossterm (presentation) and libshpool (the pool),
+# so it cross-compiles cleanly as part of the server and stays a pure data/logic
+# layer. It does carry bundled SQLite (for Codex titles) — portable C, unlike the
+# platform-linking libshpool, so it cross-compiles without trouble.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+libc = "0.2"
+notify = "8"
+toml = "1.1"
+# `bundled` statically compiles SQLite into the binary, so reading Codex's
+# state_5.sqlite for session renames needs no `sqlite3` CLI at runtime.
+# Capped at 0.39: 0.40 pulls libsqlite3-sys 0.38, whose build script uses the
+# still-unstable `cfg_select!` and won't compile on this Rust toolchain (1.94).
+rusqlite = { version = "0.39", features = ["bundled"] }

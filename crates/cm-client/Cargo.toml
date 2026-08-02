@@ -1,0 +1,37 @@
+[package]
+name = "captain-miao-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "captain-miao pool client: list and attach to local pooled sessions"
+
+# A thin, user-facing CLI for the local pty pool: list the sessions the per-host
+# daemon is holding and reattach a terminal to one. Unlike the dashboard it
+# links libshpool (so `attach` proxies the pty in-process); unlike the server it
+# hosts no daemon/pool — it's purely a client over the pool socket the server
+# binds. `--no-default-features` drops libshpool (list-only; attach declines),
+# so the crate still builds on macOS.
+[[bin]]
+name = "captain-miao-client"
+path = "src/main.rs"
+
+[dependencies]
+cm-core = { path = "../cm-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The read-only list query speaks libshpool's msgpack wire codec directly (its
+# protocol client is private); these are always needed, no libshpool required.
+shpool-protocol = "0.4"
+rmp-serde = "1"
+
+# libshpool powers `attach` (the in-process pty proxy). Optional, so the crate
+# still builds where libshpool can't (macOS): list-only, attach declines.
+libshpool = { version = "0.11", optional = true }
+
+[features]
+default = ["pty-pool"]
+pty-pool = ["dep:libshpool"]

@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (PR pushes, branch pushes). Scope by
+# event too so a push run and a PR run for the same ref don't cancel each other.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+# `shell: bash` (vs the unspecified default) adds -o pipefail.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# CI runs every check through `nix develop --command`, so the toolchain
+# (rustc/rustfmt/clippy) and build environment (mold+clang on Linux) are the
+# exact ones pinned by flake.lock — the same shell a contributor gets from
+# `nix develop`. This keeps rustfmt/clippy output in lockstep with local dev and
+# was the fix for CI-vs-local fmt drift. GitHub's ubuntu-latest maps to the
+# flake's x86_64-linux system and macos-latest to aarch64-darwin.
+#
+# Third-party actions are pinned to commit SHAs (the trailing comment is the
+# tag): a tag can be force-moved to malicious code, a SHA can't.
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Realize the dev shell once and put its Rust bin dir on PATH so
+      # Swatinem/rust-cache can read `rustc -vV` for its cache key (it runs
+      # outside the nix shell). Later steps still invoke through `nix develop`.
+      - name: Put the flake toolchain on PATH
+        run: nix develop --command bash -c 'echo "$(dirname "$(command -v rustc)")" >> "$GITHUB_PATH"'
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: rustfmt
+        run: nix develop --command cargo fmt --all --check
+
+      - name: clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Put the flake toolchain on PATH
+        run: nix develop --command bash -c 'echo "$(dirname "$(command -v rustc)")" >> "$GITHUB_PATH"'
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Build
+        run: nix develop --command cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: nix develop --command cargo test --workspace --locked

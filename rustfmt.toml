@@ -1,0 +1,3 @@
+# Use default rustfmt style, pinned to the crate's edition so `cargo fmt`
+# and a bare `rustfmt` invocation agree on let-chain / closure formatting.
+edition = "2024"

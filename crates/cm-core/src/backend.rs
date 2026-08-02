@@ -1,0 +1,489 @@
+//! The local, in-process backend and the shared open-session types.
+//!
+//! [`LocalBackend`] is the **server-core**: it reads this host's session state
+//! files, lists resumable sessions, signals local agent processes, plans launch
+//! argv, and answers the host-filesystem queries the workdir picker needs. Both
+//! the dashboard's localhost row *and* the `captain-miao-server` daemon wrap one,
+//! so the same local-read logic backs the in-process path and the remote path.
+//!
+//! [`OpenSpec`] (what to open) and [`LaunchPlan`] (how the client attaches a
+//! window to it) are the seam types the dashboard's `Backend` enum and the wire
+//! protocol share; they live here so both crates agree on them. The dashboard's
+//! `Backend`/`RemoteBackend` (the ssh client) build on these — see the
+//! `backend` module in the `captain-miao` crate.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCache};
+use crate::agents::codex;
+use crate::state::{self, LauncherState};
+
+/// What to open: which agent, where, and whether it's a fresh session or a
+/// resume/fork of an existing one. This is §3/§14.2's `SpawnSpec`, renamed to
+/// avoid colliding with `terminal::SpawnSpec` (which describes the *window*).
+/// [`LocalBackend::open_session`] turns it into a [`LaunchPlan`]. Serializable
+/// because it rides the wire to a remote server (`ClientFrame::OpenSession`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenSpec {
+    pub agent: AgentControl,
+    pub cwd: String,
+    /// `Some((session_id, fork))` to resume an existing session (`fork` continues
+    /// it on a branch instead of in place); `None` for a brand-new session.
+    pub resume: Option<(String, bool)>,
+}
+
+/// How the client attaches a *local* window to a session `open_session` made
+/// exist. The client only ever does the window half — `Terminal::spawn(argv)` —
+/// so the backend hands back the argv.
+pub enum LaunchPlan {
+    /// Local: the window *is* the launcher. Spawn this argv directly.
+    SpawnLocal { argv: Vec<String> },
+    /// Remote: the server already started the launcher inside the pty pool; the
+    /// client spawns a window that attaches to it (`ssh -t <host> captain-miao
+    /// attach <name>`, or a direct `captain-miao attach <name>` for a same-host
+    /// socket transport). `session_name` is the pool join key the client records
+    /// against the local window (§8 binding).
+    AttachRemote {
+        argv: Vec<String>,
+        #[allow(dead_code)] // recorded as the window↔session binding key in 3d
+        session_name: String,
+    },
+}
+
+impl LaunchPlan {
+    /// The argv the client spawns into a local Kitty window.
+    pub fn argv(&self) -> &[String] {
+        match self {
+            LaunchPlan::SpawnLocal { argv } => argv,
+            LaunchPlan::AttachRemote { argv, .. } => argv,
+        }
+    }
+}
+
+/// Floor between sqlite re-reads of the Codex title store once a change is
+/// detected. Renames are rare and low-stakes, so the overlay trades freshness
+/// for quiet: a title change surfaces on the first overlay pass at least this
+/// long after the previous read. First sight of a new session id bypasses the
+/// floor (one immediate read titles a fresh/resumed session).
+const CODEX_TITLE_REFRESH_FLOOR: Duration = Duration::from_secs(30);
+
+/// The per-host Codex title cache behind [`LocalBackend`]'s overlay. Exactly
+/// one exists per host process (the dashboard's local backend, or the daemon's
+/// server-core shared across every connection), so there is a **single sqlite
+/// reader per host** no matter how many Codex sessions run.
+#[derive(Default)]
+struct CodexTitles {
+    /// session id → title at the last read. `None` = queried, no usable title
+    /// row yet — the entry still marks the id *known*, so an untitled session
+    /// doesn't re-trigger the first-sight read on every overlay pass.
+    titles: HashMap<String, Option<String>>,
+    /// `(db, wal)` mtimes at the last read — the cheap change gate: an
+    /// unchanged stamp means no title can have moved, so sqlite isn't touched.
+    store_stamp: (Option<SystemTime>, Option<SystemTime>),
+    last_read: Option<Instant>,
+}
+
+/// Whether the overlay should hit sqlite this pass. Pure so the throttle rules
+/// are pinned by tests: a never-seen session id reads immediately (first-load
+/// titling); otherwise a read requires both a store change (the mtime stamp
+/// moved) and the refresh floor elapsed since the last read — so even a
+/// wal-churning Codex burst costs at most one small read-only query batch per
+/// floor interval per host.
+fn title_refresh_due(unknown_id: bool, store_changed: bool, since_read: Option<Duration>) -> bool {
+    if unknown_id {
+        return true;
+    }
+    store_changed && since_read.is_none_or(|d| d >= CODEX_TITLE_REFRESH_FLOOR)
+}
+
+/// Stamp cached titles onto the Codex rows (matched by session id), leaving
+/// every other row — and untitled Codex rows — untouched so the display falls
+/// through to the folded first prompt. Split from the cache upkeep for tests.
+fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<String>>) {
+    for s in sessions
+        .iter_mut()
+        .filter(|s| s.agent == AgentControl::Codex)
+    {
+        if let Some(title) = s
+            .session_id
+            .as_ref()
+            .and_then(|id| titles.get(id))
+            .and_then(|t| t.as_ref())
+        {
+            s.name = Some(title.clone());
+        }
+    }
+}
+
+/// In-process backend: read the local filesystem and signal local processes
+/// directly. Owns the per-agent session-name cache and the per-host Codex
+/// title overlay (per-host state that a remote backend keeps on its own
+/// server). Also the server-core (see module docs), so `captain-miao-server`
+/// calls the same operations.
+#[derive(Default)]
+pub struct LocalBackend {
+    session_index_caches: HashMap<AgentControl, SessionIndexCache>,
+    codex_titles: Mutex<CodexTitles>,
+}
+
+impl LocalBackend {
+    pub fn list_sessions(&self) -> Vec<LauncherState> {
+        let mut sessions = state::read_all_launcher_states();
+        self.overlay_codex_titles(&mut sessions);
+        sessions
+    }
+
+    /// Overlay Codex display names from the host's single title cache onto the
+    /// rows. Codex stores titles (renames *and* its own auto-titles) in
+    /// `state_5.sqlite` only — no hook, no rollout line — so this per-host
+    /// reader stamps them onto `name` before the sessions are served, which
+    /// reaches remote rows for free (the daemon's `LocalBackend` overlays
+    /// before `Snapshot`/`Delta`). Heavily throttled: no Codex sessions → no
+    /// reads at all; otherwise one batched read-only query, gated by the store
+    /// mtime stamp and [`CODEX_TITLE_REFRESH_FLOOR`] (see [`title_refresh_due`]).
+    fn overlay_codex_titles(&self, sessions: &mut [LauncherState]) {
+        let ids: Vec<String> = sessions
+            .iter()
+            .filter(|s| s.agent == AgentControl::Codex)
+            .filter_map(|s| s.session_id.clone())
+            .collect();
+        let mut cache = self.codex_titles.lock().unwrap();
+        if ids.is_empty() {
+            cache.titles.clear();
+            return;
+        }
+        let unknown = ids.iter().any(|id| !cache.titles.contains_key(id));
+        let stamp = codex::title_store_mtimes();
+        if title_refresh_due(
+            unknown,
+            stamp != cache.store_stamp,
+            cache.last_read.map(|t| t.elapsed()),
+        ) {
+            let read = codex::read_thread_titles(&ids);
+            // Rebuild from the live ids: dead sessions fall out, and every live
+            // id becomes *known* (`None` when untitled) so it doesn't re-trigger
+            // the first-sight read.
+            cache.titles = ids
+                .iter()
+                .map(|id| (id.clone(), read.get(id).cloned()))
+                .collect();
+            cache.store_stamp = stamp;
+            cache.last_read = Some(Instant::now());
+        } else {
+            cache.titles.retain(|id, _| ids.contains(id));
+        }
+        stamp_titles(sessions, &cache.titles);
+    }
+
+    pub fn session_index(&mut self) -> SessionIndex {
+        let mut merged = SessionIndex::default();
+        for &agent in AgentControl::ALL {
+            let cache = self.session_index_caches.entry(agent).or_default();
+            let shard = agent.read_session_index(cache);
+            // Tag every pid this shard contributes with its owning backend so
+            // `lookup`'s by_pid fallback can be gated on the row's backend (a
+            // recycled pid must not surface another backend's stale name).
+            for &pid in shard.by_pid.keys() {
+                merged.by_pid_owner.insert(pid, agent);
+            }
+            merged.by_pid.extend(shard.by_pid);
+            merged.by_session_id.extend(shard.by_session_id);
+            merged.session_id_by_pid.extend(shard.session_id_by_pid);
+        }
+        merged
+    }
+
+    pub fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
+        let mut all: Vec<ResumeCandidate> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for &agent in AgentControl::ALL {
+            match agent.list_resumable(limit) {
+                Ok(list) => all.extend(list),
+                Err(e) => errors.push(format!("{agent:?}: {e}")),
+            }
+        }
+        all.sort_by_key(|b| std::cmp::Reverse(b.mtime));
+        all.truncate(limit);
+        (all, errors)
+    }
+
+    pub fn kill_session(&self, child_pid: u32) -> bool {
+        unsafe { libc::kill(child_pid as i32, libc::SIGTERM) == 0 }
+    }
+
+    /// Build the argv for a local launcher window:
+    /// `captain-miao <agent> <cwd> [resume args]`. Pure metadata — the client
+    /// spawns it into a Kitty window; nothing runs here. argv[0] is the running
+    /// captain-miao exe so the launched launcher is the same build as the
+    /// dashboard (falls back to a bare `captain-miao` on PATH if unresolvable).
+    pub fn open_session(&self, spec: &OpenSpec) -> LaunchPlan {
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| "captain-miao".into())
+            .to_string_lossy()
+            .into_owned();
+        let mut argv = vec![
+            exe,
+            spec.agent.cli_subcommand().to_string(),
+            spec.cwd.clone(),
+        ];
+        if let Some((session_id, fork)) = &spec.resume {
+            argv.extend(spec.agent.resume_args(session_id, *fork));
+        }
+        LaunchPlan::SpawnLocal { argv }
+    }
+
+    // --- Host filesystem queries (server-core; also answered over the wire) ---
+    //
+    // These let the workdir picker operate against *this* host: its recent dirs,
+    // directory completion, and submit-time validation. Local runs them in
+    // process; a remote dashboard reaches the same code via the server
+    // (`ListRecentDirs`/`CompletePath`/`CheckDir`).
+
+    /// This host's recent working dirs (most-recent first) and its `$HOME`.
+    pub fn recent_dirs(&self) -> (Vec<String>, String) {
+        (read_recent_dirs(), home_dir())
+    }
+
+    /// Directory completions for `prefix` on this host's filesystem.
+    pub fn complete_path(&self, prefix: &str) -> Vec<String> {
+        complete_dirs(prefix)
+    }
+
+    /// Whether `path` is a directory on this host — the picker's submit check.
+    pub fn dir_exists(&self, path: &str) -> bool {
+        !path.is_empty() && Path::new(path).is_dir()
+    }
+
+    /// Record `cwd` into this host's recent-dirs list. The server calls this when
+    /// it opens a pool session, so remote launches build up the remote list the
+    /// picker then serves back.
+    pub fn record_recent_cwd(&self, cwd: &str) {
+        record_recent_dir(cwd);
+    }
+}
+
+/// `$HOME` for the current host, or empty if unset (then `~` isn't expanded).
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+/// The recent-dirs list from `recent_cwds_path`, most-recent first.
+fn read_recent_dirs() -> Vec<String> {
+    state::read_json::<state::RecentCwds>(&state::recent_cwds_path())
+        .map(|r| r.cwds)
+        .unwrap_or_default()
+}
+
+/// Push `cwd` onto the recent-dirs list (dedup, most-recent first, capped),
+/// persisting it. Mirrors the dashboard's `push_recent_cwd` so a locally- and a
+/// remotely-launched dir age out the same way.
+fn record_recent_dir(cwd: &str) {
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return;
+    }
+    let mut cwds = read_recent_dirs();
+    cwds.retain(|c| c.trim_end_matches('/') != cwd);
+    cwds.insert(0, cwd.to_string());
+    let max = crate::config::get().launcher.max_recent_cwds;
+    cwds.truncate(max);
+    let _ = state::write_json_atomic(&state::recent_cwds_path(), &state::RecentCwds { cwds });
+}
+
+/// Directory completions for `prefix` on the local filesystem, as absolute paths
+/// with a trailing `/`, sorted. The completion rules the picker relies on: dirs
+/// only, skip dotfiles, prefix-match the basename. Returns absolute paths (not
+/// `~`-collapsed) so the caller can render them against whichever host's home.
+fn complete_dirs(prefix: &str) -> Vec<String> {
+    let (parent, base) = split_for_completion(prefix);
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return Vec::new();
+    };
+    let mut matches: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&base) && !name.starts_with('.'))
+        .map(|name| {
+            let sep = if parent.ends_with('/') { "" } else { "/" };
+            format!("{parent}{sep}{name}/")
+        })
+        .collect();
+    matches.sort();
+    matches
+}
+
+/// Split a path into `(parent, basename-prefix)` for completion: `/a/b`→(`/a`,
+/// `b`), `/a/b/`→(`/a/b`,``), `foo`→(`.`,`foo`), ``→(`.`,``).
+fn split_for_completion(path: &str) -> (String, String) {
+    if path.is_empty() {
+        return (".".into(), String::new());
+    }
+    match path.rfind('/') {
+        Some(0) => ("/".into(), path[1..].to_string()),
+        Some(i) => (path[..i].to_string(), path[i + 1..].to_string()),
+        None => (".".into(), path.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{HostId, SessionStatus};
+
+    #[test]
+    fn title_refresh_policy_throttles_heavily() {
+        // First sight of a session id reads immediately — floor or not — so a
+        // fresh/resumed session titles on its first overlay pass.
+        assert!(title_refresh_due(true, false, Some(Duration::ZERO)));
+        // Store changed + floor elapsed → read.
+        assert!(title_refresh_due(
+            false,
+            true,
+            Some(CODEX_TITLE_REFRESH_FLOOR)
+        ));
+        // Store changed but within the floor → hold (the heavy throttle: a
+        // wal-churning burst costs at most one read per floor interval).
+        assert!(!title_refresh_due(false, true, Some(Duration::ZERO)));
+        // Stamp unchanged → never read, no matter how long it's been.
+        assert!(!title_refresh_due(
+            false,
+            false,
+            Some(Duration::from_secs(9999))
+        ));
+        // Never read yet: the floor can't block the very first change-read.
+        assert!(title_refresh_due(false, true, None));
+    }
+
+    fn codex_state(session_id: Option<&str>) -> LauncherState {
+        LauncherState {
+            agent: AgentControl::Codex,
+            launcher_pid: 1,
+            session_id: session_id.map(str::to_string),
+            window_id: None,
+            tab_id: None,
+            cwd: String::new(),
+            status: SessionStatus::Idle,
+            last_tool: None,
+            updated_at: 0,
+            active_since: None,
+            last_prompt: None,
+            child_pid: None,
+            last_error: None,
+            context_tokens: None,
+            model: None,
+            name: None,
+            first_prompt: Some("first prompt".into()),
+            pool_session: None,
+            launch_id: None,
+            terminal: None,
+            host: HostId::local(),
+        }
+    }
+
+    #[test]
+    fn stamp_titles_names_only_matching_codex_rows() {
+        let mut titles: HashMap<String, Option<String>> = HashMap::new();
+        titles.insert("sid-titled".into(), Some("My Rename".into()));
+        titles.insert("sid-untitled".into(), None); // known but no title row yet
+
+        let mut claude = codex_state(Some("sid-titled"));
+        claude.agent = AgentControl::Claude;
+        let mut sessions = vec![
+            codex_state(Some("sid-titled")),
+            codex_state(Some("sid-untitled")),
+            codex_state(None),
+            claude,
+        ];
+        stamp_titles(&mut sessions, &titles);
+        // Titled Codex row gets the sqlite title on `name`.
+        assert_eq!(sessions[0].name.as_deref(), Some("My Rename"));
+        // Untitled / id-less Codex rows keep `name` empty → first-prompt shows.
+        assert_eq!(sessions[1].name, None);
+        assert_eq!(sessions[2].name, None);
+        // A Claude row never takes a Codex title, even with a colliding id.
+        assert_eq!(sessions[3].name, None);
+    }
+
+    /// `open_session` argv[0] is the resolved exe path (varies by environment),
+    /// so the tests assert on the agent-facing tail.
+    fn open_argv(agent: AgentControl, resume: Option<(&str, bool)>) -> Vec<String> {
+        let plan = LocalBackend::default().open_session(&OpenSpec {
+            agent,
+            cwd: "/work".to_string(),
+            resume: resume.map(|(id, fork)| (id.to_string(), fork)),
+        });
+        plan.argv()[1..].to_vec()
+    }
+
+    #[test]
+    fn open_session_new_session_argv() {
+        assert_eq!(open_argv(AgentControl::Claude, None), ["claude", "/work"]);
+        assert_eq!(open_argv(AgentControl::Codex, None), ["codex", "/work"]);
+    }
+
+    #[test]
+    fn open_session_resume_and_fork_argv() {
+        // Claude resumes/forks with flags on the same subcommand.
+        assert_eq!(
+            open_argv(AgentControl::Claude, Some(("s1", false))),
+            ["claude", "/work", "--resume", "s1"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Claude, Some(("s1", true))),
+            ["claude", "/work", "--resume", "s1", "--fork-session"]
+        );
+        // Codex uses a `resume` / `fork` subcommand instead.
+        assert_eq!(
+            open_argv(AgentControl::Codex, Some(("s2", false))),
+            ["codex", "/work", "resume", "s2"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Codex, Some(("s2", true))),
+            ["codex", "/work", "fork", "s2"]
+        );
+    }
+
+    #[test]
+    fn split_for_completion_cases() {
+        assert_eq!(split_for_completion("/a/b/c"), ("/a/b".into(), "c".into()));
+        assert_eq!(split_for_completion("/a/b/"), ("/a/b".into(), "".into()));
+        assert_eq!(split_for_completion("/foo"), ("/".into(), "foo".into()));
+        assert_eq!(split_for_completion("foo"), (".".into(), "foo".into()));
+        assert_eq!(split_for_completion(""), (".".into(), "".into()));
+    }
+
+    #[test]
+    fn complete_dirs_lists_matching_subdirs_absolute() {
+        let root = std::env::temp_dir().join(format!("cm-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["alpha", "apple", "apricot", "banana"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("apex-file"), "x").unwrap(); // a file, must be skipped
+
+        let prefix = format!("{}/ap", root.display());
+        let got = complete_dirs(&prefix);
+        // Dirs only, prefix-matched, absolute + trailing slash, sorted; no
+        // dotfiles, no plain files.
+        assert_eq!(
+            got,
+            vec![
+                format!("{}/apple/", root.display()),
+                format!("{}/apricot/", root.display()),
+            ]
+        );
+        // A bare directory (no basename) lists all its non-hidden subdirs.
+        let all = complete_dirs(&format!("{}/", root.display()));
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|p| p.ends_with('/')));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

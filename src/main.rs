@@ -1,0 +1,227 @@
+//! `captain-miao` — the dashboard: the ratatui TUI that monitors and manages
+//! sessions, in Kitty, locally and over ssh. It also carries the `claude`/
+//! `codex`/`hook` entrypoints (so a local launch needs only this one binary) and
+//! `focus`. The headless per-host daemon + pty pool is the separate
+//! `captain-miao-server` binary; shared logic lives in `cm-core`.
+
+mod app;
+mod backend;
+mod config;
+mod sleep;
+mod terminal;
+
+// Core modules re-exported at the crate root so the dashboard's `crate::state`,
+// `crate::agent`, `crate::protocol`, `crate::init_tracing` paths resolve unchanged.
+pub use cm_core::logging::init_tracing;
+pub use cm_core::{agent, protocol, state};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "captain-miao",
+    version,
+    about = "Monitor and manage Claude Code sessions in Kitty or zellij"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Launch Claude Code with hooks injected for session tracking.
+    ///
+    /// The first positional is the working directory (defaults to `.`) unless
+    /// it begins with `-`, in which case it (and everything after) is forwarded
+    /// to `claude` — so `captain-miao claude --resume` works. See `cli::split_cwd`.
+    Claude {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to claude.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Launch Codex with hooks injected for session tracking. Argument handling
+    /// matches the `claude` subcommand.
+    Codex {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to codex.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Handle an agent hook event (called by hook scripts)
+    Hook {
+        /// Hook event type
+        event: String,
+
+        /// Launcher socket path. Falls back to $CAPTAIN_MIAO_SOCK when omitted
+        /// (Codex hooks read it from the environment to keep hooks.json stable).
+        #[arg(long)]
+        sock: Option<String>,
+
+        /// Which backend's hook payload to parse.
+        #[arg(long, default_value = "claude")]
+        agent: String,
+    },
+
+    /// Focus the dashboard window and (with --window-id) flag the session
+    /// running in that Kitty window so its bell indicator lights up. Bind
+    /// to a Kitty key with `launch --type=background captain-miao focus
+    /// --window-id @active-kitty-window-id` to ring the bell from any
+    /// Claude Code session.
+    Focus {
+        /// Kitty window id whose session should have its bell flag set.
+        /// When omitted, just focuses the dashboard.
+        #[arg(long)]
+        window_id: Option<terminal::WindowId>,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // The dashboard is entirely async (the TUI, or a launcher/hook/focus). Build
+    // the runtime and run it. (The pre-runtime daemon/pool dispatch that used to
+    // live here moved to the `captain-miao-server` binary.)
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+/// Commands that don't drive a terminal window and so must skip the
+/// supported-terminal gate: the `hook` forwarder (runs wherever the agent runs,
+/// including a headless remote pool) and a pooled launcher still carrying
+/// `--pool-session`. Everything else drives a local Kitty/zellij window.
+fn requires_terminal(command: &Option<Commands>) -> bool {
+    match command {
+        // A hook is a thin forwarder (parse the agent's stdin JSON → send to the
+        // launcher socket); it never touches a terminal and runs wherever the
+        // agent runs.
+        Some(Commands::Hook { .. }) => false,
+        // A pooled launcher carries `--pool-session` in its passthrough args here
+        // (stripped later); it runs on a headless pool host, not in a terminal.
+        Some(Commands::Claude { args } | Commands::Codex { args }) => {
+            !args.iter().any(|a| a == "--pool-session")
+        }
+        _ => true,
+    }
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
+    // Most commands drive a terminal window and so require running inside a
+    // supported terminal (Kitty or zellij); the `hook` forwarder and a pooled
+    // launcher are exempt — see `requires_terminal`. Detection is delegated to
+    // `terminal::supported_terminal_present` (the single detection owner,
+    // honoring the `[terminal] backend` override) so the gate can't disagree
+    // with the backend `terminal::get()` actually builds.
+    if requires_terminal(&cli.command) && !terminal::supported_terminal_present() {
+        eprintln!("captain-miao must be run inside a supported terminal (Kitty or zellij)");
+        std::process::exit(1);
+    }
+
+    match cli.command {
+        Some(Commands::Claude { args }) => {
+            cm_core::cli::run_launch(agent::AgentControl::Claude, args).await
+        }
+        Some(Commands::Codex { args }) => {
+            cm_core::cli::run_launch(agent::AgentControl::Codex, args).await
+        }
+        Some(Commands::Hook { event, sock, agent }) => {
+            cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
+        }
+        Some(Commands::Focus { window_id }) => {
+            // The terminal instance this focus process *drives* (the active
+            // backend's identity, honoring the `[terminal] backend` override —
+            // not the ambient env). The bell and the focus below are both
+            // scoped to it: Kitty window ids and zellij pane ids overlap, so a
+            // window/binding from another terminal names a different
+            // namespace's window and must not be driven here.
+            let my_identity = terminal::get().identity();
+            // Drop the sentinel *before* focusing so the bell is already in
+            // place by the time the dashboard's fs watcher reacts and the
+            // user lands on it.
+            if let Some(wid) = &window_id {
+                state::write_bell_flag_for_window(wid, my_identity.as_deref());
+            }
+            // Verify the dashboard is actually alive before issuing a focus.
+            // After an unclean exit the recorded window id is stale, so
+            // `kitten focus-window` would fail with a kitten error and a
+            // non-zero exit; surface a clean message instead and clear the
+            // stale sentinels best-effort.
+            let dashboard_pid = std::fs::read_to_string(state::dashboard_pid_path())
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            let alive = dashboard_pid.is_some_and(state::is_process_alive);
+            match (alive, app::read_dashboard_window_id()) {
+                (true, Some((dash_identity, dwid))) => {
+                    // Only drive the dashboard's window when it was recorded in
+                    // this same terminal instance; otherwise its id belongs to a
+                    // foreign namespace and focusing it could grab an unrelated
+                    // window. Skip cleanly (the bell, if any, was still dropped).
+                    if dash_identity.is_some() && dash_identity != my_identity {
+                        eprintln!(
+                            "Dashboard runs in another terminal ({}); not focusing from here",
+                            dash_identity.as_deref().unwrap_or("")
+                        );
+                        Ok(())
+                    } else {
+                        terminal::get().focus_window(&dwid).await
+                    }
+                }
+                _ => {
+                    let _ = std::fs::remove_file(state::dashboard_window_id_path());
+                    let _ = std::fs::remove_file(state::dashboard_pid_path());
+                    eprintln!("No dashboard running");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => app::run().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_terminal_dashboard_needs_terminal() {
+        // The default (no subcommand) is the dashboard, which drives a terminal.
+        assert!(requires_terminal(&None));
+    }
+
+    #[test]
+    fn requires_terminal_hook_is_exempt() {
+        // Hooks run wherever the agent runs — including a headless remote pool
+        // with no terminal — so `captain-miao hook` must not gate on one.
+        assert!(!requires_terminal(&Some(Commands::Hook {
+            event: "stop".into(),
+            sock: None,
+            agent: "claude".into(),
+        })));
+    }
+
+    #[test]
+    fn requires_terminal_plain_launcher_needs_terminal() {
+        let cmd = Some(Commands::Claude {
+            args: vec!["/work".into(), "--resume".into(), "sid".into()],
+        });
+        assert!(requires_terminal(&cmd));
+    }
+
+    #[test]
+    fn requires_terminal_pooled_claude_is_exempt() {
+        let cmd = Some(Commands::Claude {
+            args: vec![
+                "/work".into(),
+                "--pool-session".into(),
+                "cm-claude-7-1".into(),
+            ],
+        });
+        assert!(!requires_terminal(&cmd));
+    }
+}

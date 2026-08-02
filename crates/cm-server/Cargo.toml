@@ -1,0 +1,37 @@
+[package]
+name = "captain-miao-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "captain-miao per-host daemon: the pty pool + wire protocol server"
+
+# The headless per-host runtime a remote dashboard connects to over ssh: it hosts
+# the libshpool pty pool AND answers the wire protocol. This is the binary that
+# gets built for Linux and deployed to remote hosts. `pty-pool` is on by default;
+# `--no-default-features` drops libshpool (a protocol-only build that declines to
+# open pooled sessions), which is handy for building/testing on macOS.
+[[bin]]
+name = "captain-miao-server"
+path = "src/main.rs"
+
+[dependencies]
+cm-core = { path = "../cm-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+notify = "8"
+libc = "0.2"
+
+libshpool = { version = "0.11", optional = true }
+shpool-protocol = { version = "0.4", optional = true }
+# Quote a launcher argv into libshpool attach's `--cmd` string (server side).
+shell-words = { version = "1", optional = true }
+
+[features]
+default = ["pty-pool"]
+pty-pool = ["dep:libshpool", "dep:shpool-protocol", "dep:shell-words"]

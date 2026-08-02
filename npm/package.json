@@ -1,0 +1,44 @@
+{
+  "name": "@hyperlogue/captain-miao",
+  "version": "0.2.0",
+  "description": "TUI dashboard to monitor and manage multiple Claude Code and Codex sessions in Kitty or zellij. Runs the matching prebuilt native binary (shipped as a per-platform optional dependency); works with `npx @hyperlogue/captain-miao` and `bunx @hyperlogue/captain-miao`.",
+  "license": "MIT",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "captain-miao": "launch.mjs"
+  },
+  "files": [
+    "launch.mjs"
+  ],
+  "optionalDependencies": {
+    "@hyperlogue/captain-miao-darwin-arm64": "0.2.0",
+    "@hyperlogue/captain-miao-darwin-x64": "0.2.0",
+    "@hyperlogue/captain-miao-linux-x64": "0.2.0",
+    "@hyperlogue/captain-miao-linux-arm64": "0.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyperlogue/captain-miao.git"
+  },
+  "homepage": "https://github.com/hyperlogue/captain-miao#readme",
+  "bugs": "https://github.com/hyperlogue/captain-miao/issues",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "tui",
+    "dashboard",
+    "kitty",
+    "zellij",
+    "cli"
+  ]
+}
