@@ -455,23 +455,81 @@ fn classify_bg_shells(cmdlines: &[String]) -> Option<Vec<BgShell>> {
 }
 
 /// Extract the agent's actual `run_in_background` command from the Bash-tool
-/// wrapper, to serve as a stable learning key. The wrapper embeds the command
-/// as `… && eval '<cmd>' …`, and a bash single-quoted string can't contain a
-/// `'`, so the first quote after `eval '` unambiguously closes it. Everything
-/// else in the wrapper (the per-session snapshot path with its timestamp, the
-/// random cwd temp file) is volatile and must not be part of the key, or "the
-/// same command" would never match across sessions. Falls back to the whole
-/// (trimmed) command line when no `eval '…'` is present, so an unusual wrapper
-/// still yields *some* stable key rather than nothing.
+/// wrapper, to serve as a stable learning key and as the text both classifiers
+/// match on. Everything else in the wrapper (the per-session snapshot path with
+/// its timestamp, the random cwd temp file) is volatile and must not be part of
+/// the key, or "the same command" would never match across sessions.
+///
+/// The wrapper embeds the command as `… && eval '<cmd>' …` — but a bash
+/// single-quoted string can't contain a `'`, so a command that *itself* holds
+/// one is escaped as `'"'"'` (close the quote, emit a double-quoted quote,
+/// reopen). The eval argument is therefore a **concatenation of quoted
+/// segments**, not one quoted string, and the first `'` after `eval '` closes
+/// only the first segment. Slicing there truncated
+/// `nix develop <dir> --command bash -c '…r3 watch review_… '` down to
+/// `nix develop <dir> --command bash -c`, which hid the r3 watch from
+/// [`is_r3_watch_command`] (the row stuck at `BackgroundActive` instead of
+/// `ReviewPending`) and collapsed every such command onto one learning key.
+/// Parsing the argument as a whole shell word instead rebuilds the command the
+/// agent asked to run, verbatim.
+///
+/// Falls back to the whole (trimmed) command line when no `eval '…'` is present
+/// (or it parses to nothing), so an unusual wrapper still yields *some* stable
+/// key rather than nothing.
 pub fn normalize_bg_command(cmd: &str) -> String {
     const MARK: &str = "eval '";
     if let Some(start) = cmd.find(MARK) {
-        let rest = &cmd[start + MARK.len()..];
-        if let Some(end) = rest.find('\'') {
-            return rest[..end].trim().to_string();
+        // Resume *at* the opening quote (MARK includes it, and it's ASCII):
+        // the argument is a sequence of quoted segments, so it has to be
+        // parsed as a whole word rather than sliced at a quote.
+        let word = unquote_shell_word(&cmd[start + MARK.len() - 1..]);
+        if !word.is_empty() {
+            return word;
         }
     }
     cmd.trim().to_string()
+}
+
+/// Unquote one shell word from the start of `s`, stopping at the first
+/// *unquoted* whitespace. Covers the three quoting forms that can appear in the
+/// wrapper's eval argument — `'…'` (everything literal), `"…"` (backslash
+/// escapes a small set), and a bare backslash escape — and concatenates
+/// adjacent segments, which is exactly how `'"'"'` rebuilds a literal `'`.
+fn unquote_shell_word(s: &str) -> String {
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut out = String::new();
+    let mut quote = Quote::None;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (&quote, c) {
+            // An unquoted space ends the argument (the wrapper's ` < /dev/null
+            // && pwd -P >| …` tail starts here).
+            (Quote::None, c) if c.is_whitespace() => break,
+            (Quote::None, '\'') => quote = Quote::Single,
+            (Quote::None, '"') => quote = Quote::Double,
+            (Quote::None, '\\') => out.extend(chars.next()),
+            (Quote::Single, '\'') => quote = Quote::None,
+            (Quote::Double, '"') => quote = Quote::None,
+            // Inside double quotes a backslash escapes only these; before
+            // anything else it stays a literal backslash (bash semantics).
+            (Quote::Double, '\\') => match chars.next() {
+                Some(e @ ('$' | '`' | '"' | '\\')) => out.push(e),
+                // Line continuation: both characters vanish.
+                Some('\n') => {}
+                Some(e) => {
+                    out.push('\\');
+                    out.push(e);
+                }
+                None => out.push('\\'),
+            },
+            (_, c) => out.push(c),
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Seed heuristic: does `cmd` look like a **long-running service** — a dev
@@ -1887,12 +1945,15 @@ mod tests {
     }
 
     /// A real background-shell wrapper command line as `ps` reports it (captured
-    /// live from Claude Code 2.1.197), embedding the eval'd command verbatim.
-    /// Pins both the [`SHELL_SNAPSHOT_MARKER`] filter and that
-    /// [`is_r3_watch_command`] still matches through the wrapper.
+    /// live from Claude Code 2.1.220), embedding `cmd` the way the Bash tool
+    /// does: single-quoted, with any `'` the command itself contains escaped as
+    /// `'"'"'`. Pins the [`SHELL_SNAPSHOT_MARKER`] filter, that the `unalias`
+    /// preamble's own quotes don't confuse the `eval '` search, and that both
+    /// classifiers still match through the wrapper.
     fn wrapper(cmd: &str) -> String {
+        let quoted = cmd.replace('\'', r#"'"'"'"#);
         format!(
-            "/nix/store/gik3-bash-5.3p9/bin/bash -c source /home/me/.claude/shell-snapshots/snapshot-bash-1782967947153-jmpq9h.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && eval '{cmd}' < /dev/null && pwd -P >| /tmp/claude-41bf-cwd"
+            "/nix/store/gik3-bash-5.3p9/bin/bash -c source /home/me/.claude/shell-snapshots/snapshot-bash-1782967947153-jmpq9h.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && {{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; }} >/dev/null 2>&1 || true && eval '{quoted}' < /dev/null && pwd -P >| /tmp/claude-41bf-cwd"
         )
     }
 
@@ -1953,6 +2014,41 @@ mod tests {
         );
         // No wrapper: the whole (trimmed) command is the key.
         assert_eq!(normalize_bg_command("  vite  "), "vite");
+    }
+
+    /// A command containing its own `'` is embedded as a concatenation of quoted
+    /// segments (`…bash -c '"'"'…'"'"'`), so the key can only be recovered by
+    /// parsing the eval argument as a shell word. Slicing at the first quote
+    /// truncated it to the wrapper prefix — which both hid the r3 watch inside
+    /// and collapsed every `<runner> --command bash -c '…'` onto one key.
+    #[test]
+    fn normalize_bg_command_survives_quotes_inside_the_command() {
+        let inner = r#"nix develop /home/me/projects/pandallet --command bash -c '/home/me/bin/r3 watch review_742a2e64ef72 --session "claude:aporia-prd"'"#;
+        assert_eq!(normalize_bg_command(&wrapper(inner)), inner);
+
+        // Double quotes inside the single-quoted argument stay literal, so a
+        // key that already worked keeps exactly the same spelling.
+        let quoted = r#"export PATH="/nix/store/bun/bin:$PATH" /home/me/bin/r3 watch review_389337185556 --session "claude: readme review""#;
+        assert_eq!(normalize_bg_command(&wrapper(quoted)), quoted);
+    }
+
+    /// The failing report this fix came from, pinned against the exact `ps` line
+    /// (Claude Code 2.1.220 / bash 5.3): a `nix develop … --command bash -c '…'`
+    /// review-watch classified as a plain background task instead of
+    /// `ReviewWatch`, so the row read "Task" and never "Review".
+    #[test]
+    fn classify_bg_shells_sees_r3_watch_through_a_quoted_runner() {
+        let live = concat!(
+            "/nix/store/gik3rh1vz2jlgnifb9dh6vc6sxwwz9jj-bash-5.3p9/bin/bash -c source ",
+            "/home/liteye/.claude/shell-snapshots/snapshot-bash-1785691309098-vk63tk.sh 2>/dev/null || true ",
+            "&& shopt -u extglob 2>/dev/null || true ",
+            r#"&& { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true "#,
+            r#"&& eval 'nix develop /home/liteye/projects/hovo/pandallet --command bash -c '"'"'"#,
+            r#"/home/liteye/projects/hovo/pocket/bin/r3 watch review_742a2e64ef72 --session "claude:aporia-prd"'"'"'' "#,
+            "< /dev/null && pwd -P >| /tmp/claude-9f48-cwd",
+        )
+        .to_string();
+        assert_eq!(kinds(&[live]), Some(vec![BgSeedKind::ReviewWatch]));
     }
 
     #[test]
