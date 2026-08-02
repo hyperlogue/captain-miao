@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use notify::Watcher;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -310,7 +309,7 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
     // a session-file write (e.g. a background job finishing during a later turn's
     // approval prompt) is not that signal and must not reach it.
     let (sess_tx, mut sess_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut transcript_watcher: Option<notify::RecommendedWatcher> = None;
+    let mut transcript_watcher: Option<Box<dyn notify::Watcher + Send>> = None;
     let mut transcript_path: Option<PathBuf> = None;
     // Byte offset into the transcript for incremental scanning. Reset to 0
     // whenever `transcript_path` changes so we pick up existing signals in
@@ -334,7 +333,7 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
     let _session_watcher = state
         .child_pid
         .and_then(|pid| agent.session_watch_path(pid))
-        .and_then(|p| start_file_watcher(&p, sess_tx.clone()).ok());
+        .and_then(|p| start_file_watcher(&p, sess_tx.clone(), None).ok());
     // Fold the session name from the agent's own session file up front, so a
     // resumed/idle session that was previously `/rename`d shows that name before the
     // file next changes — the file may already carry the rename (Claude writes it at
@@ -434,11 +433,17 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
 
                 // (Re)start the transcript watcher when the path changes.
                 // Claude mints a new transcript on `/resume`, so the path can
-                // shift mid-session.
+                // shift mid-session. The watcher backend is the agent's call:
+                // Codex needs a stat poll on macOS (its held-open rollout fd
+                // defeats FSEvents — see `transcript_poll_interval`).
                 if let Some(ref p) = msg.transcript_path {
                     let path = PathBuf::from(p);
                     if transcript_path.as_ref() != Some(&path) {
-                        match start_file_watcher(&path, fs_tx.clone()) {
+                        match start_file_watcher(
+                            &path,
+                            fs_tx.clone(),
+                            agent.transcript_poll_interval(),
+                        ) {
                             Ok(w) => {
                                 transcript_watcher = Some(w);
                                 transcript_path = Some(path.clone());
@@ -742,10 +747,20 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
 /// Watch a single file and signal `tx` on every non-Access change. Used for both
 /// the transcript and the agent's session-status file. Falls back to watching the
 /// parent directory (filtering to `path`) when the file doesn't exist yet.
+///
+/// `poll` selects the backend: `None` is the platform's event-driven watcher
+/// (FSEvents/inotify); `Some(interval)` is a stat-polling `PollWatcher`, for
+/// files whose writer defeats the platform events — Codex appends its rollout
+/// through a fd held open for the whole session, which macOS FSEvents reports
+/// nothing for until close (see [`AgentControl::transcript_poll_interval`]).
+/// The poll compares metadata (size/mtime), which `write(2)` updates at write
+/// time, so each flushed append surfaces within one interval. Its events carry
+/// the path as registered (no symlink resolution), matched by the same filter.
 fn start_file_watcher(
     path: &Path,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
-) -> notify::Result<notify::RecommendedWatcher> {
+    poll: Option<std::time::Duration>,
+) -> notify::Result<Box<dyn notify::Watcher + Send>> {
     let target = path.to_path_buf();
     // The path we register and the path the backend reports back are not always
     // the same string: macOS FSEvents resolves symlinks (and `/var` → `/private/var`)
@@ -756,7 +771,7 @@ fn start_file_watcher(
     // silently freezing the transcript fold (no context tokens, no interrupt scan).
     // Accept either spelling.
     let real = canonical_watch_target(path).filter(|p| *p != target);
-    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    let handler = move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Drop Access events (open/close/read). On Linux notify uses inotify
         // with a mask that includes IN_OPEN, and `scan_transcript_signals`
@@ -775,7 +790,14 @@ fn start_file_watcher(
         {
             let _ = tx.send(());
         }
-    })?;
+    };
+    let mut w: Box<dyn notify::Watcher + Send> = match poll {
+        Some(interval) => Box::new(notify::PollWatcher::new(
+            handler,
+            notify::Config::default().with_poll_interval(interval),
+        )?),
+        None => Box::new(notify::recommended_watcher(handler)?),
+    };
 
     // Try watching the file directly; fall back to its parent directory if
     // the file doesn't exist yet (notify requires the path to exist on some
@@ -1037,6 +1059,45 @@ mod tests {
             None
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A stat-polling transcript watch (the Codex-on-macOS case — see
+    /// `AgentControl::transcript_poll_interval`) must report appends made
+    /// through a fd the writer holds open, which is exactly what the
+    /// event-driven FSEvents watch cannot do. Guards the watcher-selection seam:
+    /// if `start_file_watcher` stops honouring `poll`, this hangs the sender and
+    /// fails on the timeout.
+    #[test]
+    fn poll_watcher_sees_held_fd_appends() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join(format!("cm-poll-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("rollout.jsonl");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"{}\n").unwrap();
+        writer.flush().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let _w =
+                start_file_watcher(&path, tx, Some(std::time::Duration::from_millis(100))).unwrap();
+            // Let the watcher's baseline scan settle first — an append that races
+            // it gets folded into the baseline and (correctly) fires nothing.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Append through the still-open fd; never close it.
+            writer.write_all(b"{\"more\":1}\n").unwrap();
+            writer.flush().unwrap();
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+            assert!(woke.is_ok(), "poll watcher never fired for a held-fd append");
+        });
+
+        drop(writer);
         let _ = std::fs::remove_dir_all(&base);
     }
 

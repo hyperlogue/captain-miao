@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents::{claude, codex};
@@ -226,6 +226,29 @@ impl AgentControl {
     pub fn session_watch_path(self, agent_pid: u32) -> Option<PathBuf> {
         match self {
             AgentControl::Claude => claude::session_file_path(agent_pid),
+            AgentControl::Codex => None,
+        }
+    }
+
+    /// `Some(interval)` when the launcher's transcript watch must be a
+    /// stat-polling watcher rather than the platform's event-driven one, because
+    /// the agent's writer defeats the platform events.
+    ///
+    /// Codex opens its rollout once and appends through that fd for the whole
+    /// session, and **macOS FSEvents reports nothing for writes through a
+    /// long-held fd until the file is closed** (measured: 4 flushed appends over
+    /// 14s produced 0 events; the close produced 1). An event-driven watch
+    /// therefore never wakes the launcher during a Codex session — no context
+    /// tokens, no first-prompt fold, and an Esc-interrupt (`turn_aborted`, no
+    /// hook) leaves the row Active forever. A stat poll sees each append
+    /// immediately (`write(2)` updates size/mtime at write time; only the
+    /// FSEvents notification waits for close). Linux inotify fires per write, so
+    /// it stays event-driven there. Claude opens/writes/closes per line, so
+    /// FSEvents works and it stays event-driven everywhere.
+    pub fn transcript_poll_interval(self) -> Option<Duration> {
+        match self {
+            AgentControl::Claude => None,
+            AgentControl::Codex if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Codex => None,
         }
     }
