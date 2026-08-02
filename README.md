@@ -73,32 +73,59 @@ nix develop        # dev shell with the pinned Rust toolchain
 
 ## Kitty setup
 
-captain-miao drives Kitty via its remote-control protocol, so your `kitty.conf` must allow it. A simple setup that works out of the box:
+captain-miao drives Kitty via its remote-control protocol, so your `kitty.conf` must allow it. Remote control is a real privilege — a program that has it can read your terminal's contents, open windows, and run commands — so the setup below is the tightest one kitty offers: a password paired with an authorization script that answers every request.
 
 ```conf
 allow_remote_control password
-remote_control_password "i-am-the-captain-miao"
+remote_control_password "i-am-the-captain-miao" captain_miao_rc.py
 listen_on unix:/tmp/mykitty
 ```
 
-`i-am-the-captain-miao` is captain-miao's built-in default password, so remote control works out of the box — you only need to set `[kitty] rc_password` in captain-miao's config if you change it:
+Kitty resolves that filename against your config directory, so the script goes in `~/.config/kitty/captain_miao_rc.py`:
+
+```python
+# The complete set of remote-control commands captain-miao issues.
+ALLOWED_COMMANDS = frozenset({
+    "ls",             # read the window/tab tree (also the startup check)
+    "get-text",       # the session preview
+    "launch",         # open a session window or tab
+    "focus-window",   # Enter, Ctrl-1..9
+    "focus-tab",      # w, the per-directory work tabs
+    "close-window",   # x, and the restart path
+    "detach-window",  # t, move a session's window to another tab
+    "goto-layout",    # make the shared cm:sessions tab a stack
+})
+
+
+def is_cmd_allowed(pcmd, window, from_socket, extra_data):
+    # Refuse the in-terminal escape-code channel outright: only a request
+    # arriving over the listen_on socket can be captain-miao's.
+    if not from_socket:
+        return False
+    if pcmd["cmd"] in ALLOWED_COMMANDS:
+        return True
+    return False
+```
+
+`i-am-the-captain-miao` is captain-miao's built-in default, so that block works as written with no change to captain-miao's own config. To use a secret of your own instead, set both sides — `remote_control_password` above, and:
 
 ```toml
 [kitty]
-rc_password = "i-am-the-captain-miao"   # captain-miao's default; must match remote_control_password
+rc_password = "my-own-secret"
 ```
 
-**The password is not a sensitive secret.** `rc_password`'s only job is to gate kitty's *in-terminal escape-code channel* — the path by which any program that can write to your terminal (a shell inside a kitty window, including one on the far end of an `ssh` session) could otherwise send remote-control commands — so the published default is fine for most setups. Kitty's [remote-control documentation](https://sw.kovidgoyal.net/kitty/remote-control/) describes the levels:
+A request now has to clear three independent checks, and each one closes a door the others leave open:
 
-- `allow_remote_control password` keeps the escape-code channel open but requires the password. Set a value only you know if untrusted programs might share your terminal; otherwise the default is fine.
-- `allow_remote_control socket-only` turns the escape-code channel off entirely, so the only way in is the unix socket named by `listen_on`. Filesystem access to that socket becomes the real boundary — and anything that can already reach it can run commands as you regardless — so the password barely matters in this mode. This is the tightest common setup.
-- `allow_remote_control yes` enables everything, with no password check at all.
+- **`from_socket`** — kitty passes `False` when a request arrives over the in-terminal escape-code channel, the path by which any program that can write to your terminal (a shell inside a kitty window, including one on the far end of an `ssh` session) could otherwise drive it. Rejecting those leaves the unix socket as the only way in.
+- **The password** — under `allow_remote_control password` every request must carry it, *whichever channel it came from*, so filesystem access to the socket is not by itself enough. The default is a published constant, though, so it stops nothing that can read this page; substituting a secret of your own is what turns this check into a real one, on top of the two around it.
+- **The allowlist** — even a request with the password is confined to the eight commands captain-miao actually issues, so a leaked password doesn't buy `send-text` into your shell.
 
-To lock it down further, scope the password to only the commands captain-miao actually issues — kitty then refuses anything else even with the right password:
+Two things worth knowing about how kitty evaluates this:
 
-```conf
-remote_control_password "i-am-the-captain-miao" ls get-text focus-tab focus-window launch close-window close-tab detach-window goto-layout set-enabled-layouts resize-window set-window-title set-tab-title set-tab-color set-colors set-background-opacity set-background-image set-window-logo
-```
+- **Keep the script the only item after the password.** Command names listed alongside it are matched first and return "allowed" immediately, so `remote_control_password "…" ls captain_miao_rc.py` would permit `ls` without ever calling your function.
+- **It fails closed.** A command your function doesn't allow is denied, and so is one that raises — kitty logs the traceback and treats the error as a refusal. A denial is an immediate error rather than a hang (unlike a wrong password, below), so if a future captain-miao version needs a ninth command, the startup check catches a missing `ls` and anything else fails the moment you use the key that needs it.
+
+If you'd rather not run a script, `allow_remote_control socket-only` is the next-best option: it turns off the escape-code channel the same way, but checks no password and scopes nothing, so anything that can reach the socket can run any command. Avoid `allow_remote_control yes` — it honours every request with no password check at all, including over the escape-code channel.
 
 captain-miao passes the password to `kitten @` out-of-band via an environment variable rather than on the command line, so it isn't visible in `ps` or `/proc/<pid>/cmdline`.
 
@@ -187,7 +214,7 @@ backend = "kitty"            # "kitty" | "zellij"; unset auto-detects (zellij in
 sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this)
 
 [kitty]
-rc_password = "i-am-the-captain-miao"   # must match remote_control_password in kitty.conf
+rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant — set your own (see Kitty setup)
 
 [launcher]
 default_agent = "claude"     # backend for new sessions: "claude" | "codex" (Space a overrides)
