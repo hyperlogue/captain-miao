@@ -478,6 +478,32 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
                     }
                 }
 
+                // A poll-watched transcript (Codex on macOS) catches up here,
+                // before the dispatch: Codex writes the rollout lines *before*
+                // firing the matching hook (`token_count` lands ~20ms ahead of
+                // `Stop`), so the bytes behind this state change are already on
+                // disk and deserve to fold now, not a poll tick later. The
+                // ordering is load-bearing — transcript first, hook second: the
+                // scan may consume a stale `turn_aborted` from an Esc no tick
+                // had read yet, which must settle the *old* turn before
+                // `dispatch_hook` applies this hook's status (scanning after
+                // the dispatch would clobber a fresh `UserPromptSubmit`'s
+                // Active with Idle and stick the row there for the whole turn).
+                // Event-watched agents (Claude; Codex on Linux) skip this:
+                // their writes already woke the fs arm directly.
+                if agent.transcript_poll_interval().is_some()
+                    && let Some(path) = &transcript_path
+                {
+                    rescan_transcript(
+                        agent,
+                        path,
+                        &mut transcript_offset,
+                        &mut transcript_data,
+                        state,
+                    )
+                    .await;
+                }
+
                 let was_approval = state.status == SessionStatus::WaitingForApproval;
                 let dispatched_event = msg.event;
                 agent.dispatch_hook(state, msg).await;
@@ -510,48 +536,17 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
                 if state.status != SessionStatus::WaitingForApproval {
                     approval_entered_at = None;
                 }
-                if let Some(path) = &transcript_path {
-                    // Offload the blocking File::open+read off the runtime thread
-                    // that also drives child.wait()/accept(). One read serves both
-                    // the interrupt/compact signal scan and the derived-field fold
-                    // (context tokens, model, title, first prompt). A join error is
-                    // treated like the read failing: hold the offset + prior fold.
-                    let scan_path = path.clone();
-                    let scan_offset = transcript_offset;
-                    let prior = transcript_data.clone();
-                    let (scan, data) = tokio::task::spawn_blocking(move || {
-                        let scan = agent.scan_transcript_signals(&scan_path, scan_offset);
-                        let data = agent.read_transcript_stats(&scan_path, prior.as_ref());
-                        (scan, data)
-                    })
+                if let Some(path) = &transcript_path
+                    && rescan_transcript(
+                        agent,
+                        path,
+                        &mut transcript_offset,
+                        &mut transcript_data,
+                        state,
+                    )
                     .await
-                    .unwrap_or_else(|_| {
-                        (
-                            TranscriptScan {
-                                new_offset: scan_offset,
-                                ..Default::default()
-                            },
-                            transcript_data.clone().unwrap_or_default(),
-                        )
-                    });
-                    transcript_offset = scan.new_offset;
-                    if scan.interrupted {
-                        // Some agents (Claude) fire no hook on Esc/interrupt
-                        // — without this, the session stays Active forever.
-                        state.status = SessionStatus::Idle;
-                        state.last_tool = None;
-                    }
-                    if scan.compact_aborted && state.status == SessionStatus::Compacting {
-                        // Claude fires no PostCompact when `/compact` errors,
-                        // so the transcript-side stderr is the only signal
-                        // the user is back at the prompt.
-                        state.status = SessionStatus::Idle;
-                        state.last_tool = None;
-                    }
-                    if apply_transcript_data(state, &data) {
-                        state_changed = true;
-                    }
-                    transcript_data = Some(data);
+                {
+                    state_changed = true;
                 }
                 if state.status != prev_status
                     || state.last_tool != prev_last_tool
@@ -849,6 +844,63 @@ fn start_stat_poll(
             tokio::time::sleep(interval).await;
         }
     }))
+}
+
+/// Re-read the transcript from the incremental offset: the signal scan
+/// (interrupt / aborted compact) **and** the derived-field fold (context
+/// tokens, model, title, first prompt), in one blocking read offloaded off the
+/// runtime thread that also drives `child.wait()`/`accept()`. Advances
+/// `offset`, replaces `data`, applies both onto `state`, and returns whether
+/// the fold changed anything (a signal-driven status change is visible to the
+/// caller through `state`). A join error is treated like the read failing: the
+/// offset and the prior fold are held.
+///
+/// Shared by the two wakes that can find unread transcript bytes: the fs-watch
+/// arm, and — for a poll-watched transcript — the hook arm's pre-dispatch
+/// catch-up (see the call site there for why it must run *before*
+/// `dispatch_hook`).
+async fn rescan_transcript(
+    agent: AgentControl,
+    path: &Path,
+    offset: &mut u64,
+    data: &mut Option<TranscriptStats>,
+    state: &mut LauncherState,
+) -> bool {
+    let scan_path = path.to_path_buf();
+    let scan_offset = *offset;
+    let prior = data.clone();
+    let (scan, fresh) = tokio::task::spawn_blocking(move || {
+        let scan = agent.scan_transcript_signals(&scan_path, scan_offset);
+        let stats = agent.read_transcript_stats(&scan_path, prior.as_ref());
+        (scan, stats)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            TranscriptScan {
+                new_offset: scan_offset,
+                ..Default::default()
+            },
+            data.clone().unwrap_or_default(),
+        )
+    });
+    *offset = scan.new_offset;
+    if scan.interrupted {
+        // Some agents (Claude) fire no hook on Esc/interrupt — without this,
+        // the session stays Active forever. (Codex writes `turn_aborted`.)
+        state.status = SessionStatus::Idle;
+        state.last_tool = None;
+    }
+    if scan.compact_aborted && state.status == SessionStatus::Compacting {
+        // Claude fires no PostCompact when `/compact` errors, so the
+        // transcript-side stderr is the only signal the user is back at
+        // the prompt.
+        state.status = SessionStatus::Idle;
+        state.last_tool = None;
+    }
+    let changed = apply_transcript_data(state, &fresh);
+    *data = Some(fresh);
+    changed
 }
 
 /// Watch a single file and signal `tx` on every non-Access change, via the
