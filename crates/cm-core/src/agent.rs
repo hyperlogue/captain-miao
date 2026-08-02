@@ -231,20 +231,26 @@ impl AgentControl {
     }
 
     /// `Some(interval)` when the launcher's transcript watch must be a
-    /// stat-polling watcher rather than the platform's event-driven one, because
-    /// the agent's writer defeats the platform events.
+    /// stat-polling one (`launcher::start_stat_poll`) rather than the
+    /// platform's event-driven watcher, because the agent's writer defeats the
+    /// platform events.
     ///
     /// Codex opens its rollout once and appends through that fd for the whole
     /// session, and **macOS FSEvents reports nothing for writes through a
-    /// long-held fd until the file is closed** (measured: 4 flushed appends over
-    /// 14s produced 0 events; the close produced 1). An event-driven watch
-    /// therefore never wakes the launcher during a Codex session — no context
-    /// tokens, no first-prompt fold, and an Esc-interrupt (`turn_aborted`, no
-    /// hook) leaves the row Active forever. A stat poll sees each append
-    /// immediately (`write(2)` updates size/mtime at write time; only the
-    /// FSEvents notification waits for close). Linux inotify fires per write, so
-    /// it stays event-driven there. Claude opens/writes/closes per line, so
-    /// FSEvents works and it stays event-driven everywhere.
+    /// long-held fd until the file is closed** (measured: 12 flushed appends
+    /// over 36s produced 0 events — on both a file-level and a directory-level
+    /// watch, with or without fsync; the close produced 1). An event-driven
+    /// watch therefore never wakes the launcher during a Codex session — no
+    /// context tokens, no first-prompt fold, and an Esc-interrupt
+    /// (`turn_aborted`, which fires **no hook** — verified against the codex
+    /// source at 0.142.3: an aborted turn returns before `run_turn_stop_hooks`
+    /// and the `notify` program) leaves the row Active forever. A stat poll
+    /// sees each append immediately (`write(2)` updates size/mtime at write
+    /// time; only the FSEvents notification waits for close). Linux inotify
+    /// fires per write, so it stays event-driven there. Claude
+    /// opens/writes/closes per line, so FSEvents works and it stays
+    /// event-driven everywhere. The poll runs only while the session is off
+    /// Idle — see the lifecycle gate in `launcher::process_hooks`.
     pub fn transcript_poll_interval(self) -> Option<Duration> {
         match self {
             AgentControl::Claude => None,

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use notify::Watcher;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -309,7 +310,7 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
     // a session-file write (e.g. a background job finishing during a later turn's
     // approval prompt) is not that signal and must not reach it.
     let (sess_tx, mut sess_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut transcript_watcher: Option<Box<dyn notify::Watcher + Send>> = None;
+    let mut transcript_watcher: Option<TranscriptWatch> = None;
     let mut transcript_path: Option<PathBuf> = None;
     // Byte offset into the transcript for incremental scanning. Reset to 0
     // whenever `transcript_path` changes so we pick up existing signals in
@@ -333,7 +334,7 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
     let _session_watcher = state
         .child_pid
         .and_then(|pid| agent.session_watch_path(pid))
-        .and_then(|p| start_file_watcher(&p, sess_tx.clone(), None).ok());
+        .and_then(|p| start_file_watcher(&p, sess_tx.clone()).ok());
     // Fold the session name from the agent's own session file up front, so a
     // resumed/idle session that was previously `/rename`d shows that name before the
     // file next changes — the file may already carry the rename (Claude writes it at
@@ -431,37 +432,48 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
                     buf.len(),
                 );
 
-                // (Re)start the transcript watcher when the path changes.
-                // Claude mints a new transcript on `/resume`, so the path can
-                // shift mid-session. The watcher backend is the agent's call:
-                // Codex needs a stat poll on macOS (its held-open rollout fd
-                // defeats FSEvents — see `transcript_poll_interval`).
+                // (Re)adopt the transcript when the path changes. Claude mints a
+                // new transcript on `/resume`, so the path can shift mid-session.
+                // The watcher backend is the agent's call: an event-driven watch
+                // (Claude; Linux) starts here, once; a poll-backed watch (Codex
+                // on macOS, whose held-open rollout fd defeats FSEvents — see
+                // `transcript_poll_interval`) is instead lifecycle-managed at the
+                // bottom of the loop, running only while the session is off Idle,
+                // so the path is adopted here without a watcher (any stale
+                // old-path watcher is dropped).
                 if let Some(ref p) = msg.transcript_path {
                     let path = PathBuf::from(p);
                     if transcript_path.as_ref() != Some(&path) {
-                        match start_file_watcher(
-                            &path,
-                            fs_tx.clone(),
-                            agent.transcript_poll_interval(),
-                        ) {
-                            Ok(w) => {
-                                transcript_watcher = Some(w);
-                                transcript_path = Some(path.clone());
-                                // Seed the offset to the new transcript's end so
-                                // historical interrupt/compact signals from a
-                                // resumed session aren't replayed as fresh.
-                                let scan = agent.scan_transcript_signals(&path, 0);
-                                transcript_offset = scan.new_offset;
-                                // Fold the derived fields from the top so a
-                                // resumed/idle session shows context, model,
-                                // title, and first prompt before its next write.
-                                // (Synchronous like the seed scan above — the same
-                                // one-shot whole-file read at path set.)
-                                let data = agent.read_transcript_stats(&path, None);
-                                apply_transcript_data(state, &data);
-                                transcript_data = Some(data);
+                        let adopted = if agent.transcript_poll_interval().is_some() {
+                            transcript_watcher = None;
+                            true
+                        } else {
+                            match start_file_watcher(&path, fs_tx.clone()) {
+                                Ok(w) => {
+                                    transcript_watcher = Some(TranscriptWatch::Event(w));
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::debug!("transcript watch failed: {e}");
+                                    false
+                                }
                             }
-                            Err(e) => tracing::debug!("transcript watch failed: {e}"),
+                        };
+                        if adopted {
+                            transcript_path = Some(path.clone());
+                            // Seed the offset to the new transcript's end so
+                            // historical interrupt/compact signals from a
+                            // resumed session aren't replayed as fresh.
+                            let scan = agent.scan_transcript_signals(&path, 0);
+                            transcript_offset = scan.new_offset;
+                            // Fold the derived fields from the top so a
+                            // resumed/idle session shows context, model,
+                            // title, and first prompt before its next write.
+                            // (Synchronous like the seed scan above — the same
+                            // one-shot whole-file read at path set.)
+                            let data = agent.read_transcript_stats(&path, None);
+                            apply_transcript_data(state, &data);
+                            transcript_data = Some(data);
                         }
                     }
                 }
@@ -736,31 +748,118 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
             dirty = false;
             flush_at = None;
         }
-        // `transcript_watcher` is held purely for its side effect — a live fs
-        // watch that stops when the value drops — and is never read, so it trips
-        // the assigned-but-never-read lint. Touch it to silence that; the binding
-        // (not this line) is what keeps the watch alive until `run` returns.
+        // Lifecycle of the poll-backed transcript watch (Codex on macOS — see
+        // `AgentControl::transcript_poll_interval`): it runs only while the
+        // session is off Idle. An idle session's rollout doesn't change without
+        // a hook firing first (`UserPromptSubmit` wakes this loop and the next
+        // pass lands here with the status already Active), so parking the
+        // watcher at Idle makes an at-rest session cost nothing — no 2s stat
+        // cadence while a session sits parked for hours. Idle is deliberately
+        // the *only* at-rest state: WaitingForApproval/WaitingForDecision need
+        // the rollout wake (approval-granted fast path; an Esc there writes
+        // `turn_aborted` with no hook), and a Compacted row can still take that
+        // same hookless Esc. Dropping the watcher on the way to rest fires one
+        // synthetic fs wake so the next iteration folds whatever the last tick
+        // hadn't seen — Codex writes its final `token_count` ~20ms before
+        // `Stop` fires, which is inside the tick window essentially always.
+        // Creation fires the same wake: bytes written while parked predate the
+        // poll's baseline stat (it only signals *changes* from there), so the
+        // catch-up read must be explicit.
+        if let Some(interval) = agent.transcript_poll_interval() {
+            let engaged = state.status != SessionStatus::Idle;
+            if engaged && transcript_watcher.is_none() {
+                if let Some(path) = &transcript_path {
+                    transcript_watcher = Some(TranscriptWatch::Poll(start_stat_poll(
+                        path.clone(),
+                        fs_tx.clone(),
+                        interval,
+                    )));
+                    let _ = fs_tx.send(());
+                }
+            } else if !engaged && transcript_watcher.is_some() {
+                transcript_watcher = None;
+                let _ = fs_tx.send(());
+            }
+        }
+        // `transcript_watcher` is otherwise held purely for its side effect — a
+        // live fs watch that stops when the value drops. The binding (not this
+        // line) is what keeps the watch alive until `run` returns.
         let _ = &transcript_watcher;
     }
 }
 
-/// Watch a single file and signal `tx` on every non-Access change. Used for both
-/// the transcript and the agent's session-status file. Falls back to watching the
-/// parent directory (filtering to `path`) when the file doesn't exist yet.
+/// A live transcript watch. Dropping either variant stops it — the binding's
+/// lifetime is the watch's lifetime, which is how the poll's engaged-only
+/// lifecycle (the gate at the bottom of the loop) turns it on and off.
+enum TranscriptWatch {
+    /// The platform's event-driven watcher (FSEvents/inotify) — Claude
+    /// everywhere, Codex on Linux.
+    #[allow(dead_code)] // held for its Drop; never read
+    Event(notify::RecommendedWatcher),
+    /// The stat poll standing in where the platform events can't fire (Codex
+    /// on macOS — see [`AgentControl::transcript_poll_interval`]).
+    #[allow(dead_code)]
+    Poll(StatPoll),
+}
+
+/// Handle to a [`start_stat_poll`] task; aborts the task on drop, mirroring
+/// how dropping a notify watcher stops its watch.
+struct StatPoll(tokio::task::JoinHandle<()>);
+
+impl Drop for StatPoll {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Stat `path` every `interval` and signal `tx` whenever `(size, mtime)` moves
+/// — the stand-in transcript watch for a writer that defeats the platform's
+/// fs events (Codex holds its rollout fd open for the whole session, which
+/// macOS FSEvents reports nothing for until close; `write(2)` updates the stat
+/// metadata immediately). The first stat is a silent baseline: what's already
+/// on disk is covered by the creation wake the gate fires, not by this task.
 ///
-/// `poll` selects the backend: `None` is the platform's event-driven watcher
-/// (FSEvents/inotify); `Some(interval)` is a stat-polling `PollWatcher`, for
-/// files whose writer defeats the platform events — Codex appends its rollout
-/// through a fd held open for the whole session, which macOS FSEvents reports
-/// nothing for until close (see [`AgentControl::transcript_poll_interval`]).
-/// The poll compares metadata (size/mtime), which `write(2)` updates at write
-/// time, so each flushed append surfaces within one interval. Its events carry
-/// the path as registered (no symlink resolution), matched by the same filter.
+/// Hand-rolled rather than notify's `PollWatcher` deliberately: that watcher
+/// compares mtime **truncated to whole seconds** and nothing else (size only
+/// enters via the opt-in whole-file content hash), so the second of two
+/// appends landing within one wall-clock second never fires — and a rollout
+/// is exactly that write pattern (e.g. a `turn_aborted` written sub-second
+/// after the previous line would be missed forever, sticking the row at
+/// Active). Comparing the full-precision mtime *and* the size catches every
+/// append to an append-only file. Pinned by `stat_poll_sees_held_fd_appends`.
+fn start_stat_poll(
+    path: PathBuf,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    interval: std::time::Duration,
+) -> StatPoll {
+    StatPoll(tokio::spawn(async move {
+        // `Some((size, mtime))` per stat; `None` = missing/unreadable. The
+        // outer Option distinguishes "no baseline yet" from "file was absent".
+        let mut prev: Option<Option<(u64, std::time::SystemTime)>> = None;
+        loop {
+            let cur = std::fs::metadata(&path)
+                .ok()
+                .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            if let Some(p) = &prev
+                && *p != cur
+            {
+                let _ = tx.send(());
+            }
+            prev = Some(cur);
+            tokio::time::sleep(interval).await;
+        }
+    }))
+}
+
+/// Watch a single file and signal `tx` on every non-Access change, via the
+/// platform's event-driven watcher (FSEvents/inotify). Used for the transcript
+/// (except where the poll stands in — see [`start_stat_poll`]) and the agent's
+/// session-status file. Falls back to watching the parent directory (filtering
+/// to `path`) when the file doesn't exist yet.
 fn start_file_watcher(
     path: &Path,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
-    poll: Option<std::time::Duration>,
-) -> notify::Result<Box<dyn notify::Watcher + Send>> {
+) -> notify::Result<notify::RecommendedWatcher> {
     let target = path.to_path_buf();
     // The path we register and the path the backend reports back are not always
     // the same string: macOS FSEvents resolves symlinks (and `/var` → `/private/var`)
@@ -791,13 +890,7 @@ fn start_file_watcher(
             let _ = tx.send(());
         }
     };
-    let mut w: Box<dyn notify::Watcher + Send> = match poll {
-        Some(interval) => Box::new(notify::PollWatcher::new(
-            handler,
-            notify::Config::default().with_poll_interval(interval),
-        )?),
-        None => Box::new(notify::recommended_watcher(handler)?),
-    };
+    let mut w = notify::recommended_watcher(handler)?;
 
     // Try watching the file directly; fall back to its parent directory if
     // the file doesn't exist yet (notify requires the path to exist on some
@@ -1062,17 +1155,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A stat-polling transcript watch (the Codex-on-macOS case — see
+    /// The stat-polling transcript watch (the Codex-on-macOS case — see
     /// `AgentControl::transcript_poll_interval`) must report appends made
-    /// through a fd the writer holds open, which is exactly what the
-    /// event-driven FSEvents watch cannot do. Guards the watcher-selection seam:
-    /// if `start_file_watcher` stops honouring `poll`, this hangs the sender and
-    /// fails on the timeout.
+    /// through a fd the writer holds open — which the event-driven FSEvents
+    /// watch cannot do — **including a second append landing within the same
+    /// wall-clock second as the first**. The same-second case is what
+    /// disqualified notify's `PollWatcher` (it compares mtime truncated to
+    /// whole seconds and nothing else, so it misses it — a `turn_aborted`
+    /// written sub-second after the previous rollout line would stick the row
+    /// at Active forever) and is why `start_stat_poll` compares the size too.
     #[test]
-    fn poll_watcher_sees_held_fd_appends() {
+    fn stat_poll_sees_held_fd_appends() {
         use std::io::Write;
 
-        let base = std::env::temp_dir().join(format!("cm-poll-watch-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cm-stat-poll-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let path = base.join("rollout.jsonl");
         let mut writer = std::fs::File::create(&path).unwrap();
@@ -1085,16 +1181,24 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let _w =
-                start_file_watcher(&path, tx, Some(std::time::Duration::from_millis(100))).unwrap();
-            // Let the watcher's baseline scan settle first — an append that races
-            // it gets folded into the baseline and (correctly) fires nothing.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _w = start_stat_poll(path.clone(), tx, std::time::Duration::from_millis(50));
+            // Let the first stat (the silent baseline) land.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             // Append through the still-open fd; never close it.
             writer.write_all(b"{\"more\":1}\n").unwrap();
             writer.flush().unwrap();
             let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
-            assert!(woke.is_ok(), "poll watcher never fired for a held-fd append");
+            assert!(woke.is_ok(), "stat poll never fired for a held-fd append");
+            // Drain the burst, then a follow-up append — typically within the
+            // same wall-clock second — must fire again.
+            while rx.try_recv().is_ok() {}
+            writer.write_all(b"{\"more\":2}\n").unwrap();
+            writer.flush().unwrap();
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+            assert!(
+                woke.is_ok(),
+                "stat poll missed a same-second follow-up append"
+            );
         });
 
         drop(writer);
