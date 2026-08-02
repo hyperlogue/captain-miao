@@ -757,9 +757,14 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
         // synthetic fs wake so the next iteration folds whatever the last tick
         // hadn't seen — Codex writes its final `token_count` ~20ms before
         // `Stop` fires, which is inside the tick window essentially always.
-        // Creation fires the same wake: bytes written while parked predate the
-        // poll's baseline stat (it only signals *changes* from there), so the
-        // catch-up read must be explicit.
+        // Creation fires the same wake, as the backstop for the baseline gap:
+        // the poll only signals *changes* from its first stat, so a write that
+        // lands between this iteration's reads and that baseline would
+        // otherwise surface only on the next write. (The bulk of parked-era
+        // bytes were already consumed by the hook arm's pre-dispatch rescan —
+        // re-engaging off Idle always rides a hook — so this wake usually
+        // reads nothing; it exists for that racing-write window and for any
+        // future off-Idle path that doesn't come through a hook.)
         if let Some(interval) = agent.transcript_poll_interval() {
             let engaged = state.status != SessionStatus::Idle;
             if engaged && transcript_watcher.is_none() {
@@ -1254,6 +1259,75 @@ mod tests {
         });
 
         drop(writer);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `rescan_transcript` must consume a transcript signal exactly once — the
+    /// property the hook arm's transcript-before-dispatch ordering relies on:
+    /// a `turn_aborted` from an Esc settles the row to Idle on the read that
+    /// first sees it (folding the stats alongside), and a later rescan of the
+    /// same file must NOT re-settle a row that has since started a new turn
+    /// (the offset advanced past the signal). If a refactor made the scan
+    /// re-read consumed signals, an Esc followed by a quick resubmit would
+    /// flip the new turn's Active back to Idle and stick there.
+    #[test]
+    fn rescan_consumes_a_transcript_signal_exactly_once() {
+        let base = std::env::temp_dir().join(format!("cm-rescan-once-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"p\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+                "\"info\":{\"last_token_usage\":{\"total_tokens\":4242}}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut state = state_with(SessionStatus::Active);
+            let mut offset = 0u64;
+            let mut data: Option<TranscriptStats> = None;
+
+            rescan_transcript(
+                AgentControl::Codex,
+                &path,
+                &mut offset,
+                &mut data,
+                &mut state,
+            )
+            .await;
+            assert_eq!(state.status, SessionStatus::Idle, "abort settles the turn");
+            assert_eq!(state.context_tokens, Some(4242), "stats fold alongside");
+            assert_eq!(
+                offset,
+                std::fs::metadata(&path).unwrap().len(),
+                "offset advances past the consumed signal"
+            );
+
+            // A new turn started (hook set Active); the same file re-read must
+            // not replay the stale abort.
+            state.status = SessionStatus::Active;
+            rescan_transcript(
+                AgentControl::Codex,
+                &path,
+                &mut offset,
+                &mut data,
+                &mut state,
+            )
+            .await;
+            assert_eq!(
+                state.status,
+                SessionStatus::Active,
+                "a consumed signal never re-settles a later turn"
+            );
+        });
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

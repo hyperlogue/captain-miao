@@ -251,6 +251,14 @@ impl AgentControl {
     /// opens/writes/closes per line, so FSEvents works and it stays
     /// event-driven everywhere. The poll runs only while the session is off
     /// Idle — see the lifecycle gate in `launcher::process_hooks`.
+    ///
+    /// Returning `Some` also opts the agent into the launcher's hook-arm
+    /// pre-dispatch rescan, which assumes the agent writes its transcript
+    /// lines *before* firing the matching hook (true of Codex: `token_count`
+    /// lands ~20ms ahead of `Stop`). An agent that wrote them after would
+    /// merely make that read a no-op — the next poll tick still catches the
+    /// bytes — so the assumption is a latency optimization, not a correctness
+    /// requirement.
     pub fn transcript_poll_interval(self) -> Option<Duration> {
         match self {
             AgentControl::Claude => None,
