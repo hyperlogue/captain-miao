@@ -223,6 +223,20 @@ pub trait Terminal: Send + Sync {
     /// terminal.
     fn identity(&self) -> Option<String>;
 
+    /// Prove this backend can actually *drive* its terminal instance — the
+    /// startup half of detection: [`supported_terminal_present`] answers "is a
+    /// terminal we know how to drive present?" from the env alone, this answers
+    /// "does the control channel to it work?" with a real round-trip.
+    ///
+    /// Default: nothing to prove. That is zellij's answer — its `zellij action`
+    /// CLI is trusted by the session it runs in, so there is no socket or
+    /// password to get wrong (contrast Kitty, which overrides this: its whole
+    /// channel is a socket + password pair spread across two config files, and a
+    /// mismatch there doesn't even fail — it hangs).
+    async fn verify_control(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The full window/tab tree (Kitty: parsed `kitten @ ls`).
     async fn snapshot(&self) -> Result<Vec<Tab>>;
 
@@ -360,6 +374,21 @@ pub fn supported_terminal_present() -> bool {
             std::env::var_os("KITTY_PID").is_some()
         }
     }
+}
+
+/// Verify the backend detection settled on can actually drive its terminal —
+/// the second half of the startup gate, kept beside the first so both live with
+/// the detection they depend on. [`supported_terminal_present`] picks the
+/// backend from the env; this asks *that* backend to prove the control channel
+/// works ([`Terminal::verify_control`]), which is a no-op for zellij and a real
+/// `kitten @` round-trip for Kitty.
+///
+/// The error is a ready-to-print, multi-line diagnosis naming the fix, because
+/// its only caller (the dashboard, in `main`) prints it and exits: a dashboard
+/// that can't reach kitty can't spawn, focus, preview, or move a window, and a
+/// wrong password would freeze it on the first of those rather than fail it.
+pub async fn verify_control() -> Result<()> {
+    get().verify_control().await
 }
 
 /// The process-wide terminal backend, constructed once on first use. Detection

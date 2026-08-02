@@ -123,6 +123,29 @@ async fn async_main(cli: Cli) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Being *in* a supported terminal isn't the same as being able to drive it:
+    // on Kitty every window op is a `kitten @` round-trip over a socket the user
+    // has to enable, with a password that has to match across two config files.
+    // So the backend detection settled on is asked to prove the channel works
+    // (`terminal::verify_control`) before the dashboard commits to it. Fail
+    // fast rather than start: without remote control the dashboard can't spawn,
+    // focus, preview or move a window, and the password half doesn't even
+    // *error* — kitty answers a password it doesn't accept by prompting in its
+    // own window, so the first rc call would hang the loop forever with the TUI
+    // already owning the screen. Here, stderr is still the user's terminal and
+    // the diagnosis is readable.
+    //
+    // Dashboard-only: a launcher never touches the terminal (it self-reports its
+    // window from the env), and `focus` is a single rc call whose own error
+    // surfaces the same way — neither should be gated on a probe they'd pay for
+    // and not need.
+    if cli.command.is_none()
+        && let Err(e) = terminal::verify_control().await
+    {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     match cli.command {
         Some(Commands::Claude { args }) => {
             cm_core::cli::run_launch(agent::AgentControl::Claude, args).await

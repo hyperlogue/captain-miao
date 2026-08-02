@@ -122,6 +122,8 @@ rc_password = "choose-your-own-secret"
 
 captain-miao passes the password to `kitten @` out-of-band via an environment variable rather than on the command line, so it isn't visible in `ps` or `/proc/<pid>/cmdline`.
 
+**The dashboard checks this at startup.** Before drawing anything it makes one real remote-control request, and if that fails it prints what is wrong (no `listen_on` socket, a socket from a kitty that has since restarted, a password kitty doesn't accept, a missing `kitten` binary) along with the config above, and exits. Failing there is deliberate: without remote control the dashboard cannot open, focus, preview, or move a window — and a password mismatch doesn't produce an error at all. Kitty responds to an unrecognised password by asking *you* to approve the request in its own window, so the request simply never returns; caught at startup that is a message, caught later it would be a frozen dashboard.
+
 ### Ring the dashboard from any session (optional)
 
 Bind a Kitty key to focus the dashboard and flag the session running in the current window; its bell indicator lights up so you can find it again:

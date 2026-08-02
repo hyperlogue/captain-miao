@@ -4,6 +4,8 @@
 //! The password is passed out-of-band (env + `--password-env`) rather than as an
 //! argv element so it isn't exposed through `ps` / `/proc/<pid>/cmdline`.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -17,6 +19,14 @@ use crate::config;
 /// Env var carrying the Kitty remote-control password to the `kitten @` child.
 const RC_PASSWORD_ENV: &str = "CAPTAIN_MIAO_RC_PASSWORD";
 
+/// How long [`verify_control`](Terminal::verify_control)'s probe waits for kitty
+/// to answer before declaring the channel unusable. Generous beside a healthy
+/// `kitten @ ls` (~20ms), because the failure it guards is *unbounded*: with
+/// `allow_remote_control password`, a password kitty doesn't accept makes it ask
+/// the user for permission **in its own window** rather than reply, so the
+/// request never returns on its own (verified against kitty 0.47).
+const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Title of the shared stack tab that hosts every session in the Stacked layout
 /// — the Kitty analog of zellij's `cm:sessions` floating tab. Looked up by title
 /// on each Stacked spawn (`SpawnTarget::SharedStackTab`) and created on first use.
@@ -24,17 +34,39 @@ const SESSIONS_TAB: &str = "cm:sessions";
 
 pub struct KittyTerminal;
 
-async fn kitten_cmd(args: &[&str]) -> Result<String> {
-    let listen_on = std::env::var("KITTY_LISTEN_ON").context("KITTY_LISTEN_ON not set")?;
+/// The socket `kitten @` talks to, from the env kitty exports into its windows.
+/// `None` when kitty isn't listening on one (no `listen_on` in kitty.conf), in
+/// which case remote control would fall back to the in-terminal escape
+/// channel — which the dashboard can't use: it would write control sequences
+/// into its own alt-screen. An empty value is treated as unset.
+fn listen_on() -> Option<String> {
+    std::env::var("KITTY_LISTEN_ON")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
 
-    let output = Command::new("kitten")
-        .arg("@")
+/// Build the `kitten @ <args>` invocation, with the socket and the out-of-band
+/// password wired in. Split from [`kitten_cmd`] so the startup probe can impose
+/// a timeout by dropping the future: `kill_on_drop` is what makes that reap the
+/// child instead of leaving an orphaned `kitten` blocked on kitty's permission
+/// prompt. Every other call site awaits to completion, where it's inert.
+fn kitten_command(args: &[&str]) -> Result<Command> {
+    let listen_on = listen_on().context("KITTY_LISTEN_ON not set")?;
+
+    let mut cmd = Command::new("kitten");
+    cmd.arg("@")
         .arg("--to")
         .arg(&listen_on)
         .arg("--password-env")
         .arg(RC_PASSWORD_ENV)
         .env(RC_PASSWORD_ENV, &config::get().kitty.rc_password)
         .args(args)
+        .kill_on_drop(true);
+    Ok(cmd)
+}
+
+async fn kitten_cmd(args: &[&str]) -> Result<String> {
+    let output = kitten_command(args)?
         .output()
         .await
         .context("Failed to run kitten")?;
@@ -66,6 +98,74 @@ fn match_id(id: &str) -> Result<&str> {
     super::validate_id(id, "kitty")
 }
 
+// ---- startup control check ----
+
+/// What the startup control probe observed. Split from the probe itself so the
+/// user-facing diagnosis below is a *pure* function of the outcome — testable
+/// without a misconfigured kitty to reproduce against.
+#[derive(Debug, Clone, Copy)]
+enum ProbeOutcome<'a> {
+    /// Kitty exports no socket to talk to (`KITTY_LISTEN_ON` unset/empty).
+    NoSocket,
+    /// The request went out but nothing came back inside
+    /// [`CONTROL_PROBE_TIMEOUT`].
+    TimedOut { socket: &'a str },
+    /// `kitten @ ls` ran and failed, with this error text.
+    Failed { socket: &'a str, err: &'a str },
+}
+
+/// The kitty.conf + config.toml lines a working setup needs. Appended to every
+/// diagnosis that is actually a configuration problem (i.e. all but a missing
+/// `kitten` binary), since the fix is the same block in each case.
+const SETUP_HINT: &str = "\
+Remote control must be enabled over a socket in kitty.conf:
+
+    allow_remote_control password
+    remote_control_password \"choose-your-own-secret\"
+    listen_on unix:/tmp/mykitty
+
+and [kitty] rc_password in captain-miao's config.toml must be that same secret.
+kitty only opens the socket at startup, so restart kitty after editing it.";
+
+/// Turn a failed probe into an actionable message: what is broken, then the fix.
+/// The dashboard prints this and exits, so it is the only chance the user gets
+/// to be told *which* half of the setup (kitty.conf vs config.toml) is wrong.
+fn diagnose(outcome: ProbeOutcome<'_>) -> String {
+    let problem = match outcome {
+        ProbeOutcome::NoSocket => "KITTY_LISTEN_ON is not set, so kitty is not listening on a \
+             remote-control socket (or this window predates the setting)."
+            .to_string(),
+        ProbeOutcome::TimedOut { socket } => format!(
+            "kitty at {socket} did not answer within {}s.\n\nThat is what a password kitty does \
+             not accept looks like: rather than refuse, kitty asks the user to approve the \
+             request in its own window, so the request never returns. Check that [kitty] \
+             rc_password matches remote_control_password in kitty.conf.",
+            CONTROL_PROBE_TIMEOUT.as_secs()
+        ),
+        ProbeOutcome::Failed { socket, err } => {
+            let lower = err.to_ascii_lowercase();
+            // Ordered most-specific first: the missing-binary case carries our
+            // own "Failed to run kitten" context and would otherwise be caught
+            // by the connect arm (both mention "no such file or directory").
+            if lower.contains("failed to run kitten") {
+                return format!(
+                    "Kitty remote control check failed: the `kitten` binary could not be run \
+                     ({err}).\n\nIt ships with kitty — put it on captain-miao's PATH."
+                );
+            } else if lower.contains("failed to connect") || lower.contains("connection refused") {
+                format!(
+                    "nothing is listening on {socket} ({err}).\n\nThe socket belongs to the kitty \
+                     instance that exported it; if kitty has been restarted since this window was \
+                     created, start captain-miao from a window of the current instance."
+                )
+            } else {
+                format!("kitty at {socket} rejected the request: {err}")
+            }
+        }
+    };
+    format!("Kitty remote control check failed: {problem}\n\n{SETUP_HINT}")
+}
+
 #[async_trait]
 impl Terminal for KittyTerminal {
     fn current_window(&self) -> Option<WindowId> {
@@ -81,6 +181,38 @@ impl Terminal for KittyTerminal {
             std::env::var("KITTY_LISTEN_ON").ok(),
             std::env::var("KITTY_PID").ok(),
         )
+    }
+
+    /// Prove the `kitten @` channel to *this* kitty actually works, by making
+    /// the cheapest real request there is (`ls` — the same call `snapshot` runs,
+    /// so a pass means every other rc call has a working transport).
+    ///
+    /// The timeout is not belt-and-braces: a password kitty doesn't accept
+    /// produces no reply at all (it prompts the user in its own window), so the
+    /// probe must bound its own wait or the check would hang exactly where the
+    /// misconfiguration it looks for hangs.
+    async fn verify_control(&self) -> Result<()> {
+        let Some(socket) = listen_on() else {
+            anyhow::bail!("{}", diagnose(ProbeOutcome::NoSocket));
+        };
+        match tokio::time::timeout(CONTROL_PROBE_TIMEOUT, kitten_cmd(&["ls"])).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                // `{e:#}` flattens the anyhow chain onto one line — the context
+                // ("Failed to run kitten") is what `diagnose` classifies on.
+                let err = format!("{e:#}");
+                anyhow::bail!(
+                    "{}",
+                    diagnose(ProbeOutcome::Failed {
+                        socket: &socket,
+                        err: &err
+                    })
+                );
+            }
+            Err(_elapsed) => {
+                anyhow::bail!("{}", diagnose(ProbeOutcome::TimedOut { socket: &socket }))
+            }
+        }
     }
 
     async fn snapshot(&self) -> Result<Vec<Tab>> {
@@ -292,7 +424,60 @@ impl Terminal for KittyTerminal {
 
 #[cfg(test)]
 mod tests {
-    use super::match_id;
+    use super::{ProbeOutcome, diagnose, match_id};
+
+    /// Every configuration failure has to name the config block that fixes it —
+    /// the dashboard prints this once and exits, so a message that only says
+    /// "remote control failed" strands the user.
+    #[test]
+    fn diagnosis_carries_the_setup_fix() {
+        for outcome in [
+            ProbeOutcome::NoSocket,
+            ProbeOutcome::TimedOut {
+                socket: "unix:/tmp/mykitty",
+            },
+            ProbeOutcome::Failed {
+                socket: "unix:/tmp/mykitty",
+                err: "kitten @ ls failed: something unexpected",
+            },
+        ] {
+            let msg = diagnose(outcome);
+            assert!(msg.contains("allow_remote_control"), "{msg}");
+            assert!(msg.contains("rc_password"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn diagnosis_names_the_specific_cause() {
+        // No socket: kitty.conf is missing `listen_on` (or the window predates it).
+        assert!(diagnose(ProbeOutcome::NoSocket).contains("KITTY_LISTEN_ON"));
+
+        // A hang is the *password* symptom, not a slow kitty, so the timeout
+        // message has to point at the password rather than suggest retrying.
+        let timed_out = diagnose(ProbeOutcome::TimedOut {
+            socket: "unix:/tmp/mykitty",
+        });
+        assert!(timed_out.contains("remote_control_password"), "{timed_out}");
+
+        // A missing binary is the one failure the kitty.conf block can't fix, so
+        // it gets its own message (and must not be mistaken for the connect
+        // failure below — both mention "no such file or directory").
+        let no_kitten = diagnose(ProbeOutcome::Failed {
+            socket: "unix:/tmp/mykitty",
+            err: "Failed to run kitten: No such file or directory (os error 2)",
+        });
+        assert!(no_kitten.contains("PATH"), "{no_kitten}");
+        assert!(!no_kitten.contains("allow_remote_control"), "{no_kitten}");
+
+        // A dead socket is usually a restarted kitty, not a config error.
+        let dead_socket = diagnose(ProbeOutcome::Failed {
+            socket: "unix:/tmp/kitty-715",
+            err: "kitten @ ls failed: Error: Failed to connect to unix:/tmp/kitty-715 with \
+                  error: dial unix /tmp/kitty-715: connect: no such file or directory",
+        });
+        assert!(dead_socket.contains("unix:/tmp/kitty-715"), "{dead_socket}");
+        assert!(dead_socket.contains("restarted"), "{dead_socket}");
+    }
 
     #[test]
     fn match_id_accepts_only_digits() {
