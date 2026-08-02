@@ -20,8 +20,32 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 // Filesystem locations
 // =============================================================================
 
+/// Claude Code's config directory. Honours `CLAUDE_CONFIG_DIR` — the same env
+/// var Claude Code itself reads — so a caller that relocates the agent's home
+/// (an isolated demo/test instance) gets a captain-miao that reads the *same*
+/// transcripts, session manifests and resume list the agent is writing. Without
+/// this the two disagree: the agent would write to the relocated home while the
+/// dashboard kept scanning `~/.claude`, surfacing the user's real sessions.
+/// Mirrors [`codex_home`](super::codex)'s `CODEX_HOME` handling, including
+/// treating an empty value as unset.
 fn claude_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude"))
+    resolve_claude_home(
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+/// The precedence itself, split from the env/home reads so it's unit-testable
+/// without mutating process-global state (`set_var` is unsafe in edition 2024,
+/// and env mutation races parallel tests). An empty `CLAUDE_CONFIG_DIR` is
+/// treated as unset, per the same convention `codex_home` uses.
+fn resolve_claude_home(configured: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = configured
+        && !p.as_os_str().is_empty()
+    {
+        return Some(p);
+    }
+    home.map(|h| h.join(".claude"))
 }
 
 /// `~/.claude/sessions` — the per-pid session manifests Claude writes (names and
@@ -1361,6 +1385,36 @@ pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CLAUDE_CONFIG_DIR` relocates the whole Claude tree we read — transcripts,
+    /// the session manifests, and the resume list. An isolated instance (the
+    /// screencast sandbox) depends on this: without it the agent writes to the
+    /// relocated home while captain-miao keeps scanning `~/.claude`, and the
+    /// user's real sessions leak into the resume picker.
+    #[test]
+    fn claude_home_prefers_configured_dir() {
+        let home = Some(PathBuf::from("/home/miao"));
+
+        // Set: wins outright, and is used verbatim (no `.claude` suffix — the
+        // var names the config dir itself, exactly as Claude Code treats it).
+        assert_eq!(
+            resolve_claude_home(Some(PathBuf::from("/demo/claude-home")), home.clone()),
+            Some(PathBuf::from("/demo/claude-home")),
+        );
+
+        // Unset and empty both fall back to `~/.claude`.
+        assert_eq!(
+            resolve_claude_home(None, home.clone()),
+            Some(PathBuf::from("/home/miao/.claude")),
+        );
+        assert_eq!(
+            resolve_claude_home(Some(PathBuf::new()), home),
+            Some(PathBuf::from("/home/miao/.claude")),
+        );
+
+        // No home and no override: nothing to read.
+        assert_eq!(resolve_claude_home(None, None), None);
+    }
 
     fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
