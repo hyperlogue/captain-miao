@@ -6,12 +6,7 @@
 
 A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice — for example, [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
 
-When you run several agent sessions at the same time, it's hard to tell which
-one is actively working, which one is waiting on your decision, and which one
-has already finished. captain-miao watches every session and shows you the
-whole fleet at a glance: status, working directory, context usage, and a live
-preview. From there you can jump to any session, open a new one, fork one, or
-kill one without leaving the dashboard.
+When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance — status, working directory, context usage, and a live preview — and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
 Unlike herdr or cmux, captain-miao brings no terminal of its own. It drives the
 Kitty or zellij you already run — every session is a native window or pane,
@@ -23,26 +18,30 @@ tool and the rest of your workflow is yours to compose.
 - **The whole fleet at a glance:** every session in one table, with status, working directory, model, context usage, git branch, and a live transcript preview.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard, with a filterable picker for recent working directories.
-- **[Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents.
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents.
+- **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
+- **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
 - **Pin, mute, mark:** pin important sessions to the top, mute the ones you don't need right now, and flag the ones to follow up on.
 
 ## Requirements
 
-**To run:**
-
 - A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), or **zellij** ≥ 0.44 (run captain-miao inside the zellij session; no extra setup needed).
 - **Claude Code** and/or **Codex** on your `PATH`.
 
-**To build from source:**
-
-- **Rust** 1.88 or newer and a C compiler (for the statically-bundled SQLite used to read Codex session titles).
-
 ## Installation
 
-### From npm (prebuilt binary)
+### From source with Cargo
 
-The quickest route — no Rust toolchain, no build:
+```sh
+cargo install --git https://github.com/hyperlogue/captain-miao
+```
+
+Building needs a Rust toolchain and a C compiler (for the statically-bundled SQLite that reads Codex session titles).
+
+### From a prebuilt binary (npm)
+
+No Rust toolchain, no build:
 
 ```sh
 npx @hyperlogue/captain-miao          # run it once
@@ -52,85 +51,60 @@ npm install -g @hyperlogue/captain-miao   # or install the `captain-miao` comman
 `bunx @hyperlogue/captain-miao` works too. The npm package is a small launcher
 that execs a prebuilt native binary shipped as a per-platform optional
 dependency, so your package manager downloads only the one binary matching your
-machine — nothing is fetched at runtime.
-
-Prebuilt binaries are published for **macOS** (Apple silicon + Intel) and
-**Linux** (x86-64 + arm64). The Linux builds are glibc, built against glibc 2.35,
-so they run on Ubuntu 22.04+, Debian 12+, RHEL 9+ and similar. On musl/Alpine the
-launcher says so and points you at a source build. There is no Windows build —
-captain-miao needs Unix sockets, `$XDG_RUNTIME_DIR`, and Kitty or zellij.
-
-The same binaries are attached to every [GitHub
-Release](https://github.com/hyperlogue/captain-miao/releases) as a `.tar.gz` if
-you'd rather download one directly. GitHub records a SHA-256 digest for each
-asset, so you can verify a download without a checksum file:
-
-```sh
-gh release view v0.2.0 --repo hyperlogue/captain-miao --json assets \
-  --jq '.assets[] | "\(.digest)  \(.name)"'
-```
-
-### From source with Cargo
-
-```sh
-git clone https://github.com/hyperlogue/captain-miao
-cd captain-miao
-cargo install --path .
-```
-
-Or build a release binary and put it on your `PATH`:
-
-```sh
-cargo build --release
-# binary at ./target/release/captain-miao
-```
+machine — nothing is fetched at runtime. Prebuilt binaries cover **macOS** (Apple
+silicon + Intel) and **Linux** (x86-64 + arm64), and are also attached to every
+[GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as a
+`.tar.gz` if you'd rather download one directly.
 
 ### With Nix
 
-A flake is provided:
+A flake is provided — run it straight from GitHub:
+
+```sh
+nix run github:hyperlogue/captain-miao
+```
+
+Or, in a clone:
 
 ```sh
 nix build          # result/bin/captain-miao
-nix run            # run the dashboard directly
 nix develop        # dev shell with the pinned Rust toolchain
 ```
 
 ## Kitty setup
 
-captain-miao drives Kitty via its remote-control protocol, so your `kitty.conf` must allow it. The recommended setup is password-scoped:
+captain-miao drives Kitty via its remote-control protocol, so your `kitty.conf` must allow it. A simple setup that works out of the box:
 
 ```conf
 allow_remote_control password
-remote_control_password "choose-your-own-secret"
+remote_control_password "i-am-the-captain-miao"
 listen_on unix:/tmp/mykitty
 ```
 
-and the matching line in captain-miao's config:
+`i-am-the-captain-miao` is captain-miao's built-in default password, so remote control works out of the box — you only need to set `[kitty] rc_password` in captain-miao's config if you change it:
 
 ```toml
 [kitty]
-rc_password = "choose-your-own-secret"
+rc_password = "i-am-the-captain-miao"   # captain-miao's default; must match remote_control_password
 ```
 
-> **Pick your own password.** captain-miao's built-in default is `i-am-the-captain-miao` — fine to get started, but it is a published constant, so anything that can reach the socket already knows it. Setting a value you choose is what actually makes the password meaningful.
+**The password is not a sensitive secret.** `rc_password`'s only job is to gate kitty's *in-terminal escape-code channel* — the path by which any program that can write to your terminal (a shell inside a kitty window, including one on the far end of an `ssh` session) could otherwise send remote-control commands — so the published default is fine for most setups. Kitty's [remote-control documentation](https://sw.kovidgoyal.net/kitty/remote-control/) describes the levels:
 
-**Understand what you're enabling.** Kitty's remote control is a real privilege: a program that has it can read your terminal's contents, open windows, and run commands. Three levels are worth knowing apart:
+- `allow_remote_control password` keeps the escape-code channel open but requires the password. Set a value only you know if untrusted programs might share your terminal; otherwise the default is fine.
+- `allow_remote_control socket-only` turns the escape-code channel off entirely, so the only way in is the unix socket named by `listen_on`. Filesystem access to that socket becomes the real boundary — and anything that can already reach it can run commands as you regardless — so the password barely matters in this mode. This is the tightest common setup.
+- `allow_remote_control yes` enables everything, with no password check at all.
 
-- `allow_remote_control password` — only requests carrying a password from `remote_control_password` are honoured. Recommended, and what the config above sets up.
-- `allow_remote_control socket-only` — refuses the in-terminal escape channel and only listens on the `listen_on` socket, so a process inside a kitty window (including a shell on the far end of an `ssh` session) cannot drive your terminal. Combine with `password` for both protections.
-- `allow_remote_control yes` — allows *everything*, with **no password check at all**. captain-miao still sends its password, but kitty won't verify it. Simplest to set up; least protective.
+To lock it down further, scope the password to only the commands captain-miao actually issues — kitty then refuses anything else even with the right password:
+
+```conf
+remote_control_password "i-am-the-captain-miao" ls get-text focus-tab focus-window launch close-window close-tab detach-window goto-layout set-enabled-layouts resize-window set-window-title set-tab-title set-tab-color set-colors set-background-opacity set-background-image set-window-logo
+```
 
 captain-miao passes the password to `kitten @` out-of-band via an environment variable rather than on the command line, so it isn't visible in `ps` or `/proc/<pid>/cmdline`.
 
 **The dashboard checks this at startup.** Before drawing anything it makes one real remote-control request, and if that fails it prints what is wrong (no `listen_on` socket, a socket from a kitty that has since restarted, a password kitty doesn't accept, a missing `kitten` binary) along with the config above, and exits. Failing there is deliberate: without remote control the dashboard cannot open, focus, preview, or move a window — and a password mismatch doesn't produce an error at all. Kitty responds to an unrecognised password by asking *you* to approve the request in its own window, so the request simply never returns; caught at startup that is a message, caught later it would be a frozen dashboard.
 
-### Ring the dashboard from any session (optional)
-
-Bind a Kitty key to focus the dashboard and flag the session running in the current window; its bell indicator lights up so you can find it again:
-
-```conf
-map ctrl+shift+c launch --type=background captain-miao focus --window-id @active-kitty-window-id
-```
+**Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout consolidates every session into one kitty tab and shows one at a time using kitty's `stack` layout. The default `enabled_layouts *` already includes it, so nothing to do — but if you've narrowed `enabled_layouts` in your `kitty.conf`, add `stack` to the list, otherwise captain-miao's `goto-layout stack` silently no-ops and sessions tile instead of stacking. (The alternate **Per-tab** layout — `Space l` toggles it — gives each session its own tab and needs no particular layout.)
 
 ## Usage
 
@@ -142,16 +116,17 @@ captain-miao
 
 > captain-miao must be launched from within Kitty or a zellij session; it exits with an error otherwise. When run inside a zellij session it auto-selects the zellij backend (override with `[terminal] backend` in the config).
 
-From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also launch sessions directly from a shell:
+From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-```sh
-captain-miao claude .            # launch Claude Code in the current dir, with hooks
-captain-miao claude --resume     # any extra args are forwarded straight to claude
-captain-miao codex .             # launch Codex in the current dir, with hooks
-captain-miao focus               # focus the running dashboard window
-```
+| Command                               | What it does                                                                                                       |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `captain-miao`                        | Run the TUI dashboard (the default).                                                                               |
+| `captain-miao claude [dir] [args…]`   | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
+| `captain-miao codex [dir] [args…]`    | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                    |
+| `captain-miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.       |
+| `captain-miao hook <event>`           | Internal — forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically. |
 
-Sessions launched this way are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
 ### Key bindings
 
@@ -172,6 +147,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `y`                            | Copy the selected session id to the clipboard                     |
 | `t` / `w`                      | Move window to tab (Kitty only) / switch to or open the cwd's work tab |
 | `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                   |
+| `Ctrl-u` / `Ctrl-d`            | Scroll the preview up / down                                      |
 | `R`                            | Refresh the preview now                                           |
 | `Space v` / `Space d`          | Toggle the preview / detail panel                                 |
 | `Space i`                      | Edit the selected directory's icon + color                        |
@@ -179,6 +155,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)          |
 | `Space a`                      | Set the default backend for new sessions (Claude / Codex)         |
 | `Space l`                      | Switch session layout (stacked in one tab / one tab per session)  |
+| `?`                            | Show the full key list (help overlay)                             |
 | `/`                            | Search                                                            |
 | `q` / `Ctrl-c`                 | Quit                                                              |
 
@@ -198,79 +175,73 @@ toggle_detail = []              # unbind a command
 
 Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
 
-### Session statuses
-
-| Label                  | Meaning                                                                              |
-| ---------------------- | ------------------------------------------------------------------------------------ |
-| Starting               | Session launching                                                                    |
-| Active                 | Agent is working on a turn                                                           |
-| Compacting / Compacted | Context compaction in progress / just finished                                       |
-| Task                   | Turn ended, but a short-term background job (build, test) is still running           |
-| Server                 | Turn ended and a long-running service (dev server, watcher) was left running         |
-| Review                 | Agent is parked waiting on a human code review                                       |
-| Approval               | Waiting for you to approve a tool use                                                |
-| Decision               | Waiting for you to answer a question                                                 |
-| Idle                   | At rest, waiting for your next prompt                                                |
-| Failed                 | The launch never produced an agent (e.g. blocked `direnv`, missing binary)           |
-
-**Task vs Server.** Both mean "the turn ended but a background shell is still alive", and captain-miao tells them apart by what the command is. A build or test the agent is waiting on counts as work in progress: it stays green, sorts with the active sessions, and keeps your machine awake. A dev server or file watcher the agent parked and moved on from does not: it goes yellow, sorts with the idle sessions, and flags itself for follow-up. Common dev servers are recognised out of the box, and anything unrecognised that keeps running for more than an hour is **learned**, so it's classified correctly from the first moment next time.
-
-**Review** is a refinement of the same idea for [r3](https://github.com/hyperlogue/r3), a local human↔agent review tool: when every background job a session is waiting on is an `r3 watch`, the agent isn't working — it's blocked on *you*. Those rows are surfaced as needing attention, and `s` jumps to them.
-
-### Session layout
-
-`Space l` switches how new sessions are placed, and the choice persists:
-
-- **Stacked** (default) — every session goes into one shared `cm:sessions` tab, one visible at a time (a stack-layout tab on Kitty, full-size floating panes on zellij). The tab bar stays clean no matter how many sessions run, and the dashboard is how you switch between them.
-- **Per-tab** — each session gets its own tab, visible in the tab bar and switchable with your terminal's own keys, at the cost of a crowded bar.
-
-The layout applies to **new** sessions only; toggling it never moves a running one. Restart a session (`Space e`, or `Space E` for all idle ones) to migrate it into the current layout.
-
-## Remote hosts over SSH (experimental)
-
-captain-miao can federate remote machines: one local dashboard monitoring and managing sessions across several hosts, with remote sessions living in a per-host pty pool so they survive ssh drops, laptop sleep, and dashboard restarts.
-
-> **This is a work in progress and is off by default.** The full lifecycle (open / resume / attach / detach / kill / browse across hosts) is implemented, but it has not been verified end-to-end against a real remote host, and restart and fork remain local-only. Build with the `remote` feature to try it:
->
-> ```sh
-> cargo build --release --features remote
-> ```
->
-> Without the feature the dashboard is strictly local-only: `hosts.json` is never read, no remote connection is ever opened, and `Space h` reports that the feature is unavailable.
-
-With it enabled, `Space h` manages the host list, a **Host** column appears in the table, and `o` / `r` / `b` operate across every configured host. This needs `captain-miao-server` on the remote host and key- or agent-based ssh auth (captain-miao runs ssh in `BatchMode`, so it never prompts for a password). The design is written up in [docs/remote-sessions.md](docs/remote-sessions.md).
+Command ids are the string in each `Command::id()` — the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
 
 ## Configuration
 
-Optional TOML config at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). All keys are optional and fall back to sensible defaults; an unparseable file falls back to defaults rather than crashing. A few of the available sections:
+captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). Every key is optional and falls back to the default shown below; an unparseable file falls back to defaults rather than crashing. The complete set of options:
 
 ```toml
 [terminal]
-backend = "kitty"   # or "zellij"; unset auto-detects (zellij when run inside a zellij session, else Kitty)
+backend = "kitty"            # "kitty" | "zellij"; unset auto-detects (zellij inside a zellij session, else Kitty)
+sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this)
 
 [kitty]
-rc_password = "choose-your-own-secret"   # must match remote_control_password in kitty.conf
+rc_password = "i-am-the-captain-miao"   # must match remote_control_password in kitty.conf
 
 [launcher]
-default_agent = "claude"   # backend for new sessions: "claude" or "codex"
+default_agent = "claude"     # backend for new sessions: "claude" | "codex" (Space a overrides)
+approval_grace_secs = 2      # grace window after a permission dialog before a transcript change reads as "dismissed"
+max_recent_cwds = 50         # entries kept in the workdir picker's recent list
+resume_list_limit = 200      # max sessions listed in the resume picker
+new_tab_title = "{agent}: {basename}"     # new-session tab title; placeholders: {agent} {basename} {cwd}
+resume_tab_title = "{agent}: {basename}"  # resumed-session tab title
 
 [thresholds]
-context_warning_tokens = 175000
-context_critical_tokens = 400000
-preview_stale_secs = 20
+context_warning_tokens = 175000    # context usage turns to the warning color here
+context_critical_tokens = 400000   # …and to the critical color here
+preview_stale_secs = 20            # show "updated Ns ago" once the preview is older than this (0 = always)
 
 [polling]
-preview_auto_refresh_secs = 10   # 0 disables
+fs_reload_debounce_ms = 100        # debounce for filesystem-watch reloads
+preview_debounce_ms = 200          # debounce before re-fetching the preview
+event_poll_ms = 100                # input poll interval (floored at 10)
+preview_auto_refresh_secs = 10     # auto-refresh the preview while focused + busy + unscrolled (0 disables)
+
+[ui.panels]
+preview_auto_min_height = 16       # min body height before the preview auto-shows
+detail_auto_min_width = 70         # min body width before the detail panel auto-shows
+detail_default_width = 36          # detail panel column width
+narrow_max_width = 90              # at/below this body width the layout stacks vertically
+
+[ui.table]
+name_truncate = 35                 # max characters of a session name before truncation
 
 [colors.ui]
 title_fg = "cyan"
+header_fg = "cyan"
+attention_fg = "yellow"
+error_fg = "red"
 highlight_bg = "dark_gray"
+selection_fg = "blue"
+selection_symbol = "❯ "
+
+[colors.picker]
+highlight_bg = "dark_gray"
+chevron_fg = "blue"
 
 [debug]
-enabled = false   # or set CAPTAIN_MIAO_DEBUG=1
+enabled = false                    # verbose logging; also enabled by CAPTAIN_MIAO_DEBUG=1
+log_file = "debug.log"
+keybind_log_file = "keybinds.log"
+
+[keybinds]
+# Remap any Normal-mode command: command-id = "key" or ["key", "alt"]; [] unbinds.
+# command-ids are the Command::id() strings in src/app/keymap.rs (DEFAULTS table).
+# e.g. kill = "X"  /  jump_attention = ["s", "n"]  /  restart = "space r"
 ```
 
-Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. See `src/config.rs` for the full set of options.
+Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`kill`, `jump_attention`, `restart`, `toggle_preview`, …).
 
 ## How it works
 
@@ -282,53 +253,10 @@ captain-miao is built around a strict unidirectional data flow:
 
 State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only — session state files record your prompt text, so they are written `0600` under a `0700` directory. For a deeper tour of the architecture, module layout, hook wiring, and data files, see [AGENTS.md](AGENTS.md).
 
-## Development
+## Roadmap
 
-captain-miao is a Cargo workspace of four packages: the `captain-miao` dashboard
-(root package), the `captain-miao-server` per-host daemon + pty pool
-(`crates/cm-server`, built for and deployed to remote hosts), the
-`captain-miao-client` pool CLI (`crates/cm-client`, lists and attaches to local
-pooled sessions), and the shared `cm-core` library. See
-[docs/crate-split.md](docs/crate-split.md).
-
-```sh
-cargo run                # run the TUI dashboard
-cargo run -- claude .    # launch Claude in the current dir with hooks
-cargo run -- codex .     # launch Codex in the current dir with hooks
-cargo test --workspace   # run the full test suite (all four packages)
-cargo build --release -p captain-miao-server   # build the remote-host daemon
-cargo watch -x run       # auto-reload the dashboard on changes
-```
-
-CI runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets
---all-features -D warnings`, so run both locally before you commit.
-
-### Cutting a release
-
-`Cargo.toml`'s `[workspace.package] version` is the single version source — every
-npm package version and pin is stamped from it. Bump it, commit, then tag:
-
-```sh
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-That drives `.github/workflows/release.yml`, which builds all four targets,
-publishes a GitHub Release with the tarballs, then publishes to npm — the four
-per-platform binary packages first, then the `@hyperlogue/captain-miao` launcher
-that pins them. A tag that isn't plain SemVer, or that disagrees with
-`Cargo.toml`, fails the run in seconds before anything is built, and every
-publish step is idempotent so a re-run after a transient failure converges
-instead of double-publishing. A SemVer prerelease tag (`v0.2.0-rc.1`)
-is marked prerelease on GitHub and goes to npm's `next` dist-tag, so `latest`
-never resolves an RC.
-
-Publishing needs an `NPM_TOKEN` repository secret — an npm automation token with
-publish rights on the `@hyperlogue` scope. The publish job runs in the `release`
-GitHub environment: configure it with required reviewers (and add a ruleset on
-`v*` tags), since a tag push otherwise bypasses branch protection straight into a
-signed publish. Node is pinned to 24 so npm supports Trusted Publishing — linking
-the packages to this workflow on npmjs.com lets you drop the `NPM_TOKEN` secret
-entirely in favour of OIDC.
+- [ ] **Remote hosts over SSH** — one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle (open / resume / attach / detach / kill / browse across hosts) is implemented behind the `remote` cargo feature (`cargo build --release --features remote`), but it isn't yet verified end-to-end against a real host, and restart and fork stay local-only. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
+- [ ] **More agent backends** — the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
 
 ## License
 
