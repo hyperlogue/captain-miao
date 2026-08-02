@@ -70,8 +70,13 @@ pub fn init_tracing(role: &str) {
         return;
     }
 
+    // Both crate roots: most launcher/hook events carry an explicit
+    // `target: "captain_miao::…"`, but any plain `tracing::debug!` in cm-core
+    // defaults to its own module path (`cm_core::…`) and the crate split left
+    // those silently filtered out — including the watcher/transcript diagnostics.
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("captain_miao=debug".parse().unwrap());
+        .add_directive("captain_miao=debug".parse().unwrap())
+        .add_directive("cm_core=debug".parse().unwrap());
 
     let initialized = tracing_subscriber::registry()
         .with(env_filter)

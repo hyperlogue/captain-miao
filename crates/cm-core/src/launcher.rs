@@ -747,6 +747,15 @@ fn start_file_watcher(
     tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> notify::Result<notify::RecommendedWatcher> {
     let target = path.to_path_buf();
+    // The path we register and the path the backend reports back are not always
+    // the same string: macOS FSEvents resolves symlinks (and `/var` → `/private/var`)
+    // before reporting, while Linux inotify echoes the path as registered. Codex's
+    // `transcript_path` points into the *synthetic* `$CODEX_HOME`, whose `sessions`
+    // entry is a symlink to the real `~/.codex/sessions`, so on macOS every event
+    // arrives under the real path and a raw-string filter drops all of them —
+    // silently freezing the transcript fold (no context tokens, no interrupt scan).
+    // Accept either spelling.
+    let real = canonical_watch_target(path).filter(|p| *p != target);
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Drop Access events (open/close/read). On Linux notify uses inotify
@@ -759,7 +768,11 @@ fn start_file_watcher(
         // When we fall back to watching the parent directory (because the file
         // doesn't exist yet), events will fire for sibling transcripts too —
         // filter to just our file.
-        if event.paths.iter().any(|p| p == &target) {
+        if event
+            .paths
+            .iter()
+            .any(|p| p == &target || Some(p) == real.as_ref())
+        {
             let _ = tx.send(());
         }
     })?;
@@ -773,6 +786,20 @@ fn start_file_watcher(
         w.watch(parent, notify::RecursiveMode::NonRecursive)?;
     }
     Ok(w)
+}
+
+/// The real path a watch event will carry for `path`, for comparison against the
+/// path we registered. Resolves symlinks in the file itself when it exists, and
+/// otherwise in its parent (the parent-directory fallback watches a file that
+/// hasn't been created yet, but its directory is already real). `None` when
+/// neither resolves — there is then nothing to match beyond the raw path.
+fn canonical_watch_target(path: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return Some(p);
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    Some(std::fs::canonicalize(parent).ok()?.join(name))
 }
 
 fn on_transcript_changed(
@@ -974,6 +1001,44 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 mod tests {
     use super::*;
     use crate::agent::AgentControl;
+
+    /// A transcript reached through a symlinked directory — Codex's rollout under
+    /// the synthetic `$CODEX_HOME`, whose `sessions` entry links to `~/.codex/sessions`
+    /// — must resolve to the real path, because that is the spelling macOS FSEvents
+    /// reports and the watch filter compares against. Covers both the file-exists
+    /// case and the parent-directory fallback (file not created yet).
+    #[test]
+    fn canonical_watch_target_resolves_symlinked_dirs() {
+        let base = std::env::temp_dir().join(format!("cm-watch-target-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let existing = link.join("rollout.jsonl");
+        std::fs::write(&existing, b"{}\n").unwrap();
+        let want = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(
+            canonical_watch_target(&existing),
+            Some(want.join("rollout.jsonl"))
+        );
+
+        // Not yet created: resolved via the parent, which does exist.
+        let pending = link.join("not-yet.jsonl");
+        assert_eq!(
+            canonical_watch_target(&pending),
+            Some(want.join("not-yet.jsonl"))
+        );
+
+        // Neither the file nor its parent exists: nothing to resolve.
+        assert_eq!(
+            canonical_watch_target(&base.join("gone").join("x.jsonl")),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn state_with(status: SessionStatus) -> LauncherState {
         LauncherState {

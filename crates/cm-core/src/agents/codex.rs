@@ -504,13 +504,46 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
                 continue;
             }
             let link = home.join(&name);
-            // Refresh stale/broken symlinks; leave good ones alone.
-            let needs_link = match std::fs::read_link(&link) {
-                Ok(target) => target != entry.path(),
-                Err(_) => !link.exists(),
-            };
-            if needs_link {
-                atomic_symlink(&entry.path(), &link);
+            match std::fs::read_link(&link) {
+                // Already a symlink: refresh only when it points elsewhere. A
+                // *dangling* one is fine — the target path is right, and Codex
+                // creating the file through it lands in the real home.
+                Ok(target) => {
+                    if target != entry.path() {
+                        atomic_symlink(&entry.path(), &link);
+                    }
+                }
+                // Not a symlink: either nothing is here (link it), or a real
+                // file/dir is shadowing the real home's entry. That happens
+                // whenever Codex adds a new state file: it creates it *inside*
+                // the synthetic home before the name exists in the real one, so
+                // no symlink is ever made and the two copies then diverge —
+                // which the old `!link.exists()` guard made permanent. Worst
+                // case is a split-brain SQLite DB: the main file resolves to the
+                // stale synthetic copy while `-wal`/`-shm`, symlinked once the
+                // real home grew them, resolve to the real home's — and Codex
+                // refuses to start ("local database appears to be damaged").
+                // Everything mirrored here belongs to the real home by
+                // construction, so replacing a shadow is safe — the synthetic
+                // home holds nothing of its own but `hooks.json` and the
+                // config copy, both rewritten below.
+                Err(_) => {
+                    if let Ok(meta) = std::fs::symlink_metadata(&link) {
+                        // rename(2) can't replace a directory, so clear it first.
+                        let removed = if meta.is_dir() {
+                            std::fs::remove_dir_all(&link)
+                        } else {
+                            std::fs::remove_file(&link)
+                        };
+                        if removed.is_ok() {
+                            tracing::debug!(
+                                "replaced shadow entry {} with a link to the real home",
+                                link.display()
+                            );
+                        }
+                    }
+                    atomic_symlink(&entry.path(), &link);
+                }
             }
         }
     }
