@@ -4,6 +4,8 @@
 
 # captain-miao
 
+<img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
+
 A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
 
 When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
@@ -12,6 +14,8 @@ Unlike herdr or cmux, captain-miao brings no terminal of its own. It drives the
 Kitty or zellij you already run (every session is a native window or pane,
 controlled through the terminal's own protocol), so it stays one small, focused
 tool and the rest of your workflow is yours to compose.
+
+<video src="https://github.com/user-attachments/assets/9e447cef-5fd7-4ff6-8ba2-4bb75cefd01d" controls muted></video>
 
 ## Highlights
 
@@ -95,7 +99,7 @@ def is_cmd_allowed(pcmd, window, from_socket, extra_data):
     return from_socket and pcmd["cmd"] in ALLOWED_COMMANDS
 ```
 
-Every request must now clear three checks: arrive over the socket (not the escape-code channel that a shell, even one across `ssh`, could otherwise use), carry the password, and name one of the commands above. `i-am-the-captain-miao` is captain-miao's built-in default, so this works as written; to use your own secret instead, set `remote_control_password` (above) and `[kitty] rc_password` in captain-miao's config to match. Keep the script the *last* item after the password; command names listed alongside it are allowed without ever calling your function.
+Every request must now clear three checks: arrive over the socket (not the escape-code channel that a shell, even one across `ssh`, could otherwise use), carry the password, and name one of the commands above. `i-am-the-captain-miao` is captain-miao's built-in default, so this works as written; to use your own secret instead, set `remote_control_password` (above) and `[kitty] rc_password` in captain-miao's config to match. Keep the script the _last_ item after the password; command names listed alongside it are allowed without ever calling your function.
 
 Looser alternatives: `allow_remote_control socket-only` (off the escape-code channel, but no password and no allowlist) or `allow_remote_control yes` (no checks at all; avoid it). captain-miao verifies remote control at startup and exits with a diagnostic if it can't connect.
 
@@ -113,13 +117,13 @@ captain-miao
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-| Command                               | What it does                                                                                                       |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `captain-miao`                        | Run the TUI dashboard (the default).                                                                               |
-| `captain-miao claude [dir] [args…]`   | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
-| `captain-miao codex [dir] [args…]`    | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                    |
-| `captain-miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.       |
-| `captain-miao hook <event>`           | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically. |
+| Command                                 | What it does                                                                                                                                |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `captain-miao`                          | Run the TUI dashboard (the default).                                                                                                        |
+| `captain-miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
+| `captain-miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
+| `captain-miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
+| `captain-miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
 Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
@@ -127,32 +131,32 @@ Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process tha
 
 Press `?` in the dashboard for the complete list. Highlights:
 
-| Key                            | Action                                                            |
-| ------------------------------ | ----------------------------------------------------------------- |
-| `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                 |
-| `gg` / `G`                     | Jump to top / bottom                                              |
-| `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                  |
-| `Enter`                        | Focus the selected session's window                               |
-| `o` / `O`                      | New session (same tab / prompt for cwd)                           |
-| `r` / `f`                      | Resume picker / fork (resume selected in place)                   |
-| `b`                            | Browse every running and resumable session in one list            |
-| `x`                            | Kill the selected session                                         |
-| `s`                            | Jump to the next session needing attention                        |
-| `m` / `p` / `i`                | Mute / pin / toggle needs-input on the selected session           |
-| `y`                            | Copy the selected session id to the clipboard                     |
+| Key                            | Action                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                      |
+| `gg` / `G`                     | Jump to top / bottom                                                   |
+| `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                       |
+| `Enter`                        | Focus the selected session's window                                    |
+| `o` / `O`                      | New session (same tab / prompt for cwd)                                |
+| `r` / `f`                      | Resume picker / fork (resume selected in place)                        |
+| `b`                            | Browse every running and resumable session in one list                 |
+| `x`                            | Kill the selected session                                              |
+| `s`                            | Jump to the next session needing attention                             |
+| `m` / `p` / `i`                | Mute / pin / toggle needs-input on the selected session                |
+| `y`                            | Copy the selected session id to the clipboard                          |
 | `t` / `w`                      | Move window to tab (Kitty only) / switch to or open the cwd's work tab |
-| `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                   |
-| `Ctrl-u` / `Ctrl-d`            | Scroll the preview up / down                                      |
-| `R`                            | Refresh the preview now                                           |
-| `Space v` / `Space d`          | Toggle the preview / detail panel                                 |
-| `Space i`                      | Edit the selected directory's icon + color                        |
-| `Space e` / `Space E`          | Restart the selected / all idle sessions                          |
-| `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)          |
-| `Space a`                      | Set the default backend for new sessions (Claude / Codex)         |
-| `Space l`                      | Switch session layout (stacked in one tab / one tab per session)  |
-| `?`                            | Show the full key list (help overlay)                             |
-| `/`                            | Search                                                            |
-| `q` / `Ctrl-c`                 | Quit                                                              |
+| `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                        |
+| `Ctrl-u` / `Ctrl-d`            | Scroll the preview up / down                                           |
+| `R`                            | Refresh the preview now                                                |
+| `Space v` / `Space d`          | Toggle the preview / detail panel                                      |
+| `Space i`                      | Edit the selected directory's icon + color                             |
+| `Space e` / `Space E`          | Restart the selected / all idle sessions                               |
+| `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
+| `Space a`                      | Set the default backend for new sessions (Claude / Codex)              |
+| `Space l`                      | Switch session layout (stacked in one tab / one tab per session)       |
+| `?`                            | Show the full key list (help overlay)                                  |
+| `/`                            | Search                                                                 |
+| `q` / `Ctrl-c`                 | Quit                                                                   |
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
