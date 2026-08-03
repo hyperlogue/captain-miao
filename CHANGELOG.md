@@ -5,6 +5,61 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-02
+
+### Added
+
+- **Startup check for the terminal control channel.** Being *in* a supported
+  terminal is not the same as being able to drive it. On Kitty, a remote-control
+  setup that is missing `listen_on` or carries a mismatched password used to
+  surface one failed action at a time, with kitty's raw error in the status line;
+  captain-miao now proves the channel works before the dashboard takes over the
+  screen, and a failure prints which half of the setup is wrong — plus the config
+  block to fix it — while stderr is still visible.
+
+### Fixed
+
+- **Codex sessions on macOS track their transcript again.** Codex rows showed no
+  context usage, never picked up the first-prompt title, and stayed green forever
+  after an Esc-interrupt: the rollout watch matched the wrong spelling of a
+  symlinked path, and macOS reports nothing at all for the way Codex writes (one
+  long-held file descriptor, appended to for the whole session). Context tokens
+  and interrupts now land with the event that caused them, and the watch parks
+  itself while a session is idle, so a session sitting at rest costs nothing.
+- **Codex no longer refuses to start with "local database appears to be
+  damaged."** The synthetic `$CODEX_HOME` now repairs entries where a real file
+  sits where a link into your real `~/.codex` belongs — what Codex leaves behind
+  whenever it adds a new state file, which eventually split a SQLite database
+  across the two homes.
+- **Review-pending detection for commands containing a quote.** An `r3 watch`
+  wrapped in something like `nix develop … --command bash -c '…'` was truncated
+  when normalised, so the row sat at "Task" instead of "Review" — and every
+  command wrapped that way collapsed onto a single entry in the learned
+  long-running set.
+- **`CLAUDE_CONFIG_DIR` is honoured** when locating Claude's home. An instance
+  that relocates the agent's config dir no longer has the resume picker and the
+  `b` browser listing every project from the real `~/.claude` instead.
+- **`nix build` works again.** The build's source filter dropped `assets/`, so
+  the logo the dashboard embeds at compile time was missing and the build failed.
+
+### Changed
+
+- **README rewritten around installation and configuration**, gathering the
+  Cargo, npm, and Nix routes under one section and documenting every CLI
+  subcommand and config key in tables.
+
+### Security
+
+- **The recommended Kitty setup is now scoped by an authorization script.**
+  Pairing the remote-control password with a small `is_cmd_allowed` script shuts
+  the in-terminal escape-code channel outright — the vector by which a shell
+  running inside a Kitty window, including one on the far end of an ssh session,
+  could otherwise drive your terminal — and confines even an authenticated
+  request to the eight commands captain-miao actually issues. The README carries
+  the script, and now says plainly that substituting your own password is what
+  makes that check real: the built-in default is a published constant and
+  authenticates nothing on its own.
+
 ## [0.2.0] - 2026-08-01
 
 First public release.
@@ -71,4 +126,5 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hyperlogue/captain-miao/releases/tag/v0.2.0
