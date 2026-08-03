@@ -4,13 +4,13 @@
 
 # captain-miao
 
-A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice — for example, [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
+A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
 
-When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance — status, working directory, context usage, and a live preview — and lets you start, focus, fork, or kill any of them without leaving the dashboard.
+When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
 Unlike herdr or cmux, captain-miao brings no terminal of its own. It drives the
-Kitty or zellij you already run — every session is a native window or pane,
-controlled through the terminal's own protocol — so it stays one small, focused
+Kitty or zellij you already run (every session is a native window or pane,
+controlled through the terminal's own protocol), so it stays one small, focused
 tool and the rest of your workflow is yours to compose.
 
 ## Highlights
@@ -51,14 +51,14 @@ npm install -g @hyperlogue/captain-miao   # or install the `captain-miao` comman
 `bunx @hyperlogue/captain-miao` works too. The npm package is a small launcher
 that execs a prebuilt native binary shipped as a per-platform optional
 dependency, so your package manager downloads only the one binary matching your
-machine — nothing is fetched at runtime. Prebuilt binaries cover **macOS** (Apple
+machine; nothing is fetched at runtime. Prebuilt binaries cover **macOS** (Apple
 silicon + Intel) and **Linux** (x86-64 + arm64), and are also attached to every
 [GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as a
 `.tar.gz` if you'd rather download one directly.
 
 ### With Nix
 
-A flake is provided — run it straight from GitHub:
+A flake is provided; run it straight from GitHub:
 
 ```sh
 nix run github:hyperlogue/captain-miao
@@ -73,7 +73,7 @@ nix develop        # dev shell with the pinned Rust toolchain
 
 ## Kitty setup
 
-captain-miao drives Kitty via its remote-control protocol, so your `kitty.conf` must allow it. Remote control is a real privilege — a program that has it can read your terminal's contents, open windows, and run commands — so the setup below is the tightest one kitty offers: a password paired with an authorization script that answers every request.
+captain-miao drives Kitty over its [remote-control protocol](https://sw.kovidgoyal.net/kitty/remote-control/), so your `kitty.conf` must allow it. Remote control is a real privilege (a program that has it can read your terminal and run commands), so the tightest setup kitty offers pairs a password with an authorization script:
 
 ```conf
 allow_remote_control password
@@ -81,57 +81,25 @@ remote_control_password "i-am-the-captain-miao" captain_miao_rc.py
 listen_on unix:/tmp/mykitty
 ```
 
-Kitty resolves that filename against your config directory, so the script goes in `~/.config/kitty/captain_miao_rc.py`:
+Kitty resolves that filename against your config directory, so put the script at `~/.config/kitty/captain_miao_rc.py`:
 
 ```python
-# The complete set of remote-control commands captain-miao issues.
+# The only remote-control commands captain-miao issues.
 ALLOWED_COMMANDS = frozenset({
-    "ls",             # read the window/tab tree (also the startup check)
-    "get-text",       # the session preview
-    "launch",         # open a session window or tab
-    "focus-window",   # Enter, Ctrl-1..9
-    "focus-tab",      # w, the per-directory work tabs
-    "close-window",   # x, and the restart path
-    "detach-window",  # t, move a session's window to another tab
-    "goto-layout",    # make the shared cm:sessions tab a stack
+    "ls", "get-text", "launch", "focus-window",
+    "focus-tab", "close-window", "detach-window", "goto-layout",
 })
 
-
 def is_cmd_allowed(pcmd, window, from_socket, extra_data):
-    # Refuse the in-terminal escape-code channel outright: only a request
-    # arriving over the listen_on socket can be captain-miao's.
-    if not from_socket:
-        return False
-    if pcmd["cmd"] in ALLOWED_COMMANDS:
-        return True
-    return False
+    # Reject the in-terminal escape-code channel; only the listen_on socket gets in.
+    return from_socket and pcmd["cmd"] in ALLOWED_COMMANDS
 ```
 
-`i-am-the-captain-miao` is captain-miao's built-in default, so that block works as written with no change to captain-miao's own config. To use a secret of your own instead, set both sides — `remote_control_password` above, and:
+Every request must now clear three checks: arrive over the socket (not the escape-code channel that a shell, even one across `ssh`, could otherwise use), carry the password, and name one of the commands above. `i-am-the-captain-miao` is captain-miao's built-in default, so this works as written; to use your own secret instead, set `remote_control_password` (above) and `[kitty] rc_password` in captain-miao's config to match. Keep the script the *last* item after the password; command names listed alongside it are allowed without ever calling your function.
 
-```toml
-[kitty]
-rc_password = "my-own-secret"
-```
+Looser alternatives: `allow_remote_control socket-only` (off the escape-code channel, but no password and no allowlist) or `allow_remote_control yes` (no checks at all; avoid it). captain-miao verifies remote control at startup and exits with a diagnostic if it can't connect.
 
-A request now has to clear three independent checks, and each one closes a door the others leave open:
-
-- **`from_socket`** — kitty passes `False` when a request arrives over the in-terminal escape-code channel, the path by which any program that can write to your terminal (a shell inside a kitty window, including one on the far end of an `ssh` session) could otherwise drive it. Rejecting those leaves the unix socket as the only way in.
-- **The password** — under `allow_remote_control password` every request must carry it, *whichever channel it came from*, so filesystem access to the socket is not by itself enough. The default is a published constant, though, so it stops nothing that can read this page; substituting a secret of your own is what turns this check into a real one, on top of the two around it.
-- **The allowlist** — even a request with the password is confined to the eight commands captain-miao actually issues, so a leaked password doesn't buy `send-text` into your shell.
-
-Two things worth knowing about how kitty evaluates this:
-
-- **Keep the script the only item after the password.** Command names listed alongside it are matched first and return "allowed" immediately, so `remote_control_password "…" ls captain_miao_rc.py` would permit `ls` without ever calling your function.
-- **It fails closed.** A command your function doesn't allow is denied, and so is one that raises — kitty logs the traceback and treats the error as a refusal. A denial is an immediate error rather than a hang (unlike a wrong password, below), so if a future captain-miao version needs a ninth command, the startup check catches a missing `ls` and anything else fails the moment you use the key that needs it.
-
-If you'd rather not run a script, `allow_remote_control socket-only` is the next-best option: it turns off the escape-code channel the same way, but checks no password and scopes nothing, so anything that can reach the socket can run any command. Avoid `allow_remote_control yes` — it honours every request with no password check at all, including over the escape-code channel.
-
-captain-miao passes the password to `kitten @` out-of-band via an environment variable rather than on the command line, so it isn't visible in `ps` or `/proc/<pid>/cmdline`.
-
-**The dashboard checks this at startup.** Before drawing anything it makes one real remote-control request, and if that fails it prints what is wrong (no `listen_on` socket, a socket from a kitty that has since restarted, a password kitty doesn't accept, a missing `kitten` binary) along with the config above, and exits. Failing there is deliberate: without remote control the dashboard cannot open, focus, preview, or move a window — and a password mismatch doesn't produce an error at all. Kitty responds to an unrecognised password by asking *you* to approve the request in its own window, so the request simply never returns; caught at startup that is a message, caught later it would be a frozen dashboard.
-
-**Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout consolidates every session into one kitty tab and shows one at a time using kitty's `stack` layout. The default `enabled_layouts *` already includes it, so nothing to do — but if you've narrowed `enabled_layouts` in your `kitty.conf`, add `stack` to the list, otherwise captain-miao's `goto-layout stack` silently no-ops and sessions tile instead of stacking. (The alternate **Per-tab** layout — `Space l` toggles it — gives each session its own tab and needs no particular layout.)
+**Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
 
 ## Usage
 
@@ -151,7 +119,7 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `captain-miao claude [dir] [args…]`   | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
 | `captain-miao codex [dir] [args…]`    | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                    |
 | `captain-miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.       |
-| `captain-miao hook <event>`           | Internal — forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically. |
+| `captain-miao hook <event>`           | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically. |
 
 Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
@@ -202,7 +170,7 @@ toggle_detail = []              # unbind a command
 
 Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
 
-Command ids are the string in each `Command::id()` — the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
+Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
 
 ## Configuration
 
@@ -214,7 +182,7 @@ backend = "kitty"            # "kitty" | "zellij"; unset auto-detects (zellij in
 sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this)
 
 [kitty]
-rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant — set your own (see Kitty setup)
+rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
 
 [launcher]
 default_agent = "claude"     # backend for new sessions: "claude" | "codex" (Space a overrides)
@@ -278,13 +246,14 @@ captain-miao is built around a strict unidirectional data flow:
 - **Hooks** are thin forwarders: they parse the agent's hook payload from stdin and send it to the launcher socket.
 - The **dashboard** is a pure viewer. It watches the session state directory and per-backend transcript dirs with `notify` (FSEvents on macOS, inotify on Linux) and re-reads files when they change. It performs no IPC of its own.
 
-State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only — session state files record your prompt text, so they are written `0600` under a `0700` directory. For a deeper tour of the architecture, module layout, hook wiring, and data files, see [AGENTS.md](AGENTS.md).
+State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For a deeper tour of the architecture, module layout, hook wiring, and data files, see [AGENTS.md](AGENTS.md).
 
 ## Roadmap
 
-- [ ] **Remote hosts over SSH** — one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle (open / resume / attach / detach / kill / browse across hosts) is implemented behind the `remote` cargo feature (`cargo build --release --features remote`), but it isn't yet verified end-to-end against a real host, and restart and fork stay local-only. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
-- [ ] **More agent backends** — the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
+- [ ] **Remote hosts over SSH**: one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle (open / resume / attach / detach / kill / browse across hosts) is implemented behind the `remote` cargo feature (`cargo build --release --features remote`), but it isn't yet verified end-to-end against a real host, and restart and fork stay local-only. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
+- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty and zellij today), so other terminals and multiplexers (tmux, WezTerm, …) can slot in.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
