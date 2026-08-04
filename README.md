@@ -8,14 +8,14 @@
 
 A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
 
+https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
+
 When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
-Unlike herdr or cmux, captain-miao brings no terminal of its own. It drives the
+Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
 Kitty or zellij you already run (every session is a native window or pane,
 controlled through the terminal's own protocol), so it stays one small, focused
 tool and the rest of your workflow is yours to compose.
-
-<video src="https://github.com/user-attachments/assets/9e447cef-5fd7-4ff6-8ba2-4bb75cefd01d" controls muted></video>
 
 ## Highlights
 
