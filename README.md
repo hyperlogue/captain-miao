@@ -68,13 +68,6 @@ A flake is provided; run it straight from GitHub:
 nix run github:hyperlogue/captain-miao
 ```
 
-Or, in a clone:
-
-```sh
-nix build          # result/bin/captain-miao
-nix develop        # dev shell with the pinned Rust toolchain
-```
-
 ## Kitty setup
 
 captain-miao drives Kitty over its [remote-control protocol](https://sw.kovidgoyal.net/kitty/remote-control/), so your `kitty.conf` must allow it. Remote control is a real privilege (a program that has it can read your terminal and run commands), so the tightest setup kitty offers pairs a password with an authorization script:
