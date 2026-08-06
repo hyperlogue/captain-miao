@@ -1803,11 +1803,13 @@ impl App {
             .sessions
             .iter()
             .filter_map(|s| {
-                // Crash recovery relaunches via the local spawn path only, so a
-                // remote session here would be re-launched as a bogus *local*
-                // `resume <remote-session-id>` in a cwd that may not exist
-                // locally. Snapshot local sessions exclusively (matching
-                // `restart_spec_for`, `save_overrides`, and `apply_bell_signals`).
+                // Only direct-local sessions are worth snapshotting. A session
+                // on another host — or a pooled one on this machine — outlives
+                // the dashboard by construction: it keeps running in its pool
+                // and simply reappears on reconnect, so "recovering" it would
+                // mean resuming a session that never stopped. (Which is also
+                // why crash recovery is inert under pooled-localhost, and
+                // rightly so.)
                 if !s.host.is_local() {
                     return None;
                 }

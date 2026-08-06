@@ -162,7 +162,7 @@ fn cleanup_dashboard() {
 /// Pop the previous run's session snapshot off disk. Returns the entries
 /// whose launcher pid is no longer alive — those are the sessions the
 /// previous dashboard knew about that died with it.
-fn take_missing_from_snapshot(alive_pids: &HashSet<u32>) -> Vec<RestartSpec> {
+fn take_missing_from_snapshot(alive_pids: &HashSet<u32>, host: HostId) -> Vec<RestartSpec> {
     let path = state::dashboard_sessions_snapshot_path();
     let prior: Option<Vec<SessionSnapshotEntry>> = state::read_json(&path);
     // Even on a malformed file, drop it so we don't keep prompting.
@@ -175,10 +175,12 @@ fn take_missing_from_snapshot(alive_pids: &HashSet<u32>) -> Vec<RestartSpec> {
         .filter(|e: &SessionSnapshotEntry| !alive_pids.contains(&e.launcher_pid))
         .map(|e| RestartSpec {
             agent: e.agent,
-            // Crash recovery is local-only by design (the snapshot is), and the
-            // dead session's key is only carried so the spec is well-formed —
-            // `kill_old: false` means it's never used to signal anything.
-            host: HostId::local(),
+            // Relaunch on this machine — the snapshot only ever holds
+            // direct-local sessions (a pooled one survives a dashboard crash on
+            // its own, so there is nothing to recover). The dead session's key
+            // is carried only so the spec is well-formed; `kill_old: false`
+            // means it is never used to signal anything.
+            host: host.clone(),
             key: cm_core::state::SessionKey::from_launcher_pid(e.launcher_pid),
             window_id: Some(e.window_id),
             cwd: e.cwd,
@@ -779,7 +781,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         .filter(|s| s.host.is_local())
         .map(|s| s.launcher_pid)
         .collect();
-    let missing = take_missing_from_snapshot(&alive_pids);
+    let missing = take_missing_from_snapshot(&alive_pids, app.backends[0].host_id());
     app.prompt_restart_missing(missing);
     app.save_session_snapshot();
 
