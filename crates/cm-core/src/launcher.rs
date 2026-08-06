@@ -66,6 +66,10 @@ pub async fn run(
         pool_session,
         launch_id,
         terminal,
+        // Host-owned overlays: the server-core stamps these onto the rows it
+        // serves. The launcher never writes them (single-writer rule).
+        flags: None,
+        attached: None,
         host: HostId::local(),
     };
     launcher_state.write()?;
@@ -1353,6 +1357,8 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            flags: None,
+            attached: None,
             host: HostId::local(),
         }
     }

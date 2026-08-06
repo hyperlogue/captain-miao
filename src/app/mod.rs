@@ -20,15 +20,16 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::agent::{AgentControl, ResumeCandidate, SessionIndex};
-use crate::state::{self, HostId, LauncherState, SessionStatus};
+use crate::state::{
+    self, HostId, LauncherState, SessionFlags as HostSessionFlags, SessionKey, SessionStatus,
+};
 use crate::terminal::{Capabilities, SessionsLayout, Tab, TabId, TabInfo, TabTarget, WindowId};
 
 use self::format::{
-    collapse_tilde, contains_ci, expand_tilde, format_coarse_age, format_relative_time,
-    random_session_name, workdir_picker_title,
+    contains_ci, format_coarse_age, format_relative_time, random_session_name, workdir_picker_title,
 };
 use self::picker::{Picker, PickerItem};
-use crate::backend::{Backend, ConnState, RemoteBackend, Transport};
+use crate::backend::{Backend, BackendEvents, ConnState, RemoteBackend, Transport};
 
 /// Whether remote (SSH) host support is compiled in — the `remote` cargo
 /// feature, **off by default** because the feature is a work in progress
@@ -88,10 +89,18 @@ pub(super) enum Action {
     },
     FetchTabsForMove(WindowId),
     MoveWindow(WindowId, TabTarget),
-    FetchResumeList,
-    /// Gather running (across all hosts) + resumable (cross-host walk) sessions
-    /// and open the unified browser picker.
-    FetchBrowser,
+    /// Fetch `host`'s resumable list and open the resume picker on it. Scoped
+    /// to one host (§9): the old cross-host union made every picker's scope
+    /// implicit, and `Ctrl-h` inside the picker switches hosts explicitly.
+    FetchResumeList {
+        host: HostId,
+    },
+    /// Re-scope the *open* resume picker to another host — the `Ctrl-h` switch.
+    /// A separate action from `FetchResumeList` so a failed switch can keep the
+    /// picker open on its previous host instead of dismissing it.
+    SwitchResumeHost {
+        host: HostId,
+    },
     ResumeSession {
         agent: AgentControl,
         cwd: String,
@@ -103,7 +112,9 @@ pub(super) enum Action {
     },
     KillSession {
         host: HostId,
-        child_pid: u32,
+        /// Opaque session identity; the owning host resolves it to a live pid
+        /// at signal time, so a stale row can't make it kill a recycled pid.
+        key: SessionKey,
         window_id: Option<WindowId>,
     },
     /// Detach from a remote session: close its local `ssh attach` window but
@@ -139,6 +150,10 @@ pub(super) enum Action {
     AttachRemoteRunning {
         host: HostId,
         pool_session: String,
+        /// Steal the session from the client currently attached to it. Only ever
+        /// set behind an explicit y/N confirm — the pool is one client at a
+        /// time, so attaching otherwise declines rather than kicking someone.
+        force: bool,
     },
 }
 
@@ -149,8 +164,16 @@ pub(super) enum Action {
 #[derive(Debug, Clone)]
 pub(super) struct RestartSpec {
     pub(super) agent: AgentControl,
-    pub(super) child_pid: u32,
-    pub(super) window_id: WindowId,
+    /// Host the session lives on; the replacement opens there too, so a remote
+    /// restart lands in that host's pool rather than silently moving the session
+    /// to the laptop.
+    pub(super) host: HostId,
+    /// The session to tear down, named opaquely — its host resolves it to a pid
+    /// at signal time. `None` for crash recovery, where nothing is left to kill.
+    pub(super) key: SessionKey,
+    /// The local window to close after relaunching, if the dashboard has one. A
+    /// detached pooled session has none.
+    pub(super) window_id: Option<WindowId>,
     pub(super) cwd: String,
     pub(super) session_id: String,
     /// Status flags to re-apply once the relaunched session appears under its
@@ -177,8 +200,8 @@ impl Action {
             Action::NewSessionSplit { .. } => "NewSessionSplit",
             Action::FetchTabsForMove(_) => "FetchTabsForMove",
             Action::MoveWindow(_, _) => "MoveWindow",
-            Action::FetchResumeList => "FetchResumeList",
-            Action::FetchBrowser => "FetchBrowser",
+            Action::FetchResumeList { .. } => "FetchResumeList",
+            Action::SwitchResumeHost { .. } => "SwitchResumeHost",
             Action::ResumeSession { .. } => "ResumeSession",
             Action::KillSession { .. } => "KillSession",
             Action::DetachRemote { .. } => "DetachRemote",
@@ -202,10 +225,12 @@ pub(super) enum PickerKind {
         window_id: WindowId,
         tabs: Vec<TabInfo>,
     },
-    /// Resume one of the listed sessions, each tagged with the host it lives on
-    /// (cross-host: the picker unions every backend's resumable list).
+    /// Resume one of `host`'s dormant sessions. One host at a time — `Ctrl-h`
+    /// switches, exactly like `Ctrl-t` switches the agent — so the list's scope
+    /// is always visible in the title instead of being an implicit union (§9).
     Resume {
-        candidates: Vec<(HostId, ResumeCandidate)>,
+        host: HostId,
+        candidates: Vec<ResumeCandidate>,
     },
     /// Launch a new session. The picker shows recent cwds and also accepts
     /// a free-form path; Tab completes against the filesystem. `agent` is the
@@ -220,24 +245,15 @@ pub(super) enum PickerKind {
     },
     /// Set the persistent default backend for new sessions (`Space a`).
     DefaultAgent,
-    /// Cross-host browser (§5): every running session (focus/attach) and every
-    /// resumable one (resume), across all hosts, in one searchable list.
-    Browser { entries: Vec<BrowserEntry> },
+    /// Set the persistent default host for new sessions (`Space H`).
+    DefaultHost,
     /// Pick an emoji to drop into the directory-mark editor's icon field.
     /// Opened with `Ctrl-E` from `Space i`; submit/cancel return to the editor
     /// (which stays live in `self.dir_edit`) rather than the normal view.
     Emoji,
-}
-
-/// One row of the cross-host browser. A running session is focused or attached;
-/// a resumable one is resumed on its host.
-#[derive(Debug)]
-pub(super) enum BrowserEntry {
-    /// A live session (local or remote). Carries its full state so submit can
-    /// reuse the same focus-or-attach decision as `Enter` on a dashboard row.
-    Running(Box<LauncherState>),
-    /// A dormant session on `host`, resumable.
-    Resumable(HostId, ResumeCandidate),
+    /// The same picker, opened from the hosts panel's Icon field; submit/cancel
+    /// return to the panel.
+    HostEmoji,
 }
 
 #[derive(Debug)]
@@ -271,6 +287,13 @@ struct DashboardOverrides {
     /// `[terminal] sessions_layout` config value is kept in that case.
     #[serde(default)]
     sessions_layout: Option<String>,
+    /// Persisted default host for new-session operations (`Space H`), stored as
+    /// the host label. The exact analog of `default_agent`: `O`, a bare `o`, and
+    /// `r` all target it, so every picker's scope is explicit instead of an
+    /// implicit cross-host union (§9). `None` (or a label no longer configured)
+    /// falls back to localhost.
+    #[serde(default)]
+    default_host: Option<String>,
 }
 
 /// One row of the dashboard's session snapshot — everything `restart_one`
@@ -366,6 +389,9 @@ pub(super) struct HostEditState {
     /// `true` while editing the selected row's fields; `false` in the list.
     pub(in crate::app) editing: bool,
     pub(in crate::app) focus: HostField,
+    /// The row a `d` press is asking about — the removal confirm (§9). `None`
+    /// when nothing is pending.
+    pub(in crate::app) pending_remove: Option<usize>,
 }
 
 /// One editable host row in the popup.
@@ -376,12 +402,16 @@ pub(super) struct HostRow {
     pub(in crate::app) target: String,
     pub(in crate::app) is_socket: bool,
     pub(in crate::app) color_idx: usize,
+    /// Per-host emoji for the Host column, picked with the same searchable
+    /// picker as the workdir marks. Empty = derive one from the label.
+    pub(in crate::app) icon: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum HostField {
     Label,
     Target,
+    Icon,
     Color,
 }
 
@@ -492,11 +522,6 @@ pub(super) struct App {
     /// presses cycle through the same list rather than re-reading directories
     /// (which would fail once the text is completed past the original prefix).
     pub(super) workdir_completion: Option<WorkdirCompletion>,
-    /// `$HOME` of the workdir picker's currently-selected host, for `~`
-    /// display/expansion. Local home by default; refreshed to the remote host's
-    /// home when `Ctrl-h` switches the picker to a remote (so completion and
-    /// validation resolve against *that* machine). Empty ⇒ no `~` handling.
-    pub(super) workdir_host_home: String,
     /// A window a just-spawned session should get selection on once it appears,
     /// with the instant it was set. `reload_sessions` selects the matching row
     /// then clears it — but if the launcher dies before writing a state file the
@@ -536,14 +561,31 @@ pub(super) struct App {
     /// captain-miao created, never to an unrelated shell that happens to sit in
     /// the directory.
     pub(super) work_tabs: HashMap<(HostId, String), WorkTab>,
-    /// Cross-backend session-name index. Keyed by session id and child pid;
-    /// each `AgentControl::ALL` entry's `read_session_index` populates a
-    /// shard which is merged into this view per reload.
-    pub(super) session_index: SessionIndex,
+    /// Session-name index **per host**, never merged (§3): the shards are keyed
+    /// by bare pid, so unioning them let a remote pid collide with a local one
+    /// and hand a local row the remote's session id — which then flowed into
+    /// restart, fork, and crash recovery. Look one up with [`App::index_for`],
+    /// always keyed by the row's own host.
+    pub(super) session_indexes: HashMap<HostId, SessionIndex>,
     /// Per-host session backends, aggregated into one view. `backends[0]` is
-    /// always the local in-process backend; the rest are remote (SSH) hosts.
-    /// Reload unions their sessions (tagging each with its host) and indexes.
+    /// this machine — the in-process [`Backend::Local`], or, under
+    /// pooled-localhost, a `Remote` over a socket to the local daemon (never
+    /// both: they read the same `sessions/` dir and `collect_sessions` doesn't
+    /// dedup). The rest are remote (SSH) hosts. Reload unions their sessions,
+    /// tagging each with its host.
     pub(super) backends: Vec<Backend>,
+    /// One change-signal handle per entry of `backends`, in the same order.
+    /// Rebuilt whenever `backends` is — every backend, local included, now
+    /// reports its own changes (§5), so the run loop has no filesystem
+    /// knowledge of its own.
+    pub(super) backend_events: Vec<BackendEvents>,
+    /// Last-seen reconnect counter per remote host. A bump means the host went
+    /// Disconnected → Connected, which fires the auto-reattach sweep (§7).
+    pub(super) reconnect_epochs: HashMap<HostId, u64>,
+    /// `(host, pool_session)` pairs whose attach window the run loop should
+    /// respawn — filled by the reconnect sweep, drained like
+    /// `failed_launch_focus_queue` (the reload has no terminal access).
+    pub(super) pending_reattach: Vec<(HostId, String)>,
     /// `(host, token) → local window` for every session the dashboard has a
     /// window for — remote attaches (token = `pool_session`) and local spawns
     /// (token = `launch_id`). Populated when a session is opened, pruned when its
@@ -572,8 +614,23 @@ pub(super) struct App {
     /// Monotonic counter behind [`App::mint_launch_id`]; pid-namespaced into the
     /// token so it's unique across dashboards.
     pub(super) next_launch_id: u64,
-    /// Per-host label color for the host column, from the hosts config.
+    /// Per-host color for the host column, from the hosts config.
     pub(super) host_colors: HashMap<HostId, ratatui::style::Color>,
+    /// Per-host emoji for the host column, from the hosts config. A host with
+    /// none configured falls back to a deterministic emoji derived from its
+    /// label, so the column always reads as icons rather than truncated names.
+    pub(super) host_icons: HashMap<HostId, String>,
+    /// The host every new-session operation targets by default (`Space H`) —
+    /// `O`, a bare `o` with nothing selected, and `r`. `o` on a row and a fork
+    /// still follow *that row's* host; this is only the no-context default.
+    /// Persisted in `dashboard-overrides.json`.
+    pub(super) default_host: HostId,
+    /// Per-host recent-dir cache for the workdir picker, seeded at connect and
+    /// invalidated when a launch records a new cwd. The picker is cache-first
+    /// (§9): switching hosts must render instantly, and the rule the whole
+    /// picker follows is *never put a round trip between a keystroke and its
+    /// echo*.
+    pub(super) recent_dirs_cache: HashMap<HostId, Vec<String>>,
     pub(super) last_table_rect: Option<Rect>,
     pub(super) last_preview_rect: Option<Rect>,
     pub(super) last_detail_rect: Option<Rect>,
@@ -747,6 +804,65 @@ fn plural_sessions(n: usize) -> &'static str {
 /// Resolve a host-label color: a hex / basic name via `config::parse_color`, or
 /// one of the directory-palette names (orange/pink/teal/…) the popup offers but
 /// `parse_color` doesn't know — so every palette pick round-trips to the table.
+/// What [`App::build_backends_from_config`] produces: the backends plus the
+/// per-host display attributes the table reads. A named struct rather than a
+/// tuple because the two `HashMap`s are otherwise positionally swappable.
+pub(super) struct HostSetup {
+    pub backends: Vec<Backend>,
+    pub host_colors: HashMap<HostId, ratatui::style::Color>,
+    pub host_icons: HashMap<HostId, String>,
+}
+
+/// Start this host's daemon if it isn't already up, for pooled-localhost
+/// (§10.1). `daemon ensure` is idempotent and self-daemonizing, so this is safe
+/// to run on every dashboard start; it prints the socket path, which we ignore
+/// (the path is a shared constant — `state::server_sock_path`).
+///
+/// Errors when the server binary isn't installed, which is the case worth
+/// reporting: pooled mode is opt-in, so a user who set the flag and has no
+/// `miao-server` wants to know rather than silently get direct-local.
+fn ensure_local_daemon() -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("miao-server")
+        .args(["daemon", "ensure"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run `miao-server daemon ensure`: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`miao-server daemon ensure` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The `HostId` this machine's pooled backend is tagged with. Not `"local"` —
+/// that label is reserved for the in-process backend and gates behaviour
+/// (`is_local()`) that a pooled session genuinely doesn't want.
+fn local_host_label() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "this-host".to_string())
+}
+
+/// Title for the resume picker, naming the host it is listing — the scope is
+/// part of the question, since `Ctrl-h` switches it (§9).
+fn resume_picker_title(host: &HostId) -> String {
+    if host.is_local() {
+        "Resume Session".to_string()
+    } else {
+        format!("Resume Session on {}", host.0)
+    }
+}
+
 fn host_color(name: &str) -> Option<ratatui::style::Color> {
     crate::config::parse_color(name)
         .or_else(|| format::dir_color_index(name).map(|i| format::DIR_COLORS[i].1))
@@ -791,7 +907,14 @@ impl App {
         let status_msg = (!warnings.is_empty()).then(|| warnings.join("; "));
         let status_is_error = status_msg.is_some();
 
-        let (backends, host_colors) = Self::build_backends_from_config();
+        let HostSetup {
+            mut backends,
+            host_colors,
+            host_icons,
+        } = Self::build_backends_from_config();
+        // Every backend reports its own changes now (§5), so the run loop needs
+        // no filesystem watcher of its own; subscribe once, here.
+        let backend_events = backends.iter_mut().map(Backend::subscribe).collect();
 
         Self {
             sessions: Vec::new(),
@@ -830,19 +953,24 @@ impl App {
             directory_marks: HashMap::new(),
             recent_cwds: Vec::new(),
             workdir_completion: None,
-            workdir_host_home: String::new(),
             pending_focus_window: None,
             failed_launch_focus_queue: Vec::new(),
             reap_window_queue: Vec::new(),
             window_tab_cache: HashMap::new(),
             work_tabs: HashMap::new(),
-            session_index: SessionIndex::default(),
+            session_indexes: HashMap::new(),
             backends,
+            backend_events,
+            reconnect_epochs: HashMap::new(),
+            pending_reattach: Vec::new(),
             window_bindings: bindings::WindowBindings::default(),
             terminal_identity: crate::terminal::get().identity(),
             foreign_bindings: Vec::new(),
             next_launch_id: 0,
             host_colors,
+            host_icons,
+            default_host: HostId::local(),
+            recent_dirs_cache: HashMap::new(),
             last_table_rect: None,
             last_preview_rect: None,
             last_detail_rect: None,
@@ -935,6 +1063,69 @@ impl App {
         if changed {
             self.save_overrides();
         }
+    }
+
+    /// Adopt the flags a host serves for its own sessions (§9).
+    ///
+    /// Pins and mutes for a pooled host live in that host's sidecar, not in this
+    /// dashboard's `dashboard-overrides.json`, so every dashboard attached to
+    /// the host — and a phone-ssh user on the box itself — sees the same ones,
+    /// and they survive a dashboard restart. `App.flags` stays the single
+    /// in-memory source the sort and filter read; this just keeps it in step
+    /// with what the host says. `pin_seq` is deliberately *not* adopted: pin
+    /// ordering is a local presentation concern, so a locally-issued sequence
+    /// number is kept when the flag itself doesn't change.
+    fn adopt_host_flags(&mut self) {
+        let served: Vec<(FlagKey, HostSessionFlags)> = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.flags.map(|f| (flag_key(s), f)))
+            .collect();
+        for (key, host_flags) in served {
+            let mine = self.flags_of(&key);
+            if mine.pinned == host_flags.pinned
+                && mine.muted == host_flags.muted
+                && mine.follow_up == host_flags.follow_up
+            {
+                continue;
+            }
+            // Newly pinned by someone else: issue a local sequence number so it
+            // sorts among this dashboard's pins like any other.
+            let seq = if host_flags.pinned && !mine.pinned {
+                self.next_pin_seq = self.next_pin_seq.wrapping_add(1);
+                self.next_pin_seq
+            } else {
+                mine.pin_seq
+            };
+            self.update_flags(key, move |f| {
+                f.pinned = host_flags.pinned;
+                f.muted = host_flags.muted;
+                f.follow_up = host_flags.follow_up;
+                f.pin_seq = seq;
+            });
+        }
+    }
+
+    /// Push a session's flags to its host when that host owns them, so the
+    /// change reaches every other dashboard watching it. Returns whether the
+    /// host took them — `false` means "this host doesn't serve flags", the
+    /// caller's signal to persist them in `dashboard-overrides.json` instead.
+    fn publish_flags(&self, key: &FlagKey, flags: SessionFlags) -> bool {
+        let (host, pid) = key;
+        let Some(backend) = self.backend_for(host) else {
+            return false;
+        };
+        if !backend.capabilities().pooled {
+            return false;
+        }
+        let wire = HostSessionFlags {
+            pinned: flags.pinned,
+            muted: flags.muted,
+            follow_up: flags.follow_up,
+        };
+        tokio::task::block_in_place(|| {
+            backend.set_session_flags(&SessionKey::from_launcher_pid(*pid), wire)
+        })
     }
 
     /// Mutate a session's flags; removes the entry entirely if the result is
@@ -1031,6 +1222,7 @@ impl App {
         overrides.prevent_sleep = Some(self.prevent_sleep_enabled);
         overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
         overrides.sessions_layout = Some(self.sessions_layout.label().to_string());
+        overrides.default_host = Some(self.default_host.0.clone());
         let _ = state::write_json_atomic(&state::dashboard_overrides_path(), &overrides);
     }
 
@@ -1073,6 +1265,11 @@ impl App {
             .and_then(AgentControl::from_cli)
         {
             self.new_session_agent = a;
+        }
+        if let Some(h) = overrides.default_host.filter(|h| !h.is_empty()) {
+            // Kept even when that host isn't currently configured — the user may
+            // re-add it. `default_host_or_local` resolves the fallback at use.
+            self.default_host = HostId(h);
         }
         if let Some(l) = overrides
             .sessions_layout
@@ -1184,6 +1381,35 @@ impl App {
         self.input_mode = InputMode::Picker;
     }
 
+    /// Open the default-host picker (`Space H`) — the exact analog of the
+    /// default-agent one. Every new-session operation with no row context (`O`,
+    /// a bare `o`, `r`) targets whatever this selects, which is what let the
+    /// cross-host unions go away: each picker's scope is now a stated default
+    /// rather than "everything, merged" (§9).
+    pub(super) fn open_default_host_picker(&mut self) {
+        let current = self.default_host_or_local();
+        let hosts: Vec<(HostId, ConnState)> = self.host_states();
+        let items: Vec<PickerItem> = hosts
+            .iter()
+            .map(|(host, state)| {
+                let mut item = PickerItem::new(host.0.clone()).with_payload(host.0.clone());
+                if !state.is_connected() {
+                    item = item.with_secondary(state.label().to_string());
+                }
+                item.with_prefix(self.host_icon(host), self.host_label_color(host))
+            })
+            .collect();
+        let mut picker = Picker::new("Default host for new sessions", items);
+        if let Some(idx) = hosts.iter().position(|(h, _)| h == &current) {
+            picker.cursor = idx;
+        }
+        self.picker = Some(ActivePicker {
+            picker,
+            kind: PickerKind::DefaultHost,
+        });
+        self.input_mode = InputMode::Picker;
+    }
+
     /// Open the searchable emoji picker over the directory-mark editor. Every
     /// emoji (one representative per skin-tone family, courtesy of
     /// `emojis::iter`) becomes a row keyed by its CLDR name + shortcode, so the
@@ -1207,6 +1433,23 @@ impl App {
         self.input_mode = InputMode::Picker;
     }
 
+    /// The same emoji picker, opened from the **hosts panel**'s Icon field.
+    /// Per-host icons are configured exactly like the workdir ones (§9), so they
+    /// share the picker rather than growing a second, near-identical one; the
+    /// only difference is where the result lands and which mode we return to.
+    pub(super) fn open_emoji_picker_for_host(&mut self) {
+        if self.host_edit.is_none() {
+            return;
+        }
+        let picker =
+            Picker::new("Emoji", emoji_picker_items()).with_placeholder("Search emoji by name…");
+        self.picker = Some(ActivePicker {
+            picker,
+            kind: PickerKind::HostEmoji,
+        });
+        self.input_mode = InputMode::Picker;
+    }
+
     /// Write the emoji `payload` of a submitted emoji-picker row into the
     /// directory-mark editor's icon field, then hand control back to the
     /// editor. No-op (beyond returning to the editor) if the dir-edit state
@@ -1219,9 +1462,27 @@ impl App {
         self.input_mode = InputMode::DirEdit;
     }
 
+    /// The hosts-panel counterpart of [`App::apply_emoji_pick`]: drop the glyph
+    /// into the selected host row's icon field and return to the panel.
+    pub(super) fn apply_host_emoji_pick(&mut self, emoji: &str) {
+        if let Some(state) = self.host_edit.as_mut() {
+            let cursor = state.cursor;
+            if let Some(r) = state.rows.get_mut(cursor) {
+                r.icon = emoji.to_string();
+            }
+            state.focus = HostField::Icon;
+        }
+        self.input_mode = InputMode::HostEdit;
+    }
+
+    /// Seed this machine's recent-dir list from its backend (which collapses
+    /// each entry to the host-canonical `~` form on the way out, so a list
+    /// written by an older build is migrated on read). Only meaningful for a
+    /// direct-local backend — under pooled-localhost the list lives behind the
+    /// daemon and is fetched through the per-host cache like any other host's.
     pub(super) fn load_recent_cwds(&mut self) {
-        if let Some(recent) = state::read_json::<state::RecentCwds>(&state::recent_cwds_path()) {
-            self.recent_cwds = recent.cwds;
+        if matches!(self.backends.first(), Some(Backend::Local(_))) {
+            self.recent_cwds = self.backends[0].recent_dirs();
         }
     }
 
@@ -1320,18 +1581,34 @@ impl App {
         self.input_mode = InputMode::DirEdit;
     }
 
-    /// Build the backend set from `hosts.json`: `backends[0]` local, then one
-    /// `RemoteBackend` per host with a `socket` (the ssh-target branch lands in
-    /// the ssh-transport slice). Returns the backends plus the host-label colors.
+    /// Build the backend set: `backends[0]` is **this machine**, then one
+    /// `RemoteBackend` per configured host. Returns the backends plus the
+    /// per-host colors and icons.
+    ///
+    /// `backends[0]` is normally the in-process [`Backend::local`]. Under
+    /// **pooled-localhost** (`[launcher] pooled = true`) it is instead a
+    /// `RemoteBackend` over a `LocalSocket` to this host's own daemon, which
+    /// **replaces** the local backend rather than joining it — both would read
+    /// the same `sessions/` dir and `collect_sessions` doesn't dedup, so every
+    /// row would appear twice. That one substitution is what closes the
+    /// on-server-zellij attach gap (§10.1): every session then starts in the
+    /// pool, so a zellij pane and a laptop dashboard are both just attach
+    /// clients, and a session survives the zellij server and the seat logout.
     ///
     /// Without the `remote` feature ([`REMOTE_ENABLED`]) this stops at the local
     /// backend: `hosts.json` is never read, so no remote connection task is ever
-    /// spawned and every row is local.
-    fn build_backends_from_config() -> (Vec<Backend>, HashMap<HostId, ratatui::style::Color>) {
-        let mut backends = vec![Backend::local()];
+    /// spawned and every row is local. Pooled-localhost is deliberately *not*
+    /// gated by it — it uses no ssh and is opt-in by its own config flag.
+    fn build_backends_from_config() -> HostSetup {
         let mut host_colors: HashMap<HostId, ratatui::style::Color> = HashMap::new();
+        let mut host_icons: HashMap<HostId, String> = HashMap::new();
+        let mut backends = vec![Self::this_machine_backend()];
         if !REMOTE_ENABLED {
-            return (backends, host_colors);
+            return HostSetup {
+                backends,
+                host_colors,
+                host_icons,
+            };
         }
         for h in hosts::load_hosts() {
             let host = HostId(h.label.clone());
@@ -1344,8 +1621,13 @@ impl App {
             if let Some(c) = h.color.as_deref().and_then(host_color) {
                 host_colors.insert(host.clone(), c);
             }
+            if let Some(icon) = h.icon.filter(|i| !i.trim().is_empty()) {
+                host_icons.insert(host.clone(), icon);
+            }
             if let Some(sock) = h.socket {
-                let t = Transport::Socket(std::path::PathBuf::from(sock));
+                // A configured socket path is a daemon on *this* machine (a
+                // manual forward, or a test rig) — see `Transport::LocalSocket`.
+                let t = Transport::LocalSocket(std::path::PathBuf::from(sock));
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             } else if let Some(target) = h.ssh {
                 // One short, OS-limit-safe local socket per host; ssh forwards
@@ -1355,16 +1637,55 @@ impl App {
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             }
         }
-        (backends, host_colors)
+        HostSetup {
+            backends,
+            host_colors,
+            host_icons,
+        }
     }
 
-    /// Tear down the remote backends and rebuild from the current `hosts.json`
-    /// (dropping a `Backend::Remote` ends its connection task). Called after the
-    /// hosts popup saves.
+    /// The backend for the machine the dashboard runs on: in-process by default,
+    /// or a client of this host's own daemon under pooled-localhost. See
+    /// [`App::build_backends_from_config`] for why the two never coexist.
+    ///
+    /// The pooled arm bootstraps the daemon first (`daemon ensure`, idempotent
+    /// and self-daemonizing) so the very first connect finds it listening; if
+    /// the server binary isn't installed we fall back to the direct-local
+    /// backend rather than leaving the user with an empty dashboard.
+    fn this_machine_backend() -> Backend {
+        if !crate::config::get().launcher.pooled {
+            return Backend::local();
+        }
+        if let Err(e) = ensure_local_daemon() {
+            tracing::warn!("pooled mode requested but the local daemon is unavailable: {e}");
+            return Backend::local();
+        }
+        // A hostname-based id, since "local" is reserved for the in-process
+        // backend and `is_local()` gates behaviour that no longer applies (these
+        // sessions *are* pooled, so they detach, reattach, and can be stolen).
+        let host = HostId(local_host_label());
+        Backend::Remote(RemoteBackend::connect(
+            Transport::LocalSocket(state::server_sock_path()),
+            host,
+        ))
+    }
+
+    /// Tear down the backends and rebuild from the current `hosts.json`
+    /// (dropping a `Backend::Remote` ends its connection task), then re-subscribe
+    /// to each one's change signal. Called after the hosts panel mutates.
     fn rebuild_remote_backends(&mut self) {
-        let (backends, host_colors) = Self::build_backends_from_config();
+        let HostSetup {
+            mut backends,
+            host_colors,
+            host_icons,
+        } = Self::build_backends_from_config();
+        self.backend_events = backends.iter_mut().map(Backend::subscribe).collect();
         self.backends = backends;
         self.host_colors = host_colors;
+        self.host_icons = host_icons;
+        // Stale per-host caches would otherwise outlive the host they describe.
+        self.recent_dirs_cache.clear();
+        self.reconnect_epochs.clear();
         self.mark_dirty();
     }
 
@@ -1379,6 +1700,7 @@ impl App {
                     .unwrap_or(0),
                 is_socket: h.socket.is_some(),
                 target: h.socket.or(h.ssh).unwrap_or_default(),
+                icon: h.icon.unwrap_or_default(),
                 label: h.label,
             })
             .collect::<Vec<_>>();
@@ -1386,20 +1708,29 @@ impl App {
             cursor: 0,
             editing: false,
             focus: HostField::Label,
+            pending_remove: None,
             rows,
         });
         self.input_mode = InputMode::HostEdit;
     }
 
-    /// Persist the popup's host rows and reconnect the backends.
-    pub(super) fn commit_host_edit(&mut self) {
-        let Some(state) = self.host_edit.take() else {
+    /// Persist the panel's host rows and reconnect the backends **without
+    /// closing the panel** (§9).
+    ///
+    /// The old flow staged every edit behind a separate `s` Save, which was one
+    /// more thing to forget — and, worse, meant a freshly added host showed no
+    /// connection state until you'd saved and reopened. Now every mutation
+    /// persists as it happens (add, edit-commit, confirmed remove), so the
+    /// panel's live conn-state column animates the new host connecting in place.
+    pub(super) fn apply_host_edits(&mut self) {
+        let Some(state) = self.host_edit.as_ref() else {
             return;
         };
         let configs: Vec<hosts::HostConfig> = state
             .rows
-            .into_iter()
-            // Drop blank rows and any that alias the reserved `local` host.
+            .iter()
+            // Drop blank rows (a half-typed one being added) and any that alias
+            // the reserved `local` host.
             .filter(|r| {
                 !r.label.trim().is_empty()
                     && !r.target.trim().is_empty()
@@ -1407,7 +1738,9 @@ impl App {
             })
             .map(|r| {
                 let target = r.target.trim().to_string();
+                let icon = r.icon.trim().to_string();
                 hosts::HostConfig {
+                    icon: (!icon.is_empty()).then_some(icon),
                     label: r.label.trim().to_string(),
                     color: Some(format::DIR_COLORS[r.color_idx].0.to_string()),
                     socket: r.is_socket.then(|| target.clone()),
@@ -1417,10 +1750,11 @@ impl App {
             .collect();
         hosts::save_hosts(&configs);
         self.rebuild_remote_backends();
-        self.input_mode = InputMode::Normal;
     }
 
-    pub(super) fn cancel_host_edit(&mut self) {
+    /// Close the hosts panel. Edits are already persisted (see
+    /// [`App::apply_host_edits`]), so this is just "I'm done looking".
+    pub(super) fn close_host_edit(&mut self) {
         self.host_edit = None;
         self.input_mode = InputMode::Normal;
     }
@@ -1478,7 +1812,7 @@ impl App {
                     return None;
                 }
                 let window_id = self.window_id_for_session(s)?;
-                let session_id = self.session_index.live_session_id(s)?.to_string();
+                let session_id = self.index_of(s).live_session_id(s)?.to_string();
                 Some(SessionSnapshotEntry {
                     agent: s.agent,
                     launcher_pid: s.launcher_pid,
@@ -1628,7 +1962,25 @@ impl App {
         let prev_sessions = std::mem::replace(&mut self.sessions, fresh);
         let reaped = self.reap_departed_windows(&prev_sessions);
         self.reap_window_queue.extend(reaped);
-        self.session_index = self.refresh_session_index();
+        self.session_indexes = self.refresh_session_indexes();
+        // Adopt the host-owned flags for rows whose host serves them, so every
+        // dashboard watching that host agrees about pins and mutes (§9). Done
+        // before the follow-up transitions below, which read `flags_of`.
+        self.adopt_host_flags();
+        // Forget attach expectations for sessions their host no longer reports,
+        // then queue reattaches for any host that just came back (§7).
+        let live_bindings: HashSet<bindings::BindingKey> = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                Some(bindings::BindingKey {
+                    host: s.host.clone(),
+                    token: s.binding_token()?.to_string(),
+                })
+            })
+            .collect();
+        self.window_bindings.retain_expected(&live_bindings);
+        self.sweep_reconnected_hosts();
         // Auto-mark follow_up on Active→Idle and Compacting→Compacted
         // transitions, and clear it when a session goes back to Active — the
         // user has re-engaged, so any stale attention flag is obsolete.
@@ -1789,7 +2141,7 @@ impl App {
                         || s.last_prompt.as_deref().is_some_and(|p| contains_ci(p, q))
                         || contains_ci(s.status.label(), q)
                         || self
-                            .session_index
+                            .index_of(s)
                             .lookup(s)
                             .is_some_and(|n| contains_ci(n, q))
                 }
@@ -1812,13 +2164,19 @@ impl App {
             // follow-up — sorted by updated_at like the other attention tiers.
             let review_pending = matches!(s.status, SessionStatus::ReviewPending);
             let attention = s.status.needs_attention() && !review_pending;
+            // A pooled session with no window on this screen sinks below plain
+            // idle — it's running somewhere else, so it shouldn't compete for
+            // the eye with what's in front of you. An attention state still
+            // outranks: a parked approval prompt is urgent regardless of
+            // whether a window happens to be bound (§9).
+            let detached = self.is_detached_row(s);
             // Ranks 1–3 partition exactly what `is_attention_row` unions (an
             // unmuted needs-attention or at-rest follow-up row); kept split here
             // because ordering needs the finer tiers. If the predicate there
             // changes, revisit this arithmetic to keep the jump target and the
             // sort in agreement.
             let rank: u8 = if flags.muted {
-                6
+                7
             } else if flags.pinned {
                 0
             } else if attention {
@@ -1827,6 +2185,8 @@ impl App {
                 2
             } else if review_pending {
                 3
+            } else if detached {
+                6
             } else if !active {
                 4
             } else {
@@ -1867,57 +2227,93 @@ impl App {
             let host = backend.host_id();
             for mut s in backend.list_sessions() {
                 s.host = host.clone();
-                out.push(s);
+                // Drop rows this dashboard could only stare at — see
+                // `is_actionable_row`. Filtered here, at the single point every
+                // row enters the dashboard, so nothing downstream has to know.
+                if self.is_actionable_row(&s) {
+                    out.push(s);
+                }
             }
         }
         out
     }
 
-    /// The session-name index unioned across every backend. The merge + per-agent
-    /// caching lives in each backend; the dashboard just unions the shards. Names
-    /// no longer need a client-side overlay — Claude renames and Codex titles both
-    /// ride `LauncherState.name`, folded by each session's launcher.
-    fn refresh_session_index(&mut self) -> SessionIndex {
-        let mut merged = SessionIndex::default();
-        for backend in &mut self.backends {
-            let shard = backend.session_index();
-            merged.by_pid.extend(shard.by_pid);
-            merged.by_pid_owner.extend(shard.by_pid_owner);
-            merged.by_session_id.extend(shard.by_session_id);
-            merged.session_id_by_pid.extend(shard.session_id_by_pid);
-        }
-        merged
-    }
-
-    /// The local in-process backend (`backends[0]`, always present). Spawn-based
-    /// ops (new/resume/restart) and the resume list use it directly for now —
-    /// they create local Kitty windows, which remote sessions don't have yet.
-    pub(super) fn local_backend(&self) -> &Backend {
-        &self.backends[0]
-    }
-
-    /// The backend that owns `host`, falling back to local — so a kill routes to
-    /// the right host (an RPC for a remote, a signal for local).
-    pub(super) fn backend_for(&self, host: &HostId) -> &Backend {
+    /// Refresh each backend's session-name index, keyed **by host**.
+    ///
+    /// Deliberately not merged (§3): the shards map bare pids to names and
+    /// session ids, so unioning them made a remote pid that happened to match a
+    /// local one hand the local row the remote's identity — which then flowed
+    /// straight into restart, fork, and crash recovery. Keeping them separate
+    /// makes the collision unrepresentable rather than merely unlikely.
+    fn refresh_session_indexes(&mut self) -> HashMap<HostId, SessionIndex> {
         self.backends
-            .iter()
-            .find(|b| &b.host_id() == host)
-            .unwrap_or(&self.backends[0])
+            .iter_mut()
+            .map(|b| (b.host_id(), b.session_index()))
+            .collect()
     }
 
-    /// Remote hosts that aren't currently `Connected`, paired with their state,
-    /// for the header's connection surface. A disconnected host clears its
-    /// mirror (no rows), so this is the only place its state is visible. Local
-    /// is always connected and never listed.
+    /// The session-name index for `host` — the only correct way to read one,
+    /// since an index is meaningful solely against its own host's pids. An
+    /// unknown host yields a shared empty index, which degrades to "no cached
+    /// name", never to another host's.
+    pub(super) fn index_for(&self, host: &HostId) -> &SessionIndex {
+        static EMPTY: OnceLock<SessionIndex> = OnceLock::new();
+        self.session_indexes
+            .get(host)
+            .unwrap_or_else(|| EMPTY.get_or_init(SessionIndex::default))
+    }
+
+    /// The index for a session's own host — the common case, spelled once.
+    pub(super) fn index_of(&self, s: &LauncherState) -> &SessionIndex {
+        self.index_for(&s.host)
+    }
+
+    /// The backend that owns `host`, or `None` when no such host is configured.
+    ///
+    /// Deliberately not a fallback to `backends[0]` (§9's one correctness-grade
+    /// leak): a row carrying a `HostId` for a host that has since been removed
+    /// would silently target *localhost* instead — a kill or an open aimed at
+    /// the wrong machine. Callers surface the miss; there is no safe guess.
+    pub(super) fn backend_for(&self, host: &HostId) -> Option<&Backend> {
+        self.backends.iter().find(|b| &b.host_id() == host)
+    }
+
+    /// Remote hosts that aren't currently `Connected`, paired with their state.
+    /// A disconnected host clears its mirror (no rows), so this is the only
+    /// place its state is visible. The header shows only the *count* of these —
+    /// per-host detail (including a `Failed` reason) lives one `Space h` away in
+    /// the hosts panel, so the header stays glanceable at any host count (§9).
     pub(super) fn unhealthy_hosts(&self) -> Vec<(HostId, ConnState)> {
         self.backends
             .iter()
-            .filter(|b| !b.host_id().is_local())
+            .skip(1) // backends[0] is this machine; it is never "unreachable"
             .filter_map(|b| match b.conn_state() {
                 ConnState::Connected => None,
                 st => Some((b.host_id(), st)),
             })
             .collect()
+    }
+
+    /// Every configured host paired with its live connection state — the hosts
+    /// panel's rows, in `backends` order (this machine first).
+    pub(super) fn host_states(&self) -> Vec<(HostId, ConnState)> {
+        self.backends
+            .iter()
+            .map(|b| (b.host_id(), b.conn_state()))
+            .collect()
+    }
+
+    /// Sessions currently on `host`, split into `(running, attached)` — the
+    /// counts the hosts panel shows. `attached` counts rows this dashboard holds
+    /// a window for, which is the number that answers "what am I actually
+    /// looking at on that box".
+    pub(super) fn host_session_counts(&self, host: &HostId) -> (usize, usize) {
+        let rows: Vec<&LauncherState> = self.sessions.iter().filter(|s| &s.host == host).collect();
+        let attached = rows
+            .iter()
+            .filter(|s| self.window_id_for_session(s).is_some())
+            .count();
+        (rows.len(), attached)
     }
 
     /// Record the local window the dashboard just opened for a session, keyed by
@@ -2072,24 +2468,27 @@ impl App {
             if self.foreign_terminal(s).is_some() {
                 continue;
             }
-            if !s.host.is_local() && self.backend_for(&s.host).conn_state() != ConnState::Connected
+            // A departed row on a host that is merely *unreachable* is not
+            // evidence the session died: a disconnect clears the mirror (every
+            // row departs) while the pooled session and its local attach window
+            // live on, and reconnect brings the row back. A host that's gone
+            // from the configuration entirely can't bring anything back, so its
+            // orphaned window is reaped.
+            if self
+                .backend_for(&s.host)
+                .is_some_and(|b| !b.conn_state().is_connected())
             {
                 continue;
             }
             // Only windows the dashboard itself created are reaped, and the
-            // binding (a local `--launch-id` spawn or a remote pool attach) is
-            // that proof: removing it yields the window and retires the stale
-            // entry in one step (a local `launch_id` binding has no other
-            // collector — `prune_dead` runs only for remote attachments). A
-            // token-less hand-launched row resolves only through its
-            // self-reported window id, which names the user's own pane, not
-            // dashboard terrain — never closed.
-            let token = if s.host.is_local() {
-                s.launch_id.clone()
-            } else {
-                s.pool_session.clone()
-            };
-            if let Some(token) = token
+            // binding (a local `--launch-id` spawn or a pool attach) is that
+            // proof: removing it yields the window and retires the stale entry
+            // in one step (a local `launch_id` binding has no other collector —
+            // `prune_dead` runs only for attachments). A token-less
+            // hand-launched row resolves only through its self-reported window
+            // id, which names the user's own pane, not dashboard terrain —
+            // never closed.
+            if let Some(token) = s.binding_token().map(str::to_string)
                 && let Some(wid) = self.window_bindings.remove(&s.host, &token)
             {
                 reaped.push(wid);
@@ -2180,15 +2579,10 @@ impl App {
                 // local row, so only same-terminal (and remote-attach) rows reach
                 // here — stamp each with this dashboard's own identity.
                 let window_id = self.window_id_for_session(s)?;
-                // The token the row carries home — its `launch_id` (local) or
-                // `pool_session` (remote). A token-less (hand-launched) session
-                // has none; key the bell projection on its self-reported window
-                // with an empty token (the bell only needs window → pid).
-                let token = if s.host.is_local() {
-                    s.launch_id.clone().unwrap_or_default()
-                } else {
-                    s.pool_session.clone()?
-                };
+                // The token the row carries home. A token-less (hand-launched)
+                // session has none; key the bell projection on its self-reported
+                // window with an empty token (the bell only needs window → pid).
+                let token = s.binding_token().unwrap_or_default().to_string();
                 Some(state::WindowBinding {
                     window_id,
                     host: s.host.0.clone(),
@@ -2271,12 +2665,7 @@ impl App {
         if self.foreign_terminal(s).is_some() {
             return None;
         }
-        let token = if s.host.is_local() {
-            s.launch_id.as_deref()
-        } else {
-            s.pool_session.as_deref()
-        };
-        if let Some(t) = token {
+        if let Some(t) = s.binding_token() {
             return self.window_bindings.window_for(&s.host, t).cloned();
         }
         // Token-less: only a local session can self-report a window to fall back
@@ -2315,22 +2704,107 @@ impl App {
         if let Some(wid) = self.window_id_for_session(s) {
             return Some(Action::FocusWindow(wid));
         }
-        if s.host.is_local() {
-            return None; // local session with no window — nothing to focus
-        }
-        match &s.pool_session {
-            Some(pool) => Some(Action::AttachRemoteRunning {
+        // A detached pooled session: attach-then-focus *immediately*, so the
+        // user watches the ssh progress in the window rather than staring at a
+        // frozen dashboard (§9 — today's behavior, now the explicit contract).
+        // A row with no pool session can't be here: `collect_sessions` filters
+        // those out entirely (see `is_actionable_row`).
+        // A local, unpooled session with no window yields `None` — nothing to
+        // focus and nothing to attach to.
+        s.pool_session
+            .as_ref()
+            .map(|pool| Action::AttachRemoteRunning {
                 host: s.host.clone(),
                 pool_session: pool.clone(),
-            }),
-            None => {
-                self.set_status(
-                    "Remote session isn't attachable yet (no pool session)".to_string(),
-                    true,
-                );
-                None
-            }
+                force: false,
+            })
+    }
+
+    /// Whether a row is one this dashboard can act on, and therefore worth a
+    /// slot in the list (§9).
+    ///
+    /// The case this excludes: a session on a remote host that isn't in that
+    /// host's pty pool — one the *server's own* dashboard spawned into a zellij
+    /// pane. The daemon's snapshot is every state file, pooled or not, so such
+    /// rows do arrive; but there is no pool session to attach to, so `Enter`
+    /// dead-ends. The review challenged hiding them (an attention state on a
+    /// hidden row goes invisible remotely) and reaffirmed it: **the dashboard is
+    /// for actionable sessions** — a row this dashboard can neither attach nor
+    /// act on doesn't earn a slot, the hosts panel's session count keeps them
+    /// countable, and the host's own dashboard remains their surface.
+    ///
+    /// (If this ever needs softening, the recorded refinement is: hide *unless*
+    /// the row has an attention state.)
+    fn is_actionable_row(&self, s: &LauncherState) -> bool {
+        // Sessions on this machine are always actionable: an unpooled one *is*
+        // its window, and a pooled one is reachable through the local pool.
+        if s.host == self.backends[0].host_id() {
+            return true;
         }
+        s.pool_session.is_some()
+    }
+
+    /// A pooled session on another host that this dashboard currently holds no
+    /// window for. It sorts into its own tier at the bottom of the list and
+    /// carries its own icon, so "still running over there, just not on my
+    /// screen" reads differently from "idle in front of me" (§9).
+    pub(super) fn is_detached_row(&self, s: &LauncherState) -> bool {
+        s.pool_session.is_some() && self.window_id_for_session(s).is_none()
+    }
+
+    /// Queue an attach window for every session on a just-reconnected host that
+    /// the dashboard expects to be attached to but isn't (§7).
+    ///
+    /// Fires on the `Disconnected → Connected` edge only, tracked by each
+    /// backend's reconnect epoch, so a laptop-sleep or broken-pipe reconnect
+    /// restores the whole working set in one go — while a session the user
+    /// deliberately detached with `D` stays detached (the `D` cleared its
+    /// expectation).
+    pub(super) fn sweep_reconnected_hosts(&mut self) {
+        let epochs: Vec<(HostId, u64)> = self
+            .backends
+            .iter()
+            .filter_map(|b| match b {
+                Backend::Remote(r) => Some((b.host_id(), r.reconnect_epoch())),
+                Backend::Local(_) => None,
+            })
+            .collect();
+        for (host, epoch) in epochs {
+            let previous = self.reconnect_epochs.insert(host.clone(), epoch);
+            let targets = self.reattach_targets(&host, previous, epoch);
+            self.pending_reattach
+                .extend(targets.into_iter().map(|t| (host.clone(), t)));
+        }
+    }
+
+    /// The reattach work list for one host: empty unless its reconnect epoch
+    /// actually advanced, then every session the dashboard expects to be
+    /// attached to, holds no window for, and the host still reports as running.
+    ///
+    /// Split out from [`App::sweep_reconnected_hosts`] so the edge condition is
+    /// unit-testable without a live connection task — `previous == None` is the
+    /// host's *first* sighting (the initial connect, whose recovery is the
+    /// binding re-seed's job), not a reconnect.
+    pub(super) fn reattach_targets(
+        &self,
+        host: &HostId,
+        previous: Option<u64>,
+        epoch: u64,
+    ) -> Vec<String> {
+        if previous.is_none_or(|p| p == epoch) {
+            return Vec::new();
+        }
+        let live: HashSet<&str> = self
+            .sessions
+            .iter()
+            .filter(|s| &s.host == host)
+            .filter_map(|s| s.pool_session.as_deref())
+            .collect();
+        self.window_bindings
+            .expected_without_window(host)
+            .into_iter()
+            .filter(|t| live.contains(t.as_str()))
+            .collect()
     }
 
     /// Focus (or attach to) the currently selected session — the shared body
@@ -2462,6 +2936,14 @@ impl App {
             }
         };
 
+        // If the row's host owns its flags, push the change there so every other
+        // dashboard watching that host sees it too; otherwise it's ours to
+        // persist locally. Either way the in-memory value above already applied,
+        // so the UI responds immediately and a failed push just isn't shared.
+        if !self.publish_flags(&key, self.flags_of(&key)) {
+            self.save_overrides();
+        }
+
         let len = self.visible_len();
         if len > 0 {
             let target = match (flag, now_on) {
@@ -2571,25 +3053,24 @@ impl App {
     /// `request_restart_selected` surfaces the `Err` verbatim; the restart-all
     /// path just filters on `.ok()`.
     pub(super) fn restart_spec_for(&self, s: &LauncherState) -> Result<RestartSpec, &'static str> {
-        // Restart re-launches a *local* Kitty window and SIGTERMs a *local* pid;
-        // a remote session's window_id/child_pid mean nothing here, so never
-        // build a spec for one (guards both the selected and restart-all paths).
-        if !s.host.is_local() {
-            return Err("Only local sessions can be restarted");
-        }
+        // Restart is kill + reopen **on the row's own host** — the seam already
+        // carries `resume: (session_id, fork)`, so the old local-only gate was
+        // never a limitation of the design, just a gap in the plumbing (§9).
+        // A remote restart lands in that host's pool and auto-attaches like any
+        // open.
         if !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted) {
             return Err("Cannot restart: session must be idle (not active or waiting)");
         }
-        let (Some(window_id), Some(session_id)) = (
-            self.window_id_for_session(s),
-            self.session_index.live_session_id(s).map(str::to_string),
-        ) else {
-            return Err("Cannot restart: session is missing window id or session id");
+        let Some(session_id) = self.index_of(s).live_session_id(s).map(str::to_string) else {
+            return Err("Cannot restart: session has no session id yet");
         };
         Ok(RestartSpec {
             agent: s.agent,
-            child_pid: s.child_pid.unwrap_or(s.launcher_pid),
-            window_id,
+            host: s.host.clone(),
+            key: s.key(),
+            // `None` for a detached pooled session: there is no local window to
+            // close, and the old pty is torn down by the kill on its own host.
+            window_id: self.window_id_for_session(s),
             cwd: s.cwd.clone(),
             session_id,
             flags: self.flags_of(&flag_key(s)),
@@ -2619,7 +3100,7 @@ impl App {
         // Clip to the table's name budget so the prompt matches the row label
         // (the panels that can afford the full name show it untruncated).
         let name = format::truncate_str(
-            &format::session_display_name(&s, &self.session_index, &self.random_names),
+            &format::session_display_name(&s, self.index_of(&s), &self.random_names),
             crate::config::get().ui.table.name_truncate,
         );
         self.pending_confirm = Some(PendingConfirm {
@@ -2638,16 +3119,15 @@ impl App {
             self.set_status("No sessions to restart".to_string(), false);
             return;
         }
-        // Only local sessions are restartable (see restart_spec_for); a busy
-        // remote session must not block restarting the local ones.
+        // Restart-all exists to get every agent onto a new binary at once, so a
+        // partial run defeats the point: refuse while anything is busy.
         if self
             .sessions
             .iter()
-            .filter(|s| s.host.is_local())
             .any(|s| !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted))
         {
             self.set_status(
-                "Cannot restart all: every local session must be idle".to_string(),
+                "Cannot restart all: every session must be idle".to_string(),
                 true,
             );
             return;
@@ -2696,7 +3176,11 @@ impl App {
         // 2. The session's name in the agent's session manifest.
         // 3. First real user prompt from the transcript.
         // 4. Synthetic `(session XXXXXXXX)` fallback.
-        let saved_name = self.session_index.by_session_id.get(&c.session_id).cloned();
+        let saved_name = self
+            .index_for(host)
+            .by_session_id
+            .get(&c.session_id)
+            .cloned();
         let primary = c
             .custom_title
             .clone()
@@ -2755,64 +3239,37 @@ impl App {
     /// Open the resume-session picker populated from the given candidates.
     /// Builds each `PickerItem`'s filter text from title + cwd + branch so the
     /// telescope-style filter matches the same fields the old direct filter did.
-    pub(super) fn open_resume_picker(&mut self, candidates: Vec<(HostId, ResumeCandidate)>) {
+    pub(super) fn open_resume_picker(&mut self, host: HostId, candidates: Vec<ResumeCandidate>) {
         let items: Vec<PickerItem> = candidates
             .iter()
-            .map(|(host, c)| self.resume_candidate_item(host, c, None))
+            .map(|c| self.resume_candidate_item(&host, c, None))
             .collect();
 
-        let picker = Picker::new("Resume Session", items)
+        let picker = Picker::new(resume_picker_title(&host), items)
             .with_placeholder("Search by title, path, or branch…")
             .with_size(80, 80);
         self.picker = Some(ActivePicker {
             picker,
-            kind: PickerKind::Resume { candidates },
+            kind: PickerKind::Resume { host, candidates },
         });
         self.input_mode = InputMode::Picker;
     }
 
-    /// Open the cross-host browser (§5): every running session (focus/attach)
-    /// and every resumable one (resume), across all hosts, in one list. Each row
-    /// is tagged `running`/`resumable` and (for remotes) its host.
-    pub(super) fn open_browser_picker(&mut self, entries: Vec<BrowserEntry>) {
-        let items: Vec<PickerItem> = entries
+    /// Repopulate the open resume picker for a different host — the `Ctrl-h`
+    /// switch, the exact analog of `Ctrl-t`'s agent switch in the workdir
+    /// picker. Scoping to one host at a time is what replaced the cross-host
+    /// union (§9), so the list's scope is always readable in the title.
+    pub(super) fn reseed_resume_picker(&mut self, host: HostId, candidates: Vec<ResumeCandidate>) {
+        let items: Vec<PickerItem> = candidates
             .iter()
-            .map(|e| match e {
-                BrowserEntry::Running(s) => {
-                    let title =
-                        format::session_display_name(s, &self.session_index, &self.random_names);
-                    let mut meta = vec!["running".to_string(), s.status.label().to_string()];
-                    if !s.host.is_local() {
-                        meta.insert(0, s.host.0.clone());
-                    }
-                    meta.push(self.shorten_path(&s.cwd).into_owned());
-                    meta.push(s.agent.label().to_string());
-                    // Include the agent label so a running row is filterable by
-                    // backend too — matching the resumable rows and its own meta.
-                    let filter =
-                        format!("running {title} {} {} {}", s.cwd, s.host.0, s.agent.label());
-                    PickerItem::new(title)
-                        .with_secondary(meta.join("  ·  "))
-                        .with_filter_text(filter)
-                }
-                // Shares the resume picker's row builder; the "resumable" tag
-                // leads the meta and the filter. Widens the browser filter to
-                // match on agent label + saved name too (the resume picker
-                // already did).
-                BrowserEntry::Resumable(host, c) => {
-                    self.resume_candidate_item(host, c, Some("resumable"))
-                }
-            })
+            .map(|c| self.resume_candidate_item(&host, c, None))
             .collect();
-
-        let picker = Picker::new("Browse Sessions — all hosts", items)
-            .with_placeholder("Search running + resumable across hosts…")
-            .with_size(85, 80);
-        self.picker = Some(ActivePicker {
-            picker,
-            kind: PickerKind::Browser { entries },
-        });
-        self.input_mode = InputMode::Picker;
+        if let Some(active) = self.picker.as_mut() {
+            active.picker.title = resume_picker_title(&host);
+            active.picker.items = items;
+            active.picker.set_text("");
+            active.kind = PickerKind::Resume { host, candidates };
+        }
     }
 
     /// Open the move-window-to-tab picker. The trailing `[New Tab]` entry is
@@ -2973,11 +3430,11 @@ impl App {
     /// session lands is decided at spawn time by the current [`SessionsLayout`]
     /// (`resolve_spawn_target`), not by the selected window.
     pub(super) fn open_workdir_picker(&mut self) {
-        // New sessions default to the local host; `Ctrl-h` cycles to a remote,
-        // which re-seeds the list + home from that machine (`reseed_workdir_for_host`).
-        let host = HostId::local();
-        self.workdir_host_home = self.home_dir.clone();
-        let items = self.workdir_items(&self.recent_cwds, &host);
+        // New sessions target the persisted default host (`Space H`); `Ctrl-h`
+        // cycles per-launch, re-seeding the list from that machine.
+        let host = self.default_host_or_local();
+        let cwds = self.host_recent_dirs(&host);
+        let items = self.workdir_items(&cwds, &host);
 
         // Seed the launch backend from the persistent default; `Ctrl-t` in the
         // picker overrides it for this launch only. The title carries it so the
@@ -2998,15 +3455,18 @@ impl App {
     /// Build picker items for a list of cwds shown against `host`'s home. Only a
     /// *local* dir gets a custom directory-mark icon (marks are a local concept,
     /// keyed by local path); remote dirs render plain.
-    fn workdir_items(&self, cwds: &[String], host: &HostId) -> Vec<PickerItem> {
-        let local = host.is_local();
+    /// Build picker items for a list of cwds. The strings are already in the
+    /// host-canonical `~` form (§3) — the wire *is* the display form — so there
+    /// is nothing to collapse and no host `$HOME` to know. Directory marks now
+    /// key on that same form, which is why the same repo path on two machines
+    /// shares its icon.
+    fn workdir_items(&self, cwds: &[String], _host: &HostId) -> Vec<PickerItem> {
         cwds.iter()
             .map(|cwd| {
-                let display = collapse_tilde(cwd, &self.workdir_host_home);
-                let mut item = PickerItem::new(display.clone())
-                    .with_filter_text(format!("{display} {cwd}"))
+                let mut item = PickerItem::new(cwd.clone())
+                    .with_filter_text(cwd.clone())
                     .with_payload(cwd.clone());
-                if local && self.directory_marks.contains_key(cwd.trim_end_matches('/')) {
+                if self.directory_marks.contains_key(cwd.trim_end_matches('/')) {
                     let (icon, color, _) = self.effective_dir_mark(cwd);
                     item = item.with_prefix(icon, color);
                 }
@@ -3015,18 +3475,97 @@ impl App {
             .collect()
     }
 
+    /// The default host for new-session operations, falling back to localhost
+    /// when the persisted one is no longer configured.
+    pub(super) fn default_host_or_local(&self) -> HostId {
+        if self.backend_for(&self.default_host).is_some() {
+            self.default_host.clone()
+        } else {
+            self.backends[0].host_id()
+        }
+    }
+
+    /// A host's recent dirs, **cache-first** (§9). A host switch must render
+    /// instantly, so this never blocks: it returns the cached list (seeded on
+    /// first use and refreshed in the background by `refresh_recent_dirs`) and
+    /// only pays a round-trip when there is nothing cached at all and the host
+    /// is connected. The governing rule is simply *never put an RTT between a
+    /// keystroke and its echo*.
+    pub(super) fn host_recent_dirs(&mut self, host: &HostId) -> Vec<String> {
+        // A direct-local backend's list is held in memory and is authoritative:
+        // it reflects in-picker deletes (`Ctrl-d`) that haven't been re-read.
+        if self.is_direct_local(host) {
+            return self.recent_cwds.clone();
+        }
+        if let Some(cached) = self.recent_dirs_cache.get(host) {
+            return cached.clone();
+        }
+        let fetched = self.fetch_recent_dirs(host);
+        self.recent_dirs_cache.insert(host.clone(), fetched.clone());
+        fetched
+    }
+
+    /// Read a host's recent dirs straight from its backend. Blocks for a remote,
+    /// so callers go through [`App::host_recent_dirs`] unless they *are* the
+    /// refresh. A not-yet-connected host yields an empty list rather than
+    /// freezing the TUI through the connect attempt (`request()` would queue).
+    fn fetch_recent_dirs(&self, host: &HostId) -> Vec<String> {
+        let Some(backend) = self.backend_for(host) else {
+            return Vec::new();
+        };
+        match backend {
+            Backend::Local(_) => backend.recent_dirs(),
+            Backend::Remote(_) if backend.conn_state().is_connected() => {
+                tokio::task::block_in_place(|| backend.recent_dirs())
+            }
+            Backend::Remote(_) => Vec::new(),
+        }
+    }
+
+    /// Whether `host` is served by the in-process backend — i.e. this machine,
+    /// *not* under pooled-localhost (where it's reached through the daemon like
+    /// any other host). The few places that legitimately differ — the in-memory
+    /// recent-dir list and the picker's `Ctrl-d` delete — ask this rather than
+    /// `is_local()`, which no longer answers the question.
+    pub(super) fn is_direct_local(&self, host: &HostId) -> bool {
+        matches!(self.backend_for(host), Some(Backend::Local(_)))
+    }
+
+    /// Record a launch's cwd into the recent list of the host it landed on. A
+    /// remote (or pooled) host records its own server-side inside
+    /// `open_in_pool`, so a mac path never pollutes a Linux box's list; only the
+    /// direct-local list is ours to write. Either way the cached copy is stale.
+    pub(super) fn record_launch_cwd(&mut self, host: &HostId, cwd: &str) {
+        if self.is_direct_local(host) {
+            self.push_recent_cwd(cwd);
+        }
+        self.invalidate_recent_dirs(host);
+    }
+
+    /// Invalidate a host's cached recent dirs — after a launch records a new
+    /// cwd there, which is the only thing that changes the list. The next
+    /// picker open re-seeds it.
+    pub(super) fn invalidate_recent_dirs(&mut self, host: &HostId) {
+        self.recent_dirs_cache.remove(host);
+    }
+
     /// Directory completions for `prefix` on `host`'s filesystem. Local reads the
     /// fs in-process (no `block_in_place`, so it's usable outside a runtime — e.g.
     /// unit tests); a *connected* remote makes a blocking RPC off the async worker.
     /// A not-yet-connected remote returns no completions rather than blocking the
     /// TUI through the connect attempt (`request()` queues while Connecting).
     fn host_complete_path(&self, host: &HostId, prefix: &str) -> Vec<String> {
-        if host.is_local() {
-            self.backend_for(host).complete_path(prefix)
-        } else if self.backend_for(host).conn_state() == ConnState::Connected {
-            tokio::task::block_in_place(|| self.backend_for(host).complete_path(prefix))
-        } else {
-            Vec::new()
+        let Some(backend) = self.backend_for(host) else {
+            return Vec::new();
+        };
+        match backend {
+            // In-process: no `block_in_place`, so it works outside a runtime too
+            // (the unit tests call this directly).
+            Backend::Local(_) => backend.complete_path(prefix),
+            Backend::Remote(_) if backend.conn_state().is_connected() => {
+                tokio::task::block_in_place(|| backend.complete_path(prefix))
+            }
+            Backend::Remote(_) => Vec::new(),
         }
     }
 
@@ -3043,20 +3582,11 @@ impl App {
             return;
         };
         let host = host.clone();
-        // Local reads memory (authoritative — reflects in-picker deletes); a
-        // *connected* remote fetches from its server. A remote that isn't fully
-        // connected yet (Connecting/Disconnected) is skipped rather than RPC'd —
-        // `request()` would queue through the whole connect attempt and freeze the
-        // TUI (block_in_place on the event loop); an empty list is shown instead
-        // and the user can re-`Ctrl-h` once it connects.
-        let (cwds, home) = if host.is_local() {
-            (self.recent_cwds.clone(), self.home_dir.clone())
-        } else if self.backend_for(&host).conn_state() == ConnState::Connected {
-            tokio::task::block_in_place(|| self.backend_for(&host).recent_dirs())
-        } else {
-            (Vec::new(), String::new())
-        };
-        self.workdir_host_home = home;
+        // Cache-first: a host switch renders from memory, so `Ctrl-h` is
+        // instant even against a distant box (§9). Only a host never seen this
+        // run pays a round-trip, and one that isn't connected yet yields an
+        // empty list rather than freezing the TUI through the connect attempt.
+        let cwds = self.host_recent_dirs(&host);
         let items = self.workdir_items(&cwds, &host);
         self.workdir_completion = None;
         if let Some(active) = self.picker.as_mut() {
@@ -3075,12 +3605,19 @@ impl App {
         let Some(active) = self.picker.as_mut() else {
             return;
         };
-        // Only the *local* recent list is the dashboard's to edit; a remote
-        // host's list lives on that machine (deleting there would need an RPC —
-        // out of scope), so Ctrl-D is a no-op while the picker targets a remote.
-        if !matches!(&active.kind, PickerKind::Workdir { host, .. } if host.is_local()) {
+        // Only the in-process list is the dashboard's to edit; any other host's
+        // lives on that machine (deleting there would need an RPC — out of
+        // scope), so Ctrl-D is a no-op while the picker targets one.
+        let PickerKind::Workdir { host, .. } = &active.kind else {
+            return;
+        };
+        let host = host.clone();
+        if !self.is_direct_local(&host) {
             return;
         }
+        let Some(active) = self.picker.as_mut() else {
+            return;
+        };
         let filtered = active.picker.filtered();
         if filtered.is_empty() {
             return;
@@ -3139,19 +3676,15 @@ impl App {
             return;
         }
 
-        // Re-seed against the current prefix. The backend returns absolute dir
-        // paths on the host's filesystem; expansion/collapse use the host's home
-        // (`workdir_host_home`) so `~` resolves against the *remote* machine when
-        // the launch targets it. The remote path blocks on a round-trip.
-        let expanded = expand_tilde(&current, &self.workdir_host_home);
-        let matches_abs = self.host_complete_path(&host, &expanded);
-        if matches_abs.is_empty() {
+        // Re-seed against the current prefix. Both the prefix we send and the
+        // matches we get back are in the host-canonical `~` form (§3), so a `~`
+        // resolves against the *host's* home with no home ever reaching the
+        // client. Completion is inherently a live filesystem read, so this one
+        // does cross the wire — the remote path blocks on a round-trip.
+        let matches = self.host_complete_path(&host, &current);
+        if matches.is_empty() {
             return;
         }
-        let matches: Vec<String> = matches_abs
-            .iter()
-            .map(|p| collapse_tilde(p, &self.workdir_host_home))
-            .collect();
 
         if let Some(active) = self.picker.as_mut() {
             active.picker.set_text(&matches[0]);
@@ -3159,14 +3692,40 @@ impl App {
         self.workdir_completion = Some(WorkdirCompletion { matches, index: 0 });
     }
 
+    /// A path as it should read on screen.
+    ///
+    /// Almost a no-op now: every path the dashboard holds arrived in the
+    /// host-canonical `~` form (§3), because the backend that produced it
+    /// collapsed it. The one remaining job is a *local absolute* path that never
+    /// crossed the seam — a `ResumeCandidate.cwd` read straight off disk, say —
+    /// which is still worth abbreviating against our own home. A `~` form passes
+    /// straight through (`collapse_home` is idempotent and leaves it alone), so
+    /// this can't mangle another host's path with our home.
     pub(super) fn shorten_path<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
-        collapse_tilde(path, &self.home_dir).into()
+        cm_core::paths::collapse_home(path, &self.home_dir).into()
     }
 
     /// The display color for a host label: its configured color, else the
     /// theme's `title_fg` (Cyan by default). Shared by the table's Host column
     /// and the picker footer's `Ctrl-h` host hint so an unconfigured host reads
     /// identically at both.
+    /// The emoji shown for a host in the table's Host column and the host
+    /// pickers: the configured one, else a deterministic emoji derived from the
+    /// label — so a host always reads as an icon (§9) without the user having
+    /// configured anything, and the same host keeps the same glyph run to run.
+    pub(super) fn host_icon(&self, host: &HostId) -> String {
+        if let Some(icon) = self.host_icons.get(host) {
+            return icon.clone();
+        }
+        // This machine is the one host the user never chose a name for, so it
+        // gets a fixed glyph rather than a hash of an arbitrary hostname.
+        if self.backends.first().is_some_and(|b| &b.host_id() == host) {
+            return "🏠".to_string();
+        }
+        const FALLBACK: [&str; 8] = ["🖥", "🛰", "🐧", "📦", "⚙", "🌐", "🔷", "🧊"];
+        FALLBACK[format::stable_index(&host.0, FALLBACK.len())].to_string()
+    }
+
     pub(super) fn host_label_color(&self, host: &HostId) -> ratatui::style::Color {
         self.host_colors
             .get(host)

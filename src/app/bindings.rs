@@ -40,11 +40,25 @@ pub(crate) struct BindingKey {
 #[derive(Default)]
 pub(crate) struct WindowBindings {
     by_host: HashMap<HostId, HashMap<String, WindowId>>,
+    /// Sessions the dashboard **expects** to be holding an attach window for.
+    ///
+    /// Deliberately outlives the window itself: [`WindowBindings::prune_dead`]
+    /// drops the binding when the window dies but leaves this set alone, so
+    /// after a laptop sleep or a broken pipe the dashboard still knows *which*
+    /// sessions the user had open and can reattach them all on reconnect (§7).
+    /// A deliberate `D` detach clears it — that's the whole distinction between
+    /// "you detached" and "the link dropped".
+    expected: HashSet<BindingKey>,
 }
 
 impl WindowBindings {
-    /// Record (or replace) the local window bound to a session's token.
+    /// Record (or replace) the local window bound to a session's token, and
+    /// remember that this session is expected to stay attached.
     pub(crate) fn record(&mut self, host: HostId, token: String, window: WindowId) {
+        self.expected.insert(BindingKey {
+            host: host.clone(),
+            token: token.clone(),
+        });
         self.by_host.entry(host).or_default().insert(token, window);
     }
 
@@ -53,14 +67,37 @@ impl WindowBindings {
     /// `ssh attach` window and forgets it, while the remote pool session keeps
     /// running (so the row stays and `Enter` re-attaches). Distinct from
     /// [`WindowBindings::prune_dead`], which reacts to a window that *already*
-    /// died; this initiates the teardown.
+    /// died; this initiates the teardown — and being deliberate, it also clears
+    /// the expected-attached memory so auto-reattach leaves it detached.
     pub(crate) fn remove(&mut self, host: &HostId, token: &str) -> Option<WindowId> {
+        self.expected.remove(&BindingKey {
+            host: host.clone(),
+            token: token.to_string(),
+        });
         let inner = self.by_host.get_mut(host)?;
         let removed = inner.remove(token);
         if inner.is_empty() {
             self.by_host.remove(host);
         }
         removed
+    }
+
+    /// Tokens on `host` the dashboard expects to be attached to but currently
+    /// holds no window for — the auto-reattach work list after a reconnect (§7).
+    pub(crate) fn expected_without_window(&self, host: &HostId) -> Vec<String> {
+        self.expected
+            .iter()
+            .filter(|k| &k.host == host)
+            .filter(|k| self.window_for(&k.host, &k.token).is_none())
+            .map(|k| k.token.clone())
+            .collect()
+    }
+
+    /// Forget every expectation for sessions no longer present on their host, so
+    /// a killed session isn't reattached forever. `live` is the set of
+    /// `(host, token)` pairs the current rows carry.
+    pub(crate) fn retain_expected(&mut self, live: &HashSet<BindingKey>) {
+        self.expected.retain(|k| live.contains(k));
     }
 
     /// The local window bound to this session's token, if any.
@@ -181,6 +218,36 @@ mod tests {
         assert_eq!(b.window_for(&host("h1"), "live"), Some(&win("w1")));
         assert_eq!(b.window_for(&host("h1"), "dead"), None);
         assert!(!b.is_empty() && b.len() == 1);
+    }
+
+    /// The expected-attached memory is what makes auto-reattach possible: a
+    /// window dying (sleep / dropped ssh) must NOT be read as "the user wants
+    /// this detached", while pressing `D` must.
+    #[test]
+    fn expectation_survives_a_dead_window_but_not_an_explicit_detach() {
+        let mut b = WindowBindings::default();
+        b.record(host("h1"), "a".into(), win("w1"));
+        b.record(host("h1"), "b".into(), win("w2"));
+        assert!(b.expected_without_window(&host("h1")).is_empty());
+
+        // Both windows died with the link — both are still expected, so both
+        // come back on reconnect.
+        b.prune_dead(&HashSet::new());
+        let mut pending = b.expected_without_window(&host("h1"));
+        pending.sort();
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+
+        // A deliberate detach of `a` retires the expectation for good.
+        b.record(host("h1"), "a".into(), win("w3"));
+        b.remove(&host("h1"), "a");
+        assert_eq!(
+            b.expected_without_window(&host("h1")),
+            vec!["b".to_string()]
+        );
+
+        // A session that's gone from the host stops being expected at all.
+        b.retain_expected(&HashSet::new());
+        assert!(b.expected_without_window(&host("h1")).is_empty());
     }
 
     #[test]

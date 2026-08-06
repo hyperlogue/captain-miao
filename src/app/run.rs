@@ -6,12 +6,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
-use notify::{RecursiveMode, Watcher};
 use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 
 use crate::agent::{AgentControl, ResumeCandidate};
-use crate::backend::{LaunchPlan, OpenSpec};
+use crate::backend::{LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId};
 use crate::terminal::{
@@ -20,7 +19,7 @@ use crate::terminal::{
 
 use std::collections::HashSet;
 
-use super::{Action, App, BrowserEntry, RestartSpec, SessionSnapshotEntry};
+use super::{Action, App, RestartSpec, SessionSnapshotEntry};
 
 /// Lines of terminal output captured for the preview panel — its vertical
 /// scroll-up depth. The draw side (`draw_preview`) parses/scrolls within this.
@@ -43,28 +42,51 @@ fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
 }
 
-/// Union every backend's resumable list into one host-tagged, most-recent-first,
-/// capped list, collecting per-host errors. Each backend walks transcript dirs
-/// (local) or makes a blocking RPC (remote), so the whole aggregation runs inside
-/// `block_in_place`. Shared by the resume picker and the browser's resumable rows.
-fn list_resumable_all_hosts(
+/// One host's resumable list, most-recent-first and capped, plus any errors.
+/// Walks transcript dirs in process (local) or makes a blocking RPC (remote),
+/// so it runs inside `block_in_place`.
+///
+/// Scoped to a single host on purpose (§9): the cross-host union this replaced
+/// made the resume picker's scope implicit and its cost proportional to the
+/// number of configured hosts. `Ctrl-h` inside the picker switches host, and the
+/// title says which one you're looking at.
+fn list_resumable_on_host(
     app: &App,
+    host: &HostId,
     limit: usize,
-) -> (Vec<(HostId, ResumeCandidate)>, Vec<String>) {
-    tokio::task::block_in_place(|| {
-        let mut all: Vec<(HostId, ResumeCandidate)> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-        for backend in &app.backends {
-            let host = backend.host_id();
-            let (cands, errs) = backend.list_resumable(limit);
-            all.extend(cands.into_iter().map(|c| (host.clone(), c)));
-            errors.extend(errs);
+) -> (Vec<ResumeCandidate>, Vec<String>) {
+    let Some(backend) = app.backend_for(host) else {
+        return (Vec::new(), vec![format!("unknown host {}", host.0)]);
+    };
+    tokio::task::block_in_place(|| backend.list_resumable(limit))
+}
+
+/// Open (or re-seed) the resume picker on `host`, reporting an empty/failed
+/// list on the status line. Shared by `r` and the picker's `Ctrl-h` switch so
+/// the two can't drift on the empty-list wording.
+fn show_resume_picker(app: &mut App, host: HostId, reseed: bool) {
+    let limit = config::get().launcher.resume_list_limit;
+    let (candidates, errors) = list_resumable_on_host(app, &host, limit);
+    if !candidates.is_empty() {
+        if reseed {
+            app.reseed_resume_picker(host, candidates);
+        } else {
+            app.open_resume_picker(host, candidates);
         }
-        // Most-recent first across all hosts, capped.
-        all.sort_by_key(|(_, c)| std::cmp::Reverse(c.mtime));
-        all.truncate(limit);
-        (all, errors)
-    })
+        return;
+    }
+    let msg = if errors.is_empty() {
+        format!("No resumable sessions on {}", host.0)
+    } else {
+        format!("List sessions failed: {}", errors.join("; "))
+    };
+    // A failed switch keeps the picker open on its previous host rather than
+    // dumping the user back to the table with nothing to act on.
+    if reseed && let Some(active) = app.picker.as_mut() {
+        active.picker.set_error(msg);
+        return;
+    }
+    app.set_status(msg, true);
 }
 
 // -- Dashboard singleton --
@@ -153,12 +175,16 @@ fn take_missing_from_snapshot(alive_pids: &HashSet<u32>) -> Vec<RestartSpec> {
         .filter(|e: &SessionSnapshotEntry| !alive_pids.contains(&e.launcher_pid))
         .map(|e| RestartSpec {
             agent: e.agent,
-            child_pid: e.child_pid,
-            window_id: e.window_id,
+            // Crash recovery is local-only by design (the snapshot is), and the
+            // dead session's key is only carried so the spec is well-formed —
+            // `kill_old: false` means it's never used to signal anything.
+            host: HostId::local(),
+            key: cm_core::state::SessionKey::from_launcher_pid(e.launcher_pid),
+            window_id: Some(e.window_id),
             cwd: e.cwd,
             session_id: e.session_id,
             flags: e.flags,
-            // Crash recovery: the launcher_pid is already dead, so child_pid is
+            // Crash recovery: the launcher_pid is already dead, so its child is
             // gone (and may be recycled) and window_id may collide with an
             // unrelated live window after a kitty relaunch. Never signal/close.
             kill_old: false,
@@ -339,36 +365,31 @@ async fn launch_agent(
     cwd: &str,
     resume: Option<(&str, bool)>,
     copy: &LaunchCopy,
-    host: Option<&HostId>,
+    host: &HostId,
 ) {
-    // Only a *local* launch's cwd belongs in the local recent list; a remote
-    // launch records into the remote host's list server-side (see
-    // `server_pool::open_in_pool`), so a mac path never pollutes it and vice versa.
-    if host.is_none_or(|h| h.is_local()) {
-        app.push_recent_cwd(cwd);
-    }
-    app.set_status(
-        format!("{} in {}", copy.progress, app.shorten_path(cwd)),
-        false,
-    );
+    // The cwd goes into the recent list of the host it lands on — never another
+    // one's, so a mac path can't pollute a Linux box's picker.
+    app.record_launch_cwd(host, cwd);
+    app.set_status(format!("{} in {}", copy.progress, cwd), false);
 
-    // Ask the backend how to open the session. `host` selects it: a remote host
-    // RPCs its server to start the launcher in the pty pool and returns an
-    // `AttachRemote` plan (an `ssh … attach` window); the default `None` is the
-    // local backend, whose plan is pure metadata — the argv for a Kitty window
-    // that *is* the launcher. The remote RPC blocks, so run it off the worker;
-    // bind the plan before matching so the backend borrow ends before we touch
-    // `app` again. (Today's callers all pass `None`; remote routing comes from
-    // the 3d browser.)
+    // Ask the host how to open the session. A pooled host RPCs its daemon to
+    // start the launcher in the pty pool and returns an `AttachRemote` plan (an
+    // `ssh … attach` window, or a bare `attach` under pooled-localhost); an
+    // unpooled local host returns pure metadata — the argv for a window that
+    // *is* the launcher. The RPC blocks, so run it off the worker; bind the plan
+    // before matching so the backend borrow ends before we touch `app` again.
     let open_spec = OpenSpec {
         agent,
         cwd: cwd.to_string(),
         resume: resume.map(|(id, fork)| (id.to_string(), fork)),
     };
     let plan = {
-        let backend = match host {
-            Some(h) => app.backend_for(h),
-            None => app.local_backend(),
+        let Some(backend) = app.backend_for(host) else {
+            app.set_status(
+                format!("{} failed: unknown host {}", copy.failed, host.0),
+                true,
+            );
+            return;
         };
         tokio::task::block_in_place(|| backend.open_session(&open_spec))
     };
@@ -381,19 +402,16 @@ async fn launch_agent(
     };
     let mut argv = plan.argv().to_vec();
     // The (host, token) the appearing row will carry home, so we can bind the
-    // window we're about to open to it (§15.2). A remote attach reuses the
-    // server-minted pool session name; a local spawn gets a fresh
+    // window we're about to open to it (§15.2). A pooled open reuses the
+    // server-minted pool session name; a direct local spawn gets a fresh
     // dashboard-minted `launch_id` threaded onto the launcher as `--launch-id`.
     let (bind_host, bind_token) = match &plan {
-        LaunchPlan::AttachRemote { session_name, .. } => (
-            host.cloned().unwrap_or_else(HostId::local),
-            session_name.clone(),
-        ),
+        LaunchPlan::AttachRemote { session_name, .. } => (host.clone(), session_name.clone()),
         LaunchPlan::SpawnLocal { .. } => {
             let launch_id = app.mint_launch_id();
             argv.push("--launch-id".to_string());
             argv.push(launch_id.clone());
-            (HostId::local(), launch_id)
+            (host.clone(), launch_id)
         }
     };
 
@@ -455,6 +473,73 @@ async fn launch_agent(
     }
 }
 
+/// Spawn a local window attached to a running pool session and bind it, so the
+/// dashboard tracks (and later prunes) it. The one place an attach window is
+/// created: `Enter` on a detached row, and the reconnect sweep's auto-reattach
+/// (§7) both come through here, so they can't drift on placement or binding.
+///
+/// `force` steals the session from whichever client currently holds it — only
+/// ever set behind the y/N confirm, since the pool is one client at a time and
+/// attaching otherwise declines rather than kicking someone (§10.2).
+async fn attach_pool_session(app: &mut App, host: HostId, pool_session: String, force: bool) {
+    // Resolve the plan before the match so the backend borrow ends before `app`
+    // is touched again.
+    let plan = app
+        .backend_for(&host)
+        .ok_or_else(|| anyhow::anyhow!("unknown host {}", host.0))
+        .and_then(|b| b.attach_plan(&pool_session, force));
+    let argv = match plan {
+        Ok(crate::backend::AttachPlan { argv }) => argv,
+        Err(e) => {
+            app.set_status(format!("Cannot attach: {e}"), true);
+            return;
+        }
+    };
+    let spec = SpawnSpec {
+        cwd: app.home_dir.clone(),
+        // An attach window is a session view, so it gets the current session
+        // arrangement: the shared sessions tab in Stacked (floating on zellij,
+        // the `miao:sessions` stack tab on Kitty), its own tab in Per-tab.
+        target: resolve_spawn_target(app.capabilities, app.sessions_layout),
+        command: SpawnCommand::Exec(argv),
+        title: Some(format!("{} attach", host.0)),
+        hold: true,
+        take_focus: false,
+        stack: true,
+    };
+    match terminal::get().spawn(spec).await {
+        // A Floating/NewTab attach spawn always recovers its window; a `None`
+        // can't be bound, so report it rather than proceed.
+        Ok(result) => match result.window {
+            Some(id) => {
+                let verb = if force { "Stole" } else { "Attached to" };
+                app.set_status(format!("{verb} {pool_session} (window {id})"), false);
+                app.record_window_binding(host, pool_session, id.clone());
+                // Same free tab id as a launch spawn — keeps the next reload
+                // off a snapshot.
+                if let Some(tab) = result.tab {
+                    app.window_tab_cache.insert(id.clone(), tab);
+                }
+                // Attach-then-focus *immediately* (§9): the user watches the ssh
+                // progress in the window rather than a frozen dashboard.
+                app.pending_focus_window = Some((id, Instant::now()));
+            }
+            None => app.set_status("Attach failed: no window id".to_string(), true),
+        },
+        Err(e) => app.set_status(format!("Attach failed: {e}"), true),
+    }
+}
+
+/// Re-open the attach window for a session the dashboard expects to be attached
+/// to, after its host came back (§7). Same spawn path as an interactive attach,
+/// minus the focus yank: a reconnect restoring five windows must not fight the
+/// user for the cursor.
+async fn reattach_session(app: &mut App, host: HostId, pool_session: String) {
+    let previously_focused = app.pending_focus_window.clone();
+    attach_pool_session(app, host, pool_session, false).await;
+    app.pending_focus_window = previously_focused;
+}
+
 /// How long an action that races a launcher's own state-file write (kill,
 /// detach, restart) waits before the forced reload: enough for the launcher to
 /// die (a closed window SIGHUPs it, which can beat its own state-file cleanup)
@@ -504,19 +589,22 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
     let session_id = spec.session_id;
     let cwd = spec.cwd;
     let window_id = spec.window_id;
-    let child_pid = spec.child_pid;
+    let host = spec.host;
+    let key = spec.key;
     let flags = spec.flags;
     let kill_old = spec.kill_old;
 
-    // The replacement's placement comes from the layout policy, not the old
-    // window, so no anchor is threaded.
+    // The replacement opens on the session's **own host** (§9): a remote restart
+    // lands in that host's pool and auto-attaches like any open, rather than
+    // silently relocating the session to the laptop. Its placement comes from
+    // the layout policy, not the old window, so no anchor is threaded.
     launch_agent(
         app,
         agent,
         &cwd,
         Some((session_id.as_str(), false)),
         &LAUNCH_COPY_RESTART,
-        None,
+        &host,
     )
     .await;
     // Detect launch failure: launch_agent flips `status_is_error` to true on
@@ -537,15 +625,19 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
     }
 
     if kill_old {
-        // Live session we own: tear the old child + window down. Guard against
-        // a recycled pid even here — the child should still be alive for a user
-        // restart, but a liveness check costs nothing and avoids signaling a pid
-        // that exited between the row's last reload and now. The window close is
-        // best-effort; an already-closed window just errors.
-        if state::is_process_alive(child_pid) {
-            let _ = app.local_backend().kill_session(child_pid);
+        // Live session we own: tear the old one down on its host, then close its
+        // local window. The kill names the session by key — the host re-resolves
+        // it to a live pid at signal time, which is where the old
+        // "is this pid still alive?" guard now lives (and it's a stronger guard
+        // there: the host reads the state file, we only had a mirror). The
+        // window close is best-effort; an already-closed window just errors, and
+        // a detached pooled session has no window at all.
+        if let Some(backend) = app.backend_for(&host) {
+            let _ = tokio::task::block_in_place(|| backend.kill_session(&key));
         }
-        let _ = terminal::get().close_window(&window_id).await;
+        if let Some(window_id) = &window_id {
+            let _ = terminal::get().close_window(window_id).await;
+        }
     }
     // A crash-recovery window is left untouched: the old child is dead and may
     // be recycled, and the window id may belong to an innocent live window.
@@ -598,31 +690,20 @@ fn leave_terminal_modes(kb_enhanced: bool) {
 pub async fn run() -> Result<()> {
     check_existing_dashboard()?;
 
-    let sessions_dir = state::ensure_sessions_dir()?;
+    state::ensure_sessions_dir()?;
     write_dashboard_pid_and_window();
 
     crate::init_tracing("dashboard");
     super::keybind_log::init();
 
-    // Watch sessions directory for state file changes
-    let (fs_tx, fs_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::RecommendedWatcher::new(fs_tx, notify::Config::default())
-        .context("Failed to create file watcher")?;
-    watcher.watch(&sessions_dir, RecursiveMode::NonRecursive)?;
-
-    // Each backend nominates the paths whose changes should trigger a reload:
-    // Claude's flat session-name-store dir, Codex's title-store WAL file (the
-    // wake for `LocalBackend`'s throttled title overlay — a rename touches only
-    // that sqlite). Non-recursive either way; transcript-derived updates arrive
-    // via the launcher's state file (the `sessions_dir` watch above) rather
-    // than a transcript-dir watch. Best-effort: a missing path (e.g. a
-    // checkpointed-away wal) just isn't watched — the overlay refreshes on the
-    // next session event instead.
-    for &agent in AgentControl::ALL {
-        for path in agent.watch_paths() {
-            let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
-        }
-    }
+    // NOTE: the dashboard no longer creates a filesystem watcher of its own.
+    // Change notification is behind the backend seam now (§5): each backend
+    // reports its own changes through `Backend::subscribe` — the local one from
+    // a `notify` watch *it* owns (mirroring how the daemon owns its server-side
+    // watch), a remote one from its connection task's mirror pushes. So the run
+    // loop asks "did anything change?" once, uniformly, with no filesystem
+    // knowledge at all — and pooled-localhost gets there for free, since that
+    // backend simply has no watcher to own.
 
     let mut terminal = ratatui::init();
     // Advertise our tab/window title; kitty's default tab_title_template
@@ -649,19 +730,15 @@ pub async fn run() -> Result<()> {
     }));
 
     // Teardown must run even on an error path.
-    let result = run_app(&mut terminal, fs_rx).await;
+    let result = run_app(&mut terminal).await;
     leave_terminal_modes(kb_enhanced);
     ratatui::restore();
 
-    drop(watcher);
     cleanup_dashboard();
     result
 }
 
-async fn run_app(
-    terminal: &mut DefaultTerminal,
-    fs_rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
-) -> Result<()> {
+async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
     // Recover window bindings a previous dashboard left behind so live sessions
     // resolve their windows across a restart (§15.7). Before the first reload, so
@@ -729,23 +806,16 @@ async fn run_app(
             fs_dirty = true;
             last_reload = None;
         }
-        // Drain filesystem events and coalesce. A busy session rewrites its
-        // state file on every hook/status change, and each write wakes the
-        // (non-recursive) sessions-dir watch, so without debouncing a burst can
-        // queue reloads faster than we can service them, lagging the UI by
-        // seconds. Only reload once per RELOAD_MIN_INTERVAL regardless of how
-        // many events arrived.
-        while fs_rx.try_recv().is_ok() {
-            fs_dirty = true;
-        }
-        // Remote backends update their in-memory mirror off-thread (a pushed
-        // Snapshot/Delta/Removed, or a connect/disconnect) — no filesystem event
-        // fires, so `fs_rx` alone would leave a new remote session invisible
-        // until some *local* event happened to trigger a reload. Poll each
-        // backend's change signal (cleared on read) each loop iteration (~every
-        // `event_poll_ms`) and fold it into the same debounced reload path.
-        for backend in &app.backends {
-            if backend.take_dirty() {
+        // Take each backend's change signal and coalesce (§5). One uniform
+        // question per host: the local backend's watcher fires on every state
+        // file write, a remote's connection task flips it on a pushed
+        // Snapshot/Delta/Removed or a connect/disconnect. A busy session
+        // rewrites its state file on every hook event, so without debouncing a
+        // burst would queue reloads faster than we can service them and lag the
+        // UI by seconds — hence one reload per `reload_min_interval` no matter
+        // how many signals arrived.
+        for events in &app.backend_events {
+            if events.take() {
                 fs_dirty = true;
             }
         }
@@ -779,6 +849,16 @@ async fn run_app(
                 if let Err(e) = terminal::get().close_window(&wid).await {
                     tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
                 }
+            }
+            // Auto-reattach (§7): a host that just came back gets an attach
+            // window respawned for every session the dashboard remembers having
+            // one, so a laptop sleep or a broken pipe restores the whole working
+            // set without the user re-Entering each row. A session detached
+            // deliberately with `D` isn't in the list — that's the distinction
+            // the expected-attached flag exists to draw. Done here rather than
+            // in `reload_sessions` because it spawns windows.
+            for (host, pool_session) in std::mem::take(&mut app.pending_reattach) {
+                reattach_session(&mut app, host, pool_session).await;
             }
             // Both consumers below want a terminal snapshot: the tab-cache
             // refresh (a new/moved local window is unresolved) and the remote
@@ -992,8 +1072,7 @@ async fn run_app(
                         }
                     }
                     Action::NewSessionSplit { agent, cwd, host } => {
-                        launch_agent(&mut app, agent, &cwd, None, &LAUNCH_COPY_NEW, Some(&host))
-                            .await;
+                        launch_agent(&mut app, agent, &cwd, None, &LAUNCH_COPY_NEW, &host).await;
                     }
                     Action::FetchTabsForMove(window_id) => match terminal::get().snapshot().await {
                         Ok(tabs) => app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs)),
@@ -1015,64 +1094,35 @@ async fn run_app(
                             Err(e) => app.set_status(format!("Move failed: {e}"), true),
                         }
                     }
-                    Action::FetchResumeList => {
-                        let limit = config::get().launcher.resume_list_limit;
-                        // Union every host's resumable list into one cross-host
-                        // picker, tagging each candidate with its host so resume
-                        // opens it there.
-                        let (all, errors) = list_resumable_all_hosts(&app, limit);
-                        if !all.is_empty() {
-                            app.open_resume_picker(all);
-                        } else if !errors.is_empty() {
-                            app.set_status(
-                                format!("List sessions failed: {}", errors.join("; ")),
-                                true,
-                            );
-                        } else {
-                            app.set_status("No resumable sessions found".to_string(), true);
-                        }
+                    Action::FetchResumeList { host } => {
+                        // One host's list, chosen by the default host (`Space H`)
+                        // and switchable in-picker with `Ctrl-h`.
+                        show_resume_picker(&mut app, host, false);
                     }
-                    Action::FetchBrowser => {
-                        let limit = config::get().launcher.resume_list_limit;
-                        // Running: every aggregated session (already host-tagged).
-                        let mut entries: Vec<BrowserEntry> = app
-                            .sessions
-                            .iter()
-                            .map(|s| BrowserEntry::Running(Box::new(s.clone())))
-                            .collect();
-                        // Resumable: the same cross-host walk as the resume picker.
-                        let (resumable, errors) = list_resumable_all_hosts(&app, limit);
-                        entries.extend(
-                            resumable
-                                .into_iter()
-                                .map(|(h, c)| BrowserEntry::Resumable(h, c)),
-                        );
-                        if entries.is_empty() {
-                            app.set_status("No sessions to browse".to_string(), true);
-                        } else {
-                            if !errors.is_empty() {
-                                app.set_status(
-                                    format!("Some hosts failed: {}", errors.join("; ")),
-                                    true,
-                                );
-                            }
-                            app.open_browser_picker(entries);
-                        }
+                    Action::SwitchResumeHost { host } => {
+                        show_resume_picker(&mut app, host, true);
                     }
                     Action::KillSession {
                         host,
-                        child_pid,
+                        key,
                         window_id,
                     } => {
-                        // Route to the session's host — a signal locally, an RPC
-                        // (blocking) remotely, so it rides `block_in_place`.
-                        let killed = tokio::task::block_in_place(|| {
-                            app.backend_for(&host).kill_session(child_pid)
-                        });
+                        // Route to the session's host, naming it by key: the host
+                        // re-resolves that to a live pid immediately before
+                        // signalling, so a stale row can't kill a recycled pid.
+                        // Local is in process; a remote is an RPC, so it rides
+                        // `block_in_place`.
+                        let killed = match app.backend_for(&host) {
+                            Some(b) => tokio::task::block_in_place(|| b.kill_session(&key)),
+                            None => {
+                                app.set_status(format!("Unknown host {}", host.0), true);
+                                false
+                            }
+                        };
                         if killed {
-                            app.set_status(format!("Sent SIGTERM to pid {child_pid}"), false);
+                            app.set_status("Session terminated".to_string(), false);
                         } else {
-                            app.set_status(format!("kill({child_pid}) failed"), true);
+                            app.set_status("Kill failed (session already gone?)".to_string(), true);
                         }
                         if let Some(wid) = window_id {
                             let _ = terminal::get().close_window(&wid).await;
@@ -1104,26 +1154,29 @@ async fn run_app(
                         // still alive, else spawn a fresh shell tab and record it.
                         // It never scans for an unrelated shell that happens to
                         // sit in the cwd — only tabs captain-miao created count.
-                        let label = app.shorten_path(&cwd).into_owned();
+                        let label = cwd.clone();
                         let key = (host.clone(), cwd.clone());
-                        // What the new tab runs: a local shell in `cwd`, or an
-                        // `ssh -t <target>` that cds into the remote cwd (a remote
-                        // path never enters the *local* recent-cwd list).
-                        let command = if host.is_local() {
-                            app.push_recent_cwd(&cwd);
-                            Some(SpawnCommand::Shell)
-                        } else {
-                            let argv = app.backend_for(&host).shell_argv(&cwd);
-                            if argv.is_none() {
-                                app.set_status(
-                                    format!("Cannot open a shell on {}: no ssh target", host.0),
-                                    true,
-                                );
+                        // Ask the host how to open a shell there: in process on
+                        // this machine, an `ssh -t <target>` that cds into the
+                        // cwd for a remote. A `Result`, so the host explains
+                        // itself when it can't (§5) instead of the caller
+                        // inventing a message for a bare `None`.
+                        let plan = app
+                            .backend_for(&host)
+                            .ok_or_else(|| anyhow::anyhow!("unknown host {}", host.0))
+                            .and_then(|b| b.shell_plan(&cwd));
+                        let (command, spawn_cwd) = match plan {
+                            Ok(ShellPlan::InProcess { cwd: real }) => (SpawnCommand::Shell, real),
+                            // The ssh child launches from the dashboard's own
+                            // cwd; the remote cwd is applied by the `cd` in the
+                            // argv.
+                            Ok(ShellPlan::Spawn { argv }) => {
+                                (SpawnCommand::Exec(argv), app.home_dir.clone())
                             }
-                            argv.map(SpawnCommand::Exec)
-                        };
-                        let Some(command) = command else {
-                            break 'shell_tab;
+                            Err(e) => {
+                                app.set_status(format!("Work tab failed: {e}"), true);
+                                break 'shell_tab;
+                            }
                         };
                         // Only take the validation snapshot when there's an entry
                         // to validate — a first `w` on this cwd has nothing to
@@ -1154,14 +1207,7 @@ async fn run_app(
                                 let title = super::work_tab_title(&cwd);
                                 match terminal::get()
                                     .spawn(SpawnSpec {
-                                        // The ssh child launches from the dashboard's
-                                        // own cwd; the remote cwd is applied by the
-                                        // `cd` in the argv.
-                                        cwd: if host.is_local() {
-                                            cwd.clone()
-                                        } else {
-                                            app.home_dir.clone()
-                                        },
+                                        cwd: spawn_cwd.clone(),
                                         target: SpawnTarget::NewTab,
                                         command,
                                         title: Some(title),
@@ -1230,7 +1276,7 @@ async fn run_app(
                             &cwd,
                             Some((session_id.as_str(), fork)),
                             &LAUNCH_COPY_RESUME,
-                            Some(&host),
+                            &host,
                         )
                         .await;
                     }
@@ -1252,67 +1298,11 @@ async fn run_app(
                             Err(e) => app.set_status(format!("Copy failed: {e}"), true),
                         }
                     }
-                    Action::AttachRemoteRunning { host, pool_session } => {
-                        // Spawn a local window that attaches to the running
-                        // remote pool session, and bind it so the dashboard
-                        // tracks (and later prunes) it. Bind the argv before the
-                        // match so the backend borrow ends before `app` is used.
-                        let argv = app.backend_for(&host).attach_argv(&pool_session);
-                        match argv {
-                            Some(argv) => {
-                                let spec = SpawnSpec {
-                                    cwd: app.home_dir.clone(),
-                                    // An attach window is a session view, so it
-                                    // gets the current session arrangement: the
-                                    // shared sessions tab in Stacked (floating on
-                                    // zellij, the `cm:sessions` stack tab on
-                                    // Kitty), its own tab in Per-tab.
-                                    target: resolve_spawn_target(
-                                        app.capabilities,
-                                        app.sessions_layout,
-                                    ),
-                                    command: SpawnCommand::Exec(argv),
-                                    title: Some(format!("{} attach", host.0)),
-                                    hold: true,
-                                    take_focus: false,
-                                    stack: true,
-                                };
-                                match terminal::get().spawn(spec).await {
-                                    // A Floating/NewTab attach spawn always
-                                    // recovers its window; a `None` can't be
-                                    // bound, so report it rather than proceed.
-                                    Ok(result) => match result.window {
-                                        Some(id) => {
-                                            app.set_status(
-                                                format!("Attached to {pool_session} (window {id})"),
-                                                false,
-                                            );
-                                            app.record_window_binding(
-                                                host,
-                                                pool_session,
-                                                id.clone(),
-                                            );
-                                            // Same free tab id as a launch spawn —
-                                            // keeps the next reload off a snapshot.
-                                            if let Some(tab) = result.tab {
-                                                app.window_tab_cache.insert(id.clone(), tab);
-                                            }
-                                            app.pending_focus_window = Some((id, Instant::now()));
-                                        }
-                                        None => app.set_status(
-                                            "Attach failed: no window id".to_string(),
-                                            true,
-                                        ),
-                                    },
-                                    Err(e) => app.set_status(format!("Attach failed: {e}"), true),
-                                }
-                            }
-                            None => app.set_status(
-                                "Cannot attach: selected session has no remote host".to_string(),
-                                true,
-                            ),
-                        }
-                    }
+                    Action::AttachRemoteRunning {
+                        host,
+                        pool_session,
+                        force,
+                    } => attach_pool_session(&mut app, host, pool_session, force).await,
                     Action::RestartAll { sessions } => {
                         let total = sessions.len();
                         let mut ok = 0usize;

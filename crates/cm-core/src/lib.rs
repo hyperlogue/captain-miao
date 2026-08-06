@@ -10,8 +10,9 @@
 //! the per-backend [`agent`] dispatch (Claude/Codex parsing), the [`launcher`]
 //! that supervises an agent process, the [`hooks`] forwarder, the local
 //! server-core [`backend::LocalBackend`] + the shared open-session types, the
-//! opaque [`terminal`] ids + the launcher's `current_window` self-report, plus
-//! shared [`cli`] arg helpers and [`logging`] setup.
+//! opaque [`terminal`] ids + the launcher's `current_window` self-report, the
+//! host-canonical [`paths`] wire spelling, plus shared [`cli`] arg helpers and
+//! [`logging`] setup.
 
 pub mod agent;
 pub mod agents;
@@ -22,6 +23,7 @@ pub mod hooks;
 pub mod launcher;
 pub mod learned;
 pub mod logging;
+pub mod paths;
 pub mod protocol;
 pub mod state;
 pub mod terminal;

@@ -222,7 +222,6 @@ pub(super) enum Command {
     NewSession,
     NewSessionPrompt,
     ResumePicker,
-    OpenBrowser,
     ForkSession,
     CopySessionId,
     KillSelected,
@@ -253,8 +252,15 @@ pub(super) enum Command {
     EditDir,
     ToggleKeepAwake,
     DefaultAgent,
+    /// Set the persistent default *host* for new-session operations — the exact
+    /// analog of `DefaultAgent`, and what replaced the cross-host unions (§9).
+    DefaultHost,
     SessionsLayout,
     ManageHosts,
+    /// Attach to the selected pooled session, kicking whatever client currently
+    /// holds it. Behind a y/N confirm: the pool is one client at a time, so this
+    /// takes someone else's terminal away (§10.2).
+    StealAttach,
 }
 
 impl Command {
@@ -268,7 +274,6 @@ impl Command {
             Command::NewSession => "new_session",
             Command::NewSessionPrompt => "new_session_cwd",
             Command::ResumePicker => "resume",
-            Command::OpenBrowser => "browse",
             Command::ForkSession => "fork",
             Command::CopySessionId => "copy_id",
             Command::KillSelected => "kill",
@@ -295,6 +300,8 @@ impl Command {
             Command::EditDir => "edit_dir",
             Command::ToggleKeepAwake => "keep_awake",
             Command::DefaultAgent => "default_agent",
+            Command::DefaultHost => "default_host",
+            Command::StealAttach => "steal_attach",
             Command::SessionsLayout => "sessions_layout",
             Command::ManageHosts => "manage_hosts",
         }
@@ -314,7 +321,6 @@ impl Command {
             Command::NewSession => "new session (same tab)",
             Command::NewSessionPrompt => "new session (prompt for cwd)",
             Command::ResumePicker => "resume picker",
-            Command::OpenBrowser => "browse running + resumable, all hosts",
             Command::ForkSession => "fork / resume selected in place",
             Command::CopySessionId => "copy selected session id to clipboard",
             Command::KillSelected => "kill selected session",
@@ -341,6 +347,8 @@ impl Command {
             Command::EditDir => "edit directory icon + color (^E emoji picker)",
             Command::ToggleKeepAwake => "toggle keep-awake (prevent OS sleep)",
             Command::DefaultAgent => "set default new-session backend (Claude/Codex)",
+            Command::DefaultHost => "set default host for new sessions",
+            Command::StealAttach => "attach, kicking the client already attached",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
         }
@@ -356,7 +364,6 @@ impl Command {
             Command::NewSession => "new",
             Command::NewSessionPrompt => "new (cwd)",
             Command::ResumePicker => "resume",
-            Command::OpenBrowser => "browse",
             Command::ForkSession => "fork",
             Command::CopySessionId => "copy id",
             Command::KillSelected => "kill",
@@ -383,6 +390,8 @@ impl Command {
             Command::EditDir => "color",
             Command::ToggleKeepAwake => "keep-awake",
             Command::DefaultAgent => "agent",
+            Command::DefaultHost => "host",
+            Command::StealAttach => "steal",
             Command::SessionsLayout => "layout",
             Command::ManageHosts => "hosts",
         }
@@ -401,7 +410,6 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::NewSession,         &["o"]),
     (Command::NewSessionPrompt,   &["O"]),
     (Command::ResumePicker,       &["r"]),
-    (Command::OpenBrowser,        &["b"]),
     (Command::ForkSession,        &["f"]),
     (Command::CopySessionId,      &["y"]),
     (Command::KillSelected,       &["x"]),
@@ -428,6 +436,8 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::EditDir,            &["space i"]),
     (Command::ToggleKeepAwake,    &["space z"]),
     (Command::DefaultAgent,       &["space a"]),
+    (Command::DefaultHost,        &["space H"]),
+    (Command::StealAttach,        &["space s"]),
     (Command::SessionsLayout,     &["space l"]),
     (Command::ManageHosts,        &["space h"]),
 ];
@@ -884,14 +894,19 @@ mod tests {
 
         // Move the majority of leader sequences onto `ctrl+x`; the footer's
         // `more…` should follow the crowd to the larger menu.
-        let mut cfg = HashMap::new();
-        for (id, key) in [
+        // Move more than half of the leader sequences onto `ctrl+x`; the
+        // footer's `more…` should follow the crowd to the larger menu.
+        let moved = [
             ("toggle_preview", "ctrl+x v"),
             ("toggle_detail", "ctrl+x d"),
             ("restart", "ctrl+x e"),
             ("restart_all", "ctrl+x E"),
             ("edit_dir", "ctrl+x i"),
-        ] {
+            ("keep_awake", "ctrl+x z"),
+            ("default_agent", "ctrl+x a"),
+        ];
+        let mut cfg = HashMap::new();
+        for (id, key) in moved {
             cfg.insert(
                 id.to_string(),
                 crate::config::KeyBinding::One(key.to_string()),
@@ -899,8 +914,18 @@ mod tests {
         }
         let (km, warnings) = Keymap::from_config(&cfg);
         assert!(warnings.is_empty(), "{warnings:?}");
-        // 5 on C-x vs 4 left on Space (keep_awake, default_agent,
-        // sessions_layout, manage_hosts).
+        // The moved set must actually be the majority, whatever the leader menu
+        // grows to — assert that rather than a hard-coded count, so adding a
+        // `Space` binding can't silently invert the test's premise.
+        let space_left = DEFAULTS
+            .iter()
+            .filter(|(c, _)| km.keys_for(*c).is_some_and(|k| k.starts_with("Space ")))
+            .count();
+        assert!(
+            moved.len() > space_left,
+            "test premise broken: {} moved vs {space_left} left on Space",
+            moved.len()
+        );
         assert_eq!(km.primary_prefix().as_deref(), Some("C-x"));
     }
 

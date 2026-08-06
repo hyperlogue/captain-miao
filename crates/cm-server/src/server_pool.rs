@@ -84,7 +84,12 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
     // The local-window argv *is* the launcher argv: [exe, agent, cwd, resume…].
     // Append `--pool-session <name>` so the launcher folds the pool name into its
     // state file (the client uses it to attach to this running session later).
-    let plan = LocalBackend::default().open_session(spec);
+    let backend = LocalBackend::new();
+    // The spec's cwd arrives in the host-canonical `~` form (§3); a process
+    // needs the real path — both in the argv (`open_session` expands it) and in
+    // libshpool's `--dir`, which is a chdir, not a shell word.
+    let cwd = cm_core::paths::expand_home(&spec.cwd, backend.home());
+    let plan = backend.open_session(spec);
     let mut argv: Vec<String> = plan.argv().to_vec();
     argv.push("--pool-session".to_string());
     argv.push(name.clone());
@@ -135,7 +140,7 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
             "--cmd",
             &cmd,
             "--dir",
-            &spec.cwd,
+            &cwd,
             &name,
         ])
         .stdin(Stdio::null())
@@ -171,7 +176,7 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
     // Record the cwd into this host's recent-dirs so the client's picker shows
     // it next time it targets this host (a remote launch's dir wouldn't
     // otherwise land in the remote list — the dashboard records only local ones).
-    LocalBackend::default().record_recent_cwd(&spec.cwd);
+    LocalBackend::new().record_recent_cwd(&spec.cwd);
     Ok(name)
 }
 

@@ -101,6 +101,25 @@ pub struct LauncherConfig {
     /// Backend used for new sessions (`o` / `O`) until toggled with `Space a`.
     /// One of "claude" or "codex"; unknown values fall back to claude.
     pub default_agent: String,
+    /// **Pooled-localhost** (`docs/remote-sessions.md` §10.1): run this
+    /// machine's sessions inside the local pty pool instead of spawning them
+    /// directly into terminal windows, and have the dashboard reach them
+    /// through its own daemon like any other host.
+    ///
+    /// Opt-in, and the two modes are permanent, chosen by machine role:
+    ///
+    /// * **Laptops stay direct-local** (the default). Nobody remotes into a
+    ///   laptop, so the pool buys no persistence there — only an extra process
+    ///   hop, no scrollback replay on reattach, and single-attach.
+    /// * **Dev servers want pooled-local.** They have two kinds of consumer
+    ///   needing the *same* attachable sessions: a laptop dashboard over the
+    ///   protocol, and someone who sshs in from a phone and runs captain-miao
+    ///   inside zellij on the box. Pooling makes both of them ordinary attach
+    ///   clients, and sessions then survive a zellij crash and a seat logout.
+    ///
+    /// Needs `miao-server` on PATH; without it the dashboard logs the
+    /// problem and falls back to direct-local rather than starting empty.
+    pub pooled: bool,
 }
 
 impl Default for LauncherConfig {
@@ -112,6 +131,7 @@ impl Default for LauncherConfig {
             new_tab_title: DEFAULT_TAB_TITLE.to_string(),
             resume_tab_title: DEFAULT_TAB_TITLE.to_string(),
             default_agent: "claude".to_string(),
+            pooled: false,
         }
     }
 }

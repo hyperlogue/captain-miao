@@ -95,7 +95,7 @@ impl SessionRow {
 /// whose `pool_session` matches its name.
 fn session_rows() -> Result<Vec<SessionRow>> {
     let sessions = pool_list_sessions()?;
-    let states = LocalBackend::default().list_sessions();
+    let states = LocalBackend::new().list_sessions();
     let by_pool: HashMap<&str, &LauncherState> = states
         .iter()
         .filter_map(|s| s.pool_session.as_deref().map(|p| (p, s)))
@@ -123,7 +123,12 @@ pub fn list(json: bool) -> Result<()> {
 /// ([`cm_core::state::ATTACH_EXIT_BUSY`] / [`ATTACH_EXIT_STALE`]) so a wrapper
 /// can tell them apart from a clean detach — libshpool's own busy refusal
 /// exits 0, which is why the busy case must be caught here.
-pub fn attach(name: String) -> Result<()> {
+/// `force` steals a busy session instead of declining: libshpool's own attach
+/// client sends a `Detach` (kicking the other client, whose attach process just
+/// exits) and retries the dial. Only the *busy* guard is bypassed — the
+/// resurrection guard below is never forceable, since attaching to a dead name
+/// would silently mint a bare login shell wearing it, which nobody can mean.
+pub fn attach(name: String, force: bool) -> Result<()> {
     let sessions = pool_list_sessions()?;
     let Some(session) = sessions.iter().find(|s| s.name == name) else {
         // Don't fall through to libshpool on an unknown name: it would *create*
@@ -140,7 +145,7 @@ pub fn attach(name: String) -> Result<()> {
     // Resurrection guard: a session whose command died while *detached* still
     // lists here (shpool never drops it from its table), and attaching would
     // silently respawn it as a bare login shell wearing the cm- name.
-    let states = LocalBackend::default().list_sessions();
+    let states = LocalBackend::new().list_sessions();
     if cm_core::state::find_live_pool_session(&states, &name, cm_core::state::is_process_alive)
         .is_none()
     {
@@ -151,13 +156,19 @@ pub fn attach(name: String) -> Result<()> {
         std::process::exit(cm_core::state::ATTACH_EXIT_STALE);
     }
     if matches!(session.status, SessionStatus::Attached) {
-        eprintln!("session {name:?} already has a terminal attached; not attaching");
-        std::process::exit(cm_core::state::ATTACH_EXIT_BUSY);
+        if !force {
+            eprintln!(
+                "session {name:?} already has a terminal attached; not attaching \
+                 (pass --force to steal it)"
+            );
+            std::process::exit(cm_core::state::ATTACH_EXIT_BUSY);
+        }
+        eprintln!("stealing session {name:?} from its attached client");
     }
     // Detached → plain interactive reattach. A racing attach between the list
     // and here is still caught by libshpool's own busy guard (which exits 0 —
     // acceptable for the residual race window).
-    attach_pty(&name)
+    attach_pty(&name, force)
 }
 
 /// Proxy the named session's pty to this terminal via libshpool. Mirrors the
@@ -165,7 +176,7 @@ pub fn attach(name: String) -> Result<()> {
 /// plain reattach). `libshpool::run` must precede any thread — this binary is
 /// single-threaded up to here, honoring that contract.
 #[cfg(feature = "pty-pool")]
-fn attach_pty(name: &str) -> Result<()> {
+fn attach_pty(name: &str, force: bool) -> Result<()> {
     use clap::Parser as _;
     let socket = pool_socket_path();
     if let Some(parent) = socket.parent() {
@@ -175,21 +186,24 @@ fn attach_pty(name: &str) -> Result<()> {
     // Parse a synthetic argv: libshpool's `Commands::Attach` is
     // `#[non_exhaustive]`, so it can't be constructed directly, and parsing
     // stays correct if libshpool adds optional flags.
-    let argv = [
+    let mut argv: Vec<&str> = vec![
         "miao-client",
         "--socket",
         &socket,
         "--no-daemonize",
         "attach",
-        name,
     ];
+    if force {
+        argv.push("--force");
+    }
+    argv.push(name);
     let args = libshpool::Args::try_parse_from(argv).context("building libshpool args")?;
     // Safety: single-threaded process, no thread spawned before this point.
     unsafe { libshpool::run(args, None) }
 }
 
 #[cfg(not(feature = "pty-pool"))]
-fn attach_pty(_name: &str) -> Result<()> {
+fn attach_pty(_name: &str, _force: bool) -> Result<()> {
     bail!("this build has no attach support (compiled without the pty-pool feature)");
 }
 

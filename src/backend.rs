@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,8 +35,11 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{ResumeCandidate, SessionIndex};
-use crate::protocol::{ClientFrame, PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
-use crate::state::{self, HostId, LauncherState};
+use crate::protocol::{
+    ClientFrame, PROTOCOL_MIN, PROTOCOL_VERSION, ServerFrame, protocol_compatible, read_frame,
+    write_frame,
+};
+use crate::state::{self, HostId, LauncherState, SessionFlags, SessionKey};
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
 // re-exported so `crate::backend::…` paths across the dashboard resolve unchanged.
@@ -45,41 +48,114 @@ pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
 /// Per-host session management. `Local` is in-process; `Remote` speaks the wire
 /// protocol to a `miao-server` over a (possibly ssh-forwarded) socket.
 pub(crate) enum Backend {
-    Local(LocalBackend),
+    Local(LocalHost),
     Remote(RemoteBackend),
 }
 
-/// Connection health of a backend, surfaced in the header. `Local` is always
-/// `Connected`; a `Remote`'s background task moves it Connecting → Connected →
-/// Disconnected (then back to Connecting as it retries with backoff). Stored as
-/// an `AtomicU8` on the backend (written by the task, read by the draw thread).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Connection health of a backend, surfaced in the header aggregate and, in
+/// full, in the hosts panel. `Local` is always `Connected`; a `Remote`'s
+/// background task moves it Connecting → Connected → Disconnected (then back to
+/// Connecting as it retries with backoff), or parks on `Failed` when the reason
+/// is diagnosable and won't fix itself by retrying.
+///
+/// `Failed` is what closes the "silent ⚠" gap (§4): a missing or
+/// version-mismatched `miao-server` on the remote used to surface as an
+/// ordinary disconnect, so the user saw a warning triangle and no way to learn
+/// *why*. The reason travels with the state and the panel prints it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConnState {
     Connecting,
     Connected,
     Disconnected,
+    /// Reachable-but-unusable: the reason is a short human sentence, already
+    /// phrased for display.
+    Failed(String),
 }
 
 impl ConnState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => ConnState::Connected,
-            2 => ConnState::Disconnected,
-            _ => ConnState::Connecting,
-        }
+    /// Whether this host is currently usable for requests.
+    pub(crate) fn is_connected(&self) -> bool {
+        matches!(self, ConnState::Connected)
     }
-    fn as_u8(self) -> u8 {
+
+    /// A short label for the hosts panel / header.
+    pub(crate) fn label(&self) -> &str {
         match self {
-            ConnState::Connecting => 0,
-            ConnState::Connected => 1,
-            ConnState::Disconnected => 2,
+            ConnState::Connecting => "connecting",
+            ConnState::Connected => "connected",
+            ConnState::Disconnected => "disconnected",
+            ConnState::Failed(reason) => reason,
         }
     }
+}
+
+/// The in-process host: a [`LocalBackend`] plus **its own** change watcher.
+///
+/// Owning the watcher here is the point (§5): the dashboard's run loop used to
+/// create a `notify` watch on `sessions/` itself, so "how do I learn a session
+/// changed" had two answers — an app-level fs watch for localhost and a mirror
+/// push for remotes. Now every backend answers [`Backend::subscribe`] the same
+/// way and the app has no filesystem knowledge at all. (It also makes
+/// pooled-localhost free: that backend is a `Remote` over a local socket, and
+/// it simply has no watcher to own.)
+pub(crate) struct LocalHost {
+    inner: LocalBackend,
+    /// Bumped by the notify callback; the run loop reads it through
+    /// [`BackendEvents`]. Held here so the watcher outlives `subscribe`.
+    changed: Arc<AtomicBool>,
+    watcher: Option<notify::RecommendedWatcher>,
+}
+
+/// A backend's change signal, taken (and cleared) by the run loop. One handle
+/// per backend, from [`Backend::subscribe`]; a local one is fed by that
+/// backend's fs watcher, a remote one by its connection task's mirror pushes
+/// and connect/disconnect transitions.
+pub(crate) struct BackendEvents {
+    changed: Arc<AtomicBool>,
+}
+
+impl BackendEvents {
+    /// Whether this backend changed since the last call (and clear the signal).
+    pub(crate) fn take(&self) -> bool {
+        self.changed.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// What a host can do, as the host itself reports it — the `capabilities()`
+/// seam that replaced `Option`-returning `attach_argv`/`shell_argv` (§5). App
+/// code asks "does this host pool its sessions?", never "is this host local?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendCaps {
+    /// Sessions live in a pty pool, so a local window *attaches* to one rather
+    /// than being it — which is what makes detach (`D`), re-attach, and the
+    /// steal meaningful. True for any host reached over the protocol, including
+    /// a pooled localhost.
+    pub pooled: bool,
+    /// A `w` work-tab shell can be opened on this host.
+    pub shell: bool,
+}
+
+/// How the client opens a shell on a host for the `w` work tab.
+pub(crate) enum ShellPlan {
+    /// Run the user's own shell locally in `cwd` (the terminal backend does it;
+    /// there is no argv).
+    InProcess { cwd: String },
+    /// Spawn this argv — an `ssh -t <target>` that cds into the host's cwd.
+    Spawn { argv: Vec<String> },
+}
+
+/// How the client attaches a window to an already-running pooled session.
+pub(crate) struct AttachPlan {
+    pub argv: Vec<String>,
 }
 
 impl Backend {
     pub(crate) fn local() -> Self {
-        Backend::Local(LocalBackend::default())
+        Backend::Local(LocalHost {
+            inner: LocalBackend::new(),
+            changed: Arc::new(AtomicBool::new(false)),
+            watcher: None,
+        })
     }
 
     /// The host this backend manages — `local` for in-process, the configured
@@ -100,10 +176,69 @@ impl Backend {
         }
     }
 
+    /// What this host supports, so app code branches on the capability rather
+    /// than on locality (§1's load-bearing principle).
+    pub(crate) fn capabilities(&self) -> BackendCaps {
+        match self {
+            Backend::Local(_) => BackendCaps {
+                pooled: false,
+                shell: true,
+            },
+            Backend::Remote(b) => BackendCaps {
+                pooled: true,
+                // Reached over ssh → an `ssh -t` shell tab. Reached over a
+                // *local* socket (pooled-localhost) → there's no ssh target,
+                // but the host is this machine, so the shell is in-process.
+                shell: b.attach_target.is_some() || b.transport_is_local,
+            },
+        }
+    }
+
+    /// Start (or fetch) this backend's change signal. Called once per backend
+    /// at startup and after a hosts-panel reconnect; a local backend lazily
+    /// creates its `sessions/` + agent-path watcher on the first call.
+    pub(crate) fn subscribe(&mut self) -> BackendEvents {
+        match self {
+            Backend::Local(h) => {
+                if h.watcher.is_none() {
+                    h.watcher = start_local_watcher(h.changed.clone());
+                    // Whatever the watcher's fate, the first pass must reload.
+                    h.changed.store(true, Ordering::Relaxed);
+                }
+                BackendEvents {
+                    changed: h.changed.clone(),
+                }
+            }
+            Backend::Remote(b) => BackendEvents {
+                changed: b.dirty.clone(),
+            },
+        }
+    }
+
+    /// The daemon version this host reported at handshake, for the hosts panel.
+    /// `None` for a local backend (it *is* this build) or before a handshake.
+    pub(crate) fn daemon_version(&self) -> Option<String> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Remote(b) => b.server_version.lock().unwrap().clone(),
+        }
+    }
+
+    /// Round-trip time to this host, sampled opportunistically from real
+    /// request/response traffic — there is deliberately **no `Ping` frame**
+    /// (§9): every reply is already matched by `req_id`, so timing one costs
+    /// nothing. `None` for local, or before any request has been answered.
+    pub(crate) fn latency(&self) -> Option<Duration> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Remote(b) => *b.latency.lock().unwrap(),
+        }
+    }
+
     /// Live sessions on this host (those with a current state file).
     pub(crate) fn list_sessions(&self) -> Vec<LauncherState> {
         match self {
-            Backend::Local(b) => b.list_sessions(),
+            Backend::Local(h) => h.inner.list_sessions(),
             Backend::Remote(b) => b.list_sessions(),
         }
     }
@@ -113,7 +248,7 @@ impl Backend {
     /// `LauncherState.name` via the per-host overlay).
     pub(crate) fn session_index(&mut self) -> SessionIndex {
         match self {
-            Backend::Local(b) => b.session_index(),
+            Backend::Local(h) => h.inner.session_index(),
             Backend::Remote(b) => b.session_index(),
         }
     }
@@ -125,18 +260,32 @@ impl Backend {
     /// should wrap this in `block_in_place`.
     pub(crate) fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
         match self {
-            Backend::Local(b) => b.list_resumable(limit),
+            Backend::Local(h) => h.inner.list_resumable(limit),
             Backend::Remote(b) => b.list_resumable(limit),
         }
     }
 
-    /// SIGTERM the agent process so its launcher tears the session down. Returns
-    /// whether the signal was delivered. May block on a round-trip for a remote
-    /// host, so an async caller should wrap this in `block_in_place`.
-    pub(crate) fn kill_session(&self, child_pid: u32) -> bool {
+    /// Tear the session down, naming it by its opaque [`SessionKey`]. The
+    /// *owning host* resolves the key to a live pid immediately before
+    /// signalling, so a mirror lagging the session's exit can't make it SIGTERM
+    /// a recycled pid (§3). May block on a round-trip for a remote host, so an
+    /// async caller should wrap this in `block_in_place`.
+    pub(crate) fn kill_session(&self, key: &SessionKey) -> bool {
         match self {
-            Backend::Local(b) => b.kill_session(child_pid),
-            Backend::Remote(b) => b.kill_session(child_pid),
+            Backend::Local(h) => h.inner.kill_session(key),
+            Backend::Remote(b) => b.kill_session(key),
+        }
+    }
+
+    /// Record the host-owned flags for a session, so every dashboard watching
+    /// that host agrees (§9). `false` when the host doesn't serve flags — a
+    /// plain local backend, whose flags are the dashboard's own
+    /// `dashboard-overrides.json` — which is the caller's signal to persist
+    /// them locally instead. Blocks on a round-trip for a remote host.
+    pub(crate) fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
+        match self {
+            Backend::Local(_) => false,
+            Backend::Remote(b) => b.set_session_flags(key, flags),
         }
     }
 
@@ -150,69 +299,84 @@ impl Backend {
     /// attach windows arrive with the 3d browser; see `App::local_backend`.)
     pub(crate) fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         match self {
-            Backend::Local(b) => Ok(b.open_session(spec)),
+            Backend::Local(h) => Ok(h.inner.open_session(spec)),
             Backend::Remote(b) => b.open_session(spec),
         }
     }
 
-    /// The argv for a window that attaches to an *already-running* pool session
-    /// on this host (`ssh -t <target> miao-server attach <name>`). `None` for
-    /// the local backend — local sessions aren't pooled, they keep their own
-    /// window. Used by the client to attach to a running remote session it isn't
-    /// already attached to (§5).
-    pub(crate) fn attach_argv(&self, session_name: &str) -> Option<Vec<String>> {
+    /// How to open a window onto an *already-running* pooled session on this
+    /// host. `force` steals it from whatever client currently holds it (the
+    /// pool is one client at a time — §10.2).
+    ///
+    /// A `Result`, not an `Option` (§5): the old signature could only say
+    /// "no", so every caller invented its own message for a case it couldn't
+    /// distinguish. Now the host explains itself.
+    pub(crate) fn attach_plan(
+        &self,
+        session_name: &str,
+        force: bool,
+    ) -> anyhow::Result<AttachPlan> {
         match self {
-            Backend::Local(_) => None,
-            Backend::Remote(b) => Some(attach_argv(
-                b.attach_target.as_deref(),
-                &b.remote_exe.lock().unwrap(),
-                session_name,
-            )),
+            Backend::Local(_) => anyhow::bail!(
+                "sessions on this host aren't pooled — they own their window, so there is \
+                 nothing to attach to"
+            ),
+            Backend::Remote(b) => Ok(AttachPlan {
+                argv: attach_argv(
+                    b.attach_target.as_deref(),
+                    &b.remote_exe.lock().unwrap(),
+                    session_name,
+                    force,
+                ),
+            }),
         }
     }
 
-    /// The argv for a window that opens an interactive login shell on this
-    /// host in `cwd`. `None` for the local backend (the client opens a local
-    /// shell itself, in-process) and for a socket-transport remote (no ssh
-    /// target to reach it by); `Some` ssh argv for an ssh remote — so `w` on a
-    /// remote row lands a terminal on that server in the session's workdir.
-    pub(crate) fn shell_argv(&self, cwd: &str) -> Option<Vec<String>> {
+    /// How to open an interactive login shell on this host in `cwd` (the `w`
+    /// work tab): in process for this machine, over ssh for a remote.
+    pub(crate) fn shell_plan(&self, cwd: &str) -> anyhow::Result<ShellPlan> {
         match self {
-            Backend::Local(_) => None,
-            Backend::Remote(b) => b
-                .attach_target
-                .as_deref()
-                .map(|t| remote_shell_argv(t, cwd)),
+            Backend::Local(h) => Ok(ShellPlan::InProcess {
+                // The row's cwd is host-canonical; a local chdir needs the real
+                // path, and this backend's own home is the one to expand it by.
+                cwd: cm_core::paths::expand_home(cwd, h.inner.home()),
+            }),
+            Backend::Remote(b) => match b.attach_target.as_deref() {
+                Some(target) => Ok(ShellPlan::Spawn {
+                    argv: remote_shell_argv(target, cwd),
+                }),
+                // Pooled localhost: the "remote" host is this machine, so the
+                // shell is the ordinary local one. `$HOME` never crosses the
+                // wire, so the expansion uses *our* home — correct precisely
+                // because this transport is local-only by contract.
+                None if b.transport_is_local => Ok(ShellPlan::InProcess {
+                    cwd: cm_core::paths::expand_home(cwd, &cm_core::paths::host_home()),
+                }),
+                None => anyhow::bail!(
+                    "cannot open a shell on {}: it is reached over a socket with no ssh target",
+                    b.host.0
+                ),
+            },
         }
     }
 
-    /// Whether a change signal has arrived from this backend's mirror since the
-    /// last check (and clears it). A remote backend's connection task updates
-    /// its in-memory mirror off-thread — no filesystem event fires — so the
-    /// dashboard loop polls this to know when to reload + redraw remote rows.
-    /// Always `false` for the local backend (its changes ride fs notify).
-    pub(crate) fn take_dirty(&self) -> bool {
-        match self {
-            Backend::Local(_) => false,
-            Backend::Remote(b) => b.take_dirty(),
-        }
-    }
-
-    /// This host's recent working dirs + its `$HOME`, for the workdir picker.
-    /// The remote path blocks on a round-trip, so wrap async callers in
+    /// This host's recent working dirs, host-canonical (§3 — no `$HOME` on the
+    /// wire, so what comes back is what the picker displays and submits). The
+    /// remote path blocks on a round-trip, so wrap async callers in
     /// `block_in_place`.
-    pub(crate) fn recent_dirs(&self) -> (Vec<String>, String) {
+    pub(crate) fn recent_dirs(&self) -> Vec<String> {
         match self {
-            Backend::Local(b) => b.recent_dirs(),
+            Backend::Local(h) => h.inner.recent_dirs(),
             Backend::Remote(b) => b.recent_dirs(),
         }
     }
 
-    /// Directory completions for `prefix` on this host's filesystem (absolute
-    /// paths, trailing `/`). Remote blocks — wrap in `block_in_place`.
+    /// Directory completions for `prefix` on this host's filesystem
+    /// (host-canonical, trailing `/`). Remote blocks — wrap in
+    /// `block_in_place`.
     pub(crate) fn complete_path(&self, prefix: &str) -> Vec<String> {
         match self {
-            Backend::Local(b) => b.complete_path(prefix),
+            Backend::Local(h) => h.inner.complete_path(prefix),
             Backend::Remote(b) => b.complete_path(prefix),
         }
     }
@@ -221,10 +385,43 @@ impl Backend {
     /// `block_in_place`.
     pub(crate) fn dir_exists(&self, path: &str) -> bool {
         match self {
-            Backend::Local(b) => b.dir_exists(path),
+            Backend::Local(h) => h.inner.dir_exists(path),
             Backend::Remote(b) => b.dir_exists(path),
         }
     }
+}
+
+/// Watch this host's session state for changes, feeding `changed`. Owned by the
+/// local backend (§5), not the app: the `sessions/` dir where launchers write,
+/// plus each agent backend's own nominated paths (Claude's session-name store,
+/// Codex's title-store WAL — the wake for the throttled title overlay).
+///
+/// Best-effort throughout: a missing path simply isn't watched, and a watcher
+/// that can't be created at all leaves the dashboard on its reload cadence
+/// rather than failing to start.
+fn start_local_watcher(changed: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher as _;
+    let sink = changed.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else { return };
+        // Skip Access (open/close/read): our own reads would otherwise wake us.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        sink.store(true, Ordering::Relaxed);
+    })
+    .ok()?;
+    let dir = state::sessions_dir();
+    if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+        tracing::warn!("could not watch {}: {e}", dir.display());
+        return None;
+    }
+    for &agent in crate::agent::AgentControl::ALL {
+        for path in agent.watch_paths() {
+            let _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);
+        }
+    }
+    Some(watcher)
 }
 
 // =============================================================================
@@ -233,9 +430,12 @@ impl Backend {
 
 /// How a [`RemoteBackend`] reaches its server.
 pub(crate) enum Transport {
-    /// Connect straight to this socket (already reachable — a manual forward or
-    /// local testing).
-    Socket(PathBuf),
+    /// Connect straight to a daemon socket **on this same machine** — no ssh
+    /// hop. Local-only is part of the contract, not an accident: this is the
+    /// pooled-localhost transport (§10.1), where the "remote" host is the
+    /// machine the dashboard runs on, so an attach needs no ssh and a `w` shell
+    /// is opened in process. (It doubles as the manual-forward / test path.)
+    LocalSocket(PathBuf),
     /// Set up an ssh forward to `target`'s daemon and connect via `local_sock`:
     /// ensure the daemon is running + learn its socket path (`daemon ensure`),
     /// then run a forward-only `ssh -N -L <local_sock>:<remote_sock> target`
@@ -264,8 +464,14 @@ pub(crate) struct RemoteBackend {
     /// an ssh host (`ssh -t <target> miao-server attach <name>`), `None` for a
     /// direct socket transport (a same-host `miao-server attach <name>`).
     attach_target: Option<String>,
-    /// Latest known sessions on the remote host, keyed by launcher pid.
-    mirror: Arc<Mutex<HashMap<u32, LauncherState>>>,
+    /// Whether this backend's transport is [`Transport::LocalSocket`], i.e. the
+    /// daemon is on *this* machine. Distinguishes pooled-localhost (where a
+    /// missing ssh target is correct and a shell is in-process) from a
+    /// misconfigured remote.
+    transport_is_local: bool,
+    /// Latest known sessions on the remote host, keyed by their opaque
+    /// [`SessionKey`] — the wire's only session identifier (§3).
+    mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
     /// Requests to the connection task; `None` once the task has exited.
     requests: mpsc::UnboundedSender<PendingRequest>,
     next_req_id: AtomicU64,
@@ -275,14 +481,26 @@ pub(crate) struct RemoteBackend {
     /// resolves it (or for a socket transport) the attach argv is unchanged.
     /// Never the dashboard binary (`miao`) — the remote runs the headless server.
     remote_exe: Arc<Mutex<String>>,
-    /// Connection health (a [`ConnState`] as `u8`) the connection task updates
-    /// as it dials / connects / loses the link, read by the header surface.
-    conn: Arc<AtomicU8>,
+    /// Connection health the connection task updates as it dials / connects /
+    /// loses the link, read by the header + hosts panel. Carries the `Failed`
+    /// reason, so a diagnosable problem (server missing, version mismatch, ssh
+    /// refused) is nameable rather than a silent ⚠ (§4).
+    conn: Arc<Mutex<ConnState>>,
+    /// The daemon version from `Welcome`, for the hosts panel.
+    server_version: Arc<Mutex<Option<String>>>,
+    /// Most recent request→reply round-trip. Sampled from ordinary traffic —
+    /// there is no `Ping` frame, because every reply is already `req_id`-matched
+    /// and timing one is free (§9).
+    latency: Arc<Mutex<Option<Duration>>>,
     /// Set by the connection task whenever the mirror or connection state
     /// changes (a pushed `Snapshot`/`Delta`/`Removed`, or a connect/disconnect).
-    /// The dashboard loop polls [`RemoteBackend::take_dirty`] to reload + redraw,
-    /// since these off-thread updates fire no filesystem event.
+    /// Read through [`BackendEvents`], the same handle a local backend's fs
+    /// watcher feeds — these off-thread updates fire no filesystem event.
     dirty: Arc<AtomicBool>,
+    /// Bumped on each `Disconnected → Connected` transition. The dashboard
+    /// compares it against what it last saw to fire the auto-reattach sweep
+    /// (§7) exactly once per reconnect.
+    reconnect_epoch: Arc<AtomicU64>,
 }
 
 impl RemoteBackend {
@@ -296,51 +514,63 @@ impl RemoteBackend {
         // `open_session` needs it to build the attach window's argv.
         let attach_target = match &transport {
             Transport::Ssh { target, .. } => Some(target.clone()),
-            Transport::Socket(_) => None,
+            Transport::LocalSocket(_) => None,
         };
+        let transport_is_local = matches!(transport, Transport::LocalSocket(_));
         let mirror = Arc::new(Mutex::new(HashMap::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
-        let conn = Arc::new(AtomicU8::new(ConnState::Connecting.as_u8()));
+        let conn = Arc::new(Mutex::new(ConnState::Connecting));
         let dirty = Arc::new(AtomicBool::new(false));
+        let server_version = Arc::new(Mutex::new(None));
+        let latency = Arc::new(Mutex::new(None));
+        let reconnect_epoch = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(connection_task(
             transport,
-            mirror.clone(),
-            remote_exe.clone(),
-            conn.clone(),
-            dirty.clone(),
+            ConnectionShared {
+                mirror: mirror.clone(),
+                remote_exe: remote_exe.clone(),
+                conn: conn.clone(),
+                dirty: dirty.clone(),
+                server_version: server_version.clone(),
+                latency: latency.clone(),
+                reconnect_epoch: reconnect_epoch.clone(),
+            },
             rx,
         ));
         Self {
             host,
             attach_target,
+            transport_is_local,
             mirror,
             requests: tx,
             next_req_id: AtomicU64::new(1),
             remote_exe,
             conn,
+            server_version,
+            latency,
             dirty,
+            reconnect_epoch,
         }
     }
 
     /// Current connection health, for the header surface.
     fn conn_state(&self) -> ConnState {
-        ConnState::from_u8(self.conn.load(Ordering::Relaxed))
-    }
-
-    /// Take (and clear) the pending change signal — see the `dirty` field.
-    fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::Relaxed)
+        self.conn.lock().unwrap().clone()
     }
 
     /// Send a request and block until its reply (or the task is gone). Returns
-    /// `None` if the connection task has exited.
+    /// `None` if the connection task has exited. Samples the round-trip time on
+    /// the way through — the hosts panel's latency, with no dedicated frame.
     fn request(&self, make: impl FnOnce(u64) -> ClientFrame) -> Option<ServerFrame> {
         // A known-down host fails fast: queueing the request would block the
         // caller (it's on a `block_in_place`) through the whole reconnect
         // backoff. While merely dialing (Connecting) we still queue, so the very
         // first request right after `connect()` rides the pending connection.
-        if self.conn_state() == ConnState::Disconnected {
+        if matches!(
+            self.conn_state(),
+            ConnState::Disconnected | ConnState::Failed(_)
+        ) {
             return None;
         }
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +582,17 @@ impl RemoteBackend {
                 reply,
             })
             .ok()?;
-        rx.blocking_recv().ok()
+        let sent_at = Instant::now();
+        let reply = rx.blocking_recv().ok();
+        if reply.is_some() {
+            *self.latency.lock().unwrap() = Some(sent_at.elapsed());
+        }
+        reply
+    }
+
+    /// The reconnect counter behind the auto-reattach sweep (§7).
+    pub(crate) fn reconnect_epoch(&self) -> u64 {
+        self.reconnect_epoch.load(Ordering::Relaxed)
     }
 
     fn list_sessions(&self) -> Vec<LauncherState> {
@@ -375,10 +615,19 @@ impl RemoteBackend {
         }
     }
 
-    fn kill_session(&self, child_pid: u32) -> bool {
+    fn kill_session(&self, key: &SessionKey) -> bool {
+        let key = key.clone();
         matches!(
-            self.request(|req_id| ClientFrame::KillSession { req_id, child_pid }),
+            self.request(|req_id| ClientFrame::KillSession { req_id, key }),
             Some(ServerFrame::Killed { ok: true, .. })
+        )
+    }
+
+    fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
+        let key = key.clone();
+        matches!(
+            self.request(|req_id| ClientFrame::SetSessionFlags { req_id, key, flags }),
+            Some(ServerFrame::FlagsSet { ok: true, .. })
         )
     }
 
@@ -396,6 +645,9 @@ impl RemoteBackend {
                     self.attach_target.as_deref(),
                     &self.remote_exe.lock().unwrap(),
                     &name,
+                    // A session we just created can't already have a client, so
+                    // the create path never steals.
+                    false,
                 ),
                 session_name: name,
             }),
@@ -404,12 +656,12 @@ impl RemoteBackend {
         }
     }
 
-    /// The remote host's recent dirs + its `$HOME`, for the workdir picker.
-    /// Blocks on the round-trip; empty + no-home if unreachable.
-    fn recent_dirs(&self) -> (Vec<String>, String) {
+    /// The remote host's recent dirs, host-canonical. Blocks on the round-trip;
+    /// empty if unreachable.
+    fn recent_dirs(&self) -> Vec<String> {
         match self.request(|req_id| ClientFrame::ListRecentDirs { req_id }) {
-            Some(ServerFrame::RecentDirs { cwds, home, .. }) => (cwds, home),
-            _ => (Vec::new(), String::new()),
+            Some(ServerFrame::RecentDirs { cwds, .. }) => cwds,
+            _ => Vec::new(),
         }
     }
 
@@ -436,44 +688,65 @@ impl RemoteBackend {
 /// The argv for the window that attaches to a pool session: over ssh for a
 /// remote host (`ssh -t <target> miao-server attach <name>`), or directly for
 /// a same-host socket transport (`miao-server attach <name>`). `-t` forces a
-/// pty so the agent's TUI renders.
-fn attach_argv(target: Option<&str>, remote_exe: &str, session_name: &str) -> Vec<String> {
+/// pty so the agent's TUI renders. `force` steals the session from whatever
+/// client currently holds it (§10.2).
+///
+/// The ssh form rides the **same `ControlMaster`** the connection task already
+/// established (§4), so opening an attach window skips authentication entirely
+/// — instant, and no 2FA re-prompt. The deliberate cost is shared fate: OpenSSH
+/// multiplexes every channel over the master's single TCP connection, so if the
+/// master dies all of this host's attach windows detach at once. That's benign
+/// (the pooled sessions survive; each window is one `Enter` to reattach) and
+/// worth the latency.
+fn attach_argv(
+    target: Option<&str>,
+    remote_exe: &str,
+    session_name: &str,
+    force: bool,
+) -> Vec<String> {
     let mut argv = match target {
-        Some(t) => vec![
-            "ssh".to_string(),
-            "-t".to_string(),
-            t.to_string(),
-            remote_exe.to_string(),
-        ],
+        Some(t) => {
+            let mut v = vec!["ssh".to_string(), "-t".to_string()];
+            v.extend(ssh_common_opts(&state::ssh_control_path(t)));
+            v.push(t.to_string());
+            v.push(remote_exe.to_string());
+            v
+        }
         None => vec![remote_exe.to_string()],
     };
     argv.push("attach".to_string());
+    if force {
+        argv.push("--force".to_string());
+    }
     argv.push(session_name.to_string());
     argv
 }
 
 /// The argv for a window that opens an interactive login shell on a remote host
-/// in `cwd`, over ssh: `ssh -t <target> "cd <cwd> && exec $SHELL -l"`. `-t`
-/// forces a pty so the shell is interactive; the `cd` lands in the session's
-/// workdir, then we hand off to the user's login shell (falling back to
-/// `/bin/sh`). The path is single-quoted so spaces and glob chars are safe. An
-/// empty `cwd` just drops the `cd`. Pure + unit-tested.
+/// in `cwd`, over ssh: `ssh -t <target> "cd <cwd> && exec $SHELL -l"`, sharing
+/// the ControlMaster like [`attach_argv`]. `-t` forces a pty so the shell is
+/// interactive; the `cd` lands in the session's workdir, then we hand off to the
+/// user's login shell (falling back to `/bin/sh`).
+///
+/// `cwd` is **host-canonical** (§3), so it may be a `~` form — which a plain
+/// `'…'` quoting would render inert. `shell_quote_host_path` emits the tilde as
+/// a `"$HOME"` the *remote* shell expands while keeping the rest quoted, so
+/// spaces and glob chars are still safe. An empty `cwd` just drops the `cd`.
+/// Pure + unit-tested.
 fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
     let remote_cmd = if cwd.is_empty() {
         "exec \"${SHELL:-/bin/sh}\" -l".to_string()
     } else {
         format!(
             "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
-            shell_single_quote(cwd)
+            cm_core::paths::shell_quote_host_path(cwd)
         )
     };
-    vec!["ssh".into(), "-t".into(), target.to_string(), remote_cmd]
-}
-
-/// Single-quote `s` for a POSIX shell: wrap in `'…'` and rewrite each embedded
-/// `'` as `'\''`, so an arbitrary path can't break out of the quoting.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    argv.extend(ssh_common_opts(&state::ssh_control_path(target)));
+    argv.push(target.to_string());
+    argv.push(remote_cmd);
+    argv
 }
 
 // =============================================================================
@@ -569,6 +842,34 @@ fn decide_provision(local_version: &str, probe: &RemoteProbe) -> Provision {
     Provision::FallBack
 }
 
+/// The **loud** half of "assume it's there, verify, and fail loudly" (§4): turn
+/// a fall-back decision into a sentence the hosts panel can show, instead of the
+/// generic connection failure a missing or stale server used to produce.
+/// `None` when the provision succeeded and there is nothing to report. Pure.
+fn provision_failure(
+    local_version: &str,
+    probe: &RemoteProbe,
+    action: &Provision,
+) -> Option<String> {
+    if !matches!(action, Provision::FallBack) {
+        return None;
+    }
+    let found: Vec<&str> = [
+        probe.path_version.as_deref(),
+        probe.cache_version.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Some(match found.as_slice() {
+        [] => format!("miao-server not found (need {local_version}); deploy it with redeploy.sh"),
+        versions => format!(
+            "miao-server version mismatch (found {}, need {local_version})",
+            versions.join(", ")
+        ),
+    })
+}
+
 /// The remote command an action resolves to: the absolute cache path for
 /// `UseCache`, else `miao-server` from PATH.
 fn remote_exe_for(action: &Provision, home: &str) -> String {
@@ -636,16 +937,22 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
 
 /// Resolve the remote command to invoke: probe → decide. Never errors — any
 /// failure resolves to `miao-server` on PATH so the rest of `setup_ssh`
-/// behaves exactly as it did before provisioning existed.
-async fn resolve_remote_exe(target: &str, opts: &[String]) -> String {
+/// behaves exactly as it did before provisioning existed. The second half of
+/// the pair is the *diagnosis*: a `Some(reason)` names what's wrong with the
+/// remote install, for `ConnState::Failed` to carry (§4).
+async fn resolve_remote_exe(target: &str, opts: &[String]) -> (String, Option<String>) {
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
             "{target}: probe failed (unreachable / no shell) → PATH miao-server"
         );
-        return "miao-server".to_string();
+        return (
+            "miao-server".to_string(),
+            Some("host unreachable over ssh (or no shell)".to_string()),
+        );
     };
-    let action = decide_provision(env!("CARGO_PKG_VERSION"), &probe);
+    let local_version = env!("CARGO_PKG_VERSION");
+    let action = decide_provision(local_version, &probe);
     tracing::debug!(
         target: "captain_miao::provision",
         "{target}: remote_arch={:?} path_ver={:?} cache_ver={:?} → {action:?}",
@@ -653,7 +960,7 @@ async fn resolve_remote_exe(target: &str, opts: &[String]) -> String {
     );
     let exe = remote_exe_for(&action, &probe.home);
     tracing::debug!(target: "captain_miao::provision", "{target}: remote exe = {exe}");
-    exe
+    (exe, provision_failure(local_version, &probe, &action))
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -666,7 +973,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const RECONNECT_HEALTHY: Duration = Duration::from_secs(20);
 
 /// How one `serve` session ended, telling [`connection_task`] how to proceed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ServeOutcome {
     /// The `RemoteBackend` was dropped (request channel closed) — stop for good.
     BackendDropped,
@@ -674,8 +981,22 @@ enum ServeOutcome {
     /// promptly (a healthy link just dropped; reset the backoff).
     ConnectionLost,
     /// The handshake/subscribe never completed — reconnect, but keep backing off
-    /// (an incompatible or absent server shouldn't hot-loop).
-    HandshakeFailed,
+    /// (an incompatible or absent server shouldn't hot-loop). A `Some` reason is
+    /// diagnosable and becomes the host's `ConnState::Failed` text.
+    HandshakeFailed(Option<String>),
+}
+
+/// The handles [`connection_task`] shares with its [`RemoteBackend`]. Grouped
+/// into a struct rather than passed as seven positional `Arc`s, where the two
+/// `Arc<Mutex<Option<String>>>`s would be swappable at a call site.
+struct ConnectionShared {
+    mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
+    remote_exe: Arc<Mutex<String>>,
+    conn: Arc<Mutex<ConnState>>,
+    dirty: Arc<AtomicBool>,
+    server_version: Arc<Mutex<Option<String>>>,
+    latency: Arc<Mutex<Option<Duration>>>,
+    reconnect_epoch: Arc<AtomicU64>,
 }
 
 /// Own a [`RemoteBackend`]'s connection for its whole lifetime, reconnecting on
@@ -686,30 +1007,38 @@ enum ServeOutcome {
 /// the `RemoteBackend` was dropped, when the task exits.
 async fn connection_task(
     transport: Transport,
-    mirror: Arc<Mutex<HashMap<u32, LauncherState>>>,
-    remote_exe: Arc<Mutex<String>>,
-    conn: Arc<AtomicU8>,
-    dirty: Arc<AtomicBool>,
+    shared: ConnectionShared,
     mut requests: mpsc::UnboundedReceiver<PendingRequest>,
 ) {
+    let ConnectionShared {
+        mirror,
+        remote_exe,
+        conn,
+        dirty,
+        server_version,
+        latency,
+        reconnect_epoch,
+    } = shared;
     // A connection-state change flips `dirty` alongside `conn` so the dashboard
-    // reloads + redraws the header (⟳/⚠) promptly on connect/disconnect, not
-    // only when the mirror later changes.
+    // reloads + redraws the header promptly on connect/disconnect, not only when
+    // the mirror later changes.
     let store = |s: ConnState| {
-        conn.store(s.as_u8(), Ordering::Relaxed);
+        *conn.lock().unwrap() = s;
         dirty.store(true, Ordering::Relaxed);
     };
     let mut backoff = RECONNECT_INITIAL;
+    let mut was_connected = false;
     loop {
         store(ConnState::Connecting);
         // Establish the transport; for ssh, (re)stand up the forward+server
         // child. Re-running `setup_ssh` on each attempt is deliberate: it also
         // re-cancels any stale ControlMaster forward, which is what makes a
         // reconnect actually bind its socket.
+        let mut failure: Option<String> = None;
         let established = match &transport {
-            Transport::Socket(p) => Some((p.clone(), None)),
+            Transport::LocalSocket(p) => Some((p.clone(), None)),
             Transport::Ssh { target, local_sock } => {
-                match setup_ssh(target, local_sock, &remote_exe).await {
+                match setup_ssh(target, local_sock, &remote_exe, &mut failure).await {
                     Some(child) => Some((local_sock.clone(), Some(child))),
                     None => {
                         tracing::warn!(target: "captain_miao::ssh", "{target}: ssh setup failed — will retry");
@@ -719,7 +1048,15 @@ async fn connection_task(
             }
         };
         let Some((sock_path, ssh_child)) = established else {
-            store(ConnState::Disconnected);
+            // A diagnosable cause (server missing, version mismatch, host
+            // unreachable) is surfaced verbatim instead of a bare ⚠ (§4). The
+            // task keeps retrying either way — `Failed` is a *label*, not a
+            // terminal state, since deploying the binary should heal it without
+            // the user restarting anything.
+            store(match failure {
+                Some(reason) => ConnState::Failed(reason),
+                None => ConnState::Disconnected,
+            });
             if !wait_before_retry(&mut requests, &mut backoff).await {
                 return;
             }
@@ -737,15 +1074,27 @@ async fn connection_task(
             continue;
         };
         tracing::debug!(target: "captain_miao::ssh", "connected to {}; serving", sock_path.display());
+        // A Disconnected → Connected edge bumps the epoch, which is what the
+        // dashboard's auto-reattach sweep watches (§7): after a laptop sleep or
+        // a broken pipe, every session that *had* an attach window gets one
+        // again, without the user re-Entering each row.
+        if was_connected {
+            reconnect_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+        was_connected = true;
         store(ConnState::Connected);
         let connected_at = Instant::now();
-        let outcome = serve(stream, &mirror, &dirty, &mut requests).await;
+        let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
         drop(ssh_child); // explicit: kill the ssh child once the connection ends
         // The mirror is now stale; clear it so the host shows no (misleading)
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
         mirror.lock().unwrap().clear();
-        store(ConnState::Disconnected);
+        *latency.lock().unwrap() = None;
+        store(match &outcome {
+            ServeOutcome::HandshakeFailed(Some(reason)) => ConnState::Failed(reason.clone()),
+            _ => ConnState::Disconnected,
+        });
         tracing::debug!(
             target: "captain_miao::ssh",
             "serve loop ended for {} ({outcome:?})", sock_path.display()
@@ -758,7 +1107,7 @@ async fn connection_task(
             ServeOutcome::ConnectionLost if connected_at.elapsed() >= RECONNECT_HEALTHY => {
                 backoff = RECONNECT_INITIAL;
             }
-            ServeOutcome::ConnectionLost | ServeOutcome::HandshakeFailed => {}
+            ServeOutcome::ConnectionLost | ServeOutcome::HandshakeFailed(_) => {}
         }
         if !wait_before_retry(&mut requests, &mut backoff).await {
             return;
@@ -827,6 +1176,7 @@ async fn setup_ssh(
     target: &str,
     local_sock: &Path,
     remote_exe: &Arc<Mutex<String>>,
+    failure: &mut Option<String>,
 ) -> Option<tokio::process::Child> {
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
@@ -842,8 +1192,12 @@ async fn setup_ssh(
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
-    let exe = resolve_remote_exe(target, &opts).await;
+    let (exe, diagnosis) = resolve_remote_exe(target, &opts).await;
     *remote_exe.lock().unwrap() = exe.clone();
+    // Carry the diagnosis out even when we go on to try the fallback: if the
+    // `daemon ensure` below fails, *this* is the reason the user needs, not
+    // "connection failed".
+    *failure = diagnosis;
 
     // Ensure the remote daemon is running AND learn its socket path in one call:
     // `daemon ensure` self-daemonizes if needed (idempotent — a no-op against a
@@ -858,14 +1212,30 @@ async fn setup_ssh(
         .await
         .ok()?;
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
         tracing::warn!(
             target: "captain_miao::ssh",
             "{target}: `{exe} daemon ensure` failed (rc={:?}): {}",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr.trim()
         );
+        // Keep a provisioning diagnosis if we have one (it's the root cause);
+        // otherwise report what the remote actually said.
+        if failure.is_none() {
+            let detail: String = stderr.trim().chars().take(160).collect();
+            *failure = Some(if detail.is_empty() {
+                format!(
+                    "`daemon ensure` failed on the host (rc={:?})",
+                    out.status.code()
+                )
+            } else {
+                format!("`daemon ensure` failed on the host: {detail}")
+            });
+        }
         return None;
     }
+    // The daemon answered, so nothing is wrong with the install after all.
+    *failure = None;
     let remote_sock = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
@@ -938,8 +1308,9 @@ async fn setup_ssh(
 /// The [`ServeOutcome`] tells the caller whether to reconnect and how fast.
 async fn serve(
     stream: UnixStream,
-    mirror: &Arc<Mutex<HashMap<u32, LauncherState>>>,
+    mirror: &Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
     dirty: &Arc<AtomicBool>,
+    server_version: &Arc<Mutex<Option<String>>>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
 ) -> ServeOutcome {
     let (rd, mut wr) = stream.into_split();
@@ -952,22 +1323,38 @@ async fn serve(
     };
     if write_frame(&mut wr, &hello).await.is_err() {
         tracing::warn!(target: "captain_miao::ssh", "failed to send Hello");
-        return ServeOutcome::HandshakeFailed;
+        return ServeOutcome::HandshakeFailed(None);
     }
     match read_frame::<_, ServerFrame>(&mut rd).await {
-        Ok(Some(ServerFrame::Welcome { protocol, .. })) if protocol == PROTOCOL_VERSION => {
-            tracing::debug!(target: "captain_miao::ssh", "handshake ok (protocol {protocol})");
+        Ok(Some(ServerFrame::Welcome {
+            protocol,
+            server_version: sv,
+            ..
+        })) => {
+            // Only a server *below* the floor is refused — a newer one is fine,
+            // since both sides decode unknown frames/fields tolerantly (§3).
+            if !protocol_compatible(protocol) {
+                tracing::warn!(
+                    target: "captain_miao::ssh",
+                    "server speaks protocol {protocol}, below our floor {PROTOCOL_MIN}"
+                );
+                return ServeOutcome::HandshakeFailed(Some(format!(
+                    "daemon {sv} speaks protocol {protocol}; this build needs ≥ {PROTOCOL_MIN}"
+                )));
+            }
+            tracing::debug!(target: "captain_miao::ssh", "handshake ok (protocol {protocol}, server {sv})");
+            *server_version.lock().unwrap() = Some(sv);
         }
-        // Mismatched/absent welcome: bail — the dashboard surfaces the host as
-        // unreachable rather than risk talking an incompatible dialect.
+        // No usable Welcome at all: something is answering the socket that
+        // isn't our daemon, or it hung up mid-handshake.
         other => {
             tracing::warn!(target: "captain_miao::ssh", "handshake failed, no usable Welcome: {other:?}");
-            return ServeOutcome::HandshakeFailed;
+            return ServeOutcome::HandshakeFailed(None);
         }
     }
     if write_frame(&mut wr, &ClientFrame::Subscribe).await.is_err() {
         tracing::warn!(target: "captain_miao::ssh", "failed to send Subscribe");
-        return ServeOutcome::HandshakeFailed;
+        return ServeOutcome::HandshakeFailed(None);
     }
 
     let mut pending: HashMap<u64, oneshot::Sender<ServerFrame>> = HashMap::new();
@@ -985,30 +1372,28 @@ async fn serve(
                         let mut m = mirror.lock().unwrap();
                         m.clear();
                         for s in sessions {
-                            m.insert(s.launcher_pid, s);
+                            m.insert(s.key(), s);
                         }
                         // The mirror changed off-thread; wake the dashboard loop.
                         dirty.store(true, Ordering::Relaxed);
                     }
                     ServerFrame::Delta { state } => {
-                        mirror.lock().unwrap().insert(state.launcher_pid, *state);
+                        mirror.lock().unwrap().insert(state.key(), *state);
                         dirty.store(true, Ordering::Relaxed);
                     }
-                    ServerFrame::Removed { launcher_pid } => {
-                        mirror.lock().unwrap().remove(&launcher_pid);
+                    ServerFrame::Removed { key } => {
+                        mirror.lock().unwrap().remove(&key);
                         dirty.store(true, Ordering::Relaxed);
                     }
-                    ServerFrame::Resumable { req_id, .. }
-                    | ServerFrame::Killed { req_id, .. }
-                    | ServerFrame::Opened { req_id, .. }
-                    | ServerFrame::RecentDirs { req_id, .. }
-                    | ServerFrame::PathCompletions { req_id, .. }
-                    | ServerFrame::DirChecked { req_id, .. } => {
-                        if let Some(tx) = pending.remove(&req_id) {
+                    // Every reply routes by `req_id` through one accessor, so a
+                    // future reply variant needs no change here (§3 tolerance).
+                    // `None` covers the pushed stream and an unknown frame from
+                    // a newer peer, both of which are simply ignored.
+                    _ => {
+                        if let Some(tx) = frame.req_id().and_then(|id| pending.remove(&id)) {
                             let _ = tx.send(frame);
                         }
                     }
-                    ServerFrame::Welcome { .. } => {} // unexpected post-handshake
                 }
             }
             req = requests.recv() => {
@@ -1052,47 +1437,74 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            flags: None,
+            attached: None,
             host: crate::state::HostId::local(),
         }
     }
 
+    /// The tail of an ssh argv after the `-o` option block, so the assertions
+    /// stay about *shape* rather than restating `ssh_common_opts`.
+    fn ssh_tail(argv: &[String]) -> Vec<String> {
+        let start = argv
+            .iter()
+            .rposition(|a| a == "-o")
+            .map(|i| i + 2)
+            .unwrap_or(0);
+        argv[start..].to_vec()
+    }
+
     #[test]
     fn attach_argv_ssh_vs_direct() {
-        // PATH default for both transports.
+        let ssh = attach_argv(Some("user@box"), "miao-server", "s1", false);
+        assert_eq!(ssh[0], "ssh");
+        assert_eq!(ssh[1], "-t");
+        assert_eq!(ssh_tail(&ssh), ["user@box", "miao-server", "attach", "s1"]);
+        // Attach windows ride the connection task's ControlMaster (§4), so they
+        // skip authentication entirely — that's the whole point of the options.
+        assert!(ssh.iter().any(|a| a.starts_with("ControlPath=")));
+        assert!(ssh.iter().any(|a| a == "ControlMaster=auto"));
+
+        // A socket transport (pooled localhost) needs no ssh hop at all.
         assert_eq!(
-            attach_argv(Some("user@box"), "miao-server", "s1"),
-            ["ssh", "-t", "user@box", "miao-server", "attach", "s1"]
-        );
-        assert_eq!(
-            attach_argv(None, "miao-server", "s1"),
+            attach_argv(None, "miao-server", "s1", false),
             ["miao-server", "attach", "s1"]
         );
-        // An auto-provisioned cache path is invoked over ssh in place of `miao-server`.
-        let cache = "/home/u/.cache/captain-miao/bin/miao-server";
+        // The steal is a flag on the attach, never on the create path.
         assert_eq!(
-            attach_argv(Some("user@box"), cache, "s1"),
-            ["ssh", "-t", "user@box", cache, "attach", "s1"]
+            attach_argv(None, "miao-server", "s1", true),
+            ["miao-server", "attach", "--force", "s1"]
         );
+        // A deployed cache path is invoked in place of `miao-server`.
+        let cache = "/home/u/.cache/captain-miao/bin/miao-server";
+        let ssh = attach_argv(Some("user@box"), cache, "s1", false);
+        assert_eq!(ssh_tail(&ssh), ["user@box", cache, "attach", "s1"]);
     }
 
     #[test]
     fn remote_shell_argv_cds_and_execs_login_shell() {
+        let argv = remote_shell_argv("user@box", "/home/u/proj");
         assert_eq!(
-            remote_shell_argv("user@box", "/home/u/proj"),
+            ssh_tail(&argv),
             [
-                "ssh",
-                "-t",
                 "user@box",
                 "cd '/home/u/proj' && exec \"${SHELL:-/bin/sh}\" -l"
             ]
         );
-        // Empty cwd drops the `cd` and just opens a login shell.
+        // The landmine (§3): a host-canonical `~` path must reach the remote as
+        // something the *remote* shell expands. Single-quoting it — the obvious
+        // thing — would make `cd '~/proj'` fail on every host.
+        let argv = remote_shell_argv("box", "~/proj");
         assert_eq!(
-            remote_shell_argv("box", ""),
-            ["ssh", "-t", "box", "exec \"${SHELL:-/bin/sh}\" -l"]
+            ssh_tail(&argv),
+            [
+                "box",
+                "cd \"$HOME\"/'proj' && exec \"${SHELL:-/bin/sh}\" -l"
+            ]
         );
-        // A path with a space / quote is single-quoted safely.
-        assert_eq!(shell_single_quote("/a b/it's"), r#"'/a b/it'\''s'"#);
+        // Empty cwd drops the `cd` and just opens a login shell.
+        let argv = remote_shell_argv("box", "");
+        assert_eq!(ssh_tail(&argv), ["box", "exec \"${SHELL:-/bin/sh}\" -l"]);
     }
 
     fn probe(arch: &str, path: Option<&str>, cache: Option<&str>) -> RemoteProbe {
@@ -1171,7 +1583,7 @@ mod tests {
         // No server on the socket → the request never gets a reply, so
         // open_session reports the host as unreachable rather than hanging.
         let remote = RemoteBackend::connect(
-            Transport::Socket(PathBuf::from("/nonexistent/captain-miao.sock")),
+            Transport::LocalSocket(PathBuf::from("/nonexistent/captain-miao.sock")),
             HostId::local(),
         );
         let spec = OpenSpec {
@@ -1190,7 +1602,7 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         tokio::spawn(mock_server(listener, vec![]));
         let backend =
-            RemoteBackend::connect(Transport::Socket(sock.clone()), HostId("mock".into()));
+            RemoteBackend::connect(Transport::LocalSocket(sock.clone()), HostId("mock".into()));
 
         let spec = OpenSpec {
             agent: AgentControl::Claude,
@@ -1268,8 +1680,9 @@ mod tests {
                     &mut wr,
                     &ServerFrame::RecentDirs {
                         req_id,
-                        cwds: vec!["/home/u/proj".into(), "/home/u/other".into()],
-                        home: "/home/u".into(),
+                        // Host-canonical: the wire form IS the display form,
+                        // and no `$HOME` rides along (§3).
+                        cwds: vec!["~/proj".into(), "~/other".into()],
                     },
                 )
                 .await
@@ -1309,8 +1722,10 @@ mod tests {
             vec![test_state(101), test_state(102)],
         ));
 
-        let backend =
-            RemoteBackend::connect(Transport::Socket(sock.clone()), HostId("mock".to_string()));
+        let backend = RemoteBackend::connect(
+            Transport::LocalSocket(sock.clone()),
+            HostId("mock".to_string()),
+        );
 
         // The mirror fills asynchronously once the snapshot lands.
         let mut tries = 0;
@@ -1330,7 +1745,9 @@ mod tests {
         // Blocking request/response must run off the async worker.
         let (cands, errs) = tokio::task::block_in_place(|| backend.list_resumable(5));
         assert!(cands.is_empty() && errs.is_empty());
-        assert!(tokio::task::block_in_place(|| backend.kill_session(999)));
+        assert!(tokio::task::block_in_place(
+            || backend.kill_session(&SessionKey::from_launcher_pid(999))
+        ));
 
         let _ = std::fs::remove_file(&sock);
     }
@@ -1397,12 +1814,11 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         tokio::spawn(mock_server(listener, vec![]));
         let backend =
-            RemoteBackend::connect(Transport::Socket(sock.clone()), HostId("mock".into()));
+            RemoteBackend::connect(Transport::LocalSocket(sock.clone()), HostId("mock".into()));
 
-        // recent_dirs: the remote's list + home ride the reply.
-        let (cwds, home) = tokio::task::block_in_place(|| backend.recent_dirs());
-        assert_eq!(cwds, vec!["/home/u/proj", "/home/u/other"]);
-        assert_eq!(home, "/home/u");
+        // recent_dirs: the remote's list arrives host-canonical, with no home.
+        let cwds = tokio::task::block_in_place(|| backend.recent_dirs());
+        assert_eq!(cwds, vec!["~/proj", "~/other"]);
 
         // complete_path: the prefix reaches the server and matches come back.
         let matches = tokio::task::block_in_place(|| backend.complete_path("/home/u/a"));
@@ -1435,7 +1851,7 @@ mod tests {
         ));
 
         let backend =
-            RemoteBackend::connect(Transport::Socket(sock.clone()), HostId("mock".into()));
+            RemoteBackend::connect(Transport::LocalSocket(sock.clone()), HostId("mock".into()));
 
         wait_for_len(&backend, 1).await;
         assert_eq!(backend.conn_state(), ConnState::Connected);

@@ -4,10 +4,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use crate::state::{LauncherState, SessionStatus};
 use crate::terminal::{TabId, TabInfo, TabTarget, WindowId};
 
-use super::format::{
-    ansi_to_lines, base64_encode, collapse_tilde, default_dir_emoji_and_color, expand_tilde,
-    format_coarse_age,
-};
+use super::format::{ansi_to_lines, base64_encode, default_dir_emoji_and_color, format_coarse_age};
 use super::{Action, App, InputMode};
 
 // -- Test harness --
@@ -152,6 +149,8 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         // hand-launched fallback (no launch_id, self-reported window_id).
         launch_id: Some(format!("launch-{pid}")),
         terminal: None,
+        flags: None,
+        attached: None,
         host: crate::state::HostId::local(),
     }
 }
@@ -360,7 +359,9 @@ fn double_click_attaches_running_remote_like_enter() {
 
     assert!(d.click(col, row).is_none(), "first click only selects");
     match d.click(col, row) {
-        Some(Action::AttachRemoteRunning { host, pool_session }) => {
+        Some(Action::AttachRemoteRunning {
+            host, pool_session, ..
+        }) => {
             assert_eq!(host, HostId("box".into()));
             assert_eq!(pool_session, "cm-claude-42-1");
         }
@@ -493,7 +494,7 @@ fn workdir_picker_defaults_to_local_host() {
 }
 
 #[test]
-fn resume_picker_labels_remote_host_only() {
+fn resume_picker_names_the_host_it_lists() {
     use crate::agent::{AgentControl, ResumeCandidate};
     use crate::state::HostId;
     use std::time::SystemTime;
@@ -508,24 +509,30 @@ fn resume_picker_labels_remote_host_only() {
         mtime: SystemTime::UNIX_EPOCH,
     };
 
+    // One host at a time (§9): the title states the scope, so the list is never
+    // an implicit union the user has to infer.
     let mut d = TestDashboard::new(140, 14);
-    d.app.open_resume_picker(vec![
-        (HostId::local(), cand("aaaa1111", "/home/test/local-proj")),
-        (
-            HostId("buildbox".into()),
-            cand("bbbb2222", "/srv/remote-proj"),
-        ),
-    ]);
+    d.app.open_resume_picker(
+        HostId("buildbox".into()),
+        vec![cand("bbbb2222", "/srv/remote-proj")],
+    );
     assert_eq!(d.app.input_mode, InputMode::Picker);
 
     let out = d.render();
-    // The remote row carries its host label; the local row is unlabelled (no
-    // "local" noise), so the only host name shown is the remote one.
     assert!(
-        out.contains("buildbox"),
-        "remote host label missing:\n{out}"
+        out.contains("Resume Session on buildbox"),
+        "picker title should name the host:\n{out}"
     );
-    assert!(!out.contains("local-proj") || !out.contains(" local "));
+
+    // The local list is titled plainly — no "local" noise in the common case.
+    d.app
+        .open_resume_picker(HostId::local(), vec![cand("aaaa1111", "/home/test/proj")]);
+    let out = d.render();
+    assert!(out.contains("Resume Session"), "missing title:\n{out}");
+    assert!(
+        !out.contains("on local"),
+        "local host should not be named:\n{out}"
+    );
 }
 
 #[test]
@@ -539,7 +546,9 @@ fn enter_on_running_remote_session_emits_attach() {
 
     // We aren't attached to it yet → Enter attaches (spawns the ssh window).
     match d.press(KeyCode::Enter) {
-        Some(Action::AttachRemoteRunning { host, pool_session }) => {
+        Some(Action::AttachRemoteRunning {
+            host, pool_session, ..
+        }) => {
             assert_eq!(host, HostId("box".into()));
             assert_eq!(pool_session, "cm-claude-42-1");
         }
@@ -899,154 +908,141 @@ fn window_bindings_file_round_trips_through_seed() {
     );
 }
 
+/// A remote row with no pool session is one this dashboard can neither attach
+/// nor act on, so it never reaches the list at all (§9). The hosts panel's
+/// session count keeps it countable; the host's own dashboard is its surface.
 #[test]
-fn enter_on_remote_session_without_pool_name_is_not_attachable() {
+fn remote_session_without_pool_name_is_hidden() {
     use crate::state::HostId;
-    let mut d = TestDashboard::new(120, 10);
+    let d = TestDashboard::new(120, 10);
     let mut s = session(1, "/srv/proj", SessionStatus::Idle);
     s.host = HostId("box".into());
-    s.pool_session = None; // older launcher / pre-pool: nothing to attach to
-    d.set_sessions(vec![s]);
+    s.pool_session = None; // spawned into the server's own zellij, not the pool
 
-    assert!(d.press(KeyCode::Enter).is_none());
-    assert!(d.app.status_is_error);
+    // A session on *this* machine is always actionable, whatever it carries.
+    let local = session(2, "/home/test/here", SessionStatus::Idle);
+    assert!(d.app.is_actionable_row(&local));
+    assert!(!d.app.is_actionable_row(&s));
 }
 
+/// A pooled session with no window on this screen sinks below plain idle — it's
+/// running somewhere else, so it shouldn't compete for the eye with what's in
+/// front of you (§9).
 #[test]
-fn browser_lists_running_and_resumable_and_dispatches() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+fn detached_rows_sink_below_plain_idle() {
     use crate::state::HostId;
-    use std::time::SystemTime;
+    let mut d = TestDashboard::new(120, 12);
+    let mut detached = session(1, "/srv/away", SessionStatus::Idle);
+    detached.host = HostId("box".into());
+    detached.pool_session = Some("cm-away".into()); // pooled, but unbound
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![detached, here]);
 
-    let mut d = TestDashboard::new(140, 16);
-    // `b` opens the browser — handle_key returns the fetch action the loop runs.
-    assert!(matches!(
-        d.press(KeyCode::Char('b')),
-        Some(Action::FetchBrowser)
-    ));
-
-    // Build the browser directly with one running-remote + one resumable row.
-    let mut running = session(1, "/srv/run", SessionStatus::Active);
-    running.host = HostId("box".into());
-    running.pool_session = Some("cm-run-1".into());
-    let resumable = ResumeCandidate {
-        agent: AgentControl::Claude,
-        session_id: "deadbeef".into(),
-        cwd: "/srv/dormant".into(),
-        first_prompt: Some("older work".into()),
-        custom_title: None,
-        git_branch: None,
-        mtime: SystemTime::UNIX_EPOCH,
-    };
-    d.app.open_browser_picker(vec![
-        super::BrowserEntry::Running(Box::new(running)),
-        super::BrowserEntry::Resumable(HostId("box".into()), resumable),
-    ]);
-
-    let out = d.render();
-    assert!(out.contains("running"), "missing running tag:\n{out}");
-    assert!(out.contains("resumable"), "missing resumable tag:\n{out}");
-    assert!(out.contains("box"), "missing host label:\n{out}");
-
-    // Enter on row 0 (the running remote we aren't attached to) → attach.
-    match d.press(KeyCode::Enter) {
-        Some(Action::AttachRemoteRunning { pool_session, .. }) => {
-            assert_eq!(pool_session, "cm-run-1");
-        }
-        other => panic!("expected AttachRemoteRunning, got {other:?}"),
-    }
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(order, vec![2, 1], "the detached row should sort last");
 }
 
+/// …but an attention state still outranks: a parked approval prompt is urgent
+/// regardless of whether a window happens to be bound here.
 #[test]
-fn browser_filter_matches_agent_label_on_resumable_row() {
-    // The browser's resumable rows share the resume picker's row builder, so
-    // they're now filterable by agent label too (previously only `r` was). The
-    // cwds/prompts deliberately avoid the word "codex" so the only match path is
-    // the agent label itself.
-    use crate::agent::{AgentControl, ResumeCandidate};
+fn attention_outranks_detached() {
     use crate::state::HostId;
-    use std::time::SystemTime;
+    let mut d = TestDashboard::new(120, 12);
+    let mut waiting = session(1, "/srv/away", SessionStatus::WaitingForApproval);
+    waiting.host = HostId("box".into());
+    waiting.pool_session = Some("cm-away".into());
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![waiting, here]);
 
-    let cand = |agent, id: &str, cwd: &str, prompt: &str| ResumeCandidate {
-        agent,
-        session_id: id.to_string(),
-        cwd: cwd.to_string(),
-        first_prompt: Some(prompt.to_string()),
-        custom_title: None,
-        git_branch: None,
-        mtime: SystemTime::UNIX_EPOCH,
-    };
-
-    let mut d = TestDashboard::new(140, 16);
-    d.app.open_browser_picker(vec![
-        super::BrowserEntry::Resumable(
-            HostId::local(),
-            cand(
-                AgentControl::Claude,
-                "aaaa1111",
-                "/home/test/alpha",
-                "alpha work",
-            ),
-        ),
-        super::BrowserEntry::Resumable(
-            HostId::local(),
-            cand(
-                AgentControl::Codex,
-                "bbbb2222",
-                "/home/test/bravo",
-                "bravo work",
-            ),
-        ),
-    ]);
-
-    // Both rows visible before filtering.
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 2);
-
-    // Typing the agent label narrows to just the Codex row (index 1).
-    for c in "codex".chars() {
-        d.press(KeyCode::Char(c));
-    }
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered(), vec![1]);
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(order, vec![1, 2]);
 }
 
+/// `backend_for` must never silently fall back to localhost (§9's one
+/// correctness-grade leak): a row carrying a host that's no longer configured
+/// would otherwise aim its kill or its open at the wrong machine.
 #[test]
-fn browser_filter_matches_agent_label_on_running_row() {
-    // Running rows carry the agent label in their filter too, so a running Codex
-    // session is reachable by typing "codex" — same as the resumable rows. The
-    // cwds/prompts avoid the word "codex" so the agent label is the only match.
-    use crate::agent::AgentControl;
+fn backend_for_reports_an_unknown_host_instead_of_guessing() {
+    use crate::state::HostId;
+    let d = TestDashboard::new(120, 10);
+    assert!(d.app.backend_for(&HostId::local()).is_some());
+    assert!(d.app.backend_for(&HostId("ghost".into())).is_none());
+}
 
-    let running = |pid, cwd: &str, prompt: &str, agent| {
-        let mut s = session(pid, cwd, SessionStatus::Active);
-        s.agent = agent;
-        s.first_prompt = Some(prompt.to_string());
-        s
-    };
+/// The reconnect sweep fires on a `Disconnected → Connected` edge only, and only
+/// for sessions the dashboard *expects* to be attached to (§7). A first sighting
+/// is the initial connect, not a reconnect, so it must not queue anything.
+#[test]
+fn reconnect_sweep_only_reattaches_expected_sessions() {
+    use crate::state::HostId;
+    let host = HostId("box".into());
+    let mut d = TestDashboard::new(120, 10);
 
-    let mut d = TestDashboard::new(140, 16);
-    d.app.open_browser_picker(vec![
-        super::BrowserEntry::Running(Box::new(running(
-            1,
-            "/home/test/alpha",
-            "alpha work",
-            AgentControl::Claude,
-        ))),
-        super::BrowserEntry::Running(Box::new(running(
-            2,
-            "/home/test/bravo",
-            "bravo work",
-            AgentControl::Codex,
-        ))),
-    ]);
+    let mut s = session(1, "/srv/p", SessionStatus::Idle);
+    s.host = host.clone();
+    s.pool_session = Some("cm-1".into());
+    let mut other = session(2, "/srv/q", SessionStatus::Idle);
+    other.host = host.clone();
+    other.pool_session = Some("cm-2".into());
+    d.app.sessions = vec![s, other];
 
-    // Both rows visible before filtering.
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 2);
+    // `cm-1` was attached and its window died with the link; `cm-2` was never
+    // attached at all.
+    d.app
+        .window_bindings
+        .record(host.clone(), "cm-1".into(), WindowId::from(9u64));
+    d.app.window_bindings.prune_dead(&Default::default());
 
-    // Typing the agent label narrows to just the Codex running row (index 1).
-    for c in "codex".chars() {
-        d.press(KeyCode::Char(c));
-    }
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered(), vec![1]);
+    // First sighting of the host is the *initial* connect, not a reconnect:
+    // startup recovery is the binding re-seed's job, so nothing is queued.
+    assert!(d.app.reattach_targets(&host, None, 0).is_empty());
+    // An unchanged epoch means the host never dropped.
+    assert!(d.app.reattach_targets(&host, Some(3), 3).is_empty());
+
+    // A real reconnect brings back exactly what was open — `cm-1`, not `cm-2`,
+    // which the user never attached to.
+    assert_eq!(
+        d.app.reattach_targets(&host, Some(0), 1),
+        vec!["cm-1".to_string()]
+    );
+
+    // A deliberate `D` retires the expectation for good, so a later reconnect
+    // leaves that session detached — the whole point of tracking intent.
+    d.app.window_bindings.remove(&host, "cm-1");
+    assert!(d.app.reattach_targets(&host, Some(1), 2).is_empty());
+}
+
+/// A host's flags are its own: when the host serves them, the dashboard adopts
+/// what it reports rather than keeping a divergent local copy (§9).
+#[test]
+fn host_served_flags_are_adopted_onto_rows() {
+    use crate::state::{HostId, SessionFlags as HostFlags};
+    let mut d = TestDashboard::new(120, 10);
+    let mut s = session(1, "/srv/p", SessionStatus::Idle);
+    s.host = HostId("box".into());
+    s.pool_session = Some("cm-1".into());
+    s.flags = Some(HostFlags {
+        pinned: true,
+        muted: false,
+        follow_up: false,
+    });
+    d.app.sessions = vec![s];
+    d.app.adopt_host_flags();
+
+    let key = super::flag_key(&d.app.sessions[0]);
+    assert!(d.app.flags_of(&key).pinned);
+    // A locally-issued pin sequence is assigned so it sorts among our own pins.
+    assert!(d.app.flags_of(&key).pin_seq > 0);
 }
 
 #[test]
@@ -1593,8 +1589,10 @@ fn shift_o_enters_workdir_picker() {
     }
     let action = d.press(KeyCode::Enter);
     match action {
+        // The path travels in the host-canonical `~` form (§3) — the *host*
+        // expands it, so the dashboard never needs to know any machine's home.
         Some(Action::NewSessionSplit { cwd, .. }) => {
-            assert_eq!(cwd, "/home/test/myproj");
+            assert_eq!(cwd, "~/myproj");
         }
         _ => panic!("expected NewSessionSplit action, got {:?}", action),
     }
@@ -1615,7 +1613,7 @@ fn workdir_picker_can_be_edited() {
 
     let action = d.press(KeyCode::Enter);
     match action {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/home/test/b"),
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/b"),
         _ => panic!("expected NewSessionSplit"),
     }
 }
@@ -1633,9 +1631,8 @@ fn workdir_picker_esc_cancels() {
 }
 
 #[test]
-fn workdir_picker_expands_tilde_on_submit() {
+fn workdir_picker_submits_the_canonical_form() {
     let mut d = TestDashboard::new(120, 15);
-    // home_dir is "/home/test" in TestDashboard::new
     d.press(KeyCode::Char('O'));
     // Clear pre-seeded text with Ctrl-U, then type "~/foo"
     d.app
@@ -1646,7 +1643,8 @@ fn workdir_picker_expands_tilde_on_submit() {
 
     let action = d.press(KeyCode::Enter);
     match action {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/home/test/foo"),
+        // Unchanged, not expanded: the host owns the expansion (§3).
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/foo"),
         _ => panic!("expected NewSessionSplit"),
     }
 }
@@ -1654,15 +1652,15 @@ fn workdir_picker_expands_tilde_on_submit() {
 #[test]
 fn workdir_picker_lists_recent_cwds() {
     let mut d = TestDashboard::new(120, 15);
-    d.app.recent_cwds = vec!["/home/test/alpha".to_string(), "/tmp/work".to_string()];
+    // The list arrives host-canonical from the backend, so what's stored, what's
+    // shown, and what's submitted are all one string (§3).
+    d.app.recent_cwds = vec!["~/alpha".to_string(), "/tmp/work".to_string()];
     d.press(KeyCode::Char('O'));
     let picker = &d.app.picker.as_ref().unwrap().picker;
     assert_eq!(picker.items.len(), 2);
-    // Home-prefixed recents render with `~`.
     assert_eq!(picker.items[0].primary, "~/alpha");
     assert_eq!(picker.items[1].primary, "/tmp/work");
-    // Payload stores the raw path for expansion-free submission.
-    assert_eq!(picker.items[0].payload.as_deref(), Some("/home/test/alpha"));
+    assert_eq!(picker.items[0].payload.as_deref(), Some("~/alpha"));
 }
 
 #[test]
@@ -1792,18 +1790,6 @@ fn workdir_picker_navigation_overrides_literal_typed_path() {
         Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/home/test/beta"),
         _ => panic!("expected NewSessionSplit, got {:?}", action),
     }
-}
-
-#[test]
-fn path_completion_helpers() {
-    // expand_tilde
-    assert_eq!(expand_tilde("~/foo", "/home/test"), "/home/test/foo");
-    assert_eq!(expand_tilde("~", "/home/test"), "/home/test");
-    assert_eq!(expand_tilde("/abs", "/home/test"), "/abs");
-
-    // collapse_tilde
-    assert_eq!(collapse_tilde("/home/test/foo", "/home/test"), "~/foo");
-    assert_eq!(collapse_tilde("/other", "/home/test"), "/other");
 }
 
 #[test]
@@ -3261,7 +3247,7 @@ fn space_e_on_idle_session_confirms_then_restarts() {
     assert!(d.app.pending_confirm.is_none());
     match action {
         Some(Action::RestartSession(spec)) => {
-            assert_eq!(spec.window_id, WindowId::from(100));
+            assert_eq!(spec.window_id, Some(WindowId::from(100)));
             assert_eq!(spec.cwd, "/home/test/proj");
             assert_eq!(spec.session_id, "sess-1");
         }
@@ -3369,7 +3355,10 @@ fn space_shift_e_restarts_all_when_all_idle() {
     match action {
         Some(Action::RestartAll { sessions }) => {
             assert_eq!(sessions.len(), 3);
-            let mut wids: Vec<WindowId> = sessions.iter().map(|s| s.window_id.clone()).collect();
+            let mut wids: Vec<WindowId> = sessions
+                .iter()
+                .filter_map(|s| s.window_id.clone())
+                .collect();
             wids.sort();
             assert_eq!(
                 wids,

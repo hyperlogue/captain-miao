@@ -178,9 +178,9 @@ fn shpool_decode<T: DeserializeOwned, R: Read>(r: R) -> Result<T> {
     rmp_serde::from_read(r).context("decoding shpool frame")
 }
 
-/// Whether the named pool session currently has a client attached, via the
-/// pool daemon's read-only `List`. `Ok(None)` = the pool has no such session.
-fn pool_session_attached(name: &str) -> Result<Option<bool>> {
+/// The pool daemon's read-only `List`, as `session name → has a client
+/// attached`. One connection, no side effects.
+fn pool_attached_map() -> Result<std::collections::HashMap<String, bool>> {
     let stream =
         UnixStream::connect(pool_socket_path()).context("connecting to the pty pool socket")?;
     let _version: VersionHeader =
@@ -189,9 +189,27 @@ fn pool_session_attached(name: &str) -> Result<Option<bool>> {
     let reply: ListReply = shpool_decode(&stream).context("reading pool session list")?;
     Ok(reply
         .sessions
-        .iter()
-        .find(|s| s.name == name)
-        .map(|s| matches!(s.status, SessionStatus::Attached)))
+        .into_iter()
+        .map(|s| (s.name, matches!(s.status, SessionStatus::Attached)))
+        .collect())
+}
+
+/// The attached-bit overlay the daemon's server-core stamps onto the rows it
+/// serves (`docs/remote-sessions.md` §10.2), so a dashboard can show
+/// attached/detached per row and offer a steal only when one actually applies.
+/// A pool that can't be reached yields an empty map — every row's bit stays
+/// `None` ("unknown"), never a false "detached".
+pub(crate) fn attached_by_session() -> std::collections::HashMap<String, bool> {
+    pool_attached_map().unwrap_or_else(|e| {
+        tracing::debug!(target: "captain_miao::pool", "attached-bit probe failed: {e}");
+        Default::default()
+    })
+}
+
+/// Whether the named pool session currently has a client attached.
+/// `Ok(None)` = the pool has no such session.
+fn pool_session_attached(name: &str) -> Result<Option<bool>> {
+    Ok(pool_attached_map()?.get(name).copied())
 }
 
 /// Pre-flight for a plain interactive reattach — never for the
@@ -213,7 +231,14 @@ fn pool_session_attached(name: &str) -> Result<Option<bool>> {
 ///   Best-effort: a `List` failure falls through to libshpool, whose own
 ///   connect surfaces the error; a client attaching between this check and
 ///   ours hits libshpool's busy path as before.
-fn guard_plain_reattach(name: &str) {
+///
+/// `force` (the steal) skips only the **busy** half: libshpool's own attach
+/// client implements the whole steal — on a busy session it sends a `Detach`,
+/// kicking the other client (whose attach process simply exits, which that
+/// dashboard already treats as a window-closed detach), then retries the dial.
+/// The **stale-name** half is never skipped: resurrecting a dead name as a bare
+/// login shell is not something a user can mean to force.
+fn guard_plain_reattach(name: &str, force: bool) {
     let live = (0..10).find_map(|i| {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(250));
@@ -231,10 +256,16 @@ fn guard_plain_reattach(name: &str) {
         std::process::exit(crate::state::ATTACH_EXIT_STALE);
     }
     match pool_session_attached(name) {
+        // `force` means the caller has already decided to kick the other
+        // client, so libshpool's own steal is allowed to run.
+        Ok(Some(true)) if force => {
+            eprintln!("stealing pool session {name:?} from its attached client");
+        }
         Ok(Some(true)) => {
             eprintln!(
                 "pool session {name:?} already has a terminal attached (the pool is one \
-                 client at a time); detach the other client first"
+                 client at a time); detach the other client first, or attach with --force \
+                 to steal it"
             );
             std::process::exit(crate::state::ATTACH_EXIT_BUSY);
         }
@@ -265,10 +296,11 @@ pub(crate) fn run_attach(
     cmd: Option<String>,
     dir: Option<String>,
     background: bool,
+    force: bool,
     log_file: Option<String>,
 ) -> Result<()> {
     if cmd.is_none() && !background {
-        guard_plain_reattach(&name);
+        guard_plain_reattach(&name, force);
     }
     // `--log-file` is the only way to see the attach *client*'s logs: libshpool
     // writes non-daemon logs to `io::empty()` without it (its stderr writer is
@@ -282,6 +314,12 @@ pub(crate) fn run_attach(
     let mut sub: Vec<&str> = vec!["attach"];
     if background {
         sub.push("--background");
+    }
+    // libshpool's own steal: busy → send `Detach` → retry the dial (up to
+    // 20×100ms). The session itself is undisturbed — a detach is clean, nothing
+    // restarts — and the kicked client's attach process just exits.
+    if force {
+        sub.push("--force");
     }
     if let Some(c) = &cmd {
         sub.push("--cmd");

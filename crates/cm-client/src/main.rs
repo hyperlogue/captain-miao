@@ -35,6 +35,12 @@ enum Command {
     Attach {
         /// Pool session name, as shown by `list`.
         name: String,
+        /// Steal the session from the terminal currently attached to it. The
+        /// pool is one client at a time, so a busy session otherwise declines;
+        /// with this the other client is kicked (its attach process exits
+        /// cleanly) and the session itself is undisturbed.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -47,7 +53,7 @@ fn main() -> Result<()> {
         .unwrap_or(Command::List { json: false })
     {
         Command::List { json } => pool::list(json),
-        Command::Attach { name } => pool::attach(name),
+        Command::Attach { name, force } => pool::attach(name, force),
     }
 }
 
@@ -70,7 +76,12 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["miao-client", "attach", "cm-claude-1-1"]).unwrap(),
-            Some(Command::Attach { name }) if name == "cm-claude-1-1"
+            Some(Command::Attach { name, force: false }) if name == "cm-claude-1-1"
+        ));
+        // The steal is opt-in and never the default.
+        assert!(matches!(
+            parse(&["miao-client", "attach", "s", "--force"]).unwrap(),
+            Some(Command::Attach { force: true, .. })
         ));
         // Attach requires a name.
         assert!(parse(&["miao-client", "attach"]).is_err());

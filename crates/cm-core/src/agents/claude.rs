@@ -1812,6 +1812,8 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            flags: None,
+            attached: None,
             host: crate::state::HostId::local(),
         }
     }

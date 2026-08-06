@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCache};
 use crate::agents::codex;
-use crate::state::{self, LauncherState};
+use crate::paths;
+use crate::state::{self, LauncherState, SessionFlags, SessionKey};
 
 /// What to open: which agent, where, and whether it's a fresh session or a
 /// resume/fork of an existing one. This is §3/§14.2's `SpawnSpec`, renamed to
@@ -130,13 +131,122 @@ fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<
 pub struct LocalBackend {
     session_index_caches: HashMap<AgentControl, SessionIndexCache>,
     codex_titles: Mutex<CodexTitles>,
+    /// This host's `$HOME`, resolved once. Every path the backend returns is
+    /// collapsed against it and every path it receives is expanded against it,
+    /// so the seam speaks one host-canonical spelling (§3) and the caller never
+    /// learns the home.
+    home: String,
+    /// Whether this backend is acting as a **server-core** — the daemon's, or a
+    /// pooled-localhost one — in which case it also owns the per-session flags
+    /// sidecar and the pool's attached bit, overlaying both onto the rows it
+    /// serves. A plain local dashboard leaves both off: its flags live in
+    /// `dashboard-overrides.json`, and it has no pool.
+    serve_host_state: bool,
+    /// Reads libshpool's live session list for the attached-bit overlay.
+    /// Injected so cm-core stays free of libshpool (only the server links it).
+    #[allow(clippy::type_complexity)]
+    attached_probe: Option<Box<dyn Fn() -> HashMap<String, bool> + Send + Sync>>,
 }
 
 impl LocalBackend {
+    /// A backend for the in-process dashboard: reads and signals, no host-owned
+    /// state served to anyone else.
+    pub fn new() -> Self {
+        Self {
+            home: paths::host_home(),
+            ..Default::default()
+        }
+    }
+
+    /// A backend acting as the **server-core** — the daemon's, or the one a
+    /// pooled-localhost dashboard reaches over a socket. On top of the reads it
+    /// owns the per-session flags sidecar and (given a probe) overlays the
+    /// pool's attached bit, so every dashboard watching this host agrees.
+    pub fn server_core() -> Self {
+        Self {
+            home: paths::host_home(),
+            serve_host_state: true,
+            ..Default::default()
+        }
+    }
+
+    /// Supply the pool's attached-bit reader (the server's libshpool `List`).
+    /// Without it `LauncherState.attached` stays `None` — "unknown", which the
+    /// UI treats as "don't offer a steal".
+    pub fn with_attached_probe(
+        mut self,
+        probe: impl Fn() -> HashMap<String, bool> + Send + Sync + 'static,
+    ) -> Self {
+        self.attached_probe = Some(Box::new(probe));
+        self
+    }
+
+    /// This host's `$HOME`. Only the backend's own boundary conversions and the
+    /// server's argv construction should need it — it never crosses the seam.
+    pub fn home(&self) -> &str {
+        &self.home
+    }
+
+    /// A backend with an injected home, so the canonical-path boundary can be
+    /// exercised without depending on the test runner's `$HOME`.
+    #[cfg(test)]
+    fn with_home(home: &str) -> Self {
+        Self {
+            home: home.to_string(),
+            ..Default::default()
+        }
+    }
+
     pub fn list_sessions(&self) -> Vec<LauncherState> {
         let mut sessions = state::read_all_launcher_states();
         self.overlay_codex_titles(&mut sessions);
+        // Every path leaving the backend is host-canonical, so the client can
+        // display it verbatim and hand it straight back (§3).
+        for s in sessions.iter_mut() {
+            s.cwd = paths::collapse_home(&s.cwd, &self.home);
+        }
+        if self.serve_host_state {
+            self.overlay_host_state(&mut sessions);
+        }
         sessions
+    }
+
+    /// Stamp the host-owned per-session state onto the rows being served: the
+    /// flags sidecar (so every dashboard sees the same pins/mutes) and the
+    /// pool's live attached bit (so the UI knows whether a steal even applies).
+    fn overlay_host_state(&self, sessions: &mut [LauncherState]) {
+        let flags = read_session_flags();
+        let attached = self.attached_probe.as_ref().map(|p| p());
+        for s in sessions.iter_mut() {
+            if let Some(f) = flags.get(&s.key()) {
+                s.flags = Some(*f);
+            }
+            if let (Some(map), Some(pool)) = (&attached, s.pool_session.as_deref()) {
+                s.attached = map.get(pool).copied();
+            }
+        }
+    }
+
+    /// Record this host's flags for a session. Server-core only — a plain local
+    /// dashboard persists its own overrides instead. Returns whether it stuck.
+    pub fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
+        if !self.serve_host_state {
+            return false;
+        }
+        let mut all = read_session_flags();
+        if flags.is_clear() {
+            all.remove(key);
+        } else {
+            all.insert(key.clone(), flags);
+        }
+        // Garbage-collect entries whose session is gone, so the sidecar can't
+        // grow without bound across a host's lifetime.
+        let live: std::collections::HashSet<SessionKey> = state::read_all_launcher_states()
+            .iter()
+            .map(|s| s.key())
+            .collect();
+        all.retain(|k, _| live.contains(k) || k == key);
+        state::write_json_atomic(&state::session_flags_path(), &all).is_ok()
     }
 
     /// Overlay Codex display names from the host's single title cache onto the
@@ -213,8 +323,28 @@ impl LocalBackend {
         (all, errors)
     }
 
-    pub fn kill_session(&self, child_pid: u32) -> bool {
-        unsafe { libc::kill(child_pid as i32, libc::SIGTERM) == 0 }
+    /// Tear a session down, resolving `key` → the **current** agent pid from
+    /// the live state file first. That re-resolution is the point: the pid a
+    /// caller's mirror holds may name a session that has already exited, and
+    /// the OS recycles pids — so signalling the pid off the wire could SIGTERM
+    /// an unrelated process. An unknown key is refused rather than guessed at.
+    ///
+    /// Falls back to the launcher pid when the row carries no `child_pid` (a
+    /// `FailedToStart` launcher holding its error), matching the client's own
+    /// kill target.
+    pub fn kill_session(&self, key: &SessionKey) -> bool {
+        let Some(state) = state::read_all_launcher_states()
+            .into_iter()
+            .find(|s| &s.key() == key)
+        else {
+            tracing::warn!(
+                target: "captain_miao::backend",
+                "kill refused: no live session for key {key}"
+            );
+            return false;
+        };
+        let pid = state.child_pid.unwrap_or(state.launcher_pid);
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
     }
 
     /// Build the argv for a local launcher window:
@@ -228,11 +358,9 @@ impl LocalBackend {
             .unwrap_or_else(|_| "miao".into())
             .to_string_lossy()
             .into_owned();
-        let mut argv = vec![
-            exe,
-            spec.agent.cli_subcommand().to_string(),
-            spec.cwd.clone(),
-        ];
+        // The spec's cwd arrives host-canonical; a process needs the real path.
+        let cwd = paths::expand_home(&spec.cwd, &self.home);
+        let mut argv = vec![exe, spec.agent.cli_subcommand().to_string(), cwd];
         if let Some((session_id, fork)) = &spec.resume {
             argv.extend(spec.agent.resume_args(session_id, *fork));
         }
@@ -244,37 +372,44 @@ impl LocalBackend {
     // These let the workdir picker operate against *this* host: its recent dirs,
     // directory completion, and submit-time validation. Local runs them in
     // process; a remote dashboard reaches the same code via the server
-    // (`ListRecentDirs`/`CompletePath`/`CheckDir`).
+    // (`ListRecentDirs`/`CompletePath`/`CheckDir`). Every one of them expands a
+    // host-canonical argument on the way in and collapses its results on the
+    // way out, so the two arms are indistinguishable to the picker (§3).
 
-    /// This host's recent working dirs (most-recent first) and its `$HOME`.
-    pub fn recent_dirs(&self) -> (Vec<String>, String) {
-        (read_recent_dirs(), home_dir())
+    /// This host's recent working dirs, most-recent first, host-canonical.
+    pub fn recent_dirs(&self) -> Vec<String> {
+        read_recent_dirs()
+            .into_iter()
+            .map(|c| paths::collapse_home(&c, &self.home))
+            .collect()
     }
 
     /// Directory completions for `prefix` on this host's filesystem.
     pub fn complete_path(&self, prefix: &str) -> Vec<String> {
-        complete_dirs(prefix)
+        complete_dirs(&paths::expand_home(prefix, &self.home))
+            .into_iter()
+            .map(|p| paths::collapse_home(&p, &self.home))
+            .collect()
     }
 
     /// Whether `path` is a directory on this host — the picker's submit check.
     pub fn dir_exists(&self, path: &str) -> bool {
-        !path.is_empty() && Path::new(path).is_dir()
+        let path = paths::expand_home(path, &self.home);
+        !path.is_empty() && Path::new(&path).is_dir()
     }
 
     /// Record `cwd` into this host's recent-dirs list. The server calls this when
     /// it opens a pool session, so remote launches build up the remote list the
     /// picker then serves back.
     pub fn record_recent_cwd(&self, cwd: &str) {
-        record_recent_dir(cwd);
+        record_recent_dir(&paths::collapse_home(cwd, &self.home));
     }
 }
 
-/// `$HOME` for the current host, or empty if unset (then `~` isn't expanded).
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_default()
-}
-
-/// The recent-dirs list from `recent_cwds_path`, most-recent first.
+/// The recent-dirs list from `recent_cwds_path`, most-recent first. Stored
+/// host-canonical, so the same repo path shares an entry (and, client-side, a
+/// directory mark) no matter which machine's home it sits under; a legacy
+/// absolute entry is collapsed by the caller on the way out.
 fn read_recent_dirs() -> Vec<String> {
     state::read_json::<state::RecentCwds>(&state::recent_cwds_path())
         .map(|r| r.cwds)
@@ -295,6 +430,12 @@ fn record_recent_dir(cwd: &str) {
     let max = crate::config::get().launcher.max_recent_cwds;
     cwds.truncate(max);
     let _ = state::write_json_atomic(&state::recent_cwds_path(), &state::RecentCwds { cwds });
+}
+
+/// The host's per-session flags sidecar. Missing/unreadable → empty, so a
+/// deleted file just resets flags rather than failing anything.
+fn read_session_flags() -> HashMap<SessionKey, SessionFlags> {
+    state::read_json(&state::session_flags_path()).unwrap_or_default()
 }
 
 /// Directory completions for `prefix` on the local filesystem, as absolute paths
@@ -384,6 +525,8 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            flags: None,
+            attached: None,
             host: HostId::local(),
         }
     }
@@ -449,6 +592,38 @@ mod tests {
             open_argv(AgentControl::Codex, Some(("s2", true))),
             ["codex", "/work", "fork", "s2"]
         );
+    }
+
+    /// The seam's canonical-path contract (§3), on the *local* arm — which is
+    /// what makes the in-process and the wire path indistinguishable to the
+    /// picker: what comes out is `~`-collapsed, and what goes in is expanded
+    /// before it touches the filesystem or an argv.
+    #[test]
+    fn local_backend_speaks_host_canonical_paths() {
+        let root = std::env::temp_dir().join(format!("cm-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proj/sub")).unwrap();
+        let backend = LocalBackend::with_home(&root.display().to_string());
+
+        // In: a `~` argument is expanded against the host's home.
+        assert!(backend.dir_exists("~/proj"));
+        assert!(!backend.dir_exists("~/nope"));
+        // …and an absolute path still works, so nothing regresses.
+        assert!(backend.dir_exists(&root.join("proj").display().to_string()));
+
+        // Out: completions come back collapsed, never as absolute twins.
+        assert_eq!(backend.complete_path("~/proj/"), vec!["~/proj/sub/"]);
+
+        // The launch argv gets the *expanded* path — a process chdir, not a
+        // shell word, so a `~` there would be a literal directory name.
+        let plan = backend.open_session(&OpenSpec {
+            agent: AgentControl::Claude,
+            cwd: "~/proj".to_string(),
+            resume: None,
+        });
+        assert_eq!(plan.argv()[2], root.join("proj").display().to_string());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

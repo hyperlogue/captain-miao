@@ -427,6 +427,16 @@ pub(super) fn default_dir_emoji_and_color(cwd: &str) -> (&'static str, usize) {
     (icon, color)
 }
 
+/// A stable index into a fixed table for `key`, on the same FNV-1a seed as
+/// [`default_dir_emoji_and_color`] — so a derived choice (a host's fallback
+/// emoji) is identical across restarts and across machines.
+pub(super) fn stable_index(key: &str, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (fnv1a_64(key.as_bytes()) as usize) % len
+}
+
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -459,15 +469,27 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
 /// a left-glyph at buf N auto-skips buf N+1; a right-glyph at buf N+2
 /// auto-skips buf N+3 (the column spacer), giving a tight `[L][L][R][R]`
 /// visual layout with no gap between glyphs.
-pub(super) fn override_indicator_cell(follow_up: bool, pinned: bool, muted: bool) -> Cell<'static> {
-    // nf-oct-bell, nf-cod-pinned, nf-md-sleep
+pub(super) fn override_indicator_cell(
+    follow_up: bool,
+    pinned: bool,
+    muted: bool,
+    detached: bool,
+) -> Cell<'static> {
+    // nf-oct-bell, nf-cod-pinned, nf-md-sleep, nf-md-link_off
     let bell = Span::styled("\u{f49a}", Style::default().fg(Color::Yellow));
     let pin = Span::styled("\u{eba0}", Style::default().fg(Color::Blue));
     let mute = Span::styled("\u{f04b2}", Style::default().add_modifier(Modifier::DIM));
+    // A pooled session still running on its host with no window on this screen
+    // (§9). It joins the existing icon set rather than getting a column of its
+    // own, and ranks last among the secondaries: pin and mute are things the
+    // *user* chose, detached is just where the session happens to be.
+    let unplugged = Span::styled("\u{f0d1d}", Style::default().add_modifier(Modifier::DIM));
     let secondary = if pinned {
         Some(pin)
     } else if muted {
         Some(mute)
+    } else if detached {
+        Some(unplugged)
     } else {
         None
     };
@@ -753,20 +775,6 @@ pub(super) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-pub(super) fn expand_tilde(path: &str, home: &str) -> String {
-    if home.is_empty() {
-        return path.to_string();
-    }
-    if path == "~" {
-        return home.to_string();
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else {
-        path.to_string()
-    }
-}
-
 /// Title for the new-session (workdir) picker, naming the backend the launch
 /// will use. Shared by the picker opener and the in-picker `Ctrl-t` toggle so
 /// the two never drift.
@@ -775,14 +783,6 @@ pub(super) fn workdir_picker_title(agent: AgentControl, host: &HostId) -> String
         format!("New {} Session — Directory", agent.label())
     } else {
         format!("New {} Session on {} — Directory", agent.label(), host.0)
-    }
-}
-
-pub(super) fn collapse_tilde(path: &str, home: &str) -> String {
-    if !home.is_empty() && path.starts_with(home) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.to_string()
     }
 }
 

@@ -88,6 +88,12 @@ enum Commands {
         /// Create/attach then immediately detach (background create).
         #[arg(long)]
         background: bool,
+        /// Steal the session from whatever client currently holds it: the pool
+        /// is one client at a time, so a busy session otherwise declines. The
+        /// kicked client's attach process exits cleanly (its dashboard reads
+        /// that as a detach) and the session itself is undisturbed.
+        #[arg(long)]
+        force: bool,
         /// Write libshpool's client-side log to this file. The daemon passes it
         /// for `--background` creates: without it the attach client's logs —
         /// including the error it prints before a silent `exit(1)` — go to
@@ -138,8 +144,9 @@ fn main() -> Result<()> {
             cmd,
             dir,
             background,
+            force,
             log_file,
-        } => return pty_pool::run_attach(name, cmd, dir, background, log_file),
+        } => return pty_pool::run_attach(name, cmd, dir, background, force, log_file),
         _ => {}
     }
 

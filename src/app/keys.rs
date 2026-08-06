@@ -3,11 +3,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::agent::{AgentControl, ResumeCandidate};
-use crate::backend::ConnState;
 use crate::state::{HostId, SessionStatus};
 use crate::terminal::TabTarget;
 
-use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS, collapse_tilde, expand_tilde};
+use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS};
 use super::keymap::{Chord, Command};
 use super::picker::{PickerEvent, TextInputEvent};
 use super::{
@@ -297,17 +296,18 @@ impl App {
                 self.open_workdir_picker();
                 None
             }
-            Command::ResumePicker => Some(Action::FetchResumeList),
-            Command::OpenBrowser => Some(Action::FetchBrowser),
+            Command::ResumePicker => Some(Action::FetchResumeList {
+                // One host at a time, defaulting to the persisted default host
+                // (`Space H`); `Ctrl-h` in the picker switches (§9).
+                host: self.default_host_or_local(),
+            }),
             Command::ForkSession => {
                 let s = self.selected_session()?;
-                // Fork spawns a *local* agent; a remote session can't be forked
-                // from here until the remote attach/spawn path lands.
-                if !s.host.is_local() {
-                    self.set_status("Only local sessions can be forked".to_string(), true);
-                    return None;
-                }
-                let session_id = self.session_index.live_session_id(&s)?.to_string();
+                // A fork follows the **focused session's** host, never the
+                // default: forking is about *this* session, and its transcript
+                // lives on that machine. A remote fork lands in that host's pool
+                // and auto-attaches like any open (§9).
+                let session_id = self.index_of(&s).live_session_id(&s)?.to_string();
                 // The fork lands per the current layout (`resolve_spawn_target`),
                 // not next to the session's window.
                 Some(Action::ResumeSession {
@@ -323,7 +323,7 @@ impl App {
                 // known until the backend writes it (early in startup), so give
                 // explicit feedback rather than silently doing nothing.
                 let s = self.selected_session()?;
-                match self.session_index.live_session_id(&s) {
+                match self.index_of(&s).live_session_id(&s) {
                     Some(sid) => Some(Action::CopySessionId(sid.to_string())),
                     None => {
                         self.set_status("No session id available yet".to_string(), true);
@@ -339,20 +339,25 @@ impl App {
                 // (signal only) — §15.3.
                 let window_id = self.window_id_for_session(&s);
                 Some(Action::KillSession {
+                    key: s.key(),
                     host: s.host,
-                    child_pid: s.child_pid.unwrap_or(s.launcher_pid),
                     window_id,
                 })
             }
             Command::DetachRemote => {
                 let s = self.selected_session()?;
-                // Detach only makes sense for a remote session we're attached to:
-                // a local session *is* its window (closing it would lose the
-                // session — that's `x`). Close the `ssh attach` window but leave
-                // the pooled session running; the row stays and Enter re-attaches.
-                if s.host.is_local() {
+                // Detach only makes sense for a **pooled** session we're
+                // attached to: an unpooled local session *is* its window, so
+                // closing it would lose the session — that's `x`. Keyed on the
+                // capability, not on locality, so it works under
+                // pooled-localhost too. Closes the attach window and leaves the
+                // pooled session running; the row stays and Enter re-attaches.
+                let pooled = self
+                    .backend_for(&s.host)
+                    .is_some_and(|b| b.capabilities().pooled);
+                if !pooled {
                     self.set_status(
-                        "Detach is for remote sessions; use x to kill a local one".to_string(),
+                        "Detach is for pooled sessions; use x to kill a local one".to_string(),
                         true,
                     );
                     return None;
@@ -486,6 +491,42 @@ impl App {
                 self.open_default_agent_picker();
                 None
             }
+            Command::DefaultHost => {
+                self.open_default_host_picker();
+                None
+            }
+            Command::StealAttach => {
+                let s = self.selected_session()?;
+                let Some(pool_session) = s.pool_session.clone() else {
+                    self.set_status(
+                        "Steal only applies to pooled sessions (this one owns its window)"
+                            .to_string(),
+                        true,
+                    );
+                    return None;
+                };
+                // The host overlays libshpool's live attached bit onto each row,
+                // so we can tell the user whether anyone is actually there —
+                // and skip the confirm entirely when nobody is. `None` means the
+                // bit is unknown (the pool couldn't be read), so we still ask.
+                if s.attached == Some(false) {
+                    return Some(Action::AttachRemoteRunning {
+                        host: s.host,
+                        pool_session,
+                        force: false,
+                    });
+                }
+                self.pending_confirm = Some(super::PendingConfirm {
+                    prompt: "Another terminal is attached — kick it? [y/N]".to_string(),
+                    action: Action::AttachRemoteRunning {
+                        host: s.host,
+                        pool_session,
+                        force: true,
+                    },
+                });
+                self.input_mode = InputMode::Confirm;
+                None
+            }
             Command::SessionsLayout => {
                 self.toggle_sessions_layout();
                 None
@@ -547,10 +588,16 @@ impl App {
     /// `dir_exists` (real fs in production, a stub in tests); remote makes a
     /// blocking RPC to the host's server (`false` if unreachable).
     fn host_dir_exists(&self, host: &HostId, path: &str) -> bool {
-        if host.is_local() {
-            (self.dir_exists)(path)
-        } else {
-            tokio::task::block_in_place(|| self.backend_for(host).dir_exists(path))
+        let Some(backend) = self.backend_for(host) else {
+            return false;
+        };
+        match backend {
+            // The injected probe (real fs in production, a stub in tests) keeps
+            // the local arm runtime-free, so the picker's unit tests can call it.
+            crate::backend::Backend::Local(_) => (self.dir_exists)(path),
+            crate::backend::Backend::Remote(_) => {
+                tokio::task::block_in_place(|| backend.dir_exists(path))
+            }
         }
     }
 
@@ -583,16 +630,20 @@ impl App {
             .and_then(|i| active.picker.items.get(i))
             .and_then(|it| it.payload.clone());
 
-        // Paths resolve against the *selected host*: `~` expands to that host's
-        // home (`workdir_host_home`) and existence checks hit that host's fs.
-        let home = self.workdir_host_home.clone();
+        // Paths here are **host-canonical** throughout (§3): what the picker
+        // shows is the wire string, a typed `~` stays a `~`, and the host itself
+        // expands it — both for the existence checks below and for the launch.
+        // Nothing on this side needs to know any machine's `$HOME`.
 
         // Fast-fail a not-fully-connected remote BEFORE any blocking RPC: the
         // checks go over the wire and `request()` would queue (freezing the TUI on
         // `block_in_place`) through the whole connect attempt. Show "unreachable"
         // and keep the picker open, rather than "not a directory" (misleading — we
         // just can't reach it).
-        if !host.is_local() && self.backend_for(&host).conn_state() != ConnState::Connected {
+        if !self
+            .backend_for(&host)
+            .is_some_and(|b| b.conn_state().is_connected())
+        {
             if let Some(active) = self.picker.as_mut() {
                 active.picker.set_error(format!("{} unreachable", host.0));
             }
@@ -604,12 +655,10 @@ impl App {
         // recent wins. We consult the host fs only when it can affect the choice —
         // an explicit selection skips the typed check entirely — and remember when
         // the typed path was confirmed a dir so we don't re-check it below.
-        let typed_expanded = expand_tilde(&typed, &home);
         let (chosen_raw, typed_known_dir) = if user_selected && let Some(p) = &item_path {
             (p.clone(), false)
         } else {
-            let typed_is_dir =
-                !typed_expanded.is_empty() && self.host_dir_exists(&host, &typed_expanded);
+            let typed_is_dir = !typed.is_empty() && self.host_dir_exists(&host, &typed);
             if typed_is_dir {
                 (typed.clone(), true)
             } else if let Some(p) = &item_path {
@@ -622,16 +671,15 @@ impl App {
             }
         };
 
-        let cwd = expand_tilde(chosen_raw.trim(), &home);
+        let cwd = chosen_raw.trim().to_string();
         if cwd.is_empty() {
             return None;
         }
         // Validate, skipping a second round-trip when we already confirmed this
-        // exact path is a directory (typed_known_dir ⇒ cwd == typed_expanded).
+        // exact path is a directory (typed_known_dir ⇒ cwd == typed).
         if !typed_known_dir && !self.host_dir_exists(&host, &cwd) {
-            let shown = collapse_tilde(&cwd, &home);
             if let Some(active) = self.picker.as_mut() {
-                active.picker.set_error(format!("Not a directory: {shown}"));
+                active.picker.set_error(format!("Not a directory: {cwd}"));
             }
             return None;
         }
@@ -701,6 +749,18 @@ impl App {
             self.reseed_workdir_for_host();
             return None;
         }
+        // The same `Ctrl-h` in the *resume* picker re-scopes it to the next
+        // host. Scoping to one host at a time is what replaced the cross-host
+        // union (§9); the switch is the affordance that makes that cheap.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h'))
+            && let PickerKind::Resume { host, .. } = &active.kind
+        {
+            let hosts: Vec<HostId> = self.backends.iter().map(|b| b.host_id()).collect();
+            let cur = hosts.iter().position(|h| h == host).unwrap_or(0);
+            let next = hosts[(cur + 1) % hosts.len()].clone();
+            return Some(Action::SwitchResumeHost { host: next });
+        }
         match active.picker.handle_key(key) {
             PickerEvent::Noop => None,
             PickerEvent::Cancel => {
@@ -710,10 +770,10 @@ impl App {
                 // returns to Normal.
                 let active = self.picker.take().expect("picker was Some just above");
                 self.workdir_completion = None;
-                self.input_mode = if matches!(active.kind, PickerKind::Emoji) {
-                    InputMode::DirEdit
-                } else {
-                    InputMode::Normal
+                self.input_mode = match active.kind {
+                    PickerKind::Emoji => InputMode::DirEdit,
+                    PickerKind::HostEmoji => InputMode::HostEdit,
+                    _ => InputMode::Normal,
                 };
                 None
             }
@@ -744,28 +804,18 @@ impl App {
                         };
                         Some(Action::MoveWindow(window_id, target))
                     }
-                    PickerKind::Resume { mut candidates } => {
+                    PickerKind::Resume {
+                        host,
+                        mut candidates,
+                    } => {
                         if idx >= candidates.len() {
                             return None;
                         }
-                        let (host, c) = candidates.swap_remove(idx);
+                        let c = candidates.swap_remove(idx);
                         Some(self.resume_action(host, c))
                     }
                     // Handled above via `submit_workdir` before the take.
                     PickerKind::Workdir { .. } => None,
-                    PickerKind::Browser { mut entries } => {
-                        if idx >= entries.len() {
-                            return None;
-                        }
-                        match entries.swap_remove(idx) {
-                            // Running → the same focus-or-attach decision as Enter.
-                            super::BrowserEntry::Running(s) => self.focus_or_attach(&s),
-                            // Resumable → resume on its host.
-                            super::BrowserEntry::Resumable(host, c) => {
-                                Some(self.resume_action(host, c))
-                            }
-                        }
-                    }
                     PickerKind::DefaultAgent => {
                         let chosen = active
                             .picker
@@ -777,6 +827,20 @@ impl App {
                             self.new_session_agent = a;
                             self.save_overrides();
                             self.set_status(format!("Default backend: {}", a.label()), false);
+                        }
+                        None
+                    }
+                    PickerKind::DefaultHost => {
+                        let chosen = active
+                            .picker
+                            .items
+                            .get(idx)
+                            .and_then(|it| it.payload.clone());
+                        if let Some(label) = chosen {
+                            self.default_host = HostId(label);
+                            self.save_overrides();
+                            let host = self.default_host.0.clone();
+                            self.set_status(format!("Default host: {host}"), false);
                         }
                         None
                     }
@@ -792,6 +856,19 @@ impl App {
                             self.apply_emoji_pick(&emoji);
                         } else {
                             self.input_mode = InputMode::DirEdit;
+                        }
+                        None
+                    }
+                    PickerKind::HostEmoji => {
+                        if let Some(emoji) = active
+                            .picker
+                            .items
+                            .get(idx)
+                            .and_then(|it| it.payload.clone())
+                        {
+                            self.apply_host_emoji_pick(&emoji);
+                        } else {
+                            self.input_mode = InputMode::HostEdit;
                         }
                         None
                     }
@@ -815,35 +892,62 @@ impl App {
         }
     }
 
+    /// The hosts panel (`Space h`). A list view with live per-host state, not a
+    /// staged edit form (§9): there is no Save step, because every mutation
+    /// persists as it happens — adding a host connects it immediately (so you
+    /// watch its state animate in the list), an edit applies when you commit the
+    /// row, and a removal takes a `d`-then-`y` confirm.
     fn handle_host_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let ncol = super::format::DIR_COLORS.len();
         let editing = self.host_edit.as_ref()?.editing;
 
-        // List-mode globals: save / cancel (in field-edit these are text/Esc-back).
-        if !editing {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.cancel_host_edit();
-                    return None;
+        // A pending removal owns the keyboard until answered.
+        if let Some(idx) = self.host_edit.as_ref()?.pending_remove {
+            let state = self.host_edit.as_mut()?;
+            state.pending_remove = None;
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                if idx < state.rows.len() {
+                    state.rows.remove(idx);
+                    state.cursor = state.cursor.min(state.rows.len());
                 }
-                KeyCode::Char('s') => {
-                    self.commit_host_edit();
-                    return None;
-                }
-                _ => {}
+                self.apply_host_edits();
             }
+            return None;
+        }
+
+        // List-mode globals (in field-edit these are text / Esc-back).
+        if !editing && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.close_host_edit();
+            return None;
+        }
+
+        // Ctrl-E from the Icon field opens the same searchable emoji picker the
+        // directory marks use — one affordance, learned once.
+        if editing
+            && ctrl
+            && matches!(key.code, KeyCode::Char('e'))
+            && self.host_edit.as_ref()?.focus == HostField::Icon
+        {
+            self.open_emoji_picker_for_host();
+            return None;
         }
 
         let state = self.host_edit.as_mut()?;
         if state.editing {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => state.editing = false,
+                // Committing a row applies it: persist + reconnect right away.
+                KeyCode::Esc | KeyCode::Enter => {
+                    state.editing = false;
+                    self.apply_host_edits();
+                    return None;
+                }
                 KeyCode::Tab => {
                     state.focus = match state.focus {
                         HostField::Label => HostField::Target,
-                        HostField::Target => HostField::Color,
+                        HostField::Target => HostField::Icon,
+                        HostField::Icon => HostField::Color,
                         HostField::Color => HostField::Label,
                     }
                 }
@@ -871,6 +975,9 @@ impl App {
                             HostField::Target => {
                                 r.target.pop();
                             }
+                            HostField::Icon => {
+                                r.icon.pop();
+                            }
                             HostField::Color => {}
                         }
                     }
@@ -882,6 +989,7 @@ impl App {
                         match state.focus {
                             HostField::Label => r.label.push(c),
                             HostField::Target => r.target.push(c),
+                            HostField::Icon => r.icon.push(c),
                             HostField::Color => {}
                         }
                     }
@@ -907,11 +1015,10 @@ impl App {
                     state.editing = true;
                     state.focus = HostField::Label;
                 }
+                // Removal is destructive (it drops the host and its mirror), so
+                // it asks first.
                 KeyCode::Char('d') if state.cursor < n => {
-                    state.rows.remove(state.cursor);
-                    if state.cursor >= state.rows.len() {
-                        state.cursor = state.cursor.saturating_sub(1);
-                    }
+                    state.pending_remove = Some(state.cursor);
                 }
                 _ => {}
             }

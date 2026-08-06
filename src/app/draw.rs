@@ -10,7 +10,7 @@ use ratatui::{
 
 use crate::backend::ConnState;
 use crate::config;
-use crate::state::{LauncherState, SessionStatus};
+use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
     DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, WIDE_PUA_GLYPHS, ansi_to_lines,
@@ -315,6 +315,52 @@ impl App {
         frame.render_widget(help, help_area);
     }
 
+    /// The live status spans for one host row in the panel: connection state
+    /// (green when connected, the `Failed` reason verbatim when there is one),
+    /// running/attached session counts, the daemon version from `Welcome`, and
+    /// the opportunistic latency sample. A host that isn't connected yet — or
+    /// isn't in the backend set at all (a row the user is still typing) — shows
+    /// only what's known.
+    fn host_status_spans(&self, host: &HostId) -> Vec<Span<'static>> {
+        let ui = &config::get().colors.ui;
+        let Some(backend) = self.backend_for(host) else {
+            return vec![Span::styled(
+                "not connected".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            )];
+        };
+        let state = backend.conn_state();
+        let style = match &state {
+            ConnState::Connected => Style::default().fg(Color::Green),
+            ConnState::Connecting => Style::default().add_modifier(Modifier::DIM),
+            ConnState::Disconnected | ConnState::Failed(_) => Style::default().fg(ui.attention_fg),
+        };
+        let mut spans = vec![Span::styled(state.label().to_string(), style)];
+        if state.is_connected() {
+            let (running, attached) = self.host_session_counts(host);
+            spans.push(Span::styled(
+                format!("  {running} session(s), {attached} attached"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            let mut trailer = String::new();
+            if let Some(v) = backend.daemon_version() {
+                trailer.push_str(&format!("  v{v}"));
+            }
+            // Sampled from ordinary request traffic — no `Ping` frame exists,
+            // deliberately (§9). `None` just means nothing has been asked yet.
+            if let Some(rtt) = backend.latency() {
+                trailer.push_str(&format!("  {}ms", rtt.as_millis()));
+            }
+            if !trailer.is_empty() {
+                spans.push(Span::styled(
+                    trailer,
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+        spans
+    }
+
     fn draw_host_edit(&self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(state) = self.host_edit.as_ref() else {
             return;
@@ -323,15 +369,24 @@ impl App {
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Remote Hosts ", Style::default().bold()));
+            .title(Span::styled(" Hosts ", Style::default().bold()))
+            .title_bottom(Span::styled(
+                " a add  e edit  d remove  q close ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let form_h: u16 = if state.editing { 6 } else { 0 };
+        let form_h: u16 = if state.editing { 7 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
-        // The host list (+ a trailing "add" line).
+        // The panel proper: one line per host, showing what you'd actually go
+        // here to find out — live connection state (with a `Failed` reason
+        // spelled out), how many sessions it holds and how many you're attached
+        // to, the daemon version it reported at handshake, and a latency sample.
+        // The header only carries the aggregate, so this is where the detail
+        // lives (§9).
         let mut lines: Vec<Line> = Vec::new();
         for (i, r) in state.rows.iter().enumerate() {
             let on = i == state.cursor;
@@ -346,22 +401,50 @@ impl App {
             } else {
                 r.label.clone()
             };
-            let kind = if r.is_socket { "sock" } else { "ssh " };
-            lines.push(Line::from(vec![
+            let host = HostId(r.label.clone());
+            let icon = if r.icon.trim().is_empty() {
+                self.host_icon(&host)
+            } else {
+                r.icon.clone()
+            };
+            let mut spans = vec![
                 Span::raw(marker),
-                Span::styled(format!("{label:<16}"), Style::default().fg(color).bold()),
-                Span::styled(
-                    format!("{kind}  "),
-                    Style::default().add_modifier(Modifier::DIM),
+                Span::raw(format!("{icon} ")),
+                Span::styled(format!("{label:<14}"), Style::default().fg(color).bold()),
+            ];
+            spans.extend(self.host_status_spans(&host));
+            lines.push(Line::from(spans));
+            // The target is secondary detail — one indented dim line, so the
+            // status line above stays scannable across many hosts.
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "      {} {}",
+                    if r.is_socket { "socket" } else { "ssh" },
+                    r.target
                 ),
-                Span::raw(r.target.clone()),
-            ]));
+                Style::default().add_modifier(Modifier::DIM),
+            )));
         }
         let add_on = state.cursor == state.rows.len() && !state.editing;
         lines.push(Line::from(Span::styled(
             format!("{}+ add host", if add_on { "\u{276F} " } else { "  " }),
             Style::default().add_modifier(Modifier::DIM),
         )));
+        // Removing a host drops it and its mirror, so it asks first.
+        if let Some(idx) = state.pending_remove {
+            let label = state
+                .rows
+                .get(idx)
+                .map(|r| r.label.clone())
+                .unwrap_or_default();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Remove host \"{label}\"? [y/N]"),
+                Style::default()
+                    .fg(config::get().colors.ui.attention_fg)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         frame.render_widget(Paragraph::new(lines), list_area);
 
         // The field form for the row being edited.
@@ -415,6 +498,14 @@ impl App {
                 }
                 color_spans.push(Span::styled("\u{25CF} ", st));
             }
+            let icon_line = Line::from(vec![
+                Span::raw(if r.icon.trim().is_empty() {
+                    format!("{} (auto)", self.host_icon(&HostId(r.label.clone())))
+                } else {
+                    r.icon.clone()
+                }),
+                cursor(state.focus == super::HostField::Icon),
+            ]);
             let mut form_lines = vec![
                 field_row(state.focus == super::HostField::Label, "Label", label_line),
                 field_row(
@@ -422,18 +513,24 @@ impl App {
                     "Target",
                     target_line,
                 ),
+                field_row(state.focus == super::HostField::Icon, "Icon", icon_line),
                 field_row(
                     state.focus == super::HostField::Color,
                     "Color",
                     Line::from(color_spans),
                 ),
             ];
-            // For the Target field, hint the ssh/socket toggle.
-            if state.focus == super::HostField::Target {
-                form_lines.push(Line::from(Span::styled(
+            // Per-field hints for the two non-obvious affordances.
+            match state.focus {
+                super::HostField::Target => form_lines.push(Line::from(Span::styled(
                     "  ^t toggle ssh / socket",
                     Style::default().add_modifier(Modifier::DIM),
-                )));
+                ))),
+                super::HostField::Icon => form_lines.push(Line::from(Span::styled(
+                    "  ^e pick emoji   empty = auto",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                _ => {}
             }
             frame.render_widget(Paragraph::new(form_lines), form_area);
         }
@@ -550,6 +647,21 @@ impl App {
                 Style::default().fg(ui.title_fg),
             ),
         ]);
+        // The default *host* joins the cluster only once there's a choice to
+        // make — a single-host user never sees it, exactly like the Host column.
+        if self.backends.len() > 1 {
+            let host = self.default_host_or_local();
+            right_segs.push(vec![
+                Span::styled(
+                    "Default host: ",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("{} {}", self.host_icon(&host), host.0),
+                    Style::default().fg(self.host_label_color(&host)),
+                ),
+            ]);
+        }
         if self.sleep_inhibitor.is_active() {
             right_segs.push(vec![Span::styled(
                 "\u{2615}",
@@ -572,27 +684,48 @@ impl App {
         );
     }
 
-    /// One ribbon segment per remote host that isn't currently connected, shown
-    /// at the left of the header's right cluster so a dropped/reconnecting host
-    /// is visible even though its rows have cleared. Empty when every host is
-    /// connected (the common all-local / all-healthy case adds nothing).
+    /// The header's connection surface: a single **aggregate**, never per-host
+    /// detail (§9).
+    ///
+    /// It used to print one `⚠ <host>` segment per unhealthy host, which read
+    /// fine with one remote and blew the header out with five. Now it says how
+    /// many hosts are configured and how many are unwell — `hosts 3 ⚠1` — and
+    /// everything else (which host, and *why*, including a `Failed` reason)
+    /// lives one `Space h` away in the hosts panel. Empty when no remote hosts
+    /// are configured, so a zero-remote user sees nothing.
     fn connection_segments(&self) -> Vec<Vec<Span<'static>>> {
-        let attention = config::get().colors.ui.attention_fg;
-        let mut segs = Vec::new();
-        for (host, state) in self.unhealthy_hosts() {
-            let (glyph, style) = match state {
-                // Actively re-dialing: dim, it's expected to clear on its own.
-                ConnState::Connecting => ("\u{27f3}", Style::default().add_modifier(Modifier::DIM)),
-                // Lost and backing off: loud, the host is unreachable right now.
-                ConnState::Disconnected => (
-                    "\u{26a0}",
-                    Style::default().fg(attention).add_modifier(Modifier::BOLD),
-                ),
-                ConnState::Connected => continue,
-            };
-            segs.push(vec![Span::styled(format!("{glyph} {}", host.0), style)]);
+        // `backends[0]` is this machine; the header counts the hosts the user
+        // added, since those are the ones that can be unreachable.
+        let total = self.backends.len().saturating_sub(1);
+        if total == 0 {
+            return Vec::new();
         }
-        segs
+        let unhealthy = self.unhealthy_hosts();
+        let mut spans = vec![Span::styled(
+            format!("hosts {total}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        if !unhealthy.is_empty() {
+            // Loud only when something is actually wrong, and one glyph either
+            // way: `⟳` while every problem host is merely re-dialing (expected
+            // to clear on its own), `⚠` once one is genuinely down or failed.
+            let all_dialing = unhealthy
+                .iter()
+                .all(|(_, st)| matches!(st, ConnState::Connecting));
+            let (glyph, style) = if all_dialing {
+                ("\u{27f3}", Style::default().add_modifier(Modifier::DIM))
+            } else {
+                (
+                    "\u{26a0}",
+                    Style::default()
+                        .fg(config::get().colors.ui.attention_fg)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{glyph}{}", unhealthy.len()), style));
+        }
+        vec![spans]
     }
 
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -649,14 +782,14 @@ impl App {
             return;
         }
 
-        let name = session_display_name(s, &self.session_index, &self.random_names);
+        let name = session_display_name(s, self.index_of(s), &self.random_names);
         let status_text = match (&s.status, &s.last_tool) {
             (SessionStatus::Active, Some(tool)) => format!("{} ({tool})", s.status.label()),
             _ => s.status.label().to_string(),
         };
         let ui = &config::get().colors.ui;
         let status_fg = super::format::status_fg(&s.status, self.is_follow_up(&super::flag_key(s)));
-        let live_sid = self.session_index.live_session_id(s);
+        let live_sid = self.index_of(s).live_session_id(s);
         let sid_short = live_sid
             .map(|sid| sid.split('-').next().unwrap_or(sid).to_string())
             .unwrap_or_else(|| "—".to_string());
@@ -737,19 +870,29 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    /// The Host-column label for a row and whether it's a *foreign-terminal* tag
-    /// rather than a remote host name: the terminal kind (`kitty` / `zellij`) for
-    /// a local row that lives in another terminal instance, the host name for a
-    /// remote row, or `None` for an ordinary local row. Drives both the column
-    /// width and the cell so the two can't disagree.
+    /// The Host-column cell for a row and whether it's a *foreign-terminal* tag
+    /// rather than a host: the terminal kind (`kitty` / `zellij`) for a local
+    /// row that lives in another terminal instance, and otherwise the host's
+    /// **emoji** (§9) — configurable per host in the hosts panel exactly like
+    /// the workdir icons, with a deterministic fallback.
+    ///
+    /// An icon rather than a name because the column is a glance-level "which
+    /// box is this?", and a name either truncates to noise or eats six cells of
+    /// a row that has better uses for them. `None` for a row on this machine
+    /// with nothing unusual about it. Drives both the column width and the cell
+    /// so the two can't disagree.
     fn host_column_label(&self, s: &LauncherState) -> Option<(String, bool)> {
         if let Some(identity) = self.foreign_terminal(s) {
-            Some((terminal_kind(&identity).to_string(), true))
-        } else if !s.host.is_local() {
-            Some((s.host.0.clone(), false))
-        } else {
-            None
+            return Some((terminal_kind(&identity).to_string(), true));
         }
+        // `backends[0]` is this machine — under pooled-localhost its id is a
+        // hostname, not "local", so compare against the backend rather than
+        // testing `is_local()`.
+        let this_machine = self.backends.first().map(|b| b.host_id());
+        if this_machine.as_ref() == Some(&s.host) {
+            return None;
+        }
+        Some((self.host_icon(&s.host), false))
     }
 
     fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -908,11 +1051,12 @@ impl App {
                 let foreign = self.foreign_terminal(s).is_some();
                 let status_text = s.status.label();
                 let name = truncate_str(
-                    &session_display_name(s, &self.session_index, &self.random_names),
+                    &session_display_name(s, self.index_of(s), &self.random_names),
                     name_col_max as usize,
                 );
 
-                let override_cell = override_indicator_cell(follow_up, important, muted);
+                let override_cell =
+                    override_indicator_cell(follow_up, important, muted, self.is_detached_row(s));
                 let status_fg = super::format::status_fg(&s.status, follow_up);
                 let status_cell = if muted {
                     Cell::from(status_text).style(Style::default().add_modifier(Modifier::DIM))
@@ -1235,13 +1379,20 @@ impl App {
             cmd(Command::NewSession),
             cmd(Command::NewSessionPrompt),
             cmd(Command::ResumePicker),
-            cmd(Command::OpenBrowser),
             cmd(Command::ForkSession),
             cmd(Command::CopySessionId),
             cmd(Command::KillSelected),
             cmd(Command::RestartSelected),
             cmd(Command::RestartAll),
         ];
+        // Detach and steal only mean anything once some host pools its sessions
+        // (a remote, or pooled-localhost) — otherwise a session *is* its window.
+        // Hide them rather than list keys that only report they don't apply,
+        // mirroring how the unsupported `t` is hidden on zellij.
+        if self.backends.iter().any(|b| b.capabilities().pooled) {
+            lines.push(cmd(Command::DetachRemote));
+            lines.push(cmd(Command::StealAttach));
+        }
         // zellij can't reparent a pane across tabs; drop the hint rather than
         // list a key that only errors.
         if self.capabilities.move_to_tab {
@@ -1262,7 +1413,12 @@ impl App {
             cmd(Command::EditDir),
             cmd(Command::ToggleKeepAwake),
             cmd(Command::DefaultAgent),
+            cmd(Command::SessionsLayout),
         ]);
+        // The default-host choice only exists once there's more than one host.
+        if self.backends.len() > 1 {
+            lines.push(cmd(Command::DefaultHost));
+        }
         // Remote hosts are gated behind the `remote` feature (work in progress);
         // hide the key rather than list one that only reports it's unavailable.
         if super::REMOTE_ENABLED {
@@ -1324,7 +1480,6 @@ impl App {
                     (Command::FocusSelected, "focus"),
                     (Command::NewSession, "new"),
                     (Command::ResumePicker, "resume"),
-                    (Command::OpenBrowser, "browse"),
                     (Command::JumpAttention, "next attention"),
                     (Command::Search, "search"),
                     (Command::Help, "help"),

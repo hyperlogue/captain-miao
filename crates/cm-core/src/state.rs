@@ -244,6 +244,19 @@ pub fn window_bindings_path() -> PathBuf {
     state_dir().join("window-bindings.json")
 }
 
+/// The host-side per-session flags sidecar (`docs/remote-sessions.md` §9): a
+/// `SessionKey → SessionFlags` map the **server-core** owns, so every dashboard
+/// attached to a host sees the same pins/mutes and they survive a dashboard
+/// restart. Deliberately a sidecar rather than a field on the launcher's state
+/// file: that file has exactly one writer (its launcher), and flags are set by
+/// someone else entirely.
+///
+/// Last-writer-wins across concurrent dashboards, by decision (§8) — nothing
+/// coordinates beyond the atomic replace. Safe to delete (flags reset).
+pub fn session_flags_path() -> PathBuf {
+    state_dir().join("session-flags.json")
+}
+
 // -- Process utilities --
 
 pub fn is_process_alive(pid: u32) -> bool {
@@ -656,6 +669,20 @@ pub struct LauncherState {
     /// `host`) so it reaches the dashboard off the state file / wire.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// Per-session flags (pinned / muted / follow-up) as the **owning host**
+    /// knows them, overlaid by the server-core from its sidecar as sessions are
+    /// served — never written by the launcher (single-writer rule). `None` from
+    /// a backend that doesn't serve flags (a plain local dashboard, which keeps
+    /// its own `dashboard-overrides.json`). Serialized so it rides the wire;
+    /// part of `PartialEq`, so a flag change from another dashboard pushes a
+    /// `Delta` like any other state change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<SessionFlags>,
+    /// Whether a terminal is currently attached to this session's pool pty,
+    /// overlaid by the server-core from libshpool's own session list. `None`
+    /// when unknown (not a pool session, or the pool couldn't be queried).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached: Option<bool>,
     /// Which host this session lives on. Never serialized — the launcher and
     /// server don't know it; the dashboard stamps it during reload so per-row
     /// keying can disambiguate a remote pid from a local one. Defaults `local`.
@@ -663,9 +690,80 @@ pub struct LauncherState {
     pub host: HostId,
 }
 
+/// Per-session flags a host owns on behalf of every dashboard watching it
+/// (`docs/remote-sessions.md` §9). Persisted in the daemon's sidecar
+/// ([`session_flags_path`]), overlaid onto served rows, and updated by
+/// `ClientFrame::SetSessionFlags` — so pins and mutes are the same for every
+/// dashboard attached to the host, and survive a dashboard restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionFlags {
+    pub pinned: bool,
+    pub muted: bool,
+    pub follow_up: bool,
+}
+
+impl SessionFlags {
+    /// Whether every flag is off — the value that means "drop the entry"
+    /// rather than persist a row of `false`s.
+    pub fn is_clear(&self) -> bool {
+        *self == SessionFlags::default()
+    }
+}
+
+/// The opaque identifier for a session on its owning host — the **only** thing
+/// that crosses the backend seam or the wire (`docs/remote-sessions.md` §3).
+///
+/// Minted by the owning backend; no caller above the seam may parse it. The
+/// encoding it happens to carry (the launcher pid, which names the state file)
+/// is an implementation detail of [`crate::backend::LocalBackend`], and the
+/// server **re-resolves key → current pid from the live state file at signal
+/// time** rather than trusting a pid a possibly-stale mirror sent. That's the
+/// mis-kill fix: the old wire carried the agent pid, so a mirror lagging a
+/// session's exit plus OS pid reuse could SIGTERM an unrelated process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionKey(pub String);
+
+impl SessionKey {
+    /// The key for a session identified by its launcher pid — the state file's
+    /// own name, so key → file is a direct lookup on the owning host.
+    pub fn from_launcher_pid(pid: u32) -> Self {
+        SessionKey(pid.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl LauncherState {
     fn file_path(launcher_pid: u32) -> PathBuf {
         sessions_dir().join(format!("{launcher_pid}.json"))
+    }
+
+    /// This session's opaque [`SessionKey`] on its owning host.
+    pub fn key(&self) -> SessionKey {
+        SessionKey::from_launcher_pid(self.launcher_pid)
+    }
+
+    /// The binding **token** the dashboard keys this session's window by: its
+    /// `pool_session` when it runs in a pty pool (the join key the attach
+    /// window names), else the `launch_id` the dashboard minted for the local
+    /// spawn. `None` for a hand-launched session, which self-reports its own
+    /// `window_id` instead.
+    ///
+    /// The single accessor for a choice that used to be re-derived at four call
+    /// sites (window resolution, binding GC, binding re-seed, launch bind).
+    /// Keyed on *pooled-ness*, not on host: under pooled-localhost a local
+    /// session is pooled too, and `pool_session` is then the right token.
+    pub fn binding_token(&self) -> Option<&str> {
+        self.pool_session.as_deref().or(self.launch_id.as_deref())
     }
 
     pub fn write(&self) -> Result<()> {
@@ -877,6 +975,8 @@ mod tests {
             pool_session: pool.map(str::to_string),
             launch_id: None,
             terminal: None,
+            flags: None,
+            attached: None,
             host: HostId::default(),
         };
         let states = vec![
