@@ -28,9 +28,9 @@ const RC_PASSWORD_ENV: &str = "CAPTAIN_MIAO_RC_PASSWORD";
 const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Title of the shared stack tab that hosts every session in the Stacked layout
-/// — the Kitty analog of zellij's `cm:sessions` floating tab. Looked up by title
+/// — the Kitty analog of zellij's `miao:sessions` floating tab. Looked up by title
 /// on each Stacked spawn (`SpawnTarget::SharedStackTab`) and created on first use.
-const SESSIONS_TAB: &str = "cm:sessions";
+const SESSIONS_TAB: &str = "miao:sessions";
 
 pub struct KittyTerminal;
 
@@ -250,7 +250,7 @@ impl Terminal for KittyTerminal {
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnResult> {
         // The Stacked layout on Kitty puts every session in one shared
-        // `cm:sessions` stack tab (`SharedStackTab`): join it if it exists, else
+        // `miao:sessions` stack tab (`SharedStackTab`): join it if it exists, else
         // create it. Finding it needs a snapshot (`launch` prints only a window
         // id). We match on a *window* already in that tab, not the tab id: `-m
         // window_id:<w>` selects the target tab by a window it contains (the same
@@ -312,7 +312,7 @@ impl Terminal for KittyTerminal {
             }
             SpawnTarget::SharedStackTab => {
                 // Label the window with the per-session title (the tab stays
-                // fixed-titled `cm:sessions`, unlike a per-project NewTab).
+                // fixed-titled `miao:sessions`, unlike a per-project NewTab).
                 if let Some(title) = &spec.title {
                     args.push(format!("--window-title={title}"));
                 }
@@ -371,7 +371,7 @@ impl Terminal for KittyTerminal {
 
         // `launch` prints only the window id, so the tab is reported only where
         // we already know it for free: a `SharedStackTab` spawn that *joined* an
-        // existing `cm:sessions` tab, whose id came out of the lookup snapshot
+        // existing `miao:sessions` tab, whose id came out of the lookup snapshot
         // above. A spawn that created a tab (`NewTab`, or the first
         // `SharedStackTab`) would need a second `ls` to learn it — not worth it,
         // so the caller falls back to resolving that one from a later snapshot.

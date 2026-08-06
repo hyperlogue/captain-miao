@@ -30,7 +30,7 @@ pub async fn run(
     // spawned — it threads a token (`--launch-id` locally, `--pool-session`
     // remotely) and records the window itself (next-step #6 §15). So self-report
     // `window_id` *only* when neither token is present — a hand-launched
-    // `captain-miao claude` in a real Kitty window, where nothing else can supply
+    // `miao claude` in a real Kitty window, where nothing else can supply
     // it and the resolver falls back to this field. A headless/pooled launcher
     // (token set) never touches the terminal.
     let window_id = if launch_id.is_none() && pool_session.is_none() {

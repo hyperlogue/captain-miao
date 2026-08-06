@@ -19,7 +19,7 @@
 #   scripts/stage-npm-packages.sh [tarball-dir]      # default: artifacts/
 #   EXPECT_VERSION=0.2.0 scripts/stage-npm-packages.sh
 #
-# Output: dist/npm/<pkg>/{package.json,bin/captain-miao,LICENSE,README.md}
+# Output: dist/npm/<pkg>/{package.json,bin/miao,LICENSE,README.md}
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -27,7 +27,13 @@ cd "$(dirname "$0")/.."
 SRC="${1:-artifacts}"
 OUT="dist/npm"
 SCOPE="@hyperlogue"
-BIN="captain-miao"
+# The project's name and the executable's are deliberately different: PROJECT
+# names the npm packages and the release tarballs (the published identity, which
+# a rename would break for every existing install), BIN is the file inside them.
+# Keep BIN in sync with the [[bin]] target in Cargo.toml and the require.resolve
+# path in npm/launch.mjs (the consumer).
+PROJECT="captain-miao"
+BIN="miao"
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
 
@@ -75,9 +81,9 @@ COUNT=0
 while IFS='|' read -r slug target os cpu libc; do
     [ -n "$slug" ] || continue
 
-    name="$SCOPE/$BIN-$slug"
-    pkgdir="$OUT/$BIN-$slug"
-    tarball="$SRC/$BIN-v$VERSION-$target.tar.gz"
+    name="$SCOPE/$PROJECT-$slug"
+    pkgdir="$OUT/$PROJECT-$slug"
+    tarball="$SRC/$PROJECT-v$VERSION-$target.tar.gz"
 
     [ -f "$tarball" ] || { echo "error: missing $tarball" >&2; exit 1; }
 
@@ -88,14 +94,14 @@ while IFS='|' read -r slug target os cpu libc; do
     # both). tar itself is the remaining integrity check: gzip carries a CRC and
     # a truncated archive fails extraction below.
     mkdir -p "$pkgdir/bin"
-    # The tarball holds <name>/captain-miao; --strip-components lands the binary
+    # The tarball holds <project-v-target>/cm; --strip-components lands the binary
     # directly in bin/. Extract only the binary — never the README/LICENSE copies
     # the release tarball also carries, which would shadow the ones staged above.
     # --no-same-owner/--no-same-permissions are the non-root defaults, stated
     # explicitly so a run as root can't restore an archived uid or setuid bit.
     tar -xzf "$tarball" -C "$pkgdir/bin" --strip-components=1 \
         --no-same-owner --no-same-permissions \
-        "$BIN-v$VERSION-$target/$BIN"
+        "$PROJECT-v$VERSION-$target/$BIN"
 
     # tar extracts whatever kind of entry the archive names. A member recorded as
     # a symlink extracts as one (verified: exit 0, no warning), and the chmod
@@ -115,8 +121,8 @@ while IFS='|' read -r slug target os cpu libc; do
     #   libc  — lets npm >=9.6 skip a glibc package on musl. The isMusl() check
     #           in launch.mjs is the real guard, for older npm / Bun that ignore
     #           this field. Omitted ("-") on darwin, which has no libc variants.
-    #   bin   — deliberately absent: the launcher package owns the captain-miao
-    #           command, and a second one here would collide on install.
+    #   bin   — deliberately absent: the launcher package owns the miao command,
+    #           and a second one here would collide on install.
     #   files — no `exports` either; it would block the bin/ subpath that
     #           launch.mjs resolves through createRequire.
     jq -n \

@@ -1,8 +1,8 @@
-//! `captain-miao-client` — a small CLI over the local pty pool: list the
+//! `miao-client` — a small CLI over the local pty pool: list the
 //! sessions the per-host daemon is holding, and reattach a terminal to one. It
 //! links libshpool for the attach (an in-process pty proxy) but hosts no
 //! daemon/pool of its own — it's purely a client over the pool socket the
-//! `captain-miao-server` daemon binds.
+//! `miao-server` daemon binds.
 
 mod pool;
 
@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "captain-miao-client",
+    name = "miao-client",
     version,
     about = "List and attach to captain-miao's local pooled sessions"
 )]
@@ -59,20 +59,20 @@ mod tests {
     fn cli_parses() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.command);
         // Bare invocation → list by default.
-        assert!(parse(&["captain-miao-client"]).unwrap().is_none());
+        assert!(parse(&["miao-client"]).unwrap().is_none());
         assert!(matches!(
-            parse(&["captain-miao-client", "list"]).unwrap(),
+            parse(&["miao-client", "list"]).unwrap(),
             Some(Command::List { json: false })
         ));
         assert!(matches!(
-            parse(&["captain-miao-client", "list", "--json"]).unwrap(),
+            parse(&["miao-client", "list", "--json"]).unwrap(),
             Some(Command::List { json: true })
         ));
         assert!(matches!(
-            parse(&["captain-miao-client", "attach", "cm-claude-1-1"]).unwrap(),
+            parse(&["miao-client", "attach", "cm-claude-1-1"]).unwrap(),
             Some(Command::Attach { name }) if name == "cm-claude-1-1"
         ));
         // Attach requires a name.
-        assert!(parse(&["captain-miao-client", "attach"]).is_err());
+        assert!(parse(&["miao-client", "attach"]).is_err());
     }
 }

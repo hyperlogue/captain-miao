@@ -129,7 +129,7 @@ impl Config {
 pub struct TerminalConfig {
     pub backend: Option<ConfiguredBackend>,
     /// Initial session layout: `"stacked"` (all sessions in the shared
-    /// `cm:sessions` tab) or `"per-tab"` (one tab per session). Unset ⇒ stacked.
+    /// `miao:sessions` tab) or `"per-tab"` (one tab per session). Unset ⇒ stacked.
     /// Toggled at runtime with `Space l` and persisted in
     /// `dashboard-overrides.json`, which then wins over this value.
     pub sessions_layout: Option<crate::terminal::SessionsLayout>,

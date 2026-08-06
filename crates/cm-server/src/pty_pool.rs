@@ -1,7 +1,7 @@
 //! Phase 3 pty pool — the `pty-daemon` and `attach` entrypoints that embed
 //! libshpool. Only compiled with the `pty-pool` feature (the remote/Linux
 //! build). The macOS dashboard client never runs these: it spawns
-//! `ssh -t <host> captain-miao attach <name>`, so `attach` (and the daemon the
+//! `ssh -t <host> miao-server attach <name>`, so `attach` (and the daemon the
 //! server supervises) run on the *remote* after the ssh hop. See
 //! `docs/remote-sessions.md` §8.
 //!
@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use shpool_protocol::{ConnectHeader, ListReply, SessionStatus, VersionHeader};
 
 /// captain-miao's private pool socket — resolved in cm-core so the server and
-/// the `captain-miao-client` list/attach tool agree on the path. A dedicated
+/// the `miao-client` list/attach tool agree on the path. A dedicated
 /// path (not shpool's default) gives the pool its own session namespace, so
 /// captain-miao sessions never collide with a user's own shpool/tmux — §8
 /// isolation-by-construction.
@@ -163,7 +163,7 @@ pub(crate) fn run_daemon() -> Result<()> {
 }
 
 /// Serialize `value` the way libshpool's daemon expects (msgpack, struct-map).
-/// Mirrors captain-miao-client's `pool.rs`; the codec is pinned there by
+/// Mirrors miao-client's `pool.rs`; the codec is pinned there by
 /// `list_codec_roundtrips` and here by `busy_check_codec_roundtrips`, so a
 /// libshpool protocol bump surfaces in both crates' tests.
 fn shpool_encode<T: Serialize, W: Write>(value: &T, w: W) -> Result<()> {

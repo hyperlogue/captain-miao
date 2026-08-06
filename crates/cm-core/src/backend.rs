@@ -3,7 +3,7 @@
 //! [`LocalBackend`] is the **server-core**: it reads this host's session state
 //! files, lists resumable sessions, signals local agent processes, plans launch
 //! argv, and answers the host-filesystem queries the workdir picker needs. Both
-//! the dashboard's localhost row *and* the `captain-miao-server` daemon wrap one,
+//! the dashboard's localhost row *and* the `miao-server` daemon wrap one,
 //! so the same local-read logic backs the in-process path and the remote path.
 //!
 //! [`OpenSpec`] (what to open) and [`LaunchPlan`] (how the client attaches a
@@ -44,8 +44,9 @@ pub enum LaunchPlan {
     /// Local: the window *is* the launcher. Spawn this argv directly.
     SpawnLocal { argv: Vec<String> },
     /// Remote: the server already started the launcher inside the pty pool; the
-    /// client spawns a window that attaches to it (`ssh -t <host> captain-miao
-    /// attach <name>`, or a direct `captain-miao attach <name>` for a same-host
+    /// client spawns a window that attaches to it (`ssh -t <host>
+    /// miao-server attach <name>`, or a direct `miao-server
+    /// attach <name>` for a same-host
     /// socket transport). `session_name` is the pool join key the client records
     /// against the local window (§8 binding).
     AttachRemote {
@@ -123,7 +124,7 @@ fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<
 /// In-process backend: read the local filesystem and signal local processes
 /// directly. Owns the per-agent session-name cache and the per-host Codex
 /// title overlay (per-host state that a remote backend keeps on its own
-/// server). Also the server-core (see module docs), so `captain-miao-server`
+/// server). Also the server-core (see module docs), so `miao-server`
 /// calls the same operations.
 #[derive(Default)]
 pub struct LocalBackend {
@@ -217,13 +218,14 @@ impl LocalBackend {
     }
 
     /// Build the argv for a local launcher window:
-    /// `captain-miao <agent> <cwd> [resume args]`. Pure metadata — the client
-    /// spawns it into a Kitty window; nothing runs here. argv[0] is the running
+    /// `miao <agent> <cwd> [resume args]`. Pure metadata — the client spawns it
+    /// into a Kitty window; nothing runs here. argv[0] is the running
     /// captain-miao exe so the launched launcher is the same build as the
-    /// dashboard (falls back to a bare `captain-miao` on PATH if unresolvable).
+    /// dashboard (falls back to a bare `miao` on PATH if unresolvable — the
+    /// dashboard binary's name, since that is what a local install puts there).
     pub fn open_session(&self, spec: &OpenSpec) -> LaunchPlan {
         let exe = std::env::current_exe()
-            .unwrap_or_else(|_| "captain-miao".into())
+            .unwrap_or_else(|_| "miao".into())
             .to_string_lossy()
             .into_owned();
         let mut argv = vec![

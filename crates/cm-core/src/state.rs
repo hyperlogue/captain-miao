@@ -150,7 +150,7 @@ pub fn ssh_sock_dir() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(|d| PathBuf::from(d).join("cm"))
+        .map(|d| PathBuf::from(d).join("miao"))
         .unwrap_or_else(|| {
             let uid = unsafe { libc::getuid() };
             std::env::temp_dir().join(format!("cm-{uid}"))
@@ -237,7 +237,7 @@ pub fn work_tabs_path() -> PathBuf {
 /// the sole writer — rebuilt each reload from the live rows + `WindowBindings` —
 /// and three readers consume it: the dashboard re-seeds its in-memory bindings
 /// from it on startup (recovery across a restart, §15.7), the external
-/// `captain-miao focus --window-id` bell keybind resolves a window→pid through it
+/// `miao focus --window-id` bell keybind resolves a window→pid through it
 /// (replacing the old state-file scan), and the prune loop garbage-collects it.
 /// Safe to delete (regenerated next reload).
 pub fn window_bindings_path() -> PathBuf {
@@ -254,7 +254,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-// -- Attach guards (shared by captain-miao-server and captain-miao-client) --
+// -- Attach guards (shared by miao-server and miao-client) --
 
 /// Exit code of `attach` when the pool session already has a client attached.
 /// libshpool's own busy refusal exits 0 — indistinguishable from a clean
@@ -710,7 +710,7 @@ impl LauncherState {
 }
 
 /// Bell signaling — small sentinel files dropped into `sessions_dir()` by
-/// `captain-miao focus --window-id <id>` so external Kitty keybinds can ring
+/// `miao focus --window-id <id>` so external Kitty keybinds can ring
 /// the bell on a session. The dashboard drains them on every reload via
 /// `drain_bell_flag_pids()` and applies them as `follow_up = true`.
 ///

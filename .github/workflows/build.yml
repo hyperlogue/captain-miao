@@ -6,7 +6,8 @@ name: build
 # Unix-domain sockets, $XDG_RUNTIME_DIR, and caffeinate/systemd-inhibit — and
 # Kitty itself has no native Windows build, so there is no Windows target.
 #
-# Ships ONLY the `captain-miao` dashboard package (`-p captain-miao`), not the
+# Ships ONLY the `captain-miao` dashboard package (`-p captain-miao`, whose binary
+# is `cm`), not the
 # whole workspace: the dashboard carries the `claude`/`codex`/`hook`/`focus`
 # entrypoints a local install needs, and building it alone keeps libshpool (the
 # `captain-miao-server` pty pool) out of the cross-build — cross-compiling
@@ -104,15 +105,18 @@ jobs:
       # links and runs. Only on natively-runnable targets.
       - name: Smoke-test the binary
         if: matrix.native
-        run: ./target/"$TARGET"/release/captain-miao --version
+        run: ./target/"$TARGET"/release/miao --version
 
       - name: Package
         run: |
           set -euo pipefail
+          # The tarball is named for the project; the binary inside it is `miao`
+          # (see the [[bin]] target in Cargo.toml). stage-npm-packages.sh reads
+          # both halves of that split — keep them in sync with its PROJECT/BIN.
           name="captain-miao-$VERSION-$TARGET"
           stage="dist/$name"
           mkdir -p "$stage"
-          cp "target/$TARGET/release/captain-miao" "$stage/"
+          cp "target/$TARGET/release/miao" "$stage/"
           # README + LICENSE only. CLAUDE.md is `@AGENTS.md` plus agent tooling
           # tips — an import that would dangle here, and not user-facing docs.
           cp README.md LICENSE "$stage/"

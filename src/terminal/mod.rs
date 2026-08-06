@@ -54,11 +54,11 @@ pub enum SpawnTarget {
     /// A fresh tab.
     NewTab,
     /// A full-size floating pane in the backend's shared sessions tab (zellij:
-    /// all sessions stack at identical 100% geometry in one `cm:sessions` tab;
+    /// all sessions stack at identical 100% geometry in one `miao:sessions` tab;
     /// focusing one raises it). Only produced when
     /// [`Capabilities::floating_sessions`] is set; other backends reject it.
     Floating,
-    /// A window in the backend's shared `cm:sessions` **stack** tab, created if
+    /// A window in the backend's shared `miao:sessions` **stack** tab, created if
     /// absent — the stacking analog of [`Floating`](SpawnTarget::Floating) for a
     /// backend that stacks windows in a tab rather than floating them (Kitty).
     /// Produced only when [`Capabilities::window_stacking`] is set and the
@@ -76,7 +76,7 @@ pub enum SpawnTarget {
 #[serde(rename_all = "kebab-case")]
 pub enum SessionsLayout {
     /// All sessions consolidated in one shared tab, one visible at a time:
-    /// floating panes in the `cm:sessions` tab on zellij, a single `cm:sessions`
+    /// floating panes in the `miao:sessions` tab on zellij, a single `miao:sessions`
     /// stack-layout tab on Kitty. The default.
     #[default]
     Stacked,
@@ -137,7 +137,7 @@ pub struct SpawnSpec {
     pub command: SpawnCommand,
     /// Tab title on a [`SpawnTarget::NewTab`] spawn, pane name on a
     /// [`SpawnTarget::Floating`] one, window title on a
-    /// [`SpawnTarget::SharedStackTab`] one (whose tab stays `cm:sessions`).
+    /// [`SpawnTarget::SharedStackTab`] one (whose tab stays `miao:sessions`).
     pub title: Option<String>,
     /// Keep the window open after the child process exits.
     pub hold: bool,

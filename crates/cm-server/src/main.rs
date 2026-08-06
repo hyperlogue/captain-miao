@@ -1,4 +1,4 @@
-//! `captain-miao-server` — the headless per-host runtime: the persistent daemon
+//! `miao-server` — the headless per-host runtime: the persistent daemon
 //! (pty pool + wire protocol) plus the `claude`/`codex`/`hook` entrypoints used
 //! by launchers running *inside* the pool. A remote dashboard reaches this over
 //! ssh; it never drives a terminal, so there is no Kitty gate. All the shared
@@ -21,7 +21,7 @@ pub use cm_core::{backend, protocol, state};
 
 #[derive(Parser)]
 #[command(
-    name = "captain-miao-server",
+    name = "miao-server",
     version,
     about = "captain-miao per-host daemon: pty pool + wire protocol"
 )]
@@ -71,7 +71,7 @@ enum Commands {
     PtyDaemon,
 
     /// Attach to (or create) a named pool session, proxying its pty to this
-    /// terminal. Run by the dashboard's `ssh -t <host> captain-miao-server attach
+    /// terminal. Run by the dashboard's `ssh -t <host> miao-server attach
     /// <name>` window (plain reattach), or by the daemon with `--cmd`/`--background`
     /// to create a session running the launcher.
     #[cfg(feature = "pty-pool")]
@@ -174,36 +174,36 @@ mod tests {
     fn daemon_subcommands_parse() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.command);
         assert!(matches!(
-            parse(&["captain-miao-server", "daemon", "ensure"]).unwrap(),
+            parse(&["miao-server", "daemon", "ensure"]).unwrap(),
             Commands::Daemon {
                 action: DaemonAction::Ensure
             }
         ));
         assert!(matches!(
-            parse(&["captain-miao-server", "daemon", "print-path"]).unwrap(),
+            parse(&["miao-server", "daemon", "print-path"]).unwrap(),
             Commands::Daemon {
                 action: DaemonAction::PrintPath
             }
         ));
         assert!(matches!(
-            parse(&["captain-miao-server", "daemon", "status"]).unwrap(),
+            parse(&["miao-server", "daemon", "status"]).unwrap(),
             Commands::Daemon {
                 action: DaemonAction::Status
             }
         ));
         assert!(matches!(
-            parse(&["captain-miao-server", "daemon", "stop"]).unwrap(),
+            parse(&["miao-server", "daemon", "stop"]).unwrap(),
             Commands::Daemon {
                 action: DaemonAction::Stop { force: false }
             }
         ));
         assert!(matches!(
-            parse(&["captain-miao-server", "daemon", "stop", "--force"]).unwrap(),
+            parse(&["miao-server", "daemon", "stop", "--force"]).unwrap(),
             Commands::Daemon {
                 action: DaemonAction::Stop { force: true }
             }
         ));
         // An unknown action is rejected, not silently accepted.
-        assert!(parse(&["captain-miao-server", "daemon", "frobnicate"]).is_err());
+        assert!(parse(&["miao-server", "daemon", "frobnicate"]).is_err());
     }
 }

@@ -41,6 +41,8 @@ tool and the rest of your workflow is yours to compose.
 cargo install --git https://github.com/hyperlogue/captain-miao
 ```
 
+This installs the `miao` command (the project is captain-miao; the binary is short because you'll type it a lot).
+
 Building needs a Rust toolchain and a C compiler (for the statically-bundled SQLite that reads Codex session titles).
 
 ### From a prebuilt binary (npm)
@@ -49,7 +51,7 @@ No Rust toolchain, no build:
 
 ```sh
 npx @hyperlogue/captain-miao          # run it once
-npm install -g @hyperlogue/captain-miao   # or install the `captain-miao` command
+npm install -g @hyperlogue/captain-miao   # or install the `miao` command
 ```
 
 `bunx @hyperlogue/captain-miao` works too. The npm package is a small launcher
@@ -103,20 +105,20 @@ Looser alternatives: `allow_remote_control socket-only` (off the escape-code cha
 Run the dashboard inside a supported terminal (Kitty or zellij):
 
 ```sh
-captain-miao
+miao
 ```
 
-> captain-miao must be launched from within Kitty or a zellij session; it exits with an error otherwise. When run inside a zellij session it auto-selects the zellij backend (override with `[terminal] backend` in the config).
+> `miao` must be launched from within Kitty or a zellij session; it exits with an error otherwise. When run inside a zellij session it auto-selects the zellij backend (override with `[terminal] backend` in the config).
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-| Command                                 | What it does                                                                                                                                |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `captain-miao`                          | Run the TUI dashboard (the default).                                                                                                        |
-| `captain-miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
-| `captain-miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
-| `captain-miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
-| `captain-miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
+| Command                       | What it does                                                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `miao`                          | Run the TUI dashboard (the default).                                                                                                       |
+| `miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
+| `miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
+| `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
+| `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
 Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 

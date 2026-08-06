@@ -20,7 +20,7 @@ so explicitly.
 ```
 user's machine (client)                      each session host (server)
 ┌────────────────────────────────┐           ┌───────────────────────────────────────┐
-│ dashboard (ratatui TUI)        │           │ captain-miao-server daemon (singleton) │
+│ dashboard (ratatui TUI)        │           │ miao-server daemon (singleton) │
 │                                │           │  ├─ protocol server (unix socket)      │
 │  Backend[0] Local ─────────────┼─in-proc──►│  │    ▲ same LocalBackend logic        │
 │  Backend[1] Remote("hostA") ───┼─socket───►│  ├─ LocalBackend (server-core)         │
@@ -56,9 +56,9 @@ branch only on (1) the row's host, to route; (2) a reported capability; (3)
 connection state (§1).
 
 Workspace split (`docs/crate-split.md`): `cm-core` (shared logic/types, no TUI,
-no libshpool — cross-compiles), `captain-miao` (the dashboard TUI), 
-`captain-miao-server` (the per-host daemon, the binary deployed to Linux
-remotes), `captain-miao-client` (thin local pool CLI: `list`/`attach`).
+no libshpool — cross-compiles), `captain-miao` (the dashboard TUI, whose binary
+is `miao`), `miao-server` (the per-host daemon, the binary deployed to
+Linux remotes), `miao-client` (thin local pool CLI: `list`/`attach`).
 
 ## 1. The foundation: libshpool and the pty pool
 
@@ -70,7 +70,7 @@ detach from at will, the same trick as tmux/screen, provided by
 library**.
 
 - **Embedded, not shelled out.** captain-miao runs its own shpool daemon on a
-  dedicated thread inside `captain-miao-server` (`crates/cm-server/src/pty_pool.rs`),
+  dedicated thread inside `miao-server` (`crates/cm-server/src/pty_pool.rs`),
   on its own private socket (`cm_core::state::pool_socket_path` — shared const
   with the client crate so the path can't drift), with a config file it
   authors. A user's standalone `shpool` install shares nothing with it (§5.1).
@@ -150,7 +150,7 @@ window and touches nothing on the host — the launcher keeps running in its
 pool pty; **kill** signals the agent and the whole triple tears down, pool
 session included.
 
-## 2. The per-host daemon: `captain-miao-server`
+## 2. The per-host daemon: `miao-server`
 
 One persistent process per host, doing two jobs with one lifetime: it **hosts
 the pool** and it **answers the protocol**. That coupling is deliberate — the

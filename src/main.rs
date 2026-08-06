@@ -1,8 +1,11 @@
-//! `captain-miao` — the dashboard: the ratatui TUI that monitors and manages
-//! sessions, in Kitty, locally and over ssh. It also carries the `claude`/
-//! `codex`/`hook` entrypoints (so a local launch needs only this one binary) and
-//! `focus`. The headless per-host daemon + pty pool is the separate
-//! `captain-miao-server` binary; shared logic lives in `cm-core`.
+//! `miao` — the dashboard: the ratatui TUI that monitors and manages sessions, in
+//! Kitty, locally and over ssh. It also carries the `claude`/`codex`/`hook`
+//! entrypoints (so a local launch needs only this one binary) and `focus`. The
+//! headless per-host daemon + pty pool is the separate `miao-server`
+//! binary; shared logic lives in `cm-core`.
+//!
+//! The binary is `miao` while the package (and the project) stays `captain-miao` —
+//! see the `[[bin]]` note in `Cargo.toml`.
 
 mod app;
 mod backend;
@@ -20,7 +23,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "captain-miao",
+    name = "miao",
     version,
     about = "Monitor and manage Claude Code sessions in Kitty or zellij"
 )]
@@ -35,7 +38,7 @@ enum Commands {
     ///
     /// The first positional is the working directory (defaults to `.`) unless
     /// it begins with `-`, in which case it (and everything after) is forwarded
-    /// to `claude` — so `captain-miao claude --resume` works. See `cli::split_cwd`.
+    /// to `claude` — so `miao claude --resume` works. See `cli::split_cwd`.
     Claude {
         /// Working directory (first positional, unless it starts with `-`)
         /// followed by any extra arguments passed straight to claude.
@@ -69,7 +72,7 @@ enum Commands {
 
     /// Focus the dashboard window and (with --window-id) flag the session
     /// running in that Kitty window so its bell indicator lights up. Bind
-    /// to a Kitty key with `launch --type=background captain-miao focus
+    /// to a Kitty key with `launch --type=background miao focus
     /// --window-id @active-kitty-window-id` to ring the bell from any
     /// Claude Code session.
     Focus {
@@ -85,7 +88,7 @@ fn main() -> Result<()> {
 
     // The dashboard is entirely async (the TUI, or a launcher/hook/focus). Build
     // the runtime and run it. (The pre-runtime daemon/pool dispatch that used to
-    // live here moved to the `captain-miao-server` binary.)
+    // live here moved to the `miao-server` binary.)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -220,7 +223,7 @@ mod tests {
     #[test]
     fn requires_terminal_hook_is_exempt() {
         // Hooks run wherever the agent runs — including a headless remote pool
-        // with no terminal — so `captain-miao hook` must not gate on one.
+        // with no terminal — so `miao hook` must not gate on one.
         assert!(!requires_terminal(&Some(Commands::Hook {
             event: "stop".into(),
             sock: None,

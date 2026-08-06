@@ -1,6 +1,6 @@
 //! `cm-core` — the logic and data captain-miao's two binaries share.
 //!
-//! The `captain-miao` dashboard (the ratatui TUI client) and `captain-miao-server`
+//! The `captain-miao` dashboard (the ratatui TUI client) and `miao-server`
 //! (the per-host daemon + pty pool) both depend on this crate. It is deliberately
 //! free of ratatui/crossterm (presentation lives in the dashboard) and libshpool
 //! (the pool lives in the server), so it stays a portable data/logic layer that

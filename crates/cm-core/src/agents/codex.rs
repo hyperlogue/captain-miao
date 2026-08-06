@@ -802,7 +802,7 @@ fn sync_config(home: &Path) {
 /// socket arrives via `$CAPTAIN_MIAO_SOCK` — so the file is identical for every
 /// session and Codex only ever asks to trust it once.
 pub fn build_hooks_settings(_sock_path: &str) -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("captain-miao"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
 
     let hook = |event: HookEvent| -> serde_json::Value {

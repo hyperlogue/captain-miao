@@ -44,7 +44,7 @@ fn pool_list_sessions() -> Result<Vec<Session>> {
     let stream = UnixStream::connect(&socket).map_err(|e| {
         anyhow!(
             "cannot reach the pty pool at {} ({e}); is the daemon running? \
-             start it with `captain-miao-server daemon ensure`",
+             start it with `miao-server daemon ensure`",
             socket.display()
         )
     })?;
@@ -176,7 +176,7 @@ fn attach_pty(name: &str) -> Result<()> {
     // `#[non_exhaustive]`, so it can't be constructed directly, and parsing
     // stays correct if libshpool adds optional flags.
     let argv = [
-        "captain-miao-client",
+        "miao-client",
         "--socket",
         &socket,
         "--no-daemonize",

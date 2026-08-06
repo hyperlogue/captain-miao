@@ -204,7 +204,7 @@ jobs:
         run: |
           set -euo pipefail
           for d in dist/npm/*/; do
-            test -x "$d/bin/captain-miao"
+            test -x "$d/bin/miao"
             echo "  ok $d"
           done
 

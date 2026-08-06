@@ -34,7 +34,7 @@ impl AgentControl {
     pub const ALL: &'static [AgentControl] = &[AgentControl::Claude, AgentControl::Codex];
 
     /// CLI subcommand the dashboard launches to wrap this agent
-    /// (e.g. `captain-miao claude .`).
+    /// (e.g. `miao claude .`).
     pub fn cli_subcommand(self) -> &'static str {
         match self {
             AgentControl::Claude => "claude",
@@ -174,7 +174,7 @@ impl AgentControl {
     }
 
     /// Parse the agent's stdin JSON hook payload into a normalized
-    /// `HookMessage`. Used by the `captain-miao hook` subcommand.
+    /// `HookMessage`. Used by the `miao hook` subcommand.
     pub fn parse_hook_payload(self, event: HookEvent, stdin: &str) -> Result<HookMessage> {
         match self {
             AgentControl::Claude => claude::parse_hook_payload(event, stdin),

@@ -5,6 +5,35 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The commands are now `miao`, `miao-server` and `miao-client`** (were
+  `captain-miao`, `captain-miao-server`, `captain-miao-client`) — you reach for
+  the dashboard dozens of times a day, so it should be short enough to type
+  without thinking. Only the executables were renamed: the project, the crates,
+  the npm package (`@hyperlogue/captain-miao`), the release tarballs, and the
+  `~/.config` + `~/.local/state` directories all keep the captain-miao name, so
+  an upgrade moves no state and no config. Every subcommand follows the binary —
+  `miao claude`, `miao codex`, `miao focus`, `miao hook`.
+
+  The shared tab holding your sessions in the Stacked layout is renamed to match,
+  from `cm:sessions` to `miao:sessions`. It is found by title, so a dashboard
+  running against a terminal that still has the old tab simply creates the new
+  one beside it; sessions in the old tab keep running and stay reachable with
+  `Enter`. Close it once it empties.
+
+  **Upgrading:** the old `captain-miao` command is gone rather than aliased.
+  Re-run your installer (`cargo install --git …`, `npm i -g
+  @hyperlogue/captain-miao`, or `nix run`) to pick up the new name, and update
+  any Kitty keybind that calls it — `launch --type=background miao focus
+  --window-id @active-kitty-window-id`. A `cargo install` upgrade leaves the old
+  `captain-miao` binary behind in `~/.cargo/bin`; delete it so a stale build
+  can't shadow the new one. Sessions already running keep hooks pointing at the
+  absolute path of the binary that launched them, so restart them once the old
+  path is gone (npm removes it; `cargo install` leaves it in place).
+
 ## [0.2.1] - 2026-08-02
 
 ### Added
@@ -126,5 +155,6 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hyperlogue/captain-miao/releases/tag/v0.2.0

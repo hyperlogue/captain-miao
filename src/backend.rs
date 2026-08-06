@@ -1,6 +1,6 @@
 //! `Backend` is the dashboard's seam to *where sessions run and where their
 //! files live*. `Local` is in-process (the dashboard and the agents share one
-//! host); `Remote` reaches a `captain-miao-server` over a (possibly
+//! host); `Remote` reaches a `miao-server` over a (possibly
 //! ssh-forwarded) socket. Enum-dispatched to match `AgentControl`'s style: no
 //! dyn, no registry, just a `match` per operation.
 //!
@@ -11,7 +11,7 @@
 //! capture — stays in the TUI (the *client*), which overlays its own state on
 //! what the backend returns.
 //!
-//! [`LocalBackend`] is also the **server-core**: `captain-miao-server` wraps one
+//! [`LocalBackend`] is also the **server-core**: `miao-server` wraps one
 //! to answer a remote dashboard's requests, so the same local-read logic backs
 //! both the in-process path and the remote path. See `docs/remote-sessions.md`.
 //!
@@ -43,7 +43,7 @@ use crate::state::{self, HostId, LauncherState};
 pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
 
 /// Per-host session management. `Local` is in-process; `Remote` speaks the wire
-/// protocol to a `captain-miao-server` over a (possibly ssh-forwarded) socket.
+/// protocol to a `miao-server` over a (possibly ssh-forwarded) socket.
 pub(crate) enum Backend {
     Local(LocalBackend),
     Remote(RemoteBackend),
@@ -156,7 +156,7 @@ impl Backend {
     }
 
     /// The argv for a window that attaches to an *already-running* pool session
-    /// on this host (`ssh -t <target> captain-miao-server attach <name>`). `None` for
+    /// on this host (`ssh -t <target> miao-server attach <name>`). `None` for
     /// the local backend — local sessions aren't pooled, they keep their own
     /// window. Used by the client to attach to a running remote session it isn't
     /// already attached to (§5).
@@ -228,7 +228,7 @@ impl Backend {
 }
 
 // =============================================================================
-// Remote backend (RPC to a `captain-miao-server` over a socket)
+// Remote backend (RPC to a `miao-server` over a socket)
 // =============================================================================
 
 /// How a [`RemoteBackend`] reaches its server.
@@ -261,18 +261,19 @@ pub(crate) struct RemoteBackend {
     /// The host this backend speaks for; stamped onto every session it returns.
     host: HostId,
     /// ssh target for the attach window, learned from the transport: `Some` for
-    /// an ssh host (`ssh -t <target> captain-miao-server attach <name>`), `None` for a
-    /// direct socket transport (a same-host `captain-miao-server attach <name>`).
+    /// an ssh host (`ssh -t <target> miao-server attach <name>`), `None` for a
+    /// direct socket transport (a same-host `miao-server attach <name>`).
     attach_target: Option<String>,
     /// Latest known sessions on the remote host, keyed by launcher pid.
     mirror: Arc<Mutex<HashMap<u32, LauncherState>>>,
     /// Requests to the connection task; `None` once the task has exited.
     requests: mpsc::UnboundedSender<PendingRequest>,
     next_req_id: AtomicU64,
-    /// The command to invoke captain-miao on the remote, resolved at connect by
-    /// `setup_ssh` (PATH `captain-miao`, or an auto-provisioned cache path —
-    /// open-decision #3). Defaults to `captain-miao`, so before the task resolves
-    /// it (or for a socket transport) the attach argv is exactly as before.
+    /// The command to invoke the remote daemon, resolved at connect by
+    /// `setup_ssh` (PATH `miao-server`, or a deployed cache path —
+    /// open-decision #3). Defaults to `miao-server`, so before the task
+    /// resolves it (or for a socket transport) the attach argv is unchanged.
+    /// Never the dashboard binary (`miao`) — the remote runs the headless server.
     remote_exe: Arc<Mutex<String>>,
     /// Connection health (a [`ConnState`] as `u8`) the connection task updates
     /// as it dials / connects / loses the link, read by the header surface.
@@ -298,7 +299,7 @@ impl RemoteBackend {
             Transport::Socket(_) => None,
         };
         let mirror = Arc::new(Mutex::new(HashMap::new()));
-        let remote_exe = Arc::new(Mutex::new("captain-miao-server".to_string()));
+        let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(AtomicU8::new(ConnState::Connecting.as_u8()));
         let dirty = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::unbounded_channel();
@@ -433,8 +434,8 @@ impl RemoteBackend {
 }
 
 /// The argv for the window that attaches to a pool session: over ssh for a
-/// remote host (`ssh -t <target> captain-miao-server attach <name>`), or directly for
-/// a same-host socket transport (`captain-miao-server attach <name>`). `-t` forces a
+/// remote host (`ssh -t <target> miao-server attach <name>`), or directly for
+/// a same-host socket transport (`miao-server attach <name>`). `-t` forces a
 /// pty so the agent's TUI renders.
 fn attach_argv(target: Option<&str>, remote_exe: &str, session_name: &str) -> Vec<String> {
     let mut argv = match target {
@@ -478,25 +479,25 @@ fn shell_single_quote(s: &str) -> String {
 // =============================================================================
 // Remote binary provisioning (next-step #1, open-decision #3)
 //
-// On connect, probe the remote for a version-matching `captain-miao-server` and
+// On connect, probe the remote for a version-matching `miao-server` and
 // invoke whichever copy it finds: one on PATH first, else one at our cache path
 // (where `redeploy.sh` and, later, the embed-and-deploy work put it). Read-only
 // and never fatal — any failure (host unreachable, version mismatch, no binary)
-// resolves to `captain-miao-server` on PATH, i.e. exactly the pre-provisioning
+// resolves to `miao-server` on PATH, i.e. exactly the pre-provisioning
 // behavior.
 //
 // NOTE: the dashboard used to *auto-upload itself* here when the arches matched.
 // That died with the crate split — the dashboard no longer links the pty pool
-// (that's `captain-miao-server`), so the binary it could upload wouldn't be a
+// (that's `miao-server`), so the binary it could upload wouldn't be a
 // functional server. The scp/upload path and its `Provision::Upload` arm were
 // removed rather than left unreachable; recover them from git history if the
 // embed-and-deploy work wants them back (they'd need to ship the *server*
 // binary, not self).
 // =============================================================================
 
-/// Where a deployed captain-miao-server lives on the remote, relative to `$HOME`.
+/// Where a deployed miao-server lives on the remote, relative to `$HOME`.
 /// Shared with `redeploy.sh`, which uploads to exactly this path.
-const REMOTE_CACHE_REL: &str = ".cache/captain-miao/bin/captain-miao-server";
+const REMOTE_CACHE_REL: &str = ".cache/captain-miao/bin/miao-server";
 
 /// One-shot probe of a remote host: its `$HOME`, `uname -sm`, and the version of
 /// a captain-miao on PATH / at the cache path (if any).
@@ -511,11 +512,11 @@ struct RemoteProbe {
 /// The provisioning action a probe + local facts imply. Pure + unit-tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Provision {
-    /// A version-matching binary is already on PATH; invoke `captain-miao`.
+    /// A version-matching binary is already on PATH; invoke `miao-server`.
     UsePath,
     /// A version-matching binary is already at the cache path; invoke it there.
     UseCache,
-    /// Nothing version-matching anywhere; fall back to `captain-miao-server` on
+    /// Nothing version-matching anywhere; fall back to `miao-server` on
     /// PATH and let the connection fail loudly if it isn't there.
     FallBack,
 }
@@ -525,8 +526,8 @@ enum Provision {
 /// and the cache-path binary. `--version` errors and "command not found" both
 /// land on stderr and a non-zero exit, so `|| echo -` normalizes them.
 const PROBE_SCRIPT: &str = "echo \"$HOME\"; uname -sm; \
-captain-miao-server --version 2>/dev/null || echo -; \
-\"$HOME/.cache/captain-miao/bin/captain-miao-server\" --version 2>/dev/null || echo -";
+miao-server --version 2>/dev/null || echo -; \
+\"$HOME/.cache/captain-miao/bin/miao-server\" --version 2>/dev/null || echo -";
 
 /// Parse [`PROBE_SCRIPT`] output. A `--version` line is `captain-miao <ver>`;
 /// our `-` sentinel and a blank line map to `None`. Pure.
@@ -569,11 +570,11 @@ fn decide_provision(local_version: &str, probe: &RemoteProbe) -> Provision {
 }
 
 /// The remote command an action resolves to: the absolute cache path for
-/// `UseCache`, else `captain-miao-server` from PATH.
+/// `UseCache`, else `miao-server` from PATH.
 fn remote_exe_for(action: &Provision, home: &str) -> String {
     match action {
         Provision::UseCache => format!("{home}/{REMOTE_CACHE_REL}"),
-        Provision::UsePath | Provision::FallBack => "captain-miao-server".to_string(),
+        Provision::UsePath | Provision::FallBack => "miao-server".to_string(),
     }
 }
 
@@ -634,15 +635,15 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
 }
 
 /// Resolve the remote command to invoke: probe → decide. Never errors — any
-/// failure resolves to `captain-miao-server` on PATH so the rest of `setup_ssh`
+/// failure resolves to `miao-server` on PATH so the rest of `setup_ssh`
 /// behaves exactly as it did before provisioning existed.
 async fn resolve_remote_exe(target: &str, opts: &[String]) -> String {
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
-            "{target}: probe failed (unreachable / no shell) → PATH captain-miao-server"
+            "{target}: probe failed (unreachable / no shell) → PATH miao-server"
         );
-        return "captain-miao-server".to_string();
+        return "miao-server".to_string();
     };
     let action = decide_provision(env!("CARGO_PKG_VERSION"), &probe);
     tracing::debug!(
@@ -840,7 +841,7 @@ async fn setup_ssh(
     // Probe the host, auto-provision our binary if it's missing/stale and our
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
-    // Non-fatal: a failure resolves to `captain-miao` on PATH, the prior default.
+    // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
     let exe = resolve_remote_exe(target, &opts).await;
     *remote_exe.lock().unwrap() = exe.clone();
 
@@ -1059,22 +1060,15 @@ mod tests {
     fn attach_argv_ssh_vs_direct() {
         // PATH default for both transports.
         assert_eq!(
-            attach_argv(Some("user@box"), "captain-miao-server", "s1"),
-            [
-                "ssh",
-                "-t",
-                "user@box",
-                "captain-miao-server",
-                "attach",
-                "s1"
-            ]
+            attach_argv(Some("user@box"), "miao-server", "s1"),
+            ["ssh", "-t", "user@box", "miao-server", "attach", "s1"]
         );
         assert_eq!(
-            attach_argv(None, "captain-miao-server", "s1"),
-            ["captain-miao-server", "attach", "s1"]
+            attach_argv(None, "miao-server", "s1"),
+            ["miao-server", "attach", "s1"]
         );
-        // An auto-provisioned cache path is invoked over ssh in place of `captain-miao`.
-        let cache = "/home/u/.cache/captain-miao/bin/captain-miao-server";
+        // An auto-provisioned cache path is invoked over ssh in place of `miao-server`.
+        let cache = "/home/u/.cache/captain-miao/bin/miao-server";
         assert_eq!(
             attach_argv(Some("user@box"), cache, "s1"),
             ["ssh", "-t", "user@box", cache, "attach", "s1"]
@@ -1160,15 +1154,15 @@ mod tests {
     fn remote_exe_resolves_cache_path_or_falls_back_to_path() {
         assert_eq!(
             remote_exe_for(&Provision::UsePath, "/home/u"),
-            "captain-miao-server"
+            "miao-server"
         );
         assert_eq!(
             remote_exe_for(&Provision::FallBack, "/home/u"),
-            "captain-miao-server"
+            "miao-server"
         );
         assert_eq!(
             remote_exe_for(&Provision::UseCache, "/root"),
-            "/root/.cache/captain-miao/bin/captain-miao-server"
+            "/root/.cache/captain-miao/bin/miao-server"
         );
     }
 
@@ -1207,7 +1201,7 @@ mod tests {
         match plan {
             // A socket transport (no ssh target) yields a direct attach window.
             LaunchPlan::AttachRemote { argv, session_name } => {
-                assert_eq!(argv, ["captain-miao-server", "attach", "pool-claude"]);
+                assert_eq!(argv, ["miao-server", "attach", "pool-claude"]);
                 assert_eq!(session_name, "pool-claude");
             }
             LaunchPlan::SpawnLocal { .. } => panic!("expected AttachRemote from a remote backend"),
@@ -1215,7 +1209,7 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// A protocol-speaking stand-in for `captain-miao-server`: one connection,
+    /// A protocol-speaking stand-in for `miao-server`: one connection,
     /// handshake, snapshot, then canned replies to requests.
     async fn mock_server(listener: UnixListener, sessions: Vec<LauncherState>) {
         let Ok((stream, _)) = listener.accept().await else {

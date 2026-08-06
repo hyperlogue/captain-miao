@@ -135,7 +135,7 @@ pub(super) enum Action {
     /// Copy the selected session's id to the system clipboard (via OSC 52).
     CopySessionId(String),
     /// Attach a local window to an already-running remote pool session (§5):
-    /// spawn `ssh -t <host> captain-miao attach <pool_session>` and bind it.
+    /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
     AttachRemoteRunning {
         host: HostId,
         pool_session: String,
@@ -436,7 +436,7 @@ pub(super) struct App {
     /// `launcher.default_agent`, cycled with `Space a`.
     pub(super) new_session_agent: AgentControl,
     /// How new sessions are arranged (`resolve_spawn_target`): the shared
-    /// `cm:sessions` tab (Stacked) or one tab per session (Per-tab). Seeded from
+    /// `miao:sessions` tab (Stacked) or one tab per session (Per-tab). Seeded from
     /// `[terminal] sessions_layout`, toggled with `Space l`, persisted. A
     /// spawn-time policy only — existing sessions migrate via `Space e`/`Space E`.
     pub(super) sessions_layout: SessionsLayout,
@@ -908,11 +908,11 @@ impl App {
     }
 
     /// Apply bell sentinels dropped into the sessions dir by
-    /// `captain-miao focus --window-id <id>`. Each pid that still has a live
+    /// `miao focus --window-id <id>`. Each pid that still has a live
     /// session gets `follow_up = true`; entries for dead pids are silently
     /// dropped. Persists overrides only if at least one flag actually changed.
     pub(super) fn apply_bell_signals(&mut self, pids: Vec<u32>) {
-        // Bell sentinels come from `captain-miao focus --window-id`, which only
+        // Bell sentinels come from `miao focus --window-id`, which only
         // ever targets local windows, so these pids are local.
         let alive: HashSet<u32> = self
             .sessions
@@ -2035,7 +2035,7 @@ impl App {
     /// launcher whose state file vanished without a clean kill (crash, SIGKILL, or
     /// the file removed), or a remote pool session the host reported gone. Each
     /// such session spawned `hold: true`, so zellij holds its exited command pane
-    /// open: buried in the shared `cm:sessions` tab, invisible (only the z-order
+    /// open: buried in the shared `miao:sessions` tab, invisible (only the z-order
     /// top shows), unreachable except via zellij's floating-cycle keybinds, and
     /// counted in every `list-panes` (~20ms/pane). Resolve the window the dashboard
     /// bound to the departed row (through the still-lingering binding — a local
@@ -2254,7 +2254,7 @@ impl App {
     /// owns the binding for any session it spawned: it resolves the session's
     /// **token** (a local session's `launch_id`, a remote one's `pool_session`,
     /// §15.2) to the window it opened. A token-less local session — hand-launched
-    /// `captain-miao claude`, or a launcher predating `launch_id` — self-reported
+    /// `miao claude`, or a launcher predating `launch_id` — self-reported
     /// `window_id`, so fall back to that. Returns `None` for a remote session we
     /// aren't attached to (no local window); preview / focus / move-to-tab then
     /// no-op rather than target a phantom.

@@ -11,7 +11,7 @@ use crate::logging::init_tracing;
 ///
 /// The dashboard always invokes us as `[exe, <subcommand>, <cwd>, <extra...>]`,
 /// so the first positional is the cwd. Manual invocations may instead lead with
-/// a flag (`captain-miao claude --resume`); a clap-level defaulted `cwd`
+/// a flag (`miao claude --resume`); a clap-level defaulted `cwd`
 /// positional would swallow that flag, so we route it here: the first element
 /// is treated as the cwd only when it does NOT begin with `-`, otherwise the
 /// cwd defaults to `.` and every argument is forwarded to the agent.

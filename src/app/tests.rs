@@ -604,7 +604,7 @@ fn window_lookups_route_a_bound_remote_attach_window() {
 #[test]
 fn hand_launched_session_resolves_via_window_id_fallback() {
     use crate::terminal::WindowId;
-    // A session launched directly (`captain-miao claude`, not via the dashboard)
+    // A session launched directly (`miao claude`, not via the dashboard)
     // carries no launch_id; its launcher self-reported window_id. With no binding,
     // the resolver falls back to that field so preview/focus still work (§15.3).
     let mut d = TestDashboard::new(120, 10);
@@ -3882,7 +3882,7 @@ fn spawn_target_respects_capabilities_and_layout() {
         ));
     }
 
-    // Stacked: a window-stacking backend (kitty) uses the shared `cm:sessions`
+    // Stacked: a window-stacking backend (kitty) uses the shared `miao:sessions`
     // stack tab.
     assert!(matches!(
         resolve_spawn_target(kitty, SessionsLayout::Stacked),

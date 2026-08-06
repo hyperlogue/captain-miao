@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "captain-miao shared core: state, wire protocol, agent backends, launcher, hooks"
 
-# Shared by both binaries (the `captain-miao` dashboard and `captain-miao-server`).
+# Shared by both binaries (the `miao` dashboard and `miao-server`).
 # Deliberately free of ratatui/crossterm (presentation) and libshpool (the pool),
 # so it cross-compiles cleanly as part of the server and stays a pure data/logic
 # layer. It does carry bundled SQLite (for Codex titles) — portable C, unlike the

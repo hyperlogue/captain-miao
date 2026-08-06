@@ -64,9 +64,12 @@
 
         # Root package: the `captain-miao` dashboard (crane infers it from the
         # workspace root, so this builds the dashboard + its `cm-core` dep).
+        # Its binary is `miao`, not the package name, so `meta.mainProgram` has to
+        # say so — otherwise `nix run` looks for `$out/bin/captain-miao`.
         captain-miao = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
+            meta.mainProgram = "miao";
           });
 
         # The per-host daemon + pty pool, deployed to remote hosts. A separate

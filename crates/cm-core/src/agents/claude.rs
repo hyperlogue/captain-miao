@@ -1147,7 +1147,7 @@ fn check_direnv_allowed(direnv: &Path, cwd: &str) -> Result<()> {
 /// is the one outlier — Claude uses that name but we surface it as
 /// `prompt-submit`.
 pub fn build_hooks_settings(sock_path: &str) -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("captain-miao"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
     let sock_q = shell_quote(sock_path);
 

@@ -57,7 +57,7 @@ use super::{
 /// by a cached id: zellij recycles a closed highest tab's id onto the next
 /// tab created, so an id could silently point at an impostor — the name is
 /// the identity, and a user closing the tab just gets it recreated.
-const SESSIONS_TAB: &str = "cm:sessions";
+const SESSIONS_TAB: &str = "miao:sessions";
 
 pub struct ZellijTerminal {
     /// Session every `zellij action` call is pinned to, captured at startup.
@@ -612,7 +612,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(find_tab_id_by_name(LIST_TABS, "Tab #1").unwrap(), Some(0));
-        assert_eq!(find_tab_id_by_name(LIST_TABS, "cm:sessions").unwrap(), None);
+        assert_eq!(
+            find_tab_id_by_name(LIST_TABS, "miao:sessions").unwrap(),
+            None
+        );
         assert!(find_tab_id_by_name("not json", "x").is_err());
     }
 
@@ -622,7 +625,7 @@ mod tests {
     /// flag is a single joined `--flag=value` element (hyphen-immune, see below).
     #[test]
     fn floating_new_pane_args_full_size_borderless() {
-        let exec = vec!["captain-miao".to_string(), "claude".to_string()];
+        let exec = vec!["miao".to_string(), "claude".to_string()];
         let args = floating_new_pane_args(7, "/tmp/proj", Some("claude: proj"), false, Some(&exec));
         assert_eq!(
             args,
@@ -638,7 +641,7 @@ mod tests {
                 "--cwd=/tmp/proj",
                 "--name=claude: proj",
                 "--",
-                "captain-miao",
+                "miao",
                 "claude",
             ]
         );
@@ -661,10 +664,10 @@ mod tests {
 
     #[test]
     fn wrap_env_prefixes_env_path() {
-        let argv = vec!["captain-miao".to_string(), "claude".to_string()];
+        let argv = vec!["miao".to_string(), "claude".to_string()];
         assert_eq!(
             wrap_env(&argv, Some("/a:/b")),
-            vec!["/usr/bin/env", "PATH=/a:/b", "captain-miao", "claude"]
+            vec!["/usr/bin/env", "PATH=/a:/b", "miao", "claude"]
         );
         // No PATH to forward → argv unchanged.
         assert_eq!(wrap_env(&argv, None), argv);

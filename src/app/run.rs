@@ -304,8 +304,8 @@ const LAUNCH_COPY_RESTART: LaunchCopy = LaunchCopy {
 /// every session in one shared tab, so there is nothing to anchor to).
 ///
 /// - **Per-tab** ⇒ a fresh tab per session, on both backends.
-/// - **Stacked** ⇒ the shared `cm:sessions` tab: floating panes on a backend that
-///   floats sessions (zellij, `floating_sessions`), a single `cm:sessions`
+/// - **Stacked** ⇒ the shared `miao:sessions` tab: floating panes on a backend that
+///   floats sessions (zellij, `floating_sessions`), a single `miao:sessions`
 ///   stack-layout tab on one that stacks windows (Kitty, `window_stacking`). A
 ///   backend that does neither falls back to a fresh tab per session.
 pub(super) fn resolve_spawn_target(caps: Capabilities, layout: SessionsLayout) -> SpawnTarget {
@@ -408,7 +408,7 @@ async fn launch_agent(
     let tab_title = expand_tab_title(template, agent, cwd);
     let target = resolve_spawn_target(app.capabilities, app.sessions_layout);
     // The expanded title names a NewTab spawn's tab, a Floating spawn's pane, or
-    // a SharedStackTab window (whose shared tab stays fixed-titled `cm:sessions`).
+    // a SharedStackTab window (whose shared tab stays fixed-titled `miao:sessions`).
     let wants_title = matches!(
         target,
         SpawnTarget::NewTab | SpawnTarget::Floating | SpawnTarget::SharedStackTab
@@ -476,12 +476,12 @@ fn arm_settle_reload(settle_reload_at: &mut Option<Instant>) {
 
 /// Replace one running session with a fresh launcher resumed at the same
 /// transcript, spawned into the current [`SessionsLayout`] (the shared
-/// `cm:sessions` tab in Stacked, its own tab in Per-tab) — this is how a layout
+/// `miao:sessions` tab in Stacked, its own tab in Per-tab) — this is how a layout
 /// switch migrates an existing session. Returns true on a successful relaunch.
 ///
 /// Order still matters on the reuse path: launch the replacement first, then
 /// close the old window, so a Stacked restart doesn't momentarily empty (and
-/// destroy) the shared `cm:sessions` tab between the close and the respawn.
+/// destroy) the shared `miao:sessions` tab between the close and the respawn.
 ///
 /// `spec.kill_old` gates the SIGTERM + close_window post-step. It's true for
 /// user-initiated restarts (the session is live, so the old child must be torn
@@ -759,7 +759,7 @@ async fn run_app(
             // own awaits (kitty rc, title pulls) aren't starved during a large
             // reload.
             tokio::task::block_in_place(|| app.reload_sessions());
-            // Drain bell sentinels written by `captain-miao focus --window-id`
+            // Drain bell sentinels written by `miao focus --window-id`
             // *after* reload_sessions so we know which pids are alive.
             app.apply_bell_signals(state::drain_bell_flag_pids());
             // Bring just-failed launch windows (direnv blocked, missing agent) to

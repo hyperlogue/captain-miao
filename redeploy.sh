@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# redeploy.sh — build the workspace and (re)deploy captain-miao-server to a
+# redeploy.sh — build the workspace and (re)deploy miao-server to a
 # remote pool host.
 #
 # Server-side changes (anything the remote daemon/launcher runs) don't take
@@ -10,7 +10,7 @@
 # version, so the connect probe can't tell a stale cache binary from a fresh
 # one. This script is therefore the dev deploy loop: kill the remote processes,
 # push the freshly built captain-miao-server to the cache path the probe checks
-# (~/.cache/captain-miao/bin/captain-miao-server), and let the next dashboard
+# (~/.cache/captain-miao/bin/miao-server), and let the next dashboard
 # connect resolve it via UseCache.
 #
 # pkill note: a `pkill -f` pattern matches the ssh shell running it (the
@@ -31,7 +31,7 @@ if [ -z "$HOST" ]; then
 fi
 cd "$(dirname "$0")"
 
-CACHE_BIN=".cache/captain-miao/bin/captain-miao-server"
+CACHE_BIN=".cache/captain-miao/bin/miao-server"
 
 echo "▶ Building release (workspace: dashboard + server)…"
 cargo build --release --workspace
@@ -56,16 +56,16 @@ ssh "$HOST" '
   echo "  ✓ $(hostname) reset"
 '
 
-echo "▶ Uploading captain-miao-server…"
+echo "▶ Uploading miao-server…"
 # temp + atomic mv so a half-written file is never exec'd.
-scp target/release/captain-miao-server "${HOST}:${CACHE_BIN}.tmp"
+scp target/release/miao-server "${HOST}:${CACHE_BIN}.tmp"
 ssh "$HOST" "mv ~/${CACHE_BIN}.tmp ~/${CACHE_BIN} && chmod +x ~/${CACHE_BIN}"
 
 # The probe matches the dashboard's version against the server's --version, so
 # print both for an eyeball check (a mismatch degrades to FallBack/PATH).
-echo "  local dashboard: $(./target/release/captain-miao --version)"
+echo "  local dashboard: $(./target/release/miao --version)"
 echo "  remote server:   $(ssh "$HOST" "~/${CACHE_BIN} --version")"
 
 echo "▶ Done. Now quit your dashboard (q) and relaunch it:"
-echo "    CAPTAIN_MIAO_DEBUG=1 ./target/release/captain-miao"
+echo "    CAPTAIN_MIAO_DEBUG=1 ./target/release/miao"
 echo "  The provision log should show '→ UseCache' and a fresh daemon starting."

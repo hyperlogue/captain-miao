@@ -14,7 +14,7 @@ description = "captain-miao pool client: list and attach to local pooled session
 # binds. `--no-default-features` drops libshpool (list-only; attach declines),
 # so the crate still builds on macOS.
 [[bin]]
-name = "captain-miao-client"
+name = "miao-client"
 path = "src/main.rs"
 
 [dependencies]

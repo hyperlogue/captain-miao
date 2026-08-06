@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // captain-miao launcher — the npm package's only runtime file. It selects and
-// execs the prebuilt native `captain-miao` binary that ships in a per-platform
-// optional-dependency package (`@hyperlogue/captain-miao-<os>-<arch>`). npm/bun
+// execs the prebuilt native `miao` binary that ships in a per-platform
+// optional-dependency package (`@hyperlogue/captain-miao-<os>-<arch>`). The
+// package keeps the project's name while the command it installs is `miao`; npm's
+// `bin` map decouples the two, so only the binary was renamed. npm/bun
 // install only the package whose `os`/`cpu` match the host, so the matching
 // binary is already on disk by the time this runs — no download, no network, no
 // checksum dance. This file just resolves it and hands off, forwarding argv,
@@ -38,7 +40,7 @@ const PACKAGES = {
 const REPO = "https://github.com/hyperlogue/captain-miao";
 
 function fail(msg) {
-  process.stderr.write(`captain-miao: ${msg}\n`);
+  process.stderr.write(`miao: ${msg}\n`);
   process.exit(1);
 }
 
@@ -83,9 +85,10 @@ function resolveBinary() {
   if (isMusl()) muslFail();
 
   try {
-    // Resolves to node_modules/<pkg>/bin/captain-miao when the optional
-    // dependency installed.
-    return require.resolve(`${pkg}/bin/captain-miao`);
+    // Resolves to node_modules/<pkg>/bin/miao when the optional dependency
+    // installed. Keep the basename in sync with BIN in
+    // scripts/stage-npm-packages.sh, which is what puts the file there.
+    return require.resolve(`${pkg}/bin/miao`);
   } catch {
     // The platform package didn't install. Common causes, in order of likelihood:
     // a stale lockfile (npm optional-deps bug npm/cli#4828), a --no-optional /
@@ -110,7 +113,7 @@ try {
 const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
 // Forward termination signals so `kill <launcher-pid>` (or a supervisor) reaches
 // the captain-miao child instead of orphaning it — matters for the long-lived
-// dashboard and for `captain-miao claude`, which wraps an agent session.
+// dashboard and for `miao claude`, which wraps an agent session.
 // (SIGINT/Ctrl-C already reaches the child via the shared process group.)
 for (const sig of ["SIGTERM", "SIGHUP"]) {
   process.on(sig, () => {

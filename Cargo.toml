@@ -22,9 +22,17 @@ rust-version.workspace = true
 readme = "README.md"
 description = "TUI dashboard to monitor and manage multiple Claude Code and Codex sessions in Kitty or zellij"
 
+# The package is `captain-miao` (the project's name, and the npm/crate identity)
+# but the executable it installs is `miao` — a dashboard you reach for dozens of
+# times a day should be two keystrokes. Naming the target explicitly is what
+# decouples the two; without it cargo derives the binary name from the package.
+[[bin]]
+name = "miao"
+path = "src/main.rs"
+
 # The `captain-miao` dashboard: the ratatui TUI client. It never hosts a pty pool
 # (no libshpool) — the per-host daemon that does is the separate
-# `captain-miao-server` binary (crates/cm-server), which cross-compiles to Linux.
+# `miao-server` binary (crates/cm-server), which cross-compiles to Linux.
 # Shared logic (state, protocol, agents, launcher, hooks) lives in `cm-core`.
 [dependencies]
 cm-core = { path = "crates/cm-core" }

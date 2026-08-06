@@ -21,14 +21,16 @@ A Cargo workspace of four packages — three at the time of the split, plus
   types, the opaque `terminal` ids + `current_window`, the `[launcher]`/`[debug]`
   `config`, and shared `cli`/`logging` helpers. **No ratatui, no libshpool** — so
   it cross-compiles as part of the server.
-- **`captain-miao`** (root, `src/`) — bin. The ratatui dashboard (TUI client) +
+- **`captain-miao`** (root, `src/`) — bin, installed as **`miao`** (an explicit
+  `[[bin]]` target; only the executable is short, the package keeps the project's
+  name). The ratatui dashboard (TUI client) +
   the `claude`/`codex`/`hook` entrypoints (so a local launch needs only this one
   binary) + `focus`. Depends on `cm-core`. **No pty pool.**
-- **`captain-miao-server`** (`crates/cm-server/`) — bin. The headless per-host
+- **`captain-miao-server`** (`crates/cm-server/`) — bin `miao-server`. The headless per-host
   daemon + pty pool a remote dashboard reaches over ssh. `daemon`/`attach`/
   `pty-daemon` + the pooled `claude`/`codex`/`hook`. Depends on `cm-core`.
   It **hosts** the pool (feature `pty-pool`, default on).
-- **`captain-miao-client`** (`crates/cm-client/`) — bin. Added after the original
+- **`captain-miao-client`** (`crates/cm-client/`) — bin `miao-client`. Added after the original
   three-way split: a thin user-facing CLI over the *local* pool socket, `list`
   and `attach`. The only other crate that links libshpool (for the in-process
   attach), but it hosts no daemon/pool — a pure client, so it stays separate from
