@@ -433,8 +433,22 @@ async fn launch_agent(
         target,
         SpawnTarget::NewTab | SpawnTarget::Floating | SpawnTarget::SharedStackTab
     );
+    // The **window's** cwd, which is a chdir the local terminal performs — not a
+    // shell word and not the session's cwd on its own host. Two distinct cases:
+    //
+    // * a direct-local spawn: the window *is* the launcher, so it starts in the
+    //   session's directory — expanded, since `cwd` arrived in the
+    //   host-canonical `~` form (§3) and no shell is involved to expand it;
+    // * a pooled spawn: the window only runs an `attach`, and the session's
+    //   directory belongs to *another machine*, where chdir'ing to it locally
+    //   would fail (or, worse, land somewhere unrelated). Start it at home,
+    //   matching `attach_pool_session`.
+    let window_cwd = match &plan {
+        LaunchPlan::SpawnLocal { .. } => cm_core::paths::expand_home(cwd, &app.home_dir),
+        LaunchPlan::AttachRemote { .. } => app.home_dir.clone(),
+    };
     let spec = SpawnSpec {
-        cwd: cwd.to_string(),
+        cwd: window_cwd,
         target,
         command: SpawnCommand::Exec(argv),
         title: wants_title.then_some(tab_title),

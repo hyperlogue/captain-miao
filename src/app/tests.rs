@@ -1618,6 +1618,37 @@ fn workdir_picker_can_be_edited() {
     }
 }
 
+/// The picker submits the host-canonical form, but its *validation* runs against
+/// the real filesystem — and `Path::is_dir` doesn't expand a `~` (nothing here
+/// is a shell). So a typed `~/foo` has to be expanded before the check, or every
+/// tilde path would be rejected as "not a directory".
+#[test]
+fn workdir_picker_validates_the_expanded_path() {
+    let mut d = TestDashboard::new(120, 15);
+    // Only the real, expanded path "exists".
+    d.app.dir_exists = |p| p == "/home/test/foo";
+
+    d.press(KeyCode::Char('O'));
+    for c in "~/foo".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/foo"),
+        other => panic!("tilde path should validate and launch, got {other:?}"),
+    }
+
+    // And a path that genuinely doesn't exist is still rejected, with the
+    // picker left open so the user can correct it.
+    let mut d = TestDashboard::new(120, 15);
+    d.app.dir_exists = |p| p == "/home/test/foo";
+    d.press(KeyCode::Char('O'));
+    for c in "~/nope".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert!(d.press(KeyCode::Enter).is_none());
+    assert_eq!(d.app.input_mode, InputMode::Picker);
+}
+
 #[test]
 fn workdir_picker_esc_cancels() {
     let mut d = TestDashboard::new(120, 15);

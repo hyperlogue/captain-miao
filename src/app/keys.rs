@@ -593,8 +593,12 @@ impl App {
         };
         match backend {
             // The injected probe (real fs in production, a stub in tests) keeps
-            // the local arm runtime-free, so the picker's unit tests can call it.
-            crate::backend::Backend::Local(_) => (self.dir_exists)(path),
+            // the local arm runtime-free, so the picker's unit tests can call
+            // it. It takes a *real* path: `path` is host-canonical (§3), and
+            // `Path::is_dir` doesn't expand a `~` — nothing here is a shell.
+            crate::backend::Backend::Local(_) => {
+                (self.dir_exists)(&cm_core::paths::expand_home(path, &self.home_dir))
+            }
             crate::backend::Backend::Remote(_) => {
                 tokio::task::block_in_place(|| backend.dir_exists(path))
             }

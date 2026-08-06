@@ -320,6 +320,15 @@ impl LocalBackend {
         }
         all.sort_by_key(|b| std::cmp::Reverse(b.mtime));
         all.truncate(limit);
+        // The cwds come straight off the transcripts, so collapse them like
+        // every other path the backend returns (§3). Without this a resume
+        // candidate would be the one path the client sees in a *different*
+        // spelling from the running rows beside it — and, worse, a remote
+        // candidate's absolute path would get collapsed against the *client's*
+        // home for display, which is meaningless.
+        for c in all.iter_mut() {
+            c.cwd = paths::collapse_home(&c.cwd, &self.home);
+        }
         (all, errors)
     }
 
