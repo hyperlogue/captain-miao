@@ -103,9 +103,10 @@ readable. Pinned by `state_dirs_and_files_are_owner_only`.
 - `dashboard.pid` — dashboard singleton lock
 - `dashboard-window-id` — for the `focus` command, written as `<terminal-identity>|<window-id>` so a focus process in another terminal declines instead of driving a same-numbered foreign window
 - `window-bindings.json` — the dashboard's persisted window↔session bindings (`window_id`, `host`, `launcher_pid`, `token`, `terminal`); same-terminal entries are validated/pruned against live rows, foreign-terminal entries are carried verbatim so a dashboard backend switch loses nothing
-- `dashboard-overrides.json` — pin/mute/follow-up flags + the prevent-sleep toggle + the default new-session backend (`Space a`) + the session layout (`Space l`, Stacked / Per-tab), persisted across restarts
+- `dashboard-overrides.json` — pin/mute/follow-up flags for **direct-local** rows + the prevent-sleep toggle + the default new-session backend (`Space a`) + the default host (`Space H`) + the session layout (`Space l`, Stacked / Per-tab), persisted across restarts. A *pooled* host's flags live in its own `session-flags.json` instead (below), so every dashboard watching it agrees.
+- `session-flags.json` — the **host-owned** per-session flags sidecar (`SessionKey → {pinned, muted, follow_up}`), written only by a server-core `LocalBackend` (the daemon's, or a pooled-localhost one) and overlaid onto the rows it serves. Deliberately a sidecar and not a field on the launcher's state file: that file has exactly one writer (its launcher), and flags are set by someone else. Last-writer-wins across dashboards, by decision. Safe to delete (flags reset).
 - `dashboard-sessions.json` — last-seen restartable session snapshot (incl. each session's pin/mute/follow-up flags, re-adopted on crash-recovery restart); presence at startup signals an unclean previous exit
-- `recent-cwds.json` — recent cwds shown in the workdir picker
+- `recent-cwds.json` — recent cwds shown in the workdir picker, stored in the **host-canonical `~` form** (so the same repo path shares an entry, and a directory mark, across machines); a host records only its *own* launches, so a mac path never pollutes a Linux box's list
 - `directory-marks.json` — user-set per-cwd icon + color overrides
 - `work-tabs.json` — dashboard-owned `(host, cwd) → (tab, spawned pane)` map for the work tabs `w` opened, re-seeded on startup so `w` returns to an existing work tab (the terminal keeps it alive across a dashboard restart) instead of spawning a duplicate; validated lazily against a live snapshot on use — tab id, basename title, and pane-in-tab (pane ids never recycle) — so a stale entry self-heals (safe to delete)
 - `codex-home/` — shared synthetic `$CODEX_HOME` for Codex sessions: symlinks every entry of the real `~/.codex` plus captain-miao's own `hooks.json`. **`config.toml` is a writable copy, not a symlink** — the launcher writes the pre-seeded hook trust (`[hooks.state]`, see Codex hooks → Trust) into it, which fails if it points at a read-only file (e.g. a nix-store / home-manager symlink). The copy is reseeded from the real config only when the real one changes (tracked via `.config-source.toml`), and the hook-trust `[hooks.state]` is (re)merged on top every launch, so the user's config edits propagate while trust stays current. The mirror pass also **repairs shadow entries** — a real file/dir sitting where a symlink belongs, which is what Codex leaves behind whenever it adds a new state file: it creates the file *inside* the synthetic home before that name exists in the real one, and the two copies then diverge permanently. The failure this prevents is a split-brain SQLite DB (stale synthetic `goals_1.sqlite` against `-wal`/`-shm` symlinks into the real home, once it grew them), on which Codex refuses to start at all — "local database appears to be damaged". Created/refreshed by the launcher; safe to delete (regenerated on next Codex launch).
@@ -234,10 +235,11 @@ The title read uses **bundled SQLite** — the `rusqlite` crate with the `bundle
 Press `?` in the dashboard for the full list. Highlights:
 
 - `j/k`, `↑/↓`, `Ctrl-n/p` — navigate sessions; `gg`/`G` — top/bottom; `1..9` — select Nth; `Ctrl-1..9` — select Nth and focus its window
-- `Enter` — focus selected window (for a running *remote* session with a known pool name, attaches a local `ssh … captain-miao-server attach` window to it instead, or focuses the one already bound); `o` / `O` — new session (`o` in the selected row's cwd, `O` prompts for one; placement follows the current **session layout** — Stacked puts it in the shared `cm:sessions` tab, Per-tab in a fresh tab, on both backends — see `Space l` below and Known zellij limitations) — `o` on a *remote* row opens another session on that host + cwd (its pty pool), not locally. In the cwd picker, `Ctrl-t` switches the backend for this launch (title reflects it), `Ctrl-d` drops the highlighted recent directory (local host only), and `Ctrl-h` cycles the host this launch opens on (local → each configured remote; only shown when remotes exist). The picker is **host-aware**: switching to a remote re-seeds the recent-dir list, path completion (`Tab`), and submit-time validation against *that machine's* filesystem (over the protocol's `ListRecentDirs`/`CompletePath`/`CheckDir`), with `~` resolving to the remote `$HOME` — so a remote launch's cwd is a real path on the remote, not a local one that libshpool's `--dir` would reject. Remote launches record their cwd into the remote host's recent list server-side (in `open_in_pool`); local launches record into the local list.
-- `r` — resume picker (cross-host: unions every backend's resumable list, each row tagged with its host when remotes exist; resume opens it on that host); `b` — cross-host browser (one searchable list of every **running** session — focus/attach — and every **resumable** one — resume — across all hosts, each row tagged `running`/`resumable` + host); `f` — fork (resume selected in place, local sessions only); `y` — copy selected session id to clipboard (platform CLI `pbcopy`/`wl-copy`/`xclip`/`xsel`, falling back to an OSC 52 terminal escape when none is installed); `x` — kill; `D` — detach from a *remote* session (close the local `ssh attach` window but leave the pooled session running; the row stays and `Enter` re-attaches — contrast `x`, which kills it); `t` — move window to tab (**unsupported on the zellij backend** — no cross-tab pane reparent, so the key reports it and the `?`-help entry is hidden); `w` — switch to the per-`(host, cwd)` **work tab** captain-miao created earlier for that dir (validated against a live snapshot on the tab id, the basename title the spawn stamped, *and* — when recorded — the pane the spawn created: zellij recycles a closed highest tab's id, and two same-basename dirs share a title, but pane ids never recycle, so the window check defeats both; a failed check prunes the entry, while a failed *snapshot* bails without pruning — the map is persisted, so a transient terminal error must not do durable damage), otherwise open a fresh shell tab titled with the dir basename and record it (a local shell for a local row; an `ssh -t <host>` tab that cds into the dir for a remote row). It no longer jumps to a manually-opened shell that merely happens to sit in the cwd — only tabs captain-miao created count. (`W`, the old always-open variant, is removed.)
+- `Enter` — focus selected window; for a **detached pooled** session (one this dashboard holds no window for) it spawns the attach window and focuses it *at once*, so the user watches the ssh progress in the window rather than a frozen dashboard. There is no "not attachable" case: a remote row with no pool session is filtered out of the list entirely at reload (`is_actionable_row`) — the dashboard is for sessions it can act on, the hosts panel keeps them countable, and the host's own dashboard is their surface.
+- `o` / `O` — new session (`o` in the selected row's cwd, `O` prompts for one; placement follows the current **session layout** — Stacked puts it in the shared `miao:sessions` tab, Per-tab in a fresh tab, on both backends — see `Space l` below and Known zellij limitations). `o` on a row opens another session on *that row's* host + cwd, not locally; with nothing selected it targets the default host (`Space H`). In the cwd picker, `Ctrl-t` switches the backend for this launch (title reflects it), `Ctrl-d` drops the highlighted recent directory (in-process backend only), and `Ctrl-h` cycles the host this launch opens on. The picker is **host-aware and cache-first**: a host switch renders instantly from a per-host recent-dir cache (seeded on first use, invalidated when a launch records a cwd there), path completion (`Tab`) is a live fs read and does cross the wire, and validation happens only at submit — the rule being *never put a round trip between a keystroke and its echo*. Every path it handles is in the host-canonical `~` form, so what's shown is what's submitted and no machine's `$HOME` is involved; each host records its own launches' cwds, so a mac path never pollutes a Linux box's list.
+- `r` — resume picker, scoped to **one host at a time** (the default host, named in the picker title; `Ctrl-h` switches). This replaced the old cross-host union, whose scope was implicit and whose cost scaled with the host count — and with it, `b` (the cross-host browser) is gone: the table covers running, `r` covers resumable. `f` — fork, following the **focused session's** host (never the default — the transcript lives on that machine); `y` — copy selected session id to clipboard (platform CLI `pbcopy`/`wl-copy`/`xclip`/`xsel`, falling back to an OSC 52 terminal escape when none is installed); `x` — kill; `D` — detach from a **pooled** session (close the local attach window but leave the session running; the row stays, sorts into the detached tier, and `Enter` re-attaches — contrast `x`, which kills it). Keyed on the *capability*, not on locality, so it works under pooled-localhost too; `t` — move window to tab (**unsupported on the zellij backend** — no cross-tab pane reparent, so the key reports it and the `?`-help entry is hidden); `Space s` — **steal**: attach to the selected pooled session, kicking whatever client currently holds it (behind a y/N confirm, skipped when the host's attached-bit overlay says nobody is there; hidden from `?` when no host pools its sessions); `w` — switch to the per-`(host, cwd)` **work tab** captain-miao created earlier for that dir (validated against a live snapshot on the tab id, the basename title the spawn stamped, *and* — when recorded — the pane the spawn created: zellij recycles a closed highest tab's id, and two same-basename dirs share a title, but pane ids never recycle, so the window check defeats both; a failed check prunes the entry, while a failed *snapshot* bails without pruning — the map is persisted, so a transient terminal error must not do durable damage), otherwise open a fresh shell tab titled with the dir basename and record it (a local shell for a local row; an `ssh -t <host>` tab that cds into the dir for a remote row). It no longer jumps to a manually-opened shell that merely happens to sit in the cwd — only tabs captain-miao created count. (`W`, the old always-open variant, is removed.)
 - `m` / `p` / `i` — mute / pin / toggle needs-input; `s` — jump to next attention; `h`/`l` (or `←`/`→`, or `<`/`>`) — scroll preview horizontally; `R` — refresh preview now (the preview also auto-refreshes every `polling.preview_auto_refresh_secs` = 10s, but only while the dashboard has terminal focus — tracked via FocusGained/FocusLost — the selected session `is_busy()`, and the preview isn't scrolled; 0 disables). A preview whose content is older than `thresholds.preview_stale_secs` = 20s shows an `updated <age> ago` label in its title — minute resolution like the Updated column (`<1m`, then `3m` / `1h05m`); success-stamped, so a failing re-fetch keeps the age growing.
-- `Space` is the leader key (pressing it shows a which-key strip of the available continuations in the footer; `g` shows its own). `Space v` / `Space d` — toggle preview / detail panels. The **panel arrangement is responsive to the body width** (`ui.panels.narrow_max_width`, default 90): above it the panels sit side-by-side (detail in the right column, preview across the bottom); at or below it they **stack vertically** — session list → detail → preview — with the session table trimmed to just status / workdir-icon / name (the title truncates, the rest fixed-width), a compact detail panel showing only agent / model / context / last-updated, and a dynamic-height preview that drops out entirely when the viewport is too short to spare it. The stacked layout auto-sizes (the split-resize border drags are wide-only), and `Space v` / `Space d` still gate preview/detail visibility in both. In the wide layout the **name column is a fixed max-width column** (`Max(name_truncate + 10)`, 45 cells by default) and the title is truncated to that same width so an over-long title's ellipsis lands at the column edge; the **last-prompt column is elastic** (`Fill`), soaking up the slack when there's room and yielding (truncating) first when there isn't — so a tight-but-wide viewport shortens the prompt rather than collapsing the session title (the old `Min`-width prompt column out-prioritized the capped name column and did exactly that). `Space i` — edit selected dir's icon + color (Tab cycles the Icon text field and the Color palette; from the Icon field `Ctrl-E` opens a **searchable emoji picker** — the standard telescope `Picker` over every emoji (`emojis` crate, one representative per skin-tone family), filtered by typing the CLDR name/shortcode; selecting writes the glyph into the Icon field and returns to the editor, cancelling returns without changing it); `Space e` / `Space E` — restart selected / all (idle only, y/N confirm) to pick up agent or `.envrc` updates; `Space z` — toggle keep-awake (defaults on when supported; runs `caffeinate -dis -w <pid>` on macOS or `systemd-inhibit ... sleep infinity` on Linux while any session is Active/Compacting). A ☕ shows at the top-right of the header **only while it's actively inhibiting sleep** (the feature is on and a session is busy); when idle, disabled, or unsupported there's no indicator at all. `Space a` — open a picker to set the *default* backend for new sessions (Claude / Codex), persisted across restarts in `dashboard-overrides.json` (initial value from `[launcher] default_agent`). The current default is shown in the header's top-right cluster (`Default agent: <backend>`, just left of the ☕ indicator); the footer hint reads `Space a switch default agent`. A single launch can override the default in the new-session cwd picker with `Ctrl-t`. `Space l` — toggle the **session layout** between **Stacked** (all sessions consolidated in one shared `cm:sessions` tab, one visible at a time — floating panes on zellij, a stack-layout tab on Kitty) and **Per-tab** (one session per tab, both backends), persisted across restarts in `dashboard-overrides.json` (initial value from `[terminal] sessions_layout`) and shown in the header's top-right cluster (`Layout: stacked` / `Layout: per-tab`, mirroring the `Space a` default-agent indicator). It's a spawn-time policy on **new** sessions only — toggling never moves a running session; restart with `Space e` (selected) / `Space E` (all) to migrate existing sessions into the new layout, since the restart path respawns each into the current layout. `Space h` — open the remote-hosts popup (add/edit/remove hosts + per-host name color; persisted in `hosts.json`); on save it reconnects the backends. See Remote hosts.
+- `Space` is the leader key (pressing it shows a which-key strip of the available continuations in the footer; `g` shows its own). `Space v` / `Space d` — toggle preview / detail panels. The **panel arrangement is responsive to the body width** (`ui.panels.narrow_max_width`, default 90): above it the panels sit side-by-side (detail in the right column, preview across the bottom); at or below it they **stack vertically** — session list → detail → preview — with the session table trimmed to just status / workdir-icon / name (the title truncates, the rest fixed-width), a compact detail panel showing only agent / model / context / last-updated, and a dynamic-height preview that drops out entirely when the viewport is too short to spare it. The stacked layout auto-sizes (the split-resize border drags are wide-only), and `Space v` / `Space d` still gate preview/detail visibility in both. In the wide layout the **name column is a fixed max-width column** (`Max(name_truncate + 10)`, 45 cells by default) and the title is truncated to that same width so an over-long title's ellipsis lands at the column edge; the **last-prompt column is elastic** (`Fill`), soaking up the slack when there's room and yielding (truncating) first when there isn't — so a tight-but-wide viewport shortens the prompt rather than collapsing the session title (the old `Min`-width prompt column out-prioritized the capped name column and did exactly that). `Space i` — edit selected dir's icon + color (Tab cycles the Icon text field and the Color palette; from the Icon field `Ctrl-E` opens a **searchable emoji picker** — the standard telescope `Picker` over every emoji (`emojis` crate, one representative per skin-tone family), filtered by typing the CLDR name/shortcode; selecting writes the glyph into the Icon field and returns to the editor, cancelling returns without changing it); `Space e` / `Space E` — restart selected / all (idle only, y/N confirm) to pick up agent or `.envrc` updates; `Space z` — toggle keep-awake (defaults on when supported; runs `caffeinate -dis -w <pid>` on macOS or `systemd-inhibit ... sleep infinity` on Linux while any session is Active/Compacting). A ☕ shows at the top-right of the header **only while it's actively inhibiting sleep** (the feature is on and a session is busy); when idle, disabled, or unsupported there's no indicator at all. `Space a` — open a picker to set the *default* backend for new sessions (Claude / Codex), persisted across restarts in `dashboard-overrides.json` (initial value from `[launcher] default_agent`). `Space H` — the same thing for the *default host*: every new-session operation with no row context (`O`, a bare `o`, `r`) targets it, which is what let the cross-host unions go away — each picker's scope is now a stated default rather than "everything, merged". Persisted, and shown in the header cluster once more than one host exists. The current default is shown in the header's top-right cluster (`Default agent: <backend>`, just left of the ☕ indicator); the footer hint reads `Space a switch default agent`. A single launch can override the default in the new-session cwd picker with `Ctrl-t`. `Space l` — toggle the **session layout** between **Stacked** (all sessions consolidated in one shared `miao:sessions` tab, one visible at a time — floating panes on zellij, a stack-layout tab on Kitty) and **Per-tab** (one session per tab, both backends), persisted across restarts in `dashboard-overrides.json` (initial value from `[terminal] sessions_layout`) and shown in the header's top-right cluster (`Layout: stacked` / `Layout: per-tab`, mirroring the `Space a` default-agent indicator). It's a spawn-time policy on **new** sessions only — toggling never moves a running session; restart with `Space e` (selected) / `Space E` (all) to migrate existing sessions into the new layout, since the restart path respawns each into the current layout. `Space h` — open the **hosts panel**: a list view showing each host's live connection state (including a `Failed` reason verbatim), running/attached session counts, daemon version and sampled latency, over an editable label / target / **emoji icon** (`^e` opens the same searchable emoji picker as `Space i`) / color. There is no Save step — adding persists and connects immediately (so its state animates live in the list), an edit applies on row commit, and `d` removes behind a `y/N`. Persisted in `hosts.json`. See Remote hosts.
 - `/` — search; `q` / `Ctrl-c` — quit
 
 ### Configurable keybindings (`src/app/keymap.rs`)
@@ -250,83 +252,146 @@ Every Normal-mode command above (including the `Space`-leader ones) is remappabl
 - **Discoverability.** While a prefix is pending, the footer shows a **which-key strip** of the available continuations (`Keymap::continuations` → `(second-key, Command::short_label)`); the bespoke `g` prefix shows its own one-item hint (`pending_g`). The `?` help overlay and the steady-state footer render live bindings via `Keymap::keys_for` / `primary_key` (showing `(unbound)` / dropping the hint when a command has no key), so a remap shows through without touching `draw.rs`.
 - **Recent default tweaks** (informed by the `keybinds.log` sweep): horizontal preview scroll moved its canonical keys to `h`/`l` (+ `←`/`→`), keeping `<`/`>` as alternates, since the old shifted `<`/`>` saw zero use; the directory-mark editor moved to `Space i` (was `Space c`) and the detail-panel toggle to `Space d`; the `:` command line (`q`/`quit`/`clear` — all duplicates of existing keys, zero use) was removed along with `InputMode::Command`.
 
-## Remote hosts (SSH)
+## Remote hosts (SSH) and the pty pool
 
-The dashboard federates remote hosts: it aggregates sessions from a local backend
-(`backends[0]`) plus one `RemoteBackend` per configured host, each mirroring a
-`captain-miao daemon` on that host over a unix socket. Full design in
-`docs/remote-sessions.md`.
+The dashboard federates hosts: it aggregates sessions from `backends[0]` (this
+machine) plus one `RemoteBackend` per configured host, each mirroring a
+`miao-server daemon` over a unix socket. Full design + rationale in
+`docs/remote-sessions.md`; that doc is the authority, this is the map.
 
-**Gated off by default.** The feature is unverified end-to-end against a real
-remote host (and restart/fork are still local-only), so it ships behind the
-`remote` cargo feature — `cargo build --features remote`. The gate is the runtime
-const `app::REMOTE_ENABLED` (`cfg!(feature = "remote")`), *not* `#[cfg]` on the
-~240 remote references across the dashboard: the code compiles, type-checks, and
-runs its tests in both configurations, and the const closes the only two doors
-that reach it — `build_backends_from_config` (returns local-only without ever
-reading `hosts.json`, so no connection task is spawned) and the `Space h` handler
-(reports the feature is off; its `?`-help entry is hidden, mirroring how the
-unsupported `t` is hidden on zellij). Keep new remote entry points funnelling
-through those two rather than adding a third gate.
+**Gated off by default.** The *remote-hosts* half is unverified end-to-end
+against a real remote host, so it ships behind the `remote` cargo feature —
+`cargo build --features remote`. The gate is the runtime const
+`app::REMOTE_ENABLED` (`cfg!(feature = "remote")`), *not* `#[cfg]` on the ~240
+remote references across the dashboard: the code compiles, type-checks, and runs
+its tests in both configurations, and the const closes the only two doors that
+reach it — `build_backends_from_config` (never reads `hosts.json`, so no
+connection task is spawned) and the `Space h` handler (reports the feature is
+off; its `?`-help entry is hidden, mirroring how the unsupported `t` is hidden
+on zellij). Keep new remote entry points funnelling through those two rather
+than adding a third gate. **Pooled-localhost is deliberately not behind it** —
+it uses no ssh and has its own config flag.
 
-- **Daemon** (`captain-miao daemon`, `src/server.rs`) is the single persistent
-  per-host process. It **hosts the pty pool** (the libshpool daemon on a dedicated
-  thread — `pty-pool` feature) AND wraps a `LocalBackend` to serve the protocol: a
-  `Snapshot` then per-session `Delta`/`Removed` (driven by the `sessions/` notify
-  watch), plus `ListResumable`/`KillSession`/`OpenSession` + the host-fs queries.
-  **Self-daemonizing** (`daemon ensure` double-forks + `setsid`, so it detaches
-  from the ssh session that started it and survives disconnects); singleton per
-  host (`server.pid`); idempotent to start; **auto-exits when idle** (no pool
-  sessions and no connected clients for 5 min); Kitty-exempt (headless). Lifecycle
-  CLI (tmux/zellij-style): `daemon ensure` (start + print socket path), `daemon
-  print-path`, `daemon status`, `daemon stop [--force]` (SIGTERM → tears down the
-  pool + all its sessions). The daemon is dispatched in `main()` before the tokio
-  runtime because the daemonize fork + the libshpool thread must precede it.
+- **Daemon** (`miao-server daemon`, `crates/cm-server/src/server.rs`) is
+  the single persistent per-host process. It **hosts the pty pool** (the
+  libshpool daemon on a dedicated thread — `pty-pool` feature) AND wraps a
+  `LocalBackend::server_core()` to serve the protocol: a `Snapshot` then
+  per-session `Delta`/`Removed` (driven by the `sessions/` notify watch), plus
+  `ListResumable`/`KillSession`/`OpenSession`/`SetSessionFlags` + the host-fs
+  queries. **Self-daemonizing** (`daemon ensure` double-forks + `setsid`, so it
+  detaches from the ssh session that started it and survives disconnects);
+  singleton via `flock(server.pid)`; idempotent to start; **auto-exits when
+  idle** (no pool sessions and no connected clients for 5 min); headless.
+  Lifecycle CLI: `daemon ensure` (start + print socket path), `daemon
+  print-path`, `daemon status`, `daemon stop [--force]`. Dispatched in `main()`
+  before the tokio runtime because the daemonize fork + the libshpool thread
+  must precede it.
+  Two hardening properties worth not regressing: the accept loop **logs and
+  continues** (the daemon *is* the pool, so propagating one transient EMFILE
+  would kill every session on the host), and it **rebinds its control socket**
+  if the path vanishes — systemd-logind removes `/run/user/<uid>` at last logout
+  without `loginctl enable-linger`, which otherwise wedges the daemon holding
+  deleted inodes and the flock forever. `ensure` restarts a still-unreachable
+  lock-holder as the backstop. **`loginctl enable-linger` is a documented host
+  requirement.**
 - **Client** (`RemoteBackend`) runs a background task that keeps an in-memory
-  **mirror** of the host's sessions and pumps request/response by `req_id`. The
-  sync `Backend` methods read the mirror (no round-trip) or `block_in_place` on a
-  oneshot for a reply. The task is a **reconnect loop**: on any connection loss it
-  re-establishes the transport (re-running `setup_ssh`, so the stale-forward
-  cancel re-fires), re-`Hello`/`Subscribe`s and re-`Snapshot`s, with exponential
-  backoff (500ms → 30s, reset on a good connect). `serve` returns a `ServeOutcome`
-  (`BackendDropped` stops the loop; `ConnectionLost`/`HandshakeFailed` reconnect).
-  On disconnect the mirror is cleared and per-host `ConnState`
-  (`Connecting`/`Connected`/`Disconnected`) is surfaced in the header
-  (`⟳`/`⚠ <host>`); a `Disconnected` host fails requests fast instead of blocking
-  the caller through the backoff.
-- **Transport.** `Transport::Socket` connects to a path directly (manual forward /
-  testing); `Transport::Ssh` (a) ensures the remote daemon is up and learns its
-  socket path in one `ssh … daemon ensure` call (idempotent, self-daemonizing,
-  prints the path), then (b) runs a **forward-only** `ssh -N -L <local>:<remote>
-  target` child (`kill_on_drop`) that just holds the tunnel — under `ControlMaster`
-  + `BatchMode` (key/agent auth only). The daemon and the tunnel are **decoupled**:
-  a dashboard disconnect / reconnect kills only the tunnel; the persistent daemon
-  (and its pooled sessions) are untouched. (This replaced the old "server runs
-  inside the ssh channel + `exec sleep`" model, whose lifetime was tied to one
-  client's channel — the disconnect bug.)
+  **mirror** of the host's sessions (keyed by `SessionKey`) and pumps
+  request/response by `req_id`. The sync `Backend` methods read the mirror (no
+  round-trip) or `block_in_place` on a oneshot for a reply. The task is a
+  **reconnect loop**: on any loss it re-establishes the transport (re-running
+  `setup_ssh`, so the stale-forward cancel re-fires), re-`Hello`/`Subscribe`s
+  and re-`Snapshot`s, with exponential backoff (500ms → 30s, reset only after
+  ≥20s healthy). On disconnect the mirror is cleared and per-host `ConnState`
+  (`Connecting`/`Connected`/`Disconnected`/**`Failed(reason)`**) is surfaced; a
+  down host fails requests fast instead of blocking the caller through the
+  backoff. `Failed` carries a diagnosis (server missing, version mismatch,
+  `daemon ensure` stderr, protocol below the floor) so the hosts panel can say
+  *why* rather than showing a bare ⚠. Each `Disconnected → Connected` edge bumps
+  a **reconnect epoch**, which drives auto-reattach. Round-trip time is sampled
+  from ordinary traffic — there is deliberately no `Ping` frame.
+- **Transport.** `Transport::LocalSocket` connects to a daemon socket **on this
+  same machine** (local-only by contract — the pooled-localhost path, and a
+  manual-forward / test path); `Transport::Ssh` (a) ensures the remote daemon is
+  up and learns its socket path in one `ssh … daemon ensure` call, then (b) runs
+  a **forward-only** `ssh -N -L <local>:<remote> target` child (`kill_on_drop`)
+  holding the tunnel — under `ControlMaster` + `BatchMode` (key/agent auth
+  only). **Attach and `w`-shell windows share that same ControlMaster**, so they
+  skip authentication entirely; the deliberate cost is shared fate (a master
+  death detaches every attach window on that host at once — benign, since the
+  pooled sessions survive and auto-reattach brings the windows back). The daemon
+  and the tunnel are **decoupled**: a dashboard reconnect kills only the tunnel.
+- **Protocol v4** (`crates/cm-core/src/protocol.rs`) — length-prefixed JSON.
+  Three properties to preserve:
+  * **`SessionKey` is opaque and is the only session identifier** on seam or
+    wire. The owning host re-resolves it to a live pid **at signal time**, so a
+    stale mirror plus pid reuse can't cause a mis-kill. Nothing above the seam
+    may parse it.
+  * **Decoding is forward-tolerant** — unknown frame variants decode to
+    `Unknown` and are ignored, unknown fields skip, and refusal happens only
+    *below* `PROTOCOL_MIN`. v4 is meant to be the **last refusing bump**, so new
+    frames/fields must stay additive (`#[serde(default)]`).
+  * **`$HOME` never crosses the wire.** Paths are in the host-canonical `~` form
+    (`cm_core::paths`): each backend collapses what it returns and expands what
+    it receives, so the client is home-ignorant and a path has one spelling per
+    host. A `~` path spliced into a *shell* command must go through
+    `paths::shell_quote_host_path` — single-quoting makes the tilde inert, so
+    `cd '~/proj'` fails on every host.
+- **The seam** (`src/backend.rs`). `Backend::Local(LocalHost) | Remote(..)`,
+  with congruent surfaces. App code branches on the row's **host** (to route),
+  a reported **capability**, or **connection state** — never on locality:
+  * `capabilities() -> {pooled, shell}` is what `D` (detach), the steal, and the
+    detached tier key on, which is why they work under pooled-localhost.
+  * `attach_plan`/`shell_plan` return `Result`, so a host that can't do the
+    thing explains itself instead of handing back a bare `None`.
+  * `subscribe() -> BackendEvents` is the *only* change signal. The local
+    backend owns its own `notify` watcher (`sessions/` + each agent's
+    `watch_paths()`); the run loop has no filesystem knowledge at all.
+  * `backend_for` returns `Option` and **errors on an unknown host** — the old
+    fallback to `backends[0]` silently aimed kills and opens at localhost.
+  * `LauncherState::binding_token()` (pool name, else launch id) is the single
+    accessor for the window-binding token; don't re-derive it from `is_local()`.
+  * The session-name index is **per host** (`App::index_for`), never merged —
+    the shards key on bare pids.
 - **Identity.** Each session is tagged with its `HostId` during reload (a
-  `#[serde(skip)]` field, never persisted). Per-row state (`flags`, selection)
-  keys on `(host, launcher_pid)` so a remote pid can't collide with a local one.
-  Only local flags persist (remote flags are session-lifetime).
+  `#[serde(skip)]` field, never persisted). Per-row state keys on
+  `(host, launcher_pid)` so a remote pid can't collide with a local one.
+- **Per-session flags are host-owned** for a pooled host: the daemon keeps a
+  `session-flags.json` sidecar (never the launcher's state file — single-writer
+  rule), overlays it onto served rows like the Codex titles, and
+  `SetSessionFlags` updates it and wakes every subscriber. So every dashboard
+  watching a host agrees on its pins/mutes, and they survive a restart.
+  Direct-local rows keep using `dashboard-overrides.json`. `pin_seq` stays
+  client-side (ordering is presentation).
+- **Window bindings** carry an **expected-attached** set that deliberately
+  outlives the binding: `prune_dead` drops a dead window's binding but keeps the
+  expectation, while an explicit `D` clears it. That distinction — "the link
+  dropped" vs "you detached" — is what auto-reattach runs on: on a host's
+  reconnect epoch bump, every remembered `(host, pool_session)` without a window
+  gets one respawned (without stealing focus).
 - **Config.** Hosts are mutable TUI state (`hosts.json`: label, ssh target /
-  socket, color), managed via the `Space h` popup; saving reconnects the
-  backends. A compact, colored **Host** column appears only when remotes are
-  configured.
-- **Remote spawn/attach/detach** work through the pty pool: a new session (`o`,
-  or the picker's `Ctrl-h`) and a resume open in the remote's pool
-  (`OpenSession` → `open_in_pool`), and the dashboard attaches a local
-  `ssh … captain-miao-server attach <pool_session>` window (`Enter` /
-  `AttachRemoteRunning`), bound by `(host, pool_session)`. `D` detaches (closes
-  that window, leaves the pooled session running); closing the window otherwise
-  detaches via the reload's `prune_detached_sessions`. Still local-only: **fork**
-  and **restart** (both create local Kitty windows via `launch_agent(host=None)`).
-- **Deferred** (follow-ups): Session names now ride `LauncherState.name` for both backends (Claude's
-  launcher folds its session-file rename; the daemon's server-core overlays the
-  Codex sqlite title before `Snapshot`/`Delta`), so remote rows get real titles —
-  no name-index / title RPC needed; the Claude `session_id → name` manifest index
-  stays local-only. The ssh
-  transport is under active host-verification against a real remote (see
-  `docs/remote-sessions.md` §8); the dev sandbox has no remote.
+  socket, color, emoji icon), managed via the `Space h` **hosts panel** — a list
+  view with live conn state, running/attached counts, daemon version and
+  latency. There is no Save step: adding persists + connects immediately, edits
+  apply on row commit, removal is behind a `y/N`. A per-host **emoji** Host
+  column appears only when more than one host exists.
+- **Pooled localhost** (`[launcher] pooled = true`, opt-in). Makes
+  `backends[0]` a `RemoteBackend` over `LocalSocket` to *this* host's daemon,
+  **replacing** `Backend::local()` (never alongside — both read the same
+  `sessions/` dir and `collect_sessions` doesn't dedup). Every session then
+  starts in the pool, so a zellij pane on the box and a laptop dashboard are
+  both just attach clients — which is what closes the on-server-zellij attach
+  gap. Its `HostId` is the hostname (`"local"` is reserved). Two permanent modes
+  by machine role: **laptops direct-local** (the pool buys no persistence where
+  nobody remotes in), **dev servers pooled-local**.
+- **Steal-attach.** `--force` on both attach entrypoints bypasses only the
+  *busy* guard — the stale-name/resurrection guard is never forceable, since
+  attaching to a dead name silently mints a bare login shell wearing it. In the
+  TUI it's `Space s` behind a y/N confirm, skipped when the daemon's attached-bit
+  overlay (`LauncherState.attached`, from libshpool's `List`) says nobody's there.
+- **Deferred**: end-to-end host verification (the top item — the feature stays
+  behind the cargo feature until then), the pool-engine ruling (tmux/zellij vs
+  shpool — see `docs/remote-sessions.md` §10.2), per-host keep-awake, and remote
+  focus/bell.
 
 ## Dev commands
 
@@ -344,6 +409,10 @@ cargo run -p captain-miao-server -- daemon status   # is the daemon running? pid
 cargo run -p captain-miao-server -- daemon stop     # stop it (kills the pool + all its sessions)
 cargo build --workspace      # build all four packages (dashboard + server + client + core)
 cargo build --features remote  # dashboard with the WIP remote-hosts feature enabled
+cargo run -p captain-miao-client -- list            # this host's pooled sessions
+cargo run -p captain-miao-client -- attach <name> [--force]
+                              # reattach a pooled session (--force steals it
+                              # from the client currently attached)
 cargo test --workspace       # run the full test suite
 cargo watch -x run           # auto-reload the dashboard on changes
 ```

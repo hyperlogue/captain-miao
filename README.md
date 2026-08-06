@@ -27,6 +27,7 @@ tool and the rest of your workflow is yours to compose.
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
 - **Pin, mute, mark:** pin important sessions to the top, mute the ones you don't need right now, and flag the ones to follow up on.
+- **Sessions that outlive their window** (opt-in): run them in a local pty pool so closing the terminal — or logging out — doesn't end them, and a dashboard on another machine can attach to the same ones.
 
 ## Requirements
 
@@ -133,9 +134,8 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                       |
 | `Enter`                        | Focus the selected session's window                                    |
 | `o` / `O`                      | New session (same tab / prompt for cwd)                                |
-| `r` / `f`                      | Resume picker / fork (resume selected in place)                        |
-| `b`                            | Browse every running and resumable session in one list                 |
-| `x`                            | Kill the selected session                                              |
+| `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session |
+| `x` / `D`                      | Kill the selected session / detach from it, leaving it running         |
 | `s`                            | Jump to the next session needing attention                             |
 | `m` / `p` / `i`                | Mute / pin / toggle needs-input on the selected session                |
 | `y`                            | Copy the selected session id to the clipboard                          |
@@ -147,15 +147,16 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `Space i`                      | Edit the selected directory's icon + color                             |
 | `Space e` / `Space E`          | Restart the selected / all idle sessions                               |
 | `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
-| `Space a`                      | Set the default backend for new sessions (Claude / Codex)              |
+| `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
 | `Space l`                      | Switch session layout (stacked in one tab / one tab per session)       |
+| `Space h` / `Space s`          | Hosts panel / attach to a session, kicking the client holding it       |
 | `?`                            | Show the full key list (help overlay)                                  |
 | `/`                            | Search                                                                 |
 | `q` / `Ctrl-c`                 | Quit                                                                   |
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
-In the cwd picker, `Ctrl-t` switches the backend for that one launch and `Ctrl-d` drops the highlighted recent directory.
+In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, and `Ctrl-d` drops the highlighted recent directory.
 
 **Custom keybindings.** Every Normal-mode command above is remappable via a `[keybinds]` table in `~/.config/captain-miao/config.toml`. Map a command id to a key (or list of keys); an empty list unbinds it:
 
@@ -190,6 +191,7 @@ max_recent_cwds = 50         # entries kept in the workdir picker's recent list
 resume_list_limit = 200      # max sessions listed in the resume picker
 new_tab_title = "{agent}: {basename}"     # new-session tab title; placeholders: {agent} {basename} {cwd}
 resume_tab_title = "{agent}: {basename}"  # resumed-session tab title
+pooled = false               # run this machine's sessions in the local pty pool (see below)
 
 [thresholds]
 context_warning_tokens = 175000    # context usage turns to the warning color here
@@ -237,6 +239,47 @@ keybind_log_file = "keybinds.log"
 
 Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`kill`, `jump_attention`, `restart`, `toggle_preview`, …).
 
+### Pooled sessions (`[launcher] pooled`)
+
+By default a session *is* its terminal window: closing the window ends it. With
+`pooled = true` captain-miao instead runs each session in a local pty pool (an
+embedded [libshpool](https://github.com/shell-pool/shpool)), and the window
+merely *attaches* to it — so the session survives closing the window, a crashed
+multiplexer, and logging out.
+
+This is meant for **dev servers, not laptops**. On a machine you only ever sit
+at, the pool buys no persistence and costs an extra process hop, no scrollback
+replay when you reattach, and one client at a time. On a machine you also reach
+from elsewhere it's the point: a dashboard on your laptop and a captain-miao you
+ssh into from a phone become two clients of the *same* sessions.
+
+Needs `miao-server` on `PATH` (it hosts the pool); without it the
+dashboard says so and falls back to the default behaviour. On Linux, also run
+`loginctl enable-linger` — see below.
+
+### Running sessions on other machines
+
+Remote-host support is behind a cargo feature while it's being verified; build
+with `cargo build --release --features remote`, then add hosts with `Space h`.
+Each host runs a `miao-server` daemon holding its sessions in a pty
+pool, and the dashboard attaches local windows to them over ssh, so a dropped
+connection or a slept laptop detaches windows without touching the sessions —
+and reconnecting brings them all back. Full design notes:
+[docs/remote-sessions.md](docs/remote-sessions.md).
+
+**On any Linux host that runs the daemon — including your own machine under
+`pooled = true` — run `loginctl enable-linger`:**
+
+```sh
+loginctl enable-linger "$USER"
+```
+
+Without it, systemd-logind removes `/run/user/<uid>` when you log out, taking
+the daemon's sockets with it (and on distros with `KillUserProcesses=yes`,
+killing the daemon outright). captain-miao recovers on the next login — the
+daemon notices its socket is gone and rebinds — but linger avoids the outage
+entirely, which matters precisely when you're away and expecting persistence.
+
 ## How it works
 
 captain-miao is built around a strict unidirectional data flow:
@@ -249,7 +292,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 ## Roadmap
 
-- [ ] **Remote hosts over SSH**: one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle (open / resume / attach / detach / kill / browse across hosts) is implemented behind the `remote` cargo feature (`cargo build --release --features remote`), but it isn't yet verified end-to-end against a real host, and restart and fork stay local-only. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
+- [ ] **Remote hosts over SSH**: one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle — open, resume, attach, detach, steal, kill, restart, fork, auto-reattach on reconnect — is implemented behind the `remote` cargo feature (`cargo build --release --features remote`); what's left is verifying it end to end against a real host, so it stays off by default until then. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty and zellij today), so other terminals and multiplexers (tmux, WezTerm, …) can slot in.
 

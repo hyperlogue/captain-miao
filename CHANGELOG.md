@@ -7,7 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
+  By default a session *is* its terminal window and closing it ends the session.
+  Pooled mode runs each of this machine's sessions in a local pty pool instead,
+  with the window merely attached — so a session survives closing the window, a
+  crashed multiplexer, and logging out, and a dashboard on another machine can
+  attach to the very same ones. Meant for dev servers, not laptops: where nobody
+  connects from elsewhere the pool buys no persistence and costs an extra hop,
+  no scrollback replay on reattach, and one client at a time. Needs
+  `miao-server` on `PATH`; without it the dashboard says so and keeps
+  the default behaviour.
+
+- **`Space H` — a default host** for new-session operations, the exact analog of
+  `Space a`'s default backend, persisted and shown in the header once you have
+  more than one host.
+
+- **`Space s` — steal a session** from whatever client is attached to it, behind
+  a confirm (skipped when nobody is actually there). The pool is one client at a
+  time, so this is how you take a session back from a terminal you can't reach.
+  Also available as `--force` on `miao-server attach` and
+  `miao-client attach`.
+
 ### Changed
+
+- **Remote hosts: the whole feature is now implemented** (still behind the
+  `remote` cargo feature until it's verified end to end against a real host).
+  Restart and fork work on any host; windows you had open come back by
+  themselves when a slept laptop or a dropped connection reconnects, while a
+  session you detached with `D` stays detached; pins and mutes on a pooled host
+  are stored by that host, so every dashboard watching it agrees and they
+  survive a restart; and opening an attach or `w` window reuses the existing ssh
+  connection, so it costs no second authentication. Design notes:
+  [docs/remote-sessions.md](docs/remote-sessions.md).
+
+- **`Space h` is a hosts panel, not a form.** Each host shows its live
+  connection state, running/attached session counts, daemon version and latency,
+  and gets a configurable emoji shown in the session table's Host column. There
+  is no Save step to forget: adding a host connects it immediately, edits apply
+  when you leave the row, and removal asks first. When something is wrong the
+  panel now says *what* — "miao-server not found", "version mismatch
+  (found 0.3.1, need 0.4.0)" — where the header used to show only a warning
+  triangle. The header itself carries just a count (`hosts 3 ⚠1`), so it stays
+  glanceable however many hosts you have.
+
+- **`r` lists one host at a time** (named in the picker title, `Ctrl-h` to
+  switch) instead of merging every host's resumable sessions into one list whose
+  scope you had to infer. With that, **`b` (the cross-host browser) is gone** —
+  the table covers running sessions and `r` covers resumable ones.
+
+- **Remote rows you can't act on are hidden**, and a session still running on
+  its host with no window here sorts to the bottom of the list with its own
+  icon — though an approval prompt still floats to the top wherever it is.
+
+- **A daemon no longer dies with your login session.** It rebinds its socket
+  when systemd-logind takes the runtime directory away at logout, which used to
+  wedge it permanently, and one transient error accepting a connection no longer
+  tears down every session on the host. **Run `loginctl enable-linger` on any
+  Linux machine hosting sessions** to avoid the outage entirely.
 
 - **The commands are now `miao`, `miao-server` and `miao-client`** (were
   `captain-miao`, `captain-miao-server`, `captain-miao-client`) — you reach for
