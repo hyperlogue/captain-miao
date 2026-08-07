@@ -39,11 +39,37 @@
         ];
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # The targets a bundled dashboard cross-compiles the server to
+        # (docs/crate-split.md). Only `rust-std` comes from here — the C half of
+        # the cross (bundled SQLite's amalgamation, and the link itself) is
+        # `cargo-zigbuild`'s job, which ships its own libc headers and linker
+        # per target.
+        #
+        # Deliberately layered on *top* of `rustToolchain` rather than folded
+        # into it: crane's package builds take `rustToolchain`, so the artifacts
+        # `nix build` produces stay byte-identical whether or not the cross
+        # targets are installed.
+        crossTargets = [
+          "x86_64-unknown-linux-gnu"
+          "aarch64-unknown-linux-gnu"
+        ];
+        devToolchain = fenix.packages.${system}.combine (
+          [rustToolchain]
+          ++ map (t: fenix.packages.${system}.targets.${t}.stable.rust-std) crossTargets
+        );
+
         # `craneLib.cleanCargoSource` keeps only `.rs` / `.toml` / `Cargo.lock`,
         # which drops `assets/logo/*.gray` — the masks `src/app/logo.rs` embeds
         # with `include_bytes!`, so the build fails at compile time without
         # them. A source filter can't see a compile-time file dependency, so
         # keep `assets/` explicitly alongside the Rust sources.
+        #
+        # Nothing extra is needed for the embedded server payloads: these
+        # packages build without the `bundle` feature, so they reserve no slot
+        # and `build.rs` does nothing but read one unset environment variable.
+        # The bundled variants below cross-build servers and patch them in after
+        # linking, which works offline — every cargo invocation resolves from the
+        # vendored registry crane sets up for the outer build.
         src = let
           root = ./.;
           isAsset = path: lib.hasPrefix "${toString root}/assets/" path;
@@ -81,13 +107,73 @@
             pname = "captain-miao-server";
             cargoExtraArgs = "--locked -p captain-miao-server";
           });
+        # The dashboard variants that carry a `miao-server` to deploy to
+        # a remote host — one package per variant `cargo xtask dist` knows about
+        # (docs/crate-split.md).
+        #
+        # These delegate to `xtask` rather than reimplementing it in nix, because
+        # the reservation has to be sized from the *compressed* servers: xtask
+        # cross-builds them, measures, compiles a dashboard reserving that much,
+        # and writes them into the linked binary. A nix expression could only
+        # guess the number, and a guess is the thing this design set out to
+        # remove. The whole sequence runs offline — every cargo invocation
+        # resolves from the vendored registry crane already set up.
+        #
+        # Two things they need that a plain build doesn't. `devToolchain`, for
+        # the cross `rust-std`s — hence a second craneLib, leaving the plain
+        # packages on `rustToolchain` so their output is untouched. And a
+        # writable `HOME`: cargo-zigbuild keeps a cache under it and nix points it
+        # at the non-existent `/homeless-shelter`, so the cross fails on a
+        # permission error before zig is ever invoked.
+        craneLibBundled = (crane.mkLib pkgs).overrideToolchain devToolchain;
+        mkBundled = variant:
+          craneLibBundled.buildPackage (commonArgs
+            // {
+              pname = "captain-miao-${variant}";
+              nativeBuildInputs = [pkgs.cargo-zigbuild pkgs.zig];
+              preBuild = ''
+                export HOME="$TMPDIR"
+                export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+              '';
+              buildPhaseCargoCommand = ''
+                cargo run --release --locked -p xtask -- dist --variant ${variant}
+              '';
+              # `dist` names its artifacts, and the binary inside is `miao`.
+              installPhaseCommand = ''
+                install -Dm755 dist/miao-${variant} "$out/bin/miao"
+              '';
+              # crane's default install reads a cargo build log to decide which
+              # binaries to install. There isn't one here — the artifact comes
+              # out of `dist/`, already patched — and installing straight from
+              # `target/release` would give an *unbundled* `miao`, so this has to
+              # be off rather than merely redundant.
+              doNotPostBuildInstallCargoBinaries = true;
+              # `xtask dist` already runs the artifact and checks it reports the
+              # servers it was injected with, which is the only check that can
+              # catch a bad patch.
+              doCheck = false;
+              meta.mainProgram = "miao";
+            });
+        bundled = lib.genAttrs [
+          "bundle-linux"
+          "bundle-linux-x86_64"
+          "bundle-linux-aarch64"
+        ] (variant: mkBundled variant);
       in {
-        packages = {
-          default = captain-miao;
-          inherit captain-miao captain-miao-server;
-        };
+        packages =
+          {
+            default = captain-miao;
+            inherit captain-miao captain-miao-server;
+          }
+          # `captain-miao-bundle-linux`, and the two single-arch variants.
+          // lib.mapAttrs' (feature: pkg:
+            lib.nameValuePair "captain-miao-${feature}" pkg)
+          bundled;
 
-        devShells.default = import ./nix/shell.nix {inherit pkgs rustToolchain;};
+        devShells.default = import ./nix/shell.nix {
+          inherit pkgs;
+          rustToolchain = devToolchain;
+        };
 
         formatter = pkgs.alejandra;
       };
