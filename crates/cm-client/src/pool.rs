@@ -117,8 +117,12 @@ pub fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `attach` — reattach this terminal to a pooled session, but only if it exists
-/// and isn't already attached elsewhere.
+/// `attach` — reattach this terminal to a pooled session, but only if it exists,
+/// still belongs to a live captain-miao session, and isn't already attached
+/// elsewhere. The refusals exit with the shared guard codes
+/// ([`cm_core::state::ATTACH_EXIT_BUSY`] / [`ATTACH_EXIT_STALE`]) so a wrapper
+/// can tell them apart from a clean detach — libshpool's own busy refusal
+/// exits 0, which is why the busy case must be caught here.
 pub fn attach(name: String) -> Result<()> {
     let sessions = pool_list_sessions()?;
     let Some(session) = sessions.iter().find(|s| s.name == name) else {
@@ -133,12 +137,26 @@ pub fn attach(name: String) -> Result<()> {
             names.join(", ")
         );
     };
+    // Resurrection guard: a session whose command died while *detached* still
+    // lists here (shpool never drops it from its table), and attaching would
+    // silently respawn it as a bare login shell wearing the cm- name.
+    let states = LocalBackend::default().list_sessions();
+    if cm_core::state::find_live_pool_session(&states, &name, cm_core::state::is_process_alive)
+        .is_none()
+    {
+        eprintln!(
+            "no live captain-miao session owns pool session {name:?} (it likely exited); \
+             not attaching — that would resurrect the name as a bare shell"
+        );
+        std::process::exit(cm_core::state::ATTACH_EXIT_STALE);
+    }
     if matches!(session.status, SessionStatus::Attached) {
         eprintln!("session {name:?} already has a terminal attached; not attaching");
-        return Ok(());
+        std::process::exit(cm_core::state::ATTACH_EXIT_BUSY);
     }
     // Detached → plain interactive reattach. A racing attach between the list
-    // and here is still caught by libshpool's own busy guard.
+    // and here is still caught by libshpool's own busy guard (which exits 0 —
+    // acceptable for the residual race window).
     attach_pty(&name)
 }
 

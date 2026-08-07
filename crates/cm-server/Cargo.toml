@@ -29,9 +29,13 @@ libc = "0.2"
 
 libshpool = { version = "0.11", optional = true }
 shpool-protocol = { version = "0.4", optional = true }
+# The attach guards speak libshpool's msgpack wire codec directly for the
+# read-only busy pre-check (its protocol client is private) — same approach as
+# captain-miao-client's `list`.
+rmp-serde = { version = "1", optional = true }
 # Quote a launcher argv into libshpool attach's `--cmd` string (server side).
 shell-words = { version = "1", optional = true }
 
 [features]
 default = ["pty-pool"]
-pty-pool = ["dep:libshpool", "dep:shpool-protocol", "dep:shell-words"]
+pty-pool = ["dep:libshpool", "dep:shpool-protocol", "dep:rmp-serde", "dep:shell-words"]

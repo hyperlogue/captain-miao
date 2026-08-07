@@ -254,6 +254,35 @@ pub fn is_process_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+// -- Attach guards (shared by captain-miao-server and captain-miao-client) --
+
+/// Exit code of `attach` when the pool session already has a client attached.
+/// libshpool's own busy refusal exits 0 — indistinguishable from a clean
+/// detach to anything watching the attach process — so the wrappers pre-check
+/// and refuse with this code instead.
+pub const ATTACH_EXIT_BUSY: i32 = 43;
+
+/// Exit code of `attach` when no live captain-miao session owns the pool
+/// name. Attaching anyway would make libshpool *resurrect* the name as a bare
+/// login shell: a session whose command died while detached is never removed
+/// from shpool's table, and a name-attach to it (or to an unknown name)
+/// silently creates a fresh shell wearing the `cm-…` name.
+pub const ATTACH_EXIT_STALE: i32 = 44;
+
+/// The live captain-miao session bound to pool session `name`: a state file
+/// carrying `pool_session == name` whose launcher process is still alive.
+/// `alive` is injected ([`is_process_alive`] in production) so the policy is
+/// testable without real processes.
+pub fn find_live_pool_session<'a>(
+    states: &'a [LauncherState],
+    name: &str,
+    alive: impl Fn(u32) -> bool,
+) -> Option<&'a LauncherState> {
+    states
+        .iter()
+        .find(|s| s.pool_session.as_deref() == Some(name) && alive(s.launcher_pid))
+}
+
 // -- JSON file helpers --
 
 /// Atomic write: serialize to pretty JSON, write to `<path>.tmp`, then rename.
@@ -821,6 +850,50 @@ pub fn read_all_launcher_states() -> Vec<LauncherState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The attach-guard predicate: only a state file whose `pool_session`
+    /// matches AND whose launcher pid is alive counts — a matching name on a
+    /// dead launcher is exactly the resurrection case the guard exists for.
+    #[test]
+    fn find_live_pool_session_requires_matching_name_and_live_pid() {
+        let mk = |pid: u32, pool: Option<&str>| LauncherState {
+            agent: crate::agent::AgentControl::Claude,
+            launcher_pid: pid,
+            session_id: None,
+            window_id: None,
+            tab_id: None,
+            cwd: String::new(),
+            status: SessionStatus::Idle,
+            last_tool: None,
+            updated_at: 0,
+            active_since: None,
+            last_prompt: None,
+            child_pid: None,
+            last_error: None,
+            context_tokens: None,
+            model: None,
+            name: None,
+            first_prompt: None,
+            pool_session: pool.map(str::to_string),
+            launch_id: None,
+            terminal: None,
+            host: HostId::default(),
+        };
+        let states = vec![
+            mk(10, None),                  // local session, no pool name
+            mk(20, Some("cm-claude-1-1")), // dead launcher (alive=false below)
+            mk(30, Some("cm-codex-2-1")),  // live, different name
+            mk(40, Some("cm-claude-1-1")), // live match
+        ];
+        let alive = |pid: u32| pid >= 30;
+        let hit = find_live_pool_session(&states, "cm-claude-1-1", alive);
+        assert_eq!(hit.map(|s| s.launcher_pid), Some(40));
+        assert!(find_live_pool_session(&states, "cm-codex-9-9", alive).is_none());
+        // Liveness is judged per matching state file, not globally.
+        assert!(find_live_pool_session(&states, "cm-claude-1-1", |pid| pid == 20).is_some());
+        // The name exists but only on dead launchers → no hit (resurrection).
+        assert!(find_live_pool_session(&states, "cm-claude-1-1", |_| false).is_none());
+    }
 
     /// State files carry the user's prompt text, so they must not be readable by
     /// other users on a shared machine — regardless of the ambient umask (the

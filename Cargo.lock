@@ -274,6 +274,7 @@ dependencies = [
  "libc",
  "libshpool",
  "notify 8.2.0",
+ "rmp-serde",
  "serde",
  "serde_json",
  "shell-words",

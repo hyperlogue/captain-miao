@@ -13,12 +13,17 @@
 //! child (§8), so no double-fork actually happens — but honoring the
 //! pre-threads contract costs nothing and keeps the call sound.
 
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use libshpool::Args;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use shpool_protocol::{ConnectHeader, ListReply, SessionStatus, VersionHeader};
 
 /// captain-miao's private pool socket — resolved in cm-core so the server and
 /// the `captain-miao-client` list/attach tool agree on the path. A dedicated
@@ -157,10 +162,101 @@ pub(crate) fn run_daemon() -> Result<()> {
     }
 }
 
+/// Serialize `value` the way libshpool's daemon expects (msgpack, struct-map).
+/// Mirrors captain-miao-client's `pool.rs`; the codec is pinned there by
+/// `list_codec_roundtrips` and here by `busy_check_codec_roundtrips`, so a
+/// libshpool protocol bump surfaces in both crates' tests.
+fn shpool_encode<T: Serialize, W: Write>(value: &T, w: W) -> Result<()> {
+    let mut ser = rmp_serde::Serializer::new(w).with_struct_map();
+    value.serialize(&mut ser).context("encoding shpool frame")?;
+    Ok(())
+}
+
+/// Read one msgpack value from `r` — rmp reads exactly one value's bytes, so
+/// sequential calls on the same stream stay framed.
+fn shpool_decode<T: DeserializeOwned, R: Read>(r: R) -> Result<T> {
+    rmp_serde::from_read(r).context("decoding shpool frame")
+}
+
+/// Whether the named pool session currently has a client attached, via the
+/// pool daemon's read-only `List`. `Ok(None)` = the pool has no such session.
+fn pool_session_attached(name: &str) -> Result<Option<bool>> {
+    let stream =
+        UnixStream::connect(pool_socket_path()).context("connecting to the pty pool socket")?;
+    let _version: VersionHeader =
+        shpool_decode(&stream).context("reading pool daemon version header")?;
+    shpool_encode(&ConnectHeader::List, &stream).context("sending pool list request")?;
+    let reply: ListReply = shpool_decode(&stream).context("reading pool session list")?;
+    Ok(reply
+        .sessions
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| matches!(s.status, SessionStatus::Attached)))
+}
+
+/// Pre-flight for a plain interactive reattach — never for the
+/// `--background --cmd` create path, where the daemon is deliberately minting
+/// a fresh session. Refuses (with a distinct exit code, so the held window and
+/// anything watching the process can tell the cases apart) the two situations
+/// libshpool itself handles badly:
+///
+/// * **Stale name** ([`crate::state::ATTACH_EXIT_STALE`]): no live launcher
+///   owns `name`. shpool never drops a dead-detached session from its table,
+///   and an attach to it — or to a name it has never seen — silently *creates*
+///   a bare login shell wearing the `cm-…` name. The check retries briefly:
+///   right after a create, the attach window can beat the launcher's first
+///   state-file write.
+/// * **Busy** ([`crate::state::ATTACH_EXIT_BUSY`]): the session already has a
+///   client. libshpool's own refusal prints to stderr but **exits 0**,
+///   indistinguishable from a clean detach (the dashboard treats a closed
+///   attach window as a detach), so it must be caught before libshpool runs.
+///   Best-effort: a `List` failure falls through to libshpool, whose own
+///   connect surfaces the error; a client attaching between this check and
+///   ours hits libshpool's busy path as before.
+fn guard_plain_reattach(name: &str) {
+    let live = (0..10).find_map(|i| {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let states = crate::state::read_all_launcher_states();
+        crate::state::find_live_pool_session(&states, name, crate::state::is_process_alive)
+            .map(|s| s.launcher_pid)
+    });
+    if live.is_none() {
+        eprintln!(
+            "no live captain-miao session owns pool session {name:?} (it likely exited); \
+             refusing to attach — attaching would resurrect the name as a bare shell. \
+             Resume the session from the dashboard instead."
+        );
+        std::process::exit(crate::state::ATTACH_EXIT_STALE);
+    }
+    match pool_session_attached(name) {
+        Ok(Some(true)) => {
+            eprintln!(
+                "pool session {name:?} already has a terminal attached (the pool is one \
+                 client at a time); detach the other client first"
+            );
+            std::process::exit(crate::state::ATTACH_EXIT_BUSY);
+        }
+        // A live launcher whose session the pool doesn't know: the pool was
+        // restarted out from under it (or the name never existed). Attaching
+        // would create a bare shell under the name — refuse.
+        Ok(None) => {
+            eprintln!(
+                "the pty pool has no session named {name:?} (was the pool restarted?); \
+                 refusing to attach"
+            );
+            std::process::exit(crate::state::ATTACH_EXIT_STALE);
+        }
+        Ok(Some(false)) | Err(_) => {}
+    }
+}
+
 /// Attach to a pool session, proxying its pty to this terminal. With
 /// `cmd`/`background` set, instead *creates* a session running `cmd` and detaches
 /// (how the server starts a launcher in the pool); otherwise a plain interactive
-/// reattach (what the client's ssh window runs). Always `--no-daemonize`:
+/// reattach (what the client's ssh window runs), pre-flighted by
+/// [`guard_plain_reattach`]. Always `--no-daemonize`:
 /// captain-miao manages its own daemon (named `pty-daemon`, not shpool's default
 /// `daemon`), so shpool's auto-launch — which would re-exec `<exe> daemon` — must
 /// not fire.
@@ -171,6 +267,9 @@ pub(crate) fn run_attach(
     background: bool,
     log_file: Option<String>,
 ) -> Result<()> {
+    if cmd.is_none() && !background {
+        guard_plain_reattach(&name);
+    }
     // `--log-file` is the only way to see the attach *client*'s logs: libshpool
     // writes non-daemon logs to `io::empty()` without it (its stderr writer is
     // daemon-only), and it `error!`s + exits 1 on failure — so a background
@@ -200,6 +299,36 @@ pub(crate) fn run_attach(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    /// Pin this crate's copy of the shpool wire codec (struct-map msgpack,
+    /// value-framed) — the busy pre-check's `List` must keep decoding what the
+    /// daemon emits. Mirrors cm-client's `list_codec_roundtrips`.
+    #[test]
+    fn busy_check_codec_roundtrips() {
+        let reply = ListReply {
+            sessions: vec![shpool_protocol::Session {
+                name: "cm-claude-1-1".into(),
+                started_at_unix_ms: 0,
+                last_connected_at_unix_ms: None,
+                last_disconnected_at_unix_ms: None,
+                status: SessionStatus::Attached,
+            }],
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        shpool_encode(
+            &VersionHeader {
+                version: "0.0.0".into(),
+            },
+            &mut buf,
+        )
+        .unwrap();
+        shpool_encode(&reply, &mut buf).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let _version: VersionHeader = shpool_decode(&mut cursor).unwrap();
+        let got: ListReply = shpool_decode(&mut cursor).unwrap();
+        assert_eq!(got.sessions[0].name, "cm-claude-1-1");
+        assert!(matches!(got.sessions[0].status, SessionStatus::Attached));
+    }
 
     fn temp_sock(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cm-pty-{}-{}.sock", tag, std::process::id()))
