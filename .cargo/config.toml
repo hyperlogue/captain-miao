@@ -1,0 +1,8 @@
+# `cargo xtask …` → the `xtask` workspace member (see xtask/src/main.rs). The
+# standard cargo-xtask pattern: build chores stay Rust that the workspace
+# type-checks, lints, and tests, instead of a shell script nobody runs CI on.
+#
+# `--` is what lets `cargo xtask dist --all` reach xtask's own clap parser
+# rather than being eaten by `cargo run`.
+[alias]
+xtask = "run --package xtask --"

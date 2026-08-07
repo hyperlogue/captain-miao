@@ -292,20 +292,34 @@ CheckDir{req_id, path}                 DirChecked{req_id, exists}
 per host; the dashboard thread never does socket I/O for reads. The task runs
 the full sequence and re-runs it on every reconnect:
 
-1. **Probe** — `ssh <target> 'echo $HOME; uname -sm; <version checks>'`.
-   Provisioning is **read-only**: it *chooses* between a matching
-   `captain-miao-server` on PATH and one at the cache path
-   (`REMOTE_CACHE_REL`); `redeploy.sh` is what puts a binary there. (The old
-   self-upload died with the crate split — the dashboard no longer links the
-   pool, so the binary it could send wouldn't be a functional server.) The v1
-   distribution story is **assume it's already there, verify, and fail
-   loudly** — and it is now loud: `provision_failure` turns a fall-back
-   decision into a sentence (*"captain-miao-server version mismatch (found
-   0.3.1, need 0.4.0)"*, *"captain-miao-server not found (need 0.4.0); deploy
-   it with redeploy.sh"*) that becomes the host's `ConnState::Failed` text and
-   shows verbatim in the hosts panel. Anything smarter (a `deploy` command
-   wrapping `redeploy.sh`'s scp step) stays a later, deliberately dumb
-   convenience — no auto-upload magic.
+1. **Probe, then provision** —
+   `ssh <target> 'echo $HOME; uname -sm; <version checks>; <digest marker>'`,
+   then decide: a version-matching `miao-server` on PATH, else one at
+   the cache path (`REMOTE_CACHE_REL`), else **deploy the one this dashboard
+   carries**.
+
+   The self-upload that died with the crate split is back, on a sounder
+   footing: what it sends is a real `miao-server`, cross-built and
+   embedded by `build.rs` in the same command that builds the dashboard, rather
+   than the dashboard binary (which no longer links the pool and so wouldn't be
+   a functional server). It streams into `cat` over the connection the probe just
+   opened, and is `chmod`ed and **run on the host** before being moved into
+   place — so a truncated transfer or a wrong-ABI payload never becomes the
+   binary the next connect invokes. Ownership rule: **PATH is the user's, the
+   cache path is ours** — a binary the user installed is never overwritten, and
+   a digest marker beside ours distinguishes *this* build from a same-versioned
+   one, which is what makes the dev loop work without a version bump. Full
+   design in `docs/crate-split.md`.
+
+   Where a deploy isn't possible — no payload for that arch, or a build with no
+   bundle feature (the default) — the original story stands, **assume it's already
+   there, verify, and fail loudly**, and it is loud: `provision_failure` turns a
+   fall-back into a sentence (*"miao-server version mismatch (found
+   0.3.1, need 0.4.0)"*, *"…not found (need 0.4.0); no payload for Linux
+   riscv64 (this build carries x86_64-unknown-linux-gnu) — deploy it with
+   redeploy.sh"*, *"could not deploy miao-server: <what the host
+   said>"*) that becomes the host's `ConnState::Failed` text and shows verbatim
+   in the hosts panel.
 2. **Ensure** — `ssh <target> <exe> daemon ensure` → prints the control-socket
    path; idempotent. Its stderr becomes the `Failed` reason when the probe had
    nothing to say.
@@ -742,7 +756,26 @@ has no remote. Until it has, the feature ships off by default behind the
   `miao focus` bell are both client-side and only meaningful for sessions with a
   local window; a remote session that wants attention currently reaches the
   user through the row, not the OS.
-- **A `deploy` command** wrapping `redeploy.sh`'s scp step, so a version
-  mismatch is one keystroke to fix rather than a shell trip (§4 step 1).
+- ~~**A `deploy` command** wrapping `redeploy.sh`'s scp step~~ — superseded.
+  The dashboard now deploys its own embedded server on connect (§4 step 1), so
+  a version mismatch fixes itself rather than needing a keystroke. What's left
+  here is a **packaging** decision: release CI builds only the dashboard, so the
+  binaries on npm and GitHub Releases carry no payload. Wiring the server into
+  the release matrix (both Linux arches already build natively there) is what
+  would make this zero-touch for users rather than only for source builds —
+  worth doing when `remote` comes out from behind its cargo feature, and not
+  before, since it adds ~7 MB to every download for a feature that's off.
+- **A musl payload.** `target_candidates` already prefers glibc and falls
+  through to a musl entry, and the post-upload verification is what would catch
+  a glibc payload failing on Alpine — but there is no `bundle-*-musl` feature to
+  build one, so an Alpine host still reports the failure rather than
+  self-healing.
+- **`remote_shell_argv` doesn't survive a fish login shell.** The `w` work-tab
+  command emits `cd '<dir>' && exec "${SHELL:-/bin/sh}" -l`, and
+  `${SHELL:-/bin/sh}` is not fish syntax — the same class of bug the deploy path
+  hit and fixed with `login_shell_safe`. It can't reuse that wrapper directly:
+  the cwd is already single-quoted by `shell_quote_host_path`, which collides
+  with the wrapper's own quoting, so it needs its own thought (§3's `~` handling
+  is the constraint).
 - **A clippy `disallowed-methods` quarantine on `is_local()`**, to keep new
   code asking about capabilities rather than locality.

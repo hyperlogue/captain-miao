@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Build chores for captain-miao: builds the named release dashboard variants"
+
+# The `cargo xtask` pattern: a plain workspace binary invoked through the
+# `[alias]` in `.cargo/config.toml`, so build chores are Rust the whole workspace
+# type-checks and tests rather than a shell script nobody lints.
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Cross-builds the servers and writes them into the linked dashboard. The `build`
+# feature is the half the dashboard itself never links.
+cm-payload = { path = "../crates/cm-payload", features = ["build"] }

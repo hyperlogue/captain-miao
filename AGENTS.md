@@ -22,10 +22,11 @@ Claude Code hook → miao hook → launcher (Unix socket)
 
 ## Module layout
 
-captain-miao is a **Cargo workspace** with four members. The split keeps the
-portable logic in a library all binaries link, the ratatui client in one binary,
-the libshpool-hosting daemon in another that cross-compiles to Linux and is
-deployed to remote hosts, and a small pool client in a fourth. Full rationale in
+captain-miao is a **Cargo workspace** with four shipping members plus two
+build-support ones (`cm-payload`, `xtask`). The split keeps the portable logic in
+a library all binaries link, the ratatui client in one binary, the
+libshpool-hosting daemon in another that cross-compiles to Linux and is deployed
+to remote hosts, and a small pool client in a fourth. Full rationale in
 `docs/crate-split.md`.
 
 - **`cm-core`** (`crates/cm-core/`) — the logic + data all binaries share. No
@@ -50,6 +51,16 @@ deployed to remote hosts, and a small pool client in a fourth. Full rationale in
   dashboard's attach path spawns `miao-server attach` instead. If a remote host
   ever needs `list`, add it to `miao-server` (which already holds the pool
   socket) rather than deploying a second executable.
+- **`cm-payload`** (`crates/cm-payload/`) — not shipped (`publish = false`). Two
+  halves split by who links which: `format` has no dependencies and is shared, so
+  the dashboard reads the payload slot and `xtask` writes it through one module
+  that can't drift; the `build` feature adds the cross-compile, compression and
+  injector, and only `xtask` enables it. See **Embedded server payloads**.
+- **`xtask`** (`xtask/`) — not shipped (`publish = false`); the standard
+  `cargo xtask` build-chore binary, reached through the `[alias]` in
+  `.cargo/config.toml`. Its job is the named **release dashboard variants**
+  (`dist`). Rust rather than a shell script so the workspace type-checks, lints,
+  and tests it.
 
 **cm-core (`crates/cm-core/src/`):**
 
@@ -70,7 +81,8 @@ deployed to remote hosts, and a small pool client in a fourth. Full rationale in
 
 - `main.rs` — CLI entrypoint with clap: TUI (default), `claude`, `codex`, `hook`, `focus`
 - `app/` — Ratatui TUI: `mod.rs` (App state + event loop wiring, incl. the `REMOTE_ENABLED` feature gate), `run.rs` (entry + main loop), `draw.rs` (rendering), `keys.rs` (key + mouse dispatch), `keymap.rs` (configurable Normal-mode keybindings), `picker.rs` (telescope-style filterable picker), `format.rs` (text/color helpers, incl. the status→color mapping), `hosts.rs` (remote-host config + `hosts.json`), `bindings.rs` (the client-side window↔session `WindowBindings` map), `logo.rs` (the kitty-graphics header paw + walking cat), `keybind_log.rs` (debug-mode TSV log), `tests.rs`
-- `backend.rs` — `Backend` enum (per-host session management): `Local` (wraps `cm_core::backend::LocalBackend`) and `Remote` (mirrors a `captain-miao-server daemon` over a socket / ssh-forward via `Transport`) + the ssh transport + remote-binary resolution (a **read-only** probe choosing between a `captain-miao-server` on PATH and one at the cache path; the old same-arch auto-upload was removed with the crate split — see the note above `REMOTE_CACHE_REL`). The dashboard aggregates `App.backends` (localhost #0 + one per remote host); see Remote hosts below and `docs/remote-sessions.md`.
+- `backend.rs` — `Backend` enum (per-host session management): `Local` (wraps `cm_core::backend::LocalBackend`) and `Remote` (mirrors a `miao-server daemon` over a socket / ssh-forward via `Transport`) + the ssh transport + remote-binary provisioning (probe → decide → **deploy** → invoke; see the note above `REMOTE_CACHE_REL` and Embedded server payloads below). The dashboard aggregates `App.backends` (localhost #0 + one per remote host); see Remote hosts below and `docs/remote-sessions.md`.
+- `server_payload.rs` — the `captain-miao-server` builds this dashboard carries: the reserved slot (gated on the `bundle` feature, **absent in a regular build**), the reader that parses it, and the `uname -sm` → target-triple mapping the deploy picks with. See Embedded server payloads.
 - `terminal/` — terminal-emulator backend: `mod.rs` (`Terminal` trait + `Tab`/`Window`/`TabInfo`/`SpawnSpec` types + pure policy fns + `get()`'s zellij-first backend detection, re-exporting the id types from cm-core), `kitty.rs` (Kitty `kitten @` backend), `zellij.rs` (zellij `zellij action` backend), `graphics.rs` (kitty graphics-protocol primitives backing `app/logo.rs`), `tests.rs` (pure-policy tests)
 - `config.rs` — the presentation config (colors, ui, thresholds, polling, keybinds) layered on cm-core's loader
 - `sleep.rs` — OS-sleep inhibitor (caffeinate / systemd-inhibit)
@@ -393,6 +405,116 @@ it uses no ssh and has its own config flag.
   shpool — see `docs/remote-sessions.md` §10.2), per-host keep-awake, and remote
   focus/bell.
 
+## Embedded server payloads (the dashboard deploys its own server)
+
+A host needs a version-matching `miao-server`. The dashboard can **carry
+one and push it on connect**, so a bare host needs no manual deploy step. Full
+rationale in `docs/crate-split.md`; this is the map.
+
+- **The `bundle` cargo feature is the switch.** It reserves room for servers and
+  compiles the reader; without it there is no slot and no reader, so a regular
+  build is byte-for-byte what it would be if none of this existed. One feature
+  rather than one per arch, because *which* servers a binary carries is decided
+  when they are written in — a single dashboard build serves every combination,
+  and turning the feature on needs no cross toolchain.
+- **Payloads are written in after linking.** `cargo xtask dist` cross-builds the
+  servers, compresses them, compiles a dashboard reserving exactly that much, and
+  overwrites the reservation in the finished binary. One command, so the server a
+  dashboard carries is always compiled from the sources beside it — which has to
+  be arranged, since the workspace version is the only thing a released artifact
+  is keyed on and it doesn't move between dev builds.
+- **The mechanism is a reserved `.rodata` slot, and the reason is `strip`.**
+  Measured: appended bytes are **silently wiped** (strip rewrites a binary from
+  its own structure and doesn't carry trailing data across); an
+  `objcopy --add-section` section survives but Mach-O has no post-link equivalent
+  (`ld -sectcreate` is link-time, `segedit -replace` is same-size-only); a slot
+  the linker already placed is allocated and referenced, so strip can't remove it,
+  and overwriting it in place works identically on both formats.
+- **Three details that are load-bearing**, each found by trying it: (1) the slot
+  is an **`UnsafeCell`**, because an immutable `static` lets release LTO
+  constant-fold reads of its initializer — every read of the used-length field
+  would fold to the compile-time zero and the injected payload would sit in the
+  file unread; (2) `find` requires the **sentinel** at the capacity the header
+  claims, not just the magic, so re-injecting over bytes that are themselves a
+  payload can't be fooled, and two survivors is an error rather than a coin flip;
+  (3) a **malformed slot decodes to nothing** — half a payload would deploy and
+  then fail to exec on someone else's machine.
+- **The reservation is sized, not chosen.** `CM_PAYLOAD_RESERVE` is read by
+  `build.rs` (which does nothing else); `xtask` sets it from the servers it just
+  compressed, plus headroom, rounded up to a MiB so variants needing similar
+  amounts share a dashboard compile. Unset means a zero-length slot, so ordinary
+  builds and `clippy --all-features` are unaffected. The rounding slack costs
+  **5,232 bytes** in a gzipped release tarball (measured), so it shows up in
+  on-disk footprint and essentially nowhere else.
+- **Variants** — `cargo xtask dist [--variant N]… [--all] [--list]` builds named
+  release artifacts into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`,
+  and the two single-arch bundles. Each run verifies its artifact by running it
+  and checking it reports the servers just injected — the only check that can
+  catch a bad patch. Default: plain + `bundle-linux`.
+- **Cross-compiling** is `cargo-zigbuild` — the only strategy that handles
+  bundled SQLite's C amalgamation without a distro cross toolchain. `nix develop`
+  provides it, `zig`, and the cross `rust-std`s. It is preferred **even for the
+  host target**: a native release build links against the builder's glibc (2.39
+  on NixOS) and dies on any older server's loader, where zigbuild pins the floor
+  at `GLIBC_FLOOR` (2.28 — Debian 10 / RHEL 8). Falls back to `cross` (the
+  macOS→Linux route without zig; needs a container runtime, which on a mac is a
+  VM), then to native for the host. **Both fallbacks warn**, via `unpinned_floor`,
+  which names where the floor actually came from — `cross` builds in a container,
+  so blaming the builder's glibc would be wrong, and on macOS there is none to
+  blame. Known gap: Homebrew's `macos-cross-toolchains` would work but isn't a
+  strategy, so a mac carrying those and no zig is refused rather than used.
+- **`lto = "fat"` + `codegen-units = 1`** on the release profile: 16% off the
+  server (8.61 → 7.21 MB) and the same order off `miao`, which every download pays
+  for and a bundled build pays for twice. Deliberately **not** `panic = "abort"` —
+  the server is a daemon hosting the pty pool, so unwinding drops one task where
+  aborting would kill every session on the host.
+- **Nix builds the variants too** — `packages.captain-miao-bundle-linux` and the
+  two single-arch ones, each delegating to `cargo xtask dist` rather than
+  reimplementing it, because the reservation has to be sized from the *compressed*
+  servers and a nix expression could only guess. Runs offline (every cargo
+  invocation resolves from crane's vendored registry). Needs `devToolchain` for
+  the cross `rust-std`s and a **writable `HOME`** — cargo-zigbuild caches under it
+  and nix points it at the non-existent `/homeless-shelter`.
+- **Deploying** (`backend.rs`) — the probe reads a fifth line, the digest marker
+  beside the deployed binary, and `Provision::Upload` streams the inflated
+  payload into `cat` over the ssh connection the probe just opened (no local temp
+  file, no second round trip, no decompressor needed on the host). It is staged,
+  `chmod`ed and **run on the host** before being moved into place, so a truncated
+  transfer or wrong-ABI payload never becomes the binary the next connect
+  invokes — the only check that can catch glibc-vs-musl, which `uname` can't
+  report.
+- **Ownership rule**: **PATH is the user's, the cache path is ours.** A
+  version-matching binary the user installed always wins and is never
+  overwritten; `~/.cache/captain-miao/bin/miao-server` is refreshed to
+  match our payload whenever the marker doesn't.
+- **The digest marker exists because a version match is not identity.** Dev
+  builds never bump the version, so `0.2.1` on a host says nothing about *which*
+  `0.2.1`. Rebuild, reconnect, and the host gets the new server — which is what
+  retires `redeploy.sh` for payload-carrying builds.
+- **Everything sent over ssh is wrapped `/bin/sh -c '<script>'`**
+  (`login_shell_safe`). `ssh host <cmd>` hands `<cmd>` to the *account's login
+  shell*, which is routinely `fish`: a POSIX-sh deploy script came back as
+  *"fish: Unsupported use of '='"*. A single-quoted string is literal in
+  sh/bash/zsh/fish/csh, but only fish honours escapes inside one, so a wrapped
+  script must contain **no single quote and no backslash** — hence `echo` for the
+  marker instead of `printf '%s\n'`, and clearing the temp file up front instead
+  of an `EXIT` trap. A test runs the deploy under every shell installed on the
+  machine. (Note `remote_shell_argv`, for `w` work tabs, is **not** wrapped and
+  still emits `${SHELL:-/bin/sh}` — invalid in fish. Separate defect.)
+- **A failed deploy is rate-limited** (`UploadGate`, keyed on the payload
+  digest): the reconnect backoff caps at 30s, so a host that accepts ssh but
+  refuses the write would otherwise be re-sent megabytes twice a minute forever.
+  A *new* payload always gets a fresh attempt, and a working connection clears it.
+- **`miao --version` is the inventory.** Whether a given binary can deploy a
+  server is fixed at *build* time, so no config or state file can answer it;
+  clap's long-version form lists the targets, gz sizes, and digests (`-V` keeps
+  the bare version for scripts). It always prints a line, "none" included —
+  absence has to read as an answer rather than as a build too old to report.
+- **Verified end to end** over real ssh by `provisions_a_real_host_end_to_end`
+  (`#[ignore]`d, target from `CM_TEST_SSH_TARGET`) — an sshd on localhost
+  exercises every line, so it needs no remote machine. Run it with a bundle
+  feature on; that is what puts a payload in the test binary.
+
 ## Dev commands
 
 ```sh
@@ -415,6 +537,21 @@ cargo run -p captain-miao-client -- attach <name> [--force]
                               # from the client currently attached)
 cargo test --workspace       # run the full test suite
 cargo watch -x run           # auto-reload the dashboard on changes
+
+# Embedded server payloads — needs `nix develop` for zig + the cross rust-stds.
+# `cargo xtask dist` is the whole thing: it cross-builds the servers, sizes the
+# reservation, compiles the dashboard, writes them in, and verifies the result.
+# A plain `cargo build` reserves nothing and builds nothing extra.
+cargo xtask dist                   # the named release variants, into dist/
+cargo xtask dist --list            # the variants, and what each carries
+cargo xtask dist --variant bundle-linux-x86_64   # just one
+nix build .#captain-miao-bundle-linux            # the same, straight from the flake
+nix build .#captain-miao-bundle-linux-aarch64    # …single-arch
+miao --version                       # what an already-built binary actually embeds
+
+# The deploy path, end to end, against any ssh host you can reach:
+CM_TEST_SSH_TARGET=box cargo test -p captain-miao --features bundle-linux-x86_64 -- \
+  --ignored provisions_a_real_host
 ```
 
 ## Release + npm distribution

@@ -23,6 +23,15 @@ in
       cargo-edit
       cargo-watch
 
+      # `cargo xtask dist` cross-compiles captain-miao-server for the dashboards
+      # that carry one. zig is what makes that work at all: the server pulls in
+      # bundled SQLite's C amalgamation, so a cross needs a C cross-compiler and
+      # a target libc, and zig ships both for every glibc version it supports.
+      # Without these two only the *host* target builds, natively and against
+      # this machine's glibc, and xtask says what to install for the others.
+      cargo-zigbuild
+      zig
+
       # for kitty remote control during development
       kitty
     ];

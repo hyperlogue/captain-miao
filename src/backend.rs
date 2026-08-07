@@ -39,6 +39,7 @@ use crate::protocol::{
     ClientFrame, PROTOCOL_MIN, PROTOCOL_VERSION, ServerFrame, protocol_compatible, read_frame,
     write_frame,
 };
+use crate::server_payload::ServerPayload;
 use crate::state::{self, HostId, LauncherState, SessionFlags, SessionKey};
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
@@ -753,33 +754,72 @@ fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
 // Remote binary provisioning (next-step #1, open-decision #3)
 //
 // On connect, probe the remote for a version-matching `miao-server` and
-// invoke whichever copy it finds: one on PATH first, else one at our cache path
-// (where `redeploy.sh` and, later, the embed-and-deploy work put it). Read-only
-// and never fatal — any failure (host unreachable, version mismatch, no binary)
-// resolves to `miao-server` on PATH, i.e. exactly the pre-provisioning
-// behavior.
+// invoke whichever copy it finds: one on PATH first (a user install — never
+// touched), else one at our cache path. If neither is usable and this build
+// carries a payload the host could run, **upload it** and use that.
 //
-// NOTE: the dashboard used to *auto-upload itself* here when the arches matched.
-// That died with the crate split — the dashboard no longer links the pty pool
-// (that's `miao-server`), so the binary it could upload wouldn't be a
-// functional server. The scp/upload path and its `Provision::Upload` arm were
-// removed rather than left unreachable; recover them from git history if the
-// embed-and-deploy work wants them back (they'd need to ship the *server*
-// binary, not self).
+// The upload is the crate split's deferred "embed + auto-deploy" work, restored
+// on the right footing. It died with the split because the dashboard stopped
+// linking the pty pool, so the only binary it could upload — itself — wouldn't
+// be a functional server. What it sends now is a real `miao-server`,
+// cross-built and embedded by `build.rs` in the same command that builds the
+// dashboard (`src/server_payload.rs`, `crates/cm-payload`). A dashboard built
+// without a `bundle-*` feature behaves exactly
+// as it did before: probe, don't upload, and name what's wrong.
+//
+// Ownership rule, and the reason `UsePath` sorts first: **PATH is the user's,
+// the cache path is ours.** A version-matching binary the user installed always
+// wins and is never overwritten; the cache path is refreshed to match our
+// payload exactly whenever it doesn't.
 // =============================================================================
+
+/// The binary's name: what it's called on the remote's `PATH`, and what a
+/// `--version` line starts with.
+const SERVER_BIN: &str = "miao-server";
+
+/// The directory a deployed miao-server lives in, relative to `$HOME`.
+/// The three `REMOTE_*_REL` paths have to agree; they're literals rather than
+/// `concat!`-derived because `concat!` takes literals, not consts.
+const REMOTE_BIN_DIR_REL: &str = ".cache/captain-miao/bin";
 
 /// Where a deployed miao-server lives on the remote, relative to `$HOME`.
 /// Shared with `redeploy.sh`, which uploads to exactly this path.
 const REMOTE_CACHE_REL: &str = ".cache/captain-miao/bin/miao-server";
 
-/// One-shot probe of a remote host: its `$HOME`, `uname -sm`, and the version of
-/// a captain-miao on PATH / at the cache path (if any).
+/// Where an in-flight upload is staged before it's verified and published,
+/// relative to `$HOME`.
+const REMOTE_INCOMING_REL: &str = ".cache/captain-miao/bin/miao-server.incoming";
+
+/// Marker beside the deployed binary recording the sha256 of the payload we put
+/// there, relative to `$HOME`.
+///
+/// It exists because a version match is not identity: dev builds never bump the
+/// version, so `0.2.1` on the host tells us nothing about *which* `0.2.1`. The
+/// marker closes that — rebuild, reconnect, and the host gets the new server —
+/// which is what makes `redeploy.sh`'s whole reason for existing go away for
+/// payload-carrying builds.
+const REMOTE_MARKER_REL: &str = ".cache/captain-miao/bin/miao-server.sha256";
+
+/// How long a failed upload suppresses the next attempt for the same payload.
+/// Without it, a host that accepts ssh but refuses the write (read-only `$HOME`,
+/// full disk, no exec permission on the mount) would be re-sent multiple
+/// megabytes on every reconnect — and the reconnect backoff caps at 30s.
+const UPLOAD_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Ceiling on one upload, so a stalled transfer can't wedge the reconnect loop
+/// forever. Generous: this is multiple megabytes over whatever link the user has.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One-shot probe of a remote host: its `$HOME`, `uname -sm`, the version of a
+/// miao-server on PATH / at the cache path (if any), and the digest
+/// marker we left beside the cached one (if any).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteProbe {
     home: String,
     arch: String,
     path_version: Option<String>,
     cache_version: Option<String>,
+    cache_sha: Option<String>,
 }
 
 /// The provisioning action a probe + local facts imply. Pure + unit-tested.
@@ -789,21 +829,66 @@ enum Provision {
     UsePath,
     /// A version-matching binary is already at the cache path; invoke it there.
     UseCache,
-    /// Nothing version-matching anywhere; fall back to `miao-server` on
-    /// PATH and let the connection fail loudly if it isn't there.
+    /// Nothing usable is there, but we carry a payload this host can run: push it
+    /// to the cache path, then use it. Carries the payload's digest, which is
+    /// what the retry cooldown keys on.
+    Upload { sha256: String },
+    /// Nothing version-matching anywhere and nothing to upload; fall back to
+    /// `miao-server` on PATH and let the connection fail loudly.
     FallBack,
 }
 
-/// The shell script the probe runs over ssh. Four lines out: `$HOME`, the
-/// machine, then a `--version` line (or our `-` sentinel) for the PATH binary
-/// and the cache-path binary. `--version` errors and "command not found" both
-/// land on stderr and a non-zero exit, so `|| echo -` normalizes them.
-const PROBE_SCRIPT: &str = "echo \"$HOME\"; uname -sm; \
-miao-server --version 2>/dev/null || echo -; \
-\"$HOME/.cache/captain-miao/bin/miao-server\" --version 2>/dev/null || echo -";
+/// The shell script the probe runs over ssh. Five lines out: `$HOME`, the
+/// machine, a `--version` line (or our `-` sentinel) for the PATH binary and for
+/// the cache-path binary, then the digest marker. `--version` errors and
+/// "command not found" both land on stderr and a non-zero exit, so `|| echo -`
+/// normalizes them.
+fn probe_script() -> String {
+    format!(
+        "echo \"$HOME\"; uname -sm; \
+         {SERVER_BIN} --version 2>/dev/null || echo -; \
+         \"$HOME/{REMOTE_CACHE_REL}\" --version 2>/dev/null || echo -; \
+         cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null || echo -"
+    )
+}
 
-/// Parse [`PROBE_SCRIPT`] output. A `--version` line is `captain-miao <ver>`;
-/// our `-` sentinel and a blank line map to `None`. Pure.
+/// Pull the version out of a remote `<binary> --version`, tolerating anything a
+/// login shell's rc files printed around it — a `fish_greeting` or an `echo` in
+/// `.bashrc` lands on the same stdout, so taking "the second word of the output"
+/// would read the greeting instead. Pure.
+fn reported_version(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        (words.next()? == SERVER_BIN)
+            .then(|| words.next())?
+            .map(str::to_string)
+    })
+}
+
+/// Wrap a POSIX-sh script so it survives the remote's **login shell**.
+///
+/// `ssh host <command>` does not exec the command — it hands the whole string to
+/// the account's login shell, which is regularly `fish` (and occasionally
+/// `csh`), neither of which speaks `var=value`, `trap`, or `set -e`. Verified
+/// the hard way: a `d="$HOME/…"` assignment came back as *"fish: Unsupported use
+/// of '='"*.
+///
+/// So the command we send is `/bin/sh -c '<script>'`, and the wrapping survives
+/// every dialect for one specific reason: a single-quoted string is literal in
+/// sh, bash, zsh, fish, **and** csh. The catch is that only fish honours `\'` and
+/// `\\` inside one, so the script must contain **neither a single quote nor a
+/// backslash** — pinned by [`upload_script`]'s tests, and the reason the deploy
+/// script writes its marker with `echo` rather than `printf '%s\n'`.
+fn login_shell_safe(script: &str) -> String {
+    debug_assert!(
+        !script.contains('\'') && !script.contains('\\'),
+        "a script wrapped for the login shell must contain no quote or backslash: {script}"
+    );
+    format!("/bin/sh -c '{script}'")
+}
+
+/// Parse [`probe_script`] output. A `--version` line is `miao-server
+/// <ver>`; our `-` sentinel and a blank line map to `None`. Pure.
 fn parse_probe(out: &str) -> Option<RemoteProbe> {
     let mut lines = out.lines();
     let home = lines.next()?.trim().to_string();
@@ -811,48 +896,80 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
     if home.is_empty() || arch.is_empty() {
         return None;
     }
-    let version = |line: Option<&str>| -> Option<String> {
+    // A plain fn, not a closure: closure lifetime elision can't express
+    // "borrowed from the argument" for a `&str` in and a `&str` out.
+    fn field(line: Option<&str>) -> Option<&str> {
         let l = line?.trim();
-        if l.is_empty() || l == "-" {
-            return None;
-        }
-        // clap prints "<name> <version>"; take the version token.
-        l.split_whitespace().nth(1).map(str::to_string)
+        (!l.is_empty() && l != "-").then_some(l)
+    }
+    // clap prints "<name> <version>"; take the version token.
+    let version = |line: Option<&str>| -> Option<String> {
+        field(line)?.split_whitespace().nth(1).map(str::to_string)
     };
     let path_version = version(lines.next());
     let cache_version = version(lines.next());
+    let cache_sha = field(lines.next()).map(str::to_string);
     Some(RemoteProbe {
         home,
         arch,
         path_version,
         cache_version,
+        cache_sha,
     })
 }
 
-/// Decide which remote binary to invoke: prefer a version-matching one on PATH
-/// (a user install), then one at our cache path, else fall back to PATH and let
-/// it fail. Pure + unit-tested.
-fn decide_provision(local_version: &str, probe: &RemoteProbe) -> Provision {
+/// Decide which remote binary to invoke. `payload` is `(target, sha256)` for the
+/// embedded server this host could run, if we carry one — passed as plain
+/// strings rather than a `&ServerPayload` so the decision stays testable in a
+/// build carrying no payload — which is every test run, since the `bundle-*`
+/// features are off. Pure + unit-tested.
+fn decide_provision(
+    local_version: &str,
+    probe: &RemoteProbe,
+    payload: Option<(&str, &str)>,
+) -> Provision {
+    // A user install always wins, and we never overwrite it.
     if probe.path_version.as_deref() == Some(local_version) {
         return Provision::UsePath;
     }
     if probe.cache_version.as_deref() == Some(local_version) {
-        return Provision::UseCache;
+        match payload {
+            // The cache path is ours, so "right version" isn't enough once we
+            // have a payload to compare against — it has to be *this* build.
+            Some((_, sha)) if probe.cache_sha.as_deref() != Some(sha) => {}
+            _ => return Provision::UseCache,
+        }
     }
-    Provision::FallBack
+    match payload {
+        Some((_, sha)) => Provision::Upload {
+            sha256: sha.to_string(),
+        },
+        None => Provision::FallBack,
+    }
 }
 
 /// The **loud** half of "assume it's there, verify, and fail loudly" (§4): turn
 /// a fall-back decision into a sentence the hosts panel can show, instead of the
 /// generic connection failure a missing or stale server used to produce.
-/// `None` when the provision succeeded and there is nothing to report. Pure.
+/// `None` when the provision succeeded and there is nothing to report.
+///
+/// `upload_error` is the reason an attempted deploy didn't land; it takes
+/// precedence, because "we tried to fix this for you and here's what stopped us"
+/// is more actionable than "not found". `embedded` is what this build could have
+/// deployed, so a `FallBack` on an arch we don't carry says *that* rather than
+/// leaving the user to guess why nothing was pushed. Pure.
 fn provision_failure(
     local_version: &str,
     probe: &RemoteProbe,
     action: &Provision,
+    upload_error: Option<&str>,
+    embedded: &[&str],
 ) -> Option<String> {
     if !matches!(action, Provision::FallBack) {
         return None;
+    }
+    if let Some(e) = upload_error {
+        return Some(format!("could not deploy miao-server: {e}"));
     }
     let found: Vec<&str> = [
         probe.path_version.as_deref(),
@@ -861,22 +978,94 @@ fn provision_failure(
     .into_iter()
     .flatten()
     .collect();
+    // Why we didn't just fix it ourselves: either this build ships no payloads
+    // at all, or none for this host's arch.
+    let cannot_deploy = if embedded.is_empty() {
+        "this build carries no server payload".to_string()
+    } else {
+        format!(
+            "no payload for {} (this build carries {})",
+            probe.arch,
+            embedded.join(", ")
+        )
+    };
     Some(match found.as_slice() {
-        [] => format!("miao-server not found (need {local_version}); deploy it with redeploy.sh"),
+        [] => format!(
+            "miao-server not found (need {local_version}); {cannot_deploy} — \
+             deploy it with redeploy.sh"
+        ),
         versions => format!(
-            "miao-server version mismatch (found {}, need {local_version})",
+            "miao-server version mismatch (found {}, need {local_version}); \
+             {cannot_deploy}",
             versions.join(", ")
         ),
     })
 }
 
 /// The remote command an action resolves to: the absolute cache path for
-/// `UseCache`, else `miao-server` from PATH.
+/// `UseCache` (and for `Upload`, which lands there), else `miao-server`
+/// from PATH.
 fn remote_exe_for(action: &Provision, home: &str) -> String {
     match action {
-        Provision::UseCache => format!("{home}/{REMOTE_CACHE_REL}"),
+        Provision::UseCache | Provision::Upload { .. } => format!("{home}/{REMOTE_CACHE_REL}"),
         Provision::UsePath | Provision::FallBack => "miao-server".to_string(),
     }
+}
+
+/// Remembers a failed upload so the next reconnect doesn't repeat it. Keyed on
+/// the payload digest, so building a new server *does* get a fresh attempt
+/// immediately — only re-sending the same bytes to the same host is suppressed.
+/// Pure over an injected `now`, so the cooldown is unit-tested without sleeping.
+#[derive(Default)]
+struct UploadGate {
+    last: Option<(String, Instant, String)>,
+}
+
+impl UploadGate {
+    /// The remembered error, if uploading `sha` is still on cooldown.
+    fn suppressed(&self, sha: &str, now: Instant) -> Option<&str> {
+        let (failed_sha, at, error) = self.last.as_ref()?;
+        (failed_sha == sha && now.duration_since(*at) < UPLOAD_RETRY_COOLDOWN)
+            .then_some(error.as_str())
+    }
+
+    fn record_failure(&mut self, sha: &str, now: Instant, error: String) {
+        self.last = Some((sha.to_string(), now, error));
+    }
+
+    /// Forget the last failure — called once a connection actually works, so a
+    /// transient problem doesn't hold the cooldown past its usefulness.
+    fn clear(&mut self) {
+        self.last = None;
+    }
+}
+
+/// The script the remote runs while we stream the binary into its stdin.
+///
+/// Staged through a temp file and moved into place only after the host itself
+/// has run it: a truncated transfer or a payload for the wrong ABI fails the
+/// `--version` line, `set -e` aborts, and nothing was ever visible at the path
+/// the next connect will invoke. That check is also what covers the one thing
+/// `uname` can't tell us, glibc vs musl.
+///
+/// Two constraints shape how it's written, both from [`login_shell_safe`]: no
+/// single quote and no backslash anywhere in it. Hence `echo` for the marker
+/// rather than `printf '%s\n'`, and hence clearing the temp file at the *start*
+/// of the run rather than with an `EXIT` trap — a failed deploy leaves its temp
+/// behind, which costs some cache-directory space until the next attempt and
+/// buys a script that runs everywhere. Pure, so all of this is unit-tested.
+fn upload_script(sha256: &str) -> String {
+    format!(
+        "set -e; \
+         t=\"$HOME/{REMOTE_INCOMING_REL}\"; \
+         mkdir -p \"$HOME/{REMOTE_BIN_DIR_REL}\"; \
+         rm -f \"$t\"; \
+         cat > \"$t\"; \
+         chmod 0755 \"$t\"; \
+         \"$t\" --version; \
+         mv -f \"$t\" \"$HOME/{REMOTE_CACHE_REL}\"; \
+         echo {sha256} > \"$HOME/{REMOTE_MARKER_REL}\""
+    )
 }
 
 /// An ssh/scp `Command` detached from the TUI's terminal — stdin/stdout/stderr
@@ -920,12 +1109,12 @@ fn ssh_common_opts(ctl: &Path) -> Vec<String> {
     ]
 }
 
-/// Run [`PROBE_SCRIPT`] on the remote (this also primes the ControlMaster).
+/// Run [`probe_script`] on the remote (this also primes the ControlMaster).
 async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
     let out = Command::new("ssh")
         .args(opts)
         .arg(target)
-        .arg(PROBE_SCRIPT)
+        .arg(login_shell_safe(&probe_script()))
         .output()
         .await
         .ok()?;
@@ -935,12 +1124,106 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
     parse_probe(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Resolve the remote command to invoke: probe → decide. Never errors — any
-/// failure resolves to `miao-server` on PATH so the rest of `setup_ssh`
-/// behaves exactly as it did before provisioning existed. The second half of
-/// the pair is the *diagnosis*: a `Some(reason)` names what's wrong with the
-/// remote install, for `ConnState::Failed` to carry (§4).
-async fn resolve_remote_exe(target: &str, opts: &[String]) -> (String, Option<String>) {
+/// Stream an embedded server payload to the host's cache path over the ssh
+/// connection the probe already opened (so it costs no extra authentication —
+/// the ControlMaster is up by now).
+///
+/// The binary goes in over **stdin** rather than via `scp`: `scp` would need a
+/// local temp file holding a multi-megabyte executable, and a second remote
+/// command to chmod and move it, where `cat > tmp` is one round trip with no
+/// local artifact. The payload is inflated here rather than shipped compressed,
+/// which deliberately trades bandwidth for having no decompressor requirement on
+/// a host whose entire distinguishing feature is that nothing is installed on it
+/// yet.
+async fn upload_server(
+    target: &str,
+    opts: &[String],
+    payload: &'static ServerPayload,
+) -> Result<(), String> {
+    let bytes = payload
+        .decompress()
+        .map_err(|e| format!("inflating the embedded {} payload: {e}", payload.target))?;
+    let len = bytes.len();
+    tracing::info!(
+        target: "captain_miao::provision",
+        "{target}: deploying embedded {} server ({len} bytes) to ~/{REMOTE_CACHE_REL}",
+        payload.target
+    );
+
+    let mut child = Command::new("ssh")
+        .args(opts)
+        .arg(target)
+        .arg(login_shell_safe(&upload_script(payload.sha256)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // The timeout below is enforced by dropping the future, which would
+        // otherwise leave an ssh child holding a half-written temp file.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawning ssh: {e}"))?;
+
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    // Feed stdin from a task while `wait_with_output` drains stdout/stderr:
+    // doing both from one task deadlocks the moment either pipe fills.
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(&bytes).await?;
+        stdin.shutdown().await
+    });
+
+    let out = tokio::time::timeout(UPLOAD_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("timed out after {}s", UPLOAD_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    // A write error here is usually the *consequence* of the remote script
+    // failing (it exited, closing the pipe), so the script's own stderr below is
+    // the better message; only report this one if the script looked fine.
+    let write_err = match writer.await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(format!("sending the binary: {e}")),
+        Err(e) => Some(format!("upload task: {e}")),
+    };
+
+    if !out.status.success() {
+        let stderr: String = String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(if stderr.is_empty() {
+            write_err.unwrap_or_else(|| format!("host rejected it (rc={:?})", out.status.code()))
+        } else {
+            stderr
+        });
+    }
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    // The script echoed what the *host* got from `<binary> --version`, which is
+    // the real proof it both landed intact and can run there.
+    let expected = env!("CARGO_PKG_VERSION");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if reported_version(&stdout).as_deref() != Some(expected) {
+        return Err(format!(
+            "deployed binary reported {:?}, expected {SERVER_BIN} {expected}",
+            stdout.trim().chars().take(120).collect::<String>()
+        ));
+    }
+    tracing::info!(target: "captain_miao::provision", "{target}: deployed {expected} ({} bytes)", len);
+    Ok(())
+}
+
+/// Resolve the remote command to invoke: probe → decide → (deploy) → invoke.
+/// Never errors — any failure resolves to `miao-server` on PATH so the
+/// rest of `setup_ssh` behaves exactly as it did before provisioning existed.
+/// The second half of the pair is the *diagnosis*: a `Some(reason)` names what's
+/// wrong with the remote install, for `ConnState::Failed` to carry (§4).
+async fn resolve_remote_exe(
+    target: &str,
+    opts: &[String],
+    gate: &mut UploadGate,
+) -> (String, Option<String>) {
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
@@ -952,15 +1235,54 @@ async fn resolve_remote_exe(target: &str, opts: &[String]) -> (String, Option<St
         );
     };
     let local_version = env!("CARGO_PKG_VERSION");
-    let action = decide_provision(local_version, &probe);
+    let payload = crate::server_payload::for_uname(&probe.arch);
+    let mut action = decide_provision(local_version, &probe, payload.map(|p| (p.target, p.sha256)));
     tracing::debug!(
         target: "captain_miao::provision",
-        "{target}: remote_arch={:?} path_ver={:?} cache_ver={:?} → {action:?}",
-        probe.arch, probe.path_version, probe.cache_version
+        "{target}: remote_arch={:?} path_ver={:?} cache_ver={:?} payload={:?} → {action:?}",
+        probe.arch, probe.path_version, probe.cache_version, payload.map(|p| p.target)
     );
+
+    // Deploy, if that's what the decision asked for. A failure demotes to
+    // `FallBack` and is reported verbatim rather than retried here — the
+    // reconnect loop is the retry mechanism, and `gate` keeps it from re-sending
+    // megabytes on every pass.
+    let mut upload_error = None;
+    if let Provision::Upload { sha256 } = &action {
+        let payload = payload.expect("Upload is only reachable with a payload");
+        let now = Instant::now();
+        let failure = match gate.suppressed(sha256, now) {
+            Some(previous) => Some(previous.to_string()),
+            None => match upload_server(target, opts, payload).await {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!(target: "captain_miao::provision", "{target}: deploy failed: {e}");
+                    gate.record_failure(sha256, now, e.clone());
+                    Some(e)
+                }
+            },
+        };
+        match failure {
+            None => action = Provision::UseCache,
+            Some(e) => {
+                upload_error = Some(e);
+                action = Provision::FallBack;
+            }
+        }
+    }
+
     let exe = remote_exe_for(&action, &probe.home);
     tracing::debug!(target: "captain_miao::provision", "{target}: remote exe = {exe}");
-    (exe, provision_failure(local_version, &probe, &action))
+    (
+        exe,
+        provision_failure(
+            local_version,
+            &probe,
+            &action,
+            upload_error.as_deref(),
+            &crate::server_payload::embedded_targets(),
+        ),
+    )
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -1028,6 +1350,9 @@ async fn connection_task(
     };
     let mut backoff = RECONNECT_INITIAL;
     let mut was_connected = false;
+    // Lives for the whole task, so one host's refusal to accept a deployed
+    // server isn't re-litigated (at multiple megabytes a go) on every reconnect.
+    let mut upload_gate = UploadGate::default();
     loop {
         store(ConnState::Connecting);
         // Establish the transport; for ssh, (re)stand up the forward+server
@@ -1038,7 +1363,15 @@ async fn connection_task(
         let established = match &transport {
             Transport::LocalSocket(p) => Some((p.clone(), None)),
             Transport::Ssh { target, local_sock } => {
-                match setup_ssh(target, local_sock, &remote_exe, &mut failure).await {
+                match setup_ssh(
+                    target,
+                    local_sock,
+                    &remote_exe,
+                    &mut failure,
+                    &mut upload_gate,
+                )
+                .await
+                {
                     Some(child) => Some((local_sock.clone(), Some(child))),
                     None => {
                         tracing::warn!(target: "captain_miao::ssh", "{target}: ssh setup failed — will retry");
@@ -1082,6 +1415,10 @@ async fn connection_task(
             reconnect_epoch.fetch_add(1, Ordering::Relaxed);
         }
         was_connected = true;
+        // The host is demonstrably working, so any remembered deploy failure is
+        // history — a later one gets a fresh attempt rather than inheriting an
+        // old cooldown.
+        upload_gate.clear();
         store(ConnState::Connected);
         let connected_at = Instant::now();
         let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
@@ -1177,6 +1514,7 @@ async fn setup_ssh(
     local_sock: &Path,
     remote_exe: &Arc<Mutex<String>>,
     failure: &mut Option<String>,
+    upload_gate: &mut UploadGate,
 ) -> Option<tokio::process::Child> {
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
@@ -1192,7 +1530,7 @@ async fn setup_ssh(
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
-    let (exe, diagnosis) = resolve_remote_exe(target, &opts).await;
+    let (exe, diagnosis) = resolve_remote_exe(target, &opts, upload_gate).await;
     *remote_exe.lock().unwrap() = exe.clone();
     // Carry the diagnosis out even when we go on to try the fallback: if the
     // `daemon ensure` below fails, *this* is the reason the user needs, not
@@ -1513,25 +1851,41 @@ mod tests {
             arch: arch.into(),
             path_version: path.map(str::to_string),
             cache_version: cache.map(str::to_string),
+            cache_sha: None,
+        }
+    }
+
+    /// The payload a test dashboard carries: `(target, sha256)`, exactly the
+    /// shape `decide_provision` takes.
+    const PAYLOAD: (&str, &str) = ("x86_64-unknown-linux-gnu", "abc123");
+
+    fn upload(sha: &str) -> Provision {
+        Provision::Upload {
+            sha256: sha.to_string(),
         }
     }
 
     #[test]
-    fn parse_probe_extracts_home_arch_and_versions() {
-        let out = "/home/u\nLinux x86_64\ncaptain-miao 0.1.0\n-\n";
+    fn parse_probe_extracts_home_arch_versions_and_marker() {
+        let out = "/home/u\nLinux x86_64\nmiao-server 0.1.0\n-\n-\n";
         let p = parse_probe(out).unwrap();
         assert_eq!(p.home, "/home/u");
         assert_eq!(p.arch, "Linux x86_64");
         assert_eq!(p.path_version.as_deref(), Some("0.1.0"));
         assert_eq!(p.cache_version, None); // the "-" sentinel
+        assert_eq!(p.cache_sha, None);
     }
 
     #[test]
     fn parse_probe_handles_cache_only_and_blank_lines() {
-        // PATH binary missing ("-"), cache binary present.
-        let p = parse_probe("/root\nDarwin arm64\n-\ncaptain-miao 0.2.0").unwrap();
+        // PATH binary missing ("-"), cache binary present, marker written.
+        let p = parse_probe("/root\nDarwin arm64\n-\nmiao-server 0.2.0\ndeadbeef\n").unwrap();
         assert_eq!(p.path_version, None);
         assert_eq!(p.cache_version.as_deref(), Some("0.2.0"));
+        assert_eq!(p.cache_sha.as_deref(), Some("deadbeef"));
+        // A host deployed by an older build (or by redeploy.sh) has no marker.
+        let p = parse_probe("/root\nDarwin arm64\n-\nmiao-server 0.2.0").unwrap();
+        assert_eq!(p.cache_sha, None);
         // Truncated/garbage output → None rather than a half-built probe.
         assert!(parse_probe("/home/u").is_none());
         assert!(parse_probe("\n\n").is_none());
@@ -1540,26 +1894,78 @@ mod tests {
     #[test]
     fn decide_prefers_path_install_over_cache() {
         let lx = "Linux x86_64";
-        // PATH match wins outright — a user install beats our cache copy.
+        // PATH match wins outright — a user install beats our cache copy, and is
+        // never overwritten even when we carry a payload.
         let p = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p), Provision::UsePath);
+        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UsePath);
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            Provision::UsePath
+        );
         // No PATH match, but our cache copy matches → use it.
         let p = probe(lx, None, Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p), Provision::UseCache);
+        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UseCache);
     }
 
     #[test]
-    fn decide_falls_back_when_nothing_matches_the_local_version() {
+    fn decide_falls_back_when_nothing_matches_and_we_carry_nothing() {
         let lx = "Linux x86_64";
         // Nothing deployed anywhere.
         assert_eq!(
-            decide_provision("0.1.0", &probe(lx, None, None)),
+            decide_provision("0.1.0", &probe(lx, None, None), None),
             Provision::FallBack
         );
         // Both present but stale — a version mismatch must not be invoked, since
         // the wire protocol isn't guaranteed compatible across versions.
         let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.2.0", &stale), Provision::FallBack);
+        assert_eq!(decide_provision("0.2.0", &stale, None), Provision::FallBack);
+    }
+
+    #[test]
+    fn a_payload_turns_every_fallback_into_a_deploy() {
+        let lx = "Linux x86_64";
+        // Nothing there at all — the fresh-host case.
+        assert_eq!(
+            decide_provision("0.1.0", &probe(lx, None, None), Some(PAYLOAD)),
+            upload("abc123")
+        );
+        // Everything there but stale.
+        let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
+        assert_eq!(
+            decide_provision("0.2.0", &stale, Some(PAYLOAD)),
+            upload("abc123")
+        );
+    }
+
+    #[test]
+    fn a_same_version_cache_binary_is_refreshed_unless_it_is_this_exact_build() {
+        // The dev loop: the version never moves between builds, so identity has
+        // to come from the digest marker we left beside the binary.
+        let mut p = probe("Linux x86_64", None, Some("0.1.0"));
+
+        p.cache_sha = Some("abc123".into());
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            Provision::UseCache
+        );
+
+        // A different build of the same version — re-deploy.
+        p.cache_sha = Some("999999".into());
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            upload("abc123")
+        );
+
+        // No marker at all (redeploy.sh, or a pre-marker dashboard). We own this
+        // path, so we take it over rather than trusting an unlabelled binary.
+        p.cache_sha = None;
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            upload("abc123")
+        );
+        // …but a build carrying no payload has nothing better to offer, so it
+        // keeps using what's there.
+        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UseCache);
     }
 
     #[test]
@@ -1576,6 +1982,386 @@ mod tests {
             remote_exe_for(&Provision::UseCache, "/root"),
             "/root/.cache/captain-miao/bin/miao-server"
         );
+        // An upload lands at the cache path, so it resolves there too.
+        assert_eq!(
+            remote_exe_for(&upload("abc123"), "/root"),
+            "/root/.cache/captain-miao/bin/miao-server"
+        );
+    }
+
+    #[test]
+    fn the_failure_text_says_which_of_the_three_things_went_wrong() {
+        let lx = "Linux x86_64";
+        let missing = probe(lx, None, None);
+        let msg = provision_failure("0.2.0", &missing, &Provision::FallBack, None, &[]).unwrap();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("carries no server payload"), "{msg}");
+
+        let stale = probe(lx, Some("0.1.0"), None);
+        let msg = provision_failure("0.2.0", &stale, &Provision::FallBack, None, &[]).unwrap();
+        assert!(msg.contains("version mismatch"), "{msg}");
+
+        // A build that *does* carry payloads, just not for this host: say so,
+        // and say what it has, so the fix (a build carrying that arch) is
+        // obvious.
+        let msg = provision_failure(
+            "0.2.0",
+            &probe("Linux riscv64", None, None),
+            &Provision::FallBack,
+            None,
+            &["x86_64-unknown-linux-gnu"],
+        )
+        .unwrap();
+        assert!(msg.contains("no payload for Linux riscv64"), "{msg}");
+        assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
+
+        // A failed deploy outranks both: it's the more actionable sentence.
+        let msg = provision_failure(
+            "0.2.0",
+            &missing,
+            &Provision::FallBack,
+            Some("disk full"),
+            &[],
+        )
+        .unwrap();
+        assert!(msg.contains("could not deploy"), "{msg}");
+        assert!(msg.contains("disk full"), "{msg}");
+
+        // Nothing to report when provisioning worked.
+        assert!(provision_failure("0.2.0", &missing, &Provision::UseCache, None, &[]).is_none());
+        assert!(provision_failure("0.2.0", &missing, &upload("x"), None, &[]).is_none());
+    }
+
+    #[test]
+    fn a_failed_upload_is_not_retried_until_the_cooldown_or_a_new_payload() {
+        let mut gate = UploadGate::default();
+        let t0 = Instant::now();
+        assert!(gate.suppressed("sha-a", t0).is_none());
+
+        gate.record_failure("sha-a", t0, "read-only $HOME".into());
+        // Same payload, still inside the window: reuse the remembered reason
+        // rather than re-sending megabytes on every reconnect.
+        assert_eq!(
+            gate.suppressed("sha-a", t0 + Duration::from_secs(30)),
+            Some("read-only $HOME")
+        );
+        // A *different* payload is a new fact — try immediately.
+        assert!(gate.suppressed("sha-b", t0).is_none());
+        // Past the cooldown, so is the same one.
+        assert!(
+            gate.suppressed("sha-a", t0 + UPLOAD_RETRY_COOLDOWN + Duration::from_secs(1))
+                .is_none()
+        );
+        // A working connection wipes the memory outright.
+        gate.clear();
+        assert!(gate.suppressed("sha-a", t0).is_none());
+    }
+
+    #[test]
+    fn the_upload_script_stages_verifies_then_moves() {
+        let script = upload_script("d1g3st");
+        // Order is the safety property: the binary is only visible at the path
+        // the next connect invokes *after* the host itself has run it.
+        let stage = script.find("cat > ").unwrap();
+        let verify = script.find("--version").unwrap();
+        let publish = script.find("mv -f").unwrap();
+        let marker = script.find("miao-server.sha256").unwrap();
+        assert!(stage < verify, "{script}");
+        assert!(verify < publish, "{script}");
+        assert!(publish < marker, "{script}");
+        // The temp is cleared before it's written, not after — there is no trap
+        // to clean up with (see the doc comment), so the next attempt does it.
+        assert!(script.find("rm -f").unwrap() < stage, "{script}");
+        // A failure anywhere aborts rather than publishing half a deploy.
+        assert!(script.starts_with("set -e;"), "{script}");
+        // The digest is what a later probe compares against.
+        assert!(script.contains("echo d1g3st"), "{script}");
+        // `$HOME` is expanded by the *remote* shell — the client is
+        // home-ignorant (§3), so it must never splice its own in.
+        assert!(
+            script.contains("\"$HOME/.cache/captain-miao/bin\""),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_deployed_version_is_read_past_whatever_the_login_shell_printed() {
+        assert_eq!(
+            reported_version("miao-server 0.2.1\n").as_deref(),
+            Some("0.2.1")
+        );
+        // A `fish_greeting` or an `echo` in .bashrc shares this stdout.
+        assert_eq!(
+            reported_version("Welcome to box!\n\nmiao-server 0.2.1\n").as_deref(),
+            Some("0.2.1")
+        );
+        assert_eq!(reported_version("Welcome to box!\n"), None);
+        assert_eq!(reported_version("miao-server\n"), None);
+        assert_eq!(reported_version(""), None);
+    }
+
+    #[test]
+    fn every_script_we_send_survives_the_wrapping_that_defeats_a_login_shell() {
+        // The constraint that makes `/bin/sh -c '<script>'` parse identically in
+        // sh, bash, zsh, fish and csh. `login_shell_safe` debug-asserts it too,
+        // but only for the scripts a given run happens to build.
+        for script in [probe_script(), upload_script(&"a".repeat(64))] {
+            let script = script.as_str();
+            assert!(!script.contains('\''), "{script}");
+            assert!(!script.contains('\\'), "{script}");
+        }
+        assert_eq!(login_shell_safe("echo hi"), "/bin/sh -c 'echo hi'");
+    }
+
+    /// Run the deploy command against a throwaway `$HOME` under a given shell,
+    /// feeding it a stand-in binary on stdin — exactly as `ssh` would.
+    ///
+    /// This is the half of the deploy that exists only as a shell string, so
+    /// there is nothing else to type-check it: the staging/verify/publish
+    /// ordering and the quoting are only *actually* correct if a shell agrees.
+    /// A stand-in executable rather than a real payload, so it runs in every
+    /// checkout and on any arch — and needs no bundle feature.
+    fn run_deploy(shell: &str, home: &Path, stdin_bytes: &[u8], sha: &str) -> std::process::Output {
+        use std::io::Write;
+        let mut child = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(login_shell_safe(&upload_script(sha)))
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning {shell}: {e}"));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin_bytes)
+            .expect("feeding the script");
+        child.wait_with_output().expect("waiting for the shell")
+    }
+
+    fn run_upload_script(home: &Path, stdin_bytes: &[u8], sha: &str) -> std::process::Output {
+        run_deploy("/bin/sh", home, stdin_bytes, sha)
+    }
+
+    fn scratch_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cm-upload-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_upload_script_deploys_a_binary_the_host_can_run() {
+        let home = scratch_home("ok");
+        let version = env!("CARGO_PKG_VERSION");
+        let fake = format!("#!/bin/sh\necho 'miao-server {version}'\n");
+        let out = run_upload_script(&home, fake.as_bytes(), "d1g3st");
+
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The version the *host* reported is what `upload_server` verifies.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("miao-server {version}")
+        );
+
+        let deployed = home.join(REMOTE_CACHE_REL);
+        assert_eq!(std::fs::read(&deployed).unwrap(), fake.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&deployed).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // The marker is what makes the next probe recognise this exact build.
+        assert_eq!(
+            std::fs::read_to_string(home.join(REMOTE_MARKER_REL))
+                .unwrap()
+                .trim(),
+            "d1g3st"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_deploy_lands_under_every_login_shell_installed_here() {
+        // The bug this pins: `ssh host <cmd>` hands `<cmd>` to the *account's
+        // login shell*, so a POSIX-sh script reached a fish user as
+        // "fish: Unsupported use of '='" and no host with fish as its shell
+        // could ever be provisioned. Whichever of these a machine has, they all
+        // have to produce the same deploy.
+        let version = env!("CARGO_PKG_VERSION");
+        let fake = format!("#!/bin/sh\necho 'miao-server {version}'\n");
+        for shell in ["/bin/sh", "bash", "zsh", "fish", "tcsh"] {
+            if std::process::Command::new(shell)
+                .arg("-c")
+                .arg("exit 0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_err()
+            {
+                continue; // not installed here
+            }
+            let home = scratch_home(&format!("shell-{}", shell.replace('/', "_")));
+            let out = run_deploy(shell, &home, fake.as_bytes(), "d1g3st");
+            assert!(
+                out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(home.join(REMOTE_CACHE_REL)).unwrap(),
+                fake.as_bytes(),
+                "{shell} did not deploy the binary"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join(REMOTE_MARKER_REL))
+                    .unwrap()
+                    .trim(),
+                "d1g3st",
+                "{shell} did not write the marker"
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn a_binary_the_host_cannot_run_never_reaches_the_cache_path() {
+        // The wrong-ABI / truncated-transfer case, which is the whole reason the
+        // script verifies before it publishes: the previous deploy (if any) must
+        // survive, and no temp file may be left behind.
+        let home = scratch_home("bad");
+        let bin_dir = home.join(".cache/captain-miao/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(home.join(REMOTE_CACHE_REL), b"the previous server").unwrap();
+
+        let out = run_upload_script(&home, b"\x7fELF\x00 not runnable here", "d1g3st");
+        assert!(!out.status.success());
+        assert_eq!(
+            std::fs::read(home.join(REMOTE_CACHE_REL)).unwrap(),
+            b"the previous server"
+        );
+        assert!(!home.join(REMOTE_MARKER_REL).exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&bin_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "trap left debris: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The whole provisioning path against a **real** ssh host: probe, deploy
+    /// the embedded payload, verify it runs there, then confirm a second connect
+    /// recognises its own work and doesn't re-send it.
+    ///
+    /// Ignored by default because it needs a host, and a bundle feature so the
+    /// test binary carries a payload for that host's arch. It is the one part of
+    /// §10.3's end-to-end checklist that
+    /// doesn't need a *remote* machine — an sshd on localhost exercises every
+    /// line of it — so run it whenever the deploy path changes:
+    ///
+    /// ```text
+    /// CM_TEST_SSH_TARGET=127.0.0.1 \
+    ///   CM_TEST_SSH_OPTS="-p 2299 -i /tmp/id -o StrictHostKeyChecking=no" \
+    ///   cargo test -p captain-miao --features bundle-linux-x86_64 -- \
+    ///     --ignored provisions_a_real_host
+    /// ```
+    ///
+    /// The feature is what puts a payload in the test binary; without one there
+    /// is nothing to deploy and the test says so.
+    ///
+    /// It deploys to `~/.cache/captain-miao/bin/` on the target, which is
+    /// exactly where a normal connect would put it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a real ssh host: set CM_TEST_SSH_TARGET"]
+    async fn provisions_a_real_host_end_to_end() {
+        let target = std::env::var("CM_TEST_SSH_TARGET").expect("CM_TEST_SSH_TARGET");
+        let ctl = crate::state::ssh_control_path(&target);
+        if let Some(dir) = ctl.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut opts = ssh_common_opts(&ctl);
+        if let Ok(extra) = std::env::var("CM_TEST_SSH_OPTS") {
+            opts.extend(extra.split_whitespace().map(str::to_string));
+        }
+
+        let probe = probe_remote(&target, &opts).await.expect("probe");
+        let payload = crate::server_payload::for_uname(&probe.arch).unwrap_or_else(|| {
+            panic!(
+                "no embedded payload for {:?}; build with a bundle-* feature (have: {:?})",
+                probe.arch,
+                crate::server_payload::embedded_targets()
+            )
+        });
+
+        // Start from a clean slate so this really is the fresh-host path.
+        let wipe = format!("rm -f \"$HOME/{REMOTE_CACHE_REL}\" \"$HOME/{REMOTE_MARKER_REL}\"");
+        assert!(
+            Command::new("ssh")
+                .args(&opts)
+                .arg(&target)
+                .arg(&wipe)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let fresh = probe_remote(&target, &opts).await.expect("probe");
+        assert_eq!(fresh.cache_version, None);
+        assert_eq!(
+            decide_provision(
+                env!("CARGO_PKG_VERSION"),
+                &fresh,
+                Some((payload.target, payload.sha256))
+            ),
+            upload(payload.sha256),
+        );
+
+        // First connect: deploys, and resolves to what it deployed.
+        let mut gate = UploadGate::default();
+        let (exe, failure) = resolve_remote_exe(&target, &opts, &mut gate).await;
+        assert_eq!(failure, None, "deploy reported: {failure:?}");
+        assert_eq!(exe, format!("{}/{REMOTE_CACHE_REL}", fresh.home));
+
+        // The deployed binary is real: it answers `--version` on the host with
+        // our version, and it left the marker that identifies this exact build.
+        let after = probe_remote(&target, &opts).await.expect("probe");
+        assert_eq!(
+            after.cache_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(after.cache_sha.as_deref(), Some(payload.sha256));
+
+        // Second connect: recognises its own deploy and re-sends nothing.
+        assert_eq!(
+            decide_provision(
+                env!("CARGO_PKG_VERSION"),
+                &after,
+                Some((payload.target, payload.sha256))
+            ),
+            Provision::UseCache,
+        );
+        let (exe2, failure2) = resolve_remote_exe(&target, &opts, &mut gate).await;
+        assert_eq!(failure2, None);
+        assert_eq!(exe2, exe);
+
+        // And the thing we deployed actually is the daemon, not just a binary
+        // that parses `--version`.
+        let out = Command::new("ssh")
+            .args(&opts)
+            .arg(&target)
+            .arg(format!("\"$HOME/{REMOTE_CACHE_REL}\" daemon status"))
+            .output()
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("daemon"), "daemon status said: {text:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

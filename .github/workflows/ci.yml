@@ -56,8 +56,16 @@ jobs:
       - name: rustfmt
         run: nix develop --command cargo fmt --all --check
 
+      # Two explicit runs rather than `--all-features`. The `bundle` feature is
+      # harmless to lint — it only reserves slot space, and the servers are
+      # written in afterwards by `cargo xtask dist` — but `remote` is the one
+      # that gates real code, so it gets an explicit pass rather than being
+      # swept up in a flag whose meaning changes as features are added.
       - name: clippy
-        run: nix develop --command cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: clippy (remote hosts)
+        run: nix develop --command cargo clippy -p captain-miao --all-targets --features remote --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

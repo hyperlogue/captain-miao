@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The dashboard can deploy its own server to a remote host.** Connecting to a
+  host with no `miao-server` — or one built from a different version —
+  used to be a dead end that told you to go install it yourself. A dashboard
+  built to carry a server now pushes the right binary over the ssh connection it
+  just opened, checks it actually runs there before putting it in place, and
+  remembers what it deployed so the next connect doesn't repeat the work. When
+  it *can't* help (no payload for that architecture, or the host refused the
+  write) it says exactly that instead of a generic failure.
+
+  This is opt-in, and it is one command: `cargo xtask dist` cross-compiles the
+  servers and writes them into the finished dashboard, so what a binary carries
+  is always compiled from the sources beside it. It produces a plain `cm`
+  alongside a `cm-bundle-linux` carrying servers for both Linux architectures
+  (single-arch variants too, if your fleet is only one). The embedded servers
+  are cross-compiled against an old glibc (2.28 — Debian 10, RHEL 8) so they run
+  on machines far older than the one that built them. A regular build is
+  unchanged and costs nothing extra; bundling both arches costs about 7 MB.
+  Prebuilt downloads (npm, GitHub Releases) are the plain build for now —
+  bundling them waits on remote hosts leaving experimental.
+
 - **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
   By default a session *is* its terminal window and closing it ends the session.
   Pooled mode runs each of this machine's sessions in a local pty pool instead,
@@ -31,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `miao-client attach`.
 
 ### Changed
+
+- **Release binaries are about 15% smaller.** Link-time optimisation is now on
+  for release builds, which takes `miao` from 7.6 MB to 6.6 MB and the same
+  proportion off `miao-server`. Costs about 90 seconds of build time;
+  debug builds are untouched.
 
 - **Remote hosts: the whole feature is now implemented** (still behind the
   `remote` cargo feature until it's verified end to end against a real host).

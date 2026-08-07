@@ -4,14 +4,21 @@
 #
 # Server-side changes (anything the remote daemon/launcher runs) don't take
 # effect until the new binary is on the host AND a fresh daemon is running.
-# Since the crate split the dashboard can't auto-upload (it no longer links the
-# pty pool, so the binary it could send wouldn't be a functional server — see
-# the provisioning note in src/backend.rs), and dev builds never bump the
-# version, so the connect probe can't tell a stale cache binary from a fresh
-# one. This script is therefore the dev deploy loop: kill the remote processes,
-# push the freshly built captain-miao-server to the cache path the probe checks
+# This script is the manual version of that: kill the remote processes, push the
+# freshly built miao-server to the cache path the probe checks
 # (~/.cache/captain-miao/bin/miao-server), and let the next dashboard
 # connect resolve it via UseCache.
+#
+# MOSTLY SUPERSEDED. A dashboard built with a bundle feature deploys itself —
+# `cargo xtask dist --variant bundle-linux` builds the server and the dashboard
+# carrying it in one step, and the next connect pushes the new server (the
+# digest marker beside the deployed binary is what lets it tell one dev build of
+# the same version from another). See "Embedded server payloads" in AGENTS.md.
+# This script is still what you want for a dashboard built *without* a bundle
+# feature, for pushing a binary the
+# embedded one isn't (a debug build, a local patch), or to force the
+# kill-daemon-and-clear-state reset below, which the deploy path deliberately
+# doesn't do.
 #
 # pkill note: a `pkill -f` pattern matches the ssh shell running it (the
 # self-match trap); `pkill captain-miao` matches the process *name* instead
@@ -45,10 +52,15 @@ echo "▶ Resetting ${HOST}: clear stale binaries, kill daemon/launchers…"
 # with "spawn attach --background"). With the binary gone first, reconnect
 # attempts fall back to PATH (absent) and keep backing off until the upload
 # lands. Both cache-binary names are removed: the pre-split auto-upload left a
-# `captain-miao` there. Clearing dead session state files keeps the next
-# snapshot clean.
+# `captain-miao` there. The `.sha256` marker goes too, and that one is
+# load-bearing: it is how a payload-carrying dashboard recognises a binary as
+# its own, so leaving it beside a binary *this script* pushed would make that
+# dashboard adopt ours as if it had deployed it. Clearing dead session state
+# files keeps the next snapshot clean.
 ssh "$HOST" '
-  rm -f ~/.cache/captain-miao/bin/captain-miao ~/.cache/captain-miao/bin/captain-miao-server
+  rm -f ~/.cache/captain-miao/bin/captain-miao ~/.cache/captain-miao/bin/miao-server \
+        ~/.cache/captain-miao/bin/miao-server.sha256 \
+        ~/.cache/captain-miao/bin/miao-server.incoming
   pkill captain-miao 2>/dev/null || true
   sleep 1
   rm -f ~/.local/state/captain-miao/sessions/*.json

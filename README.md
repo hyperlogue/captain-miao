@@ -267,6 +267,44 @@ connection or a slept laptop detaches windows without touching the sessions —
 and reconnecting brings them all back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
 
+**Getting the daemon onto each host.** Either install `miao-server`
+there yourself (any copy on `PATH` matching your dashboard's version is used as
+is, and never touched), or let the dashboard carry one and deploy it for you:
+
+```sh
+nix develop                                # provides zig + the cross toolchains
+cargo xtask dist --variant bundle-linux
+# …or straight from the flake, no dev shell needed:
+nix build .#captain-miao-bundle-linux
+```
+
+That one command cross-builds `captain-miao-server` for both Linux
+architectures, compresses them, and writes them into the finished dashboard, so
+the server a dashboard carries is always compiled from the sources beside it —
+there is no separate step to run and nothing to keep up to date.
+
+The resulting binary pushes the right server to any host that's missing one,
+verifies it runs there before putting it in place, and skips the work on later
+connects. The embedded binaries target glibc 2.28 (Debian 10, RHEL 8, and newer)
+and cost about 7 MB (7.6 → 14.2 MB).
+
+What a dashboard carries is fixed when it is built, and `miao --version` reports
+it. `cargo xtask dist` builds the named
+release variants side by side — a plain `cm` carrying nothing and a
+`cm-bundle-linux` carrying both — and `--list` shows the rest, including
+single-arch bundles if your fleet is only one. The flake exposes the same set as
+packages (`captain-miao-bundle-linux`, `-x86_64`, `-aarch64`). Binaries from npm
+and GitHub Releases are the plain build.
+
+`miao --version` says what any given binary is carrying:
+
+```
+miao 0.2.1
+embedded miao-server:
+  aarch64-unknown-linux-gnu     3.2 MiB  36fd6ac00444
+  x86_64-unknown-linux-gnu      3.4 MiB  c1a3cd563639
+```
+
 **On any Linux host that runs the daemon — including your own machine under
 `pooled = true` — run `loginctl enable-linger`:**
 

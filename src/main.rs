@@ -10,6 +10,7 @@
 mod app;
 mod backend;
 mod config;
+mod server_payload;
 mod sleep;
 mod terminal;
 
@@ -21,10 +22,30 @@ pub use cm_core::{agent, protocol, state};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+/// `--version`'s long form: the version, plus which `miao-server`
+/// builds this binary can deploy to a remote host.
+///
+/// That inventory is decided at *build* time (by the `bundle-*` cargo features),
+/// so no amount of looking at config or state can answer it — `--version` is the
+/// only place it can honestly live, and with several dashboard variants shipping
+/// it is also how you tell two of them apart. `-V` keeps the bare version for
+/// scripts.
+fn long_version() -> &'static str {
+    static LONG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LONG.get_or_init(|| {
+        format!(
+            "{}\n{}",
+            env!("CARGO_PKG_VERSION"),
+            server_payload::describe()
+        )
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "miao",
     version,
+    long_version = long_version(),
     about = "Monitor and manage Claude Code sessions in Kitty or zellij"
 )]
 struct Cli {

@@ -234,9 +234,11 @@ dependencies = [
  "base64",
  "clap",
  "cm-core",
+ "cm-payload",
  "crossterm",
  "dirs",
  "emojis",
+ "flate2",
  "libc",
  "notify 8.2.0",
  "ratatui",
@@ -390,6 +392,14 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cm-payload"
+version = "0.2.1"
+dependencies = [
+ "flate2",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3159,6 +3169,15 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "xtask"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cm-payload",
+]
 
 [[package]]
 name = "zmij"
