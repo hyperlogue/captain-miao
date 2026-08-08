@@ -272,29 +272,41 @@ there yourself (any copy on `PATH` matching your dashboard's version is used as
 is, and never touched), or let the dashboard carry one and deploy it for you:
 
 ```sh
+# Download this version's published servers and bundle them in — needs only
+# curl and tar, no cross toolchain:
+cargo xtask dist --variant bundle-linux --servers release
+
+# …or cross-compile them from the sources beside you, which is what you want
+# while changing the server itself:
 nix develop                                # provides zig + the cross toolchains
 cargo xtask dist --variant bundle-linux
+
 # …or straight from the flake, no dev shell needed:
 nix build .#captain-miao-bundle-linux
 ```
 
-That one command cross-builds `captain-miao-server` for both Linux
-architectures, compresses them, and writes them into the finished dashboard, so
-the server a dashboard carries is always compiled from the sources beside it —
-there is no separate step to run and nothing to keep up to date.
+Either way it ends with the servers written into the finished dashboard, and
+there is no separate step to run or keep up to date. You can also bundle a
+dashboard you already have, without rebuilding it:
+
+```sh
+cargo xtask bundle ./cm --servers release -o ./cm-bundled
+```
 
 The resulting binary pushes the right server to any host that's missing one,
 verifies it runs there before putting it in place, and skips the work on later
 connects. The embedded binaries target glibc 2.28 (Debian 10, RHEL 8, and newer)
 and cost about 7 MB (7.6 → 14.2 MB).
 
-What a dashboard carries is fixed when it is built, and `miao --version` reports
-it. `cargo xtask dist` builds the named
-release variants side by side — a plain `cm` carrying nothing and a
-`cm-bundle-linux` carrying both — and `--list` shows the rest, including
-single-arch bundles if your fleet is only one. The flake exposes the same set as
-packages (`captain-miao-bundle-linux`, `-x86_64`, `-aarch64`). Binaries from npm
-and GitHub Releases are the plain build.
+What a dashboard carries is fixed when it is bundled, and `cm --version` reports
+it — including each server's digest, which is what tells two builds of the same
+version apart. `cargo xtask dist` builds the named release variants side by
+side — a plain `miao` carrying nothing and a `miao-bundle-linux` carrying both — and
+`--list` shows the rest, including single-arch bundles if your fleet is only one.
+The flake exposes the same set as packages (`captain-miao-bundle-linux`,
+`-x86_64`, `-aarch64`). Binaries from npm and GitHub Releases are the plain
+build; each release also publishes the servers on their own, which is what
+`--servers release` downloads.
 
 `miao --version` says what any given binary is carrying:
 

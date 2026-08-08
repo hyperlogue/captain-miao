@@ -97,19 +97,56 @@ of this existed. There is one feature rather than one per architecture because
 *which* servers a binary carries is decided when they are written in, not when it
 is compiled — so a single dashboard build serves every combination.
 
-**Payloads are written in after linking.** `cargo xtask dist` cross-compiles
-`captain-miao-server` per target, compresses it, compiles a dashboard that
-reserves exactly that much space, and overwrites the reservation in the finished
-binary. One command, four steps, and the server a dashboard carries is always
-compiled from the sources beside it — which has to be arranged rather than
-assumed, since the workspace version is the only thing a released artifact is
-keyed on and it does not move between dev builds.
+**Payloads are written in after linking, and the point of that is decoupling.**
+Compiling the payload in would make it an *input* to the dashboard's build, which
+welds two questions together that have no business being one: where do servers
+come from, and how is the dashboard built. Injecting keeps them apart, and the
+tooling is split along the same line:
 
-Injecting rather than compiling the payload in is what keeps `build.rs` to
-reading one environment variable and writing one constant. It also means the
-payload is not an input to the compile: `cargo build`, `clippy` and `check` need
-no cross toolchain, CI can use `--all-features`, and one compile serves every
-architecture combination.
+| `cargo xtask …` | does | needs |
+|---|---|---|
+| `server` | obtains server binaries | a cross toolchain, or a network |
+| `bundle <cm>` | writes them into a linked dashboard | neither — no cargo either |
+| `dist` | both, plus the dashboard build | whatever the source needs |
+
+`bundle` is the one that could not exist otherwise. It patches a `cm` that is
+already built — or already shipped — so a dashboard and the servers it carries
+need never have been on the same machine, let alone in the same command.
+
+**Where servers come from is therefore a flag, not an assumption.** Three sources
+produce the same `Payload` and nothing downstream can tell which answered:
+
+- `--servers build` cross-compiles from this workspace. The default, and what the
+  dev loop wants: the server has to match the sources you are changing.
+- `--servers release[:<version>]` downloads a published one. A bundled build then
+  needs `curl` and `tar` and nothing else — no zig, no cross `rust-std`s, not
+  even the server's sources. A bare `release` means this workspace's version,
+  since that is the only defensible reading of an omitted one.
+- `--server <target>=<path>` takes a binary the caller already has. The escape
+  hatch, and what release CI uses when its own jobs have already produced them.
+
+The rest still follows: `build.rs` reads one environment variable and writes one
+constant, `cargo build` / `clippy` / `check` need no cross toolchain, and one
+dashboard compile serves every architecture combination.
+
+Two properties of the fetch path are load-bearing, and both are pinned by tests
+over real tarballs rather than over a live download — a test can be handed a
+hostile archive, it cannot be handed a hostile release. `--proto =https` is
+re-asserted on every redirect hop, because GitHub bounces release downloads to
+S3 and pinning only the URL we started from would check nothing. And the archive
+member is extracted **by name**, so a `../` entry has nothing to land on; a
+symlink wearing that name is refused rather than read through, since `tar`
+extracts one happily and reading it would pack a file from anywhere on the box.
+
+**A version match is not identity**, which is why provenance is recorded rather
+than inferred. The workspace version is the only thing a released artifact is
+keyed on and it does not move between dev builds, so a `0.2.1` server says
+nothing about *which* `0.2.1`. `Provenance` names the source for the human;
+each payload's sha256 is what actually tells two builds apart, on `cm --version`
+and in the marker the deploy leaves on the host. It also decides what may be
+warned about: only a build we ran has a glibc floor we chose, so `unpinned_floor`
+is reached through `Provenance::strategy()` and stays quiet about a binary
+somebody else linked.
 
 **The mechanism is a reserved slot, and the reason is `strip`.** Three ways to
 get bytes into a linked binary were measured:
@@ -168,8 +205,23 @@ session on the host.
 
 **Building the variants: `cargo xtask dist`** builds the named release artifacts
 into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`, plus the single-arch
-bundles. It is now a thin loop over feature sets — the servers come from
-`build.rs` like they would in any other build.
+bundles. Each run obtains every server once even when several variants want it,
+then verifies each artifact by running it and checking it reports what was just
+injected — the only check that can catch a bad patch. `bundle` runs the same
+check but merely warns when the artifact will not start, since bundling a Linux
+`cm` on a mac is a thing it exists for; a binary that *runs* and reports the
+wrong payloads is an error either way.
+
+**Release CI publishes the servers** (`build.yml`'s `server` job), which is what
+gives `--servers release` something to fetch. One x86_64 runner cross-compiles
+both Linux arches through `nix develop --command cargo xtask server` — the same
+code path a laptop runs, so the strategy choice, the pinned glibc floor and the
+architecture check cannot drift between what CI publishes and what a developer
+builds. One runner rather than two, deliberately: zigbuild pins the floor at 2.28
+where a native arm64 build would inherit the runner's glibc, and the flake
+declares no `aarch64-linux` system to enter a dev shell on anyway. The assets are
+flat tarballs holding just `miao-server`, which is the other half of the
+by-name extraction contract above.
 
 **Nix has the same variants**: `packages.captain-miao-bundle-linux` and the two
 single-arch ones. They delegate to `cargo xtask dist` rather than reimplementing

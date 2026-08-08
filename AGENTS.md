@@ -54,13 +54,16 @@ to remote hosts, and a small pool client in a fourth. Full rationale in
 - **`cm-payload`** (`crates/cm-payload/`) — not shipped (`publish = false`). Two
   halves split by who links which: `format` has no dependencies and is shared, so
   the dashboard reads the payload slot and `xtask` writes it through one module
-  that can't drift; the `build` feature adds the cross-compile, compression and
+  that can't drift; the `build` feature adds the three payload *sources*
+  (cross-build / local file / release download), the compression and the
   injector, and only `xtask` enables it. See **Embedded server payloads**.
 - **`xtask`** (`xtask/`) — not shipped (`publish = false`); the standard
   `cargo xtask` build-chore binary, reached through the `[alias]` in
-  `.cargo/config.toml`. Its job is the named **release dashboard variants**
-  (`dist`). Rust rather than a shell script so the workspace type-checks, lints,
-  and tests it.
+  `.cargo/config.toml`. Three subcommands split along the seam that matters:
+  `server` obtains server binaries, `bundle` writes them into an already-linked
+  dashboard, and `dist` is both plus the dashboard build (the named **release
+  variants**). Rust rather than a shell script so the workspace type-checks,
+  lints, and tests it.
 
 **cm-core (`crates/cm-core/src/`):**
 
@@ -417,12 +420,48 @@ rationale in `docs/crate-split.md`; this is the map.
   rather than one per arch, because *which* servers a binary carries is decided
   when they are written in — a single dashboard build serves every combination,
   and turning the feature on needs no cross toolchain.
-- **Payloads are written in after linking.** `cargo xtask dist` cross-builds the
-  servers, compresses them, compiles a dashboard reserving exactly that much, and
-  overwrites the reservation in the finished binary. One command, so the server a
-  dashboard carries is always compiled from the sources beside it — which has to
-  be arranged, since the workspace version is the only thing a released artifact
-  is keyed on and it doesn't move between dev builds.
+- **Payloads are written in after linking, and that is what decouples the two
+  builds.** A compiled-in payload is an *input* to the dashboard's compile, so
+  where servers come from would be welded to how the dashboard is built; an
+  injected one isn't. So obtaining a server and building a dashboard are separate
+  steps with a seam between them, and `xtask` has one subcommand per half:
+  * `cargo xtask server` **obtains** servers (and is what release CI runs to
+    publish them — same code path as a laptop's, so the strategy choice, glibc
+    floor and arch check can't drift between them).
+  * `cargo xtask bundle <cm>` **writes** them into a dashboard that is already
+    linked — no cargo, no cross toolchain, not even the server's sources. Given a
+    released `cm` and `--servers release`, it needs nothing from this workspace.
+    It patches **in place** by default, so `inject` stages a sibling and renames
+    over the target (`write_replacing`) rather than truncating: the `cm` being
+    patched may be the one on your PATH and may be running, where a torn write
+    would leave a corrupt binary and Linux refuses the write outright
+    (`ETXTBSY`). The original's mode is copied onto the staged file, so the
+    executable bit survives the swap.
+  * `cargo xtask dist` is the convenience that runs both plus the dashboard
+    build, producing the named variants.
+- **Where servers come from is a flag, not an assumption** (`ServerArgs`, shared
+  by all three subcommands). `--servers build` cross-compiles here (the default,
+  and what the dev loop wants — the server must match your sources);
+  `--servers release[:<version>]` downloads a published one, so a bundled build
+  needs only `curl` + `tar` and a bare `release` means *this* workspace's version;
+  `--server <target>=<path>` hands over an exact binary, which is the escape
+  hatch and what a CI job that already downloaded its artifacts uses. All three
+  land on the same `cm_payload::Payload` and nothing downstream learns which
+  answered. A `--server` naming a target nothing wants is an **error** — a typo'd
+  triple would otherwise look exactly like success.
+  Two guards live on the fetch path, both pinned by tests over real tarballs
+  rather than over a live download: `--proto =https` is re-asserted on every
+  redirect hop (GitHub bounces release downloads to S3), and the archive member
+  is extracted **by name**, so a `../` entry has nothing to land on and a symlink
+  wearing that name is refused rather than read through.
+- **A version match is still not identity**, which is why provenance is recorded
+  rather than inferred. The workspace version is the only thing a released
+  artifact is keyed on and it doesn't move between dev builds, so `Provenance`
+  names the source for the human and each payload's sha256 is what actually
+  distinguishes two `0.2.1` servers — on `miao --version`, and in the marker the
+  deploy writes to the host. Only a build *we ran* has a glibc floor we chose, so
+  `unpinned_floor` is consulted through `Provenance::strategy()` and stays quiet
+  about a binary somebody else linked.
 - **The mechanism is a reserved `.rodata` slot, and the reason is `strip`.**
   Measured: appended bytes are **silently wiped** (strip rewrites a binary from
   its own structure and doesn't carry trailing data across); an
@@ -450,7 +489,20 @@ rationale in `docs/crate-split.md`; this is the map.
   release artifacts into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`,
   and the two single-arch bundles. Each run verifies its artifact by running it
   and checking it reports the servers just injected — the only check that can
-  catch a bad patch. Default: plain + `bundle-linux`.
+  catch a bad patch. Default: plain + `bundle-linux`. `bundle` runs the same
+  check but only *warns* when the artifact won't start, since bundling a Linux
+  `cm` on a mac is a thing it exists for; a binary that runs and reports the
+  wrong payloads is still an error either way.
+- **Release CI publishes the servers** (`build.yml`'s `server` job), which is
+  what gives `--servers release` something to fetch. One x86_64 runner
+  cross-compiles both Linux arches through `nix develop --command cargo xtask
+  server`, deliberately: zigbuild pins the floor at 2.28 where a native build
+  would inherit the runner's, and the flake has no `aarch64-linux` system to run
+  the arm64 runner in anyway. The assets are **flat** tarballs holding just
+  `miao-server` — machine-consumed, and the by-name extraction above is
+  the other half of that contract. Their names (`miao-server-v<version>-
+  <target>.tar.gz`) can't collide with the dashboard tarballs
+  `stage-npm-packages.sh` stages, which it looks up by exact name.
 - **Cross-compiling** is `cargo-zigbuild` — the only strategy that handles
   bundled SQLite's C amalgamation without a distro cross toolchain. `nix develop`
   provides it, `zig`, and the cross `rust-std`s. It is preferred **even for the
@@ -538,9 +590,8 @@ cargo run -p captain-miao-client -- attach <name> [--force]
 cargo test --workspace       # run the full test suite
 cargo watch -x run           # auto-reload the dashboard on changes
 
-# Embedded server payloads — needs `nix develop` for zig + the cross rust-stds.
-# `cargo xtask dist` is the whole thing: it cross-builds the servers, sizes the
-# reservation, compiles the dashboard, writes them in, and verifies the result.
+# Embedded server payloads. `cargo xtask dist` is the one-command path: obtain
+# the servers, size the reservation, compile the dashboard, write them in, verify.
 # A plain `cargo build` reserves nothing and builds nothing extra.
 cargo xtask dist                   # the named release variants, into dist/
 cargo xtask dist --list            # the variants, and what each carries
@@ -548,6 +599,18 @@ cargo xtask dist --variant bundle-linux-x86_64   # just one
 nix build .#captain-miao-bundle-linux            # the same, straight from the flake
 nix build .#captain-miao-bundle-linux-aarch64    # …single-arch
 miao --version                       # what an already-built binary actually embeds
+
+# …but where the servers come from is a flag. Cross-building them (the default)
+# is the only part that needs `nix develop` for zig + the cross rust-stds.
+cargo xtask dist --servers release          # download this version's published servers
+cargo xtask dist --servers release:0.2.0    # …or another version's
+cargo xtask dist --server x86_64-unknown-linux-gnu=/path/to/miao-server
+
+# And the two halves are reachable on their own. `bundle` writes servers into a
+# dashboard that already exists — no cargo, no cross toolchain, no server sources:
+cargo xtask bundle dist/cm-bundle-linux --servers release
+cargo xtask bundle ./cm -o ./cm-bundled --server aarch64-unknown-linux-gnu=./srv
+cargo xtask server --out dist/servers       # just the servers (what release CI runs)
 
 # The deploy path, end to end, against any ssh host you can reach:
 CM_TEST_SSH_TARGET=box cargo test -p captain-miao --features bundle-linux-x86_64 -- \

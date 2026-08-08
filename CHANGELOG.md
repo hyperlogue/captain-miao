@@ -18,16 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it *can't* help (no payload for that architecture, or the host refused the
   write) it says exactly that instead of a generic failure.
 
-  This is opt-in, and it is one command: `cargo xtask dist` cross-compiles the
-  servers and writes them into the finished dashboard, so what a binary carries
-  is always compiled from the sources beside it. It produces a plain `cm`
-  alongside a `cm-bundle-linux` carrying servers for both Linux architectures
-  (single-arch variants too, if your fleet is only one). The embedded servers
-  are cross-compiled against an old glibc (2.28 — Debian 10, RHEL 8) so they run
-  on machines far older than the one that built them. A regular build is
-  unchanged and costs nothing extra; bundling both arches costs about 7 MB.
-  Prebuilt downloads (npm, GitHub Releases) are the plain build for now —
-  bundling them waits on remote hosts leaving experimental.
+  This is opt-in, and it is one command: `cargo xtask dist` obtains the servers
+  and writes them into the finished dashboard. It produces a plain `miao` alongside
+  a `miao-bundle-linux` carrying servers for both Linux architectures (single-arch
+  variants too, if your fleet is only one). A regular build is unchanged and
+  costs nothing extra; bundling both arches costs about 7 MB. Prebuilt downloads
+  (npm, GitHub Releases) are the plain build for now — bundling them waits on
+  remote hosts leaving experimental.
+
+  **Where the servers come from is up to you.** `--servers build` (the default)
+  cross-compiles them from the sources beside you, against an old glibc (2.28 —
+  Debian 10, RHEL 8) so they run on machines far older than the one that built
+  them. `--servers release` downloads the ones a release published, so a bundled
+  dashboard needs only `curl` and `tar` — no cross toolchain at all. And
+  `cargo xtask bundle` writes servers into a `cm` you already have, without
+  rebuilding it. Each release now publishes the servers as their own assets to
+  make that possible, and `cm --version` prints the digest of everything a binary
+  carries, which is what tells two builds of the same version apart.
 
 - **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
   By default a session *is* its terminal window and closing it ends the session.

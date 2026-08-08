@@ -1,17 +1,29 @@
-//! Cross-builds `miao-server`, compresses it, and writes it into a
-//! linked dashboard — the thing that dashboard then deploys to a remote host
-//! that hasn't got a server (`docs/crate-split.md`).
+//! Turns a `miao-server` binary into a packed payload, and writes packed
+//! payloads into a linked dashboard — the thing that dashboard then deploys to a
+//! remote host that hasn't got a server (`docs/crate-split.md`).
 //!
-//! Driven by `cargo xtask dist`, which runs both halves in one command, so the
-//! server a dashboard carries is always compiled from the sources beside it.
-//! That alignment has to be arranged rather than assumed: the workspace version
-//! is the only thing a released artifact is keyed on, and it does not move
-//! between dev builds, so nothing else could tell a current server from an old
-//! one.
+//! **Obtaining a server and building the dashboard are separate concerns**, and
+//! this module keeps them that way. Three sources produce the same [`Payload`]:
+//! [`build`] cross-compiles one from this workspace, [`from_file`] takes one
+//! somebody already has, and [`fetch`] downloads one from a published release.
+//! Everything downstream — packing, sizing, injection — is written once against
+//! the result and never learns which it was.
+//!
+//! That seam is the reason the payload is written in *after* linking rather than
+//! compiled in. A compiled-in payload is an input to the dashboard's build, so
+//! changing where servers come from means recompiling the dashboard; an injected
+//! one does not, so `cargo xtask bundle` can put a fetched server into a `cm`
+//! that is already built (or already shipped).
+//!
+//! Where a payload came from still has to be *recorded*, because the workspace
+//! version is the only thing a released artifact is keyed on and it does not move
+//! between dev builds — so a version match cannot tell one `0.2.1` server from
+//! another. [`Provenance`] names the source for the human, and the sha256 every
+//! payload carries is what tells the builds apart on the wire.
 //!
 //! Cargo is left in charge of *whether* a rebuild is needed: [`build`] always
 //! invokes it, and cargo does nothing when nothing changed. Only the packing
-//! step is memoised here, keyed on the digest of the binary cargo produced,
+//! step is memoised here, keyed on the digest of the binary that arrived,
 //! because gzipping ~9 MB at maximum compression is the one part that would
 //! otherwise cost real time on a no-op run.
 
@@ -43,6 +55,45 @@ const SERVER_BIN: &str = "miao-server";
 /// NSS drops LDAP/SSSD and its utmp is stubbed, both of which mainstream server
 /// fleets actually use.
 pub const GLIBC_FLOOR: &str = "2.28";
+
+/// Where [`fetch`] looks for a published server, minus the tag and filename.
+///
+/// Overridable so a fork, a private mirror, or a test can be pointed somewhere
+/// else without a code change — the URL shape is the contract, not the host.
+pub const RELEASE_BASE: &str = "https://github.com/hyperlogue/captain-miao/releases/download";
+
+/// Where a payload came from. Recorded rather than inferred: the three sources
+/// are indistinguishable by the time the bytes are packed, and "which server is
+/// this" is the question a bundled dashboard exists to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provenance {
+    /// Cross-compiled from this workspace by [`build`].
+    Built(Strategy),
+    /// A binary the caller already had, taken as-is by [`from_file`].
+    Local,
+    /// Downloaded from a published release by [`fetch`].
+    Fetched { version: String },
+}
+
+impl Provenance {
+    pub fn label(&self) -> String {
+        match self {
+            Provenance::Built(s) => s.label().to_string(),
+            Provenance::Local => "local file".to_string(),
+            Provenance::Fetched { version } => format!("release v{version}"),
+        }
+    }
+
+    /// The build strategy, when we were the ones who built it. `None` for a
+    /// binary that arrived from elsewhere — we know nothing about how it was
+    /// linked, and guessing is what [`unpinned_floor`] must not do.
+    pub fn strategy(&self) -> Option<Strategy> {
+        match self {
+            Provenance::Built(s) => Some(*s),
+            _ => None,
+        }
+    }
+}
 
 /// How a given target gets built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,17 +262,21 @@ fn elf_machine(bytes: &[u8]) -> Option<u16> {
     })
 }
 
-/// One built, packed payload.
+/// One packed payload, whatever produced it.
 pub struct Payload {
     pub target: String,
     /// Digest of the **uncompressed** binary — what the deploy writes to the
     /// host as its marker, so it identifies the build rather than the archive.
     pub sha256: String,
-    /// The gzip the dashboard `include_bytes!`es.
+    /// The uncompressed binary this was packed from. Kept because obtaining a
+    /// server is now a step in its own right: `cargo xtask server` publishes
+    /// these, and the archive is no use to anything but the injector.
+    pub bin_path: PathBuf,
+    /// The gzip the injector writes into the dashboard's slot.
     pub gz_path: PathBuf,
     pub raw_len: u64,
     pub gz_len: u64,
-    pub strategy: Strategy,
+    pub provenance: Provenance,
     /// False when the binary was byte-identical to the last one packed and the
     /// existing archive was reused.
     pub repacked: bool,
@@ -240,7 +295,7 @@ pub fn host_triple() -> Result<String, String> {
         .ok_or_else(|| "`rustc -vV` printed no host line".to_string())
 }
 
-/// Build `SERVER_PKG` for `target` and return the packed payload.
+/// Cross-build `SERVER_PKG` for `target` and pack the `SERVER_BIN` it produces.
 ///
 /// `root` is the workspace root, `build_dir` a directory this owns entirely.
 pub fn build(
@@ -263,34 +318,180 @@ pub fn build(
             artifact.display()
         )
     })?;
+    verify_arch(&raw, target, &artifact.display().to_string())?;
+    pack_binary(
+        build_dir,
+        target,
+        &artifact,
+        &raw,
+        Provenance::Built(strategy),
+    )
+}
 
-    // A cross that silently produced a host binary would upload cleanly and then
-    // fail to exec on the remote, which is a confusing place to learn about it.
-    // The ELF header says which arch it is without running anything.
-    if let Some(expected) = expected_elf_machine(target) {
-        let found = elf_machine(&raw)
-            .ok_or_else(|| format!("{} is not an ELF binary", artifact.display()))?;
-        if found != expected {
-            return Err(format!(
-                "{} is ELF e_machine {found:#06x}, expected {expected:#06x} for {target} \
-                 (the build fell back to the host arch)",
-                artifact.display()
-            ));
-        }
+/// Pack a server binary the caller already has.
+///
+/// The escape hatch for anything the other two sources don't cover — a binary
+/// built by some other pipeline, one pulled from an internal artifact store, or
+/// the ones a CI job just downloaded. Nothing is assumed about how it was
+/// produced beyond it being for `target`, which the arch check confirms.
+pub fn from_file(build_dir: &Path, target: &str, path: &Path) -> Result<Payload, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    verify_arch(&raw, target, &path.display().to_string())?;
+    pack_binary(build_dir, target, path, &raw, Provenance::Local)
+}
+
+/// Download a published `miao-server` for `target` and pack it.
+///
+/// The point of this source is that a bundled dashboard no longer needs a cross
+/// toolchain — or the server's sources — to be built. It needs `curl` and `tar`,
+/// which every macOS and Linux box has, and a release that published servers.
+///
+/// The bytes are **not** checksummed against an expected digest, because there
+/// is nothing to check one against: the URL is the assertion. What guards the
+/// far end instead is the deploy path, which stages the binary on the host and
+/// runs it there before moving it into place, so a wrong-ABI or truncated
+/// payload fails on the host rather than becoming the server it invokes.
+pub fn fetch(build_dir: &Path, target: &str, version: &str, base: &str) -> Result<Payload, String> {
+    let version = version.trim().trim_start_matches('v');
+    let url = release_url(base, version, target);
+
+    // A fresh directory per fetch: `tar` extracts over whatever is there, so a
+    // failed download followed by a successful extract of the *previous* archive
+    // would silently pack a stale binary.
+    let dir = build_dir.join("fetched").join(target);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let tgz = dir.join("server.tar.gz");
+
+    println!("  curl {url}");
+    run_quiet(
+        "curl",
+        &[
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            // Redirects are followed, so pin the scheme on every hop rather than
+            // trusting the one in the URL we started from.
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--output",
+            &tgz.display().to_string(),
+            &url,
+        ],
+    )?;
+
+    let (bin, raw) = unpack_server(&tgz, &dir, target, &url)?;
+    pack_binary(
+        build_dir,
+        target,
+        &bin,
+        &raw,
+        Provenance::Fetched {
+            version: version.to_string(),
+        },
+    )
+}
+
+/// Extract the server out of a release archive and read it back.
+///
+/// Split from [`fetch`] because this half is where the judgement is — what the
+/// archive is allowed to contain, and what the bytes must be — while the download
+/// is one `curl` invocation. A test can hand this a hostile tarball; it cannot
+/// hand `curl` a hostile release.
+///
+/// `whence` names the archive's origin in errors (a URL, in the one real caller).
+fn unpack_server(
+    archive: &Path,
+    into: &Path,
+    target: &str,
+    whence: &str,
+) -> Result<(PathBuf, Vec<u8>), String> {
+    // Naming the member explicitly is the extraction guard: only an entry called
+    // exactly `miao-server` comes out, so a `../` path in the archive has
+    // nothing to land on. The owner/permission flags are the non-root defaults,
+    // stated so a run as root can't restore an archived uid or a setuid bit.
+    run_quiet(
+        "tar",
+        &[
+            "-xzf",
+            &archive.display().to_string(),
+            "-C",
+            &into.display().to_string(),
+            "--no-same-owner",
+            "--no-same-permissions",
+            SERVER_BIN,
+        ],
+    )?;
+
+    let bin = into.join(SERVER_BIN);
+    // tar extracts whatever kind of entry the archive names, symlinks included —
+    // and reading through one would pack a file from outside the staging dir, or
+    // from outside this machine's idea of what we asked for.
+    if bin.is_symlink() || !bin.is_file() {
+        return Err(format!(
+            "{whence} did not yield a regular file at {SERVER_BIN}"
+        ));
     }
+    let raw = std::fs::read(&bin).map_err(|e| format!("reading {}: {e}", bin.display()))?;
+    verify_arch(&raw, target, whence)?;
+    Ok((bin, raw))
+}
 
-    let sha256 = hex(&Sha256::digest(&raw));
-    let (gz_path, gz_len, repacked) = pack(build_dir, target, &raw, &sha256)?;
+/// The release asset a [`fetch`] pulls. Pure, so the naming contract with the
+/// release workflow is pinned by a test rather than by a successful download.
+pub fn release_url(base: &str, version: &str, target: &str) -> String {
+    let version = version.trim().trim_start_matches('v');
+    let base = base.trim_end_matches('/');
+    format!("{base}/v{version}/{SERVER_BIN}-v{version}-{target}.tar.gz")
+}
 
+/// Digest, compress, and record a server binary — the tail every source shares.
+///
+/// Split out so the three of them differ only in how the bytes arrive: anything
+/// that produces a `miao-server` for `target` becomes a payload here,
+/// and nothing downstream can tell which one did.
+pub fn pack_binary(
+    build_dir: &Path,
+    target: &str,
+    bin_path: &Path,
+    raw: &[u8],
+    provenance: Provenance,
+) -> Result<Payload, String> {
+    let sha256 = hex(&Sha256::digest(raw));
+    let (gz_path, gz_len, repacked) = pack(build_dir, target, raw, &sha256)?;
     Ok(Payload {
         target: target.to_string(),
         sha256,
+        bin_path: bin_path.to_path_buf(),
         gz_path,
         raw_len: raw.len() as u64,
         gz_len,
-        strategy,
+        provenance,
         repacked,
     })
+}
+
+/// Confirm a binary is for the architecture it claims.
+///
+/// A cross that silently produced a host binary — or a release asset fetched for
+/// the wrong triple — would upload cleanly and then fail to exec on the remote,
+/// which is a confusing place to learn about it. The ELF header says which arch
+/// it is without running anything. `whence` names the source in the error, since
+/// by this point it could be a build product, a path, or a URL.
+fn verify_arch(raw: &[u8], target: &str, whence: &str) -> Result<(), String> {
+    let Some(expected) = expected_elf_machine(target) else {
+        return Ok(());
+    };
+    let found = elf_machine(raw).ok_or_else(|| format!("{whence} is not an ELF binary"))?;
+    if found != expected {
+        return Err(format!(
+            "{whence} is ELF e_machine {found:#06x}, expected {expected:#06x} for {target} \
+             (wrong architecture for this payload)"
+        ));
+    }
+    Ok(())
 }
 
 /// What an [`inject`] call put where.
@@ -339,14 +540,48 @@ pub fn inject(binary: &Path, payloads: &[&Payload]) -> Result<Injected, String> 
     format::write(&mut bin, slot, &body)?;
     debug_assert_eq!(before, bin.len(), "injection must not resize the binary");
 
-    // Rewriting in place keeps the existing mode, so the executable bit survives.
-    std::fs::write(binary, &bin).map_err(|e| format!("writing {}: {e}", binary.display()))?;
+    write_replacing(binary, &bin)?;
     resign(binary)?;
 
     Ok(Injected {
         used: body.len(),
         capacity: slot.capacity,
     })
+}
+
+/// Replace a file's contents atomically, keeping its mode.
+///
+/// `cargo xtask bundle` patches a dashboard **in place**, and that dashboard may
+/// be the `cm` on someone's PATH — possibly a running one. Truncate-and-write is
+/// wrong on both counts: an interrupted write leaves a corrupt binary where a
+/// working one was, and on Linux writing to a running executable fails outright
+/// with `ETXTBSY`. Staging beside it and renaming over answers both — the swap is
+/// atomic, and a process already running keeps the old inode until it exits.
+///
+/// The temp file is a sibling so the rename stays within one filesystem, and the
+/// original's permissions are copied onto it before the swap so the executable
+/// bit survives (a fresh file would be created by the umask instead).
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let perms = std::fs::metadata(path)
+        .map_err(|e| format!("reading the mode of {}: {e}", path.display()))?
+        .permissions();
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let tmp = path.with_file_name(format!(".{}.cm-inject", name.to_string_lossy()));
+
+    let staged = (|| {
+        std::fs::write(&tmp, bytes)?;
+        std::fs::set_permissions(&tmp, perms)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = staged {
+        // The rename is what publishes it, so anything before that leaves only a
+        // dotfile to clean up and the original untouched.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("writing {}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 /// Re-sign a patched Mach-O.
@@ -440,6 +675,36 @@ fn run(root: &Path, program: &str, args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("`{program} {}` failed ({status})", args.join(" ")))
+}
+
+/// Run a helper that should say nothing when it works, capturing its output so a
+/// failure reports what it actually said.
+///
+/// `curl` and `tar` are the only two, and both are quiet on success — so
+/// inheriting stdio the way [`run`] does would print nothing useful and lose the
+/// message that matters. A missing binary is reported as itself rather than as
+/// an opaque spawn error, because "no curl on this machine" and "that release
+/// has no server for this target" are different problems with different fixes.
+fn run_quiet(program: &str, args: &[&str]) -> Result<(), String> {
+    let out = Command::new(program).args(args).output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("`{program}` is not installed, and fetching a released server needs it")
+        } else {
+            format!("spawning `{program}`: {e}")
+        }
+    })?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "`{program}` failed ({}){}",
+        out.status,
+        match stderr.trim() {
+            "" => String::new(),
+            msg => format!(": {msg}"),
+        }
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -594,6 +859,80 @@ mod tests {
         }
     }
 
+    /// The URL shape is a contract with the release workflow, which names its
+    /// server assets by hand. A test is the only thing that keeps the two ends
+    /// together without a successful download to prove it.
+    #[test]
+    fn the_release_url_matches_what_the_workflow_publishes() {
+        assert_eq!(
+            release_url(RELEASE_BASE, "0.2.1", OTHER),
+            "https://github.com/hyperlogue/captain-miao/releases/download/v0.2.1/\
+             miao-server-v0.2.1-aarch64-unknown-linux-gnu.tar.gz"
+        );
+        // A version is accepted in either spelling, so `--server-source
+        // release:v0.2.1` and `release:0.2.1` cannot resolve differently.
+        assert_eq!(
+            release_url(RELEASE_BASE, "v0.2.1", HOST),
+            release_url(RELEASE_BASE, "0.2.1", HOST)
+        );
+        // A mirror is pointed at by base alone, with or without a trailing slash.
+        assert_eq!(
+            release_url("https://mirror.example/dl/", "0.2.1", HOST),
+            release_url("https://mirror.example/dl", "0.2.1", HOST)
+        );
+        assert!(
+            release_url("https://mirror.example/dl", "0.2.1", HOST)
+                .starts_with("https://mirror.example/dl/v0.2.1/")
+        );
+    }
+
+    /// Only a build we performed knows how it was linked. A fetched or
+    /// caller-supplied binary must not be described as if we had chosen its
+    /// strategy — which is what would happen if the floor warning defaulted.
+    #[test]
+    fn provenance_reports_a_strategy_only_for_builds_we_ran() {
+        assert_eq!(
+            Provenance::Built(Strategy::Zigbuild).strategy(),
+            Some(Strategy::Zigbuild)
+        );
+        assert_eq!(Provenance::Local.strategy(), None);
+        assert_eq!(
+            Provenance::Fetched {
+                version: "0.2.1".into()
+            }
+            .strategy(),
+            None
+        );
+        assert!(
+            Provenance::Fetched {
+                version: "0.2.1".into()
+            }
+            .label()
+            .contains("0.2.1"),
+            "a fetched payload has to say which release it came from"
+        );
+    }
+
+    /// The arch check is the one thing every source shares, and the reason it
+    /// exists is that the failure it catches otherwise surfaces on someone
+    /// else's machine.
+    #[test]
+    fn the_arch_check_names_its_source_and_skips_targets_it_cannot_judge() {
+        let mut arm = vec![0u8; 24];
+        arm[..4].copy_from_slice(b"\x7fELF");
+        arm[5] = 1;
+        arm[18] = 0xb7;
+
+        assert!(verify_arch(&arm, OTHER, "x").is_ok());
+        let msg = verify_arch(&arm, HOST, "https://example/asset.tar.gz").unwrap_err();
+        assert!(msg.contains("https://example/asset.tar.gz"), "{msg}");
+        assert!(msg.contains("0x00b7"), "{msg}");
+
+        assert!(verify_arch(b"not an elf", HOST, "y").is_err());
+        // Darwin has no ELF header to read, so there is nothing to check.
+        assert!(verify_arch(b"not an elf", "aarch64-apple-darwin", "y").is_ok());
+    }
+
     #[test]
     fn elf_machine_reads_both_endiannesses_and_rejects_non_elf() {
         let mut hdr = vec![0u8; 24];
@@ -614,6 +953,86 @@ mod tests {
         assert_eq!(expected_elf_machine(HOST), Some(0x3e));
         assert_eq!(expected_elf_machine(OTHER), Some(0xb7));
         assert_eq!(expected_elf_machine("aarch64-apple-darwin"), None);
+    }
+
+    /// The half of `fetch` that makes decisions, against archives a test can
+    /// actually build. What a release asset is allowed to contain is a security
+    /// boundary — the bytes come off the network and end up executed on someone
+    /// else's server — so the refusals are pinned rather than assumed.
+    #[test]
+    fn a_release_archive_yields_a_server_or_is_refused() {
+        let root = std::env::temp_dir().join(format!("cm-unpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // An ELF header for OTHER, which is what a real asset would carry.
+        let mut server = vec![0u8; 4096];
+        server[..4].copy_from_slice(b"\x7fELF");
+        server[5] = 1;
+        server[18] = 0xb7;
+
+        let tar_up = |name: &str, build: &dyn Fn(&Path)| -> PathBuf {
+            let stage = root.join(name).join("stage");
+            std::fs::create_dir_all(&stage).unwrap();
+            build(&stage);
+            let tgz = root.join(name).join("asset.tar.gz");
+            let ok = Command::new("tar")
+                .args(["-C", &stage.display().to_string(), "-czf"])
+                .arg(&tgz)
+                .arg(SERVER_BIN)
+                .status()
+                .expect("tar is required to fetch a released server");
+            assert!(ok.success(), "packing the {name} fixture");
+            tgz
+        };
+        let out = |name: &str| {
+            let d = root.join(name).join("out");
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+
+        // The happy path: a flat archive holding exactly the binary, which is
+        // what the release workflow's `tar -C <dir> … miao-server` makes.
+        let good = tar_up("good", &|stage| {
+            std::fs::write(stage.join(SERVER_BIN), &server).unwrap()
+        });
+        let (bin, raw) = unpack_server(&good, &out("good"), OTHER, "u").unwrap();
+        assert_eq!(raw, server);
+        assert!(bin.is_file());
+
+        // An asset for the wrong architecture. It would upload cleanly and then
+        // fail to exec on the remote, which is a terrible place to find out.
+        let msg = unpack_server(&good, &out("arch"), HOST, "u").unwrap_err();
+        assert!(msg.contains("architecture"), "{msg}");
+
+        // A symlink wearing the member's name. tar extracts it happily; reading
+        // through it would pack a file from anywhere on the machine.
+        #[cfg(unix)]
+        {
+            let evil = tar_up("evil", &|stage| {
+                std::os::unix::fs::symlink("/etc/passwd", stage.join(SERVER_BIN)).unwrap()
+            });
+            let msg = unpack_server(&evil, &out("evil"), OTHER, "u").unwrap_err();
+            assert!(msg.contains("regular file"), "{msg}");
+        }
+
+        // An archive with no such member at all: tar fails, and the failure has
+        // to surface rather than leaving an empty directory to read from.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let tgz = empty.join("asset.tar.gz");
+        assert!(
+            Command::new("tar")
+                .args(["-C", &empty.display().to_string(), "-czf"])
+                .arg(&tgz)
+                .arg("--files-from")
+                .arg("/dev/null")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(unpack_server(&tgz, &out("empty"), OTHER, "u").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Packing is the one memoised step, so its cache has to key on the binary's

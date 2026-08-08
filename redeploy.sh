@@ -13,7 +13,9 @@
 # `cargo xtask dist --variant bundle-linux` builds the server and the dashboard
 # carrying it in one step, and the next connect pushes the new server (the
 # digest marker beside the deployed binary is what lets it tell one dev build of
-# the same version from another). See "Embedded server payloads" in AGENTS.md.
+# the same version from another). For a server-only change you can skip the
+# dashboard rebuild entirely: `cargo xtask bundle` writes a freshly built server
+# into the `cm` you already have. See "Embedded server payloads" in AGENTS.md.
 # This script is still what you want for a dashboard built *without* a bundle
 # feature, for pushing a binary the
 # embedded one isn't (a debug build, a local patch), or to force the

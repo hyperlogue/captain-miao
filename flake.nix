@@ -117,7 +117,9 @@
         # and writes them into the linked binary. A nix expression could only
         # guess the number, and a guess is the thing this design set out to
         # remove. The whole sequence runs offline — every cargo invocation
-        # resolves from the vendored registry crane already set up.
+        # resolves from the vendored registry crane already set up, which is also
+        # why these pin `--servers build` (the default) rather than offering the
+        # `release` source: a nix build has no network to fetch one over.
         #
         # Two things they need that a plain build doesn't. `devToolchain`, for
         # the cross `rust-std`s — hence a second craneLib, leaving the plain

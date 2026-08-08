@@ -6,13 +6,16 @@ name: build
 # Unix-domain sockets, $XDG_RUNTIME_DIR, and caffeinate/systemd-inhibit — and
 # Kitty itself has no native Windows build, so there is no Windows target.
 #
-# Ships ONLY the `captain-miao` dashboard package (`-p captain-miao`, whose binary
-# is `cm`), not the
-# whole workspace: the dashboard carries the `claude`/`codex`/`hook`/`focus`
-# entrypoints a local install needs, and building it alone keeps libshpool (the
-# `captain-miao-server` pty pool) out of the cross-build — cross-compiling
-# libshpool to a portable binary is a separate, unsolved spike (docs/crate-split.md),
-# and the server is deployed to remote hosts by its own path, not this tarball.
+# The `build` matrix ships ONLY the `captain-miao` dashboard package
+# (`-p captain-miao`, whose binary is `miao`), not the whole workspace: the
+# dashboard carries the `claude`/`codex`/`hook`/`focus` entrypoints a local
+# install needs, and building it alone keeps libshpool (the `miao-server`
+# pty pool) off these runners' cross-builds.
+#
+# `miao-server` is published by the separate `server` job below, on one
+# x86_64 runner, cross-compiled to both Linux arches by cargo-zigbuild — which is
+# what makes the server a *fetchable* artifact rather than something every
+# bundled build has to compile for itself (`cargo xtask dist --servers release`).
 #
 # Linux builds run on **ubuntu-22.04**, not ubuntu-latest, purely to set the glibc
 # floor: a binary linked against 24.04's glibc 2.39 dies with a cryptic loader
@@ -131,5 +134,79 @@ jobs:
         with:
           name: captain-miao-${{ matrix.target }}
           path: captain-miao-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # The per-host daemon a dashboard deploys to a remote box. Published as its own
+  # release asset so obtaining a server is decoupled from building a dashboard:
+  # `cargo xtask dist --servers release` downloads these instead of cross-building,
+  # and `cargo xtask bundle` can write them into a `cm` that already exists.
+  #
+  # ONE x86_64 runner for both arches, deliberately. cargo-zigbuild cross-compiles
+  # bundled SQLite's C amalgamation without a distro cross toolchain, and — the
+  # reason it is used even for the runner's own arch — it pins the glibc floor at
+  # cm_payload::GLIBC_FLOOR (2.28, Debian 10 / RHEL 8). A native build here would
+  # link against the runner's glibc instead and die on the loader of any older
+  # server, which is precisely the fleet this binary exists to reach. The nix dev
+  # shell is where zig and the cross rust-stds come from; the flake covers
+  # x86_64-linux but not aarch64-linux, so the arm64 runner is not an option here
+  # even if we wanted one.
+  #
+  # It runs `cargo xtask server`, the same code path a developer runs locally, so
+  # the strategy choice, the floor, and the ELF architecture check cannot drift
+  # between what CI publishes and what a laptop builds.
+  server:
+    name: miao-server (linux payloads)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false # nothing here pushes
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Realize the dev shell once and put its Rust bin dir on PATH so
+      # Swatinem/rust-cache can read `rustc -vV` for its cache key (it runs
+      # outside the nix shell). The build itself still goes through `nix develop`.
+      - name: Put the flake toolchain on PATH
+        run: nix develop --command bash -c 'echo "$(dirname "$(command -v rustc)")" >> "$GITHUB_PATH"'
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: server-payloads
+
+      - name: Cross-build the servers
+        run: nix develop --command cargo xtask server --out dist/servers
+
+      # Flat tarballs — one binary, no wrapper directory and no README. These are
+      # a machine-consumed artifact: `cm_payload::fetch` extracts the single
+      # member `miao-server` by name, which is also what stops a crafted
+      # archive writing anywhere else. The file name is the other half of that
+      # contract; `release_url` builds exactly this string, pinned by a unit test.
+      - name: Package
+        run: |
+          set -euo pipefail
+          for dir in dist/servers/*/; do
+            target=$(basename "$dir")
+            tar -C "$dir" -czf "miao-server-$VERSION-$target.tar.gz" miao-server
+            echo "  packaged miao-server-$VERSION-$target.tar.gz"
+          done
+
+      # Two different names, and both matter. The *artifact* keeps the
+      # `captain-miao-` prefix because the release job selects artifacts with
+      # `pattern: captain-miao-*`; rename it and the servers silently stop being
+      # published. The *files* inside are `miao-server-v<version>-<target>.tar.gz`,
+      # which `release_url` reconstructs (pinned by a unit test) and which
+      # `stage-npm-packages.sh` cannot pick up — it looks for the exact name
+      # `captain-miao-v<version>-<target>`, so a server tarball can never be
+      # mistaken for a dashboard one and staged into an npm package.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: captain-miao-server-payloads
+          path: miao-server-*.tar.gz
           if-no-files-found: error
           retention-days: 7
