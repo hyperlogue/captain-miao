@@ -763,7 +763,7 @@ fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
 // linking the pty pool, so the only binary it could upload — itself — wouldn't
 // be a functional server. What it sends now is a real `miao-server`,
 // cross-built and embedded by `build.rs` in the same command that builds the
-// dashboard (`src/server_payload.rs`, `crates/cm-payload`). A dashboard built
+// dashboard (`src/server_payload.rs`, `xtask/src/server.rs`). A dashboard built
 // without a `bundle-*` feature behaves exactly
 // as it did before: probe, don't upload, and name what's wrong.
 //
@@ -2120,7 +2120,7 @@ mod tests {
     /// there is nothing else to type-check it: the staging/verify/publish
     /// ordering and the quoting are only *actually* correct if a shell agrees.
     /// A stand-in executable rather than a real payload, so it runs in every
-    /// checkout and on any arch — and needs no bundle feature.
+    /// checkout and on any arch — and needs no embedded server.
     fn run_deploy(shell: &str, home: &Path, stdin_bytes: &[u8], sha: &str) -> std::process::Output {
         use std::io::Write;
         let mut child = std::process::Command::new(shell)
@@ -2260,20 +2260,26 @@ mod tests {
     /// the embedded payload, verify it runs there, then confirm a second connect
     /// recognises its own work and doesn't re-send it.
     ///
-    /// Ignored by default because it needs a host, and a bundle feature so the
-    /// test binary carries a payload for that host's arch. It is the one part of
+    /// Ignored by default because it needs a host, and a payload manifest so the
+    /// test binary carries a server for that host's arch. It is the one part of
     /// §10.3's end-to-end checklist that
     /// doesn't need a *remote* machine — an sshd on localhost exercises every
     /// line of it — so run it whenever the deploy path changes:
     ///
     /// ```text
-    /// CM_TEST_SSH_TARGET=127.0.0.1 \
+    /// # Obtain a server and note where its manifest landed:
+    /// cargo xtask server --out /tmp/srv
+    /// printf '%s\t%s\t%s\n' x86_64-unknown-linux-gnu "$SHA" /tmp/srv/…/server.gz \
+    ///   > /tmp/payloads.tsv
+    ///
+    /// CM_SERVER_PAYLOAD_MANIFEST=/tmp/payloads.tsv \
+    ///   CM_TEST_SSH_TARGET=127.0.0.1 \
     ///   CM_TEST_SSH_OPTS="-p 2299 -i /tmp/id -o StrictHostKeyChecking=no" \
-    ///   cargo test -p captain-miao --features bundle-linux-x86_64 -- \
+    ///   cargo test -p captain-miao --features remote -- \
     ///     --ignored provisions_a_real_host
     /// ```
     ///
-    /// The feature is what puts a payload in the test binary; without one there
+    /// The manifest is what puts a payload in the test binary; without one there
     /// is nothing to deploy and the test says so.
     ///
     /// It deploys to `~/.cache/captain-miao/bin/` on the target, which is

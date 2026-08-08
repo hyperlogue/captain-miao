@@ -1,19 +1,14 @@
-//! Turns a `miao-server` binary into a packed payload, and writes packed
-//! payloads into a linked dashboard — the thing that dashboard then deploys to a
-//! remote host that hasn't got a server (`docs/crate-split.md`).
+//! Turns a `miao-server` binary into a packed payload — the thing a
+//! dashboard carries and deploys to a remote host that hasn't got a server
+//! (`docs/crate-split.md`).
 //!
 //! **Obtaining a server and building the dashboard are separate concerns**, and
 //! this module keeps them that way. Three sources produce the same [`Payload`]:
 //! [`build`] cross-compiles one from this workspace, [`from_file`] takes one
 //! somebody already has, and [`fetch`] downloads one from a published release.
-//! Everything downstream — packing, sizing, injection — is written once against
-//! the result and never learns which it was.
-//!
-//! That seam is the reason the payload is written in *after* linking rather than
-//! compiled in. A compiled-in payload is an input to the dashboard's build, so
-//! changing where servers come from means recompiling the dashboard; an injected
-//! one does not, so `cargo xtask bundle` can put a fetched server into a `cm`
-//! that is already built (or already shipped).
+//! Everything downstream is written once against the result and never learns
+//! which it was — including the dashboard's own build, which is handed the
+//! finished archives through a manifest and `include_bytes!`es them.
 //!
 //! Where a payload came from still has to be *recorded*, because the workspace
 //! version is the only thing a released artifact is keyed on and it does not move
@@ -34,8 +29,6 @@ use std::process::{Command, Stdio};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
-
-use crate::format;
 
 /// The cargo package we build. Distinct from [`SERVER_BIN`] since the rename:
 /// `cargo -p` still wants the package name, everything downstream wants the file.
@@ -269,10 +262,10 @@ pub struct Payload {
     /// host as its marker, so it identifies the build rather than the archive.
     pub sha256: String,
     /// The uncompressed binary this was packed from. Kept because obtaining a
-    /// server is now a step in its own right: `cargo xtask server` publishes
-    /// these, and the archive is no use to anything but the injector.
+    /// server is a step in its own right: `cargo xtask server` publishes these,
+    /// while only the dashboard's build wants the archive.
     pub bin_path: PathBuf,
-    /// The gzip the injector writes into the dashboard's slot.
+    /// The gzip the dashboard `include_bytes!`es.
     pub gz_path: PathBuf,
     pub raw_len: u64,
     pub gz_len: u64,
@@ -380,7 +373,8 @@ pub fn fetch(build_dir: &Path, target: &str, version: &str, base: &str) -> Resul
             &tgz.display().to_string(),
             &url,
         ],
-    )?;
+    )
+    .map_err(|e| annotate_fetch_failure(e, version, target))?;
 
     let (bin, raw) = unpack_server(&tgz, &dir, target, &url)?;
     pack_binary(
@@ -439,6 +433,24 @@ fn unpack_server(
     Ok((bin, raw))
 }
 
+/// Turn curl's exit into something that says what to do next. Pure.
+///
+/// A 404 is by far the likeliest failure and it has two quite different causes:
+/// the release predates servers being published at all, or it published them but
+/// not for this architecture. Neither is obvious from "HTTP 404", and the first
+/// has a specific answer — build them instead.
+fn annotate_fetch_failure(err: String, version: &str, target: &str) -> String {
+    if !err.contains("404") {
+        return err;
+    }
+    format!(
+        "{err}\n  v{version} publishes no miao-server for {target}. \
+         Releases before servers were published as their own assets carry none at \
+         all — use `--servers build` (needs cargo-zigbuild + zig; `nix develop` \
+         provides both), or `--server {target}=<path>` if you already have one."
+    )
+}
+
 /// The release asset a [`fetch`] pulls. Pure, so the naming contract with the
 /// release workflow is pinned by a test rather than by a successful download.
 pub fn release_url(base: &str, version: &str, target: &str) -> String {
@@ -489,124 +501,6 @@ fn verify_arch(raw: &[u8], target: &str, whence: &str) -> Result<(), String> {
         return Err(format!(
             "{whence} is ELF e_machine {found:#06x}, expected {expected:#06x} for {target} \
              (wrong architecture for this payload)"
-        ));
-    }
-    Ok(())
-}
-
-/// What an [`inject`] call put where.
-pub struct Injected {
-    pub used: usize,
-    pub capacity: usize,
-}
-
-/// How much slot a set of payloads needs, so a caller can size the reservation
-/// before the dashboard is compiled. Pure over the sizes it is given.
-pub fn slot_needed(entries: &[(&str, &str, usize)]) -> usize {
-    // 4-byte count, then per entry: 2 + 2 + 8 of fixed header, the target and
-    // digest strings, and the blob itself.
-    entries.iter().fold(4, |n, (target, sha, gz_len)| {
-        n + 12 + target.len() + sha.len() + gz_len
-    })
-}
-
-/// Write `payloads` into an already-linked dashboard binary, in place.
-///
-/// The file's length never changes: every byte lands inside the reservation the
-/// linker placed, which is what lets this survive `strip` and work identically on
-/// ELF and Mach-O (see [`crate::format`]).
-pub fn inject(binary: &Path, payloads: &[&Payload]) -> Result<Injected, String> {
-    let blobs: Vec<Vec<u8>> = payloads
-        .iter()
-        .map(|p| {
-            std::fs::read(&p.gz_path).map_err(|e| format!("reading {}: {e}", p.gz_path.display()))
-        })
-        .collect::<Result<_, _>>()?;
-    let entries: Vec<format::Entry<'_>> = payloads
-        .iter()
-        .zip(&blobs)
-        .map(|(p, gz)| format::Entry {
-            target: &p.target,
-            sha256: &p.sha256,
-            gz,
-        })
-        .collect();
-    let body = format::encode(&entries);
-
-    let mut bin =
-        std::fs::read(binary).map_err(|e| format!("reading {}: {e}", binary.display()))?;
-    let before = bin.len();
-    let slot = format::find(&bin)?;
-    format::write(&mut bin, slot, &body)?;
-    debug_assert_eq!(before, bin.len(), "injection must not resize the binary");
-
-    write_replacing(binary, &bin)?;
-    resign(binary)?;
-
-    Ok(Injected {
-        used: body.len(),
-        capacity: slot.capacity,
-    })
-}
-
-/// Replace a file's contents atomically, keeping its mode.
-///
-/// `cargo xtask bundle` patches a dashboard **in place**, and that dashboard may
-/// be the `cm` on someone's PATH — possibly a running one. Truncate-and-write is
-/// wrong on both counts: an interrupted write leaves a corrupt binary where a
-/// working one was, and on Linux writing to a running executable fails outright
-/// with `ETXTBSY`. Staging beside it and renaming over answers both — the swap is
-/// atomic, and a process already running keeps the old inode until it exits.
-///
-/// The temp file is a sibling so the rename stays within one filesystem, and the
-/// original's permissions are copied onto it before the swap so the executable
-/// bit survives (a fresh file would be created by the umask instead).
-fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let perms = std::fs::metadata(path)
-        .map_err(|e| format!("reading the mode of {}: {e}", path.display()))?
-        .permissions();
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("{} has no file name", path.display()))?;
-    let tmp = path.with_file_name(format!(".{}.cm-inject", name.to_string_lossy()));
-
-    let staged = (|| {
-        std::fs::write(&tmp, bytes)?;
-        std::fs::set_permissions(&tmp, perms)?;
-        std::fs::rename(&tmp, path)
-    })();
-    if let Err(e) = staged {
-        // The rename is what publishes it, so anything before that leaves only a
-        // dotfile to clean up and the original untouched.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("writing {}: {e}", path.display()));
-    }
-    Ok(())
-}
-
-/// Re-sign a patched Mach-O.
-///
-/// Every arm64 macOS binary must carry a valid signature, and the bytes we
-/// overwrite are inside the region the signature hashes — so a patched binary is
-/// killed on exec until it is signed again. Ad-hoc (`-s -`) is what the toolchain
-/// produces by default, so this restores the status quo rather than adding a
-/// requirement; a release signed with a real identity has to be signed after
-/// bundling regardless. A no-op everywhere else.
-fn resign(binary: &Path) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Ok(());
-    }
-    let out = Command::new("codesign")
-        .args(["-f", "-s", "-"])
-        .arg(binary)
-        .output()
-        .map_err(|e| format!("running codesign (needed after patching a Mach-O): {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "codesign failed on {} ({}); a patched Mach-O will not run unsigned\n{}",
-            binary.display(),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
         ));
     }
     Ok(())
@@ -886,6 +780,21 @@ mod tests {
         );
     }
 
+    /// A 404 is the likeliest fetch failure and the least self-explanatory, so
+    /// it gets an answer rather than an HTTP status. Anything else is passed
+    /// through — curl already said it better than we could.
+    #[test]
+    fn a_missing_release_asset_says_what_to_do_instead() {
+        let msg = annotate_fetch_failure("curl: (22) … error: 404".into(), "0.2.1", OTHER);
+        assert!(msg.contains("404"), "{msg}");
+        assert!(msg.contains("v0.2.1"), "{msg}");
+        assert!(msg.contains(OTHER), "{msg}");
+        assert!(msg.contains("--servers build"), "{msg}");
+
+        let other = "curl: (6) Could not resolve host".to_string();
+        assert_eq!(annotate_fetch_failure(other.clone(), "0.2.1", OTHER), other);
+    }
+
     /// Only a build we performed knows how it was linked. A fetched or
     /// caller-supplied binary must not be described as if we had chosen its
     /// strategy — which is what would happen if the floor warning defaulted.
@@ -1039,7 +948,7 @@ mod tests {
     /// content — not on the archive merely existing.
     #[test]
     fn packing_is_reused_only_while_the_binary_is_unchanged() {
-        let dir = std::env::temp_dir().join(format!("cm-payload-pack-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cm-server-pack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let raw = b"\x7fELF and then some payload bytes".repeat(64);

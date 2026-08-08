@@ -1,7 +1,7 @@
 //! The `miao-server` binaries this dashboard carries, and the mapping
 //! from a remote's `uname -sm` to the one it can run.
 //!
-//! A dashboard built with the `bundle` feature can **deploy its own server**: on
+//! A dashboard built carrying a server can **deploy it**: on
 //! connect, a host with no matching `miao-server` gets one pushed over
 //! the ssh connection the probe just opened, instead of a "not found — go deploy
 //! it" message. That is the zero-touch provisioning the crate split gave up when
@@ -9,20 +9,25 @@
 //! *server* build rather than against the dashboard binary itself
 //! (`docs/crate-split.md`).
 //!
-//! **The payloads are written in after linking.** The feature reserves a run of
-//! bytes here; `cargo xtask dist` cross-builds the servers and overwrites that
-//! reservation in the finished binary. So which servers a `cm` carries is chosen
-//! at bundling time, not compile time — one dashboard build serves every
-//! architecture combination — and the compile itself needs no cross toolchain.
-//! Without the feature there is no slot and no reader, and `backend.rs` behaves
-//! exactly as it did before any of this existed: probe, don't deploy, and say
-//! what's wrong.
+//! **What a build carries comes from one environment variable.** `cargo xtask`
+//! obtains the servers — cross-compiled here, downloaded from a release, or
+//! handed over as paths — and points `CM_SERVER_PAYLOAD_MANIFEST` at the
+//! archives; `build.rs` `include_bytes!`es them into [`PAYLOADS`]. Unset, which
+//! is every ordinary `cargo build`, the table is empty, nothing extra is linked,
+//! and `backend.rs` behaves exactly as it did before any of this existed: probe,
+//! don't deploy, and say what's wrong.
+//!
+//! The archives are `include_bytes!`d rather than patched into the linked binary
+//! afterwards. The alternative was measured and dropped: a reserved slot bought
+//! only the ability to re-bundle a `miao` without recompiling it, which saves 58
+//! seconds and still needs cargo (to build `xtask`), and it cost a binary format,
+//! two `unsafe` blocks, a fixed reservation, and a `codesign` step on macOS.
+//! `include_bytes!` data is allocated and referenced, so — like the slot it
+//! replaced — it survives `strip`.
 
 use std::io::Read;
-use std::sync::OnceLock;
 
-/// One embedded server build. The borrows point into the reserved slot, which is
-/// a `static`, so they really are `'static`.
+/// One embedded server build.
 pub(crate) struct ServerPayload {
     /// The Rust target triple it was built for.
     pub(crate) target: &'static str,
@@ -45,86 +50,14 @@ impl ServerPayload {
     }
 }
 
-/// The reserved slot: the bytes `cargo xtask dist` overwrites after linking.
-#[cfg(feature = "bundle")]
-mod slot {
-    use std::cell::UnsafeCell;
+// The table `build.rs` generates: one `ServerPayload` per line of the manifest,
+// each `gz` an `include_bytes!` of the archive. Empty — a `&[]` costing nothing —
+// whenever `CM_SERVER_PAYLOAD_MANIFEST` was unset, which is every ordinary build.
+include!(concat!(env!("OUT_DIR"), "/payloads.rs"));
 
-    include!(concat!(env!("OUT_DIR"), "/reserve.rs"));
-
-    #[repr(C)]
-    struct Slot {
-        magic: [u8; 16],
-        used: u64,
-        capacity: u64,
-        body: [u8; RESERVE],
-        sentinel: [u8; 16],
-    }
-
-    /// `UnsafeCell` is load-bearing, not decoration. An immutable `static` lets
-    /// the compiler constant-fold reads of its initializer, which under release
-    /// LTO it does — every read of `used` would fold to the compile-time `0` and
-    /// the injected payload would be invisible while the bytes sat in the file.
-    /// Interior mutability forces a real load. (It also moves the slot from
-    /// `.rodata` to `.data`; both are `PROGBITS`, so the strip-immunity that
-    /// motivates the whole design is unaffected.)
-    struct Cell(UnsafeCell<Slot>);
-    // SAFETY: written only by the injector, into the on-disk file, before any of
-    // this ever runs. Nothing in the process mutates it, so shared reads are fine.
-    unsafe impl Sync for Cell {}
-
-    #[used]
-    static SLOT: Cell = Cell(UnsafeCell::new(Slot {
-        magic: cm_payload::format::MAGIC,
-        used: 0,
-        capacity: RESERVE as u64,
-        body: [0xA5; RESERVE],
-        sentinel: cm_payload::format::SENTINEL,
-    }));
-
-    /// The written region of the slot, or `None` when nothing was injected.
-    pub(super) fn body() -> Option<&'static [u8]> {
-        // SAFETY: `SLOT` is a `static`, so the reference is genuinely `'static`;
-        // see the `Sync` note above for why sharing it is sound.
-        let slot = unsafe { &*SLOT.0.get() };
-        let used = slot.used as usize;
-        if used == 0 || used > slot.capacity as usize {
-            return None;
-        }
-        Some(&slot.body[..used])
-    }
-}
-
-#[cfg(not(feature = "bundle"))]
-mod slot {
-    /// No feature, no slot — the binary is byte-for-byte what it would be
-    /// without any of this.
-    pub(super) fn body() -> Option<&'static [u8]> {
-        None
-    }
-}
-
-/// The payloads this binary carries, parsed from the slot on first use.
-///
-/// A malformed slot yields an empty table rather than an error: a half-written
-/// payload would deploy and then fail to exec on someone else's machine, which
-/// is worse than carrying nothing and saying so.
+/// The payloads this binary carries.
 pub(crate) fn payloads() -> &'static [ServerPayload] {
-    static PARSED: OnceLock<Vec<ServerPayload>> = OnceLock::new();
-    PARSED.get_or_init(|| {
-        let Some(body) = slot::body() else {
-            return Vec::new();
-        };
-        cm_payload::format::decode(body)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| ServerPayload {
-                target: e.target,
-                sha256: e.sha256,
-                gz: e.gz,
-            })
-            .collect()
-    })
+    PAYLOADS
 }
 
 /// The targets, in preference order, that a host reporting `uname -sm` could
@@ -178,7 +111,7 @@ pub(crate) fn embedded_targets() -> Vec<&'static str> {
 ///
 /// Whether a given `miao` can deploy a server is otherwise invisible until you
 /// connect to a host and it either works or explains itself — and since the
-/// answer depends on how the binary was *bundled*, not on any config, there is
+/// answer depends on what the binary was *built with*, not on any config, there is
 /// nothing else to look at. Always says something, including "none", so the
 /// absence of payloads reads as an answer rather than as an old build that
 /// doesn't report. The digest is what distinguishes two same-version builds.
@@ -187,7 +120,7 @@ pub(crate) fn describe() -> String {
 }
 
 /// [`describe`] over an injected table, so both branches are testable in a
-/// binary whose own slot is whatever it was bundled with. Pure.
+/// binary whose own table is whatever it was built with. Pure.
 fn describe_table(table: &[ServerPayload]) -> String {
     if table.is_empty() {
         return "embedded miao-server: none \
@@ -282,7 +215,7 @@ mod tests {
         enc.write_all(&raw).unwrap();
         let gz = enc.finish().unwrap();
         // `gz` has to outlive the borrow in `ServerPayload`, hence the leak; this
-        // is the one place a payload isn't `'static` from the slot itself.
+        // is the one place a payload isn't `'static` from the embedded table.
         let payload = ServerPayload {
             target: "t",
             sha256: "s",
@@ -311,8 +244,8 @@ mod tests {
 
     #[test]
     fn whatever_this_binary_carries_is_well_formed() {
-        // Vacuously true in a regular build (nothing is bundled); in a bundled
-        // one this pins that the slot parsed into usable entries.
+        // Vacuously true in a regular build (nothing is embedded); in a bundled
+        // one this pins that the manifest produced usable entries.
         for p in payloads() {
             assert_eq!(p.sha256.len(), 64, "{}: bad digest", p.target);
             assert!(!p.gz.is_empty(), "{}: empty payload", p.target);

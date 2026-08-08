@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Build chores for captain-miao: builds the named release dashboard variants"
+description = "Build chores for captain-miao: obtains miao-server payloads and builds the named release dashboard variants"
 
 # The `cargo xtask` pattern: a plain workspace binary invoked through the
 # `[alias]` in `.cargo/config.toml`, so build chores are Rust the whole workspace
@@ -14,6 +14,13 @@ description = "Build chores for captain-miao: builds the named release dashboard
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# Cross-builds the servers and writes them into the linked dashboard. The `build`
-# feature is the half the dashboard itself never links.
-cm-payload = { path = "../crates/cm-payload", features = ["build"] }
+# `server.rs` obtains and packs the payloads. These live here rather than in a
+# crate of their own because nothing else links them: the dashboard reads the
+# archives through `include_bytes!`, so it needs no code from this side at all.
+#
+# gzip. The dashboard inflates with the same crate, so there is one codec in the
+# tree and no C dependency on either side.
+flate2 = "1"
+# The digest that rides to the remote host as the deployed-build marker. Same
+# major as cm-core's, so the workspace carries one copy.
+sha2 = "0.11"

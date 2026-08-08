@@ -56,11 +56,12 @@ jobs:
       - name: rustfmt
         run: nix develop --command cargo fmt --all --check
 
-      # Two explicit runs rather than `--all-features`. The `bundle` feature is
-      # harmless to lint — it only reserves slot space, and the servers are
-      # written in afterwards by `cargo xtask dist` — but `remote` is the one
-      # that gates real code, so it gets an explicit pass rather than being
-      # swept up in a flag whose meaning changes as features are added.
+      # Two explicit runs rather than `--all-features`. `remote` is the feature
+      # that gates real code, so it gets an explicit pass rather than being swept
+      # up in a flag whose meaning changes as features are added. Nothing here
+      # needs to arrange for the embedded server payloads: those ride an
+      # environment variable (CM_SERVER_PAYLOAD_MANIFEST) that CI never sets, so
+      # `build.rs` embeds nothing and lints see the ordinary build.
       - name: clippy
         run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
 

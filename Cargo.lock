@@ -234,7 +234,6 @@ dependencies = [
  "base64",
  "clap",
  "cm-core",
- "cm-payload",
  "crossterm",
  "dirs",
  "emojis",
@@ -392,14 +391,6 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "cm-payload"
-version = "0.2.1"
-dependencies = [
- "flate2",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3176,7 +3167,8 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
- "cm-payload",
+ "flate2",
+ "sha2 0.11.0",
 ]
 
 [[package]]

@@ -30,11 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-compiles them from the sources beside you, against an old glibc (2.28 —
   Debian 10, RHEL 8) so they run on machines far older than the one that built
   them. `--servers release` downloads the ones a release published, so a bundled
-  dashboard needs only `curl` and `tar` — no cross toolchain at all. And
-  `cargo xtask bundle` writes servers into a `cm` you already have, without
-  rebuilding it. Each release now publishes the servers as their own assets to
-  make that possible, and `cm --version` prints the digest of everything a binary
-  carries, which is what tells two builds of the same version apart.
+  dashboard needs only `curl` and `tar` — no cross toolchain at all. Each release
+  now publishes the servers as their own assets to make that possible, and
+  `miao --version` prints the digest of everything a binary carries, which is what
+  tells two builds of the same version apart.
 
 - **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
   By default a session *is* its terminal window and closing it ends the session.

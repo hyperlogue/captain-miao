@@ -12,8 +12,8 @@ cleaner client/server layering and faster incremental builds come for free.
 ## Shape
 
 A Cargo workspace of four shipping packages — three at the time of the split,
-plus `captain-miao-client`, added after — with `cm-payload` and `xtask` alongside
-as build support (root stays the `captain-miao` package, so `cargo install
+plus `captain-miao-client`, added after — with `xtask` alongside as build
+support (root stays the `captain-miao` package, so `cargo install
 --path .` and the release binary path are unchanged):
 
 - **`cm-core`** (`crates/cm-core/`) — lib. The logic + data the binaries share:
@@ -31,12 +31,6 @@ as build support (root stays the `captain-miao` package, so `cargo install
   daemon + pty pool a remote dashboard reaches over ssh. `daemon`/`attach`/
   `pty-daemon` + the pooled `claude`/`codex`/`hook`. Depends on `cm-core`.
   It **hosts** the pool (feature `pty-pool`, default on).
-- **`cm-payload`** (`crates/cm-payload/`) — lib, `publish = false`. Two halves,
-  split by who links which. `format` has no dependencies and is shared: the
-  dashboard reads the payload slot with it, `xtask` writes the slot with it, and
-  one module is what stops the writer and the reader drifting apart. The `build`
-  feature adds the cross-compile, the compression and the injector, and only
-  `xtask` turns it on — so the dashboard's dependency here costs it nothing.
 - **`captain-miao-client`** (`crates/cm-client/`) — bin `miao-client`. Added after the original
   three-way split: a thin user-facing CLI over the *local* pool socket, `list`
   and `attach`. The only other crate that links libshpool (for the in-process
@@ -90,31 +84,23 @@ links libshpool), so it carries a real `miao-server` instead and pushes
 that. Provisioning is zero-touch again: connect to a bare host and it gets a
 server, with no manual deploy step.
 
-**The dashboard is no longer one artifact.** The `bundle` cargo feature (which
-implies `remote`) reserves room for servers and compiles the reader; without it
-there is no slot, no reader, and a binary byte-for-byte what it would be if none
-of this existed. There is one feature rather than one per architecture because
-*which* servers a binary carries is decided when they are written in, not when it
-is compiled — so a single dashboard build serves every combination.
+**The dashboard is no longer one artifact.** A build carries whatever servers it
+was pointed at; most users want none. `cargo xtask dist` produces the named
+variants side by side — a plain `miao` carrying nothing, a `miao-bundle-linux`
+carrying both Linux arches, single-arch ones in between — and a plain `cargo
+build` is byte-for-byte what it would be if none of this existed.
 
-**Payloads are written in after linking, and the point of that is decoupling.**
-Compiling the payload in would make it an *input* to the dashboard's build, which
-welds two questions together that have no business being one: where do servers
-come from, and how is the dashboard built. Injecting keeps them apart, and the
-tooling is split along the same line:
+**Obtaining a server and building a dashboard are separate steps**, with the seam
+between them at *where servers come from* rather than at *how they get in*.
+`xtask` has one subcommand per half:
 
 | `cargo xtask …` | does | needs |
 |---|---|---|
 | `server` | obtains server binaries | a cross toolchain, or a network |
-| `bundle <cm>` | writes them into a linked dashboard | neither — no cargo either |
-| `dist` | both, plus the dashboard build | whatever the source needs |
+| `dist` | that, plus the dashboard build | whatever the source needs |
 
-`bundle` is the one that could not exist otherwise. It patches a `cm` that is
-already built — or already shipped — so a dashboard and the servers it carries
-need never have been on the same machine, let alone in the same command.
-
-**Where servers come from is therefore a flag, not an assumption.** Three sources
-produce the same `Payload` and nothing downstream can tell which answered:
+**Where servers come from is a flag, not an assumption.** Three sources produce
+the same `Payload` and nothing downstream can tell which answered:
 
 - `--servers build` cross-compiles from this workspace. The default, and what the
   dev loop wants: the server has to match the sources you are changing.
@@ -125,10 +111,6 @@ produce the same `Payload` and nothing downstream can tell which answered:
 - `--server <target>=<path>` takes a binary the caller already has. The escape
   hatch, and what release CI uses when its own jobs have already produced them.
 
-The rest still follows: `build.rs` reads one environment variable and writes one
-constant, `cargo build` / `clippy` / `check` need no cross toolchain, and one
-dashboard compile serves every architecture combination.
-
 Two properties of the fetch path are load-bearing, and both are pinned by tests
 over real tarballs rather than over a live download — a test can be handed a
 hostile archive, it cannot be handed a hostile release. `--proto =https` is
@@ -138,63 +120,78 @@ member is extracted **by name**, so a `../` entry has nothing to land on; a
 symlink wearing that name is refused rather than read through, since `tar`
 extracts one happily and reading it would pack a file from anywhere on the box.
 
-**A version match is not identity**, which is why provenance is recorded rather
-than inferred. The workspace version is the only thing a released artifact is
-keyed on and it does not move between dev builds, so a `0.2.1` server says
-nothing about *which* `0.2.1`. `Provenance` names the source for the human;
-each payload's sha256 is what actually tells two builds apart, on `cm --version`
-and in the marker the deploy leaves on the host. It also decides what may be
-warned about: only a build we ran has a glibc floor we chose, so `unpinned_floor`
-is reached through `Provenance::strategy()` and stays quiet about a binary
-somebody else linked.
+**The payload reaches the compile through one environment variable.** `xtask`
+writes a per-variant TSV manifest — `<target>\t<sha256>\t<gz path>` — and points
+`CM_SERVER_PAYLOAD_MANIFEST` at it; `build.rs` `include_bytes!`es each archive
+into `server_payload.rs`'s table. Unset, which is every ordinary `cargo build`,
+the table is empty and the binary is what it would be if none of this existed.
+That variable is the whole switch, so there is no cargo feature beside it — a
+bundling variant simply also passes `--features remote`, since the deploy path
+lives behind that gate and a server carried without it would be dead weight.
 
-**The mechanism is a reserved slot, and the reason is `strip`.** Three ways to
-get bytes into a linked binary were measured:
+A manifest that is *set* and malformed is a **hard build error**. It is always a
+mistake — a stale exported variable, an archive that moved — and the lenient
+reading produces a dashboard that carries nothing while every sign says it
+should.
+
+**Two watched files, and neither may be touched needlessly.** `build.rs`
+`rerun-if-changed`s the manifest and each archive, so rewriting either with
+identical bytes bumps its mtime, re-runs the build script, and forces a full LTO
+relink for no reason. Hence `write_manifest` writes only on a real change, and
+`build.rs` stages a *copy* of each archive into `OUT_DIR` to embed from rather
+than `include_bytes!`ing the file it watches. Both mistakes were made here once
+each before being understood.
+
+### Post-link injection: built, measured, dropped
+
+An earlier iteration put the payloads into the *linked* binary instead — a
+reserved slot the linker placed, overwritten afterwards by an injector. It is
+recorded here because the reasoning is easy to have again.
+
+`strip` is what pushes you toward it. Three ways to get bytes into a linked
+binary, measured:
 
 | | survives `strip` | ELF + Mach-O | size cost |
 |---|---|---|---|
 | append + trailer | **no — silently wiped** | yes | exact |
 | `objcopy --add-section` | yes | ELF only | exact |
-| **reserved `.rodata` slot** | **yes** | **yes** | fixed reservation |
+| reserved slot | yes | yes | fixed reservation |
 
 `strip` does not edit a file, it rewrites it from the ELF structure, so trailing
 bytes are simply not carried across — an appended payload disappears with no
-error and `cm --version` then honestly reports carrying nothing. A section added
-by `objcopy` survives (verified, including `--strip-all`), but Mach-O has no
-post-link equivalent: `ld -sectcreate` is link-time and `segedit -replace` is
-same-size-only, which is Apple having reached the same conclusion. A slot the
-linker already placed is allocated, loaded, and referenced, so `strip` cannot
-remove it without breaking the program — and overwriting bytes in place disturbs
-nothing either format cares about, so one implementation covers both.
+error. A section added by `objcopy` survives (verified, including `--strip-all`),
+but Mach-O has no post-link equivalent: `ld -sectcreate` is link-time and
+`segedit -replace` is same-size-only. A slot the linker already placed survives
+both, and can be overwritten in place on either format.
 
-Three things that had to be right, each found by trying it:
+It worked. Three things had to be right, each found by trying it: the slot had to
+be an **`UnsafeCell`**, because release LTO constant-folds reads of an immutable
+`static`'s initializer and every read of the used-length field folded to the
+compile-time zero; `find` had to require a **sentinel** at the capacity the
+header claimed, since re-injecting scans across bytes that are themselves a
+payload; and a malformed slot had to decode to **nothing**, because half a
+payload would deploy and then fail to exec on someone else's machine.
 
-- **`UnsafeCell`, not a plain `static`.** An immutable static lets the compiler
-  constant-fold reads of its initializer, and under release LTO it does — every
-  read of the "how many bytes were injected" field would fold to the compile-time
-  zero while the payload sat in the file unread. Interior mutability forces a real
-  load. It also moves the slot from `.rodata` to `.data`; both are `PROGBITS`, so
-  strip-immunity is unaffected.
-- **The sentinel, not just the magic.** Injecting over an already-bundled binary
-  means scanning across bytes that are themselves a payload and could contain the
-  magic by chance. A candidate is only accepted when its recorded capacity lands
-  the sentinel exactly where the header implies, and two survivors is an error
-  rather than a coin flip.
-- **A malformed slot decodes to nothing.** Half a payload would deploy and then
-  fail to exec on someone else's machine, which is a worse failure than carrying
-  nothing and saying so.
+It was dropped anyway, because the question is not "does it work" but "what does
+it buy over `include_bytes!`". Measured:
 
-**The reservation is sized, not chosen.** `CM_PAYLOAD_RESERVE` is read by
-`build.rs`; `xtask` sets it from the servers it just compressed, plus headroom,
-rounded up to a megabyte so variants needing similar amounts share a dashboard
-compile. Unset — every ordinary build — means a zero-length slot, so `cargo
-build`, `clippy` and `check` behave identically with the feature on or off and
-need no cross toolchain.
+- **Its one structural claim was false.** "One dashboard compile serves every
+  architecture combination" — the three bundled variants reserve 5, 4 and 7 MiB,
+  so no two ever shared a compile. `dist --all` costs five either way.
+- **The remaining benefit is 58 seconds** — a warm release relink of the
+  dashboard, which is what re-bundling avoids. And it does not avoid *cargo*: the
+  injector is `xtask`, so you need a toolchain regardless.
+- **The cost was ~600 lines** (a binary format with magic, sentinel and capacity
+  header; a slot module; an injector), two `unsafe` blocks, a `codesign` step on
+  macOS that patching a Mach-O makes mandatory, and ~1 MiB of reservation slack
+  in every bundled artifact — `miao-bundle-linux` went from 13.7 to 12.6 MiB when
+  it came out.
 
-The rounding slack is close to free where it matters. A run of identical filler
-bytes costs **5,232 bytes** in a gzipped release tarball (measured against 4.5 MiB
-of slack), and both distribution channels are gzipped, so the reservation shows up
-in on-disk footprint and essentially nowhere else.
+`include_bytes!` gives up nothing that mattered. It is allocated, referenced data,
+so `strip` cannot remove it either; the decoupling lives in `--servers`, which is
+orthogonal to the embedding; and the "payload is not a compile input" property —
+no cross toolchain for `cargo build`, `clippy`, `check` — is preserved by the
+environment variable simply being unset.
 
 **Release builds gained `lto = "fat"` + `codegen-units = 1`** while measuring
 this: 16% off `miao-server` (8.61 → 7.21 MB) and the same order off `miao`,
@@ -206,11 +203,11 @@ session on the host.
 **Building the variants: `cargo xtask dist`** builds the named release artifacts
 into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`, plus the single-arch
 bundles. Each run obtains every server once even when several variants want it,
-then verifies each artifact by running it and checking it reports what was just
-injected — the only check that can catch a bad patch. `bundle` runs the same
-check but merely warns when the artifact will not start, since bundling a Linux
-`cm` on a mac is a thing it exists for; a binary that *runs* and reports the
-wrong payloads is an error either way.
+then verifies each artifact by running it and checking it reports what it was
+built to carry. That check earns its keep: a manifest reaches the compile through
+an environment variable and a generated file, and that seam fails *silently* — a
+variable that did not survive, an archive that moved, and the build succeeds
+carrying nothing.
 
 **Release CI publishes the servers** (`build.yml`'s `server` job), which is what
 gives `--servers release` something to fetch. One x86_64 runner cross-compiles
@@ -225,10 +222,13 @@ by-name extraction contract above.
 
 **Nix has the same variants**: `packages.captain-miao-bundle-linux` and the two
 single-arch ones. They delegate to `cargo xtask dist` rather than reimplementing
-it, because the reservation has to be sized from the *compressed* servers and a
-nix expression could only guess — and a guessed number is what this design set
-out to remove. The whole sequence runs offline: every cargo invocation resolves
-from the vendored registry crane already set up. Two things they need that the
+it, because obtaining the servers, writing each variant's manifest and building
+against it is exactly what `dist` already does — a nix expression would be a
+second copy of it, free to drift. The whole sequence runs offline: every cargo
+invocation resolves from the vendored registry crane already set up, which is
+also why these stay on `--servers build` (the default) rather than offering the
+`release` source — a nix build has no network to fetch one over. Two things they
+need that the
 plain packages don't, both found by trying it: `devToolchain` for the cross
 `rust-std`s (a second `craneLib`, so `nix build .#captain-miao` stays
 byte-identical), and a **writable `HOME`** — cargo-zigbuild keeps a cache under it
@@ -275,5 +275,6 @@ Verified end to end over real ssh (probe → deploy → verify → re-probe → 
 connect declines to re-send → `daemon status` runs on the deployed binary) by the
 `provisions_a_real_host_end_to_end` test, which is `#[ignore]`d and takes its
 target from `CM_TEST_SSH_TARGET`. An sshd on localhost exercises every line of
-it, so it does not need a remote machine. Run it with a bundle feature on — that
-is what puts a payload in the test binary.
+it, so it does not need a remote machine. Run it with
+`CM_SERVER_PAYLOAD_MANIFEST` set — that is what puts a payload in the test
+binary.

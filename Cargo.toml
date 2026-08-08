@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cm-core", "crates/cm-server", "crates/cm-client", "crates/cm-payload", "xtask"]
+members = ["crates/cm-core", "crates/cm-server", "crates/cm-client", "xtask"]
 
 # Metadata every member inherits with `<key>.workspace = true`, so the version,
 # license, and repo URL can't drift between the four packages.
@@ -60,10 +60,6 @@ base64 = "0.22"
 # the same crate `xtask` compresses with, so there is one codec in the tree and
 # no C dependency on either side.
 flate2 = "1"
-# The reserved-slot format, shared with the injector in `xtask` so the writer and
-# the reader can't drift. Default features only, which is the dependency-free
-# format module — the cross-build half is behind its `build` feature.
-cm-payload = { path = "crates/cm-payload" }
 
 [features]
 default = []
@@ -78,24 +74,6 @@ default = []
 # a `Backend::Remote`, leaving it local-only.
 remote = []
 
-# Reserve room for `captain-miao-server` builds, so the dashboard can deploy one
-# to a remote host that hasn't got it (docs/crate-split.md).
-#
-# The feature reserves the space and compiles the reader; `cargo xtask dist`
-# cross-builds the servers and writes them into the reservation **after
-# linking**. So this is not "which servers does it carry" — that is chosen at
-# bundling time, and one build serves every architecture combination. It is only
-# "can it carry any", which is why there is one feature here rather than one per
-# arch, and why turning it on needs no cross toolchain.
-#
-# How much room comes from `CM_PAYLOAD_RESERVE` (see `build.rs`), which `xtask`
-# sets from the size of the servers it just compressed. Unset means a zero-length
-# slot: the build succeeds and honestly reports carrying nothing.
-#
-# Implies `remote`: a bundled server is only reachable through the remote-host
-# path, so a bundle without it would be dead weight by construction.
-bundle = ["remote"]
-
 # Dev-only: the logo/cat alpha-mask assets are generated once by
 # `examples/gen_logo_assets` (pure-Rust 2D rasteriser) and committed under
 # `assets/logo/`. tiny-skia never ships in the dashboard binary — the runtime only
@@ -105,9 +83,9 @@ tiny-skia = "0.11"
 
 [profile.release]
 # Strip symbols from the release binary (~0.9 MB smaller); we ship the binary,
-# not a debugger target. Safe alongside the payload slot, which is allocated data
-# rather than a symbol or a trailing blob and so survives stripping — that is the
-# property the whole bundling design is built on.
+# not a debugger target. Safe alongside the embedded server payloads: an
+# `include_bytes!` static is allocated, referenced data rather than a symbol or a
+# trailing blob, so `strip` cannot drop it without breaking the program.
 strip = true
 # Measured 16% off `miao-server` (8.61 → 7.21 MB) and the same order off
 # `miao`, which every npm and GitHub download pays for, and which a bundled build

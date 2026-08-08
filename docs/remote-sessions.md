@@ -311,8 +311,8 @@ the full sequence and re-runs it on every reconnect:
    one, which is what makes the dev loop work without a version bump. Full
    design in `docs/crate-split.md`.
 
-   Where a deploy isn't possible — no payload for that arch, or a build with no
-   bundle feature (the default) — the original story stands, **assume it's already
+   Where a deploy isn't possible — no payload for that arch, or a build that
+   embedded none (the default) — the original story stands, **assume it's already
    there, verify, and fail loudly**, and it is loud: `provision_failure` turns a
    fall-back into a sentence (*"miao-server version mismatch (found
    0.3.1, need 0.4.0)"*, *"…not found (need 0.4.0); no payload for Linux

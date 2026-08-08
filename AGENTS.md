@@ -22,8 +22,8 @@ Claude Code hook → miao hook → launcher (Unix socket)
 
 ## Module layout
 
-captain-miao is a **Cargo workspace** with four shipping members plus two
-build-support ones (`cm-payload`, `xtask`). The split keeps the portable logic in
+captain-miao is a **Cargo workspace** with four shipping members plus one
+build-support one (`xtask`). The split keeps the portable logic in
 a library all binaries link, the ratatui client in one binary, the
 libshpool-hosting daemon in another that cross-compiles to Linux and is deployed
 to remote hosts, and a small pool client in a fourth. Full rationale in
@@ -51,19 +51,34 @@ to remote hosts, and a small pool client in a fourth. Full rationale in
   dashboard's attach path spawns `miao-server attach` instead. If a remote host
   ever needs `list`, add it to `miao-server` (which already holds the pool
   socket) rather than deploying a second executable.
-- **`cm-payload`** (`crates/cm-payload/`) — not shipped (`publish = false`). Two
-  halves split by who links which: `format` has no dependencies and is shared, so
-  the dashboard reads the payload slot and `xtask` writes it through one module
-  that can't drift; the `build` feature adds the three payload *sources*
-  (cross-build / local file / release download), the compression and the
-  injector, and only `xtask` enables it. See **Embedded server payloads**.
 - **`xtask`** (`xtask/`) — not shipped (`publish = false`); the standard
   `cargo xtask` build-chore binary, reached through the `[alias]` in
-  `.cargo/config.toml`. Three subcommands split along the seam that matters:
-  `server` obtains server binaries, `bundle` writes them into an already-linked
-  dashboard, and `dist` is both plus the dashboard build (the named **release
-  variants**). Rust rather than a shell script so the workspace type-checks,
-  lints, and tests it.
+  `.cargo/config.toml`. Two subcommands, split along the seam that matters:
+  `prepare-servers` obtains `miao-server` binaries (`server.rs` — the three
+  sources, the strategy choice and glibc floor, gzip + digest), and `dist` builds
+  the named **release variants**, handing each build a manifest of what to embed.
+  Rust rather than a shell script so the workspace type-checks, lints, and tests
+  it. See **Embedded server payloads**.
+
+**Binary names vs package names.** Every shipping executable drops the
+`captain-` prefix: `miao`, `miao-server`, `miao-client`, each an explicit
+`[[bin]]` target. Everything *else* keeps the `captain-miao` name — the Cargo
+packages (so `cargo -p captain-miao-server` is unchanged), the npm packages, the
+nix flake attributes, and the `~/.config` + `~/.local/state` + `~/.cache` dirs.
+The two are genuinely distinct now, which is why `xtask/src/server.rs` carries
+both `SERVER_PKG` (for `cargo -p`) and `SERVER_BIN` (the artifact filename, the
+tar member, and the release-asset stem); conflating them again would build fine
+and then fail to find the binary. The obvious two-letter contraction `cm` was
+considered and rejected: it collides with the near-ubiquitous
+`alias cm='git commit -m'` and with Plastic SCM's CLI — four characters is short
+enough, and a user who wants two can alias, whereas a user colliding cannot
+un-collide. Anything naming a built *file* has to follow: release tarball
+contents, the npm platform packages' `bin/miao`, the npm `bin` map, the CI smoke
+tests, `meta.mainProgram` in `flake.nix`, the `dist/miao-<variant>` artifact
+names, and `redeploy.sh`. The `bin` map carries **no alias**: the last published
+command is `captain-miao`, and the CHANGELOG's upgrade note asks for a
+reinstall rather than aliasing, since a stale `~/.cargo/bin/captain-miao` can
+shadow the new binary either way.
 
 **cm-core (`crates/cm-core/src/`):**
 
@@ -85,7 +100,7 @@ to remote hosts, and a small pool client in a fourth. Full rationale in
 - `main.rs` — CLI entrypoint with clap: TUI (default), `claude`, `codex`, `hook`, `focus`
 - `app/` — Ratatui TUI: `mod.rs` (App state + event loop wiring, incl. the `REMOTE_ENABLED` feature gate), `run.rs` (entry + main loop), `draw.rs` (rendering), `keys.rs` (key + mouse dispatch), `keymap.rs` (configurable Normal-mode keybindings), `picker.rs` (telescope-style filterable picker), `format.rs` (text/color helpers, incl. the status→color mapping), `hosts.rs` (remote-host config + `hosts.json`), `bindings.rs` (the client-side window↔session `WindowBindings` map), `logo.rs` (the kitty-graphics header paw + walking cat), `keybind_log.rs` (debug-mode TSV log), `tests.rs`
 - `backend.rs` — `Backend` enum (per-host session management): `Local` (wraps `cm_core::backend::LocalBackend`) and `Remote` (mirrors a `miao-server daemon` over a socket / ssh-forward via `Transport`) + the ssh transport + remote-binary provisioning (probe → decide → **deploy** → invoke; see the note above `REMOTE_CACHE_REL` and Embedded server payloads below). The dashboard aggregates `App.backends` (localhost #0 + one per remote host); see Remote hosts below and `docs/remote-sessions.md`.
-- `server_payload.rs` — the `captain-miao-server` builds this dashboard carries: the reserved slot (gated on the `bundle` feature, **absent in a regular build**), the reader that parses it, and the `uname -sm` → target-triple mapping the deploy picks with. See Embedded server payloads.
+- `server_payload.rs` — the `miao-server` builds this dashboard carries: the `PAYLOADS` table `build.rs` generates from `CM_SERVER_PAYLOAD_MANIFEST` (**empty in a regular build**) and the `uname -sm` → target-triple mapping the deploy picks with. See Embedded server payloads.
 - `terminal/` — terminal-emulator backend: `mod.rs` (`Terminal` trait + `Tab`/`Window`/`TabInfo`/`SpawnSpec` types + pure policy fns + `get()`'s zellij-first backend detection, re-exporting the id types from cm-core), `kitty.rs` (Kitty `kitten @` backend), `zellij.rs` (zellij `zellij action` backend), `graphics.rs` (kitty graphics-protocol primitives backing `app/logo.rs`), `tests.rs` (pure-policy tests)
 - `config.rs` — the presentation config (colors, ui, thresholds, polling, keybinds) layered on cm-core's loader
 - `sleep.rs` — OS-sleep inhibitor (caffeinate / systemd-inhibit)
@@ -414,39 +429,34 @@ A host needs a version-matching `miao-server`. The dashboard can **carry
 one and push it on connect**, so a bare host needs no manual deploy step. Full
 rationale in `docs/crate-split.md`; this is the map.
 
-- **The `bundle` cargo feature is the switch.** It reserves room for servers and
-  compiles the reader; without it there is no slot and no reader, so a regular
-  build is byte-for-byte what it would be if none of this existed. One feature
-  rather than one per arch, because *which* servers a binary carries is decided
-  when they are written in — a single dashboard build serves every combination,
-  and turning the feature on needs no cross toolchain.
-- **Payloads are written in after linking, and that is what decouples the two
-  builds.** A compiled-in payload is an *input* to the dashboard's compile, so
-  where servers come from would be welded to how the dashboard is built; an
-  injected one isn't. So obtaining a server and building a dashboard are separate
-  steps with a seam between them, and `xtask` has one subcommand per half:
-  * `cargo xtask server` **obtains** servers (and is what release CI runs to
+- **What a build carries comes from one environment variable.**
+  `CM_SERVER_PAYLOAD_MANIFEST` names a TSV (`<target>\t<sha256>\t<gz path>` per
+  line) that `xtask` writes; `build.rs` `include_bytes!`es each archive into
+  `server_payload.rs`'s `PAYLOADS` table. Unset — every ordinary `cargo build`,
+  `clippy`, `check` — the table is empty, nothing extra links, and the binary is
+  what it would be if none of this existed. That variable **is** the switch,
+  which is why there is no cargo feature beside it; a bundling variant just also
+  passes `--features remote`, since the deploy path lives behind that gate.
+  A manifest that is *set* and wrong is a **hard build error**, not a quiet
+  empty table: it is always a mistake (a stale exported variable, a moved
+  archive), and the lenient reading ships a dashboard that carries nothing while
+  every sign says it should.
+- **Obtaining a server and building a dashboard are separate steps**, and the
+  seam between them is `--servers`, not the embedding mechanism. `xtask` has one
+  subcommand per half:
+  * `cargo xtask server` **obtains** servers, and is what release CI runs to
     publish them — same code path as a laptop's, so the strategy choice, glibc
-    floor and arch check can't drift between them).
-  * `cargo xtask bundle <cm>` **writes** them into a dashboard that is already
-    linked — no cargo, no cross toolchain, not even the server's sources. Given a
-    released `cm` and `--servers release`, it needs nothing from this workspace.
-    It patches **in place** by default, so `inject` stages a sibling and renames
-    over the target (`write_replacing`) rather than truncating: the `cm` being
-    patched may be the one on your PATH and may be running, where a torn write
-    would leave a corrupt binary and Linux refuses the write outright
-    (`ETXTBSY`). The original's mode is copied onto the staged file, so the
-    executable bit survives the swap.
-  * `cargo xtask dist` is the convenience that runs both plus the dashboard
-    build, producing the named variants.
+    floor and arch check can't drift between them.
+  * `cargo xtask dist` builds the named variants: obtain, write each variant's
+    manifest, build the dashboard with it, verify.
 - **Where servers come from is a flag, not an assumption** (`ServerArgs`, shared
-  by all three subcommands). `--servers build` cross-compiles here (the default,
-  and what the dev loop wants — the server must match your sources);
+  by both subcommands). `--servers build` cross-compiles here (the default, and
+  what the dev loop wants — the server must match your sources);
   `--servers release[:<version>]` downloads a published one, so a bundled build
   needs only `curl` + `tar` and a bare `release` means *this* workspace's version;
   `--server <target>=<path>` hands over an exact binary, which is the escape
   hatch and what a CI job that already downloaded its artifacts uses. All three
-  land on the same `cm_payload::Payload` and nothing downstream learns which
+  land on the same `server::Payload` and nothing downstream learns which
   answered. A `--server` naming a target nothing wants is an **error** — a typo'd
   triple would otherwise look exactly like success.
   Two guards live on the fetch path, both pinned by tests over real tarballs
@@ -462,37 +472,32 @@ rationale in `docs/crate-split.md`; this is the map.
   deploy writes to the host. Only a build *we ran* has a glibc floor we chose, so
   `unpinned_floor` is consulted through `Provenance::strategy()` and stays quiet
   about a binary somebody else linked.
-- **The mechanism is a reserved `.rodata` slot, and the reason is `strip`.**
-  Measured: appended bytes are **silently wiped** (strip rewrites a binary from
-  its own structure and doesn't carry trailing data across); an
-  `objcopy --add-section` section survives but Mach-O has no post-link equivalent
-  (`ld -sectcreate` is link-time, `segedit -replace` is same-size-only); a slot
-  the linker already placed is allocated and referenced, so strip can't remove it,
-  and overwriting it in place works identically on both formats.
-- **Three details that are load-bearing**, each found by trying it: (1) the slot
-  is an **`UnsafeCell`**, because an immutable `static` lets release LTO
-  constant-fold reads of its initializer — every read of the used-length field
-  would fold to the compile-time zero and the injected payload would sit in the
-  file unread; (2) `find` requires the **sentinel** at the capacity the header
-  claims, not just the magic, so re-injecting over bytes that are themselves a
-  payload can't be fooled, and two survivors is an error rather than a coin flip;
-  (3) a **malformed slot decodes to nothing** — half a payload would deploy and
-  then fail to exec on someone else's machine.
-- **The reservation is sized, not chosen.** `CM_PAYLOAD_RESERVE` is read by
-  `build.rs` (which does nothing else); `xtask` sets it from the servers it just
-  compressed, plus headroom, rounded up to a MiB so variants needing similar
-  amounts share a dashboard compile. Unset means a zero-length slot, so ordinary
-  builds and `clippy --all-features` are unaffected. The rounding slack costs
-  **5,232 bytes** in a gzipped release tarball (measured), so it shows up in
-  on-disk footprint and essentially nowhere else.
+- **Two files are watched, and neither may be touched needlessly.** `build.rs`
+  `rerun-if-changed`s the manifest and each archive, so anything that rewrites
+  one with identical bytes bumps its mtime, re-runs the build script, and forces
+  a full LTO relink. Hence `write_manifest` writes only on a real change, and
+  `build.rs` stages a *copy* of each archive into `OUT_DIR` to `include_bytes!`
+  from rather than embedding the watched file. Both mistakes have been made here
+  once each; `rewriting_an_identical_manifest_does_not_touch_the_file` pins the
+  first.
+- **`strip` is a non-issue, and post-link injection was tried and dropped.**
+  `include_bytes!` data is allocated and referenced, so `strip` cannot remove it.
+  A reserved-slot design (magic + sentinel + `UnsafeCell` + an injector) was
+  built and measured first; it bought only the ability to re-bundle a `miao`
+  without recompiling it — **58 seconds**, and still needing cargo to build
+  `xtask` — while costing ~600 lines, two `unsafe` blocks, a `codesign` step on
+  macOS, and ~1 MiB of reservation slack per artifact. Its one claimed
+  structural win, that a single dashboard compile could serve every arch
+  combination, was false in practice: the three bundled variants round to 5, 4
+  and 7 MiB, so no two ever shared a compile.
 - **Variants** — `cargo xtask dist [--variant N]… [--all] [--list]` builds named
   release artifacts into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`,
   and the two single-arch bundles. Each run verifies its artifact by running it
-  and checking it reports the servers just injected — the only check that can
-  catch a bad patch. Default: plain + `bundle-linux`. `bundle` runs the same
-  check but only *warns* when the artifact won't start, since bundling a Linux
-  `cm` on a mac is a thing it exists for; a binary that runs and reports the
-  wrong payloads is still an error either way.
+  and checking it reports the servers it was built to carry. That check earns its
+  keep: a manifest reaches the compile through an environment variable and a
+  generated file, which fails *silently* — a variable that didn't survive, an
+  archive that moved, and the build succeeds carrying nothing. Default: plain +
+  `bundle-linux`.
 - **Release CI publishes the servers** (`build.yml`'s `server` job), which is
   what gives `--servers release` something to fetch. One x86_64 runner
   cross-compiles both Linux arches through `nix develop --command cargo xtask
@@ -606,11 +611,8 @@ cargo xtask dist --servers release          # download this version's published 
 cargo xtask dist --servers release:0.2.0    # …or another version's
 cargo xtask dist --server x86_64-unknown-linux-gnu=/path/to/miao-server
 
-# And the two halves are reachable on their own. `bundle` writes servers into a
-# dashboard that already exists — no cargo, no cross toolchain, no server sources:
-cargo xtask bundle dist/cm-bundle-linux --servers release
-cargo xtask bundle ./cm -o ./cm-bundled --server aarch64-unknown-linux-gnu=./srv
-cargo xtask server --out dist/servers       # just the servers (what release CI runs)
+# Obtaining servers is reachable on its own — this is what release CI runs:
+cargo xtask server --out dist/servers
 
 # The deploy path, end to end, against any ssh host you can reach:
 CM_TEST_SSH_TARGET=box cargo test -p captain-miao --features bundle-linux-x86_64 -- \

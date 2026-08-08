@@ -65,11 +65,10 @@
         # keep `assets/` explicitly alongside the Rust sources.
         #
         # Nothing extra is needed for the embedded server payloads: these
-        # packages build without the `bundle` feature, so they reserve no slot
-        # and `build.rs` does nothing but read one unset environment variable.
-        # The bundled variants below cross-build servers and patch them in after
-        # linking, which works offline — every cargo invocation resolves from the
-        # vendored registry crane sets up for the outer build.
+        # packages build with CM_SERVER_PAYLOAD_MANIFEST unset, so `build.rs`
+        # embeds nothing. The bundled variants below cross-build servers and pass
+        # a manifest naming them, which works offline — every cargo invocation
+        # resolves from the vendored registry crane sets up for the outer build.
         src = let
           root = ./.;
           isAsset = path: lib.hasPrefix "${toString root}/assets/" path;
@@ -111,15 +110,14 @@
         # a remote host — one package per variant `cargo xtask dist` knows about
         # (docs/crate-split.md).
         #
-        # These delegate to `xtask` rather than reimplementing it in nix, because
-        # the reservation has to be sized from the *compressed* servers: xtask
-        # cross-builds them, measures, compiles a dashboard reserving that much,
-        # and writes them into the linked binary. A nix expression could only
-        # guess the number, and a guess is the thing this design set out to
-        # remove. The whole sequence runs offline — every cargo invocation
-        # resolves from the vendored registry crane already set up, which is also
-        # why these pin `--servers build` (the default) rather than offering the
-        # `release` source: a nix build has no network to fetch one over.
+        # These delegate to `xtask` rather than reimplementing it in nix: it
+        # cross-builds the servers, writes the manifest naming them, and builds a
+        # dashboard that embeds it. A nix expression would be a second copy of
+        # that, free to drift. The whole sequence runs offline — every cargo
+        # invocation resolves from the vendored registry crane already set up,
+        # which is also why these pin `--servers build` (the default) rather than
+        # offering the `release` source: a nix build has no network to fetch one
+        # over.
         #
         # Two things they need that a plain build doesn't. `devToolchain`, for
         # the cross `rust-std`s — hence a second craneLib, leaving the plain
@@ -151,8 +149,8 @@
               # be off rather than merely redundant.
               doNotPostBuildInstallCargoBinaries = true;
               # `xtask dist` already runs the artifact and checks it reports the
-              # servers it was injected with, which is the only check that can
-              # catch a bad patch.
+              # servers it was built to carry — the check that catches a manifest
+              # that silently didn't reach the compile.
               doCheck = false;
               meta.mainProgram = "miao";
             });

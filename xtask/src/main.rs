@@ -1,25 +1,25 @@
 //! `cargo xtask` — captain-miao's build chores.
 //!
-//! Three subcommands, and the split between them is the design:
+//! Two subcommands:
 //!
-//! - `server` **obtains** `miao-server` binaries. Cross-builds them here,
-//!   and is what release CI runs to publish them.
-//! - `bundle` **writes** servers into a dashboard that is already linked. Needs no
-//!   cargo, no cross toolchain, and not even the server's sources — just a `cm`
-//!   built with the `bundle` feature and some server binaries.
-//! - `dist` is the convenience that runs both plus the dashboard build, producing
-//!   the named release variants in `dist/`.
+//! - `server` **obtains** `miao-server` binaries — cross-built here,
+//!   downloaded from a published release, or handed over as paths. Release CI
+//!   runs this to publish them.
+//! - `dist` builds the named release dashboard variants into `dist/`, obtaining
+//!   whatever servers each one carries and handing the archives to its build.
 //!
-//! Where the servers come from is a `--servers` flag, not an assumption: build
-//! them here, download them from a published release, or hand over paths. That
-//! decoupling is why payloads are injected after linking rather than compiled in
-//! — a compiled-in payload is an input to the dashboard's build, so changing the
-//! source would mean recompiling the dashboard every time.
+//! Where the servers come from is a `--servers` flag, not an assumption, and
+//! that seam is the point: it is orthogonal to how the dashboard is compiled.
+//! The dashboard learns what to carry from one environment variable naming a
+//! manifest (`build.rs`), so obtaining a server and building a dashboard stay
+//! independent without the payload having to be patched in afterwards.
 //!
 //! What still has to be arranged is that a bundled dashboard reports *which*
 //! server it carries: the workspace version is the only thing a released artifact
 //! is keyed on and it doesn't move between dev builds, so `miao --version` prints
 //! each payload's digest, and the deploy writes that digest to the host.
+
+mod server;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,30 +33,24 @@ use clap::{Args, Parser, Subcommand};
 const DASHBOARD_PKG: &str = "captain-miao";
 const DASHBOARD_BIN: &str = "miao";
 
-/// The server package, and the file name `bundle`/`server` read and write. Same
-/// string for both, and the same one the release assets carry inside them.
+/// The server package, and the file name `server` writes. Same string for both,
+/// and the same one the release assets carry inside them.
 const SERVER_BIN: &str = "miao-server";
 
-/// The one feature that reserves slot space. Which *servers* end up in it is
-/// decided when they're injected, not when the dashboard is compiled.
-const BUNDLE_FEATURE: &str = "bundle";
+/// The environment variable `build.rs` reads to learn what to embed. Kept in
+/// step with the constant of the same name there.
+const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 
-/// Round the reservation up to this, so variants needing similar amounts share a
-/// dashboard compile instead of each forcing its own. The slack is free where it
-/// matters: a run of identical filler bytes costs ~5 KB in a gzipped release
-/// tarball, measured, so this trades on-disk footprint for build time.
-const RESERVE_GRANULARITY: usize = 1 << 20;
-
-/// Headroom on top of the rounded figure, so a server that grows slightly
-/// between the measurement and the next release doesn't overflow a slot sized to
-/// the byte.
-const RESERVE_HEADROOM: usize = 1 << 20;
+/// The feature a dashboard needs to reach an embedded server at all. A bundled
+/// build implies it: the deploy path lives behind the remote-hosts gate, so a
+/// server carried without it would be dead weight by construction.
+const REMOTE_FEATURE: &str = "remote";
 
 const X86: &str = "x86_64-unknown-linux-gnu";
 const ARM: &str = "aarch64-unknown-linux-gnu";
 
-/// The servers a release publishes, and what `bundle` carries when asked for
-/// nothing in particular.
+/// The servers a release publishes, and what the shipping bundled variant
+/// carries.
 const LINUX_TARGETS: &[&str] = &[X86, ARM];
 
 #[derive(Parser)]
@@ -70,8 +64,6 @@ struct Cli {
 enum Cmd {
     /// Build release dashboard variants into `dist/`.
     Dist(DistArgs),
-    /// Write server payloads into an already-linked dashboard binary.
-    Bundle(BundleArgs),
     /// Obtain `miao-server` binaries (what release CI publishes).
     Server(ServerCmdArgs),
 }
@@ -81,7 +73,7 @@ enum Cmd {
 // ---------------------------------------------------------------------------
 
 /// The seam. Every command that needs servers takes this and never learns which
-/// arm answered — `cm_payload` returns the same `Payload` from all three.
+/// arm answered — `server` returns the same `Payload` from all three.
 #[derive(Args, Clone)]
 struct ServerArgs {
     /// Where to get servers: `build` (cross-compile from this workspace) or
@@ -96,7 +88,7 @@ struct ServerArgs {
     files: Vec<String>,
 
     /// Where `--servers release` downloads from.
-    #[arg(long, value_name = "URL", default_value = cm_payload::RELEASE_BASE)]
+    #[arg(long, value_name = "URL", default_value = server::RELEASE_BASE)]
     release_base: String,
 }
 
@@ -155,11 +147,7 @@ impl ServerArgs {
     /// downloaded its artifacts doesn't have to fetch them again — and a path
     /// naming a target nothing asked for is an error rather than a silent no-op,
     /// since a typo'd triple would otherwise look like it worked.
-    fn resolve(
-        &self,
-        ws: &Workspace,
-        targets: &BTreeSet<&str>,
-    ) -> Result<Vec<cm_payload::Payload>> {
+    fn resolve(&self, ws: &Workspace, targets: &BTreeSet<&str>) -> Result<Vec<server::Payload>> {
         let files = parse_files(&self.files)?;
         if let Some(stray) = files.keys().find(|t| !targets.contains(t.as_str())) {
             bail!(
@@ -181,8 +169,8 @@ impl ServerArgs {
         // per entry — so it happens once, and not at all when nothing is built.
         let build_env = matches!(source, Source::Build)
             .then(|| {
-                cm_payload::host_triple()
-                    .map(|host| (host, cm_payload::Tools::detect()))
+                server::host_triple()
+                    .map(|host| (host, server::Tools::detect()))
                     .map_err(|e| anyhow!("{e}"))
             })
             .transpose()?;
@@ -191,13 +179,13 @@ impl ServerArgs {
         for target in targets {
             println!("▶ {SERVER_BIN} for {target}");
             let payload = match (files.get(*target), &source) {
-                (Some(path), _) => cm_payload::from_file(&dir, target, path),
+                (Some(path), _) => server::from_file(&dir, target, path),
                 (None, Source::Build) => {
                     let (host, tools) = build_env.as_ref().expect("probed for the build source");
-                    cm_payload::build(&ws.root, &dir, target, host, tools)
+                    server::build(&ws.root, &dir, target, host, tools)
                 }
                 (None, Source::Release(version)) => {
-                    cm_payload::fetch(&dir, target, version, &self.release_base)
+                    server::fetch(&dir, target, version, &self.release_base)
                 }
             }
             .map_err(|e| anyhow!("{e}"))?;
@@ -210,11 +198,11 @@ impl ServerArgs {
 
 /// One line per payload: what it cost, where it came from, and the one warning
 /// worth interrupting for.
-fn report(p: &cm_payload::Payload) {
+fn report(p: &server::Payload) {
     println!(
         "  {} → {} via {}{}",
-        cm_payload::human(p.raw_len),
-        cm_payload::human(p.gz_len),
+        server::human(p.raw_len),
+        server::human(p.gz_len),
         p.provenance.label(),
         if p.repacked { "" } else { " (cached)" },
     );
@@ -223,12 +211,12 @@ fn report(p: &cm_payload::Payload) {
     if let Some(floor) = p
         .provenance
         .strategy()
-        .and_then(|s| cm_payload::unpinned_floor(s, &p.target))
+        .and_then(|s| server::unpinned_floor(s, &p.target))
     {
         println!(
             "  ! glibc floor is {floor} rather than the pinned {}; install cargo-zigbuild \
              + zig (`nix develop` provides both) for a payload that runs on older hosts",
-            cm_payload::GLIBC_FLOOR
+            server::GLIBC_FLOOR
         );
     }
 }
@@ -245,7 +233,7 @@ fn report(p: &cm_payload::Payload) {
 struct Variant {
     /// Suffix of the artifact in `dist/`; the plain build has none.
     name: &'static str,
-    /// Extra cargo features, beyond the bundle feature implied by `servers`.
+    /// Extra cargo features, beyond the `remote` gate implied by `servers`.
     features: &'static [&'static str],
     /// Server targets to obtain and inject.
     servers: &'static [&'static str],
@@ -308,7 +296,7 @@ impl Variant {
     fn cargo_features(&self) -> Vec<&'static str> {
         let mut f = self.features.to_vec();
         if self.bundles() {
-            f.push(BUNDLE_FEATURE);
+            f.push(REMOTE_FEATURE);
         }
         f
     }
@@ -336,7 +324,6 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Cmd::Dist(args) => dist(&ws, &args),
-        Cmd::Bundle(args) => bundle(&ws, &args),
         Cmd::Server(args) => server(&ws, &args),
     }
 }
@@ -429,7 +416,7 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         println!("\n▶ {}", v.label());
         let payloads = pick_payloads(&servers, v.servers)?;
 
-        build_dashboard(ws, v, reserve_for(&payloads))?;
+        build_dashboard(ws, v, &payloads)?;
 
         let to = dist_dir.join(v.artifact());
         // Copy rather than rename: every variant's build reuses the same
@@ -439,32 +426,22 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         std::fs::copy(&from, &to)
             .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
 
-        if v.bundles() {
-            inject_into(&to, &payloads)?;
-        }
-        // The artifact is always built for this host, so a dashboard that won't
-        // run is a failure rather than something to note and move past.
-        match verify(&to, v.servers)? {
-            Verified::Ran => {}
-            Verified::CouldNotRun(why) => {
-                bail!("{} does not run after bundling: {why}", to.display())
-            }
-        }
+        verify(&to, v.servers)?;
         built.push((v.artifact(), std::fs::metadata(&to).map(|m| m.len())?));
     }
 
     println!("\n{}:", dist_dir.display());
     for (name, size) in &built {
-        println!("  {name:<30} {}", cm_payload::human(*size));
+        println!("  {name:<30} {}", server::human(*size));
     }
     Ok(())
 }
 
 /// The payloads for one variant, out of everything this run obtained.
 fn pick_payloads<'a>(
-    servers: &'a [cm_payload::Payload],
+    servers: &'a [server::Payload],
     targets: &[&str],
-) -> Result<Vec<&'a cm_payload::Payload>> {
+) -> Result<Vec<&'a server::Payload>> {
     targets
         .iter()
         .map(|t| {
@@ -476,27 +453,7 @@ fn pick_payloads<'a>(
         .collect()
 }
 
-/// How much slot to reserve for these payloads: what they need, plus headroom,
-/// rounded up so similar variants share a compile.
-fn reserve_for(payloads: &[&cm_payload::Payload]) -> usize {
-    if payloads.is_empty() {
-        return 0;
-    }
-    let sizes: Vec<(&str, &str, usize)> = payloads
-        .iter()
-        .map(|p| (p.target.as_str(), p.sha256.as_str(), p.gz_len as usize))
-        .collect();
-    round_up(
-        cm_payload::slot_needed(&sizes) + RESERVE_HEADROOM,
-        RESERVE_GRANULARITY,
-    )
-}
-
-fn round_up(n: usize, to: usize) -> usize {
-    n.div_ceil(to) * to
-}
-
-fn build_dashboard(ws: &Workspace, v: &Variant, reserve: usize) -> Result<()> {
+fn build_dashboard(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) -> Result<()> {
     let features = v.cargo_features();
     let mut argv = vec![
         "build".to_string(),
@@ -509,20 +466,63 @@ fn build_dashboard(ws: &Workspace, v: &Variant, reserve: usize) -> Result<()> {
         argv.push("--features".to_string());
         argv.push(features.join(","));
     }
-    if reserve > 0 {
-        println!("  reserving {}", cm_payload::human(reserve as u64));
-    }
+
+    let manifest = write_manifest(ws, v, payloads)?;
     println!("  {} {}", cargo(), argv.join(" "));
     let status = Command::new(cargo())
         .args(&argv)
         .current_dir(&ws.root)
-        .env("CM_PAYLOAD_RESERVE", reserve.to_string())
+        // Always set, even to the empty-manifest path: a stale value inherited
+        // from the caller's environment would otherwise decide what a variant
+        // carries, and a plain `miao` would quietly stop being plain.
+        .env(MANIFEST_ENV, &manifest)
         .status()
         .context("spawning cargo")?;
     if !status.success() {
         bail!("building {} failed ({status})", v.label());
     }
     Ok(())
+}
+
+/// Write the manifest `build.rs` reads, and return its path.
+///
+/// One file per variant, under `target/`, so two variants built in one run can't
+/// race on it and `cargo clean` disposes of them. The archives are named by
+/// absolute path rather than copied here — `build.rs` stages its own copy into
+/// `OUT_DIR`, which is what keeps the watched file and the embedded file distinct
+/// (embedding the watched one ties its mtime to the build script's stamp and
+/// re-runs the script on every build).
+fn write_manifest(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) -> Result<PathBuf> {
+    let dir = ws.target_dir.join("cm-server-payloads");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!(
+        "{}.tsv",
+        if v.name.is_empty() { "plain" } else { v.name }
+    ));
+
+    let mut text = String::new();
+    for p in payloads {
+        // Tab-separated because a path may contain spaces and an `=`, but not a
+        // tab or a newline in any layout this produces.
+        text.push_str(&format!(
+            "{}\t{}\t{}\n",
+            p.target,
+            p.sha256,
+            p.gz_path.display()
+        ));
+        println!("  embedding {} ({})", p.target, server::human(p.gz_len));
+    }
+
+    // Written only when the contents actually change. `build.rs` watches this
+    // file, so rewriting it unconditionally would bump its mtime on every run,
+    // re-run the build script, and recompile the dashboard — a full LTO relink
+    // for a file whose bytes were identical. (Same shape as the `OUT_DIR` staging
+    // over in `build.rs`: watch a file, and you must stop touching it.)
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|old| old == text);
+    if !unchanged {
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 fn list() {
@@ -555,148 +555,27 @@ fn find_variant(name: &str) -> Result<&'static Variant> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// bundle
-// ---------------------------------------------------------------------------
-
-#[derive(Args)]
-struct BundleArgs {
-    /// A `cm` built with the `bundle` feature. Its reserved slot is what this
-    /// writes into, so a dashboard built without the feature is refused.
-    #[arg(value_name = "DASHBOARD")]
-    binary: PathBuf,
-    /// Targets to carry. Defaults to whatever `--server` names, else both Linux
-    /// arches.
-    #[arg(long = "target", value_name = "TRIPLE")]
-    targets: Vec<String>,
-    /// Write the bundled dashboard here instead of patching it in place.
-    #[arg(short, long, value_name = "PATH")]
-    out: Option<PathBuf>,
-    #[command(flatten)]
-    servers: ServerArgs,
-}
-
-/// Write servers into an already-linked dashboard.
+/// Run the artifact and check it reports what it was built to carry.
 ///
-/// The command the whole after-linking design exists for: no cargo runs here, no
-/// cross toolchain is consulted, and the dashboard's sources aren't read. Given a
-/// released `cm` and `--servers release`, it needs nothing from this workspace at
-/// all beyond xtask itself.
-fn bundle(ws: &Workspace, args: &BundleArgs) -> Result<()> {
-    // Checked before anything slow. Obtaining servers can be a cross-compile or
-    // a multi-megabyte download, and learning only afterwards that the dashboard
-    // path was a typo would waste all of it.
-    if !args.binary.is_file() {
-        bail!(
-            "{} is not a file; `bundle` writes into a dashboard that already \
-             exists (build one with `cargo xtask dist --variant bundle-linux`)",
-            args.binary.display()
-        );
-    }
-
-    let files = parse_files(&args.servers.files)?;
-    // Three ways to say which targets, in decreasing explicitness. Falling back
-    // to both Linux arches matches `bundle-linux`, the variant a release ships.
-    let targets: BTreeSet<&str> = if !args.targets.is_empty() {
-        args.targets.iter().map(String::as_str).collect()
-    } else if !files.is_empty() {
-        files.keys().map(String::as_str).collect()
-    } else {
-        LINUX_TARGETS.iter().copied().collect()
-    };
-
-    let servers = args.servers.resolve(ws, &targets)?;
-    let ordered: Vec<&str> = targets.iter().copied().collect();
-    let payloads = pick_payloads(&servers, &ordered)?;
-
-    // `--out` naming the input is patching in place spelled the long way. It has
-    // to be caught rather than obeyed: `fs::copy` opens the destination with
-    // O_TRUNC, so copying a file onto itself empties it before a byte is read.
-    let out = args
-        .out
-        .as_ref()
-        .filter(|out| !same_file(&args.binary, out));
-
-    let to = match out {
-        Some(out) => {
-            if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            std::fs::copy(&args.binary, out).with_context(|| {
-                format!("copying {} to {}", args.binary.display(), out.display())
-            })?;
-            out.clone()
-        }
-        None => args.binary.clone(),
-    };
-
-    println!("\n▶ {}", to.display());
-    inject_into(&to, &payloads)?;
-
-    // Unlike `dist`, the binary here may well be for another platform — bundling
-    // a Linux `cm` on a mac is a thing this command is *for*. So a binary that
-    // won't exec is reported rather than fatal; one that execs and reports the
-    // wrong payloads is still an error, because that is a real bad patch.
-    match verify(&to, &ordered)? {
-        Verified::Ran => println!("  verified: it runs and reports what was injected"),
-        Verified::CouldNotRun(why) => {
-            println!("  ! not verified — could not run it here ({why})");
-            println!("    that is expected when bundling for another platform; run it there.");
-        }
-    }
-    Ok(())
-}
-
-/// Whether two paths name the same file on disk.
-///
-/// Canonicalised rather than compared textually, so `./cm` and `cm` and a path
-/// through a symlink all answer the same. A path that can't be resolved is
-/// simply not the other one — the caller has already established the source
-/// exists, and a non-existent destination is the ordinary case.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn inject_into(binary: &Path, payloads: &[&cm_payload::Payload]) -> Result<()> {
-    let done = cm_payload::inject(binary, payloads).map_err(|e| anyhow!("{e}"))?;
-    println!(
-        "  injected {} into a {} slot ({}% used)",
-        cm_payload::human(done.used as u64),
-        cm_payload::human(done.capacity as u64),
-        done.used * 100 / done.capacity.max(1),
-    );
-    Ok(())
-}
-
-/// Outcome of running a bundled artifact to see what it reports.
-enum Verified {
-    Ran,
-    CouldNotRun(String),
-}
-
-/// Run the artifact and check it reports what was just put in it.
-///
-/// The injector edits a linked binary in place, so "did that produce something
-/// that still runs, and does it see its own payload" is exactly the question a
-/// unit test can't answer. Failing to *start* is returned rather than raised, so
-/// each caller can decide whether a foreign-platform binary is a problem.
-fn verify(artifact: &Path, servers: &[&str]) -> Result<Verified> {
-    let out = match Command::new(artifact).arg("--version").output() {
-        Ok(out) => out,
-        Err(e) => return Ok(Verified::CouldNotRun(e.to_string())),
-    };
+/// A manifest reaches the dashboard through an environment variable and a
+/// generated file, which is exactly the kind of seam that fails silently: a
+/// variable that didn't survive, a manifest naming an archive that moved, and the
+/// build succeeds carrying nothing. Running the thing is the only check that
+/// catches it. The artifact is always built for this host, so failing to start is
+/// a failure rather than something to note and move past.
+fn verify(artifact: &Path, servers: &[&str]) -> Result<()> {
+    let out = Command::new(artifact)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {}", artifact.display()))?;
     if !out.status.success() {
-        return Ok(Verified::CouldNotRun(out.status.to_string()));
+        bail!("{} does not run ({})", artifact.display(), out.status);
     }
     let text = String::from_utf8_lossy(&out.stdout);
     for target in servers {
         if !text.contains(target) {
             bail!(
-                "{} was injected with {target} but does not report it:\n{}",
+                "{} was built to carry {target} but does not report it:\n{}",
                 artifact.display(),
                 text.trim()
             );
@@ -709,7 +588,7 @@ fn verify(artifact: &Path, servers: &[&str]) -> Result<Verified> {
             text.trim()
         );
     }
-    Ok(Verified::Ran)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -762,7 +641,7 @@ fn server(ws: &Workspace, args: &ServerCmdArgs) -> Result<()> {
         println!(
             "  {}  {}  {}",
             to.display(),
-            cm_payload::human(p.raw_len),
+            server::human(p.raw_len),
             &p.sha256[..12]
         );
     }
@@ -805,12 +684,11 @@ mod tests {
                     v.label()
                 );
             }
-            // A bundling variant must actually enable the slot, and a plain one
-            // must not pay for it.
-            assert_eq!(
-                v.cargo_features().contains(&BUNDLE_FEATURE),
-                v.bundles(),
-                "{} has the bundle feature and its servers out of step",
+            // Carrying a server implies the gate that reaches it — one-way, since
+            // the `remote` variant enables it and deliberately carries nothing.
+            assert!(
+                !v.bundles() || v.cargo_features().contains(&REMOTE_FEATURE),
+                "{} carries servers the build could never reach",
                 v.label()
             );
         }
@@ -836,34 +714,13 @@ mod tests {
         assert!(find_variant("nope").is_err());
     }
 
-    /// Rounding is what lets two single-arch variants share one dashboard
-    /// compile; the headroom is what stops a slot sized to the byte overflowing
-    /// the next time the server grows.
+    /// The plain build is the one most people download, so it has to stay a
+    /// plain build: no servers, no features, nothing extra linked.
     #[test]
-    fn the_reservation_rounds_up_and_leaves_headroom() {
-        assert_eq!(round_up(1, 1 << 20), 1 << 20);
-        assert_eq!(round_up(1 << 20, 1 << 20), 1 << 20);
-        assert_eq!(round_up((1 << 20) + 1, 1 << 20), 2 << 20);
-        assert_eq!(round_up(0, 1 << 20), 0);
-
-        // Two payloads of similar size land in the same bucket, so the dashboard
-        // is compiled once for both.
-        let a =
-            cm_payload::slot_needed(&[("x86_64-unknown-linux-gnu", &"a".repeat(64), 2_500_000)]);
-        let b =
-            cm_payload::slot_needed(&[("aarch64-unknown-linux-gnu", &"b".repeat(64), 2_400_000)]);
-        assert_eq!(
-            round_up(a + RESERVE_HEADROOM, RESERVE_GRANULARITY),
-            round_up(b + RESERVE_HEADROOM, RESERVE_GRANULARITY),
-        );
-    }
-
-    #[test]
-    fn a_plain_variant_reserves_nothing() {
+    fn a_plain_variant_carries_and_enables_nothing() {
         let plain = find_variant("").unwrap();
         assert!(!plain.bundles());
         assert!(plain.cargo_features().is_empty());
-        assert_eq!(reserve_for(&[]), 0);
     }
 
     /// `--servers` is the decoupling seam, so its spellings are a contract.
@@ -919,7 +776,7 @@ mod tests {
         let args = ServerArgs {
             source: "build".into(),
             files: vec![format!("x86_64-unknown-linux-gnuu=/tmp/a")],
-            release_base: cm_payload::RELEASE_BASE.into(),
+            release_base: server::RELEASE_BASE.into(),
         };
         let wanted: BTreeSet<&str> = [X86].into_iter().collect();
         let Err(err) = args.resolve(&ws, &wanted) else {
@@ -942,7 +799,7 @@ mod tests {
         let args = |source: &str| ServerArgs {
             source: source.into(),
             files: Vec::new(),
-            release_base: cm_payload::RELEASE_BASE.into(),
+            release_base: server::RELEASE_BASE.into(),
         };
         assert!(
             args("build")
@@ -953,40 +810,55 @@ mod tests {
         assert!(args("nonsense").resolve(&ws, &BTreeSet::new()).is_err());
     }
 
-    /// `bundle -o` naming its own input is patching in place spelled the long
-    /// way, and it has to be *recognised* rather than obeyed — `fs::copy` opens
-    /// the destination with `O_TRUNC`, so copying a file onto itself empties it
-    /// before a byte is read. Textual comparison would miss every spelling but
-    /// the exact one.
+    /// `build.rs` watches the manifest, so writing it unconditionally would bump
+    /// its mtime every run, re-run the build script, and force a full LTO relink
+    /// of a dashboard whose inputs hadn't changed. This exact mistake has been
+    /// made twice — once here, once embedding the watched archive directly — so
+    /// pin it: identical payloads must leave the file untouched.
     #[test]
-    fn a_path_is_recognised_as_itself_however_it_is_spelled() {
-        let dir = std::env::temp_dir().join(format!("cm-same-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("cm");
-        std::fs::write(&file, b"binary").unwrap();
+    fn rewriting_an_identical_manifest_does_not_touch_the_file() {
+        let root = std::env::temp_dir().join(format!("cm-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace {
+            target_dir: root.join("target"),
+            root: root.clone(),
+        };
+        let v = find_variant("bundle-linux").unwrap();
 
-        assert!(same_file(&file, &file));
-        assert!(same_file(&file, &dir.join(".").join("cm")));
-        // `..` only resolves through a directory that exists — same as `open(2)`.
-        let sub = dir.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        assert!(same_file(&file, &sub.join("..").join("cm")));
-        // …and through a symlink, which a textual comparison would never catch.
-        #[cfg(unix)]
-        {
-            let link = dir.join("cm-link");
-            std::os::unix::fs::symlink(&file, &link).unwrap();
-            assert!(same_file(&file, &link));
-        }
+        let gz = root.join("server.gz");
+        std::fs::write(&gz, b"not really a gzip").unwrap();
+        let payload = |target: &str| server::Payload {
+            target: target.to_string(),
+            sha256: "a".repeat(64),
+            bin_path: gz.clone(),
+            gz_path: gz.clone(),
+            raw_len: 17,
+            gz_len: 17,
+            provenance: server::Provenance::Local,
+            repacked: false,
+        };
+        let (a, b) = (payload(X86), payload(ARM));
 
-        let other = dir.join("cm-bundled");
-        std::fs::write(&other, b"binary").unwrap();
-        // Same *contents* is not the same file — only identity counts.
-        assert!(!same_file(&file, &other));
-        // A destination that doesn't exist yet is the ordinary case.
-        assert!(!same_file(&file, &dir.join("not-yet")));
+        let path = write_manifest(&ws, v, &[&a, &b]).unwrap();
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "one line per payload");
+        assert!(text.lines().all(|l| l.split('\t').count() == 3), "{text}");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(write_manifest(&ws, v, &[&a, &b]).unwrap(), path);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            first,
+            "an unchanged manifest must not be rewritten"
+        );
+
+        // A different payload set *must* land, or the dashboard would keep
+        // whatever it was built with last.
+        write_manifest(&ws, v, &[&a]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The variant that ships and the `bundle` default have to agree: they are
