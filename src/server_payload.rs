@@ -66,9 +66,16 @@ pub(crate) fn payloads() -> &'static [ServerPayload] {
 /// exec failure on someone else's machine.
 ///
 /// glibc first, musl second: `uname` cannot distinguish them, and glibc is the
-/// mainstream server libc. If a glibc payload turns out not to run there (Alpine),
-/// the post-upload `--version` check on the host rejects it and the musl
-/// candidate — should one ever be built — is tried next. Pure.
+/// mainstream server libc. Nothing builds a musl server today, so those entries
+/// exist only so that one handed over by `xtask --server <musl-triple>=<path>` is
+/// selectable rather than silently unreachable.
+///
+/// Note what does **not** happen: only the first matching candidate is ever tried.
+/// If a glibc payload turns out not to run on the host (Alpine), the post-upload
+/// `--version` check rejects it and the connection falls back to whatever the host
+/// already has; `UploadGate` then suppresses re-sends of that digest, so a musl
+/// payload sitting right behind it in this list would never be reached. Closing
+/// that means looping candidates at the deploy site, not reordering here. Pure.
 pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
     let mut fields = uname_sm.split_whitespace();
     let (Some(os), Some(machine)) = (fields.next(), fields.next()) else {

@@ -24,6 +24,10 @@ const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    // The variable itself, so a build re-runs when it appears, vanishes, or names
+    // a different manifest. The manifest's *contents* — and each archive it names
+    // — are watched separately, in `read_manifest` and the loop below, so that a
+    // build carrying nothing watches nothing.
     println!("cargo::rerun-if-env-changed={MANIFEST_ENV}");
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
