@@ -442,17 +442,17 @@ rationale in `docs/crate-split.md`; this is the map.
   archive), and the lenient reading ships a dashboard that carries nothing while
   every sign says it should.
 - **Obtaining a server and building a dashboard are separate steps**, and the
-  seam between them is `--servers`, not the embedding mechanism. `xtask` has one
+  seam between them is `--from`, not the embedding mechanism. `xtask` has one
   subcommand per half:
-  * `cargo xtask server` **obtains** servers, and is what release CI runs to
+  * `cargo xtask prepare-servers` **obtains** servers, and is what release CI runs to
     publish them — same code path as a laptop's, so the strategy choice, glibc
     floor and arch check can't drift between them.
   * `cargo xtask dist` builds the named variants: obtain, write each variant's
     manifest, build the dashboard with it, verify.
 - **Where servers come from is a flag, not an assumption** (`ServerArgs`, shared
-  by both subcommands). `--servers build` cross-compiles here (the default, and
+  by both subcommands). `--from build` cross-compiles here (the default, and
   what the dev loop wants — the server must match your sources);
-  `--servers release[:<version>]` downloads a published one, so a bundled build
+  `--from release[:<version>]` downloads a published one, so a bundled build
   needs only `curl` + `tar` and a bare `release` means *this* workspace's version;
   `--server <target>=<path>` hands over an exact binary, which is the escape
   hatch and what a CI job that already downloaded its artifacts uses. All three
@@ -499,7 +499,7 @@ rationale in `docs/crate-split.md`; this is the map.
   archive that moved, and the build succeeds carrying nothing. Default: plain +
   `bundle-linux`.
 - **Release CI publishes the servers** (`build.yml`'s `server` job), which is
-  what gives `--servers release` something to fetch. One x86_64 runner
+  what gives `--from release` something to fetch. One x86_64 runner
   cross-compiles both Linux arches through `nix develop --command cargo xtask
   server`, deliberately: zigbuild pins the floor at 2.28 where a native build
   would inherit the runner's, and the flake has no `aarch64-linux` system to run
@@ -607,12 +607,12 @@ miao --version                       # what an already-built binary actually emb
 
 # …but where the servers come from is a flag. Cross-building them (the default)
 # is the only part that needs `nix develop` for zig + the cross rust-stds.
-cargo xtask dist --servers release          # download this version's published servers
-cargo xtask dist --servers release:0.2.0    # …or another version's
+cargo xtask dist --from release          # download this version's published servers
+cargo xtask dist --from release:0.2.0    # …or another version's
 cargo xtask dist --server x86_64-unknown-linux-gnu=/path/to/miao-server
 
 # Obtaining servers is reachable on its own — this is what release CI runs:
-cargo xtask server --out dist/servers
+cargo xtask prepare-servers --out dist/servers
 
 # The deploy path, end to end, against any ssh host you can reach:
 CM_TEST_SSH_TARGET=box cargo test -p captain-miao --features bundle-linux-x86_64 -- \

@@ -115,7 +115,7 @@
         # dashboard that embeds it. A nix expression would be a second copy of
         # that, free to drift. The whole sequence runs offline — every cargo
         # invocation resolves from the vendored registry crane already set up,
-        # which is also why these pin `--servers build` (the default) rather than
+        # which is also why these pin `--from build` (the default) rather than
         # offering the `release` source: a nix build has no network to fetch one
         # over.
         #

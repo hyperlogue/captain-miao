@@ -2,13 +2,13 @@
 //!
 //! Two subcommands:
 //!
-//! - `server` **obtains** `miao-server` binaries — cross-built here,
-//!   downloaded from a published release, or handed over as paths. Release CI
-//!   runs this to publish them.
+//! - `prepare-servers` **obtains** `miao-server` binaries — cross-built
+//!   here, downloaded from a published release, or handed over as paths.
+//!   Release CI runs this to publish them.
 //! - `dist` builds the named release dashboard variants into `dist/`, obtaining
 //!   whatever servers each one carries and handing the archives to its build.
 //!
-//! Where the servers come from is a `--servers` flag, not an assumption, and
+//! Where the servers come from is a `--from` flag, not an assumption, and
 //! that seam is the point: it is orthogonal to how the dashboard is compiled.
 //! The dashboard learns what to carry from one environment variable naming a
 //! manifest (`build.rs`), so obtaining a server and building a dashboard stay
@@ -65,7 +65,7 @@ enum Cmd {
     /// Build release dashboard variants into `dist/`.
     Dist(DistArgs),
     /// Obtain `miao-server` binaries (what release CI publishes).
-    Server(ServerCmdArgs),
+    PrepareServers(PrepareServersArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -73,33 +73,33 @@ enum Cmd {
 // ---------------------------------------------------------------------------
 
 /// The seam. Every command that needs servers takes this and never learns which
-/// arm answered — `server` returns the same `Payload` from all three.
+/// arm answered — `server::` returns the same `Payload` from all three.
 #[derive(Args, Clone)]
 struct ServerArgs {
     /// Where to get servers: `build` (cross-compile from this workspace) or
     /// `release[:<version>]` (download a published one; defaults to this
     /// workspace's version).
-    #[arg(long = "servers", value_name = "SOURCE", default_value = "build")]
+    #[arg(long = "from", value_name = "SOURCE", default_value = "build")]
     source: String,
 
-    /// Use this exact binary for one target, whatever `--servers` says.
+    /// Use this exact binary for one target, whatever `--from` says.
     /// Repeatable: `--server x86_64-unknown-linux-gnu=path/to/miao-server`.
     #[arg(long = "server", value_name = "TARGET=PATH")]
     files: Vec<String>,
 
-    /// Where `--servers release` downloads from.
+    /// Where `--from release` downloads from.
     #[arg(long, value_name = "URL", default_value = server::RELEASE_BASE)]
     release_base: String,
 }
 
-/// The parsed form of `--servers`.
+/// The parsed form of `--from`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
     Build,
     Release(String),
 }
 
-/// Parse `--servers`. Pure, so the accepted spellings are pinned by a test.
+/// Parse `--from`. Pure, so the accepted spellings are pinned by a test.
 ///
 /// A bare `release` means this workspace's version, which is the only defensible
 /// default: the dashboard being built is that version, and a server from a
@@ -143,7 +143,7 @@ fn parse_files(pairs: &[String]) -> Result<BTreeMap<String, PathBuf>> {
 impl ServerArgs {
     /// Resolve every requested target to a packed payload.
     ///
-    /// Explicit `--server` paths win over `--servers`, so a CI job that already
+    /// Explicit `--server` paths win over `--from`, so a CI job that already
     /// downloaded its artifacts doesn't have to fetch them again — and a path
     /// naming a target nothing asked for is an error rather than a silent no-op,
     /// since a typo'd triple would otherwise look like it worked.
@@ -155,7 +155,7 @@ impl ServerArgs {
                 targets.iter().copied().collect::<Vec<_>>().join(", ")
             );
         }
-        // Parsed even when nothing needs servers, so a typo'd `--servers` is
+        // Parsed even when nothing needs servers, so a typo'd `--from` is
         // reported rather than shrugged off by whichever variant happened not to
         // want one. The *probe* below is what stays conditional — that one costs
         // a PATH walk per entry, where this costs a `split_once`.
@@ -324,7 +324,7 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Cmd::Dist(args) => dist(&ws, &args),
-        Cmd::Server(args) => server(&ws, &args),
+        Cmd::PrepareServers(args) => prepare_servers(&ws, &args),
     }
 }
 
@@ -538,7 +538,7 @@ fn list() {
         .filter_map(|n| find_variant(n).ok().map(Variant::label))
         .collect();
     println!("\ndefault: {}", defaults.join(", "));
-    println!("\nservers come from --servers build (default) or --servers release[:<version>],");
+    println!("\nservers come from --from build (default) or --from release[:<version>],");
     println!("or one at a time from --server <target>=<path>.");
 }
 
@@ -596,7 +596,7 @@ fn verify(artifact: &Path, servers: &[&str]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[derive(Args)]
-struct ServerCmdArgs {
+struct PrepareServersArgs {
     /// Targets to produce. Defaults to both Linux arches — the ones a release
     /// publishes and a bundled dashboard deploys.
     #[arg(long = "target", value_name = "TRIPLE")]
@@ -615,7 +615,7 @@ struct ServerCmdArgs {
 /// glibc floor, same architecture check — as the ones a developer cross-builds
 /// locally. Two pipelines producing "the server" would eventually produce two
 /// different ones.
-fn server(ws: &Workspace, args: &ServerCmdArgs) -> Result<()> {
+fn prepare_servers(ws: &Workspace, args: &PrepareServersArgs) -> Result<()> {
     let targets: BTreeSet<&str> = if args.targets.is_empty() {
         LINUX_TARGETS.iter().copied().collect()
     } else {
@@ -723,7 +723,7 @@ mod tests {
         assert!(plain.cargo_features().is_empty());
     }
 
-    /// `--servers` is the decoupling seam, so its spellings are a contract.
+    /// `--from` is the decoupling seam, so its spellings are a contract.
     #[test]
     fn the_server_source_parses_every_spelling_it_advertises() {
         assert_eq!(parse_source("build").unwrap(), Source::Build);
@@ -789,7 +789,7 @@ mod tests {
 
     /// Nothing wanted means nothing obtained — no cross-toolchain probe, no
     /// download. But the flags are still checked: a plain variant happening not
-    /// to want a server must not turn a typo'd `--servers` into a silent no-op.
+    /// to want a server must not turn a typo'd `--from` into a silent no-op.
     #[test]
     fn asking_for_no_servers_does_no_work_but_still_checks_the_flags() {
         let ws = Workspace {

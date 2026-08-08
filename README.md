@@ -274,7 +274,7 @@ is, and never touched), or let the dashboard carry one and deploy it for you:
 ```sh
 # Download this version's published servers and bundle them in — needs only
 # curl and tar, no cross toolchain:
-cargo xtask dist --variant bundle-linux --servers release
+cargo xtask dist --variant bundle-linux --from release
 
 # …or cross-compile them from the sources beside you, which is what you want
 # while changing the server itself:
@@ -301,7 +301,7 @@ side — a plain `miao` carrying nothing and a `miao-bundle-linux` carrying both
 The flake exposes the same set as packages (`captain-miao-bundle-linux`,
 `-x86_64`, `-aarch64`). Binaries from npm and GitHub Releases are the plain
 build; each release also publishes the servers on their own, which is what
-`--servers release` downloads.
+`--from release` downloads.
 
 `miao --version` says what any given binary is carrying:
 

@@ -26,10 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (npm, GitHub Releases) are the plain build for now — bundling them waits on
   remote hosts leaving experimental.
 
-  **Where the servers come from is up to you.** `--servers build` (the default)
+  **Where the servers come from is up to you.** `--from build` (the default)
   cross-compiles them from the sources beside you, against an old glibc (2.28 —
   Debian 10, RHEL 8) so they run on machines far older than the one that built
-  them. `--servers release` downloads the ones a release published, so a bundled
+  them. `--from release` downloads the ones a release published, so a bundled
   dashboard needs only `curl` and `tar` — no cross toolchain at all. Each release
   now publishes the servers as their own assets to make that possible, and
   `miao --version` prints the digest of everything a binary carries, which is what

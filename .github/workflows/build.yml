@@ -15,7 +15,7 @@ name: build
 # `miao-server` is published by the separate `server` job below, on one
 # x86_64 runner, cross-compiled to both Linux arches by cargo-zigbuild — which is
 # what makes the server a *fetchable* artifact rather than something every
-# bundled build has to compile for itself (`cargo xtask dist --servers release`).
+# bundled build has to compile for itself (`cargo xtask dist --from release`).
 #
 # Linux builds run on **ubuntu-22.04**, not ubuntu-latest, purely to set the glibc
 # floor: a binary linked against 24.04's glibc 2.39 dies with a cryptic loader
@@ -139,7 +139,7 @@ jobs:
 
   # The per-host daemon a dashboard deploys to a remote box. Published as its own
   # release asset so obtaining a server is decoupled from building a dashboard:
-  # `cargo xtask dist --servers release` downloads these instead of cross-building
+  # `cargo xtask dist --from release` downloads these instead of cross-building
   # them, which is what lets a bundled dashboard be built with no cross toolchain
   # at all — just curl and tar.
   #
@@ -153,7 +153,7 @@ jobs:
   # x86_64-linux but not aarch64-linux, so the arm64 runner is not an option here
   # even if we wanted one.
   #
-  # It runs `cargo xtask server`, the same code path a developer runs locally, so
+  # It runs `cargo xtask prepare-servers`, the same code path a developer runs locally, so
   # the strategy choice, the floor, and the ELF architecture check cannot drift
   # between what CI publishes and what a laptop builds.
   server:
@@ -181,7 +181,7 @@ jobs:
           key: server-payloads
 
       - name: Cross-build the servers
-        run: nix develop --command cargo xtask server --out dist/servers
+        run: nix develop --command cargo xtask prepare-servers --out dist/servers
 
       # Flat tarballs — one binary, no wrapper directory and no README. These are
       # a machine-consumed artifact: xtask's `server::fetch` extracts the single

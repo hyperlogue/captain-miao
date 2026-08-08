@@ -2268,7 +2268,7 @@ mod tests {
     ///
     /// ```text
     /// # Obtain a server and note where its manifest landed:
-    /// cargo xtask server --out /tmp/srv
+    /// cargo xtask prepare-servers --out /tmp/srv
     /// printf '%s\t%s\t%s\n' x86_64-unknown-linux-gnu "$SHA" /tmp/srv/…/server.gz \
     ///   > /tmp/payloads.tsv
     ///

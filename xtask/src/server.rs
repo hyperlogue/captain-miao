@@ -166,8 +166,8 @@ fn choose_strategy(target: &str, host: &str, tools: &Tools) -> Result<Strategy, 
 }
 
 /// Where a strategy's glibc floor actually comes from, when it isn't the pinned
-/// [`GLIBC_FLOOR`] — phrased for the warning `build.rs` prints. `None` means the
-/// floor is pinned (or the target has no glibc to pin).
+/// [`GLIBC_FLOOR`] — phrased for the warning `dist` prints beside the payload.
+/// `None` means the floor is pinned (or the target has no glibc to pin).
 ///
 /// Only zigbuild pins it. The other two are worth naming separately rather than
 /// lumping together as "the builder's glibc": `cross` compiles inside a Linux
@@ -262,7 +262,7 @@ pub struct Payload {
     /// host as its marker, so it identifies the build rather than the archive.
     pub sha256: String,
     /// The uncompressed binary this was packed from. Kept because obtaining a
-    /// server is a step in its own right: `cargo xtask server` publishes these,
+    /// server is a step in its own right: `cargo xtask prepare-servers` publishes these,
     /// while only the dashboard's build wants the archive.
     pub bin_path: PathBuf,
     /// The gzip the dashboard `include_bytes!`es.
@@ -446,7 +446,7 @@ fn annotate_fetch_failure(err: String, version: &str, target: &str) -> String {
     format!(
         "{err}\n  v{version} publishes no miao-server for {target}. \
          Releases before servers were published as their own assets carry none at \
-         all — use `--servers build` (needs cargo-zigbuild + zig; `nix develop` \
+         all — use `--from build` (needs cargo-zigbuild + zig; `nix develop` \
          provides both), or `--server {target}=<path>` if you already have one."
     )
 }
@@ -789,7 +789,7 @@ mod tests {
         assert!(msg.contains("404"), "{msg}");
         assert!(msg.contains("v0.2.1"), "{msg}");
         assert!(msg.contains(OTHER), "{msg}");
-        assert!(msg.contains("--servers build"), "{msg}");
+        assert!(msg.contains("--from build"), "{msg}");
 
         let other = "curl: (6) Could not resolve host".to_string();
         assert_eq!(annotate_fetch_failure(other.clone(), "0.2.1", OTHER), other);

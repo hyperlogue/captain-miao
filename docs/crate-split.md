@@ -102,9 +102,9 @@ between them at *where servers come from* rather than at *how they get in*.
 **Where servers come from is a flag, not an assumption.** Three sources produce
 the same `Payload` and nothing downstream can tell which answered:
 
-- `--servers build` cross-compiles from this workspace. The default, and what the
+- `--from build` cross-compiles from this workspace. The default, and what the
   dev loop wants: the server has to match the sources you are changing.
-- `--servers release[:<version>]` downloads a published one. A bundled build then
+- `--from release[:<version>]` downloads a published one. A bundled build then
   needs `curl` and `tar` and nothing else — no zig, no cross `rust-std`s, not
   even the server's sources. A bare `release` means this workspace's version,
   since that is the only defensible reading of an omitted one.
@@ -188,7 +188,7 @@ it buy over `include_bytes!`". Measured:
   it came out.
 
 `include_bytes!` gives up nothing that mattered. It is allocated, referenced data,
-so `strip` cannot remove it either; the decoupling lives in `--servers`, which is
+so `strip` cannot remove it either; the decoupling lives in `--from`, which is
 orthogonal to the embedding; and the "payload is not a compile input" property —
 no cross toolchain for `cargo build`, `clippy`, `check` — is preserved by the
 environment variable simply being unset.
@@ -210,8 +210,8 @@ variable that did not survive, an archive that moved, and the build succeeds
 carrying nothing.
 
 **Release CI publishes the servers** (`build.yml`'s `server` job), which is what
-gives `--servers release` something to fetch. One x86_64 runner cross-compiles
-both Linux arches through `nix develop --command cargo xtask server` — the same
+gives `--from release` something to fetch. One x86_64 runner cross-compiles
+both Linux arches through `nix develop --command cargo xtask prepare-servers` — the same
 code path a laptop runs, so the strategy choice, the pinned glibc floor and the
 architecture check cannot drift between what CI publishes and what a developer
 builds. One runner rather than two, deliberately: zigbuild pins the floor at 2.28
@@ -226,7 +226,7 @@ it, because obtaining the servers, writing each variant's manifest and building
 against it is exactly what `dist` already does — a nix expression would be a
 second copy of it, free to drift. The whole sequence runs offline: every cargo
 invocation resolves from the vendored registry crane already set up, which is
-also why these stay on `--servers build` (the default) rather than offering the
+also why these stay on `--from build` (the default) rather than offering the
 `release` source — a nix build has no network to fetch one over. Two things they
 need that the
 plain packages don't, both found by trying it: `devToolchain` for the cross
