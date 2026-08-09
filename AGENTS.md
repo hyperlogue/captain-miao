@@ -577,9 +577,15 @@ rationale in `docs/crate-split.md`; this is the map.
   the PATH and cache binaries' `--version`, the marker, and whether a daemon is
   already running), and `Provision::Upload` streams the payload into `cat` over
   the ssh connection the probe just opened (no local temp file, no second round
-  trip, no decompressor needed on the host). It is staged, `chmod`ed and **run on
-  the host** before being moved into place, so a truncated transfer or wrong-ABI
-  payload never becomes the binary the next connect invokes.
+  trip, no decompressor needed on the host). It is staged, `chmod`ed, **run on
+  the host**, and its reported version checked **there** before being moved into
+  place, so a truncated transfer, a wrong-ABI payload or a wrong-versioned one
+  never becomes the binary the next connect invokes. The version check has to
+  happen in the script: comparing it dashboard-side from the output is a
+  comparison made *after* the `mv`, so a binary we then "refused" had already
+  replaced a working deployment and rewritten its marker — and the next probe,
+  seeing a mismatched cache version, re-uploaded the same stale binary every
+  cooldown. Reachable as soon as a payload can come from an env var.
 - **The host-run check is `self-check`, not `--version`.** `--version` proves the
   file loads and matches — a wrong arch, a missing loader, a truncated transfer —
   but never resolves user information, so a static-musl server on an LDAP/SSSD
@@ -619,10 +625,20 @@ rationale in `docs/crate-split.md`; this is the map.
   its marker against our preferred gnu payload, re-deploys gnu, watches the host
   refuse it, falls back to musl — every reconnect, forever, at a backoff capping
   at 30s. Four cases: a version mismatch runs the loop; a marker naming a target
-  we can still supply compares against *that* one; a target we can no longer
-  supply is kept (it proved itself there); a marker with no target keeps the old
-  rule, so upgrading churns nothing. "Can supply" means **locally** — resolving
-  via download would mean fetching a binary purely to answer a comparison.
+  we can still supply compares against *that* one; a target we **genuinely cannot
+  supply** is kept (it proved itself there); a marker with no target keeps the old
+  rule, so upgrading churns nothing. Two qualifiers, both learned by getting them
+  wrong. "Can supply" means **locally** — resolving via download would mean
+  fetching a binary purely to answer a comparison. And "cannot supply" must not be
+  confused with "the host just refused it this pass": the loop filters candidates
+  as they are rejected, so the decision takes the *unfiltered* set too, or a
+  refusal reads as unsuppliable and strands us on a binary we watched fail —
+  skipping the musl fallback exactly where it is the only thing that works.
+  Finally, when every candidate **is** spent, a same-version binary at our cache
+  path is the last resort rather than PATH: `cache_version` exists only because
+  the probe ran that binary on the host seconds ago and it answered, and on a
+  no-loader host it cannot run, so there is no `cache_version` and that host still
+  gets its honest failure.
 - **Everything sent over ssh is wrapped `/bin/sh -c '<script>'`**
   (`login_shell_safe`). `ssh host <cmd>` hands `<cmd>` to the *account's login
   shell*, which is routinely `fish`: a POSIX-sh deploy script came back as
@@ -636,9 +652,15 @@ rationale in `docs/crate-split.md`; this is the map.
 - **A failed deploy is rate-limited** (`UploadGate`, a map keyed on the payload
   digest — a *map*, because with more than one candidate a single slot is evicted
   by the next failure, leaving the first unsuppressed and re-sending both every
-  pass on exactly the hosts that refuse both): the reconnect backoff caps at 30s, so a host that accepts ssh but
-  refuses the write would otherwise be re-sent megabytes twice a minute forever.
-  A *new* payload always gets a fresh attempt, and a working connection clears it.
+  pass on exactly the hosts that refuse both): the reconnect backoff caps at 30s,
+  so a host that accepts ssh but refuses the write would otherwise be re-sent
+  megabytes twice a minute forever. A *new* payload always gets a fresh attempt.
+  A **decline is not a failure** and carries no cooldown — it is a decision, held
+  until cleared, or the consent popup returns twice an hour on a host the user
+  already refused. Clearing happens only once the handshake *and* subscribe have
+  succeeded: doing it when the socket connected wiped a recorded decline on every
+  connect-then-handshake-refused cycle, which is precisely the host that keeps
+  asking.
 - **`miao --version` is the inventory.** Whether a given binary can deploy a
   server is fixed at *build* time, so no config or state file can answer it;
   clap's long-version form lists the targets, gz sizes, and digests (`-V` keeps
