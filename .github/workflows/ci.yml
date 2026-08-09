@@ -53,6 +53,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # The flake is the toolchain source for everything that can run nix. The
+      # release workflow's dashboard matrix can't (no aarch64-linux system) and
+      # reads rust-toolchain.toml instead, and nothing makes the two agree on
+      # their own. Assert it here, where the dev shell is already realized: a
+      # `nix flake update` that moves the compiler fails until the file moves
+      # with it, rather than silently shipping releases built by a rustc that
+      # never ran a test.
+      - name: Toolchain matches rust-toolchain.toml
+        run: |
+          pinned=$(awk -F'"' '/^channel/ { print $2 }' rust-toolchain.toml)
+          actual=$(rustc --version | cut -d' ' -f2)
+          echo "flake: $actual    rust-toolchain.toml: $pinned"
+          if [ "$pinned" != "$actual" ]; then
+            echo "::error::flake toolchain is $actual but rust-toolchain.toml pins $pinned" >&2
+            exit 1
+          fi
+
       - name: rustfmt
         run: nix develop --command cargo fmt --all --check
 

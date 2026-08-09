@@ -1,0 +1,25 @@
+# The Rust toolchain this project builds with, named in one place.
+#
+# The nix path does NOT read this file. `nix develop`, every crane package, and
+# every CI job that can reach nix take their toolchain from fenix, pinned by
+# flake.lock — and the real rustc that puts on PATH ignores a rustup toolchain
+# file entirely. This file exists for the consumers that *can't* use the flake:
+#
+#   * `.github/workflows/build.yml`'s dashboard matrix, which builds the released
+#     binaries on runners the flake has no system for (aarch64-linux), so it
+#     installs its own compiler. It greps `channel` out of this file, which is
+#     what stops the published binaries being compiled by whatever the rolling
+#     `stable` channel happened to be that morning — a rustc no CI job ever
+#     linted or tested with.
+#   * a contributor working outside `nix develop`.
+#
+# Nothing makes those two sources agree on their own, so ci.yml asserts it: a
+# `nix flake update` that moves the compiler fails the run until this file moves
+# with it. Bumping is `nix flake update`, then read the version back out of
+# `nix develop --command rustc --version` and set it here.
+#
+# No `components` on purpose. The dev and CI path gets clippy, rustfmt and
+# rust-src from the flake; listing them here would only make the release matrix
+# install two tools it never runs.
+[toolchain]
+channel = "1.97.1"

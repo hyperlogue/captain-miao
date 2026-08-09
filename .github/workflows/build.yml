@@ -87,13 +87,33 @@ jobs:
         with:
           persist-credentials: false # nothing here pushes
 
+      # This matrix is the one build in the project that cannot use the flake —
+      # it runs on aarch64-linux, which the flake has no system for — so it
+      # installs its own compiler and needs to be told which. It reads the pin
+      # rather than tracking `stable`: on the rolling channel the *published*
+      # binaries were compiled by whatever rustc landed that morning, a version
+      # no lint or test job had ever run. ci.yml asserts this file agrees with
+      # the flake, so the two halves of a release share one compiler.
+      #
+      # Plain awk — no toolchain exists yet at this point, which is the same
+      # reason release.yml's verify job greps the version out of Cargo.toml.
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: |
+          channel=$(awk -F'"' '/^channel/ { print $2 }' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "::error::no channel found in rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       # Pinned to master (a moving branch, so it can't be a version tag); the
-      # channel it installs is set explicitly via `toolchain:` since the ref no
+      # version it installs is set explicitly via `toolchain:` since the ref no
       # longer names it.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
-          toolchain: stable
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

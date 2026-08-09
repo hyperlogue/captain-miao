@@ -676,6 +676,32 @@ rationale in `docs/crate-split.md`; this is the map.
   exercises every line, so it needs no remote machine. Run it with a bundle
   feature on; that is what puts a payload in the test binary.
 
+## Rust toolchain
+
+**One version, two mechanisms, asserted equal.** The flake is the real source:
+`fenix.packages.<system>.stable`, pinned by `flake.lock`, is what `nix develop`
+gives you, what every crane package builds with, and what every CI job that can
+reach nix invokes through `nix develop --command`. `rust-toolchain.toml` names
+the same version for the consumers that *can't* use the flake — a contributor
+working outside `nix develop`, and, the one that matters, `build.yml`'s
+dashboard matrix, which builds the released binaries on `ubuntu-22.04-arm`, an
+`aarch64-linux` the flake has no system for. That job installs its own compiler
+via `dtolnay/rust-toolchain` and now reads the pin instead of tracking `stable`:
+on the rolling channel the *published* binaries were compiled by whatever rustc
+landed that morning, while `ci.yml` and the `server` job (which builds the four
+`miao-server` payloads through `nix develop`) used the flake's — so one release
+shipped a dashboard and the servers it deploys from two different compilers,
+only one of which had ever run a test. Since nothing makes the two sources agree
+on their own, `ci.yml`'s **Toolchain matches rust-toolchain.toml** step compares
+the dev shell's `rustc --version` against the file and fails the run on drift.
+The file deliberately lists **no `components`** — the flake supplies
+clippy/rustfmt/rust-src, and naming them there would only make the release
+matrix install two tools it never runs.
+
+**Bumping is three steps:** `nix flake update`, read the new version back out of
+`nix develop --command rustc --version`, write it into `rust-toolchain.toml`.
+Skipping the third turns CI red, which is the point.
+
 ## Dev commands
 
 ```sh
