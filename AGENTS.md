@@ -492,7 +492,9 @@ rationale in `docs/crate-split.md`; this is the map.
   and 7 MiB, so no two ever shared a compile.
 - **Variants** — `cargo xtask dist [--variant N]… [--all] [--list]` builds named
   release artifacts into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`,
-  and the two single-arch bundles. Each run verifies its artifact by running it
+  the two single-arch bundles, and `miao-bundle-linux-all` (a **dev** variant
+  carrying all four servers so the musl fallback is exercisable; deliberately
+  outside `DEFAULT_VARIANTS`, so it is never a release artifact). Each run verifies its artifact by running it
   and checking it reports the servers it was built to carry. That check earns its
   keep: a manifest reaches the compile through an environment variable and a
   generated file, which fails *silently* — a variable that didn't survive, an
@@ -544,22 +546,83 @@ rationale in `docs/crate-split.md`; this is the map.
   invocation resolves from crane's vendored registry). Needs `devToolchain` for
   the cross `rust-std`s and a **writable `HOME`** — cargo-zigbuild caches under it
   and nix points it at the non-existent `/homeless-shelter`.
-- **Deploying** (`backend.rs`) — the probe reads a fifth line, the digest marker
-  beside the deployed binary, and `Provision::Upload` streams the inflated
-  payload into `cat` over the ssh connection the probe just opened (no local temp
-  file, no second round trip, no decompressor needed on the host). It is staged,
-  `chmod`ed and **run on the host** before being moved into place, so a truncated
-  transfer or wrong-ABI payload never becomes the binary the next connect
-  invokes — the only check that can catch glibc-vs-musl, which `uname` can't
-  report.
-- **Ownership rule**: **PATH is the user's, the cache path is ours.** A
-  version-matching binary the user installed always wins and is never
-  overwritten; `~/.cache/captain-miao/bin/miao-server` is refreshed to
-  match our payload whenever the marker doesn't.
-- **The digest marker exists because a version match is not identity.** Dev
-  builds never bump the version, so `0.2.1` on a host says nothing about *which*
-  `0.2.1`. Rebuild, reconnect, and the host gets the new server — which is what
-  retires `redeploy.sh` for payload-carrying builds.
+- **A payload comes from a chain, not just the embedded table.** Per target, in
+  order: `$CAPTAIN_MIAO_SERVER_<TARGET>` (one exact binary) →
+  `$CAPTAIN_MIAO_SERVER_DIR/<target>/miao-server` (a directory, exactly the layout
+  `prepare-servers --out` writes) → the embedded payload → the XDG cache →
+  **download** the published asset into that cache. Explicit configuration beats a
+  build-time default, so the env vars lead; the per-target variable overrides the
+  directory one, so you can point at a whole directory and still redirect a single
+  target out of it. Both spellings of the per-target variable are read (cargo's
+  uppercased/underscored one, and the verbatim triple) because a variable that
+  silently does nothing is the worst failure mode available. **Embedded
+  deliberately beats the cache**: it is the only source that works with no network
+  and no prior state, which is the entire reason to keep embedding once a
+  downloader exists. The **download is not part of resolution** — a payload only
+  the network could supply has no digest until fetched, so it cannot be compared
+  against the host's marker; it is an escalation reached only when everything
+  local is exhausted or refused, and it writes into the cache so re-resolving
+  finds it with a real digest.
+- **A download always asks first, and a refusal is the default.** It is the only
+  step that leaves the machine. The connection tasks can't open a popup, so they
+  ask over a channel the run loop drains — but only while nothing else owns the
+  screen, so a question never clobbers an open picker. The reply channel rides in
+  the `Action`, and `handle_confirm_key` already drops a pending action on
+  anything but `y`, so `n`, Esc and quitting all decline by *dropping the sender*;
+  with no UI at all (tests, headless) consent is likewise denied. A decline is
+  remembered exactly like a failure — the backoff caps at 30s, so otherwise the
+  popup returns twice a minute and a declined host becomes unusable — and a
+  working connection clears it, so saying no is never permanent.
+- **Deploying** (`backend.rs`) — the probe reads six lines (`$HOME`, `uname -sm`,
+  the PATH and cache binaries' `--version`, the marker, and whether a daemon is
+  already running), and `Provision::Upload` streams the payload into `cat` over
+  the ssh connection the probe just opened (no local temp file, no second round
+  trip, no decompressor needed on the host). It is staged, `chmod`ed and **run on
+  the host** before being moved into place, so a truncated transfer or wrong-ABI
+  payload never becomes the binary the next connect invokes.
+- **The host-run check is `self-check`, not `--version`.** `--version` proves the
+  file loads and matches — a wrong arch, a missing loader, a truncated transfer —
+  but never resolves user information, so a static-musl server on an LDAP/SSSD
+  host passes it, installs, and then fails on *first attach*: libshpool resolves
+  the user with `getpwuid_r` and errors when the lookup finds nothing, taking
+  `home_dir` and the shell with it. `self-check` makes the same call, so the host
+  answers the question that matters — can this binary host a session here? It
+  prints the same `miao-server <ver> protocol <n>` shape, so the reply parses as
+  before. A binary predating the subcommand fails it as a clap usage error, which
+  is the safe direction.
+- **Candidates are looped at the deploy site, because `uname` can't report a
+  libc.** Per arch the candidates are `[gnu, musl]`, tried in order, keeping the
+  first the host proves it can run. Debian/RHEL takes gnu; NixOS/Alpine with local
+  users falls to musl; a NixOS host with LDAP/SSSD users can be served by *no*
+  payload we could ship and is told so, pointed at
+  `programs.captain-miao.server.enable`.
+- **A locally-sourced payload is checked before it is sent.** A Linux ELF whose
+  `PT_INTERP` is not one of the two generic loaders is refused, naming what it
+  found; a `/nix/store/…` interpreter says so explicitly. The realistic mistake is
+  pointing the directory variable at a `symlinkJoin` holding the *native* nix
+  package, which under a generic triple looks correct and runs on exactly one
+  machine. Static musl has no `PT_INTERP` at all and passes — absence is the right
+  answer for it, not a missing one.
+- **Ownership rule**: **PATH is the user's, the cache path is ours.** A binary the
+  user installed always wins and is never overwritten;
+  `~/.cache/captain-miao/bin/miao-server` is refreshed to match our payload
+  whenever the marker doesn't. Since the PATH rule now turns on **protocol
+  compatibility** rather than version equality, a stale server there outlives our
+  upgrades silently — accepted (you own what you put there) and surfaced as a
+  hosts-panel annotation.
+- **The marker is `<sha256> <target>`, and the winning target is sticky.** The
+  digest exists because a version match is not identity: dev builds never bump the
+  version, so `0.2.1` on a host says nothing about *which* `0.2.1` — rebuild,
+  reconnect, and the host gets the new server, which is what retires
+  `redeploy.sh` for payload-carrying builds. The **target** is what makes the
+  candidate loop terminate. Without it a NixOS host that settled on musl compares
+  its marker against our preferred gnu payload, re-deploys gnu, watches the host
+  refuse it, falls back to musl — every reconnect, forever, at a backoff capping
+  at 30s. Four cases: a version mismatch runs the loop; a marker naming a target
+  we can still supply compares against *that* one; a target we can no longer
+  supply is kept (it proved itself there); a marker with no target keeps the old
+  rule, so upgrading churns nothing. "Can supply" means **locally** — resolving
+  via download would mean fetching a binary purely to answer a comparison.
 - **Everything sent over ssh is wrapped `/bin/sh -c '<script>'`**
   (`login_shell_safe`). `ssh host <cmd>` hands `<cmd>` to the *account's login
   shell*, which is routinely `fish`: a POSIX-sh deploy script came back as
@@ -570,8 +633,10 @@ rationale in `docs/crate-split.md`; this is the map.
   of an `EXIT` trap. A test runs the deploy under every shell installed on the
   machine. (Note `remote_shell_argv`, for `w` work tabs, is **not** wrapped and
   still emits `${SHELL:-/bin/sh}` — invalid in fish. Separate defect.)
-- **A failed deploy is rate-limited** (`UploadGate`, keyed on the payload
-  digest): the reconnect backoff caps at 30s, so a host that accepts ssh but
+- **A failed deploy is rate-limited** (`UploadGate`, a map keyed on the payload
+  digest — a *map*, because with more than one candidate a single slot is evicted
+  by the next failure, leaving the first unsuppressed and re-sending both every
+  pass on exactly the hosts that refuse both): the reconnect backoff caps at 30s, so a host that accepts ssh but
   refuses the write would otherwise be re-sent megabytes twice a minute forever.
   A *new* payload always gets a fresh attempt, and a working connection clears it.
 - **`miao --version` is the inventory.** Whether a given binary can deploy a

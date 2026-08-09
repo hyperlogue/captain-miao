@@ -211,14 +211,56 @@ carrying nothing.
 
 **Release CI publishes the servers** (`build.yml`'s `server` job), which is what
 gives `--from release` something to fetch. One x86_64 runner cross-compiles
-both Linux arches through `nix develop --command cargo xtask prepare-servers` — the same
+every Linux target through `nix develop --command cargo xtask prepare-servers` — the same
 code path a laptop runs, so the strategy choice, the pinned glibc floor and the
 architecture check cannot drift between what CI publishes and what a developer
 builds. One runner rather than two, deliberately: zigbuild pins the floor at 2.28
 where a native arm64 build would inherit the runner's glibc, and the flake
 declares no `aarch64-linux` system to enter a dev shell on anyway. The assets are
 flat tarballs holding just `miao-server`, which is the other half of the
-by-name extraction contract above.
+by-name extraction contract above. The workflow needs no edit to gain a target:
+it runs `prepare-servers` bare and packages whatever lands in `dist/servers/`,
+so the list lives in `xtask` alone.
+
+### Which libc a payload is built against
+
+**glibc is preferred, and musl is a verified fallback.** These are two different
+questions and the answer to each is on a different axis, so they are stated
+together here rather than left to be inferred from either one.
+
+glibc is preferred because **NSS is load-bearing, not a nicety.** A static musl
+build compiles NSS out, so on a host whose users come from LDAP/SSSD it cannot
+see a `passwd` entry for a perfectly valid uid — and libshpool resolves the user
+with `getpwuid_r` and *errors* when the lookup finds nothing. The session does
+not degrade to `/bin/sh`; it fails to attach at all, and `home_dir` and the shell
+go with it. (`utmpx` is stubbed too, so pooled sessions won't appear in `who`/`w`
+— real, but the smaller loss.)
+
+musl is carried anyway because it is the only thing that reaches a host with **no
+generic loader at all**. NixOS, Alpine and distroless have no
+`/lib64/ld-linux-x86-64.so.2`, so a glibc binary cannot start there — not because
+they are old, but because "generic glibc" is not a universal ABI. A static musl
+build has no `PT_INTERP`, no `PT_DYNAMIC`, and is `ET_EXEC`; it costs nothing in
+size (6.7 MiB against glibc's 6.9, and 3.1 MiB compressed either way — musl's
+libc is negligible beside 6 MiB of Rust, bundled SQLite and libshpool).
+
+**Which one a given host gets is not decided here.** `uname` cannot report a
+libc, so the choice is deferred to the host: the deploy offers candidates in
+preference order and keeps the first one the host proves it can run. Every
+combination resolves without a guess, including the honest failure — a NixOS host
+with LDAP/SSSD users can be served by *no* payload we could ship, and is told so
+rather than handed a binary that breaks at first attach.
+
+**What is embedded and what is published deliberately differ.** A release
+publishes all four targets but embeds only the gnu pair (`PUBLISHED_TARGETS` vs
+`LINUX_TARGETS` in `xtask`). musl's audience is Nix hosts, which have a better
+answer already — a server built against their own libc, on their own PATH, no
+deploy at all — so making every downloader carry ~6 MiB aimed at the one platform
+that does not need it is the wrong default. A dashboard that *meets* such a host
+downloads the published musl asset instead. The consequence, stated rather than
+discovered: a released dashboard now needs network to reach a no-loader host. The
+offline guarantee was always about the mainstream Linux fleet, which gnu covers
+completely.
 
 **A macOS host needs one environment override to cross at all** (`cross_build_env`).
 `libproc` is libshpool's dependency, so it is in every server build, and it gates
@@ -237,6 +279,13 @@ one bindgen consults; a value left in the underscored spelling is silently never
 read. Upstream's fix would be to gate on `CARGO_CFG_TARGET_OS`; 0.14.11 is the
 latest and does not.
 
+The same override also carries `-D_DARWIN_C_SOURCE`, which is the *third* face of
+that one build-script bug and only appears once musl is in the target set: with
+clang aimed back at the host, the macOS SDK's `net/if.h` still compiles its Apple
+body out unless that macro is defined, leaving `struct if_data` a forward
+declaration and killing bindgen with "field has incomplete type". Faces one and
+two were the missing per-target variable and its dashed-vs-underscored spelling.
+
 **Nix has the same variants**: `packages.captain-miao-bundle-linux` and the two
 single-arch ones. They delegate to `cargo xtask dist` rather than reimplementing
 it, because obtaining the servers, writing each variant's manifest and building
@@ -251,6 +300,19 @@ plain packages don't, both found by trying it: `devToolchain` for the cross
 byte-identical), and a **writable `HOME`** — cargo-zigbuild keeps a cache under it
 and nix points `HOME` at the non-existent `/homeless-shelter`, so the cross dies
 on a permission error before zig is even invoked.
+
+**Nix also has a better option than embedding**, and it is the one to reach for
+there: `packages.captain-miao-servers` builds a link farm via `prepare-servers`,
+and `packages.captain-miao-with-servers` wraps the dashboard with
+`CAPTAIN_MIAO_SERVER_DIR` pointed at it. The servers become store paths shared
+between dashboard generations rather than megabytes recompiled into one binary,
+and adding an architecture no longer relinks `miao`. The farm must hold
+`prepare-servers` **cross** builds and never `packages.captain-miao-server` — that
+one is crane-built against the store's own glibc with an absolute
+`/nix/store/…/ld-linux` interpreter, so under a generic triple it would look
+correct and fail on every non-Nix host. Delegating to `prepare-servers` makes that
+impossible by construction; the deploy's interpreter check is the belt. The
+wrapper uses `--set-default`, so a user's own `CAPTAIN_MIAO_SERVER_DIR` still wins.
 
 **Deploying: `backend.rs`.** The connect probe gained a fifth line (the digest
 marker beside the deployed binary) and `Provision` gained an `Upload` arm. The

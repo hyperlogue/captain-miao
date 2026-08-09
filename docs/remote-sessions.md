@@ -796,11 +796,13 @@ has no remote. Until it has, the feature ships off by default behind the
   would make this zero-touch for users rather than only for source builds —
   worth doing when `remote` comes out from behind its cargo feature, and not
   before, since it adds ~7 MB to every download for a feature that's off.
-- **A musl payload.** `target_candidates` already prefers glibc and falls
-  through to a musl entry, and the post-upload verification is what would catch
-  a glibc payload failing on Alpine — but there is no `bundle-*-musl` feature to
-  build one, so an Alpine host still reports the failure rather than
-  self-healing.
+- ~~**A musl payload.**~~ — done. The two musl targets are built and published,
+  the deploy loops `[gnu, musl]` and keeps the first the host proves it can run,
+  and a released (gnu-only) dashboard downloads the published musl asset when it
+  meets a host with no generic loader. glibc stays preferred because its NSS is
+  load-bearing: a static build cannot see LDAP/SSSD users, and the session fails
+  to attach rather than degrading — which is why the host-run check is now
+  `self-check` (it resolves the user) instead of `--version` (which never did).
 - **`remote_shell_argv` doesn't survive a fish login shell.** The `w` work-tab
   command emits `cd '<dir>' && exec "${SHELL:-/bin/sh}" -l`, and
   `${SHELL:-/bin/sh}` is not fish syntax — the same class of bug the deploy path
