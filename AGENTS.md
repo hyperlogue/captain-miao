@@ -520,6 +520,18 @@ rationale in `docs/crate-split.md`; this is the map.
   so blaming the builder's glibc would be wrong, and on macOS there is none to
   blame. Known gap: Homebrew's `macos-cross-toolchains` would work but isn't a
   strategy, so a mac carrying those and no zig is refused rather than used.
+  A **macOS host also needs `cross_build_env`'s one env override** to build for
+  Linux at all: `libproc` (transitively libshpool's, so it is in every server
+  build) gates its bindgen call on `#[cfg(target_os = "macos")]` *inside
+  build.rs*, where a cfg describes the host — so it parses the macOS SDK headers
+  with clang aimed at the Linux target and dies on `Unsupported architecture`
+  before a line of our code compiles. Pointing clang back at the host triple via
+  `BINDGEN_EXTRA_CLANG_ARGS_<target>` makes them parse, and the bindings it
+  writes are dead (libproc's *library* includes them under the same cfg, which
+  there means the target). The dashed target-suffixed spelling is the one that
+  works: bindgen reads it ahead of the underscored and plain ones, and
+  cargo-zigbuild *appends* its own sysroot flags to that same variable rather
+  than replacing it.
 - **`lto = "fat"` + `codegen-units = 1`** on the release profile: 16% off the
   server (8.61 → 7.21 MB) and the same order off `miao`, which every download pays
   for and a bundled build pays for twice. Deliberately **not** `panic = "abort"` —

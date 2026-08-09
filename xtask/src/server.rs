@@ -217,6 +217,42 @@ fn cargo() -> String {
     std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
 }
 
+/// Extra environment the nested build needs, as `(key, value)` pairs. Pure.
+///
+/// One entry, and it routes around an upstream bug rather than anything we
+/// chose. `libproc` — a transitive dependency of libshpool, so it is in *every*
+/// server build — gates its bindgen call on `#[cfg(target_os = "macos")]`
+/// **inside build.rs**, where a cfg describes the host, not the target. So on a
+/// Mac it runs even while the crate is being compiled for Linux, and bindgen
+/// then parses the macOS SDK headers with clang aimed at the Linux target:
+/// `error: Unsupported architecture`, and the build dies before it starts.
+/// Aiming clang back at the host makes those headers parse, and the bindings it
+/// then writes are dead code — libproc's *library* includes them under
+/// `cfg(target_os = "macos")`, which this time is the target.
+///
+/// Only a macOS host has the problem: `cross` builds inside a Linux container,
+/// where libproc's build script is the empty one, and a Linux host compiles
+/// that same empty one directly.
+///
+/// Both spellings are set, and which one wins is not ours to decide: bindgen
+/// reads `BINDGEN_EXTRA_CLANG_ARGS_<target>` (**dash**-spelled, ahead of the
+/// underscored variant and of the plain one), while cargo-zigbuild *also*
+/// writes that variable — appending zig's sysroot flags to whatever is already
+/// there, which is what makes setting it work rather than get clobbered. The
+/// plain one covers a strategy that rewrites nothing. The underscored spelling
+/// is deliberately absent: zigbuild sets the dashed one regardless, so a value
+/// left only in the underscored one is never the one bindgen reads.
+fn cross_build_env(target: &str, host: &str) -> Vec<(String, String)> {
+    if !host.contains("apple-darwin") || target.contains("apple-darwin") {
+        return Vec::new();
+    }
+    let arg = format!("--target={host}");
+    vec![
+        (format!("BINDGEN_EXTRA_CLANG_ARGS_{target}"), arg.clone()),
+        ("BINDGEN_EXTRA_CLANG_ARGS".to_string(), arg),
+    ]
+}
+
 /// zigbuild's target spelling: a `*-linux-gnu` triple takes a `.<glibc>` suffix
 /// naming the floor to link against. cargo-zigbuild strips the suffix before
 /// handing the triple to cargo, so the artifact still lands under the bare
@@ -302,7 +338,7 @@ pub fn build(
     let (program, args) = build_argv(strategy, target, build_dir);
 
     println!("  {} {}", program, args.join(" "));
-    run(root, &program, &args)?;
+    run(root, &program, &args, &cross_build_env(target, host))?;
 
     let artifact = build_dir.join(target).join("release").join(SERVER_BIN);
     let raw = std::fs::read(&artifact).map_err(|e| {
@@ -550,10 +586,16 @@ fn pack(
 /// The environment is inherited except for the flags aimed at the *outer* build:
 /// `RUSTFLAGS` meant for the dashboard (`-C target-cpu=native`, a lint level, a
 /// custom linker) would be silently wrong for a cross, and `CARGO_BUILD_TARGET`
-/// would override the `--target` just computed.
-fn run(root: &Path, program: &str, args: &[String]) -> Result<(), String> {
-    let status = Command::new(program)
-        .args(args)
+/// would override the `--target` just computed. `env` adds what the cross itself
+/// needs — see [`cross_build_env`].
+fn run(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(root)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
@@ -562,7 +604,11 @@ fn run(root: &Path, program: &str, args: &[String]) -> Result<(), String> {
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_TARGET_DIR")
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("spawning `{program}`: {e}"))?;
     if status.success() {
@@ -713,6 +759,36 @@ mod tests {
         let msg = choose_strategy(OTHER, HOST, &Tools::default()).unwrap_err();
         assert!(msg.contains("cargo-zigbuild"), "{msg}");
         assert!(msg.contains(OTHER), "{msg}");
+    }
+
+    #[test]
+    fn a_mac_host_aims_bindgen_back_at_itself_for_a_linux_target() {
+        // libproc's build script reads the macOS SDK headers whenever the
+        // *host* is a Mac, so a Linux target has to hand clang a Mac triple or
+        // they don't parse. Both spellings, since bindgen prefers the
+        // target-suffixed one and cargo-zigbuild appends to it.
+        let mac = "aarch64-apple-darwin";
+        let env = cross_build_env(OTHER, mac);
+        assert_eq!(
+            env,
+            vec![
+                (
+                    format!("BINDGEN_EXTRA_CLANG_ARGS_{OTHER}"),
+                    format!("--target={mac}")
+                ),
+                (
+                    "BINDGEN_EXTRA_CLANG_ARGS".to_string(),
+                    format!("--target={mac}")
+                ),
+            ]
+        );
+
+        // A Linux host compiles libproc's *empty* build script, and a Mac
+        // building for itself was never confused about its own headers —
+        // neither needs the override, and setting it would only be a way to
+        // break a future bindgen user that genuinely wants the target.
+        assert!(cross_build_env(OTHER, HOST).is_empty());
+        assert!(cross_build_env(mac, mac).is_empty());
     }
 
     #[test]

@@ -220,6 +220,23 @@ declares no `aarch64-linux` system to enter a dev shell on anyway. The assets ar
 flat tarballs holding just `miao-server`, which is the other half of the
 by-name extraction contract above.
 
+**A macOS host needs one environment override to cross at all** (`cross_build_env`).
+`libproc` is libshpool's dependency, so it is in every server build, and it gates
+its bindgen call on `#[cfg(target_os = "macos")]` *inside build.rs* — where a cfg
+describes the host, not the target. On a Mac it therefore runs while compiling
+for Linux, feeding the macOS SDK headers to a clang aimed at `aarch64-unknown-linux-gnu`,
+which fails with `error: Unsupported architecture` before any of our code
+compiles. Aiming clang back at the host triple makes the headers parse and the
+bindings it writes are dead code (libproc's *library* includes them under the
+same cfg, which there means the target). Which variable is not a free choice:
+bindgen reads `BINDGEN_EXTRA_CLANG_ARGS_<target>` — dash-spelled — ahead of both
+the underscored spelling and the plain one, and cargo-zigbuild writes that same
+variable, *appending* zig's sysroot flags rather than replacing what is there.
+So the dashed one is the only spelling that both survives zigbuild and is the
+one bindgen consults; a value left in the underscored spelling is silently never
+read. Upstream's fix would be to gate on `CARGO_CFG_TARGET_OS`; 0.14.11 is the
+latest and does not.
+
 **Nix has the same variants**: `packages.captain-miao-bundle-linux` and the two
 single-arch ones. They delegate to `cargo xtask dist` rather than reimplementing
 it, because obtaining the servers, writing each variant's manifest and building
