@@ -29,3 +29,6 @@ target/
 # than in docs/. A doc lands in docs/ when its work does — until then it is a
 # plan, and it says so in its own first line ("Status: proposal").
 /design
+
+# bv (beads viewer) local config and caches
+.bv/
