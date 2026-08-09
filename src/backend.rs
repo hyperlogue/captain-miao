@@ -1214,12 +1214,21 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
 /// downloader is an escalation the *caller* reaches for when this returns
 /// nothing usable, not a resolution step.
 ///
+/// `suppliable` is every target we could supply *at all*, including ones the
+/// host has already refused this pass. It exists purely to keep the marker's two
+/// cases apart, and conflating it with `candidates` is a real bug rather than a
+/// tidiness point: "the marker names a target we cannot supply" (keep what is
+/// deployed — it proved itself here) and "the marker names one we just watched
+/// the host reject" (keep looking) are opposite conclusions, and `candidates`
+/// alone cannot tell them apart once a refusal has filtered it.
+///
 /// Stays pure: the IO (env lookups, cache reads, downloads) happens at the
 /// resolution edge, and the looping happens at the deploy site. Unit-tested.
 fn decide_provision(
     local_version: &str,
     probe: &RemoteProbe,
     candidates: &[(&str, &str)],
+    suppliable: &[&str],
 ) -> Provision {
     // A daemon already serving outranks the whole ladder: uploading anything
     // while it holds the singleton lock is megabytes for nothing. Note this
@@ -1258,7 +1267,15 @@ fn decide_provision(
                 // it is the right version, and it is the binary that proved
                 // itself here. Churning it for one we merely prefer is exactly
                 // how the every-reconnect loop starts.
-                None => return Provision::UseCache,
+                //
+                // But only when it is genuinely beyond us. A target missing from
+                // `candidates` merely because the host *just refused it* is the
+                // opposite situation: keeping the deployed copy there would
+                // strand us on a binary we have watched fail and skip every
+                // remaining candidate — on a no-loader host, exactly the musl
+                // fallback this design exists to reach.
+                None if !suppliable.contains(&target) => return Provision::UseCache,
+                None => {}
             },
             // (4) A marker written before targets were recorded: fall back to
             // the single-candidate rule this had before the loop existed.
@@ -1865,7 +1882,11 @@ async fn resolve_remote_exe(
             .filter(|p| !refused.contains(&p.target))
             .map(|p| (p.target.as_str(), p.sha256.as_str()))
             .collect();
-        let action = decide_provision(local_version, &probe, &candidates);
+        // `suppliable` is deliberately unfiltered: it separates "cannot supply"
+        // from "just refused", which the marker's cases (3) and the loop below
+        // read in opposite directions.
+        let suppliable: Vec<&str> = available.iter().map(|p| p.target.as_str()).collect();
+        let action = decide_provision(local_version, &probe, &candidates, &suppliable);
         tracing::debug!(
             target: "captain_miao::provision",
             "{target}: arch={:?} path={:?} cache={:?}/{:?} refused={refused:?} → {action:?}",
@@ -2703,7 +2724,7 @@ mod tests {
         let mut p = probe("Linux x86_64", None, None);
         p.running = Some(RunningDaemon::OnPath);
         assert_eq!(
-            decide_provision("0.1.0", &p, &[PAYLOAD]),
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
             Provision::UseRunning(RunningDaemon::OnPath)
         );
         assert_eq!(
@@ -2715,7 +2736,10 @@ mod tests {
         // daemon's own path is not otherwise observable.
         p.running = Some(RunningDaemon::InCache);
         assert_eq!(
-            remote_exe_for(&decide_provision("0.1.0", &p, &[PAYLOAD]), "/home/u"),
+            remote_exe_for(
+                &decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+                "/home/u"
+            ),
             format!("/home/u/{REMOTE_CACHE_REL}")
         );
     }
@@ -2729,22 +2753,28 @@ mod tests {
         let mut p = probe("Linux x86_64", Some("0.9.9"), None);
         p.path_protocol = Some(PROTOCOL_VERSION);
         assert_eq!(
-            decide_provision("0.1.0", &p, &[PAYLOAD]),
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
             Provision::UsePath
         );
 
         // Below the floor is not talkable, so it does not win — the ladder
         // falls through to our payload.
         p.path_protocol = Some(PROTOCOL_MIN - 1);
-        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            upload("abc123")
+        );
 
         // A server too old to announce a protocol keeps the old exact-version
         // rule: nothing else can be inferred about it.
         p.path_protocol = None;
-        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            upload("abc123")
+        );
         let matching = probe("Linux x86_64", Some("0.1.0"), None);
         assert_eq!(
-            decide_provision("0.1.0", &matching, &[PAYLOAD]),
+            decide_provision("0.1.0", &matching, &[PAYLOAD], &[PAYLOAD.0]),
             Provision::UsePath
         );
     }
@@ -2770,14 +2800,20 @@ mod tests {
         // PATH match wins outright — a user install beats our cache copy, and is
         // never overwritten even when we carry a payload.
         let p = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UsePath);
         assert_eq!(
-            decide_provision("0.1.0", &p, &[PAYLOAD]),
+            decide_provision("0.1.0", &p, &[], BOTH_TARGETS),
+            Provision::UsePath
+        );
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
             Provision::UsePath
         );
         // No PATH match, but our cache copy matches → use it.
         let p = probe(lx, None, Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UseCache);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[], BOTH_TARGETS),
+            Provision::UseCache
+        );
     }
 
     #[test]
@@ -2785,13 +2821,16 @@ mod tests {
         let lx = "Linux x86_64";
         // Nothing deployed anywhere.
         assert_eq!(
-            decide_provision("0.1.0", &probe(lx, None, None), &[]),
+            decide_provision("0.1.0", &probe(lx, None, None), &[], &[]),
             Provision::FallBack
         );
         // Both present but stale — a version mismatch must not be invoked, since
         // the wire protocol isn't guaranteed compatible across versions.
         let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.2.0", &stale, &[]), Provision::FallBack);
+        assert_eq!(
+            decide_provision("0.2.0", &stale, &[], &[]),
+            Provision::FallBack
+        );
     }
 
     #[test]
@@ -2799,13 +2838,13 @@ mod tests {
         let lx = "Linux x86_64";
         // Nothing there at all — the fresh-host case.
         assert_eq!(
-            decide_provision("0.1.0", &probe(lx, None, None), &[PAYLOAD]),
+            decide_provision("0.1.0", &probe(lx, None, None), &[PAYLOAD], &[PAYLOAD.0]),
             upload("abc123")
         );
         // Everything there but stale.
         let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
         assert_eq!(
-            decide_provision("0.2.0", &stale, &[PAYLOAD]),
+            decide_provision("0.2.0", &stale, &[PAYLOAD], &[PAYLOAD.0]),
             upload("abc123")
         );
     }
@@ -2818,25 +2857,35 @@ mod tests {
 
         p.cache_sha = Some("abc123".into());
         assert_eq!(
-            decide_provision("0.1.0", &p, &[PAYLOAD]),
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
             Provision::UseCache
         );
 
         // A different build of the same version — re-deploy.
         p.cache_sha = Some("999999".into());
-        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            upload("abc123")
+        );
 
         // No marker at all (redeploy.sh, or a pre-marker dashboard). We own this
         // path, so we take it over rather than trusting an unlabelled binary.
         p.cache_sha = None;
-        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            upload("abc123")
+        );
         // …but a build carrying no payload has nothing better to offer, so it
         // keeps using what's there.
-        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UseCache);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[], BOTH_TARGETS),
+            Provision::UseCache
+        );
     }
 
     const GNU: (&str, &str) = ("x86_64-unknown-linux-gnu", "gnu-sha");
     const MUSL: (&str, &str) = ("x86_64-unknown-linux-musl", "musl-sha");
+    const BOTH_TARGETS: &[&str] = &[GNU.0, MUSL.0];
 
     fn upload_of(p: (&str, &str)) -> Provision {
         Provision::Upload {
@@ -2859,32 +2908,83 @@ mod tests {
         // would otherwise offer first.
         p.cache_sha = Some(MUSL.1.into());
         p.cache_target = Some(MUSL.0.into());
-        assert_eq!(decide_provision("0.1.0", &p, &both), Provision::UseCache);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
+            Provision::UseCache
+        );
 
         // (2) Same target, different digest: the dev loop. Re-deploy *that*
         // target rather than restarting the race from the top.
         p.cache_sha = Some("some-older-build".into());
-        assert_eq!(decide_provision("0.1.0", &p, &both), upload_of(MUSL));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
+            upload_of(MUSL)
+        );
 
         // (3) The marker names a target we can no longer supply — a released
         // dashboard whose host runs a downloaded musl, now offline or declined.
         // Keep what proved itself here; re-offering gnu is how the loop starts.
-        assert_eq!(decide_provision("0.1.0", &p, &[GNU]), Provision::UseCache);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[GNU], &[GNU.0]),
+            Provision::UseCache
+        );
 
         // (4) A marker written before targets were recorded falls back to the
         // single-candidate rule this had before the loop existed.
         p.cache_target = None;
         p.cache_sha = Some(GNU.1.into());
-        assert_eq!(decide_provision("0.1.0", &p, &both), Provision::UseCache);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
+            Provision::UseCache
+        );
         p.cache_sha = Some("a-different-build".into());
-        assert_eq!(decide_provision("0.1.0", &p, &both), upload_of(GNU));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
+            upload_of(GNU)
+        );
 
         // (1) A version mismatch runs the loop regardless of what the marker
         // says: stickiness is about *which* build, not about keeping a stale one.
         let mut old = probe("Linux x86_64", None, Some("0.0.9"));
         old.cache_sha = Some(MUSL.1.into());
         old.cache_target = Some(MUSL.0.into());
-        assert_eq!(decide_provision("0.1.0", &old, &both), upload_of(GNU));
+        assert_eq!(
+            decide_provision("0.1.0", &old, &both, BOTH_TARGETS),
+            upload_of(GNU)
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_let_the_marker_strand_us_on_a_dead_binary() {
+        // Regression. The marker's "we can no longer supply that target" case
+        // must not fire for a target that is missing from the candidate list
+        // only because the host *just refused it*. Those are opposite
+        // situations, and `candidates` alone cannot tell them apart once a
+        // refusal has filtered it.
+        //
+        // The scenario: a no-loader host with a same-version gnu binary already
+        // deployed from an earlier build. We offer our gnu payload (the digest
+        // differs), the host cannot run it, and gnu drops out of the running.
+        // If we then read the marker as "gnu is beyond us", we keep the gnu
+        // binary sitting there — which this host equally cannot run — and never
+        // try musl, the one payload that would have worked.
+        let mut p = probe("Linux x86_64", None, Some("0.1.0"));
+        p.cache_sha = Some("an-earlier-gnu-build".into());
+        p.cache_target = Some(GNU.0.into());
+
+        // gnu refused, so only musl remains offerable — but both are suppliable.
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[MUSL], BOTH_TARGETS),
+            upload_of(MUSL),
+            "a refused marker target must not short-circuit to UseCache"
+        );
+
+        // The genuine case (3) still holds: when the marker names something we
+        // truly cannot supply, keep what proved itself there.
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[MUSL], &[MUSL.0]),
+            Provision::UseCache
+        );
     }
 
     #[test]
@@ -2894,11 +2994,20 @@ mod tests {
         // a starting point — the host has the last word, since `uname` cannot
         // report a libc and nothing else can be asked cheaply.
         let p = probe("Linux x86_64", None, None);
-        assert_eq!(decide_provision("0.1.0", &p, &[GNU, MUSL]), upload_of(GNU));
-        assert_eq!(decide_provision("0.1.0", &p, &[MUSL]), upload_of(MUSL));
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[GNU, MUSL], BOTH_TARGETS),
+            upload_of(GNU)
+        );
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[MUSL], BOTH_TARGETS),
+            upload_of(MUSL)
+        );
         // Both refused — the NixOS-with-LDAP row. No payload we could ship
         // serves it, so say so rather than install something that breaks later.
-        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::FallBack);
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[], BOTH_TARGETS),
+            Provision::FallBack
+        );
     }
 
     #[test]
@@ -3438,6 +3547,7 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
                 &fresh,
                 &[(payload.target.as_str(), payload.sha256.as_str())],
+                &[payload.target.as_str()],
             ),
             Provision::Upload {
                 target: payload.target.clone(),
@@ -3481,6 +3591,7 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
                 &after,
                 &[(payload.target.as_str(), payload.sha256.as_str())],
+                &[payload.target.as_str()],
             ),
             Provision::UseCache,
         );
