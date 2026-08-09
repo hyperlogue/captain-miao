@@ -63,6 +63,11 @@ base64 = "0.22"
 # the same crate `xtask` compresses with, so there is one codec in the tree and
 # no C dependency on either side.
 flate2 = "1"
+# Digests a server payload that came from a file rather than the embedded table
+# (the env-var and cache sources), so every candidate carries the same identity
+# the deploy marker records. Already in the tree via `cm-core` and `xtask`, and
+# pinned to the same major, so this adds no compile.
+sha2 = "0.11"
 
 [features]
 default = []

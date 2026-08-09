@@ -96,23 +96,219 @@ pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
     }
 }
 
-/// Every embedded payload a host reporting `uname -sm` might run, in preference
-/// order — glibc first. Empty when we carry nothing it could use.
-///
-/// A list rather than a single best answer, because which one actually works is
-/// the *host's* answer, not ours: the deploy walks these until one passes the
-/// self-check on the far end.
-pub(crate) fn for_uname_all(uname_sm: &str) -> Vec<&'static ServerPayload> {
-    pick_all(target_candidates(uname_sm), payloads())
+// ---------------------------------------------------------------------------
+// The source chain
+// ---------------------------------------------------------------------------
+
+/// Environment variable prefix for both the per-target and the directory form.
+const ENV_PREFIX: &str = "CAPTAIN_MIAO_SERVER";
+
+/// Where a downloaded server is cached, under the user's cache dir. Versioned,
+/// because a server is only interchangeable with others of the same version.
+const CACHE_REL: &str = "captain-miao/servers";
+
+/// Where a payload came from — for the connection log, which is the only place
+/// a user can see *why* a particular binary was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PayloadSource {
+    /// `$CAPTAIN_MIAO_SERVER_<TARGET>` named this exact file.
+    EnvTarget,
+    /// Found under `$CAPTAIN_MIAO_SERVER_DIR/<target>/`.
+    EnvDir,
+    /// Compiled into this binary.
+    Embedded,
+    /// Previously downloaded, sitting in the XDG cache.
+    Cache,
 }
 
-/// Candidate-order lookup, over an injected table so the preference order is
-/// testable in a build that bundles nothing (which is the default). Pure.
-fn pick_all<'a>(candidates: &[&str], table: &'a [ServerPayload]) -> Vec<&'a ServerPayload> {
-    candidates
+impl PayloadSource {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            PayloadSource::EnvTarget => "env",
+            PayloadSource::EnvDir => "env dir",
+            PayloadSource::Embedded => "embedded",
+            PayloadSource::Cache => "cache",
+        }
+    }
+}
+
+/// One server we can supply for one target.
+///
+/// Holds a *path* rather than the bytes for file-backed sources: the digest is
+/// what the decision needs, and a multi-megabyte binary should only be read when
+/// it is actually being sent.
+#[derive(Debug, Clone)]
+pub(crate) struct Candidate {
+    pub(crate) target: String,
+    pub(crate) sha256: String,
+    pub(crate) source: PayloadSource,
+    /// `None` for the embedded table, whose bytes are already in the binary.
+    path: Option<std::path::PathBuf>,
+    /// Index into [`payloads`] for an embedded candidate.
+    embedded: Option<usize>,
+}
+
+impl Candidate {
+    /// The bytes to upload, inflating or reading as needed.
+    pub(crate) fn bytes(&self) -> std::io::Result<Vec<u8>> {
+        match (&self.path, self.embedded) {
+            (Some(p), _) => std::fs::read(p),
+            (None, Some(i)) => payloads()[i].decompress(),
+            _ => Err(std::io::Error::other("candidate has no source")),
+        }
+    }
+
+    /// Whether this came from somewhere the *user* pointed us at, and so is
+    /// worth checking before it is sent. An embedded payload was built by
+    /// `xtask`, which already verified its architecture.
+    pub(crate) fn is_locally_sourced(&self) -> bool {
+        matches!(
+            self.source,
+            PayloadSource::EnvTarget | PayloadSource::EnvDir
+        )
+    }
+}
+
+/// The two spellings of the per-target variable, in the order they are read.
+///
+/// Cargo's own convention is the uppercased, underscored one
+/// (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER`), so that is what we
+/// document — but the verbatim triple is accepted too, because someone who has
+/// just typed a target triple will try it, and a variable that silently does
+/// nothing is the worst possible failure. Two `getenv`s is a cheap price for
+/// not repeating the afternoon that `BINDGEN_EXTRA_CLANG_ARGS_<target>` cost.
+/// Pure.
+pub(crate) fn env_names_for(target: &str) -> [String; 2] {
+    [
+        format!("{ENV_PREFIX}_{}", target.to_uppercase().replace('-', "_")),
+        format!("{ENV_PREFIX}_{target}"),
+    ]
+}
+
+/// Where a downloaded server for `target` is cached.
+///
+/// `<cache>/captain-miao/servers/<version>/<target>/miao-server` — the same
+/// `<target>/miao-server` layout `cargo xtask prepare-servers --out <dir>`
+/// writes, so the directory env var and this cache are the same shape and a
+/// developer can point one straight at the other.
+pub(crate) fn cache_path_for(target: &str) -> Option<std::path::PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join(CACHE_REL)
+            .join(env!("CARGO_PKG_VERSION"))
+            .join(target)
+            .join("miao-server"),
+    )
+}
+
+/// Hex sha256 of a file's contents — the identity a marker records.
+fn digest_of(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    Ok(Sha256::digest(&bytes)
         .iter()
-        .filter_map(|c| table.iter().find(|p| p.target == *c))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        }))
+}
+
+/// Every server we can supply **locally** for a host, in preference order.
+///
+/// The chain, per target, is:
+///
+/// ```text
+/// 1. $CAPTAIN_MIAO_SERVER_<TARGET>                 one exact binary, by target
+/// 2. $CAPTAIN_MIAO_SERVER_DIR/<target>/miao-server a directory of them
+/// 3. embedded payload                              the offline guarantee
+/// 4. <cache>/captain-miao/servers/<ver>/<target>/miao-server
+/// ```
+///
+/// Explicit configuration beats a build-time default, so the env vars come
+/// first — and (1) overrides (2) rather than sitting beside it, so you can point
+/// at a whole directory and still redirect *one* target out of it. Embedded
+/// beats the cache because it is the only source that works with no network and
+/// no prior state; that property is the entire reason to keep embedding once a
+/// downloader exists, and demoting it for freshness would trade an offline
+/// guarantee for a marginal win.
+///
+/// **Downloading is deliberately not in here.** It is source (5) in the design,
+/// but a payload that only the network could supply has no digest until it has
+/// been fetched, so it cannot be compared against the host's marker and must not
+/// influence the decision. The caller escalates to it only when everything here
+/// is exhausted or refused; the download then writes into (4), and re-resolving
+/// picks it up with a real digest.
+///
+/// Staleness is not validated here. The deploy stages the binary, runs it on the
+/// host and refuses a mismatch — strictly better than any local inspection,
+/// since it catches wrong arch, wrong libc, truncated transfer and wrong version
+/// in one step, on the machine that matters.
+pub(crate) fn resolve_candidates(uname_sm: &str) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for target in target_candidates(uname_sm) {
+        if let Some(c) = resolve_one(target) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The chain for a single target. Separated so the ordering is readable.
+fn resolve_one(target: &str) -> Option<Candidate> {
+    let from_file = |path: std::path::PathBuf, source: PayloadSource| -> Option<Candidate> {
+        if !path.is_file() {
+            return None;
+        }
+        match digest_of(&path) {
+            Ok(sha256) => Some(Candidate {
+                target: target.to_string(),
+                sha256,
+                source,
+                path: Some(path),
+                embedded: None,
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    target: "captain_miao::provision",
+                    "cannot read server payload {}: {e}", path.display()
+                );
+                None
+            }
+        }
+    };
+
+    // (1) A binary named outright, by target.
+    for name in env_names_for(target) {
+        if let Some(v) = std::env::var_os(&name)
+            && let Some(c) = from_file(v.into(), PayloadSource::EnvTarget)
+        {
+            return Some(c);
+        }
+    }
+    // (2) A directory of them, laid out as `prepare-servers --out` writes.
+    if let Some(dir) = std::env::var_os(format!("{ENV_PREFIX}_DIR"))
+        && let Some(c) = from_file(
+            std::path::PathBuf::from(dir)
+                .join(target)
+                .join("miao-server"),
+            PayloadSource::EnvDir,
+        )
+    {
+        return Some(c);
+    }
+    // (3) What this build carries — the offline guarantee.
+    if let Some(i) = payloads().iter().position(|p| p.target == target) {
+        return Some(Candidate {
+            target: target.to_string(),
+            sha256: payloads()[i].sha256.to_string(),
+            source: PayloadSource::Embedded,
+            path: None,
+            embedded: Some(i),
+        });
+    }
+    // (4) Something we downloaded earlier.
+    from_file(cache_path_for(target)?, PayloadSource::Cache)
 }
 
 /// What this build carries, for the startup log and the hosts panel's diagnosis.
@@ -150,6 +346,112 @@ fn describe_table(table: &[ServerPayload]) -> String {
         ));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Interpreter check
+// ---------------------------------------------------------------------------
+
+/// The only two dynamic loaders a portable Linux payload may ask for.
+const GENERIC_INTERPS: &[&str] = &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"];
+
+/// Refuse a locally-sourced payload that can only run on the machine that built
+/// it.
+///
+/// The realistic mistake this catches: pointing `CAPTAIN_MIAO_SERVER_DIR` (or
+/// the per-target variable) at a `symlinkJoin` that happens to contain
+/// `packages.captain-miao-server` — the *native* nix build, linked against the
+/// store's glibc with an absolute `/nix/store/…/ld-linux-x86-64.so.2`
+/// interpreter. Filed under `x86_64-unknown-linux-gnu` it looks entirely
+/// correct and fails on every non-Nix host: the inverse of the failure that
+/// started all this, and just as confusing.
+///
+/// Same shape as `xtask`'s `verify_arch`, which already reads `e_machine` off
+/// the ELF header for this class of mistake — one more header field, one more
+/// refusal, raised on the machine that can explain it rather than after a
+/// multi-megabyte upload.
+///
+/// **A static musl binary has no `PT_INTERP` at all, and that is the correct
+/// answer for it, not a missing one** — so absence passes. The host-run check
+/// remains the backstop for everything a local read cannot see (glibc version,
+/// NSS, a truncated transfer); this just stops the plausible-looking local
+/// mistake from getting that far. Pure.
+pub(crate) fn check_interpreter(bytes: &[u8], target: &str) -> Result<(), String> {
+    let Some(interp) = elf_interpreter(bytes) else {
+        return Ok(()); // static, or not an ELF we can read — the host decides.
+    };
+    if GENERIC_INTERPS.contains(&interp.as_str()) {
+        return Ok(());
+    }
+    if interp.starts_with("/nix/store/") {
+        return Err(format!(
+            "{target}: this is a Nix-store-linked server ({interp}) — it runs only on the \
+             machine that built it. That build belongs on its own host's PATH via \
+             `programs.captain-miao.server.enable`; a payload for *other* hosts must come \
+             from `cargo xtask prepare-servers`"
+        ));
+    }
+    Err(format!(
+        "{target}: server wants a non-generic loader ({interp}), so it would not run on a \
+         stock host"
+    ))
+}
+
+/// Read `PT_INTERP` out of a 64-bit ELF image. `None` when there is no such
+/// segment (a static binary) or the bytes aren't an ELF we understand. Pure.
+fn elf_interpreter(bytes: &[u8]) -> Option<String> {
+    // e_ident: magic(4) class(1) data(1) ...; only ELF64 is worth parsing here,
+    // since every target we build is 64-bit.
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+        return None;
+    }
+    let le = bytes[5] != 2;
+    let u16_at = |o: usize| -> u16 {
+        let p = [bytes[o], bytes[o + 1]];
+        if le {
+            u16::from_le_bytes(p)
+        } else {
+            u16::from_be_bytes(p)
+        }
+    };
+    let u64_at = |o: usize| -> u64 {
+        let mut p = [0u8; 8];
+        p.copy_from_slice(&bytes[o..o + 8]);
+        if le {
+            u64::from_le_bytes(p)
+        } else {
+            u64::from_be_bytes(p)
+        }
+    };
+    let e_phoff = u64_at(0x20) as usize;
+    let e_phentsize = u16_at(0x36) as usize;
+    let e_phnum = u16_at(0x38) as usize;
+    const PT_INTERP: u32 = 3;
+    for i in 0..e_phnum {
+        let ph = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        if ph + 56 > bytes.len() {
+            return None;
+        }
+        let p_type = {
+            let mut p = [0u8; 4];
+            p.copy_from_slice(&bytes[ph..ph + 4]);
+            if le {
+                u32::from_le_bytes(p)
+            } else {
+                u32::from_be_bytes(p)
+            }
+        };
+        if p_type != PT_INTERP {
+            continue;
+        }
+        let off = u64_at(ph + 0x08) as usize;
+        let size = u64_at(ph + 0x20) as usize;
+        let end = off.checked_add(size)?;
+        let seg = bytes.get(off..end.min(bytes.len()))?;
+        let s = seg.split(|b| *b == 0).next()?;
+        return Some(String::from_utf8_lossy(s).into_owned());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -205,20 +507,95 @@ mod tests {
     }
 
     #[test]
-    fn glibc_is_preferred_over_musl_regardless_of_table_order() {
-        let t = table();
-        let got = pick_all(target_candidates("Linux x86_64"), &t);
-        // Both are offered — the host decides — but glibc is tried first, since
-        // a static build cannot see LDAP/SSSD users and its sessions would fail
-        // to attach on a host that has them.
-        assert_eq!(got.iter().map(|p| p.sha256).collect::<Vec<_>>(), ["g", "m"]);
+    fn glibc_is_offered_before_musl() {
+        // Both are offered — the host has the last word — but glibc is tried
+        // first, since a static build cannot see LDAP/SSSD users and its
+        // sessions would fail to attach on a host that has them.
+        let c = target_candidates("Linux x86_64");
+        assert_eq!(c[0], "x86_64-unknown-linux-gnu");
+        assert_eq!(c[1], "x86_64-unknown-linux-musl");
+    }
+
+    /// A minimal ELF64 image carrying one `PT_INTERP` segment, or none at all.
+    /// Synthesized rather than read off disk so the test says the same thing on
+    /// a Nix machine (where *every* binary is store-linked) as on a stock one.
+    fn elf_with_interp(interp: Option<&str>) -> Vec<u8> {
+        let mut v = vec![0u8; 120];
+        v[..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELF64
+        v[5] = 1; // little-endian
+        v[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        v[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        let Some(interp) = interp else {
+            v[0x38..0x3a].copy_from_slice(&0u16.to_le_bytes()); // e_phnum = 0
+            return v;
+        };
+        v[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64;
+        v[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        v[ph + 0x08..ph + 0x10].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        let bytes = interp.as_bytes();
+        v[ph + 0x20..ph + 0x28].copy_from_slice(&((bytes.len() + 1) as u64).to_le_bytes());
+        v.extend_from_slice(bytes);
+        v.push(0);
+        v
     }
 
     #[test]
-    fn a_host_we_carry_nothing_for_picks_nothing() {
-        let t = table();
-        assert!(pick_all(target_candidates("Linux aarch64"), &t).is_empty());
-        assert!(pick_all(target_candidates("Linux riscv64"), &t).is_empty());
+    fn a_store_linked_server_is_refused_before_it_is_sent() {
+        // The realistic mistake: pointing the env var at a symlinkJoin holding
+        // the *native* nix package. Filed under a generic triple it looks
+        // entirely correct and runs on exactly one machine.
+        let nix = elf_with_interp(Some(
+            "/nix/store/57iz36553175g3178pvxjij8z5rcsd4n-glibc-2.42-61/lib/ld-linux-x86-64.so.2",
+        ));
+        let err = check_interpreter(&nix, "x86_64-unknown-linux-gnu").unwrap_err();
+        assert!(err.contains("/nix/store/"), "{err}");
+        // It has to point at the answer, not just refuse.
+        assert!(err.contains("programs.captain-miao.server.enable"), "{err}");
+
+        // A generic loader is what a portable payload asks for.
+        for ok in ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"] {
+            assert!(
+                check_interpreter(&elf_with_interp(Some(ok)), "t").is_ok(),
+                "{ok} should pass"
+            );
+        }
+
+        // Static musl has NO PT_INTERP, and that is the correct answer for it
+        // rather than a missing one — refusing it here would reject the very
+        // payload that reaches a no-loader host.
+        assert!(check_interpreter(&elf_with_interp(None), "t").is_ok());
+
+        // Anything else is named rather than guessed at.
+        let odd = check_interpreter(&elf_with_interp(Some("/opt/weird/ld.so")), "t").unwrap_err();
+        assert!(odd.contains("/opt/weird/ld.so"), "{odd}");
+
+        // Not an ELF we can read → let the host decide; it is the backstop.
+        assert!(check_interpreter(b"not an elf at all", "t").is_ok());
+    }
+
+    #[test]
+    fn both_spellings_of_the_per_target_variable_are_accepted() {
+        // A variable that silently does nothing is the worst failure mode here,
+        // and someone who has just typed a target triple will try it verbatim.
+        let names = env_names_for("x86_64-unknown-linux-musl");
+        assert_eq!(names[0], "CAPTAIN_MIAO_SERVER_X86_64_UNKNOWN_LINUX_MUSL");
+        assert_eq!(names[1], "CAPTAIN_MIAO_SERVER_x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn the_cache_layout_matches_what_prepare_servers_writes() {
+        // `<dir>/<target>/miao-server` is not invented here — it is exactly what
+        // `cargo xtask prepare-servers --out <dir>` produces, so the directory
+        // env var and this cache are the same shape and one can be pointed at
+        // the other.
+        let p = cache_path_for("aarch64-unknown-linux-musl").expect("a cache dir");
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("aarch64-unknown-linux-musl/miao-server"), "{s}");
+        assert!(s.contains("captain-miao/servers"), "{s}");
+        // Versioned: servers are only interchangeable within a version.
+        assert!(s.contains(env!("CARGO_PKG_VERSION")), "{s}");
     }
 
     #[test]

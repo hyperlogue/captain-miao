@@ -39,7 +39,6 @@ use crate::protocol::{
     ClientFrame, PROTOCOL_MIN, PROTOCOL_VERSION, ServerFrame, protocol_compatible, read_frame,
     write_frame,
 };
-use crate::server_payload::ServerPayload;
 use crate::state::{self, HostId, LauncherState, SessionFlags, SessionKey};
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
@@ -1472,24 +1471,32 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
 async fn upload_server(
     target: &str,
     opts: &[String],
-    payload: &'static ServerPayload,
+    payload: &crate::server_payload::Candidate,
 ) -> Result<(), String> {
     let bytes = payload
-        .decompress()
-        .map_err(|e| format!("inflating the embedded {} payload: {e}", payload.target))?;
+        .bytes()
+        .map_err(|e| format!("reading the {} payload: {e}", payload.target))?;
+    // A payload the *user* pointed us at is checked before it leaves: a
+    // store-linked binary filed under a generic triple looks entirely correct
+    // and fails on every host but the one that built it, and finding that out
+    // after a multi-megabyte upload is a bad trade for one header read.
+    if payload.is_locally_sourced() {
+        crate::server_payload::check_interpreter(&bytes, &payload.target)?;
+    }
     let len = bytes.len();
     tracing::info!(
         target: "captain_miao::provision",
-        "{target}: deploying embedded {} server ({len} bytes) to ~/{REMOTE_CACHE_REL}",
-        payload.target
+        "{target}: deploying {} server from {} ({len} bytes) to ~/{REMOTE_CACHE_REL}",
+        payload.target,
+        payload.source.label()
     );
 
     let mut child = Command::new("ssh")
         .args(opts)
         .arg(target)
         .arg(login_shell_safe(&upload_script(
-            payload.sha256,
-            payload.target,
+            &payload.sha256,
+            &payload.target,
         )))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1574,7 +1581,11 @@ async fn resolve_remote_exe(
         );
     };
     let local_version = env!("CARGO_PKG_VERSION");
-    let available = crate::server_payload::for_uname_all(&probe.arch);
+    // The source chain: env vars, then what this build carries, then anything
+    // downloaded earlier. Naming the source in the log matters — "deployed the
+    // gnu server" is a different fact from "deployed the one you pointed
+    // CAPTAIN_MIAO_SERVER_DIR at", and only one of them is our bug.
+    let available = crate::server_payload::resolve_candidates(&probe.arch);
     log.info(format!(
         "probed {}: PATH {}, cache {}, need {local_version}; can supply {}",
         probe.arch,
@@ -1585,7 +1596,7 @@ async fn resolve_remote_exe(
         } else {
             available
                 .iter()
-                .map(|p| p.target)
+                .map(|p| format!("{} ({})", p.target, p.source.label()))
                 .collect::<Vec<_>>()
                 .join(", ")
         },
@@ -1601,13 +1612,13 @@ async fn resolve_remote_exe(
     // A failure is reported verbatim rather than retried here — the reconnect
     // loop is the retry mechanism, and `gate` is what stops it re-sending
     // megabytes every pass.
-    let mut refused: Vec<&'static str> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     let mut upload_error = None;
     let action = loop {
         let candidates: Vec<(&str, &str)> = available
             .iter()
             .filter(|p| !refused.contains(&p.target))
-            .map(|p| (p.target, p.sha256))
+            .map(|p| (p.target.as_str(), p.sha256.as_str()))
             .collect();
         let action = decide_provision(local_version, &probe, &candidates);
         tracing::debug!(
@@ -1622,8 +1633,7 @@ async fn resolve_remote_exe(
         };
         let payload = available
             .iter()
-            .find(|p| p.target == t)
-            .copied()
+            .find(|p| &p.target == t)
             .expect("Upload names a candidate we offered");
 
         let now = Instant::now();
@@ -1637,10 +1647,7 @@ async fn resolve_remote_exe(
                 Some(previous.to_string())
             }
             None => {
-                log.info(format!(
-                    "deploying {t} ({} KiB compressed)",
-                    payload.gz.len() / 1024
-                ));
+                log.info(format!("deploying {t} from {}", payload.source.label()));
                 match upload_server(target, opts, payload).await {
                     Ok(()) => None,
                     Err(e) => {
@@ -1662,7 +1669,7 @@ async fn resolve_remote_exe(
                 // candidate we preferred, so it is the one whose failure
                 // explains the outcome. Later ones are fallbacks.
                 upload_error.get_or_insert(e);
-                refused.push(payload.target);
+                refused.push(payload.target.clone());
             }
         }
     };
@@ -3010,12 +3017,12 @@ mod tests {
         }
 
         let probe = probe_remote(&target, &opts).await.expect("probe");
-        let payload = crate::server_payload::for_uname_all(&probe.arch)
-            .first()
-            .copied()
+        let payload = crate::server_payload::resolve_candidates(&probe.arch)
+            .into_iter()
+            .next()
             .unwrap_or_else(|| {
                 panic!(
-                    "no embedded payload for {:?}; build with a bundle-* feature (have: {:?})",
+                    "no payload for {:?}; build with a bundle-* feature (have: {:?})",
                     probe.arch,
                     crate::server_payload::embedded_targets()
                 )
@@ -3039,9 +3046,12 @@ mod tests {
             decide_provision(
                 env!("CARGO_PKG_VERSION"),
                 &fresh,
-                &[(payload.target, payload.sha256)],
+                &[(payload.target.as_str(), payload.sha256.as_str())],
             ),
-            upload(payload.sha256),
+            Provision::Upload {
+                target: payload.target.clone(),
+                sha256: payload.sha256.clone(),
+            },
         );
 
         // First connect: deploys, and resolves to what it deployed.
@@ -3058,14 +3068,16 @@ mod tests {
             after.cache_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(after.cache_sha.as_deref(), Some(payload.sha256));
+        assert_eq!(after.cache_sha.as_deref(), Some(payload.sha256.as_str()));
+        // The marker now records which build won, not just its digest.
+        assert_eq!(after.cache_target.as_deref(), Some(payload.target.as_str()));
 
         // Second connect: recognises its own deploy and re-sends nothing.
         assert_eq!(
             decide_provision(
                 env!("CARGO_PKG_VERSION"),
                 &after,
-                &[(payload.target, payload.sha256)],
+                &[(payload.target.as_str(), payload.sha256.as_str())],
             ),
             Provision::UseCache,
         );

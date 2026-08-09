@@ -243,6 +243,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tiny-skia",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
