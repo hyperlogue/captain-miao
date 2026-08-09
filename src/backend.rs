@@ -1359,8 +1359,10 @@ async fn connection_task(
     // next attempt. Retrying doesn't make "no miao-server on the host" any less
     // true, so blinking the sentence off to `connecting` once per backoff tick
     // only makes it unreadable — the reason stands until an attempt concludes
-    // something else. Invariant: `Some` exactly when the stored state is the
-    // matching `Failed`, which is why the re-dial below can skip the store.
+    // something else. Every path that loops sets this beside the state it
+    // stores, so at the top of each pass `Some` means the stored state is
+    // already the matching `Failed` — which is why the re-dial can skip its own
+    // store rather than re-announce the same sentence.
     let mut standing_failure: Option<String> = None;
     loop {
         if standing_failure.is_none() {
@@ -1433,7 +1435,6 @@ async fn connection_task(
         // history — a later one gets a fresh attempt rather than inheriting an
         // old cooldown.
         upload_gate.clear();
-        standing_failure = None;
         store(ConnState::Connected);
         let connected_at = Instant::now();
         let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;

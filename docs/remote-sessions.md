@@ -548,10 +548,17 @@ decides what they mean**.
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
   removes behind a `y/N` confirm.
-- **Header**: an **aggregate only** — `hosts 3 ⚠1`, one glyph (`⟳` while every
-  problem host is merely re-dialing, `⚠` once one is genuinely down or failed).
-  All per-host detail lives one `Space h` away, so the header stays glanceable
-  no matter how many hosts exist. Nothing at all with zero remotes.
+- **Header**: an **aggregate only** — a `☁` tally of three colored numbers,
+  good (green) / failing (attention) / down-or-dialing (dim), sitting
+  immediately right of the default-host indicator, since both answer "which
+  machines am I working across" and read as one group. An **empty bucket is
+  dropped, not printed as `0`**: all-healthy is a single green number, and a
+  problem announces itself by a second number *appearing* beside it rather than
+  by a zero quietly changing. Every host lands in exactly one bucket, so an
+  all-zero tally means no remote hosts — which is what the whole pair (tally
+  *and* default host) hides on, since naming a default is meaningless when
+  localhost is the only host. All per-host detail lives one `Space h` away, so
+  the header stays glanceable no matter how many hosts exist.
 - **Host column**: a compact, colored **emoji**, shown only when more than one
   host exists or a local row lives in another terminal instance. Per-host icons
   are configured in the panel exactly like the workdir marks, with a

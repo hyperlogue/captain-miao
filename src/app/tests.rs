@@ -2707,6 +2707,23 @@ fn format_coarse_age_has_minute_resolution() {
 }
 
 #[test]
+fn the_host_tally_prints_only_the_non_empty_buckets() {
+    let ui = crate::config::UiColors::default();
+    let text = |good, error, down| {
+        super::draw::host_tally_spans(&super::HostTally { good, error, down }, &ui)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>()
+    };
+    // All healthy: one green number, nothing else — the quiet case stays quiet.
+    assert_eq!(text(3, 0, 0), "\u{2601} 3");
+    // A problem announces itself by a number appearing, not by a 0 changing.
+    assert_eq!(text(2, 1, 0), "\u{2601} 2 1");
+    assert_eq!(text(0, 0, 2), "\u{2601} 2");
+    assert_eq!(text(1, 2, 3), "\u{2601} 1 2 3");
+}
+
+#[test]
 fn leader_v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);

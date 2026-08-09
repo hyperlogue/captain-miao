@@ -415,6 +415,25 @@ pub(super) enum HostField {
     Color,
 }
 
+/// The remote hosts, counted by how usable each one is — see
+/// [`App::remote_host_tally`]. Three numbers rather than one "unhealthy" count
+/// because the header colors them apart: a host that is *failing* (a diagnosis
+/// waiting in the hosts panel) is a different call to action than one merely
+/// re-dialing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct HostTally {
+    pub(super) good: usize,
+    pub(super) error: usize,
+    pub(super) down: usize,
+}
+
+impl HostTally {
+    /// No remote hosts configured at all (every bucket empty).
+    pub(super) fn is_empty(&self) -> bool {
+        self.good == 0 && self.error == 0 && self.down == 0
+    }
+}
+
 /// A pending y/N confirmation. Set when the user invokes a destructive
 /// action (e.g. restart) — the action is fired only after Enter / y / Y.
 #[derive(Debug)]
@@ -2280,20 +2299,28 @@ impl App {
         self.backends.iter().find(|b| &b.host_id() == host)
     }
 
-    /// Remote hosts that aren't currently `Connected`, paired with their state.
-    /// A disconnected host clears its mirror (no rows), so this is the only
-    /// place its state is visible. The header shows only the *count* of these —
-    /// per-host detail (including a `Failed` reason) lives one `Space h` away in
-    /// the hosts panel, so the header stays glanceable at any host count (§9).
-    pub(super) fn unhealthy_hosts(&self) -> Vec<(HostId, ConnState)> {
-        self.backends
-            .iter()
-            .skip(1) // backends[0] is this machine; it is never "unreachable"
-            .filter_map(|b| match b.conn_state() {
-                ConnState::Connected => None,
-                st => Some((b.host_id(), st)),
-            })
-            .collect()
+    /// Remote hosts bucketed by how usable each one is right now — the header's
+    /// whole connection surface. A disconnected host clears its mirror (no
+    /// rows), so this is the only place its state shows outside the hosts panel,
+    /// and per-host detail (including a `Failed` reason) deliberately stays one
+    /// `Space h` away so the header is glanceable at any host count (§9).
+    ///
+    /// Every remote host lands in exactly one bucket, so an all-zero tally means
+    /// "no remote hosts at all" — which is what the header hides its whole host
+    /// cluster (default host included) on.
+    pub(super) fn remote_host_tally(&self) -> HostTally {
+        let mut tally = HostTally::default();
+        // backends[0] is this machine; it is never "unreachable".
+        for backend in self.backends.iter().skip(1) {
+            match backend.conn_state() {
+                ConnState::Connected => tally.good += 1,
+                // Reachable but unusable, with a diagnosis behind it.
+                ConnState::Failed(_) => tally.error += 1,
+                // Link dropped, or not up yet — the reconnect loop is on it.
+                ConnState::Disconnected | ConnState::Connecting => tally.down += 1,
+            }
+        }
+        tally
     }
 
     /// Every configured host paired with its live connection state — the hosts

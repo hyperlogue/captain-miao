@@ -19,7 +19,7 @@ use super::format::{
     model_color, model_label, override_indicator_cell, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
-use super::{App, DirEditFocus, InputMode, PickerKind};
+use super::{App, DirEditFocus, HostTally, InputMode, PickerKind};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) {
@@ -621,13 +621,14 @@ impl App {
             Style::default().add_modifier(Modifier::DIM),
         )]]));
 
-        // Right cluster: any unhealthy remote hosts (leftmost, so a disconnect
-        // is loud), then the session layout and the default new-session backend
+        // Right cluster: the session layout and the default new-session backend
         // (always visible so the `Space l` / `Space a` choices are never hidden
-        // state), then the keep-awake ☕ indicator when sleep is actively being
-        // inhibited. Flat text on the bar, with a trailing space so it clears
-        // the terminal edge.
-        let mut right_segs = self.connection_segments();
+        // state), then the host cluster — default host, then the ☁ tally beside
+        // it, since both answer "which machines am I working across" and read as
+        // one group — and finally the keep-awake ☕ indicator when sleep is
+        // actively being inhibited. Flat text on the bar, with a trailing space
+        // so it clears the terminal edge.
+        let mut right_segs: Vec<Vec<Span<'static>>> = Vec::new();
         right_segs.push(vec![
             Span::styled("Layout: ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled(
@@ -645,9 +646,12 @@ impl App {
                 Style::default().fg(ui.title_fg),
             ),
         ]);
-        // The default *host* joins the cluster only once there's a choice to
-        // make — a single-host user never sees it, exactly like the Host column.
-        if self.backends.len() > 1 {
+        // The host cluster — default host, then the ☁ tally — appears only once
+        // there's a choice to make. Both hang off the *same* emptiness check, so
+        // a zero-remote user sees neither: naming a default host is meaningless
+        // when localhost is the only one, exactly like the Host column.
+        let tally = self.remote_host_tally();
+        if !tally.is_empty() {
             let host = self.default_host_or_local();
             right_segs.push(vec![
                 Span::styled(
@@ -659,6 +663,7 @@ impl App {
                     Style::default().fg(self.host_label_color(&host)),
                 ),
             ]);
+            right_segs.push(host_tally_spans(&tally, ui));
         }
         if self.sleep_inhibitor.is_active() {
             right_segs.push(vec![Span::styled(
@@ -680,50 +685,6 @@ impl App {
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             bar,
         );
-    }
-
-    /// The header's connection surface: a single **aggregate**, never per-host
-    /// detail (§9).
-    ///
-    /// It used to print one `⚠ <host>` segment per unhealthy host, which read
-    /// fine with one remote and blew the header out with five. Now it says how
-    /// many hosts are configured and how many are unwell — `hosts 3 ⚠1` — and
-    /// everything else (which host, and *why*, including a `Failed` reason)
-    /// lives one `Space h` away in the hosts panel. Empty when no remote hosts
-    /// are configured, so a zero-remote user sees nothing.
-    fn connection_segments(&self) -> Vec<Vec<Span<'static>>> {
-        // `backends[0]` is this machine; the header counts the hosts the user
-        // added, since those are the ones that can be unreachable.
-        let total = self.backends.len().saturating_sub(1);
-        if total == 0 {
-            return Vec::new();
-        }
-        let unhealthy = self.unhealthy_hosts();
-        let mut spans = vec![Span::styled(
-            format!("hosts {total}"),
-            Style::default().add_modifier(Modifier::DIM),
-        )];
-        if !unhealthy.is_empty() {
-            // Loud only when something is actually wrong, and one glyph either
-            // way: `⟳` while every problem host is merely re-dialing (expected
-            // to clear on its own), `⚠` once one is genuinely down or failed.
-            let all_dialing = unhealthy
-                .iter()
-                .all(|(_, st)| matches!(st, ConnState::Connecting));
-            let (glyph, style) = if all_dialing {
-                ("\u{27f3}", Style::default().add_modifier(Modifier::DIM))
-            } else {
-                (
-                    "\u{26a0}",
-                    Style::default()
-                        .fg(config::get().colors.ui.attention_fg)
-                        .add_modifier(Modifier::BOLD),
-                )
-            };
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("{glyph}{}", unhealthy.len()), style));
-        }
-        vec![spans]
     }
 
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -1616,4 +1577,38 @@ impl App {
 /// before the first `:` — for a compact "lives elsewhere" row tag.
 fn terminal_kind(identity: &str) -> &str {
     identity.split_once(':').map(|(k, _)| k).unwrap_or(identity)
+}
+
+/// The header's `☁` host tally: one colored number per bucket, good → error →
+/// down. It is an **aggregate**, never per-host detail — which host, and *why*
+/// (including a `Failed` reason), lives one `Space h` away in the hosts panel,
+/// so the header stays glanceable at any host count (§9).
+///
+/// An empty bucket is dropped rather than printed as a `0`: the all-healthy
+/// case then reads as one green number, and a problem announces itself by a
+/// second number *appearing* beside it. The numbers carry no labels at this
+/// width, so color is what tells the buckets apart — which is also why a
+/// failing host (a diagnosis waiting to be read) is loud where a merely
+/// re-dialing one, expected to clear on its own, is dim.
+pub(super) fn host_tally_spans(tally: &HostTally, ui: &config::UiColors) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        "\u{2601}",
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    for (count, style) in [
+        (tally.good, Style::default().fg(Color::Green)),
+        (
+            tally.error,
+            Style::default()
+                .fg(ui.attention_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (tally.down, Style::default().add_modifier(Modifier::DIM)),
+    ] {
+        if count > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(count.to_string(), style));
+        }
+    }
+    spans
 }
