@@ -635,10 +635,15 @@ rationale in `docs/crate-split.md`; this is the map.
   refusal reads as unsuppliable and strands us on a binary we watched fail —
   skipping the musl fallback exactly where it is the only thing that works.
   Finally, when every candidate **is** spent, a same-version binary at our cache
-  path is the last resort rather than PATH: `cache_version` exists only because
-  the probe ran that binary on the host seconds ago and it answered, and on a
-  no-loader host it cannot run, so there is no `cache_version` and that host still
-  gets its honest failure.
+  path is the last resort rather than PATH. The guard carries the whole argument:
+  `cache_version` exists **only because the probe ran that binary on the host
+  seconds ago and it answered**, so this can only ever pick something that
+  demonstrably executes there. Resist restating that as "a no-loader host has no
+  cache_version" — such a host reports one happily for a musl server deployed
+  earlier, and picking it is exactly right. What it cannot report is a version for
+  a glibc corpse at that path, which is why a host that was never successfully
+  provisioned still falls through to the honest failure. Both follow from the one
+  fact; neither is a special case.
 - **Everything sent over ssh is wrapped `/bin/sh -c '<script>'`**
   (`login_shell_safe`). `ssh host <cmd>` hands `<cmd>` to the *account's login
   shell*, which is routinely `fish`: a POSIX-sh deploy script came back as

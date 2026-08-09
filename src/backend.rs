@@ -1324,13 +1324,20 @@ fn decide_provision(
         // cache path beats falling back to PATH, which on a host we have been
         // deploying to is usually not there at all.
         //
-        // The evidence that it is worth using is stronger than it looks:
-        // `cache_version` exists only because the probe ran that binary on this
-        // host seconds ago and it answered. So this is not a hopeful guess — and
-        // it is self-limiting in the case that matters, because on a host with
-        // no loader a glibc binary at that path cannot execute, its `--version`
-        // fails, and `cache_version` is `None`, so this arm is never reached
-        // there. That host still gets the honest failure it needs.
+        // The guard is doing more work than it looks: `cache_version` exists
+        // **only because the probe ran that binary on this host seconds ago and
+        // it answered**. So this arm can only ever choose something that
+        // demonstrably executes there — it is not a hopeful guess, and it needs
+        // no argument about libcs to be safe.
+        //
+        // That generality is the point, and it is easy to get wrong by reasoning
+        // about the no-loader case specifically: such a host *can* report a
+        // `cache_version`, because a musl server deployed there earlier runs
+        // perfectly well. Picking it is exactly right. What that host cannot do
+        // is report one for a glibc corpse at the same path, which is why a
+        // never-successfully-provisioned no-loader host still falls through to
+        // the honest failure. Both follow from the one fact above; neither needs
+        // a special case.
         None if probe.cache_version.as_deref() == Some(local_version) => Provision::UseCache,
         None => Provision::FallBack,
     }
@@ -3150,16 +3157,28 @@ mod tests {
             Provision::UseCache
         );
 
-        // The no-loader host is unaffected, and not by luck: a glibc binary
-        // there cannot execute, so the probe's `--version` yields nothing and
-        // there is no cache version to fall back on. That host keeps getting
-        // the honest failure, which is the whole point of refusing loudly.
+        // A host that never got a working server keeps its honest failure: the
+        // binary at the cache path cannot execute, so the probe's `--version`
+        // yields nothing and there is no cache version to fall back on.
         let mut dead = probe("Linux x86_64", None, None);
         dead.cache_sha = Some("an-earlier-gnu-build".into());
         dead.cache_target = Some(GNU.0.into());
         assert_eq!(
             decide_provision("0.1.0", &dead, &[], BOTH_TARGETS),
             Provision::FallBack
+        );
+
+        // …but a no-loader host that *has* been provisioned reaches this arm and
+        // should: a musl server deployed there earlier runs fine, which is
+        // precisely why it reported a version. Choosing it is right, and it is
+        // the running-seconds-ago guard that makes it right — not any argument
+        // about which libc the host has.
+        let mut nixos = probe("Linux x86_64", None, Some("0.1.0"));
+        nixos.cache_sha = Some("the-musl-we-deployed".into());
+        nixos.cache_target = Some(MUSL.0.into());
+        assert_eq!(
+            decide_provision("0.1.0", &nixos, &[], BOTH_TARGETS),
+            Provision::UseCache
         );
     }
 
