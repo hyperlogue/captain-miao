@@ -961,7 +961,11 @@ fn read_transcript_header(path: &Path) -> TranscriptHeader {
 fn extract_user_prompt(content: &serde_json::Value) -> Option<String> {
     let text = if let Some(s) = content.as_str() {
         s.to_string()
-    } else if let Some(arr) = content.as_array() {
+    } else {
+        // A value that is neither a string nor an array carries no prompt, so
+        // the `?` here is the same "skip this entry" exit as the empty and
+        // wrapper cases below.
+        let arr = content.as_array()?;
         let mut parts = Vec::new();
         for block in arr {
             let ty = block.get("type").and_then(|t| t.as_str());
@@ -975,8 +979,6 @@ fn extract_user_prompt(content: &serde_json::Value) -> Option<String> {
             return None;
         }
         parts.join(" ")
-    } else {
-        return None;
     };
 
     let trimmed = text.trim();
