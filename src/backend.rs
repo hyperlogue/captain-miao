@@ -1105,7 +1105,7 @@ fn probe_script() -> String {
          \"$HOME/{REMOTE_CACHE_REL}\" --version 2>/dev/null || echo -; \
          m=$(cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null); \
          if [ -z \"$m\" ]; then m=-; fi; \
-         echo $m; \
+         echo m=$m; \
          d=-; \
          if {SERVER_BIN} daemon status 2>/dev/null | grep -q \"{DAEMON_RUNNING_MARK}\"; \
          then d=path; \
@@ -1193,7 +1193,15 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
     let (cache_version, cache_protocol) = split(lines.next());
     // `<sha256> <target>`; a marker from before the target was recorded has just
     // the digest, and yields `None` for the target rather than a wrong guess.
-    let marker = field(lines.next());
+    // The `m=` prefix is the probe's, and it is load-bearing rather than
+    // decoration: `echo` treats a leading `-n` as its own flag and suppresses
+    // the newline, so a corrupt marker beginning with one would merge this line
+    // into the next and shift every field after it. A prefix makes the first
+    // word unflaggable.
+    let marker = lines
+        .next()
+        .and_then(|l| l.trim().strip_prefix("m="))
+        .filter(|l| !l.is_empty() && *l != "-");
     let cache_sha = marker
         .and_then(|m| m.split_whitespace().next())
         .map(str::to_string);
@@ -1312,6 +1320,18 @@ fn decide_provision(
             target: (*t).to_string(),
             sha256: (*sha).to_string(),
         },
+        // Everything we could offer is spent. A same-version binary at *our*
+        // cache path beats falling back to PATH, which on a host we have been
+        // deploying to is usually not there at all.
+        //
+        // The evidence that it is worth using is stronger than it looks:
+        // `cache_version` exists only because the probe ran that binary on this
+        // host seconds ago and it answered. So this is not a hopeful guess — and
+        // it is self-limiting in the case that matters, because on a host with
+        // no loader a glibc binary at that path cannot execute, its `--version`
+        // fails, and `cache_version` is `None`, so this arm is never reached
+        // there. That host still gets the honest failure it needs.
+        None if probe.cache_version.as_deref() == Some(local_version) => Provision::UseCache,
         None => Provision::FallBack,
     }
 }
@@ -1848,7 +1868,12 @@ async fn try_download_candidate(
     let url = release_url(RELEASE_BASE, version, wanted);
     let now = Instant::now();
     if let Some(previous) = gate.suppressed(&url, now) {
-        log.info(format!("not fetching {wanted} again yet: {previous}"));
+        // A decline is held until the host actually works, not until a timer
+        // expires, so say which of the two this is — "yet" on a decision the
+        // user made reads as though it will be re-asked shortly, and it won't.
+        log.info(format!(
+            "not fetching {wanted}: {previous}              (cleared when this host connects; removing and re-adding it also resets this)"
+        ));
         return None;
     }
     log.info(format!("nothing local for {wanted}; asking to download it"));
@@ -2695,7 +2720,7 @@ mod tests {
 
     #[test]
     fn parse_probe_extracts_home_arch_versions_and_marker() {
-        let out = "/home/u\nLinux x86_64\nmiao-server 0.1.0\n-\n-\n";
+        let out = "/home/u\nLinux x86_64\nmiao-server 0.1.0\n-\nm=-\n";
         let p = parse_probe(out).unwrap();
         assert_eq!(p.home, "/home/u");
         assert_eq!(p.arch, "Linux x86_64");
@@ -2707,7 +2732,7 @@ mod tests {
     #[test]
     fn parse_probe_handles_cache_only_and_blank_lines() {
         // PATH binary missing ("-"), cache binary present, marker written.
-        let p = parse_probe("/root\nDarwin arm64\n-\nmiao-server 0.2.0\ndeadbeef\n").unwrap();
+        let p = parse_probe("/root\nDarwin arm64\n-\nmiao-server 0.2.0\nm=deadbeef\n").unwrap();
         assert_eq!(p.path_version, None);
         assert_eq!(p.cache_version.as_deref(), Some("0.2.0"));
         assert_eq!(p.cache_sha.as_deref(), Some("deadbeef"));
@@ -2723,7 +2748,7 @@ mod tests {
     fn parse_probe_reads_the_protocol_off_the_version_line() {
         // The server folds its protocol onto the same line as the version
         // precisely so this parse stays one-field-per-line.
-        let out = "/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol 4\n-\n-\n-\n";
+        let out = "/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol 4\n-\nm=-\n-\n";
         let p = parse_probe(out).unwrap();
         assert_eq!(p.path_version.as_deref(), Some("0.3.0"));
         assert_eq!(p.path_protocol, Some(4));
@@ -2732,14 +2757,15 @@ mod tests {
 
         // A server too old to announce one still yields its version, which is
         // what the exact-version fallback needs.
-        let old = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.2.1\n-\n-\n-\n").unwrap();
+        let old = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.2.1\n-\nm=-\n-\n").unwrap();
         assert_eq!(old.path_version.as_deref(), Some("0.2.1"));
         assert_eq!(old.path_protocol, None);
 
         // Garbage where the number should be is "didn't announce one", never a
         // definite answer we'd then compare against the floor.
-        let junk = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol wat\n-\n-\n-\n")
-            .unwrap();
+        let junk =
+            parse_probe("/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol wat\n-\nm=-\n-\n")
+                .unwrap();
         assert_eq!(junk.path_protocol, None);
     }
 
@@ -2764,6 +2790,9 @@ mod tests {
             ("nonl", Some("abc x86_64-unknown-linux-gnu")),
             ("multi", Some("abc x86_64-unknown-linux-gnu\njunk\n")),
             ("glob", Some("* x86_64-unknown-linux-gnu\n")),
+            // `echo` would read a leading -n as its own flag and drop the
+            // newline, merging this line into the daemon line below it.
+            ("dashn", Some("-n x86_64-unknown-linux-gnu\n")),
         ] {
             let home = root.join(name);
             std::fs::create_dir_all(home.join(".cache/captain-miao/bin")).unwrap();
@@ -2782,9 +2811,13 @@ mod tests {
                 2,
                 "{name}: marker + daemon must be exactly two lines, got {text:?}"
             );
-            // A glob must stay literal rather than listing the host's cwd.
+            // A glob must stay literal rather than listing the host's cwd,
+            // and the `m=` prefix must survive so the parse can find it.
             if name == "glob" {
-                assert!(text.starts_with("* "), "{name}: globbed: {text:?}");
+                assert!(text.starts_with("m=* "), "{name}: globbed: {text:?}");
+            }
+            if name == "dashn" {
+                assert!(text.starts_with("m=-n "), "{name}: {text:?}");
             }
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -2793,7 +2826,7 @@ mod tests {
     #[test]
     fn parse_probe_reads_the_winning_target_beside_the_digest() {
         let p = parse_probe(
-            "/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\ndead x86_64-unknown-linux-musl\n-\n",
+            "/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\nm=dead x86_64-unknown-linux-musl\n-\n",
         )
         .unwrap();
         assert_eq!(p.cache_sha.as_deref(), Some("dead"));
@@ -2803,7 +2836,7 @@ mod tests {
         // rather than a guess — which is what case (4) of the sticky rule keys
         // on, and why an upgrade doesn't churn every already-deployed host.
         let old =
-            parse_probe("/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\ndeadbeef\n-\n").unwrap();
+            parse_probe("/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\nm=deadbeef\n-\n").unwrap();
         assert_eq!(old.cache_sha.as_deref(), Some("deadbeef"));
         assert_eq!(old.cache_target, None);
     }
@@ -2811,7 +2844,7 @@ mod tests {
     #[test]
     fn parse_probe_reads_which_binary_reported_a_running_daemon() {
         let mk = |d: &str| {
-            parse_probe(&format!("/home/u\nLinux x86_64\n-\n-\n-\n{d}\n"))
+            parse_probe(&format!("/home/u\nLinux x86_64\n-\n-\nm=-\n{d}\n"))
                 .unwrap()
                 .running
         };
@@ -2820,7 +2853,7 @@ mod tests {
         assert_eq!(mk("-"), None);
         // A probe from before this field existed simply has no sixth line.
         assert_eq!(
-            parse_probe("/home/u\nLinux x86_64\n-\n-\n-\n")
+            parse_probe("/home/u\nLinux x86_64\n-\n-\nm=-\n")
                 .unwrap()
                 .running,
             None
@@ -3095,6 +3128,38 @@ mod tests {
         assert_eq!(
             decide_provision("0.1.0", &p, &[MUSL], &[MUSL.0]),
             Provision::UseCache
+        );
+    }
+
+    #[test]
+    fn a_spent_candidate_list_still_prefers_the_deployed_binary_over_path() {
+        // Regression, and the mirror of the test above: fixing the
+        // refused-target case must not cost a healthy host its last resort.
+        //
+        // A mainstream glibc host with a same-version server already deployed.
+        // A rebuild's upload fails transiently — a full disk, an ssh blip, or
+        // merely the cooldown from an earlier one. gnu drops out, nothing is
+        // left to offer, and the terminal state must be the binary that is
+        // sitting there working, not `miao-server` on a PATH that on a
+        // deploy-provisioned host is typically empty.
+        let mut p = probe("Linux x86_64", None, Some("0.1.0"));
+        p.cache_sha = Some("an-earlier-gnu-build".into());
+        p.cache_target = Some(GNU.0.into());
+        assert_eq!(
+            decide_provision("0.1.0", &p, &[], BOTH_TARGETS),
+            Provision::UseCache
+        );
+
+        // The no-loader host is unaffected, and not by luck: a glibc binary
+        // there cannot execute, so the probe's `--version` yields nothing and
+        // there is no cache version to fall back on. That host keeps getting
+        // the honest failure, which is the whole point of refusing loudly.
+        let mut dead = probe("Linux x86_64", None, None);
+        dead.cache_sha = Some("an-earlier-gnu-build".into());
+        dead.cache_target = Some(GNU.0.into());
+        assert_eq!(
+            decide_provision("0.1.0", &dead, &[], BOTH_TARGETS),
+            Provision::FallBack
         );
     }
 
