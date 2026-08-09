@@ -155,6 +155,15 @@ pub(super) enum Action {
         /// time, so attaching otherwise declines rather than kicking someone.
         force: bool,
     },
+    /// Allow a host's connection task to download a published `miao-server`.
+    ///
+    /// The only action that carries a reply channel, because it answers a
+    /// question the *backend* asked rather than starting something the user
+    /// did. Firing it sends `true`; **dropping it is a refusal**, which is what
+    /// makes `n`, Esc and quitting all decline without a branch of their own —
+    /// `handle_confirm_key` already drops the pending action on anything but
+    /// `y`, so the safe answer is the default one.
+    AllowServerDownload(tokio::sync::oneshot::Sender<bool>),
 }
 
 /// Inputs needed to restart a single session: kill the old child, then launch
@@ -210,6 +219,7 @@ impl Action {
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
+            Action::AllowServerDownload(_) => "AllowServerDownload",
         }
     }
 }
@@ -555,6 +565,14 @@ pub(super) struct App {
     /// A queued action waiting on a y/N confirmation. `Some` iff
     /// `input_mode == InputMode::Confirm`.
     pub(super) pending_confirm: Option<PendingConfirm>,
+    /// Download-consent questions from the hosts' connection tasks.
+    ///
+    /// The backends run on their own tasks and cannot open a popup; this is how
+    /// they ask. Drained by the run loop only while nothing else owns the
+    /// screen, so a question can never displace an open picker — an unread one
+    /// simply waits in the channel.
+    pub(super) download_prompts:
+        tokio::sync::mpsc::UnboundedReceiver<crate::backend::DownloadPrompt>,
     /// Active directory-mark popup. `Some` iff `input_mode == InputMode::DirEdit`.
     pub(super) dir_edit: Option<DirEditState>,
     /// Active hosts popup. `Some` iff `input_mode == InputMode::HostEdit`.
@@ -944,6 +962,11 @@ impl App {
         let home_dir = dirs::home_dir()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_default();
+        // Give the backends somewhere to ask about downloads before any of them
+        // is constructed below — a connection task can start probing
+        // immediately, and with no channel set it would (safely) refuse.
+        let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::backend::set_download_consent(download_tx);
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
         // Surface config problems the TUI would otherwise hide (it swallows
@@ -996,6 +1019,7 @@ impl App {
             preview_updated_at: None,
             picker: None,
             pending_confirm: None,
+            download_prompts: download_rx,
             dir_edit: None,
             host_edit: None,
             directory_marks: HashMap::new(),

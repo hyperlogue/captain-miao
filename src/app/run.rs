@@ -19,7 +19,7 @@ use crate::terminal::{
 
 use std::collections::HashSet;
 
-use super::{Action, App, RestartSpec, SessionSnapshotEntry};
+use super::{Action, App, InputMode, PendingConfirm, RestartSpec, SessionSnapshotEntry};
 
 /// Lines of terminal output captured for the preview panel — its vertical
 /// scroll-up depth. The draw side (`draw_preview`) parses/scrolls within this.
@@ -835,6 +835,26 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 fs_dirty = true;
             }
         }
+        // A host asking whether it may download a server. Only taken while
+        // nothing else owns the screen: a question left in the channel simply
+        // waits, where popping it here would clobber an open picker or a
+        // half-typed path — and would stack two hosts' questions on top of each
+        // other. The asking task bounds its own wait, so nothing hangs if the
+        // user never gets to it.
+        if app.input_mode == InputMode::Normal
+            && app.pending_confirm.is_none()
+            && let Ok(prompt) = app.download_prompts.try_recv()
+        {
+            app.pending_confirm = Some(PendingConfirm {
+                prompt: format!(
+                    "Download miao-server for {} on host \"{}\"?\n{} [y/N]",
+                    prompt.target, prompt.host.0, prompt.url
+                ),
+                action: Action::AllowServerDownload(prompt.reply),
+            });
+            app.input_mode = InputMode::Confirm;
+            needs_redraw = true;
+        }
         if fs_dirty && last_reload.is_none_or(|t| t.elapsed() >= reload_min_interval) {
             fs_dirty = false;
             last_reload = Some(Instant::now());
@@ -1299,6 +1319,12 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     Action::RestartSession(spec) => {
                         let _ = restart_one(&mut app, spec).await;
                         arm_settle_reload(&mut settle_reload_at);
+                    }
+                    // The only "yes" that is just an answer. A refusal never
+                    // reaches here: `handle_confirm_key` drops the action, and
+                    // the dropped sender is what the waiting task reads as no.
+                    Action::AllowServerDownload(reply) => {
+                        let _ = reply.send(true);
                     }
                     Action::CopySessionId(sid) => {
                         match copy_to_clipboard(&sid) {

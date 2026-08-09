@@ -613,6 +613,7 @@ impl RemoteBackend {
         tokio::spawn(connection_task(
             transport,
             ConnectionShared {
+                host: host.clone(),
                 mirror: mirror.clone(),
                 remote_exe: remote_exe.clone(),
                 conn: conn.clone(),
@@ -904,6 +905,77 @@ const REMOTE_INCOMING_REL: &str = ".cache/captain-miao/bin/miao-server.incoming"
 /// (see [`login_shell_safe`]); target triples are alphanumerics, dashes and
 /// underscores, so they need no quoting.
 const REMOTE_MARKER_REL: &str = ".cache/captain-miao/bin/miao-server.sha256";
+
+/// The per-host provisioning state a connect attempt threads through.
+///
+/// Grouped rather than passed as three more positional parameters: two
+/// `&mut UploadGate`s side by side are trivially swappable at a call site, and
+/// swapping them would silently cross the upload cooldown with the download one.
+struct Provisioning<'a> {
+    upload: &'a mut UploadGate,
+    download: &'a mut UploadGate,
+    host: &'a HostId,
+}
+
+/// Where a published server is downloaded from, minus the tag and filename.
+///
+/// The URL shape is a **three-way contract** — `xtask::server::release_url`
+/// builds it, `build.yml`'s asset names produce it, and this fetches it — so
+/// this copy is deliberately duplicated rather than shared through `cm-core`.
+/// Sharing would hand a build-chore binary tokio, notify, tracing and a C
+/// compile of the SQLite amalgamation on the path every bundled build runs
+/// first, and would put a `curl`/`tar` shell-out into the portable data layer
+/// that rides into `miao-server` on every host. The shared surface is a URL
+/// shape and two flags — no logic — and it is already a three-way contract, so
+/// sharing between two of the three never made it one implementation. Each copy
+/// carries its own tests instead.
+const RELEASE_BASE: &str = "https://github.com/hyperlogue/captain-miao/releases/download";
+
+/// The published asset for one target. Mirrors `xtask::server::release_url`,
+/// and pinned by a test on this side too. Pure.
+fn release_url(base: &str, version: &str, target: &str) -> String {
+    let version = version.trim().trim_start_matches('v');
+    let base = base.trim_end_matches('/');
+    format!("{base}/v{version}/{SERVER_BIN}-v{version}-{target}.tar.gz")
+}
+
+/// How long the user has to answer a download prompt before the attempt gives
+/// up. Bounded because the connection task is *blocked* here: a sync `Backend`
+/// call from the UI thread parks in `block_in_place` waiting on this host, so an
+/// unanswered popup must not wedge it indefinitely. A lapse is treated exactly
+/// like a decline, and remembered the same way.
+const DOWNLOAD_CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A pending "may I download a server?" question, on its way to the UI.
+///
+/// The download is the only step in this design that leaves the machine, so it
+/// asks first — through the same y/N machinery `Space e` and host removal use.
+pub(crate) struct DownloadPrompt {
+    pub(crate) host: HostId,
+    pub(crate) target: String,
+    pub(crate) url: String,
+    /// Answered with `true` to allow. **Dropping it means no**, which is what
+    /// makes every path that doesn't explicitly allow — pressing `n`, pressing
+    /// Esc, closing the dashboard — decline safely. Nothing may add a
+    /// reply-on-decline: the receiver treats a closed channel as a refusal.
+    pub(crate) reply: oneshot::Sender<bool>,
+}
+
+/// The dashboard's end of the consent channel, set once at startup.
+///
+/// A process-wide `OnceLock` rather than a parameter threaded through every
+/// backend constructor, mirroring `config::get()` and `terminal::get()`. Unset —
+/// in tests, and anywhere there is no TUI to ask — consent is **denied**, which
+/// is the safe direction: a download that nobody could have approved must not
+/// happen silently.
+static DOWNLOAD_CONSENT: std::sync::OnceLock<mpsc::UnboundedSender<DownloadPrompt>> =
+    std::sync::OnceLock::new();
+
+/// Hand the dashboard's consent channel to the backends. Called once, from
+/// `App::new`.
+pub(crate) fn set_download_consent(tx: mpsc::UnboundedSender<DownloadPrompt>) {
+    let _ = DOWNLOAD_CONSENT.set(tx);
+}
 
 /// How long a failed upload suppresses the next attempt for the same payload.
 /// Without it, a host that accepts ssh but refuses the write (read-only `$HOME`,
@@ -1558,6 +1630,178 @@ async fn upload_server(
     Ok(())
 }
 
+/// Ask the user whether we may fetch a server, and wait for the answer.
+///
+/// Returns `false` on a decline, on a lapse, and whenever there is no UI to ask
+/// — every ambiguous outcome refuses, because this is the one step that leaves
+/// the machine.
+async fn ask_download_consent(host: &HostId, target: &str, url: &str) -> bool {
+    let Some(tx) = DOWNLOAD_CONSENT.get() else {
+        return false;
+    };
+    let (reply, rx) = oneshot::channel();
+    if tx
+        .send(DownloadPrompt {
+            host: host.clone(),
+            target: target.to_string(),
+            url: url.to_string(),
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // A closed channel is a decline: the UI drops the sender on `n`, on Esc, and
+    // on quit, so refusal needs no message of its own.
+    matches!(
+        tokio::time::timeout(DOWNLOAD_CONSENT_TIMEOUT, rx).await,
+        Ok(Ok(true))
+    )
+}
+
+/// Fetch a published server into the XDG cache, and return where it landed.
+///
+/// Two guards travel with the download, both mirroring `xtask`'s copy and both
+/// tested here independently:
+///
+/// - `--proto =https` is re-asserted rather than trusted from the URL, because
+///   `--location` is on and GitHub bounces release downloads to S3 — the scheme
+///   has to hold on *every* hop, not just the first.
+/// - the archive member is extracted **by name**, so a `../` entry has nothing
+///   to land on, and the result is rejected unless it is a regular file: `tar`
+///   will happily extract an entry recorded as a symlink, and reading through
+///   one would pull in a file from outside the staging directory.
+async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, String> {
+    let dest = crate::server_payload::cache_path_for(target)
+        .ok_or_else(|| "no cache directory available".to_string())?;
+    let dir = dest
+        .parent()
+        .ok_or_else(|| "bad cache path".to_string())?
+        .to_path_buf();
+    // A fresh directory per fetch: `tar` extracts over whatever is there, so a
+    // failed download followed by an extract of a *previous* archive would
+    // silently install a stale binary.
+    // std, not tokio::fs: these are metadata-sized local operations, and the
+    // dashboard's tokio deliberately does not enable the `fs` feature.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let tgz = dir.join("server.tar.gz");
+
+    let out = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--output",
+        ])
+        .arg(&tgz)
+        .arg(url)
+        .output()
+        .await
+        .map_err(|e| format!("spawning curl: {e}"))?;
+    if !out.status.success() {
+        let err: String = String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(if err.is_empty() {
+            format!("download failed (rc={:?})", out.status.code())
+        } else {
+            err
+        });
+    }
+
+    let out = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&dir)
+        .args(["--no-same-owner", "--no-same-permissions", SERVER_BIN])
+        .output()
+        .await
+        .map_err(|e| format!("spawning tar: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "the archive did not contain {SERVER_BIN}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let _ = std::fs::remove_file(&tgz);
+
+    let meta = std::fs::symlink_metadata(&dest)
+        .map_err(|e| format!("{url} did not yield {SERVER_BIN}: {e}"))?;
+    if !meta.is_file() {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "{url} did not yield a regular file at {SERVER_BIN}"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(dest)
+}
+
+/// Source (5): ask, fetch, and cache a published server for the first target we
+/// can't supply locally. `None` when there is nothing left to try.
+///
+/// Rate-limited by the same gate shape the upload uses, and for the same reason:
+/// the reconnect backoff caps at 30s, so a 404 for an arch we never published —
+/// or a user who said no — would otherwise be re-attempted twice a minute
+/// forever. A **decline is remembered exactly like a failure**, which is the one
+/// refinement "confirm every time" needs: without it the popup returns every 500
+/// ms → 30 s and a declined host becomes unusable. A successful connection
+/// clears the memory, so saying no is not permanent.
+async fn try_download_candidate(
+    arch: &str,
+    available: &[crate::server_payload::Candidate],
+    refused: &[String],
+    gate: &mut UploadGate,
+    host: &HostId,
+    log: &ConnLog,
+) -> Option<crate::server_payload::Candidate> {
+    let version = env!("CARGO_PKG_VERSION");
+    let wanted = crate::server_payload::target_candidates(arch)
+        .iter()
+        .find(|t| !refused.iter().any(|r| r == *t) && !available.iter().any(|c| c.target == **t))?;
+    let url = release_url(RELEASE_BASE, version, wanted);
+    let now = Instant::now();
+    if let Some(previous) = gate.suppressed(&url, now) {
+        log.info(format!("not fetching {wanted} again yet: {previous}"));
+        return None;
+    }
+    log.info(format!("nothing local for {wanted}; asking to download it"));
+    if !ask_download_consent(host, wanted, &url).await {
+        log.info(format!("download of {wanted} declined"));
+        gate.record_failure(&url, now, "you declined the download".to_string());
+        return None;
+    }
+    log.info(format!("downloading {url}"));
+    match download_server(wanted, &url).await {
+        Ok(path) => {
+            log.info(format!("cached {}", path.display()));
+            // Re-resolve rather than hand-building a candidate: the download
+            // wrote into cache source (4), so the chain now finds it with a real
+            // digest, computed from the bytes that actually landed.
+            crate::server_payload::resolve_candidates(arch)
+                .into_iter()
+                .find(|c| &c.target == wanted)
+        }
+        Err(e) => {
+            log.error(format!("downloading {wanted} failed: {e}"));
+            gate.record_failure(&url, now, e);
+            None
+        }
+    }
+}
+
 /// Resolve the remote command to invoke: probe → decide → (deploy) → invoke.
 /// Never errors — any failure resolves to `miao-server` on PATH so the
 /// rest of `setup_ssh` behaves exactly as it did before provisioning existed.
@@ -1566,9 +1810,10 @@ async fn upload_server(
 async fn resolve_remote_exe(
     target: &str,
     opts: &[String],
-    gate: &mut UploadGate,
+    prov: &mut Provisioning<'_>,
     log: &ConnLog,
 ) -> (String, Option<String>) {
+    let host = prov.host;
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
@@ -1585,7 +1830,7 @@ async fn resolve_remote_exe(
     // downloaded earlier. Naming the source in the log matters — "deployed the
     // gnu server" is a different fact from "deployed the one you pointed
     // CAPTAIN_MIAO_SERVER_DIR at", and only one of them is our bug.
-    let available = crate::server_payload::resolve_candidates(&probe.arch);
+    let mut available = crate::server_payload::resolve_candidates(&probe.arch);
     log.info(format!(
         "probed {}: PATH {}, cache {}, need {local_version}; can supply {}",
         probe.arch,
@@ -1628,6 +1873,24 @@ async fn resolve_remote_exe(
         );
 
         let Provision::Upload { target: t, sha256 } = &action else {
+            // Nothing local left to offer. Before giving up, see whether a
+            // *published* server exists for a target we carry nothing for —
+            // this is source (5), and it is what lets a gnu-only released
+            // dashboard reach a host with no generic loader at all.
+            if matches!(action, Provision::FallBack)
+                && let Some(fetched) = try_download_candidate(
+                    &probe.arch,
+                    &available,
+                    &refused,
+                    prov.download,
+                    host,
+                    log,
+                )
+                .await
+            {
+                available.push(fetched);
+                continue;
+            }
             log.info(format!("\u{2192} {}", provision_label(&action)));
             break action;
         };
@@ -1637,7 +1900,7 @@ async fn resolve_remote_exe(
             .expect("Upload names a candidate we offered");
 
         let now = Instant::now();
-        let failure = match gate.suppressed(sha256, now) {
+        let failure = match prov.upload.suppressed(sha256, now) {
             Some(previous) => {
                 // Worth saying out loud: nothing was sent this time, so the
                 // error below is a *remembered* one, not a fresh symptom.
@@ -1652,7 +1915,7 @@ async fn resolve_remote_exe(
                     Ok(()) => None,
                     Err(e) => {
                         tracing::warn!(target: "captain_miao::provision", "{target}: deploy of {t} failed: {e}");
-                        gate.record_failure(sha256, now, e.clone());
+                        prov.upload.record_failure(sha256, now, e.clone());
                         Some(e)
                     }
                 }
@@ -1716,6 +1979,10 @@ enum ServeOutcome {
 /// into a struct rather than passed as seven positional `Arc`s, where the two
 /// `Arc<Mutex<Option<String>>>`s would be swappable at a call site.
 struct ConnectionShared {
+    /// Which host this task serves. Needed so a download prompt can name it —
+    /// the user may have several, and "may I download a server?" is not a
+    /// question worth asking without saying for whom.
+    host: HostId,
     mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
     remote_exe: Arc<Mutex<String>>,
     conn: Arc<Mutex<ConnState>>,
@@ -1738,6 +2005,7 @@ async fn connection_task(
     mut requests: mpsc::UnboundedReceiver<PendingRequest>,
 ) {
     let ConnectionShared {
+        host,
         mirror,
         remote_exe,
         conn,
@@ -1759,6 +2027,10 @@ async fn connection_task(
     // Lives for the whole task, so one host's refusal to accept a deployed
     // server isn't re-litigated (at multiple megabytes a go) on every reconnect.
     let mut upload_gate = UploadGate::default();
+    // A separate gate for downloads, keyed by URL rather than digest — a
+    // payload we have not fetched has no digest yet. Same shape and the same
+    // reason: a decline or a 404 must not be re-attempted every backoff tick.
+    let mut download_gate = UploadGate::default();
     // The diagnosis the last attempt reached, held across the wait *and* the
     // next attempt. Retrying doesn't make "no miao-server on the host" any less
     // true, so blinking the sentence off to `connecting` once per backoff tick
@@ -1789,7 +2061,11 @@ async fn connection_task(
                     local_sock,
                     &remote_exe,
                     &mut failure,
-                    &mut upload_gate,
+                    &mut Provisioning {
+                        upload: &mut upload_gate,
+                        download: &mut download_gate,
+                        host: &host,
+                    },
                     &log,
                 )
                 .await
@@ -1854,6 +2130,7 @@ async fn connection_task(
         // history — a later one gets a fresh attempt rather than inheriting an
         // old cooldown.
         upload_gate.clear();
+        download_gate.clear();
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
@@ -1962,7 +2239,7 @@ async fn setup_ssh(
     local_sock: &Path,
     remote_exe: &Arc<Mutex<String>>,
     failure: &mut Option<String>,
-    upload_gate: &mut UploadGate,
+    prov: &mut Provisioning<'_>,
     log: &ConnLog,
 ) -> Option<tokio::process::Child> {
     let ctl = crate::state::ssh_control_path(target);
@@ -1979,7 +2256,7 @@ async fn setup_ssh(
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
-    let (exe, diagnosis) = resolve_remote_exe(target, &opts, upload_gate, log).await;
+    let (exe, diagnosis) = resolve_remote_exe(target, &opts, prov, log).await;
     *remote_exe.lock().unwrap() = exe.clone();
     // Carry the diagnosis out even when we go on to try the fallback: if the
     // `daemon ensure` below fails, *this* is the reason the user needs, not
@@ -2625,6 +2902,120 @@ mod tests {
     }
 
     #[test]
+    fn the_release_url_matches_what_the_workflow_publishes() {
+        // This copy is duplicated from xtask by decision, so it carries the
+        // contract test too — the URL is already a three-way agreement between
+        // `release_url`, this fetcher, and build.yml's asset names, and no
+        // amount of code sharing between two of them would make it one.
+        assert_eq!(
+            release_url(RELEASE_BASE, "0.2.1", "aarch64-unknown-linux-musl"),
+            "https://github.com/hyperlogue/captain-miao/releases/download/v0.2.1/\
+             miao-server-v0.2.1-aarch64-unknown-linux-musl.tar.gz"
+        );
+        // Either spelling of the version resolves the same, so a `v` prefix
+        // picked up from a tag can't produce a second, wrong URL.
+        assert_eq!(
+            release_url(RELEASE_BASE, "v0.2.1", "x86_64-unknown-linux-gnu"),
+            release_url(RELEASE_BASE, "0.2.1", "x86_64-unknown-linux-gnu")
+        );
+        // A base with a trailing slash is the same base.
+        assert_eq!(
+            release_url("https://mirror.example/dl/", "0.2.1", "t"),
+            release_url("https://mirror.example/dl", "0.2.1", "t")
+        );
+    }
+
+    /// The download's extraction guards, exercised against archives built to
+    /// abuse them. `tar` is the thing under test here, so these run it for real
+    /// rather than asserting on the argv.
+    #[test]
+    fn a_hostile_archive_cannot_write_outside_the_cache_dir() {
+        let root = scratch_home("tar");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let tar_ok = std::process::Command::new("tar")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if !tar_ok {
+            return; // no tar here; the deploy tests cover the rest
+        }
+
+        // An archive whose only member escapes the extraction directory. We ask
+        // for `miao-server` **by name**, so there is nothing for it to land on.
+        let evil = root.join("evil");
+        std::fs::create_dir_all(evil.join("sub")).unwrap();
+        std::fs::write(evil.join("sub/miao-server"), b"payload").unwrap();
+        let tgz = root.join("evil.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&evil)
+            .arg("--transform=s|sub/miao-server|../escaped|")
+            .arg("sub/miao-server")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            let out = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(&tgz)
+                .arg("-C")
+                .arg(&stage)
+                .args(["--no-same-owner", "--no-same-permissions", SERVER_BIN])
+                .output()
+                .unwrap();
+            // Naming the member is the guard: the escaping entry isn't it, so
+            // the extraction finds nothing and nothing is written anywhere.
+            assert!(!out.status.success() || !stage.join(SERVER_BIN).exists());
+            assert!(!root.join("escaped").exists(), "escaped the staging dir");
+        }
+
+        // An archive whose `miao-server` is a *symlink*: tar extracts the link
+        // happily, and reading through it would pull in a file we never fetched.
+        let link_src = root.join("linky");
+        std::fs::create_dir_all(&link_src).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", link_src.join(SERVER_BIN)).unwrap();
+        let tgz2 = root.join("link.tar.gz");
+        let ok2 = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tgz2)
+            .arg("-C")
+            .arg(&link_src)
+            .arg(SERVER_BIN)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok2 {
+            let stage2 = root.join("stage2");
+            std::fs::create_dir_all(&stage2).unwrap();
+            let _ = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(&tgz2)
+                .arg("-C")
+                .arg(&stage2)
+                .args(["--no-same-owner", "--no-same-permissions", SERVER_BIN])
+                .output()
+                .unwrap();
+            let landed = stage2.join(SERVER_BIN);
+            // This is exactly what `download_server` refuses on: the check is
+            // `symlink_metadata(...).is_file()`, so a link never passes.
+            if landed.exists() || landed.is_symlink() {
+                let meta = std::fs::symlink_metadata(&landed).unwrap();
+                assert!(
+                    !meta.is_file(),
+                    "a symlink wearing the member name must not read as a regular file"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_gate_remembers_each_payload_independently() {
         // A single remembered failure would be evicted by the next candidate's,
         // leaving the first unsuppressed on the following pass — so a host that
@@ -3057,7 +3448,19 @@ mod tests {
         // First connect: deploys, and resolves to what it deployed.
         let mut gate = UploadGate::default();
         let log = ConnLog::default();
-        let (exe, failure) = resolve_remote_exe(&target, &opts, &mut gate, &log).await;
+        let host = HostId("test".into());
+        let mut dl = UploadGate::default();
+        let (exe, failure) = resolve_remote_exe(
+            &target,
+            &opts,
+            &mut Provisioning {
+                upload: &mut gate,
+                download: &mut dl,
+                host: &host,
+            },
+            &log,
+        )
+        .await;
         assert_eq!(failure, None, "deploy reported: {failure:?}");
         assert_eq!(exe, format!("{}/{REMOTE_CACHE_REL}", fresh.home));
 
@@ -3081,7 +3484,17 @@ mod tests {
             ),
             Provision::UseCache,
         );
-        let (exe2, failure2) = resolve_remote_exe(&target, &opts, &mut gate, &log).await;
+        let (exe2, failure2) = resolve_remote_exe(
+            &target,
+            &opts,
+            &mut Provisioning {
+                upload: &mut gate,
+                download: &mut dl,
+                host: &host,
+            },
+            &log,
+        )
+        .await;
         assert_eq!(failure2, None);
         assert_eq!(exe2, exe);
 
