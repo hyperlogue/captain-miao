@@ -13,7 +13,8 @@ description = "Build chores for captain-miao: obtains miao-server payloads and b
 # type-checks and tests rather than a shell script nobody lints.
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# `color` off, `suggestions` on — see the root Cargo.toml for the reasoning.
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 # `server.rs` obtains and packs the payloads. These live here rather than in a
 # crate of their own because nothing else links them: the dashboard reads the
 # archives through `include_bytes!`, so it needs no code from this side at all.

@@ -70,16 +70,8 @@ pub fn init_tracing(role: &str) {
         return;
     }
 
-    // Both crate roots: most launcher/hook events carry an explicit
-    // `target: "captain_miao::…"`, but any plain `tracing::debug!` in cm-core
-    // defaults to its own module path (`cm_core::…`) and the crate split left
-    // those silently filtered out — including the watcher/transcript diagnostics.
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("captain_miao=debug".parse().unwrap())
-        .add_directive("cm_core=debug".parse().unwrap());
-
     let initialized = tracing_subscriber::registry()
-        .with(env_filter)
+        .with(log_filter(std::env::var("RUST_LOG").ok()))
         .with(launcher_layer)
         .with(debug_layer)
         .try_init()
@@ -97,6 +89,31 @@ pub fn init_tracing(role: &str) {
         role.to_uppercase(),
         std::process::id()
     );
+}
+
+/// The level filter for our own log files, from `RUST_LOG` plus two pinned
+/// directives.
+///
+/// Both crate roots are pinned: most launcher/hook events carry an explicit
+/// `target: "captain_miao::…"`, but any plain `tracing::debug!` in cm-core
+/// defaults to its own module path (`cm_core::…`), and the crate split left
+/// those silently filtered out — including the watcher/transcript diagnostics.
+///
+/// [`Targets`] rather than `EnvFilter`: both parse the same `target=level`
+/// `RUST_LOG` syntax, but `EnvFilter` additionally supports span-field
+/// predicates (`span[field=value]`), which nothing here uses and which cost a
+/// whole regex engine in the dependency tree (matchers → regex-automata →
+/// regex-syntax). An unparseable `RUST_LOG` falls back to the two directives
+/// rather than to silence, since these files are the only place this process
+/// logs at all.
+///
+/// [`Targets`]: tracing_subscriber::filter::Targets
+fn log_filter(rust_log: Option<String>) -> tracing_subscriber::filter::Targets {
+    rust_log
+        .and_then(|v| v.parse::<tracing_subscriber::filter::Targets>().ok())
+        .unwrap_or_default()
+        .with_target("captain_miao", tracing::Level::DEBUG)
+        .with_target("cm_core", tracing::Level::DEBUG)
 }
 
 /// Remove `launcher-{pid}.log` files for launchers that have exited. Runs
@@ -122,5 +139,43 @@ fn sweep_dead_launcher_logs(log_dir: &std::path::Path) {
         if !state::is_process_alive(pid) {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn our_two_crate_roots_always_log_at_debug() {
+        let f = log_filter(None);
+        assert!(f.would_enable("captain_miao", &Level::DEBUG));
+        assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
+        assert!(f.would_enable("cm_core::launcher", &Level::DEBUG));
+        // Nothing else, so a chatty dependency can't fill the log by default.
+        assert!(!f.would_enable("notify::inotify", &Level::ERROR));
+    }
+
+    #[test]
+    fn rust_log_widens_but_never_narrows_our_own_targets() {
+        // A directive for someone else is honoured…
+        let f = log_filter(Some("notify=trace".into()));
+        assert!(f.would_enable("notify::inotify", &Level::TRACE));
+        assert!(f.would_enable("cm_core::launcher", &Level::DEBUG));
+
+        // …and one aimed at us loses to the pinned directives, exactly as the
+        // `EnvFilter::add_directive` calls this replaced did.
+        let f = log_filter(Some("captain_miao=error".into()));
+        assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
+    }
+
+    #[test]
+    fn an_unparseable_rust_log_falls_back_rather_than_silencing_us() {
+        // EnvFilter's `span[field=value]` syntax is the thing `Targets` won't
+        // take; a user carrying one in their environment must not lose our logs.
+        let f = log_filter(Some("captain_miao[request]=debug".into()));
+        assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
+        assert!(f.would_enable("cm_core::launcher", &Level::DEBUG));
     }
 }
