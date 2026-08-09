@@ -242,11 +242,18 @@ fn cargo() -> String {
 /// plain one covers a strategy that rewrites nothing. The underscored spelling
 /// is deliberately absent: zigbuild sets the dashed one regardless, so a value
 /// left only in the underscored one is never the one bindgen reads.
+/// `-D_DARWIN_C_SOURCE` is the **third** face of the same bug, and it only
+/// shows up once musl is in the target set. Having aimed clang back at the host,
+/// the SDK's `net/if.h` still compiles its Apple body out unless
+/// `_DARWIN_C_SOURCE` (or `_POSIX_C_SOURCE`) is defined — so `struct if_data`
+/// stays a forward declaration and bindgen dies with "field has incomplete
+/// type". Defining it restores the full header. (Faces one and two were the
+/// missing per-target variable and the dashed-vs-underscored spelling of it.)
 fn cross_build_env(target: &str, host: &str) -> Vec<(String, String)> {
     if !host.contains("apple-darwin") || target.contains("apple-darwin") {
         return Vec::new();
     }
-    let arg = format!("--target={host}");
+    let arg = format!("--target={host} -D_DARWIN_C_SOURCE");
     vec![
         (format!("BINDGEN_EXTRA_CLANG_ARGS_{target}"), arg.clone()),
         ("BINDGEN_EXTRA_CLANG_ARGS".to_string(), arg),
@@ -769,18 +776,27 @@ mod tests {
         // target-suffixed one and cargo-zigbuild appends to it.
         let mac = "aarch64-apple-darwin";
         let env = cross_build_env(OTHER, mac);
+        let expected = format!("--target={mac} -D_DARWIN_C_SOURCE");
         assert_eq!(
             env,
             vec![
                 (
                     format!("BINDGEN_EXTRA_CLANG_ARGS_{OTHER}"),
-                    format!("--target={mac}")
+                    expected.clone()
                 ),
-                (
-                    "BINDGEN_EXTRA_CLANG_ARGS".to_string(),
-                    format!("--target={mac}")
-                ),
+                ("BINDGEN_EXTRA_CLANG_ARGS".to_string(), expected),
             ]
+        );
+
+        // `-D_DARWIN_C_SOURCE` is not decoration: without it the SDK's
+        // `net/if.h` compiles its Apple body out, `struct if_data` stays a
+        // forward declaration, and bindgen fails with "field has incomplete
+        // type" — which is how the musl targets first refused to cross-build
+        // from a Mac even with the triple already aimed correctly.
+        let musl = cross_build_env("x86_64-unknown-linux-musl", mac);
+        assert!(
+            musl.iter().all(|(_, v)| v.contains("-D_DARWIN_C_SOURCE")),
+            "{musl:?}"
         );
 
         // A Linux host compiles libproc's *empty* build script, and a Mac

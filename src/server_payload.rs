@@ -66,16 +66,17 @@ pub(crate) fn payloads() -> &'static [ServerPayload] {
 /// exec failure on someone else's machine.
 ///
 /// glibc first, musl second: `uname` cannot distinguish them, and glibc is the
-/// mainstream server libc. Nothing builds a musl server today, so those entries
-/// exist only so that one handed over by `xtask --server <musl-triple>=<path>` is
-/// selectable rather than silently unreachable.
+/// mainstream server libc — its NSS is load-bearing rather than a nicety, since
+/// a static build cannot see LDAP/SSSD users at all and its sessions would fail
+/// to attach.
 ///
-/// Note what does **not** happen: only the first matching candidate is ever tried.
-/// If a glibc payload turns out not to run on the host (Alpine), the post-upload
-/// `--version` check rejects it and the connection falls back to whatever the host
-/// already has; `UploadGate` then suppresses re-sends of that digest, so a musl
-/// payload sitting right behind it in this list would never be reached. Closing
-/// that means looping candidates at the deploy site, not reordering here. Pure.
+/// Both are offered because **selection has to be verified, not guessed**:
+/// nothing we can ask a host cheaply reports its libc, so the deploy tries them
+/// in order and keeps the first the host proves it can actually run. A glibc
+/// binary has no loader on NixOS/Alpine/distroless; a musl one runs there but
+/// fails the self-check on an LDAP host. Every combination resolves without a
+/// guess, and the one host neither serves — NixOS with LDAP/SSSD users — is told
+/// so plainly, because no payload we could ship serves it. Pure.
 pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
     let mut fields = uname_sm.split_whitespace();
     let (Some(os), Some(machine)) = (fields.next(), fields.next()) else {
@@ -95,18 +96,23 @@ pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
     }
 }
 
-/// The best embedded payload for a host reporting `uname -sm`, or `None` when we
-/// carry nothing it could run.
-pub(crate) fn for_uname(uname_sm: &str) -> Option<&'static ServerPayload> {
-    pick(target_candidates(uname_sm), payloads())
+/// Every embedded payload a host reporting `uname -sm` might run, in preference
+/// order — glibc first. Empty when we carry nothing it could use.
+///
+/// A list rather than a single best answer, because which one actually works is
+/// the *host's* answer, not ours: the deploy walks these until one passes the
+/// self-check on the far end.
+pub(crate) fn for_uname_all(uname_sm: &str) -> Vec<&'static ServerPayload> {
+    pick_all(target_candidates(uname_sm), payloads())
 }
 
 /// Candidate-order lookup, over an injected table so the preference order is
 /// testable in a build that bundles nothing (which is the default). Pure.
-fn pick<'a>(candidates: &[&str], table: &'a [ServerPayload]) -> Option<&'a ServerPayload> {
+fn pick_all<'a>(candidates: &[&str], table: &'a [ServerPayload]) -> Vec<&'a ServerPayload> {
     candidates
         .iter()
-        .find_map(|c| table.iter().find(|p| p.target == *c))
+        .filter_map(|c| table.iter().find(|p| p.target == *c))
+        .collect()
 }
 
 /// What this build carries, for the startup log and the hosts panel's diagnosis.
@@ -201,17 +207,18 @@ mod tests {
     #[test]
     fn glibc_is_preferred_over_musl_regardless_of_table_order() {
         let t = table();
-        assert_eq!(
-            pick(target_candidates("Linux x86_64"), &t).unwrap().sha256,
-            "g"
-        );
+        let got = pick_all(target_candidates("Linux x86_64"), &t);
+        // Both are offered — the host decides — but glibc is tried first, since
+        // a static build cannot see LDAP/SSSD users and its sessions would fail
+        // to attach on a host that has them.
+        assert_eq!(got.iter().map(|p| p.sha256).collect::<Vec<_>>(), ["g", "m"]);
     }
 
     #[test]
     fn a_host_we_carry_nothing_for_picks_nothing() {
         let t = table();
-        assert!(pick(target_candidates("Linux aarch64"), &t).is_none());
-        assert!(pick(target_candidates("Linux riscv64"), &t).is_none());
+        assert!(pick_all(target_candidates("Linux aarch64"), &t).is_empty());
+        assert!(pick_all(target_candidates("Linux riscv64"), &t).is_empty());
     }
 
     #[test]

@@ -48,10 +48,29 @@ const REMOTE_FEATURE: &str = "remote";
 
 const X86: &str = "x86_64-unknown-linux-gnu";
 const ARM: &str = "aarch64-unknown-linux-gnu";
+const X86_MUSL: &str = "x86_64-unknown-linux-musl";
+const ARM_MUSL: &str = "aarch64-unknown-linux-musl";
 
-/// The servers a release publishes, and what the shipping bundled variant
-/// carries.
+/// What a **shipping bundled variant embeds**: glibc only.
+///
+/// Deliberately *not* the same set as [`PUBLISHED_TARGETS`], and the two must
+/// not be re-merged. A released dashboard embeds no musl: musl's audience is
+/// hosts with no generic loader (NixOS, Alpine, distroless), and those have a
+/// better answer already — a server built against their own libc, on their own
+/// PATH, with no deploy at all. Making every downloader carry ~6 MiB aimed at
+/// the one platform that doesn't need it is the wrong default. A released
+/// dashboard reaches such a host by *downloading* the published musl asset
+/// instead, which is what [`PUBLISHED_TARGETS`] exists for.
 const LINUX_TARGETS: &[&str] = &[X86, ARM];
+
+/// What a release **publishes** as assets, and what `prepare-servers` builds by
+/// default: all four, musl included.
+///
+/// Nothing embeds the musl builds — they are fetched at runtime by a dashboard
+/// that meets a host its glibc payload cannot run on. That is the whole reason
+/// the two halves compose, and it is why this set is wider than the one above:
+/// publishing is how a payload becomes reachable without being carried.
+const PUBLISHED_TARGETS: &[&str] = &[X86, ARM, X86_MUSL, ARM_MUSL];
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "captain-miao build chores", version)]
@@ -270,6 +289,16 @@ const VARIANTS: &[Variant] = &[
         features: &[],
         servers: LINUX_TARGETS,
         what: "remote hosts, deploying its own server to either Linux arch",
+    },
+    // A dev variant, deliberately outside DEFAULT_VARIANTS so it is never a
+    // release artifact: it exists so the candidate loop and the musl path are
+    // exercised by a build we can actually run, rather than only on a host we
+    // don't have. Released dashboards stay gnu-only — see LINUX_TARGETS.
+    Variant {
+        name: "bundle-linux-all",
+        features: &[],
+        servers: PUBLISHED_TARGETS,
+        what: "dev: every Linux server (gnu + musl), for exercising the musl fallback",
     },
 ];
 
@@ -617,7 +646,7 @@ struct PrepareServersArgs {
 /// different ones.
 fn prepare_servers(ws: &Workspace, args: &PrepareServersArgs) -> Result<()> {
     let targets: BTreeSet<&str> = if args.targets.is_empty() {
-        LINUX_TARGETS.iter().copied().collect()
+        PUBLISHED_TARGETS.iter().copied().collect()
     } else {
         args.targets.iter().map(String::as_str).collect()
     };
@@ -866,5 +895,46 @@ mod tests {
     #[test]
     fn bundle_defaults_to_what_the_shipping_variant_carries() {
         assert_eq!(find_variant("bundle-linux").unwrap().servers, LINUX_TARGETS);
+    }
+
+    /// No **release** artifact may embed a musl server.
+    ///
+    /// The two target sets were one const until musl arrived, and re-merging
+    /// them is the easy mistake: it silently adds ~6 MiB to every download for
+    /// a payload aimed at the one platform that is better served without a
+    /// deploy at all. The reverse mistake — dropping musl from what we publish —
+    /// is caught by the test below, since nothing embeds those builds and the
+    /// runtime downloader is the only thing that can reach them.
+    #[test]
+    fn no_release_variant_embeds_a_musl_server() {
+        for name in DEFAULT_VARIANTS {
+            let v = find_variant(name).unwrap();
+            assert!(
+                !v.servers.iter().any(|t| t.contains("-musl")),
+                "release variant {:?} embeds a musl server: {:?}",
+                v.label(),
+                v.servers
+            );
+        }
+        // The dev variant is where musl *is* carried, and it is deliberately not
+        // a default — that is what keeps the loop exercisable without shipping it.
+        let all = find_variant("bundle-linux-all").unwrap();
+        assert!(all.servers.iter().any(|t| t.contains("-musl")));
+        assert!(!DEFAULT_VARIANTS.contains(&"bundle-linux-all"));
+    }
+
+    /// Publishing is how a payload becomes reachable without being embedded, so
+    /// the published set has to be a strict superset of the embedded one.
+    #[test]
+    fn every_embedded_server_is_also_published() {
+        for t in LINUX_TARGETS {
+            assert!(
+                PUBLISHED_TARGETS.contains(t),
+                "{t} is embedded but never published"
+            );
+        }
+        // And the musl builds exist *only* as published assets — the case the
+        // runtime source chain fetches.
+        assert!(PUBLISHED_TARGETS.iter().any(|t| t.contains("-musl")));
     }
 }

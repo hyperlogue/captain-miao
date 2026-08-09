@@ -882,14 +882,28 @@ const REMOTE_CACHE_REL: &str = ".cache/captain-miao/bin/miao-server";
 /// relative to `$HOME`.
 const REMOTE_INCOMING_REL: &str = ".cache/captain-miao/bin/miao-server.incoming";
 
-/// Marker beside the deployed binary recording the sha256 of the payload we put
-/// there, relative to `$HOME`.
+/// Marker beside the deployed binary recording `<sha256> <target>` — the payload
+/// we put there and which build of it won — relative to `$HOME`.
 ///
-/// It exists because a version match is not identity: dev builds never bump the
-/// version, so `0.2.1` on the host tells us nothing about *which* `0.2.1`. The
-/// marker closes that — rebuild, reconnect, and the host gets the new server —
-/// which is what makes `redeploy.sh`'s whole reason for existing go away for
-/// payload-carrying builds.
+/// The digest exists because a version match is not identity: dev builds never
+/// bump the version, so `0.2.1` on the host tells us nothing about *which*
+/// `0.2.1`. The marker closes that — rebuild, reconnect, and the host gets the
+/// new server — which is what makes `redeploy.sh`'s whole reason for existing go
+/// away for payload-carrying builds.
+///
+/// The **target** is what makes the candidate loop terminate. With more than one
+/// candidate per arch, the digest on the host is whichever one the host proved
+/// it could run, which is generally *not* the one we would offer first: a NixOS
+/// box settles on musl, the next connect compares its marker against our
+/// preferred gnu payload, sees a mismatch, re-deploys gnu, watches the host
+/// refuse it, falls back to musl — and does all of that again on every
+/// reconnect, forever, at 500ms → 30s. Recording the winner makes it sticky, so
+/// the candidate order is re-litigated only when there is nothing usable on the
+/// host, never on one that has already answered the question.
+///
+/// Written with a single `echo`, so it stays free of quotes and backslashes
+/// (see [`login_shell_safe`]); target triples are alphanumerics, dashes and
+/// underscores, so they need no quoting.
 const REMOTE_MARKER_REL: &str = ".cache/captain-miao/bin/miao-server.sha256";
 
 /// How long a failed upload suppresses the next attempt for the same payload.
@@ -932,6 +946,10 @@ struct RemoteProbe {
     cache_version: Option<String>,
     cache_protocol: Option<u32>,
     cache_sha: Option<String>,
+    /// The target triple of the deployed binary, from the marker's second field.
+    /// `None` for a marker written before this existed, which falls back to the
+    /// single-candidate rule.
+    cache_target: Option<String>,
     /// A daemon already serving on this host, and which binary reported it.
     running: Option<RunningDaemon>,
 }
@@ -951,10 +969,11 @@ enum Provision {
     UsePath,
     /// A version-matching binary is already at the cache path; invoke it there.
     UseCache,
-    /// Nothing usable is there, but we carry a payload this host can run: push it
-    /// to the cache path, then use it. Carries the payload's digest, which is
-    /// what the retry cooldown keys on.
-    Upload { sha256: String },
+    /// Nothing usable is there, but we can supply a payload this host might run:
+    /// push it to the cache path, then use it. Carries the target as well as the
+    /// digest — the target is needed to fetch the bytes and to write the marker,
+    /// and the digest is what the retry cooldown keys on.
+    Upload { target: String, sha256: String },
     /// Nothing version-matching anywhere and nothing to upload; fall back to
     /// `miao-server` on PATH and let the connection fail loudly.
     FallBack,
@@ -1081,7 +1100,15 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
     };
     let (path_version, path_protocol) = split(lines.next());
     let (cache_version, cache_protocol) = split(lines.next());
-    let cache_sha = field(lines.next()).map(str::to_string);
+    // `<sha256> <target>`; a marker from before the target was recorded has just
+    // the digest, and yields `None` for the target rather than a wrong guess.
+    let marker = field(lines.next());
+    let cache_sha = marker
+        .and_then(|m| m.split_whitespace().next())
+        .map(str::to_string);
+    let cache_target = marker
+        .and_then(|m| m.split_whitespace().nth(1))
+        .map(str::to_string);
     let running = match field(lines.next()) {
         Some("path") => Some(RunningDaemon::OnPath),
         Some("cache") => Some(RunningDaemon::InCache),
@@ -1095,19 +1122,33 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
         cache_version,
         cache_protocol,
         cache_sha,
+        cache_target,
         running,
     })
 }
 
-/// Decide which remote binary to invoke. `payload` is `(target, sha256)` for the
-/// embedded server this host could run, if we carry one — passed as plain
-/// strings rather than a `&ServerPayload` so the decision stays testable in a
-/// build carrying no payload — which is every test run, since the `bundle-*`
-/// features are off. Pure + unit-tested.
+/// Decide which remote binary to invoke.
+///
+/// `candidates` is `(target, sha256)` for every server we can supply **locally**
+/// for this host, in preference order (glibc before musl) — passed as plain
+/// strings rather than `&ServerPayload`s so the decision stays testable in a
+/// build carrying no payload, which is every test run since the `bundle-*`
+/// features are off.
+///
+/// "Locally" is load-bearing and not a shorthand: a payload that only the
+/// downloader could supply has no digest until it has been fetched, so it cannot
+/// be compared against the marker and must never appear here. Resolving one that
+/// way would mean downloading a binary purely to answer a comparison — and, on a
+/// host already running a perfectly good server, prompting to do it. The
+/// downloader is an escalation the *caller* reaches for when this returns
+/// nothing usable, not a resolution step.
+///
+/// Stays pure: the IO (env lookups, cache reads, downloads) happens at the
+/// resolution edge, and the looping happens at the deploy site. Unit-tested.
 fn decide_provision(
     local_version: &str,
     probe: &RemoteProbe,
-    payload: Option<(&str, &str)>,
+    candidates: &[(&str, &str)],
 ) -> Provision {
     // A daemon already serving outranks the whole ladder: uploading anything
     // while it holds the singleton lock is megabytes for nothing. Note this
@@ -1121,17 +1162,47 @@ fn decide_provision(
     if path_is_usable(local_version, probe) {
         return Provision::UsePath;
     }
+    // What is already deployed at *our* path. The four cases below are what make
+    // the candidate loop terminate; the ordering among them matters more than
+    // any one of them.
     if probe.cache_version.as_deref() == Some(local_version) {
-        match payload {
-            // The cache path is ours, so "right version" isn't enough once we
-            // have a payload to compare against — it has to be *this* build.
-            Some((_, sha)) if probe.cache_sha.as_deref() != Some(sha) => {}
-            _ => return Provision::UseCache,
+        match probe.cache_target.as_deref() {
+            // (2) and (3): the marker names which build won here. Compare
+            // against *that* target, never against the one we merely prefer.
+            Some(target) => match candidates.iter().find(|(t, _)| *t == target) {
+                // (2) We can still supply that target: same digest means it is
+                // already this exact build; a different one is the dev loop, and
+                // re-deploys the *same* target rather than restarting the race.
+                Some((t, sha)) => {
+                    if probe.cache_sha.as_deref() == Some(*sha) {
+                        return Provision::UseCache;
+                    }
+                    return Provision::Upload {
+                        target: (*t).to_string(),
+                        sha256: (*sha).to_string(),
+                    };
+                }
+                // (3) We can no longer supply it — a released dashboard whose
+                // host runs a downloaded musl, now offline or declined. Keep it:
+                // it is the right version, and it is the binary that proved
+                // itself here. Churning it for one we merely prefer is exactly
+                // how the every-reconnect loop starts.
+                None => return Provision::UseCache,
+            },
+            // (4) A marker written before targets were recorded: fall back to
+            // the single-candidate rule this had before the loop existed.
+            None => match candidates.first() {
+                Some((_, sha)) if probe.cache_sha.as_deref() != Some(*sha) => {}
+                _ => return Provision::UseCache,
+            },
         }
     }
-    match payload {
-        Some((_, sha)) => Provision::Upload {
-            sha256: sha.to_string(),
+    // (1) Nothing usable is deployed, so the loop runs: offer our first choice
+    // and let the host rule on it.
+    match candidates.first() {
+        Some((t, sha)) => Provision::Upload {
+            target: (*t).to_string(),
+            sha256: (*sha).to_string(),
         },
         None => Provision::FallBack,
     }
@@ -1261,25 +1332,33 @@ fn remote_exe_for(action: &Provision, home: &str) -> String {
 /// Pure over an injected `now`, so the cooldown is unit-tested without sleeping.
 #[derive(Default)]
 struct UploadGate {
-    last: Option<(String, Instant, String)>,
+    /// digest → (when it failed, what the host said). **A map, not a single
+    /// slot**, and that is the whole point: with more than one candidate per
+    /// host, one remembered failure is evicted by the next. A NixOS box with
+    /// LDAP/SSSD users refuses *both* payloads — gnu has no loader, musl fails
+    /// the self-check — so a single slot would remember only musl, leave gnu
+    /// unsuppressed on the next pass, and re-send both, forever, at a backoff
+    /// that caps at 30s. Remembering each independently is what makes the wasted
+    /// transfer once per host rather than once per reconnect.
+    failed: HashMap<String, (Instant, String)>,
 }
 
 impl UploadGate {
     /// The remembered error, if uploading `sha` is still on cooldown.
     fn suppressed(&self, sha: &str, now: Instant) -> Option<&str> {
-        let (failed_sha, at, error) = self.last.as_ref()?;
-        (failed_sha == sha && now.duration_since(*at) < UPLOAD_RETRY_COOLDOWN)
-            .then_some(error.as_str())
+        let (at, error) = self.failed.get(sha)?;
+        (now.duration_since(*at) < UPLOAD_RETRY_COOLDOWN).then_some(error.as_str())
     }
 
     fn record_failure(&mut self, sha: &str, now: Instant, error: String) {
-        self.last = Some((sha.to_string(), now, error));
+        self.failed.insert(sha.to_string(), (now, error));
     }
 
-    /// Forget the last failure — called once a connection actually works, so a
-    /// transient problem doesn't hold the cooldown past its usefulness.
+    /// Forget every remembered failure — called once a connection actually
+    /// works, so a transient problem doesn't hold the cooldown past its
+    /// usefulness.
     fn clear(&mut self) {
-        self.last = None;
+        self.failed.clear();
     }
 }
 
@@ -1287,9 +1366,21 @@ impl UploadGate {
 ///
 /// Staged through a temp file and moved into place only after the host itself
 /// has run it: a truncated transfer or a payload for the wrong ABI fails the
-/// `--version` line, `set -e` aborts, and nothing was ever visible at the path
+/// `self-check` line, `set -e` aborts, and nothing was ever visible at the path
 /// the next connect will invoke. That check is also what covers the one thing
 /// `uname` can't tell us, glibc vs musl.
+///
+/// **Why `self-check` and not `--version`.** `--version` proves the file loads
+/// and matches; it never resolves user information, so a static-musl server on
+/// a host whose users come from LDAP/SSSD passes it, installs, and then fails on
+/// *first attach* — the pool resolves the user with `getpwuid_r` and errors when
+/// NSS has nothing to answer with. `self-check` makes the host answer the
+/// question that actually matters: can this binary host a session here? It
+/// prints the same `miao-server <ver> …` shape, so the reply is parsed exactly
+/// as before. (One consequence worth knowing: a binary predating `self-check` —
+/// one handed over via the env vars, or fetched from an older release — fails
+/// this as a clap usage error rather than a version mismatch. Acceptable; the
+/// deploy refuses either way, which is the safe direction.)
 ///
 /// Two constraints shape how it's written, both from [`login_shell_safe`]: no
 /// single quote and no backslash anywhere in it. Hence `echo` for the marker
@@ -1297,7 +1388,7 @@ impl UploadGate {
 /// of the run rather than with an `EXIT` trap — a failed deploy leaves its temp
 /// behind, which costs some cache-directory space until the next attempt and
 /// buys a script that runs everywhere. Pure, so all of this is unit-tested.
-fn upload_script(sha256: &str) -> String {
+fn upload_script(sha256: &str, target: &str) -> String {
     format!(
         "set -e; \
          t=\"$HOME/{REMOTE_INCOMING_REL}\"; \
@@ -1305,9 +1396,9 @@ fn upload_script(sha256: &str) -> String {
          rm -f \"$t\"; \
          cat > \"$t\"; \
          chmod 0755 \"$t\"; \
-         \"$t\" --version; \
+         \"$t\" self-check; \
          mv -f \"$t\" \"$HOME/{REMOTE_CACHE_REL}\"; \
-         echo {sha256} > \"$HOME/{REMOTE_MARKER_REL}\""
+         echo {sha256} {target} > \"$HOME/{REMOTE_MARKER_REL}\""
     )
 }
 
@@ -1396,7 +1487,10 @@ async fn upload_server(
     let mut child = Command::new("ssh")
         .args(opts)
         .arg(target)
-        .arg(login_shell_safe(&upload_script(payload.sha256)))
+        .arg(login_shell_safe(&upload_script(
+            payload.sha256,
+            payload.target,
+        )))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1480,50 +1574,77 @@ async fn resolve_remote_exe(
         );
     };
     let local_version = env!("CARGO_PKG_VERSION");
-    let payload = crate::server_payload::for_uname(&probe.arch);
-    let mut action = decide_provision(local_version, &probe, payload.map(|p| (p.target, p.sha256)));
-    tracing::debug!(
-        target: "captain_miao::provision",
-        "{target}: remote_arch={:?} path_ver={:?} cache_ver={:?} payload={:?} → {action:?}",
-        probe.arch, probe.path_version, probe.cache_version, payload.map(|p| p.target)
-    );
-    // The inputs to the decision, not just the decision: "PATH has nothing,
-    // the cache has 0.2.0, we need 0.2.1, we carry a payload for this arch" is
-    // what makes the next line's outcome make sense.
+    let available = crate::server_payload::for_uname_all(&probe.arch);
     log.info(format!(
-        "probed {}: PATH {}, cache {}, need {local_version}; payload {} \u{2192} {}",
+        "probed {}: PATH {}, cache {}, need {local_version}; can supply {}",
         probe.arch,
         probe.path_version.as_deref().unwrap_or("none"),
         probe.cache_version.as_deref().unwrap_or("none"),
-        payload.map(|p| p.target).unwrap_or("none"),
-        provision_label(&action),
+        if available.is_empty() {
+            "nothing".to_string()
+        } else {
+            available
+                .iter()
+                .map(|p| p.target)
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
     ));
 
-    // Deploy, if that's what the decision asked for. A failure demotes to
-    // `FallBack` and is reported verbatim rather than retried here — the
-    // reconnect loop is the retry mechanism, and `gate` keeps it from re-sending
-    // megabytes on every pass.
+    // **The candidate loop.** `uname` cannot report a libc and neither can
+    // anything else we can ask cheaply, so selection is verified rather than
+    // guessed: offer a payload, let the host's own `self-check` rule on it, and
+    // on a refusal drop that candidate and ask the decision again. What the host
+    // accepts is recorded in the marker, so this race is run once per host and
+    // not once per connect.
+    //
+    // A failure is reported verbatim rather than retried here — the reconnect
+    // loop is the retry mechanism, and `gate` is what stops it re-sending
+    // megabytes every pass.
+    let mut refused: Vec<&'static str> = Vec::new();
     let mut upload_error = None;
-    if let Provision::Upload { sha256 } = &action {
-        let payload = payload.expect("Upload is only reachable with a payload");
+    let action = loop {
+        let candidates: Vec<(&str, &str)> = available
+            .iter()
+            .filter(|p| !refused.contains(&p.target))
+            .map(|p| (p.target, p.sha256))
+            .collect();
+        let action = decide_provision(local_version, &probe, &candidates);
+        tracing::debug!(
+            target: "captain_miao::provision",
+            "{target}: arch={:?} path={:?} cache={:?}/{:?} refused={refused:?} → {action:?}",
+            probe.arch, probe.path_version, probe.cache_version, probe.cache_target
+        );
+
+        let Provision::Upload { target: t, sha256 } = &action else {
+            log.info(format!("\u{2192} {}", provision_label(&action)));
+            break action;
+        };
+        let payload = available
+            .iter()
+            .find(|p| p.target == t)
+            .copied()
+            .expect("Upload names a candidate we offered");
+
         let now = Instant::now();
         let failure = match gate.suppressed(sha256, now) {
             Some(previous) => {
                 // Worth saying out loud: nothing was sent this time, so the
                 // error below is a *remembered* one, not a fresh symptom.
-                log.info("deploy suppressed — the same payload failed recently");
+                log.info(format!(
+                    "deploy of {t} suppressed — the same payload failed recently"
+                ));
                 Some(previous.to_string())
             }
             None => {
                 log.info(format!(
-                    "deploying {} ({} KiB compressed)",
-                    payload.target,
+                    "deploying {t} ({} KiB compressed)",
                     payload.gz.len() / 1024
                 ));
                 match upload_server(target, opts, payload).await {
                     Ok(()) => None,
                     Err(e) => {
-                        tracing::warn!(target: "captain_miao::provision", "{target}: deploy failed: {e}");
+                        tracing::warn!(target: "captain_miao::provision", "{target}: deploy of {t} failed: {e}");
                         gate.record_failure(sha256, now, e.clone());
                         Some(e)
                     }
@@ -1532,16 +1653,19 @@ async fn resolve_remote_exe(
         };
         match failure {
             None => {
-                log.info("deployed, and the host ran it");
-                action = Provision::UseCache;
+                log.info(format!("deployed {t}, and the host ran it"));
+                break Provision::UseCache;
             }
             Some(e) => {
-                log.error(format!("deploy failed:\n{e}"));
-                upload_error = Some(e);
-                action = Provision::FallBack;
+                log.error(format!("{t} refused by the host:\n{e}"));
+                // Keep the *first* refusal as the reported reason: it is the
+                // candidate we preferred, so it is the one whose failure
+                // explains the outcome. Later ones are fallbacks.
+                upload_error.get_or_insert(e);
+                refused.push(payload.target);
             }
         }
-    }
+    };
 
     let exe = remote_exe_for(&action, &probe.home);
     tracing::debug!(target: "captain_miao::provision", "{target}: remote exe = {exe}");
@@ -2184,6 +2308,7 @@ mod tests {
             cache_version: cache.map(str::to_string),
             cache_protocol: None,
             cache_sha: None,
+            cache_target: None,
             running: None,
         }
     }
@@ -2194,6 +2319,7 @@ mod tests {
 
     fn upload(sha: &str) -> Provision {
         Provision::Upload {
+            target: PAYLOAD.0.to_string(),
             sha256: sha.to_string(),
         }
     }
@@ -2249,6 +2375,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_probe_reads_the_winning_target_beside_the_digest() {
+        let p = parse_probe(
+            "/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\ndead x86_64-unknown-linux-musl\n-\n",
+        )
+        .unwrap();
+        assert_eq!(p.cache_sha.as_deref(), Some("dead"));
+        assert_eq!(p.cache_target.as_deref(), Some("x86_64-unknown-linux-musl"));
+
+        // A marker from a build that recorded only the digest yields no target
+        // rather than a guess — which is what case (4) of the sticky rule keys
+        // on, and why an upgrade doesn't churn every already-deployed host.
+        let old =
+            parse_probe("/home/u\nLinux x86_64\n-\nmiao-server 0.2.0\ndeadbeef\n-\n").unwrap();
+        assert_eq!(old.cache_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(old.cache_target, None);
+    }
+
+    #[test]
     fn parse_probe_reads_which_binary_reported_a_running_daemon() {
         let mk = |d: &str| {
             parse_probe(&format!("/home/u\nLinux x86_64\n-\n-\n-\n{d}\n"))
@@ -2275,7 +2419,7 @@ mod tests {
         let mut p = probe("Linux x86_64", None, None);
         p.running = Some(RunningDaemon::OnPath);
         assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            decide_provision("0.1.0", &p, &[PAYLOAD]),
             Provision::UseRunning(RunningDaemon::OnPath)
         );
         assert_eq!(
@@ -2287,7 +2431,7 @@ mod tests {
         // daemon's own path is not otherwise observable.
         p.running = Some(RunningDaemon::InCache);
         assert_eq!(
-            remote_exe_for(&decide_provision("0.1.0", &p, Some(PAYLOAD)), "/home/u"),
+            remote_exe_for(&decide_provision("0.1.0", &p, &[PAYLOAD]), "/home/u"),
             format!("/home/u/{REMOTE_CACHE_REL}")
         );
     }
@@ -2301,28 +2445,22 @@ mod tests {
         let mut p = probe("Linux x86_64", Some("0.9.9"), None);
         p.path_protocol = Some(PROTOCOL_VERSION);
         assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            decide_provision("0.1.0", &p, &[PAYLOAD]),
             Provision::UsePath
         );
 
         // Below the floor is not talkable, so it does not win — the ladder
         // falls through to our payload.
         p.path_protocol = Some(PROTOCOL_MIN - 1);
-        assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
-            upload("abc123")
-        );
+        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
 
         // A server too old to announce a protocol keeps the old exact-version
         // rule: nothing else can be inferred about it.
         p.path_protocol = None;
-        assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
-            upload("abc123")
-        );
+        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
         let matching = probe("Linux x86_64", Some("0.1.0"), None);
         assert_eq!(
-            decide_provision("0.1.0", &matching, Some(PAYLOAD)),
+            decide_provision("0.1.0", &matching, &[PAYLOAD]),
             Provision::UsePath
         );
     }
@@ -2348,14 +2486,14 @@ mod tests {
         // PATH match wins outright — a user install beats our cache copy, and is
         // never overwritten even when we carry a payload.
         let p = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UsePath);
+        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UsePath);
         assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            decide_provision("0.1.0", &p, &[PAYLOAD]),
             Provision::UsePath
         );
         // No PATH match, but our cache copy matches → use it.
         let p = probe(lx, None, Some("0.1.0"));
-        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UseCache);
+        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UseCache);
     }
 
     #[test]
@@ -2363,13 +2501,13 @@ mod tests {
         let lx = "Linux x86_64";
         // Nothing deployed anywhere.
         assert_eq!(
-            decide_provision("0.1.0", &probe(lx, None, None), None),
+            decide_provision("0.1.0", &probe(lx, None, None), &[]),
             Provision::FallBack
         );
         // Both present but stale — a version mismatch must not be invoked, since
         // the wire protocol isn't guaranteed compatible across versions.
         let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
-        assert_eq!(decide_provision("0.2.0", &stale, None), Provision::FallBack);
+        assert_eq!(decide_provision("0.2.0", &stale, &[]), Provision::FallBack);
     }
 
     #[test]
@@ -2377,13 +2515,13 @@ mod tests {
         let lx = "Linux x86_64";
         // Nothing there at all — the fresh-host case.
         assert_eq!(
-            decide_provision("0.1.0", &probe(lx, None, None), Some(PAYLOAD)),
+            decide_provision("0.1.0", &probe(lx, None, None), &[PAYLOAD]),
             upload("abc123")
         );
         // Everything there but stale.
         let stale = probe(lx, Some("0.1.0"), Some("0.1.0"));
         assert_eq!(
-            decide_provision("0.2.0", &stale, Some(PAYLOAD)),
+            decide_provision("0.2.0", &stale, &[PAYLOAD]),
             upload("abc123")
         );
     }
@@ -2396,27 +2534,108 @@ mod tests {
 
         p.cache_sha = Some("abc123".into());
         assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            decide_provision("0.1.0", &p, &[PAYLOAD]),
             Provision::UseCache
         );
 
         // A different build of the same version — re-deploy.
         p.cache_sha = Some("999999".into());
-        assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
-            upload("abc123")
-        );
+        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
 
         // No marker at all (redeploy.sh, or a pre-marker dashboard). We own this
         // path, so we take it over rather than trusting an unlabelled binary.
         p.cache_sha = None;
-        assert_eq!(
-            decide_provision("0.1.0", &p, Some(PAYLOAD)),
-            upload("abc123")
-        );
+        assert_eq!(decide_provision("0.1.0", &p, &[PAYLOAD]), upload("abc123"));
         // …but a build carrying no payload has nothing better to offer, so it
         // keeps using what's there.
-        assert_eq!(decide_provision("0.1.0", &p, None), Provision::UseCache);
+        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::UseCache);
+    }
+
+    const GNU: (&str, &str) = ("x86_64-unknown-linux-gnu", "gnu-sha");
+    const MUSL: (&str, &str) = ("x86_64-unknown-linux-musl", "musl-sha");
+
+    fn upload_of(p: (&str, &str)) -> Provision {
+        Provision::Upload {
+            target: p.0.to_string(),
+            sha256: p.1.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_marker_makes_the_winning_target_sticky() {
+        // The failure this prevents: a NixOS host settles on musl; the next
+        // connect compares its marker against our *preferred* gnu payload, sees
+        // a mismatch, re-deploys gnu, watches the host refuse it, falls back to
+        // musl — and does the whole thing again every reconnect, forever.
+        let both = [GNU, MUSL];
+        let mut p = probe("Linux x86_64", None, Some("0.1.0"));
+
+        // (2) The marker names musl and we can still supply it; same digest, so
+        // it is already this exact build — keep it, even though gnu is what we
+        // would otherwise offer first.
+        p.cache_sha = Some(MUSL.1.into());
+        p.cache_target = Some(MUSL.0.into());
+        assert_eq!(decide_provision("0.1.0", &p, &both), Provision::UseCache);
+
+        // (2) Same target, different digest: the dev loop. Re-deploy *that*
+        // target rather than restarting the race from the top.
+        p.cache_sha = Some("some-older-build".into());
+        assert_eq!(decide_provision("0.1.0", &p, &both), upload_of(MUSL));
+
+        // (3) The marker names a target we can no longer supply — a released
+        // dashboard whose host runs a downloaded musl, now offline or declined.
+        // Keep what proved itself here; re-offering gnu is how the loop starts.
+        assert_eq!(decide_provision("0.1.0", &p, &[GNU]), Provision::UseCache);
+
+        // (4) A marker written before targets were recorded falls back to the
+        // single-candidate rule this had before the loop existed.
+        p.cache_target = None;
+        p.cache_sha = Some(GNU.1.into());
+        assert_eq!(decide_provision("0.1.0", &p, &both), Provision::UseCache);
+        p.cache_sha = Some("a-different-build".into());
+        assert_eq!(decide_provision("0.1.0", &p, &both), upload_of(GNU));
+
+        // (1) A version mismatch runs the loop regardless of what the marker
+        // says: stickiness is about *which* build, not about keeping a stale one.
+        let mut old = probe("Linux x86_64", None, Some("0.0.9"));
+        old.cache_sha = Some(MUSL.1.into());
+        old.cache_target = Some(MUSL.0.into());
+        assert_eq!(decide_provision("0.1.0", &old, &both), upload_of(GNU));
+    }
+
+    #[test]
+    fn a_refused_candidate_lets_the_next_one_be_offered() {
+        // What the deploy site does after the host's self-check refuses a
+        // payload: drop that candidate and ask again. Preference order is only
+        // a starting point — the host has the last word, since `uname` cannot
+        // report a libc and nothing else can be asked cheaply.
+        let p = probe("Linux x86_64", None, None);
+        assert_eq!(decide_provision("0.1.0", &p, &[GNU, MUSL]), upload_of(GNU));
+        assert_eq!(decide_provision("0.1.0", &p, &[MUSL]), upload_of(MUSL));
+        // Both refused — the NixOS-with-LDAP row. No payload we could ship
+        // serves it, so say so rather than install something that breaks later.
+        assert_eq!(decide_provision("0.1.0", &p, &[]), Provision::FallBack);
+    }
+
+    #[test]
+    fn the_gate_remembers_each_payload_independently() {
+        // A single remembered failure would be evicted by the next candidate's,
+        // leaving the first unsuppressed on the following pass — so a host that
+        // refuses *both* payloads gets both re-sent every reconnect, at a
+        // backoff that caps at 30s. That is the loop this gate exists to stop.
+        let mut gate = UploadGate::default();
+        let now = Instant::now();
+        gate.record_failure(GNU.1, now, "no loader".into());
+        gate.record_failure(MUSL.1, now, "self-check failed".into());
+
+        assert_eq!(gate.suppressed(GNU.1, now), Some("no loader"));
+        assert_eq!(gate.suppressed(MUSL.1, now), Some("self-check failed"));
+        // A payload we have never sent is not suppressed by either.
+        assert_eq!(gate.suppressed("a-fresh-build", now), None);
+        // The cooldown still expires, and a working connection still clears it.
+        assert_eq!(gate.suppressed(GNU.1, now + UPLOAD_RETRY_COOLDOWN), None);
+        gate.clear();
+        assert_eq!(gate.suppressed(MUSL.1, now), None);
     }
 
     #[test]
@@ -2531,11 +2750,11 @@ mod tests {
 
     #[test]
     fn the_upload_script_stages_verifies_then_moves() {
-        let script = upload_script("d1g3st");
+        let script = upload_script("d1g3st", "x86_64-unknown-linux-gnu");
         // Order is the safety property: the binary is only visible at the path
         // the next connect invokes *after* the host itself has run it.
         let stage = script.find("cat > ").unwrap();
-        let verify = script.find("--version").unwrap();
+        let verify = script.find("self-check").unwrap();
         let publish = script.find("mv -f").unwrap();
         let marker = script.find("miao-server.sha256").unwrap();
         assert!(stage < verify, "{script}");
@@ -2577,7 +2796,10 @@ mod tests {
         // The constraint that makes `/bin/sh -c '<script>'` parse identically in
         // sh, bash, zsh, fish and csh. `login_shell_safe` debug-asserts it too,
         // but only for the scripts a given run happens to build.
-        for script in [probe_script(), upload_script(&"a".repeat(64))] {
+        for script in [
+            probe_script(),
+            upload_script(&"a".repeat(64), "aarch64-unknown-linux-musl"),
+        ] {
             let script = script.as_str();
             assert!(!script.contains('\''), "{script}");
             assert!(!script.contains('\\'), "{script}");
@@ -2593,11 +2815,17 @@ mod tests {
     /// ordering and the quoting are only *actually* correct if a shell agrees.
     /// A stand-in executable rather than a real payload, so it runs in every
     /// checkout and on any arch — and needs no embedded server.
+    ///
+    /// The marker these write is `<digest> <target>`: the target is what makes
+    /// the candidate loop terminate, so it has to survive the round trip through
+    /// a real shell like the digest does.
+    const MARKER_TARGET: &str = "x86_64-unknown-linux-gnu";
+
     fn run_deploy(shell: &str, home: &Path, stdin_bytes: &[u8], sha: &str) -> std::process::Output {
         use std::io::Write;
         let mut child = std::process::Command::new(shell)
             .arg("-c")
-            .arg(login_shell_safe(&upload_script(sha)))
+            .arg(login_shell_safe(&upload_script(sha, MARKER_TARGET)))
             .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2628,7 +2856,13 @@ mod tests {
     fn the_upload_script_deploys_a_binary_the_host_can_run() {
         let home = scratch_home("ok");
         let version = env!("CARGO_PKG_VERSION");
-        let fake = format!("#!/bin/sh\necho 'miao-server {version}'\n");
+        // Answers `self-check` *deliberately*, not by ignoring its argv: the
+        // deploy's whole verification now hangs on that subcommand existing, so
+        // a stand-in that replied to anything would pass this test while a real
+        // binary predating `self-check` failed on a host.
+        let fake = format!(
+            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\necho 'miao-server {version}'\n"
+        );
         let out = run_upload_script(&home, fake.as_bytes(), "d1g3st");
 
         assert!(
@@ -2653,7 +2887,7 @@ mod tests {
             std::fs::read_to_string(home.join(REMOTE_MARKER_REL))
                 .unwrap()
                 .trim(),
-            "d1g3st"
+            format!("d1g3st {MARKER_TARGET}")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2666,7 +2900,13 @@ mod tests {
         // could ever be provisioned. Whichever of these a machine has, they all
         // have to produce the same deploy.
         let version = env!("CARGO_PKG_VERSION");
-        let fake = format!("#!/bin/sh\necho 'miao-server {version}'\n");
+        // Answers `self-check` *deliberately*, not by ignoring its argv: the
+        // deploy's whole verification now hangs on that subcommand existing, so
+        // a stand-in that replied to anything would pass this test while a real
+        // binary predating `self-check` failed on a host.
+        let fake = format!(
+            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\necho 'miao-server {version}'\n"
+        );
         for shell in ["/bin/sh", "bash", "zsh", "fish", "tcsh"] {
             if std::process::Command::new(shell)
                 .arg("-c")
@@ -2694,7 +2934,7 @@ mod tests {
                 std::fs::read_to_string(home.join(REMOTE_MARKER_REL))
                     .unwrap()
                     .trim(),
-                "d1g3st",
+                format!("d1g3st {MARKER_TARGET}"),
                 "{shell} did not write the marker"
             );
             let _ = std::fs::remove_dir_all(&home);
@@ -2770,13 +3010,16 @@ mod tests {
         }
 
         let probe = probe_remote(&target, &opts).await.expect("probe");
-        let payload = crate::server_payload::for_uname(&probe.arch).unwrap_or_else(|| {
-            panic!(
-                "no embedded payload for {:?}; build with a bundle-* feature (have: {:?})",
-                probe.arch,
-                crate::server_payload::embedded_targets()
-            )
-        });
+        let payload = crate::server_payload::for_uname_all(&probe.arch)
+            .first()
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no embedded payload for {:?}; build with a bundle-* feature (have: {:?})",
+                    probe.arch,
+                    crate::server_payload::embedded_targets()
+                )
+            });
 
         // Start from a clean slate so this really is the fresh-host path.
         let wipe = format!("rm -f \"$HOME/{REMOTE_CACHE_REL}\" \"$HOME/{REMOTE_MARKER_REL}\"");
@@ -2796,7 +3039,7 @@ mod tests {
             decide_provision(
                 env!("CARGO_PKG_VERSION"),
                 &fresh,
-                Some((payload.target, payload.sha256))
+                &[(payload.target, payload.sha256)],
             ),
             upload(payload.sha256),
         );
@@ -2822,7 +3065,7 @@ mod tests {
             decide_provision(
                 env!("CARGO_PKG_VERSION"),
                 &after,
-                Some((payload.target, payload.sha256))
+                &[(payload.target, payload.sha256)],
             ),
             Provision::UseCache,
         );

@@ -143,7 +143,7 @@ jobs:
   # them, which is what lets a bundled dashboard be built with no cross toolchain
   # at all — just curl and tar.
   #
-  # ONE x86_64 runner for both arches, deliberately. cargo-zigbuild cross-compiles
+  # ONE x86_64 runner for every target, deliberately. cargo-zigbuild cross-compiles
   # bundled SQLite's C amalgamation without a distro cross toolchain, and — the
   # reason it is used even for the runner's own arch — it pins the glibc floor at
   # xtask's server::GLIBC_FLOOR (2.28, Debian 10 / RHEL 8). A native build would
@@ -153,9 +153,20 @@ jobs:
   # x86_64-linux but not aarch64-linux, so the arm64 runner is not an option here
   # even if we wanted one.
   #
-  # It runs `cargo xtask prepare-servers`, the same code path a developer runs locally, so
-  # the strategy choice, the floor, and the ELF architecture check cannot drift
-  # between what CI publishes and what a laptop builds.
+  # FOUR targets, not two: the gnu pair plus a static-musl pair. Nothing embeds
+  # the musl builds — a released dashboard stays gnu-only, since musl's audience
+  # is hosts with no generic loader and those are better served by a server built
+  # against their own libc. They are published so a dashboard that *meets* such a
+  # host can fetch one at runtime, which is the only way a released binary reaches
+  # a NixOS/Alpine/distroless box at all. Publishing is what makes a payload
+  # reachable without carrying it; see xtask's PUBLISHED_TARGETS vs LINUX_TARGETS.
+  #
+  # The target list lives in xtask, not here: this job runs `cargo xtask
+  # prepare-servers` bare and packages whatever lands in dist/servers/, so adding
+  # a target is a one-line change there and this workflow needs no edit. That is
+  # also the same code path a developer runs locally, so the strategy choice, the
+  # floor, and the ELF architecture check cannot drift between what CI publishes
+  # and what a laptop builds.
   server:
     name: miao-server (linux payloads)
     runs-on: ubuntu-latest

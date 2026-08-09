@@ -58,9 +58,17 @@
         # into it: crane's package builds take `rustToolchain`, so the artifacts
         # `nix build` produces stay byte-identical whether or not the cross
         # targets are installed.
+        # The musl pair is here because a static build is the only server that
+        # runs on a host with no generic loader (NixOS, Alpine, distroless),
+        # where the gnu build cannot start at all. Nothing *ships* carrying
+        # them — a release publishes them as assets and a dashboard fetches one
+        # when it meets such a host — but `prepare-servers` builds all four, so
+        # the toolchain has to be able to.
         crossTargets = [
           "x86_64-unknown-linux-gnu"
           "aarch64-unknown-linux-gnu"
+          "x86_64-unknown-linux-musl"
+          "aarch64-unknown-linux-musl"
         ];
         devToolchain = fenix.packages.${system}.combine (
           [rustToolchain]

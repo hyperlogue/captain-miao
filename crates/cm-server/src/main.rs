@@ -125,6 +125,21 @@ enum Commands {
         #[arg(long)]
         log_file: Option<String>,
     },
+
+    /// Prove this binary can actually host a session on this machine, then print
+    /// the same `miao-server <ver> protocol <n>` line `--version` does.
+    ///
+    /// Run by the dashboard's deploy on the staged binary, *before* it is moved
+    /// into place. It exists because `--version` is too weak a check: it proves
+    /// the file loads and matches, which catches a wrong architecture, a missing
+    /// loader and a truncated transfer — but not a binary whose `getpwuid` finds
+    /// nothing, which is exactly the static-musl-on-LDAP/SSSD trap. Such a
+    /// server installs cleanly and then fails on *first attach*, because
+    /// libshpool resolves the user with `getpwuid_r` and errors when the lookup
+    /// comes back empty, taking `home_dir` and the shell with it.
+    ///
+    /// A loud refusal at deploy time is fine. A silent trap is not.
+    SelfCheck,
 }
 
 /// Lifecycle actions for the per-host daemon (tmux/zellij-style). `ensure` is
@@ -146,6 +161,55 @@ enum DaemonAction {
     },
 }
 
+/// Resolve this process's own passwd entry — the check `--version` cannot make.
+///
+/// This is deliberately the *same call* libshpool makes (`getpwuid_r` for the
+/// effective uid), not a proxy for it: `$HOME` being set proves nothing, since
+/// the pool re-resolves the user itself and fails on the lookup rather than on
+/// the environment. Anything weaker would pass on precisely the hosts this
+/// exists to refuse — a static-musl build on LDAP/SSSD, where NSS is compiled
+/// out and no `passwd` entry is visible for a perfectly valid uid.
+///
+/// `Ok(name)` when the entry resolves. `Err` names the uid, because on such a
+/// host the uid is the only identifying thing left to print.
+fn resolve_user() -> Result<String> {
+    // SAFETY: `getpwuid_r` writes into the caller's buffer and reports through
+    // `result`, so there is no shared static to race. `buf` outlives every
+    // pointer `pwd` can hold into it, and the `CStr` is read before either is
+    // dropped.
+    unsafe {
+        let uid = libc::geteuid();
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // 16 KiB: `sysconf(_SC_GETPW_R_SIZE_MAX)` is merely a hint and returns
+        // -1 on some libcs, so a fixed generous buffer is both simpler and more
+        // portable. ERANGE would surface as a failure below, not a wrong answer.
+        let mut buf = vec![0 as libc::c_char; 16 * 1024];
+        let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+        if rc != 0 || result.is_null() {
+            anyhow::bail!(
+                "no passwd entry for uid {uid} — this build cannot resolve users on this host \
+                 (a static build has no NSS, so LDAP/SSSD users are invisible to it); \
+                 sessions would fail to attach"
+            );
+        }
+        Ok(std::ffi::CStr::from_ptr(pwd.pw_name)
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+/// `self-check`: can this binary host a session *here*?
+///
+/// Prints the same first-word-`miao-server` line as `--version`, so the deploy's
+/// existing "read the version past whatever the login shell printed" parse works
+/// unchanged on its output.
+fn self_check() -> Result<()> {
+    let user = resolve_user()?;
+    println!("miao-server {} user {user}", version_string());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -155,6 +219,13 @@ fn main() -> Result<()> {
     // and serves forever; `status`/`stop`/`print-path` are quick and synchronous.
     if let Commands::Daemon { action } = &cli.command {
         return server::dispatch(action.clone());
+    }
+
+    // Synchronous, and deliberately ahead of the runtime: it must answer even on
+    // a binary too broken to stand up tokio, since the whole point is that the
+    // *deploy* runs it on a host we know nothing about.
+    if matches!(cli.command, Commands::SelfCheck) {
+        return self_check();
     }
 
     // The pty-pool client entrypoints embed libshpool, whose `run` must likewise
@@ -189,6 +260,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Commands::Daemon { .. } => {
             unreachable!("daemon is dispatched in main() before the runtime")
+        }
+        Commands::SelfCheck => {
+            unreachable!("self-check is dispatched in main() before the runtime")
         }
         #[cfg(feature = "pty-pool")]
         Commands::PtyDaemon | Commands::Attach { .. } => {
