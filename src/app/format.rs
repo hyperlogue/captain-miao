@@ -879,9 +879,41 @@ pub(super) fn elapsed_cell(secs: u64) -> Cell<'static> {
     Cell::from(Line::from(spans).alignment(Alignment::Right))
 }
 
+/// Whether `theirs` is an older release than `ours`, by SemVer-ish numeric
+/// comparison of the dotted components.
+///
+/// Exists because a host's `miao-server` now wins on **protocol**
+/// compatibility rather than version equality, which is what lets a Nix host's
+/// natively-built server survive dashboard upgrades with no deploy. The cost of
+/// that looseness is that a stale server on a host's PATH quietly outlives
+/// upgrades — and the digest-marker dev loop, which refreshes the *cache* path,
+/// never applies to a PATH install. We accept that ("PATH is the user's — you
+/// own what you put there") and surface it here instead.
+///
+/// Deliberately an **annotation, not an error**: it is usually fine, and it is a
+/// different severity from an incompatible *running* daemon, which fails the
+/// connection outright. Do not conflate the two.
+///
+/// Numeric per component, because string ordering gets this exactly wrong at
+/// every ten: `"0.10.0" < "0.9.0"` lexically. A component that isn't a number
+/// (a `-rc.1` suffix, a git describe) compares as equal rather than guessing,
+/// so a prerelease never reads as "older" on the strength of its suffix. Pure.
+pub(super) fn version_is_older(theirs: &str, ours: &str) -> bool {
+    let parts = |v: &str| -> Vec<u64> {
+        v.split(['.', '-', '+'])
+            .map_while(|c| c.parse::<u64>().ok())
+            .collect()
+    };
+    let (t, o) = (parts(theirs), parts(ours));
+    // Compare only as far as both actually parsed: a trailing component one
+    // side lacks is not evidence of age.
+    let n = t.len().min(o.len());
+    t[..n] < o[..n]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{model_color, model_label, truncate_str};
+    use super::{model_color, model_label, truncate_str, version_is_older};
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
@@ -934,5 +966,24 @@ mod tests {
         // Other families and non-Claude ids stay default.
         assert_eq!(model_color("claude-haiku-4-5-20251001"), Color::Reset);
         assert_eq!(model_color("gpt-5.5"), Color::Reset);
+    }
+
+    #[test]
+    fn an_older_host_server_is_recognised_numerically_not_lexically() {
+        assert!(version_is_older("0.2.1", "0.3.0"));
+        assert!(version_is_older("0.2.1", "0.2.2"));
+        assert!(!version_is_older("0.3.0", "0.3.0"));
+        assert!(!version_is_older("0.4.0", "0.3.0"));
+
+        // The whole reason this isn't a string compare: lexically "0.10.0" sorts
+        // *below* "0.9.0", so every tenth release would falsely read as stale.
+        assert!(!version_is_older("0.10.0", "0.9.0"));
+        assert!(version_is_older("0.9.0", "0.10.0"));
+
+        // A component we can't read is not evidence of age — a prerelease
+        // suffix must not make a same-version server look old.
+        assert!(!version_is_older("0.3.0-rc.1", "0.3.0"));
+        assert!(!version_is_older("weird", "0.3.0"));
+        assert!(!version_is_older("0.3.0", "weird"));
     }
 }

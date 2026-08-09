@@ -19,10 +19,34 @@ use cm_core::agent::AgentControl;
 pub use cm_core::logging::init_tracing;
 pub use cm_core::{backend, protocol, state};
 
+/// `<version> protocol <n>` — what `--version` prints after the binary name.
+///
+/// The protocol number rides the **same line** as the version rather than a
+/// second one, and that is load-bearing: the dashboard's probe runs
+/// `--version` over ssh and parses its output positionally, one field per line
+/// (`parse_probe` in the dashboard's `backend.rs`), so an extra line would
+/// shift every field after it. Keeping the shape `miao-server <ver> protocol
+/// <n>` also leaves "the second word is the version" true, which is how both
+/// the probe and the deploy's post-upload check read it.
+///
+/// A fn rather than a literal because `PROTOCOL_VERSION` is a `u32` const —
+/// `concat!` takes literals only — and `&'static str` because that is what
+/// clap's `version` attribute wants.
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{} protocol {}",
+            env!("CARGO_PKG_VERSION"),
+            protocol::PROTOCOL_VERSION
+        )
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "miao-server",
-    version,
+    version = version_string(),
     about = "captain-miao per-host daemon: pty pool + wire protocol"
 )]
 struct Cli {

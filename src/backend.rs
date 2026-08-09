@@ -902,22 +902,52 @@ const UPLOAD_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 /// forever. Generous: this is multiple megabytes over whatever link the user has.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// One-shot probe of a remote host: its `$HOME`, `uname -sm`, the version of a
-/// miao-server on PATH / at the cache path (if any), and the digest
-/// marker we left beside the cached one (if any).
+/// Which binary answered `daemon status` with a live daemon, if either did.
+///
+/// A daemon that is *already running* outranks the whole provisioning ladder
+/// (§3.3): `daemon ensure` never restarts one — it is the pty pool — so a
+/// payload uploaded while it holds the singleton `flock` cannot take effect
+/// until it exits. Knowing *which* binary answered is what lets `UseRunning`
+/// name an exe: the running daemon's own path is not otherwise observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningDaemon {
+    /// A daemon is up, and `miao-server` on PATH reported it.
+    OnPath,
+    /// A daemon is up, and the deployed cache-path binary reported it.
+    InCache,
+}
+
+/// One-shot probe of a remote host: its `$HOME`, `uname -sm`, the version and
+/// protocol of a miao-server on PATH / at the cache path (if any), the digest
+/// marker we left beside the cached one (if any), and whether a daemon is
+/// already running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteProbe {
     home: String,
     arch: String,
     path_version: Option<String>,
+    /// Wire protocol the PATH binary announced. `None` for one too old to print
+    /// it, which is what makes the exact-version fallback necessary.
+    path_protocol: Option<u32>,
     cache_version: Option<String>,
+    cache_protocol: Option<u32>,
     cache_sha: Option<String>,
+    /// A daemon already serving on this host, and which binary reported it.
+    running: Option<RunningDaemon>,
 }
 
 /// The provisioning action a probe + local facts imply. Pure + unit-tested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Provision {
-    /// A version-matching binary is already on PATH; invoke `miao-server`.
+    /// A daemon is **already serving** on this host, so deploy nothing and just
+    /// connect. Outranks the rest of the ladder because `daemon ensure` never
+    /// restarts a live daemon — it *is* the pty pool — so anything we uploaded
+    /// could not take effect until that daemon exited. Whether we can actually
+    /// talk to it is settled by the handshake rather than by a `--version` on
+    /// disk, which describes a binary that may have replaced the running
+    /// process (§3.3).
+    UseRunning(RunningDaemon),
+    /// A protocol-compatible binary is already on PATH; invoke `miao-server`.
     UsePath,
     /// A version-matching binary is already at the cache path; invoke it there.
     UseCache,
@@ -935,6 +965,7 @@ enum Provision {
 /// what they need is which of the four it chose. Pure.
 fn provision_label(action: &Provision) -> &'static str {
     match action {
+        Provision::UseRunning(_) => "use the daemon already running there",
         Provision::UsePath => "use the host's own miao-server",
         Provision::UseCache => "use the one already deployed",
         Provision::Upload { .. } => "deploy ours",
@@ -942,19 +973,43 @@ fn provision_label(action: &Provision) -> &'static str {
     }
 }
 
-/// The shell script the probe runs over ssh. Five lines out: `$HOME`, the
+/// The shell script the probe runs over ssh. Six lines out: `$HOME`, the
 /// machine, a `--version` line (or our `-` sentinel) for the PATH binary and for
-/// the cache-path binary, then the digest marker. `--version` errors and
-/// "command not found" both land on stderr and a non-zero exit, so `|| echo -`
-/// normalizes them.
+/// the cache-path binary, the digest marker, and which binary — if either —
+/// reports a **running daemon**. `--version` errors and "command not found"
+/// both land on stderr and a non-zero exit, so `|| echo -` normalizes them.
+///
+/// The daemon line cannot use that same `|| echo -` trick, and the reason is
+/// worth stating: `daemon status` exits **0 whether or not a daemon is
+/// running** (it is a report, not a test) and prints several lines when one is,
+/// so both the exit code and the line count would lie. Matching its first line
+/// is the only honest read — hence `grep -q`, whose exit status *is* the
+/// question, with the classification left to [`parse_probe`].
+///
+/// Shell-variable assignment is safe here even though `ssh` hands this to the
+/// account's login shell: [`login_shell_safe`] wraps the whole thing in
+/// `/bin/sh -c '…'`, so the inner dialect is always POSIX sh. The rule that
+/// still binds is the wrapper's — no single quote and no backslash anywhere.
 fn probe_script() -> String {
     format!(
         "echo \"$HOME\"; uname -sm; \
          {SERVER_BIN} --version 2>/dev/null || echo -; \
          \"$HOME/{REMOTE_CACHE_REL}\" --version 2>/dev/null || echo -; \
-         cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null || echo -"
+         cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null || echo -; \
+         d=-; \
+         if {SERVER_BIN} daemon status 2>/dev/null | grep -q \"{DAEMON_RUNNING_MARK}\"; \
+         then d=path; \
+         elif \"$HOME/{REMOTE_CACHE_REL}\" daemon status 2>/dev/null | grep -q \"{DAEMON_RUNNING_MARK}\"; \
+         then d=cache; fi; \
+         echo $d"
     )
 }
+
+/// The fragment of `miao-server daemon status`'s first line that means a daemon
+/// is up — it prints `daemon:   running (pid 1234)` or `daemon:   not running`
+/// (`crates/cm-server/src/server.rs`). Matched on the remote by `grep -q`, so it
+/// must contain no single quote or backslash (see [`login_shell_safe`]).
+const DAEMON_RUNNING_MARK: &str = "running (pid";
 
 /// Pull the version out of a remote `<binary> --version`, tolerating anything a
 /// login shell's rc files printed around it — a `fish_greeting` or an `echo` in
@@ -1006,19 +1061,41 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
         let l = line?.trim();
         (!l.is_empty() && l != "-").then_some(l)
     }
-    // clap prints "<name> <version>"; take the version token.
-    let version = |line: Option<&str>| -> Option<String> {
-        field(line)?.split_whitespace().nth(1).map(str::to_string)
+    // clap prints "<name> <version> protocol <n>" (the protocol rides the same
+    // line deliberately — see the server's `version_string`), so the version is
+    // the second word and the protocol the fourth. A server too old to announce
+    // one yields `None`, which is what the exact-version fallback keys on.
+    let split = |line: Option<&str>| -> (Option<String>, Option<u32>) {
+        let Some(l) = field(line) else {
+            return (None, None);
+        };
+        let mut words = l.split_whitespace();
+        let version = words.nth(1).map(str::to_string);
+        // `nth` consumed through the version, so the protocol number is one
+        // past the "protocol" keyword from here.
+        let protocol = (words.next() == Some("protocol"))
+            .then(|| words.next())
+            .flatten()
+            .and_then(|n| n.parse().ok());
+        (version, protocol)
     };
-    let path_version = version(lines.next());
-    let cache_version = version(lines.next());
+    let (path_version, path_protocol) = split(lines.next());
+    let (cache_version, cache_protocol) = split(lines.next());
     let cache_sha = field(lines.next()).map(str::to_string);
+    let running = match field(lines.next()) {
+        Some("path") => Some(RunningDaemon::OnPath),
+        Some("cache") => Some(RunningDaemon::InCache),
+        _ => None,
+    };
     Some(RemoteProbe {
         home,
         arch,
         path_version,
+        path_protocol,
         cache_version,
+        cache_protocol,
         cache_sha,
+        running,
     })
 }
 
@@ -1032,8 +1109,16 @@ fn decide_provision(
     probe: &RemoteProbe,
     payload: Option<(&str, &str)>,
 ) -> Provision {
+    // A daemon already serving outranks the whole ladder: uploading anything
+    // while it holds the singleton lock is megabytes for nothing. Note this
+    // does *not* check compatibility — the handshake does, because it is the
+    // only authoritative answer (§3.3), and an incompatible one is a loud
+    // failure rather than a fallback (§6.11).
+    if let Some(which) = probe.running {
+        return Provision::UseRunning(which);
+    }
     // A user install always wins, and we never overwrite it.
-    if probe.path_version.as_deref() == Some(local_version) {
+    if path_is_usable(local_version, probe) {
         return Provision::UsePath;
     }
     if probe.cache_version.as_deref() == Some(local_version) {
@@ -1050,6 +1135,54 @@ fn decide_provision(
         },
         None => Provision::FallBack,
     }
+}
+
+/// Whether the host's own `miao-server` is one we can talk to, and so should
+/// defer to rather than deploy over.
+///
+/// **Protocol compatibility, not version equality.** `PROTOCOL_MIN` is 4,
+/// decoding above it is forward-tolerant, and v4 is documented as the last
+/// refusing bump — so a 0.2.1 dashboard refusing a 0.3.0 server it could talk to
+/// perfectly well was a self-inflicted deploy. Loosening this is also what makes
+/// the Home Manager module sufficient on its own: a Nix host whose server came
+/// from a slightly older captain-miao keeps working across dashboard upgrades,
+/// with no deploy and no version lockstep — which matters because a NixOS host
+/// with LDAP/SSSD users cannot be served by *any* payload we could ship.
+///
+/// A server too old to announce a protocol falls back to the exact-version
+/// rule, since nothing else can be inferred about it. Pure.
+fn path_is_usable(local_version: &str, probe: &RemoteProbe) -> bool {
+    match probe.path_protocol {
+        Some(p) => cm_core::protocol::protocol_compatible(p),
+        None => probe.path_version.as_deref() == Some(local_version),
+    }
+}
+
+/// Why a connection to an **already-running** daemon cannot proceed, phrased for
+/// the hosts panel.
+///
+/// This is a hard failure rather than a fallback, and deliberately never an
+/// automatic restart: the daemon *is* the pty pool, so stopping it kills every
+/// pooled session on the host — which is why `daemon stop` itself refuses
+/// without `--force`. No upload can help either, since the running daemon holds
+/// the singleton `flock` until it exits. So the honest outcome is to say what is
+/// wrong and hand the user the one command that fixes it (§6.11).
+///
+/// **Word order is load-bearing.** The hosts-panel row flattens this and
+/// truncates it to the row width, so the actionable clause has to come early:
+/// the mismatch first, the remedy second, and the consequence last where only
+/// the connection log (`l`) is guaranteed to carry it. The natural phrasing puts
+/// the remedy at the end, which is exactly where the row cuts it off.
+///
+/// Note the severity: this is *not* the soft indicator a stale-but-compatible
+/// PATH server gets. That one is an annotation on a working host; this one means
+/// the connection cannot happen at all. Pure.
+fn incompatible_daemon_reason(server_version: &str, protocol: u32) -> String {
+    format!(
+        "host runs miao-server {server_version} protocol {protocol}, need \u{2265} {PROTOCOL_MIN} \
+         — run `miao-server daemon stop` there to upgrade \
+         (this kills its pooled sessions)"
+    )
 }
 
 /// The **loud** half of "assume it's there, verify, and fail loudly" (§4): turn
@@ -1113,8 +1246,12 @@ fn provision_failure(
 /// from PATH.
 fn remote_exe_for(action: &Provision, home: &str) -> String {
     match action {
-        Provision::UseCache | Provision::Upload { .. } => format!("{home}/{REMOTE_CACHE_REL}"),
-        Provision::UsePath | Provision::FallBack => "miao-server".to_string(),
+        Provision::UseCache
+        | Provision::Upload { .. }
+        | Provision::UseRunning(RunningDaemon::InCache) => format!("{home}/{REMOTE_CACHE_REL}"),
+        Provision::UsePath | Provision::FallBack | Provision::UseRunning(RunningDaemon::OnPath) => {
+            "miao-server".to_string()
+        }
     }
 }
 
@@ -1866,8 +2003,8 @@ async fn serve(
                     target: "captain_miao::ssh",
                     "server speaks protocol {protocol}, below our floor {PROTOCOL_MIN}"
                 );
-                return ServeOutcome::HandshakeFailed(Some(format!(
-                    "daemon {sv} speaks protocol {protocol}; this build needs ≥ {PROTOCOL_MIN}"
+                return ServeOutcome::HandshakeFailed(Some(incompatible_daemon_reason(
+                    &sv, protocol,
                 )));
             }
             tracing::debug!(target: "captain_miao::ssh", "handshake ok (protocol {protocol}, server {sv})");
@@ -2035,13 +2172,19 @@ mod tests {
         assert_eq!(ssh_tail(&argv), ["box", "exec \"${SHELL:-/bin/sh}\" -l"]);
     }
 
+    /// A probe of a host with no running daemon and no protocol announced by
+    /// either binary — i.e. servers old enough to fall back to the
+    /// exact-version rule, which is what most of these tests are about.
     fn probe(arch: &str, path: Option<&str>, cache: Option<&str>) -> RemoteProbe {
         RemoteProbe {
             home: "/home/u".into(),
             arch: arch.into(),
             path_version: path.map(str::to_string),
+            path_protocol: None,
             cache_version: cache.map(str::to_string),
+            cache_protocol: None,
             cache_sha: None,
+            running: None,
         }
     }
 
@@ -2079,6 +2222,124 @@ mod tests {
         // Truncated/garbage output → None rather than a half-built probe.
         assert!(parse_probe("/home/u").is_none());
         assert!(parse_probe("\n\n").is_none());
+    }
+
+    #[test]
+    fn parse_probe_reads_the_protocol_off_the_version_line() {
+        // The server folds its protocol onto the same line as the version
+        // precisely so this parse stays one-field-per-line.
+        let out = "/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol 4\n-\n-\n-\n";
+        let p = parse_probe(out).unwrap();
+        assert_eq!(p.path_version.as_deref(), Some("0.3.0"));
+        assert_eq!(p.path_protocol, Some(4));
+        assert_eq!(p.cache_protocol, None);
+        assert_eq!(p.running, None);
+
+        // A server too old to announce one still yields its version, which is
+        // what the exact-version fallback needs.
+        let old = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.2.1\n-\n-\n-\n").unwrap();
+        assert_eq!(old.path_version.as_deref(), Some("0.2.1"));
+        assert_eq!(old.path_protocol, None);
+
+        // Garbage where the number should be is "didn't announce one", never a
+        // definite answer we'd then compare against the floor.
+        let junk = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol wat\n-\n-\n-\n")
+            .unwrap();
+        assert_eq!(junk.path_protocol, None);
+    }
+
+    #[test]
+    fn parse_probe_reads_which_binary_reported_a_running_daemon() {
+        let mk = |d: &str| {
+            parse_probe(&format!("/home/u\nLinux x86_64\n-\n-\n-\n{d}\n"))
+                .unwrap()
+                .running
+        };
+        assert_eq!(mk("path"), Some(RunningDaemon::OnPath));
+        assert_eq!(mk("cache"), Some(RunningDaemon::InCache));
+        assert_eq!(mk("-"), None);
+        // A probe from before this field existed simply has no sixth line.
+        assert_eq!(
+            parse_probe("/home/u\nLinux x86_64\n-\n-\n-\n")
+                .unwrap()
+                .running,
+            None
+        );
+    }
+
+    #[test]
+    fn a_running_daemon_outranks_everything_and_deploys_nothing() {
+        // Uploading while a live daemon holds the singleton lock is megabytes
+        // for nothing: it cannot take effect until that daemon exits, and we
+        // never stop one (it *is* the pty pool).
+        let mut p = probe("Linux x86_64", None, None);
+        p.running = Some(RunningDaemon::OnPath);
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            Provision::UseRunning(RunningDaemon::OnPath)
+        );
+        assert_eq!(
+            remote_exe_for(&Provision::UseRunning(RunningDaemon::OnPath), "/home/u"),
+            "miao-server"
+        );
+
+        // Which binary answered is what lets us name an exe — the running
+        // daemon's own path is not otherwise observable.
+        p.running = Some(RunningDaemon::InCache);
+        assert_eq!(
+            remote_exe_for(&decide_provision("0.1.0", &p, Some(PAYLOAD)), "/home/u"),
+            format!("/home/u/{REMOTE_CACHE_REL}")
+        );
+    }
+
+    #[test]
+    fn a_path_server_wins_on_protocol_compatibility_not_version_equality() {
+        use cm_core::protocol::{PROTOCOL_MIN, PROTOCOL_VERSION};
+
+        // The self-inflicted deploy this removes: a different version we can
+        // still talk to perfectly well used to be refused and overwritten.
+        let mut p = probe("Linux x86_64", Some("0.9.9"), None);
+        p.path_protocol = Some(PROTOCOL_VERSION);
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            Provision::UsePath
+        );
+
+        // Below the floor is not talkable, so it does not win — the ladder
+        // falls through to our payload.
+        p.path_protocol = Some(PROTOCOL_MIN - 1);
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            upload("abc123")
+        );
+
+        // A server too old to announce a protocol keeps the old exact-version
+        // rule: nothing else can be inferred about it.
+        p.path_protocol = None;
+        assert_eq!(
+            decide_provision("0.1.0", &p, Some(PAYLOAD)),
+            upload("abc123")
+        );
+        let matching = probe("Linux x86_64", Some("0.1.0"), None);
+        assert_eq!(
+            decide_provision("0.1.0", &matching, Some(PAYLOAD)),
+            Provision::UsePath
+        );
+    }
+
+    #[test]
+    fn an_incompatible_running_daemon_leads_with_the_remedy_not_the_consequence() {
+        let msg = incompatible_daemon_reason("0.1.0", 3);
+        // The row flattens and truncates this, so what must survive the cut is
+        // the mismatch and the command — the consequence can fall off the end.
+        let stop = msg.find("daemon stop").expect("names the remedy");
+        let kills = msg.find("kills").expect("states the consequence");
+        assert!(msg.find("protocol 3").unwrap() < stop, "{msg}");
+        assert!(stop < kills, "{msg}");
+        assert!(msg.contains(&PROTOCOL_MIN.to_string()), "{msg}");
+        // Never advertised as something we'd do for them: it would kill live
+        // pooled sessions, which is why `daemon stop` itself refuses unforced.
+        assert!(!msg.contains("automatic"), "{msg}");
     }
 
     #[test]

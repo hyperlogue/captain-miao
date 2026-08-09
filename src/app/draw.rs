@@ -345,6 +345,15 @@ impl App {
             let mut trailer = String::new();
             if let Some(v) = backend.daemon_version() {
                 trailer.push_str(&format!("  v{v}"));
+                // The cost of preferring a host's own server on protocol
+                // compatibility rather than version equality: a stale one
+                // outlives our upgrades silently, and the digest marker that
+                // refreshes the *cache* path never applies to a PATH install.
+                // Stated here rather than left to be discovered — but as an
+                // annotation, since it usually works fine.
+                if super::format::version_is_older(&v, env!("CARGO_PKG_VERSION")) {
+                    trailer.push_str(" (older than ours)");
+                }
             }
             // Sampled from ordinary request traffic — no `Ping` frame exists,
             // deliberately (§9). `None` just means nothing has been asked yet.
