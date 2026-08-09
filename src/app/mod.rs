@@ -392,6 +392,35 @@ pub(super) struct HostEditState {
     /// The row a `d` press is asking about — the removal confirm (§9). `None`
     /// when nothing is pending.
     pub(in crate::app) pending_remove: Option<usize>,
+    /// The connection log open over the list (`l`). `Some` replaces the list
+    /// view entirely — it wants the whole popup, since the text it exists to
+    /// show is what didn't fit on a row.
+    pub(in crate::app) log_view: Option<HostLogView>,
+}
+
+/// One rendered line of a host's connection log — see [`App::host_log_lines`].
+#[derive(Debug, Clone)]
+pub(super) struct HostLogLine {
+    /// How long ago the entry happened, on its **first** line only; `None` on
+    /// the continuation lines of a multi-line entry.
+    pub(super) age: Option<String>,
+    pub(super) error: bool,
+    pub(super) text: String,
+}
+
+/// The hosts panel's connection-log view (`l`), scrolled over one host's
+/// [`ConnLogEntry`](crate::backend::ConnLogEntry) list.
+#[derive(Debug)]
+pub(super) struct HostLogView {
+    pub(in crate::app) host: HostId,
+    /// First visible line, counted in *physical* lines — a host's multi-line
+    /// refusal scrolls like the paragraph it is, not as one indivisible entry.
+    pub(in crate::app) scroll: usize,
+    /// Content rows the last draw had. Recorded there because `G` and PageDown
+    /// need a viewport height, and the popup's size is only known while
+    /// rendering; 0 until the first frame, which just makes those keys no-ops
+    /// for one frame.
+    pub(in crate::app) rows: usize,
 }
 
 /// One editable host row in the popup.
@@ -1728,9 +1757,36 @@ impl App {
             editing: false,
             focus: HostField::Label,
             pending_remove: None,
+            log_view: None,
             rows,
         });
         self.input_mode = InputMode::HostEdit;
+    }
+
+    /// One host's connection log, flattened to one item per **physical** line.
+    ///
+    /// Flattened here rather than at render time because the scroll offset and
+    /// the renderer have to count in the same unit, and entries are not
+    /// uniformly one line: the text this view exists to show — a host's refusal,
+    /// quoted whole — is routinely a paragraph. The age rides only the first
+    /// line of an entry, so a wrapped block reads as one event.
+    pub(super) fn host_log_lines(&self, host: &HostId) -> Vec<HostLogLine> {
+        let Some(backend) = self.backend_for(host) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for entry in backend.conn_log() {
+            let age = now.saturating_duration_since(entry.at).as_secs();
+            for (i, text) in entry.text.lines().enumerate() {
+                out.push(HostLogLine {
+                    age: (i == 0).then(|| format::format_log_age(age)),
+                    error: entry.error,
+                    text: text.to_string(),
+                });
+            }
+        }
+        out
     }
 
     /// Persist the panel's host rows and reconnect the backends **without

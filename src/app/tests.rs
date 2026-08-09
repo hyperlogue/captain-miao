@@ -2707,6 +2707,60 @@ fn format_coarse_age_has_minute_resolution() {
 }
 
 #[test]
+fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.app.open_host_edit();
+    // With no configured hosts the cursor sits on "+ add host", where there is
+    // no host to log — `l` must not open an empty view over nothing.
+    d.press(KeyCode::Char('l'));
+    assert!(d.app.host_edit.as_ref().unwrap().log_view.is_none());
+
+    // Give it a row to stand on. (No backend for it, so the log is empty — the
+    // view says so rather than showing a blank box.)
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: "polaris".to_string(),
+        target: "polaris".to_string(),
+        ..Default::default()
+    });
+    state.cursor = 0;
+    d.press(KeyCode::Char('l'));
+    let view = d.app.host_edit.as_ref().unwrap().log_view.as_ref();
+    assert_eq!(view.map(|v| v.host.0.as_str()), Some("polaris"));
+
+    let out = d.render();
+    assert!(out.contains("connection log"), "{out}");
+
+    // A stray key inside the log is swallowed, not re-read as a list command —
+    // `d` here must never reach the removal confirm.
+    d.press(KeyCode::Char('d'));
+    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(d.app.host_edit.as_ref().unwrap().log_view.is_some());
+
+    // Esc backs out to the list, not out of the panel.
+    d.press(KeyCode::Esc);
+    assert!(d.app.host_edit.as_ref().unwrap().log_view.is_none());
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+}
+
+#[test]
+fn a_host_status_is_flattened_and_truncated_to_its_row() {
+    use super::draw::one_line;
+    // The case this exists for: a host quoting a multi-line refusal. A `\n`
+    // inside a Span corrupts the row rather than wrapping, so it must not
+    // survive; the `…` is what says the rest is elsewhere (`l`).
+    let refusal = "could not deploy miao-server: Could not start dynamically linked executable:\n/home/u/.cache/captain-miao/bin/miao-server\nNixOS cannot run dynamically linked executables";
+    let out = one_line(refusal, 40);
+    assert!(!out.contains('\n'), "{out}");
+    assert_eq!(out.chars().count(), 40, "{out}");
+    assert!(out.ends_with('…'), "{out}");
+    // Short text is left alone, newlines and all.
+    assert_eq!(one_line("connected", 40), "connected");
+    assert_eq!(one_line("a\nb", 40), "a b");
+}
+
+#[test]
 fn the_host_tally_prints_only_the_non_empty_buckets() {
     let ui = crate::config::UiColors::default();
     let text = |good, error, down| {

@@ -21,7 +21,7 @@
 //! *is* the launcher); the remote `AttachRemote` plan lands once the pty pool can
 //! host a launcher. See §14.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -80,6 +80,12 @@ impl ConnState {
     }
 
     /// A short label for the hosts panel / header.
+    ///
+    /// "Short" is the caller's job to enforce: a `Failed` reason quotes what the
+    /// host said, which is routinely a paragraph — a NixOS box refusing a
+    /// glibc-linked binary answers in four lines. The panel flattens and
+    /// truncates it to its row, and the full text lives in the connection log
+    /// (`l`), which exists precisely because one row cannot hold it.
     pub(crate) fn label(&self) -> &str {
         match self {
             ConnState::Connecting => "connecting",
@@ -87,6 +93,71 @@ impl ConnState {
             ConnState::Disconnected => "disconnected",
             ConnState::Failed(reason) => reason,
         }
+    }
+}
+
+/// One line of a host's connection narrative.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnLogEntry {
+    /// When it happened. Monotonic, and rendered as an age, so neither a clock
+    /// jump nor a timezone can make the sequence read wrong.
+    pub(crate) at: Instant,
+    /// Whether this line is a reason the connection didn't come up — the panel
+    /// colors those.
+    pub(crate) error: bool,
+    /// Free text, **possibly multi-line and never elided**. The whole point of
+    /// this log is that it holds what the one-line row cannot.
+    pub(crate) text: String,
+}
+
+/// The rolling connection narrative for one host — what `l` opens in the hosts
+/// panel.
+///
+/// It exists because the panel gives a failure one row while the reason is
+/// routinely longer than that, and because the *sequence* diagnoses where the
+/// surviving sentence only reports: "probed the host, decided to deploy, the
+/// deploy came back with this" tells you what to fix, where "could not deploy
+/// miao-server: …" truncated at the row edge does not. Every step of
+/// probe → decide → deploy → ensure → forward → handshake writes here, so a
+/// failure at any of them is legible after the fact rather than only in a debug
+/// log the user has to know to enable.
+///
+/// Capped: a host that has been flapping for a week costs a bounded amount.
+#[derive(Debug, Default)]
+pub(crate) struct ConnLog {
+    entries: Mutex<VecDeque<ConnLogEntry>>,
+}
+
+/// How many lines one host's log keeps. Two full connect attempts' worth of
+/// narrative is ~15 lines, so this holds a long flap without growing.
+const CONN_LOG_CAP: usize = 200;
+
+impl ConnLog {
+    fn push(&self, error: bool, text: String) {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() >= CONN_LOG_CAP {
+            entries.pop_front();
+        }
+        entries.push_back(ConnLogEntry {
+            at: Instant::now(),
+            error,
+            text,
+        });
+    }
+
+    /// A step that went as expected.
+    fn info(&self, text: impl Into<String>) {
+        self.push(false, text.into());
+    }
+
+    /// A step that didn't — the lines the user came here to read.
+    fn error(&self, text: impl Into<String>) {
+        self.push(true, text.into());
+    }
+
+    /// Oldest first, which is the order the story happened in.
+    pub(crate) fn entries(&self) -> Vec<ConnLogEntry> {
+        self.entries.lock().unwrap().iter().cloned().collect()
     }
 }
 
@@ -174,6 +245,16 @@ impl Backend {
         match self {
             Backend::Local(_) => ConnState::Connected,
             Backend::Remote(b) => b.conn_state(),
+        }
+    }
+
+    /// What the connection task did and what came back, for the hosts panel's
+    /// `l` view. Empty for the in-process backend, which never dials anything —
+    /// the panel says so rather than showing a blank box.
+    pub(crate) fn conn_log(&self) -> Vec<ConnLogEntry> {
+        match self {
+            Backend::Local(_) => Vec::new(),
+            Backend::Remote(b) => b.conn_log(),
         }
     }
 
@@ -502,6 +583,9 @@ pub(crate) struct RemoteBackend {
     /// compares it against what it last saw to fire the auto-reattach sweep
     /// (§7) exactly once per reconnect.
     reconnect_epoch: Arc<AtomicU64>,
+    /// Everything the connection task did and what came back, for the hosts
+    /// panel's `l` view. See [`ConnLog`].
+    log: Arc<ConnLog>,
 }
 
 impl RemoteBackend {
@@ -525,6 +609,7 @@ impl RemoteBackend {
         let server_version = Arc::new(Mutex::new(None));
         let latency = Arc::new(Mutex::new(None));
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
+        let log = Arc::new(ConnLog::default());
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(connection_task(
             transport,
@@ -536,6 +621,7 @@ impl RemoteBackend {
                 server_version: server_version.clone(),
                 latency: latency.clone(),
                 reconnect_epoch: reconnect_epoch.clone(),
+                log: log.clone(),
             },
             rx,
         ));
@@ -552,12 +638,18 @@ impl RemoteBackend {
             latency,
             dirty,
             reconnect_epoch,
+            log,
         }
     }
 
     /// Current connection health, for the header surface.
     fn conn_state(&self) -> ConnState {
         self.conn.lock().unwrap().clone()
+    }
+
+    /// This host's connection narrative, oldest first.
+    fn conn_log(&self) -> Vec<ConnLogEntry> {
+        self.log.entries()
     }
 
     /// Send a request and block until its reply (or the task is gone). Returns
@@ -836,6 +928,18 @@ enum Provision {
     /// Nothing version-matching anywhere and nothing to upload; fall back to
     /// `miao-server` on PATH and let the connection fail loudly.
     FallBack,
+}
+
+/// How a [`Provision`] decision reads in the connection log. Separate from
+/// `Debug` because the digest an `Upload` carries is noise to the reader —
+/// what they need is which of the four it chose. Pure.
+fn provision_label(action: &Provision) -> &'static str {
+    match action {
+        Provision::UsePath => "use the host's own miao-server",
+        Provision::UseCache => "use the one already deployed",
+        Provision::Upload { .. } => "deploy ours",
+        Provision::FallBack => "nothing to deploy; try PATH anyway",
+    }
 }
 
 /// The shell script the probe runs over ssh. Five lines out: `$HOME`, the
@@ -1225,12 +1329,14 @@ async fn resolve_remote_exe(
     target: &str,
     opts: &[String],
     gate: &mut UploadGate,
+    log: &ConnLog,
 ) -> (String, Option<String>) {
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
             "{target}: probe failed (unreachable / no shell) → PATH miao-server"
         );
+        log.error("probe failed — the host is unreachable over ssh, or has no shell");
         return (
             "miao-server".to_string(),
             Some("host unreachable over ssh (or no shell)".to_string()),
@@ -1244,6 +1350,17 @@ async fn resolve_remote_exe(
         "{target}: remote_arch={:?} path_ver={:?} cache_ver={:?} payload={:?} → {action:?}",
         probe.arch, probe.path_version, probe.cache_version, payload.map(|p| p.target)
     );
+    // The inputs to the decision, not just the decision: "PATH has nothing,
+    // the cache has 0.2.0, we need 0.2.1, we carry a payload for this arch" is
+    // what makes the next line's outcome make sense.
+    log.info(format!(
+        "probed {}: PATH {}, cache {}, need {local_version}; payload {} \u{2192} {}",
+        probe.arch,
+        probe.path_version.as_deref().unwrap_or("none"),
+        probe.cache_version.as_deref().unwrap_or("none"),
+        payload.map(|p| p.target).unwrap_or("none"),
+        provision_label(&action),
+    ));
 
     // Deploy, if that's what the decision asked for. A failure demotes to
     // `FallBack` and is reported verbatim rather than retried here — the
@@ -1254,19 +1371,35 @@ async fn resolve_remote_exe(
         let payload = payload.expect("Upload is only reachable with a payload");
         let now = Instant::now();
         let failure = match gate.suppressed(sha256, now) {
-            Some(previous) => Some(previous.to_string()),
-            None => match upload_server(target, opts, payload).await {
-                Ok(()) => None,
-                Err(e) => {
-                    tracing::warn!(target: "captain_miao::provision", "{target}: deploy failed: {e}");
-                    gate.record_failure(sha256, now, e.clone());
-                    Some(e)
+            Some(previous) => {
+                // Worth saying out loud: nothing was sent this time, so the
+                // error below is a *remembered* one, not a fresh symptom.
+                log.info("deploy suppressed — the same payload failed recently");
+                Some(previous.to_string())
+            }
+            None => {
+                log.info(format!(
+                    "deploying {} ({} KiB compressed)",
+                    payload.target,
+                    payload.gz.len() / 1024
+                ));
+                match upload_server(target, opts, payload).await {
+                    Ok(()) => None,
+                    Err(e) => {
+                        tracing::warn!(target: "captain_miao::provision", "{target}: deploy failed: {e}");
+                        gate.record_failure(sha256, now, e.clone());
+                        Some(e)
+                    }
                 }
-            },
+            }
         };
         match failure {
-            None => action = Provision::UseCache,
+            None => {
+                log.info("deployed, and the host ran it");
+                action = Provision::UseCache;
+            }
             Some(e) => {
+                log.error(format!("deploy failed:\n{e}"));
                 upload_error = Some(e);
                 action = Provision::FallBack;
             }
@@ -1275,6 +1408,7 @@ async fn resolve_remote_exe(
 
     let exe = remote_exe_for(&action, &probe.home);
     tracing::debug!(target: "captain_miao::provision", "{target}: remote exe = {exe}");
+    log.info(format!("will invoke `{exe}` on the host"));
     (
         exe,
         provision_failure(
@@ -1321,6 +1455,7 @@ struct ConnectionShared {
     server_version: Arc<Mutex<Option<String>>>,
     latency: Arc<Mutex<Option<Duration>>>,
     reconnect_epoch: Arc<AtomicU64>,
+    log: Arc<ConnLog>,
 }
 
 /// Own a [`RemoteBackend`]'s connection for its whole lifetime, reconnecting on
@@ -1342,6 +1477,7 @@ async fn connection_task(
         server_version,
         latency,
         reconnect_epoch,
+        log,
     } = shared;
     // A connection-state change flips `dirty` alongside `conn` so the dashboard
     // reloads + redraws the header promptly on connect/disconnect, not only when
@@ -1374,14 +1510,19 @@ async fn connection_task(
         // reconnect actually bind its socket.
         let mut failure: Option<String> = None;
         let established = match &transport {
-            Transport::LocalSocket(p) => Some((p.clone(), None)),
+            Transport::LocalSocket(p) => {
+                log.info(format!("connecting to local socket {}", p.display()));
+                Some((p.clone(), None))
+            }
             Transport::Ssh { target, local_sock } => {
+                log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
                     target,
                     local_sock,
                     &remote_exe,
                     &mut failure,
                     &mut upload_gate,
+                    &log,
                 )
                 .await
                 {
@@ -1400,10 +1541,15 @@ async fn connection_task(
             // terminal state, since deploying the binary should heal it without
             // the user restarting anything.
             standing_failure = failure;
+            match &standing_failure {
+                Some(reason) => log.error(format!("could not set the connection up: {reason}")),
+                None => log.error("could not set the connection up (no diagnosis)"),
+            }
             store(match &standing_failure {
                 Some(reason) => ConnState::Failed(reason.clone()),
                 None => ConnState::Disconnected,
             });
+            log.info(format!("retrying in {}s", backoff.as_secs_f32().round()));
             if !wait_before_retry(&mut requests, &mut backoff).await {
                 return;
             }
@@ -1416,7 +1562,12 @@ async fn connection_task(
             drop(ssh_child); // kill_on_drop tears ssh down
             // Setup got this far without a diagnosis, so an older one is stale.
             standing_failure = None;
+            log.error(format!(
+                "the daemon socket never answered at {} ({attempts} attempts)",
+                sock_path.display()
+            ));
             store(ConnState::Disconnected);
+            log.info(format!("retrying in {}s", backoff.as_secs_f32().round()));
             if !wait_before_retry(&mut requests, &mut backoff).await {
                 return;
             }
@@ -1435,6 +1586,7 @@ async fn connection_task(
         // history — a later one gets a fresh attempt rather than inheriting an
         // old cooldown.
         upload_gate.clear();
+        log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
         let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
@@ -1448,6 +1600,14 @@ async fn connection_task(
             ServeOutcome::HandshakeFailed(Some(reason)) => Some(reason.clone()),
             _ => None,
         };
+        match (&standing_failure, &outcome) {
+            (Some(reason), _) => log.error(format!("handshake refused: {reason}")),
+            (None, ServeOutcome::BackendDropped) => log.info("host removed; stopping"),
+            (None, _) => log.error(format!(
+                "connection lost after {}s",
+                connected_at.elapsed().as_secs()
+            )),
+        }
         store(match &standing_failure {
             Some(reason) => ConnState::Failed(reason.clone()),
             None => ConnState::Disconnected,
@@ -1535,6 +1695,7 @@ async fn setup_ssh(
     remote_exe: &Arc<Mutex<String>>,
     failure: &mut Option<String>,
     upload_gate: &mut UploadGate,
+    log: &ConnLog,
 ) -> Option<tokio::process::Child> {
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
@@ -1550,7 +1711,7 @@ async fn setup_ssh(
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
-    let (exe, diagnosis) = resolve_remote_exe(target, &opts, upload_gate).await;
+    let (exe, diagnosis) = resolve_remote_exe(target, &opts, upload_gate, log).await;
     *remote_exe.lock().unwrap() = exe.clone();
     // Carry the diagnosis out even when we go on to try the fallback: if the
     // `daemon ensure` below fails, *this* is the reason the user needs, not
@@ -1577,6 +1738,13 @@ async fn setup_ssh(
             out.status.code(),
             stderr.trim()
         );
+        // The log gets it whole and unelided — this is the sentence the panel
+        // row has to cut, and reading all of it is the entire reason `l` exists.
+        log.error(format!(
+            "`{exe} daemon ensure` failed (rc={:?}):\n{}",
+            out.status.code(),
+            stderr.trim()
+        ));
         // Keep a provisioning diagnosis if we have one (it's the root cause);
         // otherwise report what the remote actually said.
         if failure.is_none() {
@@ -1602,8 +1770,10 @@ async fn setup_ssh(
         .to_string();
     if remote_sock.is_empty() {
         tracing::warn!(target: "captain_miao::ssh", "{target}: daemon ensure returned no socket path");
+        log.error("`daemon ensure` succeeded but printed no socket path");
         return None;
     }
+    log.info(format!("daemon is up, socket {remote_sock}"));
     tracing::debug!(target: "captain_miao::ssh", "{target}: remote daemon socket = {remote_sock}");
 
     // The persistent ControlMaster can retain a *stale forward* for this local
@@ -2010,6 +2180,24 @@ mod tests {
     }
 
     #[test]
+    fn the_conn_log_keeps_the_newest_lines_in_order() {
+        let log = ConnLog::default();
+        for i in 0..CONN_LOG_CAP + 10 {
+            log.info(format!("line {i}"));
+        }
+        log.error("it broke");
+        let entries = log.entries();
+        // Bounded, oldest-first, and the tail is what survived — a host that has
+        // been flapping for a week must not grow without limit, and what you
+        // want when you open it is the most recent attempt.
+        assert_eq!(entries.len(), CONN_LOG_CAP);
+        assert_eq!(entries.last().unwrap().text, "it broke");
+        assert!(entries.last().unwrap().error);
+        assert_eq!(entries[0].text, format!("line {}", 11));
+        assert!(!entries[0].error);
+    }
+
+    #[test]
     fn the_failure_text_says_which_of_the_three_things_went_wrong() {
         let lx = "Linux x86_64";
         let missing = probe(lx, None, None);
@@ -2354,7 +2542,8 @@ mod tests {
 
         // First connect: deploys, and resolves to what it deployed.
         let mut gate = UploadGate::default();
-        let (exe, failure) = resolve_remote_exe(&target, &opts, &mut gate).await;
+        let log = ConnLog::default();
+        let (exe, failure) = resolve_remote_exe(&target, &opts, &mut gate, &log).await;
         assert_eq!(failure, None, "deploy reported: {failure:?}");
         assert_eq!(exe, format!("{}/{REMOTE_CACHE_REL}", fresh.home));
 
@@ -2376,7 +2565,7 @@ mod tests {
             ),
             Provision::UseCache,
         );
-        let (exe2, failure2) = resolve_remote_exe(&target, &opts, &mut gate).await;
+        let (exe2, failure2) = resolve_remote_exe(&target, &opts, &mut gate, &log).await;
         assert_eq!(failure2, None);
         assert_eq!(exe2, exe);
 

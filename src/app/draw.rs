@@ -321,7 +321,7 @@ impl App {
     /// the opportunistic latency sample. A host that isn't connected yet — or
     /// isn't in the backend set at all (a row the user is still typing) — shows
     /// only what's known.
-    fn host_status_spans(&self, host: &HostId) -> Vec<Span<'static>> {
+    fn host_status_spans(&self, host: &HostId, max_width: usize) -> Vec<Span<'static>> {
         let ui = &config::get().colors.ui;
         let Some(backend) = self.backend_for(host) else {
             return vec![Span::styled(
@@ -335,7 +335,7 @@ impl App {
             ConnState::Connecting => Style::default().add_modifier(Modifier::DIM),
             ConnState::Disconnected | ConnState::Failed(_) => Style::default().fg(ui.attention_fg),
         };
-        let mut spans = vec![Span::styled(state.label().to_string(), style)];
+        let mut spans = vec![Span::styled(one_line(state.label(), max_width), style)];
         if state.is_connected() {
             let (running, attached) = self.host_session_counts(host);
             spans.push(Span::styled(
@@ -361,7 +361,87 @@ impl App {
         spans
     }
 
-    fn draw_host_edit(&self, frame: &mut ratatui::Frame, area: Rect) {
+    /// The hosts popup: the host list, or — while `l` is open — one host's
+    /// connection log in its place.
+    fn draw_host_edit(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
+        };
+        if state.log_view.is_some() {
+            self.draw_host_log(frame, area);
+        } else {
+            self.draw_host_list(frame, area);
+        }
+    }
+
+    /// One host's connection narrative, oldest first — everything the panel row
+    /// had to cut, plus the steps that led to it.
+    ///
+    /// Takes `&mut self` only to record the viewport height, which `G` and the
+    /// page keys need and which nothing but a render knows.
+    fn draw_host_log(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(view) = self.host_edit.as_ref().and_then(|s| s.log_view.as_ref()) else {
+            return;
+        };
+        let host = view.host.clone();
+        let scroll = view.scroll;
+        // Wider and taller than the list: these lines are quoted host output,
+        // and wrapping a loader error at 72 cells helps nobody.
+        let popup = centered_rect(88, 76, area);
+        frame.render_widget(Clear, popup);
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            format!(" {host} \u{00b7} connection log ", host = host.0),
+            Style::default().bold(),
+        ));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let lines = self.host_log_lines(&host);
+        let rows = inner.height as usize;
+        let ui = &config::get().colors.ui;
+        let rendered: Vec<Line> = if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                // Two ways to get here, and they aren't the same thing.
+                if self.backend_for(&host).is_some() {
+                    "(nothing logged yet)"
+                } else {
+                    "(this host isn't connected — add or edit it first)"
+                },
+                Style::default().add_modifier(Modifier::DIM),
+            ))]
+        } else {
+            lines
+                .iter()
+                .skip(scroll)
+                .take(rows)
+                .map(|l| {
+                    // The age column is fixed-width so the text starts on one
+                    // margin; a continuation line pays the same indent and so
+                    // reads as part of the entry above it.
+                    let age = Span::styled(
+                        format!("{:>5} ", l.age.as_deref().unwrap_or("")),
+                        Style::default().add_modifier(Modifier::DIM),
+                    );
+                    let style = if l.error {
+                        Style::default().fg(ui.attention_fg)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(vec![age, Span::styled(l.text.clone(), style)])
+                })
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(rendered), inner);
+
+        // Record what the keys need, and re-clamp: the log grows underneath a
+        // parked scroll offset, and the popup resizes with the terminal.
+        if let Some(view) = self.host_edit.as_mut().and_then(|s| s.log_view.as_mut()) {
+            view.rows = rows;
+            view.scroll = view.scroll.min(lines.len().saturating_sub(rows));
+        }
+    }
+
+    fn draw_host_list(&self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(state) = self.host_edit.as_ref() else {
             return;
         };
@@ -410,7 +490,12 @@ impl App {
                 Span::raw(format!("{icon} ")),
                 Span::styled(format!("{label:<14}"), Style::default().fg(color).bold()),
             ];
-            spans.extend(self.host_status_spans(&host));
+            // Everything before the status: marker (2) + icon and its space (3)
+            // + the padded label (14). A `Failed` reason quotes the host and can
+            // run for paragraphs, so it is truncated to what's left rather than
+            // being allowed to run off the popup — `l` is where it's read whole.
+            let status_width = (list_area.width as usize).saturating_sub(2 + 3 + 14);
+            spans.extend(self.host_status_spans(&host, status_width));
             lines.push(Line::from(spans));
             // The target is secondary detail — one indented dim line, so the
             // status line above stays scannable across many hosts.
@@ -1550,19 +1635,28 @@ impl App {
                 spans
             }
             InputMode::HostEdit => {
-                let editing = self.host_edit.as_ref().is_some_and(|h| h.editing);
-                if editing {
+                let host_edit = self.host_edit.as_ref();
+                if host_edit.is_some_and(|h| h.log_view.is_some()) {
+                    let mut spans = hint_pair("j/k", "scroll");
+                    spans.extend(hint_pair("g/G", "top/bottom"));
+                    spans.extend(hint_pair("Esc", "back"));
+                    spans
+                } else if host_edit.is_some_and(|h| h.editing) {
                     let mut spans = hint_pair("Tab", "field");
                     spans.extend(hint_pair("←→", "color/type"));
                     spans.extend(hint_pair("Enter", "done"));
                     spans.extend(hint_pair("Esc", "back"));
                     spans
                 } else {
+                    // No `s save`: the panel has no Save step — every mutation
+                    // persists as it happens (§9) — and `Esc` closes rather than
+                    // cancelling anything, so both old hints named keys that do
+                    // not exist.
                     let mut spans = hint_pair("a", "add");
                     spans.extend(hint_pair("e", "edit"));
                     spans.extend(hint_pair("d", "delete"));
-                    spans.extend(hint_pair("s", "save"));
-                    spans.extend(hint_pair("Esc", "cancel"));
+                    spans.extend(hint_pair("l", "log"));
+                    spans.extend(hint_pair("Esc", "close"));
                     spans
                 }
             }
@@ -1577,6 +1671,19 @@ impl App {
 /// before the first `:` — for a compact "lives elsewhere" row tag.
 fn terminal_kind(identity: &str) -> &str {
     identity.split_once(':').map(|(k, _)| k).unwrap_or(identity)
+}
+
+/// Squeeze arbitrary text — up to and including a host's multi-line refusal —
+/// onto one row of `max` cells.
+///
+/// Both halves matter. **Flattening** is a correctness fix, not cosmetics: a
+/// `\n` inside a `Span` doesn't wrap, it corrupts the row, and a `ConnState`
+/// reason quotes host output verbatim. **Truncating** with `truncate_str`'s `…`
+/// then says the text was cut, where letting it run to the popup edge looks
+/// like the whole message. Pure.
+pub(super) fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_str(&flat, max)
 }
 
 /// The header's `☁` host tally: one colored number per bucket, good → error →

@@ -832,6 +832,21 @@ pub(super) fn format_coarse_age(secs: u64) -> String {
     }
 }
 
+/// Age for a connection-log line: **seconds** below a minute, then the same
+/// coarse form everything else uses.
+///
+/// The extra resolution is the point here and nowhere else. A whole connect
+/// attempt — probe, decide, deploy, ensure, forward, handshake — happens inside
+/// one minute, so `format_coarse_age`'s `<1m` would stamp the entire story with
+/// one identical label and say nothing about how long any step took.
+pub(super) fn format_log_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format_elapsed(secs)
+    }
+}
+
 /// Build the "Updated" cell with the unit suffixes tinted: `h` yellow, `m`
 /// blue. Digits and the `>` overflow marker stay default — coloring the units
 /// alone makes the magnitude scannable without flooding the row in color.

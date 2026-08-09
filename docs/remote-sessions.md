@@ -547,7 +547,23 @@ decides what they mean**.
   the same searchable emoji picker as `Space i`) / color. There is **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
-  removes behind a `y/N` confirm.
+  removes behind a `y/N` confirm. A `Failed` reason is **flattened and
+  truncated** to its row (it quotes host output, so it carries newlines that
+  would corrupt the row and a length no row can hold), with the whole text one
+  key away.
+- **`l` — the connection log** (per host, in the panel). The row gets one line
+  for a failure whose reason is routinely a paragraph, and the *sequence* is
+  what diagnoses: "probed the host, decided to deploy, the deploy came back with
+  this" tells you what to fix where the surviving one-liner is a symptom. So
+  every step of probe → decide → deploy → `daemon ensure` → forward → handshake
+  writes a line, and anything the host said is quoted **whole**. Kept in memory
+  per backend (`ConnLog`, capped at 200 lines so a week-long flap is bounded),
+  oldest first, ages at seconds resolution — a whole connect attempt happens
+  inside one minute, so the coarse `<1m` used elsewhere would label the entire
+  story identically. Pager keys; any other key is swallowed rather than falling
+  through to the list underneath. This is deliberately *not* the debug log: it
+  is always on, needs no config flag, and holds only this host's connection
+  story.
 - **Header**: an **aggregate only** — a `☁` tally of three colored numbers,
   good (green) / failing (attention) / down-or-dialing (dim), sitting
   immediately right of the default-host indicator, since both answer "which

@@ -10,7 +10,8 @@ use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS};
 use super::keymap::{Chord, Command};
 use super::picker::{PickerEvent, TextInputEvent};
 use super::{
-    Action, App, DirEditFocus, DragTarget, HostField, HostRow, InputMode, PickerKind, SessionFlag,
+    Action, App, DirEditFocus, DragTarget, HostField, HostLogView, HostRow, InputMode, PickerKind,
+    SessionFlag,
 };
 
 /// Max gap between two left-clicks on the same row to count as a double-click.
@@ -907,6 +908,13 @@ impl App {
         let ncol = super::format::DIR_COLORS.len();
         let editing = self.host_edit.as_ref()?.editing;
 
+        // The log view owns the keyboard while it's open — it replaces the list,
+        // so none of the list's keys are reachable behind it.
+        if self.host_edit.as_ref()?.log_view.is_some() {
+            self.handle_host_log_key(key);
+            return None;
+        }
+
         // A pending removal owns the keyboard until answered.
         if let Some(idx) = self.host_edit.as_ref()?.pending_remove {
             let state = self.host_edit.as_mut()?;
@@ -1024,10 +1032,51 @@ impl App {
                 KeyCode::Char('d') if state.cursor < n => {
                     state.pending_remove = Some(state.cursor);
                 }
+                // The row shows one truncated line of a failure; `l` is where
+                // the whole thing — and the steps before it — is readable.
+                KeyCode::Char('l') if state.cursor < n => {
+                    let host = HostId(state.rows[state.cursor].label.clone());
+                    state.log_view = Some(HostLogView {
+                        host,
+                        scroll: 0,
+                        rows: 0,
+                    });
+                }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Scroll keys for the connection log (`l`). Reading, not editing, so the
+    /// bindings are the pager ones: `j`/`k`, the arrows, page keys, `g`/`G`.
+    ///
+    /// Everything else is swallowed rather than falling through to the list
+    /// underneath — the same rule the `Space` prefix follows, and for the same
+    /// reason: a mistyped key here must not reach `d`.
+    fn handle_host_log_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.host_edit.as_mut().and_then(|s| s.log_view.as_mut()) else {
+            return;
+        };
+        // The draw clamps against the live line count; a page is the viewport
+        // minus one line of overlap, so you never step over a line unread.
+        let page = view.rows.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
+                if let Some(state) = self.host_edit.as_mut() {
+                    state.log_view = None;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => view.scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char('f') => view.scroll += page,
+            KeyCode::PageUp | KeyCode::Char('b') => view.scroll = view.scroll.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+            // The draw clamps this down to the real last page — it knows the
+            // line count, and it has to re-clamp on every frame anyway.
+            KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX,
+            _ => {}
+        }
     }
 
     fn handle_dir_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
