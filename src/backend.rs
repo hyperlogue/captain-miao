@@ -1069,6 +1069,15 @@ fn provision_label(action: &Provision) -> &'static str {
 /// reports a **running daemon**. `--version` errors and "command not found"
 /// both land on stderr and a non-zero exit, so `|| echo -` normalizes them.
 ///
+/// The marker is read through a variable rather than `cat`'d straight out,
+/// because the parse is **positional** and a degenerate marker would shift every
+/// field after it. `cat` of an *empty* file (a disk-full `echo` wrote nothing)
+/// succeeds and emits no line at all, so `|| echo -` never fires and the daemon
+/// line slides up into the marker's slot — misreading a running daemon as absent
+/// at exactly the moment the host is already in a strange state. A marker
+/// missing its trailing newline would likewise run into the next line. Assigning
+/// first and echoing once guarantees exactly one line whatever the file holds.
+///
 /// The daemon line cannot use that same `|| echo -` trick, and the reason is
 /// worth stating: `daemon status` exits **0 whether or not a daemon is
 /// running** (it is a report, not a test) and prints several lines when one is,
@@ -1085,7 +1094,9 @@ fn probe_script() -> String {
         "echo \"$HOME\"; uname -sm; \
          {SERVER_BIN} --version 2>/dev/null || echo -; \
          \"$HOME/{REMOTE_CACHE_REL}\" --version 2>/dev/null || echo -; \
-         cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null || echo -; \
+         m=$(cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null); \
+         if [ -z \"$m\" ]; then m=-; fi; \
+         echo $m; \
          d=-; \
          if {SERVER_BIN} daemon status 2>/dev/null | grep -q \"{DAEMON_RUNNING_MARK}\"; \
          then d=path; \
@@ -1433,18 +1444,36 @@ struct UploadGate {
     /// unsuppressed on the next pass, and re-send both, forever, at a backoff
     /// that caps at 30s. Remembering each independently is what makes the wasted
     /// transfer once per host rather than once per reconnect.
-    failed: HashMap<String, (Instant, String)>,
+    /// key → (when it may be retried, what went wrong). A `None` deadline means
+    /// **never, until the gate is cleared** — that is a deliberate refusal,
+    /// which is a different thing from a transient failure and must not expire
+    /// on a timer. A 5-minute cooldown on a decline means the popup returns
+    /// twice an hour forever on a host the user has already said no to.
+    failed: HashMap<String, (Option<Instant>, String)>,
 }
 
 impl UploadGate {
-    /// The remembered error, if uploading `sha` is still on cooldown.
+    /// The remembered error, if `sha` is still suppressed.
     fn suppressed(&self, sha: &str, now: Instant) -> Option<&str> {
         let (at, error) = self.failed.get(sha)?;
-        (now.duration_since(*at) < UPLOAD_RETRY_COOLDOWN).then_some(error.as_str())
+        match at {
+            // A refusal stands until something clears it.
+            None => Some(error.as_str()),
+            Some(t) => (now.duration_since(*t) < UPLOAD_RETRY_COOLDOWN).then_some(error.as_str()),
+        }
     }
 
+    /// Remember a failure that is worth retrying after a cooldown — a full disk,
+    /// a refused write, a 404 that might be a release still publishing.
     fn record_failure(&mut self, sha: &str, now: Instant, error: String) {
-        self.failed.insert(sha.to_string(), (now, error));
+        self.failed.insert(sha.to_string(), (Some(now), error));
+    }
+
+    /// Remember a **decision**, which no amount of waiting changes. Cleared only
+    /// when the host actually works, so saying no is never permanent — but it is
+    /// also never re-asked on a timer.
+    fn record_refusal(&mut self, sha: &str, error: String) {
+        self.failed.insert(sha.to_string(), (None, error));
     }
 
     /// Forget every remembered failure — called once a connection actually
@@ -1458,10 +1487,21 @@ impl UploadGate {
 /// The script the remote runs while we stream the binary into its stdin.
 ///
 /// Staged through a temp file and moved into place only after the host itself
-/// has run it: a truncated transfer or a payload for the wrong ABI fails the
-/// `self-check` line, `set -e` aborts, and nothing was ever visible at the path
-/// the next connect will invoke. That check is also what covers the one thing
-/// `uname` can't tell us, glibc vs musl.
+/// has both **run it and agreed it is the right version**: a truncated transfer
+/// or a payload for the wrong ABI fails the `self-check` line, a
+/// wrong-versioned one fails the `grep`, `set -e` aborts either way, and nothing
+/// was ever visible at the path the next connect will invoke. The run is also
+/// what covers the one thing `uname` can't tell us, glibc vs musl.
+///
+/// **The version has to be checked here, not just by the caller.** It used to be
+/// compared dashboard-side from the script's output — which is *after* the `mv`
+/// has already happened, so a binary we then rejected had already replaced a
+/// working deployment and rewritten its marker. That is reachable now that a
+/// payload can come from an env var pointing at any build: the next probe sees
+/// a cache version that doesn't match, re-uploads the same stale binary, and
+/// repeats every cooldown. The caller's parse stays as a belt, but the property
+/// the design claims — nothing unusable becomes the binary the next connect
+/// invokes — only holds if the host refuses *before* publishing.
 ///
 /// **Why `self-check` and not `--version`.** `--version` proves the file loads
 /// and matches; it never resolves user information, so a static-musl server on
@@ -1482,6 +1522,7 @@ impl UploadGate {
 /// behind, which costs some cache-directory space until the next attempt and
 /// buys a script that runs everywhere. Pure, so all of this is unit-tested.
 fn upload_script(sha256: &str, target: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
     format!(
         "set -e; \
          t=\"$HOME/{REMOTE_INCOMING_REL}\"; \
@@ -1489,7 +1530,9 @@ fn upload_script(sha256: &str, target: &str) -> String {
          rm -f \"$t\"; \
          cat > \"$t\"; \
          chmod 0755 \"$t\"; \
-         \"$t\" self-check; \
+         out=$(\"$t\" self-check); \
+         echo \"$out\"; \
+         echo \"$out\" | grep -q \"{SERVER_BIN} {version} \"; \
          mv -f \"$t\" \"$HOME/{REMOTE_CACHE_REL}\"; \
          echo {sha256} {target} > \"$HOME/{REMOTE_MARKER_REL}\""
     )
@@ -1802,7 +1845,7 @@ async fn try_download_candidate(
     log.info(format!("nothing local for {wanted}; asking to download it"));
     if !ask_download_consent(host, wanted, &url).await {
         log.info(format!("download of {wanted} declined"));
-        gate.record_failure(&url, now, "you declined the download".to_string());
+        gate.record_refusal(&url, "you declined the download".to_string());
         return None;
     }
     log.info(format!("downloading {url}"));
@@ -2155,15 +2198,19 @@ async fn connection_task(
             reconnect_epoch.fetch_add(1, Ordering::Relaxed);
         }
         was_connected = true;
-        // The host is demonstrably working, so any remembered deploy failure is
-        // history — a later one gets a fresh attempt rather than inheriting an
-        // old cooldown.
-        upload_gate.clear();
-        download_gate.clear();
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
         let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
+        // Forget remembered deploy failures and refusals only once the host has
+        // *demonstrably* worked — which means the handshake and subscribe both
+        // succeeded, not merely that a socket accepted us. Clearing at connect
+        // time wiped a recorded decline on every connect-then-handshake-refused
+        // cycle, which is exactly the host that keeps re-prompting.
+        if matches!(outcome, ServeOutcome::ConnectionLost) {
+            upload_gate.clear();
+            download_gate.clear();
+        }
         drop(ssh_child); // explicit: kill the ssh child once the connection ends
         // The mirror is now stale; clear it so the host shows no (misleading)
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
@@ -3273,7 +3320,12 @@ mod tests {
         // the next connect invokes *after* the host itself has run it.
         let stage = script.find("cat > ").unwrap();
         let verify = script.find("self-check").unwrap();
+        let version_check = script.find("grep -q").unwrap();
         let publish = script.find("mv -f").unwrap();
+        // The version is checked ON THE HOST, before the mv — a check that runs
+        // after it has already replaced a working deployment is not a refusal.
+        assert!(verify < version_check, "{script}");
+        assert!(version_check < publish, "{script}");
         let marker = script.find("miao-server.sha256").unwrap();
         assert!(stage < verify, "{script}");
         assert!(verify < publish, "{script}");
@@ -3378,8 +3430,12 @@ mod tests {
         // deploy's whole verification now hangs on that subcommand existing, so
         // a stand-in that replied to anything would pass this test while a real
         // binary predating `self-check` failed on a host.
+        // Mirrors the real `self-check` line exactly — name, version, protocol,
+        // user. The trailing fields matter: the script greps for the version
+        // followed by a space, which is what stops 0.2.1 matching 0.2.10.
         let fake = format!(
-            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\necho 'miao-server {version}'\n"
+            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\n\
+             echo 'miao-server {version} protocol 4 user someone'\n"
         );
         let out = run_upload_script(&home, fake.as_bytes(), "d1g3st");
 
@@ -3391,7 +3447,7 @@ mod tests {
         // The version the *host* reported is what `upload_server` verifies.
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
-            format!("miao-server {version}")
+            format!("miao-server {version} protocol 4 user someone")
         );
 
         let deployed = home.join(REMOTE_CACHE_REL);
@@ -3422,8 +3478,12 @@ mod tests {
         // deploy's whole verification now hangs on that subcommand existing, so
         // a stand-in that replied to anything would pass this test while a real
         // binary predating `self-check` failed on a host.
+        // Mirrors the real `self-check` line exactly — name, version, protocol,
+        // user. The trailing fields matter: the script greps for the version
+        // followed by a space, which is what stops 0.2.1 matching 0.2.10.
         let fake = format!(
-            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\necho 'miao-server {version}'\n"
+            "#!/bin/sh\ntest \"$1\" = self-check || exit 64\n\
+             echo 'miao-server {version} protocol 4 user someone'\n"
         );
         for shell in ["/bin/sh", "bash", "zsh", "fish", "tcsh"] {
             if std::process::Command::new(shell)
@@ -3457,6 +3517,41 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    #[test]
+    fn a_wrong_versioned_binary_never_reaches_the_cache_path() {
+        // Regression. The version used to be compared dashboard-side, from the
+        // script's output — which is *after* the mv. So a runnable but
+        // wrong-versioned payload (an env var pointing at a stale build) got
+        // installed over a working deployment and rewrote its marker; the
+        // dashboard then "refused" it, and the next probe saw a mismatched cache
+        // version and re-uploaded the same stale binary every cooldown, forever.
+        let home = scratch_home("wrongver");
+        let bin_dir = home.join(".cache/captain-miao/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(home.join(REMOTE_CACHE_REL), b"the working server").unwrap();
+
+        // Self-check passes — it *is* a working miao-server — but of a version
+        // we cannot talk to.
+        let stale = "#!/bin/sh\ntest \"$1\" = self-check || exit 64\n\
+                     echo 'miao-server 0.0.1 protocol 4 user someone'\n";
+        let out = run_upload_script(&home, stale.as_bytes(), "d1g3st");
+
+        assert!(
+            !out.status.success(),
+            "a wrong version must abort the script"
+        );
+        assert_eq!(
+            std::fs::read(home.join(REMOTE_CACHE_REL)).unwrap(),
+            b"the working server",
+            "the previous deployment must survive"
+        );
+        assert!(
+            !home.join(REMOTE_MARKER_REL).exists(),
+            "no marker may be written for a payload that was refused"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

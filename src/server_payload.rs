@@ -258,6 +258,20 @@ pub(crate) fn resolve_candidates(uname_sm: &str) -> Vec<Candidate> {
 fn resolve_one(target: &str) -> Option<Candidate> {
     let from_file = |path: std::path::PathBuf, source: PayloadSource| -> Option<Candidate> {
         if !path.is_file() {
+            // Say so for a variable the user *set*: silently falling through to
+            // the embedded payload is precisely the "a variable that does
+            // nothing" failure this module accepts two spellings to avoid, and
+            // it is worse here — the deploy appears to work, with the wrong
+            // binary. A missing directory entry is ordinary (that is how the
+            // per-target override coexists with a partial farm), so only the
+            // explicitly-named file is worth warning about.
+            if matches!(source, PayloadSource::EnvTarget) {
+                tracing::warn!(
+                    target: "captain_miao::provision",
+                    "{ENV_PREFIX}_… names {}, which is not a file — ignoring it",
+                    path.display()
+                );
+            }
             return None;
         }
         match digest_of(&path) {
@@ -433,8 +447,13 @@ fn elf_interpreter(bytes: &[u8]) -> Option<String> {
     let e_phnum = u16_at(0x38) as usize;
     const PT_INTERP: u32 = 3;
     for i in 0..e_phnum {
+        // Every one of these is attacker- or mistake-controlled: `e_phoff` comes
+        // straight off a file someone pointed an env var at. `ph + 56` unchecked
+        // panics on add-overflow in debug and, in release, wraps to a small
+        // number that sails past the bounds check and panics on the slice
+        // instead — killing the connection task for that host.
         let ph = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
-        if ph + 56 > bytes.len() {
+        if ph.checked_add(56)? > bytes.len() {
             return None;
         }
         let p_type = {
@@ -578,6 +597,24 @@ mod tests {
 
         // Not an ELF we can read → let the host decide; it is the backstop.
         assert!(check_interpreter(b"not an elf at all", "t").is_ok());
+
+        // Malformed headers must return, never panic: every offset here comes
+        // off the file itself, so a hostile or truncated one reaches the parser.
+        let mut evil = elf_with_interp(Some("/lib64/ld-linux-x86-64.so.2"));
+        evil[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes()); // e_phoff
+        evil[0x36..0x38].copy_from_slice(&0u16.to_le_bytes()); // e_phentsize
+        evil[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        assert!(check_interpreter(&evil, "t").is_ok());
+
+        // A header claiming more program headers than the file can hold.
+        let mut short = elf_with_interp(Some("/lib64/ld-linux-x86-64.so.2"));
+        short[0x38..0x3a].copy_from_slice(&u16::MAX.to_le_bytes());
+        let _ = check_interpreter(&short, "t");
+
+        // Truncated to the header, and to nothing.
+        let _ = check_interpreter(&elf_with_interp(None)[..64], "t");
+        assert!(check_interpreter(b"", "t").is_ok());
+        assert!(check_interpreter(b"\x7fELF", "t").is_ok());
     }
 
     #[test]

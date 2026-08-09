@@ -219,9 +219,22 @@
             doCheck = false;
           });
 
+        # The dashboard with the remote-hosts gate on. Required by the wrapper
+        # below and not merely nice to have: `REMOTE_ENABLED` is
+        # `cfg!(feature = "remote")`, so a plain build never reads `hosts.json`
+        # and never constructs a remote backend — it would carry a link farm it
+        # has no code path to reach, and the whole package would be inert.
+        captain-miao-remote = craneLib.buildPackage (commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "captain-miao-remote";
+            cargoExtraArgs = "--locked --features remote";
+            meta.mainProgram = "miao";
+          });
+
         captain-miao-with-servers = pkgs.symlinkJoin {
           name = "captain-miao-with-servers";
-          paths = [captain-miao];
+          paths = [captain-miao-remote];
           nativeBuildInputs = [pkgs.makeWrapper];
           # `--set-default`, not `--set`: the chain's whole premise is that
           # explicit configuration beats a build-time default, so a user who
@@ -237,7 +250,7 @@
         packages =
           {
             default = captain-miao;
-            inherit captain-miao captain-miao-server captain-miao-servers captain-miao-with-servers;
+            inherit captain-miao captain-miao-server captain-miao-remote captain-miao-servers captain-miao-with-servers;
           }
           # `captain-miao-bundle-linux`, and the two single-arch variants.
           // lib.mapAttrs' (feature: pkg:

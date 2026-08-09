@@ -843,7 +843,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // user never gets to it.
         if app.input_mode == InputMode::Normal
             && app.pending_confirm.is_none()
-            && let Ok(prompt) = app.download_prompts.try_recv()
+            // Skip questions nobody is waiting on any more. A prompt that
+            // outlived its timeout while the user was in a picker would
+            // otherwise be shown, answered, and silently do nothing — and the
+            // *fresh* prompt for the same host is queued right behind it, so
+            // the user would be asked the same thing twice.
+            && let Some(prompt) = std::iter::from_fn(|| app.download_prompts.try_recv().ok())
+                .find(|p| !p.reply.is_closed())
         {
             app.pending_confirm = Some(PendingConfirm {
                 prompt: format!(
