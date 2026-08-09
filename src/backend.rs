@@ -1078,6 +1078,14 @@ fn provision_label(action: &Provision) -> &'static str {
 /// missing its trailing newline would likewise run into the next line. Assigning
 /// first and echoing once guarantees exactly one line whatever the file holds.
 ///
+/// `set -f` is why that echo can stay unquoted. Unquoted is what collapses a
+/// multi-line marker onto one line — quoting it would preserve the newlines and
+/// reintroduce the very shift this avoids — but unquoted also invites globbing,
+/// and a marker holding a `*` would expand against the *remote's* working
+/// directory and hand us a directory listing where a digest belongs. Disabling
+/// pathname expansion keeps the word-splitting and drops the globbing, which is
+/// exactly the pair we want.
+///
 /// The daemon line cannot use that same `|| echo -` trick, and the reason is
 /// worth stating: `daemon status` exits **0 whether or not a daemon is
 /// running** (it is a report, not a test) and prints several lines when one is,
@@ -1091,7 +1099,8 @@ fn provision_label(action: &Provision) -> &'static str {
 /// still binds is the wrapper's — no single quote and no backslash anywhere.
 fn probe_script() -> String {
     format!(
-        "echo \"$HOME\"; uname -sm; \
+        "set -f; \
+         echo \"$HOME\"; uname -sm; \
          {SERVER_BIN} --version 2>/dev/null || echo -; \
          \"$HOME/{REMOTE_CACHE_REL}\" --version 2>/dev/null || echo -; \
          m=$(cat \"$HOME/{REMOTE_MARKER_REL}\" 2>/dev/null); \
@@ -2732,6 +2741,53 @@ mod tests {
         let junk = parse_probe("/home/u\nLinux x86_64\nmiao-server 0.3.0 protocol wat\n-\n-\n-\n")
             .unwrap();
         assert_eq!(junk.path_protocol, None);
+    }
+
+    #[test]
+    fn the_probe_survives_a_degenerate_marker_file() {
+        // The parse is positional, so what matters is that the marker read emits
+        // exactly one line no matter what is in the file — an empty one (a
+        // disk-full `echo` wrote nothing), a missing one, one without a trailing
+        // newline, one with extra lines, and one holding a glob character, which
+        // would otherwise expand against the *remote's* cwd and hand us a
+        // directory listing where a digest belongs.
+        let root = scratch_home("marker");
+        let script = probe_script();
+        // The marker+daemon tail, run against a throwaway $HOME. Everything
+        // before it needs a real host, so slice from the marker read.
+        let tail = &script[script.find("m=$(cat").expect("the marker read")..];
+        let tail = format!("set -f; {tail}");
+
+        for (name, contents) in [
+            ("empty", Some("")),
+            ("missing", None),
+            ("nonl", Some("abc x86_64-unknown-linux-gnu")),
+            ("multi", Some("abc x86_64-unknown-linux-gnu\njunk\n")),
+            ("glob", Some("* x86_64-unknown-linux-gnu\n")),
+        ] {
+            let home = root.join(name);
+            std::fs::create_dir_all(home.join(".cache/captain-miao/bin")).unwrap();
+            if let Some(c) = contents {
+                std::fs::write(home.join(REMOTE_MARKER_REL), c).unwrap();
+            }
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&tail)
+                .env("HOME", &home)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                text.lines().count(),
+                2,
+                "{name}: marker + daemon must be exactly two lines, got {text:?}"
+            );
+            // A glob must stay literal rather than listing the host's cwd.
+            if name == "glob" {
+                assert!(text.starts_with("* "), "{name}: globbed: {text:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
