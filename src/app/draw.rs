@@ -367,13 +367,11 @@ impl App {
         };
         let popup = centered_rect(72, 60, area);
         frame.render_widget(Clear, popup);
+        // No key hints on the border: the footer bar already renders this
+        // mode's bindings, and two copies of the same list disagree eventually.
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Hosts ", Style::default().bold()))
-            .title_bottom(Span::styled(
-                " a add  e edit  d remove  q close ",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
+            .title(Span::styled(" Hosts ", Style::default().bold()));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
