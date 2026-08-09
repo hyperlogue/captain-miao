@@ -311,7 +311,12 @@ fn resolve_one(target: &str) -> Option<Candidate> {
     from_file(cache_path_for(target)?, PayloadSource::Cache)
 }
 
-/// What this build carries, for the startup log and the hosts panel's diagnosis.
+/// What this build carries.
+///
+/// Test-only now: the hosts panel's diagnosis reports what the *source chain*
+/// could supply instead, which stopped being the same question once env vars,
+/// the cache and the downloader joined it. `miao --version` uses [`describe`].
+#[cfg(test)]
 pub(crate) fn embedded_targets() -> Vec<&'static str> {
     payloads().iter().map(|p| p.target).collect()
 }

@@ -1351,15 +1351,20 @@ fn incompatible_daemon_reason(server_version: &str, protocol: u32) -> String {
 ///
 /// `upload_error` is the reason an attempted deploy didn't land; it takes
 /// precedence, because "we tried to fix this for you and here's what stopped us"
-/// is more actionable than "not found". `embedded` is what this build could have
-/// deployed, so a `FallBack` on an arch we don't carry says *that* rather than
-/// leaving the user to guess why nothing was pushed. Pure.
+/// is more actionable than "not found".
+///
+/// `supplied` is what the **source chain** could actually offer for this host,
+/// not merely what is compiled in. Those stopped being the same thing once env
+/// vars, the cache and the downloader joined the chain, and reporting the
+/// embedded table alone would tell a user with a perfectly good
+/// `CAPTAIN_MIAO_SERVER_DIR` that "this build carries no server payload" — true
+/// of the binary, and useless as a diagnosis. Pure.
 fn provision_failure(
     local_version: &str,
     probe: &RemoteProbe,
     action: &Provision,
     upload_error: Option<&str>,
-    embedded: &[&str],
+    supplied: &[&str],
 ) -> Option<String> {
     if !matches!(action, Provision::FallBack) {
         return None;
@@ -1376,13 +1381,13 @@ fn provision_failure(
     .collect();
     // Why we didn't just fix it ourselves: either this build ships no payloads
     // at all, or none for this host's arch.
-    let cannot_deploy = if embedded.is_empty() {
-        "this build carries no server payload".to_string()
+    let cannot_deploy = if supplied.is_empty() {
+        format!("no server available for {} to deploy", probe.arch)
     } else {
         format!(
-            "no payload for {} (this build carries {})",
+            "every server we could offer for {} was refused ({})",
             probe.arch,
-            embedded.join(", ")
+            supplied.join(", ")
         )
     };
     Some(match found.as_slice() {
@@ -1968,7 +1973,10 @@ async fn resolve_remote_exe(
             &probe,
             &action,
             upload_error.as_deref(),
-            &crate::server_payload::embedded_targets(),
+            &available
+                .iter()
+                .map(|p| p.target.as_str())
+                .collect::<Vec<_>>(),
         ),
     )
 }
@@ -3190,7 +3198,11 @@ mod tests {
         let missing = probe(lx, None, None);
         let msg = provision_failure("0.2.0", &missing, &Provision::FallBack, None, &[]).unwrap();
         assert!(msg.contains("not found"), "{msg}");
-        assert!(msg.contains("carries no server payload"), "{msg}");
+        // The diagnosis names what the *source chain* could offer, not what is
+        // compiled in: with env vars, the cache and the downloader in the chain,
+        // "this build carries nothing" would be true of the binary and useless
+        // as a diagnosis to someone with CAPTAIN_MIAO_SERVER_DIR set.
+        assert!(msg.contains("no server available"), "{msg}");
         // The advice has to be something an installed user can act on — this
         // repo's dev-loop script isn't on their machine.
         assert!(!msg.contains("redeploy.sh"), "{msg}");
@@ -3199,9 +3211,8 @@ mod tests {
         let msg = provision_failure("0.2.0", &stale, &Provision::FallBack, None, &[]).unwrap();
         assert!(msg.contains("version mismatch"), "{msg}");
 
-        // A build that *does* carry payloads, just not for this host: say so,
-        // and say what it has, so the fix (a build carrying that arch) is
-        // obvious.
+        // We could offer something and the host took none of it: name what was
+        // tried, so "then supply a different one" is an obvious next step.
         let msg = provision_failure(
             "0.2.0",
             &probe("Linux riscv64", None, None),
@@ -3210,7 +3221,7 @@ mod tests {
             &["x86_64-unknown-linux-gnu"],
         )
         .unwrap();
-        assert!(msg.contains("no payload for Linux riscv64"), "{msg}");
+        assert!(msg.contains("refused"), "{msg}");
         assert!(msg.contains("x86_64-unknown-linux-gnu"), "{msg}");
 
         // A failed deploy outranks both: it's the more actionable sentence.
