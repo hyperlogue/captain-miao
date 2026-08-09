@@ -316,10 +316,18 @@ the full sequence and re-runs it on every reconnect:
    there, verify, and fail loudly**, and it is loud: `provision_failure` turns a
    fall-back into a sentence (*"miao-server version mismatch (found
    0.3.1, need 0.4.0)"*, *"…not found (need 0.4.0); no payload for Linux
-   riscv64 (this build carries x86_64-unknown-linux-gnu) — deploy it with
-   redeploy.sh"*, *"could not deploy miao-server: <what the host
+   riscv64 (this build carries x86_64-unknown-linux-gnu) — install it on the
+   host"*, *"could not deploy miao-server: <what the host
    said>"*) that becomes the host's `ConnState::Failed` text and shows verbatim
-   in the hosts panel.
+   in the hosts panel. The advice names no repo script: `redeploy.sh` is a
+   dev-loop convenience here, not something an installed user has.
+
+   That text is **held across the retry**. The reconnect loop re-dials on a
+   backoff, and storing `Connecting` at the top of each pass blinked the reason
+   off and back once per tick — unreadable at 500ms, and worse, it read as a
+   transient. A diagnosis now stands until an attempt concludes something else
+   (`standing_failure` in `connection_task`), so the panel shows one steady
+   sentence and the `⚠` stays lit.
 2. **Ensure** — `ssh <target> <exe> daemon ensure` → prints the control-socket
    path; idempotent. Its stderr becomes the `Failed` reason when the probe had
    nothing to say.

@@ -990,9 +990,11 @@ fn provision_failure(
         )
     };
     Some(match found.as_slice() {
+        // No `redeploy.sh` in the advice: that script is a dev-loop convenience
+        // in this repo, not something an installed user has.
         [] => format!(
             "miao-server not found (need {local_version}); {cannot_deploy} — \
-             deploy it with redeploy.sh"
+             install it on the host"
         ),
         versions => format!(
             "miao-server version mismatch (found {}, need {local_version}); \
@@ -1353,8 +1355,17 @@ async fn connection_task(
     // Lives for the whole task, so one host's refusal to accept a deployed
     // server isn't re-litigated (at multiple megabytes a go) on every reconnect.
     let mut upload_gate = UploadGate::default();
+    // The diagnosis the last attempt reached, held across the wait *and* the
+    // next attempt. Retrying doesn't make "no miao-server on the host" any less
+    // true, so blinking the sentence off to `connecting` once per backoff tick
+    // only makes it unreadable — the reason stands until an attempt concludes
+    // something else. Invariant: `Some` exactly when the stored state is the
+    // matching `Failed`, which is why the re-dial below can skip the store.
+    let mut standing_failure: Option<String> = None;
     loop {
-        store(ConnState::Connecting);
+        if standing_failure.is_none() {
+            store(ConnState::Connecting);
+        }
         // Establish the transport; for ssh, (re)stand up the forward+server
         // child. Re-running `setup_ssh` on each attempt is deliberate: it also
         // re-cancels any stale ControlMaster forward, which is what makes a
@@ -1386,8 +1397,9 @@ async fn connection_task(
             // task keeps retrying either way — `Failed` is a *label*, not a
             // terminal state, since deploying the binary should heal it without
             // the user restarting anything.
-            store(match failure {
-                Some(reason) => ConnState::Failed(reason),
+            standing_failure = failure;
+            store(match &standing_failure {
+                Some(reason) => ConnState::Failed(reason.clone()),
                 None => ConnState::Disconnected,
             });
             if !wait_before_retry(&mut requests, &mut backoff).await {
@@ -1400,6 +1412,8 @@ async fn connection_task(
         let attempts = if ssh_child.is_some() { 16 } else { 3 };
         let Some(stream) = connect_with_retry(&sock_path, attempts).await else {
             drop(ssh_child); // kill_on_drop tears ssh down
+            // Setup got this far without a diagnosis, so an older one is stale.
+            standing_failure = None;
             store(ConnState::Disconnected);
             if !wait_before_retry(&mut requests, &mut backoff).await {
                 return;
@@ -1419,6 +1433,7 @@ async fn connection_task(
         // history — a later one gets a fresh attempt rather than inheriting an
         // old cooldown.
         upload_gate.clear();
+        standing_failure = None;
         store(ConnState::Connected);
         let connected_at = Instant::now();
         let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
@@ -1428,9 +1443,13 @@ async fn connection_task(
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
         mirror.lock().unwrap().clear();
         *latency.lock().unwrap() = None;
-        store(match &outcome {
-            ServeOutcome::HandshakeFailed(Some(reason)) => ConnState::Failed(reason.clone()),
-            _ => ConnState::Disconnected,
+        standing_failure = match &outcome {
+            ServeOutcome::HandshakeFailed(Some(reason)) => Some(reason.clone()),
+            _ => None,
+        };
+        store(match &standing_failure {
+            Some(reason) => ConnState::Failed(reason.clone()),
+            None => ConnState::Disconnected,
         });
         tracing::debug!(
             target: "captain_miao::ssh",
@@ -1996,6 +2015,9 @@ mod tests {
         let msg = provision_failure("0.2.0", &missing, &Provision::FallBack, None, &[]).unwrap();
         assert!(msg.contains("not found"), "{msg}");
         assert!(msg.contains("carries no server payload"), "{msg}");
+        // The advice has to be something an installed user can act on — this
+        // repo's dev-loop script isn't on their machine.
+        assert!(!msg.contains("redeploy.sh"), "{msg}");
 
         let stale = probe(lx, Some("0.1.0"), None);
         let msg = provision_failure("0.2.0", &stale, &Provision::FallBack, None, &[]).unwrap();
