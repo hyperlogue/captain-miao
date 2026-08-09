@@ -1915,35 +1915,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_r3_watch_command_matches_documented_forms() {
-        // Compiled binary / alias.
-        assert!(is_r3_watch_command("r3 watch review_2b40f7 --session docs"));
-        // Path-suffixed binary.
-        assert!(is_r3_watch_command(
-            "/home/me/.local/bin/r3 watch review_abc"
-        ));
-        // Run-from-source, full path (the form r3 documents).
-        assert!(is_r3_watch_command(
-            "bun /Users/me/projects/r3/cli/index.ts watch review_abc --agent-id x"
-        ));
-        // Run-from-source from inside the checkout (relative script + review id).
-        assert!(is_r3_watch_command(
-            "cd /Users/me/projects/r3\nbun cli/index.ts watch review_2b40f7"
-        ));
-        // Entrypoint token matches even without the `review_` id prefix.
-        assert!(is_r3_watch_command("r3 watch somethingelse"));
-    }
+    // ---- fixture vocabulary -------------------------------------------------
+    //
+    // The same handful of shapes recur across the background-shell tests: a
+    // compiled `r3`, a run-from-source `r3`, and a review-watch behind a `nix
+    // develop … bash -c '…'` runner. Each test used to spell them its own way,
+    // which is how two of them drifted into two different transcriptions of one
+    // command.
+    //
+    // Naming them keeps every case below about **shape** — which is all the
+    // classifiers key on — rather than about paths, which they ignore entirely.
+    // The home directory here is a placeholder for exactly that reason: no
+    // assertion in this module depends on it, and a fixture carrying a real one
+    // would be a real one published for no test value.
 
+    /// Compiled binary, reached through `$PATH`.
+    const R3_WATCH: &str = "r3 watch review_2b40f7 --session docs";
+    /// Compiled binary, reached by absolute path.
+    const R3_WATCH_ABS: &str = "/home/riteye/.local/bin/r3 watch review_abc";
+    /// Run-from-source by full path — the form r3's own guide documents.
+    const R3_WATCH_SRC: &str =
+        "bun /home/riteye/projects/r3/cli/index.ts watch review_abc --agent-id x";
+    /// Run-from-source from inside the checkout: relative script, so the `r3`
+    /// evidence is the `cd` on the line before.
+    const R3_WATCH_SRC_REL: &str =
+        "cd /home/riteye/projects/r3\nbun cli/index.ts watch review_2b40f7";
+
+    /// A review-watch behind a runner, from the report that produced
+    /// `normalize_bg_command`'s shell-word parse. The inner `'` is the whole
+    /// point: a bash single-quoted string can't contain one, so the Bash tool
+    /// embeds this as a *concatenation* of quoted segments
+    /// (`…bash -c '"'"'…'"'"'`) in which the first quote closes only the first
+    /// segment. Slicing at that quote truncated the key to the wrapper prefix,
+    /// which both hid the `r3 watch` from the classifier and collapsed every
+    /// `<runner> --command bash -c '…'` onto one learning key.
+    const QUOTED_RUNNER_WATCH: &str = r#"nix develop /home/riteye/projects/app --command bash -c '/home/riteye/.local/bin/r3 watch review_742a2e64ef72 --session "claude:app-prd"'"#;
+
+    /// Both sides of `is_r3_watch_command`'s boundary in one table.
+    ///
+    /// They were two tests twenty lines apart, which is the wrong shape for a
+    /// recognizer: the interesting cases are the *adjacent* ones — `r3 watch`
+    /// against `cargo watch`, an `index.ts watch` with an r3 checkout on the
+    /// line against one without — and you could not see them together. Each row
+    /// carries why it lands where it does, so a failure names the rule it broke.
     #[test]
-    fn is_r3_watch_command_rejects_unrelated_watchers() {
-        assert!(!is_r3_watch_command("cargo watch -x run"));
-        assert!(!is_r3_watch_command("npm run watch"));
-        assert!(!is_r3_watch_command("watch -n1 ls"));
-        // `r3` present but not the `watch` subcommand.
-        assert!(!is_r3_watch_command("tail -f log && r3 list"));
-        // An `index.ts watch` outside any `r3` checkout stays ambiguous → no match.
-        assert!(!is_r3_watch_command("bun cli/index.ts watch foo"));
+    fn is_r3_watch_command_draws_the_documented_boundary() {
+        let cases: &[(bool, &str, &str)] = &[
+            (true, R3_WATCH, "compiled binary on PATH"),
+            (true, R3_WATCH_ABS, "compiled binary by absolute path"),
+            (true, R3_WATCH_SRC, "run-from-source, full path"),
+            (
+                true,
+                R3_WATCH_SRC_REL,
+                "run-from-source, cd + relative script",
+            ),
+            (
+                true,
+                "r3 watch somethingelse",
+                "the entrypoint token is enough; a review_ id is not required",
+            ),
+            (false, "cargo watch -x run", "a watcher, but not r3's"),
+            (
+                false,
+                "npm run watch",
+                "ditto — the seed heuristic's territory",
+            ),
+            (false, "watch -n1 ls", "the unrelated watch(1) utility"),
+            (
+                false,
+                "tail -f log && r3 list",
+                "r3 present, but not the watch subcommand",
+            ),
+            (
+                false,
+                "bun cli/index.ts watch foo",
+                "an index.ts watch with no r3 evidence on the line stays ambiguous",
+            ),
+        ];
+        for &(expect, cmd, why) in cases {
+            assert_eq!(
+                is_r3_watch_command(cmd),
+                expect,
+                "expected {expect} ({why}) for: {cmd}"
+            );
+        }
     }
 
     /// A real background-shell wrapper command line as `ps` reports it (captured
@@ -1955,7 +2010,7 @@ mod tests {
     fn wrapper(cmd: &str) -> String {
         let quoted = cmd.replace('\'', r#"'"'"'"#);
         format!(
-            "/nix/store/gik3-bash-5.3p9/bin/bash -c source /home/me/.claude/shell-snapshots/snapshot-bash-1782967947153-jmpq9h.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && {{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; }} >/dev/null 2>&1 || true && eval '{quoted}' < /dev/null && pwd -P >| /tmp/claude-41bf-cwd"
+            "/nix/store/gik3-bash-5.3p9/bin/bash -c source /home/riteye/.claude/shell-snapshots/snapshot-bash-1782967947153-jmpq9h.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && {{ \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; }} >/dev/null 2>&1 || true && eval '{quoted}' < /dev/null && pwd -P >| /tmp/claude-41bf-cwd"
         )
     }
 
@@ -1965,13 +2020,64 @@ mod tests {
         classify_bg_shells(cmds).map(|v| v.into_iter().map(|s| s.kind).collect())
     }
 
+    /// [`wrapper`] is load-bearing for every test below it, and nothing checked
+    /// it. Its doc-comment claims three properties; if it drifted out of any of
+    /// them — a renamed snapshot marker, a lost `eval '`, a mis-typed escape —
+    /// the tests using it would quietly stop exercising the wrapper path and
+    /// keep passing, because a line the filter *rejects* simply classifies as
+    /// no shell at all. So pin the helper itself, once, here.
     #[test]
-    fn classify_bg_shells_all_watch() {
-        // One running r3 review-watch → classified ReviewWatch.
-        let cmds = vec![wrapper(
-            "bun /home/me/projects/r3/cli/index.ts watch review_63e0ef --session 5ecc9e58 --agent-id claude",
-        )];
-        assert_eq!(kinds(&cmds), Some(vec![BgSeedKind::ReviewWatch]));
+    fn wrapper_builds_a_line_the_bash_tool_filter_recognizes() {
+        let line = wrapper("npm run dev");
+        assert!(
+            line.contains(SHELL_SNAPSHOT_MARKER),
+            "no snapshot marker, so bg_shells would filter this line out: {line}"
+        );
+        // The `unalias` preamble contains quotes of its own; the eval body has
+        // to survive them.
+        assert_eq!(normalize_bg_command(&line), "npm run dev");
+
+        // A command with its own `'` must come out as the multi-segment form,
+        // not a single quoted string — otherwise QUOTED_RUNNER_WATCH below
+        // silently degrades into the easy case it exists to rule out.
+        let quoted = wrapper(QUOTED_RUNNER_WATCH);
+        assert!(
+            quoted.contains(r#"'"'"'"#),
+            "wrapper lost the quote concatenation: {quoted}"
+        );
+        assert_eq!(normalize_bg_command(&quoted), QUOTED_RUNNER_WATCH);
+    }
+
+    /// Classification keys on the command's **form**, never on where the binary
+    /// lives — the property that lets every path in this module be a
+    /// placeholder. One table over the forms that reach us, replacing three
+    /// near-identical single-form tests.
+    #[test]
+    fn classify_bg_shells_keys_on_command_form_not_on_paths() {
+        let cases: &[(&str, BgSeedKind, &str)] = &[
+            (R3_WATCH, BgSeedKind::ReviewWatch, "compiled binary"),
+            (R3_WATCH_SRC, BgSeedKind::ReviewWatch, "run-from-source"),
+            (
+                QUOTED_RUNNER_WATCH,
+                BgSeedKind::ReviewWatch,
+                "review-watch behind a quoted runner",
+            ),
+            ("npm run dev", BgSeedKind::LongRunning, "seed heuristic"),
+            (
+                "cargo build 2>&1 | tail -40",
+                BgSeedKind::Other,
+                "transient, so the row stays busy",
+            ),
+        ];
+        for &(cmd, kind, why) in cases {
+            let line = wrapper(cmd);
+            let seeds = classify_bg_shells(&[line]).expect("a wrapped command is a bg shell");
+            assert_eq!(seeds.len(), 1, "{why}");
+            // Assert the *pair*: the kind is only meaningful next to the key it
+            // was derived from, and the key is what the learning store records.
+            assert_eq!(seeds[0].kind, kind, "wrong kind for {why}: {cmd}");
+            assert_eq!(seeds[0].key, cmd, "key not recovered for {why}");
+        }
     }
 
     #[test]
@@ -1997,7 +2103,7 @@ mod tests {
     fn classify_bg_shells_ignores_non_shell_children() {
         // MCP stdio servers / helpers never source a shell snapshot: they're not
         // background tasks and must not block the refinement…
-        let mcp = "node /home/me/.local/lib/some-mcp-server/index.js --stdio".to_string();
+        let mcp = "node /home/riteye/.local/lib/some-mcp-server/index.js --stdio".to_string();
         let cmds = vec![mcp.clone(), wrapper("r3 watch review_2b40f7")];
         assert_eq!(kinds(&cmds), Some(vec![BgSeedKind::ReviewWatch]));
         // …and alone they're not a running set either (nothing to classify).
@@ -2018,39 +2124,14 @@ mod tests {
         assert_eq!(normalize_bg_command("  vite  "), "vite");
     }
 
-    /// A command containing its own `'` is embedded as a concatenation of quoted
-    /// segments (`…bash -c '"'"'…'"'"'`), so the key can only be recovered by
-    /// parsing the eval argument as a shell word. Slicing at the first quote
-    /// truncated it to the wrapper prefix — which both hid the r3 watch inside
-    /// and collapsed every `<runner> --command bash -c '…'` onto one key.
+    /// Quoting forms the eval body has to survive, beyond the round trip
+    /// [`wrapper_builds_a_line_the_bash_tool_filter_recognizes`] already pins.
     #[test]
     fn normalize_bg_command_survives_quotes_inside_the_command() {
-        let inner = r#"nix develop /home/me/projects/pandallet --command bash -c '/home/me/bin/r3 watch review_742a2e64ef72 --session "claude:aporia-prd"'"#;
-        assert_eq!(normalize_bg_command(&wrapper(inner)), inner);
-
-        // Double quotes inside the single-quoted argument stay literal, so a
-        // key that already worked keeps exactly the same spelling.
-        let quoted = r#"export PATH="/nix/store/bun/bin:$PATH" /home/me/bin/r3 watch review_389337185556 --session "claude: readme review""#;
+        // Double quotes inside the single-quoted argument stay literal, so a key
+        // that already worked keeps exactly the same spelling.
+        let quoted = r#"export PATH="/nix/store/bun/bin:$PATH" /home/riteye/.local/bin/r3 watch review_389337185556 --session "claude: readme review""#;
         assert_eq!(normalize_bg_command(&wrapper(quoted)), quoted);
-    }
-
-    /// The failing report this fix came from, pinned against the exact `ps` line
-    /// (Claude Code 2.1.220 / bash 5.3): a `nix develop … --command bash -c '…'`
-    /// review-watch classified as a plain background task instead of
-    /// `ReviewWatch`, so the row read "Task" and never "Review".
-    #[test]
-    fn classify_bg_shells_sees_r3_watch_through_a_quoted_runner() {
-        let live = concat!(
-            "/nix/store/gik3rh1vz2jlgnifb9dh6vc6sxwwz9jj-bash-5.3p9/bin/bash -c source ",
-            "/home/liteye/.claude/shell-snapshots/snapshot-bash-1785691309098-vk63tk.sh 2>/dev/null || true ",
-            "&& shopt -u extglob 2>/dev/null || true ",
-            r#"&& { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true "#,
-            r#"&& eval 'nix develop /home/liteye/projects/hovo/pandallet --command bash -c '"'"'"#,
-            r#"/home/liteye/projects/hovo/pocket/bin/r3 watch review_742a2e64ef72 --session "claude:aporia-prd"'"'"'' "#,
-            "< /dev/null && pwd -P >| /tmp/claude-9f48-cwd",
-        )
-        .to_string();
-        assert_eq!(kinds(&[live]), Some(vec![BgSeedKind::ReviewWatch]));
     }
 
     #[test]
@@ -2120,8 +2201,8 @@ mod tests {
     fn parse_ps_children_filters_by_ppid() {
         let ps = "\
     1 /sbin/launchd
- 4321 /bin/bash -c source /Users/me/.claude/shell-snapshots/snapshot-zsh-17.sh && eval 'r3 watch review_1'
- 4321 bun /Users/me/projects/r3/cli/index.ts watch review_1
+ 4321 /bin/bash -c source /Users/riteye/.claude/shell-snapshots/snapshot-zsh-17.sh && eval 'r3 watch review_1'
+ 4321 bun /Users/riteye/projects/r3/cli/index.ts watch review_1
   999 unrelated --ppid 4321
 ";
         let children = parse_ps_child_cmdlines(ps, 4321);
