@@ -23,6 +23,15 @@
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = ["x86_64-linux" "aarch64-darwin"];
 
+      # System-independent, so outside `perSystem`: the module resolves its
+      # package from `self.packages.${pkgs.system}` at evaluation time.
+      flake.homeManagerModules = let
+        module = import ./nix/home-manager.nix self;
+      in {
+        captain-miao = module;
+        default = module;
+      };
+
       perSystem = {
         pkgs,
         system,
@@ -105,6 +114,7 @@
             inherit cargoArtifacts;
             pname = "captain-miao-server";
             cargoExtraArgs = "--locked -p captain-miao-server";
+            meta.mainProgram = "miao-server";
           });
         # The dashboard variants that carry a `miao-server` to deploy to
         # a remote host — one package per variant `cargo xtask dist` knows about
