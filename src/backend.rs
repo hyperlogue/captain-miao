@@ -816,22 +816,33 @@ fn attach_argv(
 }
 
 /// The argv for a window that opens an interactive login shell on a remote host
-/// in `cwd`, over ssh: `ssh -t <target> "cd <cwd> && exec $SHELL -l"`, sharing
-/// the ControlMaster like [`attach_argv`]. `-t` forces a pty so the shell is
-/// interactive; the `cd` lands in the session's workdir, then we hand off to the
-/// user's login shell (falling back to `/bin/sh`).
+/// in `cwd`, over ssh (the `w` work tab), sharing the ControlMaster like
+/// [`attach_argv`]. `-t` forces a pty so the shell is interactive; the `cd`
+/// lands in the session's workdir, then we hand off to the user's login shell
+/// (falling back to `/bin/sh`).
 ///
-/// `cwd` is **host-canonical** (§3), so it may be a `~` form — which a plain
-/// `'…'` quoting would render inert. `shell_quote_host_path` emits the tilde as
-/// a `"$HOME"` the *remote* shell expands while keeping the rest quoted, so
-/// spaces and glob chars are still safe. An empty `cwd` just drops the `cd`.
-/// Pure + unit-tested.
+/// **The body must go through [`login_shell_safe`]**, and getting that wrong is
+/// what made `w` on a remote row flash a window open and shut. `ssh host <cmd>`
+/// hands the string to the *account's* login shell, so the `${SHELL:-/bin/sh}`
+/// default-expansion this needs is a syntax error the moment that shell is
+/// `fish` — the window dies before it draws. Wrapping in `/bin/sh -c '…'` puts
+/// the expansion in front of a shell that speaks it.
+///
+/// The wrapped script may contain no single quote and no backslash (see
+/// [`login_shell_safe`]), which is why the directory is *not* interpolated into
+/// it: `shell_quote_host_path` emits `'…'`. It rides as a positional argument
+/// **outside** the wrapper — where single quotes are literal in every dialect —
+/// and the script reads it as `$0`. That also keeps the tilde working: `cwd` is
+/// **host-canonical** (§3), so a `~` form reaches the remote as a `"$HOME"` the
+/// login shell expands, where plain `'…'` quoting would render it inert. An
+/// empty `cwd` just drops the `cd`. Pure + unit-tested.
 fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
     let remote_cmd = if cwd.is_empty() {
-        "exec \"${SHELL:-/bin/sh}\" -l".to_string()
+        login_shell_safe("exec \"${SHELL:-/bin/sh}\" -l")
     } else {
         format!(
-            "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+            "{} {}",
+            login_shell_safe("cd \"$0\" && exec \"${SHELL:-/bin/sh}\" -l"),
             cm_core::paths::shell_quote_host_path(cwd)
         )
     };
@@ -2678,23 +2689,65 @@ mod tests {
             ssh_tail(&argv),
             [
                 "user@box",
-                "cd '/home/u/proj' && exec \"${SHELL:-/bin/sh}\" -l"
+                "/bin/sh -c 'cd \"$0\" && exec \"${SHELL:-/bin/sh}\" -l' '/home/u/proj'"
             ]
         );
         // The landmine (§3): a host-canonical `~` path must reach the remote as
         // something the *remote* shell expands. Single-quoting it — the obvious
-        // thing — would make `cd '~/proj'` fail on every host.
+        // thing — would make `cd '~/proj'` fail on every host. It rides outside
+        // the `sh -c` wrapper precisely so it can keep its quotes.
         let argv = remote_shell_argv("box", "~/proj");
         assert_eq!(
             ssh_tail(&argv),
             [
                 "box",
-                "cd \"$HOME\"/'proj' && exec \"${SHELL:-/bin/sh}\" -l"
+                "/bin/sh -c 'cd \"$0\" && exec \"${SHELL:-/bin/sh}\" -l' \"$HOME\"/'proj'"
             ]
         );
         // Empty cwd drops the `cd` and just opens a login shell.
         let argv = remote_shell_argv("box", "");
-        assert_eq!(ssh_tail(&argv), ["box", "exec \"${SHELL:-/bin/sh}\" -l"]);
+        assert_eq!(
+            ssh_tail(&argv),
+            ["box", "/bin/sh -c 'exec \"${SHELL:-/bin/sh}\" -l'"]
+        );
+    }
+
+    /// The regression that made `w` unusable on a remote row: the command ssh
+    /// sends is parsed by the *account's login shell*, and a bare
+    /// `${SHELL:-/bin/sh}` is a syntax error in fish — the window opened and
+    /// died before it drew anything. Parse the real string under every shell
+    /// installed here, the way the deploy script's test does.
+    ///
+    /// Parse-only (`-n` / `--no-execute`), because *running* it would fork an
+    /// interactive login shell. That rules csh out (no syntax-check mode with
+    /// `-c`); its share of the guarantee rides on the same literal-single-quote
+    /// rule [`login_shell_safe`] documents.
+    #[test]
+    fn remote_shell_command_parses_under_every_login_shell() {
+        let cmd = remote_shell_argv("box", "~/proj").pop().unwrap();
+        let mut checked = 0;
+        for (shell, check) in [
+            ("/bin/sh", "-n"),
+            ("bash", "-n"),
+            ("zsh", "-n"),
+            ("dash", "-n"),
+            ("ksh", "-n"),
+            ("fish", "--no-execute"),
+        ] {
+            let Ok(out) = std::process::Command::new(shell)
+                .args([check, "-c", &cmd])
+                .output()
+            else {
+                continue; // not installed here
+            };
+            assert!(
+                out.status.success(),
+                "{shell} rejected the work-tab command: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no shell available to parse-check with");
     }
 
     /// A probe of a host with no running daemon and no protocol announced by

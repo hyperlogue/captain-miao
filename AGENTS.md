@@ -680,8 +680,13 @@ rationale in `docs/crate-split.md`; this is the map.
   script must contain **no single quote and no backslash** — hence `echo` for the
   marker instead of `printf '%s\n'`, and clearing the temp file up front instead
   of an `EXIT` trap. A test runs the deploy under every shell installed on the
-  machine. (Note `remote_shell_argv`, for `w` work tabs, is **not** wrapped and
-  still emits `${SHELL:-/bin/sh}` — invalid in fish. Separate defect.)
+  machine. **`remote_shell_argv` (the `w` work tab) is wrapped too** — it wasn't,
+  and its `${SHELL:-/bin/sh}` made `w` on a remote row flash a window open and
+  shut on any fish account. Its workdir can't go *inside* the wrapper
+  (`shell_quote_host_path` emits `'…'`), so it rides as a positional argument
+  outside it — single quotes are literal in every dialect there — and the script
+  reads it as `$0`, which also keeps the host-canonical `~` expanding remotely.
+  Parse-checked under every installed shell.
 - **A failed deploy is rate-limited** (`UploadGate`, a map keyed on the payload
   digest — a *map*, because with more than one candidate a single slot is evicted
   by the next failure, leaving the first unsuppressed and re-sending both every
