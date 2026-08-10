@@ -813,11 +813,46 @@ const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; shift 3; \
      EXIT HUP INT TERM; \
      \"$@\"";
 
+/// This dashboard's own binary, for the attach wrapper to re-invoke as
+/// `miao attach-exited`. `None` when it can't be named, which costs the report
+/// and nothing else — the attach spawns unwrapped and the periodic prune covers
+/// it.
+pub(crate) fn reporter_exe() -> Option<String> {
+    resolve_reporter_exe(std::env::current_exe().ok()?, |p| p.exists())
+}
+
+/// The `(deleted)` guard, split out from the environment so it is testable.
+///
+/// `/proc/self/exe` resolves to the running *inode*, so the moment the binary on
+/// disk is replaced — every `cargo build` while the dashboard is up, i.e. the
+/// entire dev loop — Linux reports the original path with a literal
+/// `" (deleted)"` appended (documented on `std::env::current_exe`). Handing that
+/// to the wrapper produces a path that cannot be executed, and the report would
+/// then silently never arrive: the exact configuration in which someone is most
+/// likely to be *testing* the report.
+///
+/// Stripping the suffix is right rather than merely convenient: the path is
+/// re-executed at trap time, minutes or hours later, so what matters is what
+/// lives there *then* — which after a rebuild is the new binary, carrying the
+/// same subcommand. The existence check is what keeps a genuinely deleted binary
+/// (a moved install, a `cargo clean`) from being spliced into the wrapper.
+fn resolve_reporter_exe(exe: PathBuf, exists: impl Fn(&Path) -> bool) -> Option<String> {
+    // A non-UTF-8 path can't ride in the argv we build; treat it as unnameable.
+    let raw = exe.to_str()?;
+    // The literal path wins when it is really there — the suffix is only ever a
+    // *guess* that the kernel appended it, and a file may legitimately carry it.
+    if exists(Path::new(raw)) {
+        return Some(raw.to_string());
+    }
+    let stripped = raw.strip_suffix(" (deleted)")?;
+    exists(Path::new(stripped)).then(|| stripped.to_string())
+}
+
 /// Wrap an attach argv so the window reports back when the attach ends, giving
 /// the dashboard an *event* for detachment instead of a periodic window-tree
 /// snapshot (`cm_core::state::DetachReport`).
 ///
-/// `exe` is this dashboard's own binary (`current_exe`), re-invoked as
+/// `exe` is this dashboard's own binary ([`reporter_exe`]), re-invoked as
 /// `miao attach-exited`; it is passed rather than re-derived so the caller owns
 /// the failure case — with no resolvable exe there is nothing to report *with*,
 /// and the argv is returned unwrapped so the attach still works.
@@ -3779,6 +3814,40 @@ mod tests {
             // went away", never as a refused attach.
             "attach-exited --host box --token cm-1 --status 129\n",
             "a closed window must report exactly once, with the signal status"
+        );
+    }
+
+    /// `cargo build` while the dashboard is running replaces the inode
+    /// `/proc/self/exe` points at, and Linux then reports the path with a
+    /// literal `" (deleted)"` glued on. Splicing that into the wrapper yields a
+    /// path that cannot be executed, so the report silently never arrives — in
+    /// the one configuration where someone is most likely to be testing it.
+    #[test]
+    fn the_reporter_path_survives_a_rebuild_under_a_running_dashboard() {
+        let real = PathBuf::from("/opt/miao/bin/miao");
+        let present = |p: &Path| p == real;
+
+        assert_eq!(
+            resolve_reporter_exe(real.clone(), present).as_deref(),
+            Some("/opt/miao/bin/miao")
+        );
+        // The rebuilt case: same path, new binary behind it by the time the trap
+        // runs — which is what the wrapper re-executes.
+        assert_eq!(
+            resolve_reporter_exe(PathBuf::from("/opt/miao/bin/miao (deleted)"), present).as_deref(),
+            Some("/opt/miao/bin/miao")
+        );
+        // Genuinely gone (moved install, `cargo clean`): nothing to report with,
+        // so the attach runs unwrapped rather than carrying a dead path.
+        assert_eq!(
+            resolve_reporter_exe(PathBuf::from("/opt/miao/bin/miao"), |_: &Path| false),
+            None
+        );
+        // A path that really does end in " (deleted)" and exists is left alone.
+        let odd = PathBuf::from("/opt/miao (deleted)");
+        assert_eq!(
+            resolve_reporter_exe(odd.clone(), |p: &Path| p == odd).as_deref(),
+            Some("/opt/miao (deleted)")
         );
     }
 

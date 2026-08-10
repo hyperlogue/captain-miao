@@ -686,9 +686,7 @@ async fn attach_pool_session(
     // lands in a directory the dashboard watches — no window-tree polling in the
     // path at all. Best-effort: with no resolvable exe there is nothing to report
     // with, so the attach runs unwrapped and the periodic prune covers it.
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string));
+    let exe = crate::backend::reporter_exe();
     let argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &host.0, &pool_session);
     let spec = SpawnSpec {
         cwd: app.home_dir.clone(),
