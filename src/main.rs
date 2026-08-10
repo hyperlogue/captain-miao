@@ -116,6 +116,12 @@ enum Commands {
         /// The session's binding token (its pool session name).
         #[arg(long)]
         token: String,
+
+        /// The attach command's exit status, which tells a session that ran and
+        /// ended from one that was refused on arrival — the dashboard leaves the
+        /// latter's window open so its error stays readable.
+        #[arg(long)]
+        status: Option<i32>,
     },
 }
 
@@ -199,14 +205,18 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Commands::Hook { event, sock, agent }) => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
         }
-        Some(Commands::AttachExited { host, token }) => {
+        Some(Commands::AttachExited {
+            host,
+            token,
+            status,
+        }) => {
             // A sentinel drop and nothing else — the dashboard's watcher on the
             // sessions dir turns it into a binding retirement. Deliberately not
             // a socket or a signal: this runs from a dying window's trap, so it
             // must not block, must not need the dashboard to be reachable, and
             // must survive the dashboard being restarted between the write and
             // the read.
-            state::write_detach_report(&host, &token);
+            state::write_detach_report(&host, &token, status);
             Ok(())
         }
         Some(Commands::Focus { window_id }) => {

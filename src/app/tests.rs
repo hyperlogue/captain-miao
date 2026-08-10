@@ -1189,6 +1189,7 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
     let changed = d.app.apply_detach_reports(vec![DetachReport {
         host: "box".into(),
         token: "cm-away".into(),
+        status: Some(0),
     }]);
     assert!(changed);
     assert!(d.app.is_detached_row(&d.app.sessions[0].clone()));
@@ -1205,13 +1206,48 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
         d.app.window_bindings.expected_without_window(&host),
         vec!["cm-away".to_string()]
     );
+    // The window it was bound to is queued for closing: it is `hold: true`, so
+    // it outlived the attach and is now a corpse the next `Enter` would spawn a
+    // sibling for.
+    assert_eq!(d.app.reap_window_queue, vec![WindowId::from(900u64)]);
 
     // A report for a binding we no longer hold is a no-op, not a wobble: the
     // snapshot prune or a `D` may well have got there first.
     assert!(!d.app.apply_detach_reports(vec![DetachReport {
         host: "box".into(),
         token: "cm-away".into(),
+        status: Some(0),
     }]));
+}
+
+/// A dropped ssh leaves the attach window behind (it is spawned `hold: true`),
+/// showing a dead session's last frame while the row says detached — and `Enter`
+/// then opens a *second* window beside it. So a spent attach's window is closed.
+/// But a *refused* attach's window is the only place its error exists, so that
+/// one stays: the two are told apart by exit status plus how long it ran.
+#[test]
+fn a_spent_attach_window_is_closed_but_a_refused_one_is_kept() {
+    use super::attach_window_is_spent;
+    use std::time::Duration;
+    let grace = super::ATTACH_STARTUP_GRACE;
+
+    // Ran and ended: a clean detach, and a link that died mid-session (ssh's
+    // 255, indistinguishable by status alone from a failure to connect — which
+    // is exactly why the duration is consulted).
+    assert!(attach_window_is_spent(Duration::from_secs(1), Some(0)));
+    assert!(attach_window_is_spent(grace, Some(255)));
+    // The window was torn down under the wrapper (128 + SIGHUP). Never a
+    // refusal, whatever the duration — otherwise closing a window seconds after
+    // opening it would be announced as a failed attach, pointing at a window
+    // that is already gone.
+    assert!(attach_window_is_spent(Duration::from_secs(1), Some(129)));
+    // A reporter that couldn't determine a status reads as clean.
+    assert!(attach_window_is_spent(Duration::from_secs(1), None));
+
+    // Refused on arrival — busy, stale name, ssh auth. The window holds the only
+    // copy of that message.
+    assert!(!attach_window_is_spent(Duration::from_millis(200), Some(1)));
+    assert!(!attach_window_is_spent(Duration::from_secs(2), Some(255)));
 }
 
 /// The preview panel is a capture of the row's *local* window, so a detached row

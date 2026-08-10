@@ -802,8 +802,14 @@ impl RemoteBackend {
 /// the ride. The `$d` latch keeps the pair from reporting twice — after a HUP
 /// handler returns, the interrupted wait unwinds and the script still exits
 /// through its EXIT trap.
+///
+/// `c=$?` is the *first* thing the handler does: it is the attach's exit status,
+/// and the latch test below would otherwise overwrite it. The dashboard uses it
+/// to tell an attach that ran and ended from one that was refused on arrival,
+/// and so whether the window still has something worth reading in it.
 const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; shift 3; \
-     trap 'if [ -z \"$d\" ]; then d=1; \"$e\" attach-exited --host \"$h\" --token \"$t\"; fi' \
+     trap 'c=$?; if [ -z \"$d\" ]; then d=1; \
+     \"$e\" attach-exited --host \"$h\" --token \"$t\" --status \"$c\"; fi' \
      EXIT HUP INT TERM; \
      \"$@\"";
 
@@ -3726,7 +3732,7 @@ mod tests {
         // mean the EXIT/HUP trap pair fired twice — the latch is what stops it.
         assert_eq!(
             std::fs::read_to_string(dir.join("reports")).unwrap(),
-            "attach-exited --host box --token cm-claude-7-1\n"
+            "attach-exited --host box --token cm-claude-7-1 --status 0\n"
         );
     }
 
@@ -3769,8 +3775,10 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(dir.join("reports")).unwrap(),
-            "attach-exited --host box --token cm-1\n",
-            "a closed window must report exactly once"
+            // 129 = 128 + SIGHUP: the status the dashboard reads as "the window
+            // went away", never as a refused attach.
+            "attach-exited --host box --token cm-1 --status 129\n",
+            "a closed window must report exactly once, with the signal status"
         );
     }
 

@@ -130,7 +130,7 @@ readable. Pinned by `state_dirs_and_files_are_owner_only`.
 
 - `sessions/{pid}.json` — launcher state files (atomic write via temp+rename)
 - `sessions/bell-{pid}.flag` — bell sentinels dropped by `miao focus --window-id`
-- `sessions/detach-{pid}.flag` — detach reports (`{host, token}`) dropped by an attach window's wrapper when its attach ends, so the dashboard retires the window binding on an event instead of a window-tree poll. Drained (and deleted) by the dashboard; safe to delete
+- `sessions/detach-{pid}.flag` — detach reports (`{host, token, status}`) dropped by an attach window's wrapper when its attach ends, so the dashboard retires the window binding on an event instead of a window-tree poll. Drained (and deleted) by the dashboard; safe to delete
 - `dashboard.pid` — dashboard singleton lock
 - `dashboard-window-id` — for the `focus` command, written as `<terminal-identity>|<window-id>` so a focus process in another terminal declines instead of driving a same-numbered foreign window
 - `window-bindings.json` — the dashboard's persisted window↔session bindings (`window_id`, `host`, `launcher_pid`, `token`, `terminal`); same-terminal entries are validated/pruned against live rows, foreign-terminal entries are carried verbatim so a dashboard backend switch loses nothing
@@ -450,6 +450,21 @@ it uses no ssh and has its own config flag.
   pooled-localhost replaces `backends[0]` with a socket client that has no
   filesystem watcher, and it is kept off `fs_dirty` since retiring a binding
   needs no session re-read.
+- **A report also cleans up the window it names — unless that window is holding
+  an error.** An attach window is spawned `hold: true`, so it outlives its attach:
+  a dropped ssh (or a dead ControlMaster, which takes every attach window on that
+  host at once) leaves a corpse showing a dead session's last frame, while the row
+  reads detached and the next `Enter` opens a *second* window beside it. So the
+  report closes it. But an attach *refused on arrival* — the busy guard, a stale
+  name, ssh auth — holds the only copy of that error, since the dashboard never
+  sees an attach's stderr. `attach_window_is_spent` (pure, tested) tells them
+  apart from the wrapper's exit status plus how long the binding lived: clean or
+  unknown → spent; 129/130/143 (128 + HUP/INT/TERM, the signals the wrapper traps
+  — the window was torn down under it) → spent whatever the duration; anything
+  else → spent only past `ATTACH_STARTUP_GRACE` (10s). Both halves are needed:
+  **ssh reports a mid-session drop and a failure to connect with the same 255**,
+  which is why the status can't decide alone and why the signal test is spelled
+  out rather than written `>= 128`.
 - **The periodic prune is now the backstop**, for the one case no trap can cover:
   the terminal emulator killed outright. Floored at
   `DETACH_PRUNE_MIN_INTERVAL` — **60s**, affordable precisely because it is no

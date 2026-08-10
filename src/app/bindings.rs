@@ -17,6 +17,7 @@
 //! `docs/remote-sessions.md` §8, §15.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::state::HostId;
 use crate::terminal::WindowId;
@@ -32,6 +33,24 @@ pub(crate) struct BindingKey {
     pub(crate) token: String,
 }
 
+/// A bound window, plus when the dashboard opened it.
+struct Bound {
+    window: WindowId,
+    /// Used only by [`WindowBindings::prune_token`], to tell an attach that ran
+    /// and then ended from one that died on arrival — see [`RetiredBinding`].
+    since: Instant,
+}
+
+/// What [`WindowBindings::prune_token`] hands back: the window that was bound,
+/// and how long it had been. The caller needs the duration to decide whether the
+/// window is worth closing or worth leaving on screen, so it is returned rather
+/// than the raw `Instant` — the policy is the dashboard's, the bookkeeping is
+/// this module's.
+pub(crate) struct RetiredBinding {
+    pub(crate) window: WindowId,
+    pub(crate) held_for: Duration,
+}
+
 /// `(host, token) → local window` for every session the dashboard has a window
 /// for. Nested `host → (token → window)` so `window_for`/`remove` probe by
 /// `&HostId` then `&str` without allocating a [`BindingKey`]. Invariant: an
@@ -39,7 +58,7 @@ pub(crate) struct BindingKey {
 /// when its last token goes, so `is_empty` is just the outer map's emptiness.
 #[derive(Default)]
 pub(crate) struct WindowBindings {
-    by_host: HashMap<HostId, HashMap<String, WindowId>>,
+    by_host: HashMap<HostId, HashMap<String, Bound>>,
     /// Sessions the dashboard **expects** to be holding an attach window for.
     ///
     /// Deliberately outlives the window itself: [`WindowBindings::prune_dead`]
@@ -59,7 +78,13 @@ impl WindowBindings {
             host: host.clone(),
             token: token.clone(),
         });
-        self.by_host.entry(host).or_default().insert(token, window);
+        self.by_host.entry(host).or_default().insert(
+            token,
+            Bound {
+                window,
+                since: Instant::now(),
+            },
+        );
     }
 
     /// Drop the binding for `(host, token)` if present, returning the window it
@@ -79,7 +104,7 @@ impl WindowBindings {
         if inner.is_empty() {
             self.by_host.remove(host);
         }
-        removed
+        removed.map(|b| b.window)
     }
 
     /// Retire the binding for `(host, token)` because its window is gone,
@@ -92,13 +117,16 @@ impl WindowBindings {
     /// closed window and a killed ssh are indistinguishable from here, and both
     /// should come back when the host reconnects. Only `D` retires the
     /// expectation.
-    pub(crate) fn prune_token(&mut self, host: &HostId, token: &str) -> Option<WindowId> {
+    pub(crate) fn prune_token(&mut self, host: &HostId, token: &str) -> Option<RetiredBinding> {
         let inner = self.by_host.get_mut(host)?;
         let removed = inner.remove(token);
         if inner.is_empty() {
             self.by_host.remove(host);
         }
-        removed
+        removed.map(|b| RetiredBinding {
+            window: b.window,
+            held_for: b.since.elapsed(),
+        })
     }
 
     /// Tokens on `host` the dashboard expects to be attached to but currently
@@ -121,26 +149,25 @@ impl WindowBindings {
 
     /// The local window bound to this session's token, if any.
     pub(crate) fn window_for(&self, host: &HostId, token: &str) -> Option<&WindowId> {
-        self.by_host.get(host)?.get(token)
+        self.by_host.get(host)?.get(token).map(|b| &b.window)
     }
 
     /// Drop bindings whose window is no longer in `live` (the windows a
     /// `Terminal::snapshot` currently shows). Returns the dropped keys — the
     /// remote sessions that just detached and should leave the dashboard.
     pub(crate) fn prune_dead(&mut self, live: &HashSet<WindowId>) -> Vec<BindingKey> {
-        let dead: Vec<BindingKey> = self
-            .by_host
-            .iter()
-            .flat_map(|(host, inner)| {
-                inner
-                    .iter()
-                    .filter(|(_, w)| !live.contains(*w))
-                    .map(move |(token, _)| BindingKey {
-                        host: host.clone(),
-                        token: token.clone(),
-                    })
-            })
-            .collect();
+        let dead: Vec<BindingKey> =
+            self.by_host
+                .iter()
+                .flat_map(|(host, inner)| {
+                    inner.iter().filter(|(_, b)| !live.contains(&b.window)).map(
+                        move |(token, _)| BindingKey {
+                            host: host.clone(),
+                            token: token.clone(),
+                        },
+                    )
+                })
+                .collect();
         for k in &dead {
             if let Some(inner) = self.by_host.get_mut(&k.host) {
                 inner.remove(&k.token);

@@ -931,6 +931,11 @@ pub struct DetachReport {
     pub host: String,
     /// The session's binding token — its `pool_session` name.
     pub token: String,
+    /// The attach command's exit status. `None` from a reporter that predates
+    /// the field (or couldn't determine one), which reads as "unknown" and is
+    /// treated as a clean end.
+    #[serde(default)]
+    pub status: Option<i32>,
 }
 
 /// `detach-{reporter pid}.flag`, in the sessions dir. The `.flag` extension
@@ -944,18 +949,19 @@ fn detach_report_path(dir: &Path, reporter_pid: u32) -> PathBuf {
 /// Drop the sentinel for `(host, token)`. Best-effort by nature: the report is
 /// a courtesy that makes the dashboard prompt, and the periodic prune is what
 /// makes it *correct*, so a failure here costs latency and nothing else.
-pub fn write_detach_report(host: &str, token: &str) {
-    write_detach_report_in(&sessions_dir(), host, token);
+pub fn write_detach_report(host: &str, token: &str, status: Option<i32>) {
+    write_detach_report_in(&sessions_dir(), host, token, status);
 }
 
 /// [`write_detach_report`] against an explicit directory, so the round trip is
 /// testable without redirecting the whole process's state dir.
-fn write_detach_report_in(dir: &Path, host: &str, token: &str) {
+fn write_detach_report_in(dir: &Path, host: &str, token: &str, status: Option<i32>) {
     let _ = create_dir_all_private(dir);
     let path = detach_report_path(dir, std::process::id());
     let report = DetachReport {
         host: host.to_string(),
         token: token.to_string(),
+        status,
     };
     if let Err(e) = write_json_atomic(&path, &report) {
         tracing::debug!("could not write detach report {}: {e}", path.display());
@@ -1093,12 +1099,13 @@ mod tests {
             drain_detach_reports_in(&dir).is_empty(),
             "no dir, no reports"
         );
-        write_detach_report_in(&dir, "box", "cm-claude-7-1");
+        write_detach_report_in(&dir, "box", "cm-claude-7-1", Some(0));
         assert_eq!(
             drain_detach_reports_in(&dir),
             vec![DetachReport {
                 host: "box".into(),
                 token: "cm-claude-7-1".into(),
+                status: Some(0),
             }]
         );
         assert!(drain_detach_reports_in(&dir).is_empty(), "drained once");
@@ -1106,7 +1113,7 @@ mod tests {
         // A torn write is removed rather than re-read forever, and doesn't take
         // a good sentinel down with it.
         std::fs::write(dir.join("detach-999999.flag"), b"{ truncated").unwrap();
-        write_detach_report_in(&dir, "box", "cm-2");
+        write_detach_report_in(&dir, "box", "cm-2", Some(255));
         let drained = drain_detach_reports_in(&dir);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].token, "cm-2");
@@ -1114,7 +1121,7 @@ mod tests {
 
         // The sentinel must stay invisible to the state-file reader: it shares
         // the sessions dir with `{pid}.json`, and a `.flag` is not a session.
-        write_detach_report_in(&dir, "box", "cm-3");
+        write_detach_report_in(&dir, "box", "cm-3", None);
         let jsons = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()

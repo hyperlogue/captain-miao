@@ -896,6 +896,52 @@ pub(super) fn flag_key(s: &LauncherState) -> FlagKey {
     (s.host.clone(), s.launcher_pid)
 }
 
+/// How long an attach has to survive before a failure is read as "the link
+/// died" rather than "it never got going". Sized for the slow half of a real
+/// attach — an ssh handshake plus shpool's connect — not for a refusal, which
+/// comes back at once.
+const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether a finished attach's window has anything left worth looking at, given
+/// how long it ran and how it exited.
+///
+/// The window is spawned `hold: true`, so it outlives the attach either way, and
+/// the two outcomes want opposite treatment:
+///
+/// * **Spent** — it attached, ran, and ended (a clean detach, a broken pipe, a
+///   dead ControlMaster). What's on screen is a dead session's last frame, the
+///   row is already detached, and `Enter` opens a *fresh* window beside it. Close
+///   it.
+/// * **Refused** — it exited non-zero almost immediately: the busy guard, a
+///   stale name, an ssh that couldn't authenticate. The window is holding the
+///   only copy of that error (the dashboard never sees the attach's stderr), so
+///   it stays.
+///
+/// 129/130/143 are 128 + HUP/INT/TERM — exactly the signals the wrapper traps,
+/// and each one means the window was torn down under it (closing a window
+/// SIGHUPs its foreground group). That is never a refusal, so it counts as spent
+/// whatever the duration says; without the carve out, closing a window within
+/// the grace would be announced as a failed attach, pointing at a window that no
+/// longer exists. The range is spelled out rather than tested as `>= 128`
+/// because **ssh exits 255**, which that would swallow — and 255 is precisely
+/// the ambiguous status the duration is there to resolve.
+///
+/// Both halves of the remaining test are load-bearing. Status alone can't
+/// separate the rest: ssh reports a mid-session drop and a failure to connect
+/// with the same 255. Duration alone can't either: it would keep a window for
+/// every session someone detaches inside the grace. A missing status (a reporter
+/// that couldn't determine one) reads as clean — closing a window that had an
+/// error in it is a milder failure than leaving a corpse on screen after every
+/// dropped link.
+fn attach_window_is_spent(held_for: Duration, status: Option<i32>) -> bool {
+    match status {
+        None | Some(0) => true,
+        // 128 + HUP / INT / TERM.
+        Some(129 | 130 | 143) => true,
+        Some(_) => held_for >= ATTACH_STARTUP_GRACE,
+    }
+}
+
 /// Whether a session matches a `FlagKey`, without allocating the session's own
 /// key (which clones the host `String`). For the per-row `position`/`find`
 /// scans that only need equality, not a key.
@@ -2551,7 +2597,8 @@ impl App {
     }
 
     /// Retire the bindings named by a batch of detach reports — the attach
-    /// windows that just told us their session ended (§5).
+    /// windows that just told us their session ended (§5). Spent windows are
+    /// queued for closing; see [`attach_window_is_spent`].
     ///
     /// This is the event that replaces polling for the common case. It is
     /// deliberately allowed to be *wrong in one direction only*: a report can
@@ -2568,17 +2615,26 @@ impl App {
         let mut changed = false;
         for report in reports {
             let host = HostId(report.host);
-            let Some(window) = self.window_bindings.prune_token(&host, &report.token) else {
+            let Some(retired) = self.window_bindings.prune_token(&host, &report.token) else {
                 continue;
             };
             changed = true;
-            // Same rule as a departed row's window (D2): on zellij the attach
-            // pane is `hold: true`, so a dropped ssh leaves an exited pane buried
-            // invisibly in the shared sessions tab, inflating every `list-panes`.
-            // On kitty it stays visible as forensics. A window the user closed is
-            // already gone, so the close is a no-op there.
-            if self.capabilities.floating_sessions {
-                self.reap_window_queue.push(window);
+            if attach_window_is_spent(retired.held_for, report.status) {
+                // Spawned `hold: true`, so the window outlives the attach. That
+                // window is now a corpse wearing a session's clothes: it shows
+                // whatever the dead ssh left on screen, `Enter` on the row opens
+                // a *second* window beside it, and on zellij it sits invisible in
+                // the shared sessions tab inflating every `list-panes`. A window
+                // the user closed themselves is already gone, so the close is a
+                // no-op there.
+                self.reap_window_queue.push(retired.window);
+            } else {
+                // Refused on arrival — the window is holding the reason (busy,
+                // stale name, ssh auth), and that text exists nowhere else.
+                self.set_status(
+                    format!("Attach to {} failed — see its window", report.token),
+                    true,
+                );
             }
         }
         if changed {

@@ -548,6 +548,32 @@ and the read. Three properties earn it:
 - **It cannot invent a binding**, only retire one. A report for a binding we no
   longer hold (the prune or a `D` got there first) is a no-op.
 
+**The report cleans up the window too — unless that window is holding an error.**
+The window is spawned `hold: true`, so it outlives its attach. After a dropped
+ssh that leaves a corpse: it shows a dead session's last frame while the row
+reads detached, and the next `Enter` opens a *second* window beside it. (A dead
+ControlMaster does this to every attach window on the host at once.) So the
+report closes it. But an attach *refused on arrival* — the busy guard, a stale
+name, ssh auth — is holding the only copy of that error, since the dashboard
+never sees an attach's stderr; that window stays, and the row gets a status line
+pointing at it.
+
+`attach_window_is_spent` is the rule, pure and tested, over the wrapper's exit
+status and how long the binding lived:
+
+| status | meaning | outcome |
+| --- | --- | --- |
+| `0` / absent | clean end, or a reporter that couldn't tell | spent → close |
+| `129` / `130` / `143` | 128 + HUP/INT/TERM, the signals the wrapper traps: the window was torn down under it | spent → close |
+| anything else | ambiguous | spent only past `ATTACH_STARTUP_GRACE` (10s) |
+
+Both halves are load-bearing, and the signal row is spelled out rather than
+written `>= 128` for one reason: **ssh exits 255 both for a mid-session drop and
+for a failure to connect**, so the status cannot decide alone, and swallowing 255
+into the signal case would close the window on every failed connection. Equally,
+duration cannot decide alone — it would keep a window for every session detached
+inside the grace.
+
 The script takes the exe, host, token and attach argv as **positional
 parameters** — nothing is interpolated into it. The attach argv holds ssh options
 and a session name, and splicing those into a script is how quoting bugs become
