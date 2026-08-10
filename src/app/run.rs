@@ -86,8 +86,9 @@ fn arm_detach_prune(last_detach_prune: &mut Option<Instant>, now: Instant) {
 /// and the reports are written here regardless. It is also *not* routed through
 /// `fs_dirty` — retiring a binding needs no session re-read, so making it wait
 /// out the reload debounce would only delay the one thing this exists to make
-/// immediate. Best-effort: without the watcher, reports are still drained on
-/// each reload, and the periodic prune remains the backstop.
+/// immediate. Best-effort: `None` falls back to draining the reports on the
+/// reload tick (like the bell sentinels), with the periodic prune as the
+/// backstop for the detection itself.
 fn start_detach_report_watcher(dirty: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher as _;
     let sink = dirty.clone();
@@ -1001,6 +1002,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     // must outlive the loop, so it is bound here (dropping it stops the watch).
     let detach_reports = Arc::new(AtomicBool::new(false));
     let _detach_report_watcher = start_detach_report_watcher(detach_reports.clone());
+    // Without a watcher nothing ever flips the flag, so the reports need the
+    // reload tick to drain them (see the reload block) — otherwise they pile up
+    // in the sessions dir until the next dashboard start.
+    let detach_reports_watched = _detach_report_watcher.is_some();
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
     // Deadline armed by an action that races a launcher's state-file write
@@ -1092,6 +1097,14 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // Drain bell sentinels written by `miao focus --window-id`
             // *after* reload_sessions so we know which pids are alive.
             app.apply_bell_signals(state::drain_bell_flag_pids());
+            // Detach reports, when they have no watcher to wake us with. Their
+            // own arm above is the fast path; this is what keeps the sentinels
+            // from accumulating in the sessions dir until the next restart on a
+            // dashboard whose watcher failed to start. The reap queue is drained
+            // just below either way.
+            if !detach_reports_watched {
+                app.apply_detach_reports(state::drain_detach_reports());
+            }
             // Bring just-failed launch windows (direnv blocked, missing agent) to
             // the foreground. `reload_sessions` queued them on the transition
             // into `FailedToStart`; the launcher can't focus its own window (it
