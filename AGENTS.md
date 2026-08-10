@@ -109,8 +109,8 @@ shadow the new binary either way.
 
 - `main.rs` — CLI entrypoint with clap: `daemon` (`ensure`/`print-path`/`status`/`stop`), `claude`/`codex`/`hook` (launchers running inside the pool), `attach`, `pty-daemon`. Headless — no Kitty gate.
 - `server.rs` — the daemon: the single persistent per-host process. Hosts the pty pool (libshpool on a thread) **and** wraps a `LocalBackend` to answer the protocol (snapshot + delta subscription, `ListResumable`/`KillSession`/`OpenSession`, host-fs queries `ListRecentDirs`/`CompletePath`/`CheckDir`). Self-daemonizing (double-fork + setsid), singleton (`server.pid`), auto-exits when idle. Dispatched in `main()` pre-runtime (daemonize + pool thread precede tokio).
-- `pty_pool.rs` — the libshpool `pty-daemon`/`attach` entrypoints
-- `server_pool.rs` — starts launchers inside the pool (`open_in_pool`), records the remote cwd
+- `pty_pool.rs` — the libshpool `pty-daemon`/`attach` entrypoints (`run_attach` claims a session reservation, so the first attach is the create)
+- `server_pool.rs` — reserves pool sessions for launchers (`open_in_pool` + the `PendingSession` records the first attach claims), records the remote cwd
 
 **miao-client (`crates/cm-client/src/`):**
 
@@ -141,6 +141,7 @@ readable. Pinned by `state_dirs_and_files_are_owner_only`.
 - `work-tabs.json` — dashboard-owned `(host, cwd) → (tab, spawned pane)` map for the work tabs `w` opened, re-seeded on startup so `w` returns to an existing work tab (the terminal keeps it alive across a dashboard restart) instead of spawning a duplicate; validated lazily against a live snapshot on use — tab id, basename title, and pane-in-tab (pane ids never recycle) — so a stale entry self-heals (safe to delete)
 - `codex-home/` — shared synthetic `$CODEX_HOME` for Codex sessions: symlinks every entry of the real `~/.codex` plus captain-miao's own `hooks.json`. **`config.toml` is a writable copy, not a symlink** — the launcher writes the pre-seeded hook trust (`[hooks.state]`, see Codex hooks → Trust) into it, which fails if it points at a read-only file (e.g. a nix-store / home-manager symlink). The copy is reseeded from the real config only when the real one changes (tracked via `.config-source.toml`), and the hook-trust `[hooks.state]` is (re)merged on top every launch, so the user's config edits propagate while trust stays current. The mirror pass also **repairs shadow entries** — a real file/dir sitting where a symlink belongs, which is what Codex leaves behind whenever it adds a new state file: it creates the file *inside* the synthetic home before that name exists in the real one, and the two copies then diverge permanently. The failure this prevents is a split-brain SQLite DB (stale synthetic `goals_1.sqlite` against `-wal`/`-shm` symlinks into the real home, once it grew them), on which Codex refuses to start at all — "local database appears to be damaged". Created/refreshed by the launcher; safe to delete (regenerated on next Codex launch).
 - `long-running-commands/` — the self-learning set of background commands observed to run past the long-running threshold (1h), one file per normalized command (hashed name, contents = the command for grep-ability). Written by any launcher that learns a command; read by every launcher to classify a `run_in_background` shell as an at-rest `BackgroundServer` vs a busy `BackgroundActive` (see Background-job states). Safe to delete — it just re-learns.
+- `pending-sessions/{pool-name}.json` — pool-session **reservations** (host-side, `miao-server` only): the libshpool `--cmd`/`--dir` a reserved session will be created from. Written by `OpenSession`, claimed-and-deleted by the first `attach` to that name, and the whole dir is pruned when the daemon starts. Safe to delete (a pending session just won't come up; reopen it)
 - `logs/launcher-{pid}.log` — per-launcher tracing
 - `logs/debug.log` — shared verbose log (only when `[debug] enabled = true` or `CAPTAIN_MIAO_DEBUG=1`); each process writes a `===== ROLE START pid=… =====` separator on startup
 - `logs/keybinds.log` — TSV of every dashboard keystroke for frequency analysis (debug mode only)
@@ -324,6 +325,33 @@ it uses no ssh and has its own config flag.
   deleted inodes and the flock forever. `ensure` restarts a still-unreachable
   lock-holder as the backstop. **`loginctl enable-linger` is a documented host
   requirement.**
+- **`OpenSession` reserves a pool session; the first attach creates it.** The
+  server mints the name and writes only a `PendingSession` record
+  (`state_dir()/pending-sessions/<name>.json`: the libshpool `--cmd` and
+  `--dir`). The attach window the dashboard opens next *claims* that record and
+  hands it to libshpool, whose `attach` creates a session that doesn't exist —
+  so the pty is born with a real terminal on the far end. This replaced an eager
+  detached create (`attach --background --cmd`), which was the root of both
+  terminal complaints from remote mode: the agent's TUI ran its capability
+  **queries** (the kitty keyboard protocol's `CSI ? u`, truecolor probes) into a
+  pty nobody was reading, got no reply, fell back to the legacy key encoding and
+  **stayed there** (shpool never re-negotiates for the app) — Shift+Enter arrived
+  as a bare CR for the session's whole life — and it forced `TERM`/tty size to be
+  guessed, since libshpool applies the attach header's environment only when it
+  spawns the command. Claiming is the `remove_file`, not the read (one unlinker
+  wins, so a race can't produce two creators), and it happens *before* libshpool
+  runs, so a later attach can't re-enter the create path and skip the stale-name
+  guard. It is host-local state, not wire protocol, which is why the change needs
+  no protocol bump and is compatible in both directions.
+- **The pooled environment is repaired in `POOL_SHELL`, and now has real inputs.**
+  The pool strips the environment, so the wrapper rebuilds it: a login shell for
+  PATH (the original agent-not-found fix), `COLORTERM=truecolor` when empty —
+  24-bit is gated on `COLORTERM` by every library that detects it, so pooled
+  agents used to render 256-color approximations of their palette — and a `TERM`
+  that is now the *attaching terminal's*, validated with `infocmp` and downgraded
+  to `xterm-256color` when the host has no such terminfo entry (a bare
+  `xterm-kitty` passthrough would give every app in the session "unknown terminal
+  type"). Details in `docs/remote-sessions.md` §8.
 - **Client** (`RemoteBackend`) runs a background task that keeps an in-memory
   **mirror** of the host's sessions (keyed by `SessionKey`) and pumps
   request/response by `req_id`. The sync `Backend` methods read the mirror (no

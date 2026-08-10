@@ -283,14 +283,29 @@ fn guard_plain_reattach(name: &str, force: bool) {
     }
 }
 
-/// Attach to a pool session, proxying its pty to this terminal. With
-/// `cmd`/`background` set, instead *creates* a session running `cmd` and detaches
-/// (how the server starts a launcher in the pool); otherwise a plain interactive
-/// reattach (what the client's ssh window runs), pre-flighted by
-/// [`guard_plain_reattach`]. Always `--no-daemonize`:
-/// captain-miao manages its own daemon (named `pty-daemon`, not shpool's default
-/// `daemon`), so shpool's auto-launch — which would re-exec `<exe> daemon` — must
-/// not fire.
+/// Attach to a pool session, proxying its pty to this terminal.
+///
+/// Three shapes, all landing on libshpool's one `attach` (which creates the
+/// session when it doesn't exist and joins it when it does):
+///
+/// * **First attach to a reserved session** — the window the dashboard opens
+///   right after `OpenSession`. There is a
+///   [`crate::server_pool::PendingSession`] record waiting, so
+///   this attach *is* the create: it runs the launcher as libshpool's `--cmd`
+///   with this terminal already on the far end, which is the whole point of
+///   reserving rather than creating (see `server_pool::open_in_pool`). The
+///   stale-name guard is skipped — deliberately, since by construction no live
+///   launcher owns the name yet.
+/// * **Plain interactive reattach** — every later window for that session
+///   (`Enter` on a detached row, auto-reattach, a steal), pre-flighted by
+///   [`guard_plain_reattach`].
+/// * **Explicit `--cmd`/`--background`** — kept for a caller that wants to
+///   create a session directly. Nothing in captain-miao takes this path
+///   any more; the reservation flow replaced it.
+///
+/// Always `--no-daemonize`: captain-miao manages its own daemon (named
+/// `pty-daemon`, not shpool's default `daemon`), so shpool's auto-launch — which
+/// would re-exec `<exe> daemon` — must not fire.
 pub(crate) fn run_attach(
     name: String,
     cmd: Option<String>,
@@ -299,13 +314,42 @@ pub(crate) fn run_attach(
     force: bool,
     log_file: Option<String>,
 ) -> Result<()> {
+    let (mut cmd, mut dir, mut log_file) = (cmd, dir, log_file);
     if cmd.is_none() && !background {
-        guard_plain_reattach(&name, force);
+        match crate::server_pool::claim_pending(&name) {
+            Some(pending) => {
+                tracing::info!(
+                    target: "captain_miao::pool",
+                    "creating reserved pool session {name:?} from this attach"
+                );
+                cmd = Some(pending.cmd);
+                dir = Some(pending.dir);
+                // Give the create somewhere to fail loudly (see `--log-file`
+                // below). The eager server-side create used to pass this and
+                // surface the tail as the dashboard's "Launch failed:" line;
+                // now the create happens here, in a window whose stderr the user
+                // can read — but only if libshpool is told to write anything at
+                // all. Not removed on success: an attach that *is* the create
+                // runs for the session's whole life, so there is no later moment
+                // to clean up in, and the file is the first place to look when a
+                // session comes up wrong.
+                log_file.get_or_insert_with(|| {
+                    let path = crate::state::state_dir()
+                        .join("logs")
+                        .join(format!("attach-{name}.log"));
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    path.display().to_string()
+                });
+            }
+            None => guard_plain_reattach(&name, force),
+        }
     }
     // `--log-file` is the only way to see the attach *client*'s logs: libshpool
     // writes non-daemon logs to `io::empty()` without it (its stderr writer is
-    // daemon-only), and it `error!`s + exits 1 on failure — so a background
-    // create that fails leaves its reason nowhere unless this is set.
+    // daemon-only), and it `error!`s + exits 1 on failure — so a create that
+    // fails leaves its reason nowhere unless this is set.
     let mut global: Vec<&str> = vec!["--no-daemonize"];
     if let Some(lf) = &log_file {
         global.push("--log-file");

@@ -347,6 +347,11 @@ fn redirect_stdio(log: &Path) -> Result<()> {
 /// sound (shpool's daemon is itself multi-threaded).
 #[cfg(feature = "pty-pool")]
 fn start_pool_thread() {
+    // The pool lives in *this* process, so a daemon only now starting hosts no
+    // sessions — every session reservation left by a previous incarnation is
+    // unredeemable (names carry the minting daemon's pid, so nothing will ever
+    // attach to them again). Inert, but drop them rather than let them pile up.
+    crate::server_pool::prune_pending();
     if let Err(e) = std::thread::Builder::new()
         .name("pty-pool".into())
         .spawn(|| {

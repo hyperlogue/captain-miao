@@ -72,50 +72,118 @@ library**.
   on its own private socket (`cm_core::state::pool_socket_path` — shared const
   with the client crate so the path can't drift), with a config file it
   authors. A user's standalone `shpool` install shares nothing with it.
-- **Session semantics.** Pool sessions are created detached:
-  `shpool attach --background --dir <cwd> --cmd '<launcher argv>'`. The
-  command runs under a **login shell wrapper** (`sh -lc`, plus a sane `TERM`)
-  because the pool strips the environment — PATH must be rebuilt the way a real
-  login would (`crates/cm-server/src/server_pool.rs`; this fixed the original
-  agent-not-found bug). `--dir` gets the **expanded** path: it's a chdir, not a
-  shell word, so a host-canonical `~` would be a literal directory name (§3).
-- **Detached pty size is 80×24.** A `--background` create has no client tty,
-  so libshpool falls back to its default `TtySize { rows: 24, cols: 80 }`
-  (libshpool `src/attach.rs:246-250`; `open_in_pool` spawns the create with
-  `Stdio::null()`). The agent TUI renders at that size while nothing is
-  attached; the first attach sends the client's real size and the SIGWINCH
-  repaint re-lays everything out. After a detach the pty keeps its last
-  attached size (resize is purely client-driven). Nothing captain-miao shows
-  depends on the detached rendering — previews are captured from the local
-  attach *window*, which only exists while attached — so the only visible
-  artifact is the momentary repaint on attach, and `simple` restore (below)
-  means no 80-column-wrapped scrollback is ever replayed at the new width.
-- **TERM is `xterm-256color`, fixed at creation.** The wrapper upgrades only
-  an empty/`dumb` TERM (`server_pool.rs`) — and since the session is created
-  detached there is no attaching terminal to copy from, so that is what a pool
-  session gets. This is the *correct* choice, not just a fallback: a process's
-  environment can't change after start, while different terminals may attach
-  over the session's life (kitty today, a zellij pane tomorrow), and a
-  client-specific TERM like `xterm-kitty` breaks on any host missing that
-  terminfo — the same reason tmux pins `tmux-256color`. What a kitty user gives
-  up inside the session: terminfo/TERM-gated kitty features don't engage, and
-  escape-*query*-detected features (e.g. the kitty keyboard protocol) get no
-  reply at detached startup, so apps settle to conservative defaults there too.
-  TERM has no bearing on the query-negotiated features: the app writes a query
-  escape and enables the feature only if the live terminal replies, so
-  `TERM=xterm-kitty` wouldn't turn them on — it would only sway TERM-sniffing
-  apps, at the cost of lying to every non-kitty attacher and of broken terminfo
-  on hosts without kitty's entry. In the standard dashboard flow the
-  degradation is rarer than it sounds: the attach window is spawned immediately
-  after the create and usually connects before the agent's TUI finishes booting
-  through the login shell, so startup queries typically *are* answered by the
-  real terminal. The residual cases: a session left genuinely detached at boot,
-  and reattaching from a *different* terminal later — negotiated state is
-  terminal-side, and shpool won't re-negotiate on the app's behalf (tmux can,
-  only because it implements the protocol itself). Truecolor is usually gated
-  on `COLORTERM`, which the pool strips — exporting `COLORTERM=truecolor` in
-  `POOL_SHELL` would be a cheap, low-risk upgrade (every terminal in this
-  ecosystem supports 24-bit).
+- **Session semantics: `OpenSession` reserves, the first attach creates.** The
+  server mints the pool name and writes a **reservation** —
+  `state_dir()/pending-sessions/<name>.json`, holding the libshpool `--cmd`
+  (the login-shell wrapper plus the launcher argv) and `--dir`. No pty and no
+  launcher exist yet. The window the dashboard opens next runs
+  `miao-server attach <name>`, which finds that record, *claims* it, and hands
+  its `cmd`/`dir` to libshpool — whose `attach` creates the session when it
+  doesn't exist. So the session is born with this terminal already on the far
+  end. The command still runs under the **login shell wrapper** (`sh -lc`, plus
+  a sane `TERM`/`COLORTERM`) because the pool strips the environment — PATH must
+  be rebuilt the way a real login would (`crates/cm-server/src/server_pool.rs`;
+  this fixed the original agent-not-found bug). `--dir` gets the **expanded**
+  path: it's a chdir, not a shell word, so a host-canonical `~` would be a
+  literal directory name (§3).
+
+  **Why, and what it replaced.** Sessions used to be created *detached*
+  (`attach --background --cmd`), which put the agent's TUI in front of a pty
+  with nobody on the other end. Everything the TUI negotiates by *asking* the
+  terminal — the kitty keyboard protocol's `CSI ? u`, truecolor probes,
+  cursor-position round trips — went into the void, got no reply, and settled on
+  the conservative fallbacks, **permanently**: shpool never re-negotiates on the
+  app's behalf when a client later connects (tmux can, only because it
+  implements the protocols itself). The reported symptom was Shift+Enter
+  arriving as a bare CR — submit instead of newline — for the whole life of
+  every pooled session. It also forced the environment to be *guessed* at create
+  time, since libshpool applies the attach header's `TERM` and tty size only
+  when it spawns the session's command. Creating from the first attach makes all
+  of it fall out for free: real `TERM`, real window size, and queries answered by
+  the terminal the user is looking at.
+
+  Five properties to preserve:
+  * **Claiming is the `remove_file`, not the read.** Only one unlinker wins, so
+    two attaches racing a fresh name can't both decide they are the creator; the
+    loser falls through to a plain reattach, which is the right handling for a
+    session the winner is bringing up.
+  * **Consume before creating, not after.** Holding the record for the session's
+    lifetime would let a later attach (a steal, a second window) re-enter the
+    create path and skip the stale-name guard. The cost — a crash between claim
+    and create loses the reservation — is a reopen, which beats a reservation
+    redeemable twice.
+  * **The stale-name guard is skipped only on a claimed reservation.** That is
+    the one case where "no live launcher owns this name" is correct rather than
+    the resurrection hazard the guard exists for.
+  * **It is host-local state, not wire protocol.** Reserving and attaching both
+    happen inside `miao-server` on the pool's own host, so nothing about it
+    reaches the dashboard — which is also what makes the change compatible in
+    both directions: an old dashboard drives a new server fine (it just runs the
+    attach argv, which now creates), and a new dashboard against an old server
+    finds no reservation and plainly reattaches the session that server created
+    eagerly. No protocol bump.
+  * **Reservations are pruned when the daemon starts.** The pool lives *in* that
+    process, so records from a previous incarnation are unredeemable anyway
+    (names carry the minting daemon's pid). Inert litter; pruning just stops it
+    accumulating.
+
+  Two consequences. A window that never reaches its attach (ssh refused, the
+  terminal failed to spawn it) now leaves **no session** rather than an agent
+  running headless that nobody asked to keep — a window closed *after* the
+  create still just detaches, as always. And a create failure surfaces in that
+  held window rather than as the dashboard's "Launch failed:" line, since there
+  is no server-side create whose stderr we could capture; what the reservation
+  step can still refuse locally (a dead pool) it does.
+- **The pty is born at the attaching client's size.** libshpool takes the tty
+  size from the attach header, and the create *is* an attach now, so the agent's
+  first paint is laid out for the real window. (A `--background` create had no
+  client tty and fell back to libshpool's default `TtySize { rows: 24, cols: 80 }`
+  — libshpool `src/attach.rs:246-250` — so every pooled session booted at 80×24
+  and re-laid out on the first SIGWINCH.) After a detach the pty keeps its last
+  attached size; resize is purely client-driven. `simple` restore (below) means
+  no scrollback is ever replayed at a new width.
+- **TERM comes from the attaching terminal, validated against the host's
+  terminfo.** libshpool forwards the attach header's `TERM` into the session it
+  spawns, and over `ssh -t` that is the dashboard's own terminal — so a kitty
+  user's session now genuinely runs as `xterm-kitty` and TERM-sniffing features
+  engage. The wrapper guards the one way that bites: `infocmp "$TERM"` must
+  succeed, else it downgrades to `xterm-256color`. A host without kitty's
+  terminfo entry (most servers — it ships with kitty, not with ncurses-base)
+  would otherwise give every app in the session "unknown terminal type", which
+  is far worse than under-reporting. An empty or `dumb` TERM is upgraded as
+  before; `dumb` needs its own case precisely because ncurses *does* know it.
+
+  This supersedes the old policy of pinning `xterm-256color` unconditionally,
+  whose stated reason — "the session is created detached, so there is no
+  attaching terminal to copy from" — stopped being true. Its *other* argument
+  still stands and is why the `infocmp` guard exists rather than a bare
+  passthrough: TERM is fixed for the session's life, so a later attach from a
+  different terminal inherits whatever the first one was. That residual is
+  accepted (the value is at worst as wrong as the old fixed one, and right in
+  the common case where a session is watched from the terminal that opened it).
+  Query-negotiated features are unaffected by any of this — the app enables them
+  only if the live terminal replies, which is what create-on-first-attach fixed.
+- **`COLORTERM=truecolor` is exported by the wrapper**, and has to be. 24-bit
+  support is gated on `COLORTERM` by every library that detects it, and the pool
+  strips it — so before this a pooled session rendered its whole UI in 256-color
+  approximations of the colors a local one gets ("the color is kind of wrong").
+  Note that create-on-first-attach does **not** fix this one the way it fixes
+  TERM: libshpool forwards a hard-coded four (`TERM`, `DISPLAY`, `LANG`,
+  `SSH_AUTH_SOCK`, plus anything in its own `forward_env` config —
+  `src/attach.rs`), and `COLORTERM` is not among them, so the attaching
+  terminal's value never arrives no matter who is attached. Verified: a client
+  attaching with `COLORTERM=8bit` still lands in a session reading `truecolor`.
+  Hard-coding is therefore the mechanism, not a shortcut, and it is safe rather
+  than a guess: the dashboard refuses to start outside Kitty or zellij, and both
+  are 24-bit, so every terminal that can ever attach supports it. Set only when
+  empty, so a host publishing its own value through `/etc/environment` (which
+  libshpool *does* load into the session) still wins. Pinned, along with the TERM rules above, by
+  `the_wrapper_fixes_the_environment_libshpool_hands_it`, which reproduces
+  libshpool's own handling — it `shell_words::split`s `--cmd` and execs the argv
+  **directly**, no shell involved on its side (`daemon/server.rs`, the
+  `header.cmd` branch) — so the test also pins that `join` → `split` round-trips.
+  (The `{`/`}` ban is separate and still real: libshpool runs the string through
+  its session-name *template* parser before that.)
 - **OSC 52 (clipboard) works end-to-end.** libshpool's live relay is a
   transparent byte pipe — its source contains no OSC handling at all (the
   vterm engine exists only for the `screen`/`lines` restore buffer, unused in
