@@ -1094,6 +1094,114 @@ fn attention_outranks_detached() {
     assert_eq!(order, vec![1, 2]);
 }
 
+/// A *follow-up bell*, however, does not lift a detached row back up. The bell
+/// is auto-armed on every Active→Idle, so a detached session that merely
+/// finished a turn would otherwise float into the attention block and stay
+/// there — the exact opposite of what the detached tier is for. Only a live
+/// blocking prompt (the test above) outranks detachment.
+#[test]
+fn a_follow_up_bell_does_not_lift_a_detached_row() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into()); // pooled, but unbound
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![away, here]);
+    d.app
+        .update_flags((HostId("box".into()), 1), |f| f.follow_up = true);
+
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(
+        order,
+        vec![2, 1],
+        "the flagged detached row still sorts last"
+    );
+}
+
+/// Detachment is a sort key, so retiring a binding has to invalidate the cached
+/// visible order. It used to not: the row picked up the unplugged icon (computed
+/// live at draw time) but kept its old slot until some unrelated reload happened
+/// to bump the version — and nothing reloads when an attach window closes, which
+/// is exactly when this fires.
+#[test]
+fn pruning_a_binding_resorts_the_list() {
+    use crate::state::HostId;
+    use crate::terminal::WindowId;
+    use std::collections::HashSet;
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    let mut here = session(2, "/home/test/here", SessionStatus::Idle);
+    here.updated_at -= 60; // older, so recency alone would sort it second
+    d.set_sessions(vec![away, here]);
+    // Attached: the row is an ordinary idle row, and the newer one leads.
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+    let order = |d: &TestDashboard| -> Vec<u32> {
+        d.app
+            .visible_sessions()
+            .iter()
+            .map(|s| s.launcher_pid)
+            .collect()
+    };
+    assert_eq!(order(&d), vec![1, 2]);
+
+    // Its window died: the prune must move it, not just re-icon it. (The local
+    // row's own `launch_id` binding goes too — `set_sessions` seeds one — but a
+    // row with no pool session can't be detached, so it doesn't move.)
+    let dropped = d.app.prune_detached_sessions(&HashSet::new());
+    assert!(dropped.iter().any(|k| k.token == "cm-away"));
+    assert_eq!(order(&d), vec![2, 1]);
+}
+
+/// The preview panel is a capture of the row's *local* window, so a detached row
+/// has nothing to show — ever, not "yet". It used to claim "(no session
+/// selected)" in the one case it fires most often.
+#[test]
+fn preview_placeholder_names_the_detached_case() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    assert_eq!(d.app.preview_placeholder(), "(no session selected)");
+
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    d.set_sessions(vec![away]);
+    assert_eq!(
+        d.app.preview_placeholder(),
+        "(detached — attach with Enter to preview)"
+    );
+
+    // A local row with a live binding is genuinely mid-fetch.
+    d.set_sessions(vec![session(2, "/home/test/here", SessionStatus::Idle)]);
+    assert_eq!(d.app.preview_placeholder(), "(loading…)");
+}
+
+/// The attach overlay is the only feedback an `Enter` on a detached row gets:
+/// the attach runs inline in the run loop, so nothing repaints until the window
+/// is up. It draws over whatever else is on screen, independent of `input_mode`
+/// (the `Space s` steal reaches it straight out of a confirm).
+#[test]
+fn the_attaching_overlay_draws_over_everything() {
+    let mut d = TestDashboard::new(120, 24);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    assert!(!d.render().contains("Attaching"));
+
+    d.app.attaching = Some("cm-away".to_string());
+    let out = d.render();
+    assert!(out.contains("Attaching to cm-away…"), "{out}");
+}
+
 /// `backend_for` must never silently fall back to localhost (§9's one
 /// correctness-grade leak): a row carrying a host that's no longer configured
 /// would otherwise aim its kill or its open at the wrong machine.

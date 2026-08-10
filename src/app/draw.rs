@@ -79,6 +79,63 @@ impl App {
         if self.input_mode == InputMode::HostEdit {
             self.draw_host_edit(frame, frame.area());
         }
+        // Last, and independent of `input_mode`: an attach freezes the loop for
+        // its whole round trip, so this is the only feedback the keypress gets
+        // until the window comes up.
+        if self.attaching.is_some() {
+            self.draw_attaching(frame, frame.area());
+        }
+    }
+
+    /// The "Attaching…" overlay shown while an attach is in flight.
+    ///
+    /// `Enter` on a detached row plans the attach, spawns a window and waits on
+    /// the terminal backend — all inline in the run loop, so nothing repaints
+    /// until it returns. Without this the keypress looked ignored and the user
+    /// pressed `Enter` again (§9). Painted by the pre-action frame, cleared when
+    /// the attach returns.
+    fn draw_attaching(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(session) = self.attaching.as_deref() else {
+            return;
+        };
+        // Sized to the message, not to a percentage of the viewport: it is two
+        // short lines, so a proportional box would be mostly empty on a tall
+        // terminal and clip its own content on a short one.
+        let title = format!("Attaching to {session}…");
+        let width = (title.chars().count() as u16 + 6).clamp(20, area.width.max(20));
+        let height: u16 = 5;
+        if area.width < width || area.height < height {
+            return;
+        }
+        let popup = Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, popup);
+        let ui = &config::get().colors.ui;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ui.title_fg))
+            .title(Span::styled(" Attaching ", Style::default().bold()));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(title, Style::default().fg(ui.title_fg).bold())),
+            Line::from(Span::styled(
+                "opening the session window",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
     }
 
     /// The default wide layout: an optional preview panel across the bottom, and
@@ -1318,13 +1375,8 @@ impl App {
         let (lines, max_line_width): (&[Line<'static>], usize) = match &self.preview_lines {
             Some(cached) => (cached.as_slice(), self.preview_max_width),
             None => {
-                let msg = if self.selected_window_id().is_none() {
-                    "(no session selected)"
-                } else {
-                    "(loading…)"
-                };
                 placeholder = vec![Line::from(Span::styled(
-                    msg.to_string(),
+                    self.preview_placeholder(),
                     Style::default().add_modifier(Modifier::DIM),
                 ))];
                 let w = placeholder.iter().map(|l| l.width()).max().unwrap_or(0);

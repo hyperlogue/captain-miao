@@ -529,11 +529,42 @@ neither the detached marker nor the detached tier, and `Enter` silently focused
 a dead window instead of re-attaching. The run loop now also prunes on its own
 schedule, still floored to `DETACH_PRUNE_MIN_INTERVAL` (what makes a periodic
 `list-panes` affordable on zellij) and still gated on `has_remote()` (so a purely
-local dashboard never snapshots for this at all). A **failed focus** resets the
-floor rather than dropping the binding itself: one failed rc call is not proof
-the window is gone, and treating it as proof would strand a live session as
-"detached" — so the next tick's snapshot decides, immediately instead of up to an
-interval later.
+local dashboard never snapshots for this at all).
+
+**Evidence short-circuits the heartbeat.** A ten-second floor is affordable but
+not *responsive* — the user closes an attach window, looks back at the dashboard,
+and sees a row still claiming to be attached. Nothing pushes a signal for a
+closed window, so the prune is armed by the closest proxies available, each
+floored at `EVIDENCE_PRUNE_MIN_INTERVAL` (2s, because focus events flap and every
+prune is a `snapshot()`):
+
+- **The dashboard regaining focus** — the move that *follows* closing a session
+  window, and the moment a stale binding starts lying.
+- **A preview capture that stopped answering** — a window that won't serve
+  `get-text`/`dump-screen` is usually a window that no longer exists.
+- **A failed focus** (`Enter` on the row), which is stronger: it snapshots *right
+  there* rather than arming a later one, then finishes what the keypress asked
+  for — see below.
+
+None of these retires a binding by itself. One failed rc call, or one unreadable
+window, is not proof the window is gone, and treating it as proof would strand a
+live session as "detached"; only a real snapshot may prune (`prune_detached_from_tabs`).
+
+**A failed focus re-decides and attaches, so `Enter` is one press.** Before, the
+first press only reported "Focus failed" and the user pressed again once the
+prune caught up. Now the arm snapshots inline, prunes, re-finds the row **by
+identity** (the prune re-sorts the list — detachment is a sort key — so the
+pre-focus index may belong to another session by then) and re-runs
+`focus_or_attach`, which for a now-window-less pooled row attaches. A row that
+still resolves to a window reports the original error instead: the failure was
+transient, and retrying focus on the same id would only fail again.
+
+**Retiring a binding must `mark_dirty()`.** `is_detached_row` feeds the sort, but
+the visible order is cached against `mutation_version` — so a prune used to
+re-icon the row (computed live at draw time) while leaving it in its old slot
+until an unrelated reload bumped the version, and *nothing reloads* when an
+attach window closes. Both binding mutations the dashboard makes outside a
+reload — `record_window_binding` and `prune_detached_sessions` — invalidate it.
 
 ## 7. Lifecycle flows, condensed
 
@@ -674,7 +705,17 @@ decides what they mean**.
   `hosts.json`.
 - **`Enter`** — the focus-or-attach decision, in order: foreign-terminal local
   row → error; a row with a resolvable window → focus; a pooled row without one
-  → spawn the attach window and focus it at once. There is no fourth case:
+  → spawn the attach window and focus it at once — an explicit `focus_window`
+  after the spawn, since an attach spawn is `take_focus: false` on both backends
+  (it must not yank the client mid-creation) and would otherwise leave the
+  session running unseen in the background; auto-reattach passes `focus: false`,
+  because a reconnect can restore five windows at once. A focus that *fails* re-enters
+  the same decision after pruning the dead binding, so a stale binding costs no
+  second press (§5). Because the attach runs inline in the run loop — planning
+  the argv, spawning a window, waiting on the terminal backend — it paints an
+  **"Attaching…" overlay** in the pre-action frame; otherwise the only feedback
+  for the whole round trip is a frozen dashboard, which reads as a dead key and
+  invites exactly the second press this is removing. There is no fourth case:
   **non-attachable remote rows are filtered out at reload**
   (`is_actionable_row`). Challenged in the first-principles review (an
   attention state on a hidden row goes invisible remotely) and reaffirmed: *the
@@ -686,9 +727,17 @@ decides what they mean**.
 - **Detached sessions**: a pooled row with no bound window gets its own icon
   (joining the pinned/muted/follow-up set) and its own sort tier at the
   **bottom**, below plain idle — it's running somewhere else, so it shouldn't
-  compete for the eye with what's in front of you. An attention state still
-  outranks: a parked approval prompt is urgent regardless of a window. New /
-  resumed / forked sessions auto-attach on create.
+  compete for the eye with what's in front of you. A *live* attention state
+  still outranks: a parked approval, decision or failed launch is urgent
+  regardless of a window. The soft signals do **not**: the detached tier is
+  tested above the follow-up and review-pending tiers, because `follow_up` is
+  auto-armed on every Active→Idle — so a detached session that merely finished a
+  turn used to float into the attention block and stay near the top for good,
+  precisely inverting the tier. (It remains a valid `s` jump target either way:
+  `s` is an explicit "take me to what wants me", the tier is only about where a
+  row sits at rest.) The preview panel names the case rather than showing
+  `(loading…)` for a fetch that will never arrive — there is no local window to
+  capture. New / resumed / forked sessions auto-attach on create.
 - **`o`** on a row opens another session on *that row's host + cwd*, not
   locally. With nothing selected it targets the default host.
 - **The workdir picker is host-aware and cache-first.** `Ctrl-h` cycles the

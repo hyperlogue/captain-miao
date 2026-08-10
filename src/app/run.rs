@@ -38,11 +38,37 @@ const PREVIEW_CAPTURE_LINES: usize = 2000;
 /// loop's snapshot gate).
 const DETACH_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Floor on *evidence-driven* detach prunes — the ones armed by something that
+/// suggests a bound window just died (the dashboard regaining focus after the
+/// user closed one, a preview capture that no longer answers) rather than by the
+/// steady `DETACH_PRUNE_MIN_INTERVAL` heartbeat.
+///
+/// Much shorter than the heartbeat because it fires on a real signal, not on a
+/// clock — but not zero: focus events flap (a window manager can emit several as
+/// the user tabs through), and each prune is a `snapshot()`, which on zellij is
+/// the ~20ms-per-pane `list-panes`.
+const EVIDENCE_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Whether the detach prune's floor (`DETACH_PRUNE_MIN_INTERVAL`) has elapsed
 /// since its last snapshot. `None` (never pruned) is always due. Pure so the
 /// throttle is unit-tested without a wall clock.
 fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
+}
+
+/// Arm the detach prune for the *next* loop iteration, given evidence that a
+/// bound window may be gone (see [`EVIDENCE_PRUNE_MIN_INTERVAL`]).
+///
+/// Clearing `last_detach_prune` is what makes [`detach_prune_due`] fire
+/// immediately; the short floor keeps a burst of evidence (focus flapping, a
+/// preview retry storm) from turning into a burst of snapshots. Deliberately
+/// *arming* rather than pruning on the spot: a failed rc call or an unreadable
+/// window is not proof the window is gone, and only a real snapshot may retire a
+/// binding (see [`prune_detached_from_tabs`]).
+fn arm_detach_prune(last_detach_prune: &mut Option<Instant>, now: Instant) {
+    if last_detach_prune.is_none_or(|t| now.duration_since(t) >= EVIDENCE_PRUNE_MIN_INTERVAL) {
+        *last_detach_prune = None;
+    }
 }
 
 /// Drop every binding whose window is missing from `tabs`, and persist what's
@@ -591,7 +617,20 @@ async fn launch_agent(
 /// `force` steals the session from whichever client currently holds it — only
 /// ever set behind the y/N confirm, since the pool is one client at a time and
 /// attaching otherwise declines rather than kicking someone (§10.2).
-async fn attach_pool_session(app: &mut App, host: HostId, pool_session: String, force: bool) {
+///
+/// `focus` raises the new window when the attach was the user's own `Enter`, and
+/// is false for the reconnect sweep — a host coming back can restore five
+/// windows at once, which must not fight the user for the cursor. An attach
+/// spawn is `take_focus: false` on both backends (the spawn itself must not yank
+/// the client mid-creation), so the raise is an explicit `focus_window` after the
+/// binding is recorded — the same call `Enter` on an already-attached row makes.
+async fn attach_pool_session(
+    app: &mut App,
+    host: HostId,
+    pool_session: String,
+    force: bool,
+    focus: bool,
+) {
     // Resolve the plan before the match so the backend borrow ends before `app`
     // is touched again.
     let plan = app
@@ -631,7 +670,14 @@ async fn attach_pool_session(app: &mut App, host: HostId, pool_session: String, 
                     app.window_tab_cache.insert(id.clone(), tab);
                 }
                 // Attach-then-focus *immediately* (§9): the user watches the ssh
-                // progress in the window rather than a frozen dashboard.
+                // handshake and the agent come up in the window, rather than
+                // waiting on a dashboard that can't show either. Best-effort —
+                // a raise that fails leaves the session attached and bound, and
+                // `Enter` on the row retries it.
+                if focus && let Err(e) = terminal::get().focus_window(&id).await {
+                    tracing::debug!("attach window {id:?} raise failed: {e}");
+                }
+                // Selects the row once it comes back carrying this window.
                 app.pending_focus_window = Some((id, Instant::now()));
             }
             None => app.set_status("Attach failed: no window id".to_string(), true),
@@ -646,7 +692,7 @@ async fn attach_pool_session(app: &mut App, host: HostId, pool_session: String, 
 /// user for the cursor.
 async fn reattach_session(app: &mut App, host: HostId, pool_session: String) {
     let previously_focused = app.pending_focus_window.clone();
-    attach_pool_session(app, host, pool_session, false).await;
+    attach_pool_session(app, host, pool_session, false, false).await;
     app.pending_focus_window = previously_focused;
 }
 
@@ -1129,6 +1175,12 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     Err(_) => {
                         app.set_preview_text(None);
                         app.preview_window_id = Some(wid);
+                        // A window that won't answer a `get-text`/`dump-screen`
+                        // is usually a window that no longer exists — the second
+                        // free signal (with a failed focus) that a binding may
+                        // be stale. Not proof on its own, so it only arms the
+                        // snapshot-verified prune.
+                        arm_detach_prune(&mut last_detach_prune, Instant::now());
                     }
                 }
             } else {
@@ -1207,6 +1259,15 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 Event::FocusGained => {
                     app.focused = true;
                     app.request_preview_refresh();
+                    // The user just came back to the dashboard — which is
+                    // exactly the move that follows closing an attach window,
+                    // and the moment a stale binding starts lying (no detached
+                    // marker, no detached tier, `Enter` aiming at a dead
+                    // window). Closing a window is invisible to every change
+                    // signal we have, so this is the closest thing to an event
+                    // for it: arm the prune now instead of waiting out up to a
+                    // full `DETACH_PRUNE_MIN_INTERVAL` of heartbeat.
+                    arm_detach_prune(&mut last_detach_prune, Instant::now());
                     None
                 }
                 Event::FocusLost => {
@@ -1231,6 +1292,15 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 _ => None,
             };
             if let Some(action) = maybe_action {
+                // An attach is the slowest action here — it spawns a window and,
+                // on a remote host, waits on the terminal backend — so it gets
+                // an explicit overlay in that pre-action frame rather than
+                // leaving the keypress unacknowledged. Set from the action, the
+                // one place every producer (`Enter`, the `Space s` steal
+                // confirm, a double-click) passes through.
+                if let Action::AttachRemoteRunning { pool_session, .. } = &action {
+                    app.attaching = Some(pool_session.clone());
+                }
                 // Paint the keystroke's own effect (the confirm prompt closing,
                 // the picker dismissing) *before* running the action: an action
                 // handler runs inline in this loop and shells out to the terminal
@@ -1242,20 +1312,55 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 app.render_logo_graphics();
                 match action {
                     Action::FocusWindow(id) => {
+                        // The row's identity, captured before the call: the
+                        // retry below runs after a prune that re-sorts the list,
+                        // so the selected *index* is no longer a reliable handle
+                        // on the session the user acted on.
+                        let key = app.selected_key();
                         // The TUI stays up: tearing ratatui down around the
                         // focus (as an early build did) drops the dashboard
                         // pane out of the alt screen for the whole call — on
                         // zellij a visible flash of the underlying shell
                         // before the client switches tabs.
                         if let Err(e) = terminal::get().focus_window(&id).await {
-                            app.set_status(format!("Focus failed: {e}"), true);
                             // Most likely the window is gone (an attach window
                             // the user closed). Don't drop the binding on the
                             // strength of one failed rc call — a transient error
-                            // would then strand a live session as "detached".
-                            // Instead let the *next* tick's snapshot decide,
-                            // right away rather than up to the floor later.
-                            last_detach_prune = None;
+                            // would then strand a live session as "detached" —
+                            // but *do* settle it now rather than leaving the
+                            // press unanswered: take the snapshot this instant,
+                            // and if the window really is gone, prune and finish
+                            // the job the keypress asked for by re-attaching.
+                            // One `Enter` therefore reaches the session whether
+                            // or not the binding was still good (§9); before
+                            // this, the first press only ever reported an error
+                            // and the user had to press again after the prune
+                            // caught up.
+                            match terminal::get().snapshot().await {
+                                Ok(tabs) => {
+                                    last_detach_prune = Some(Instant::now());
+                                    prune_detached_from_tabs(&mut app, &tabs);
+                                }
+                                Err(_) => arm_detach_prune(&mut last_detach_prune, Instant::now()),
+                            }
+                            match key.and_then(|k| app.refocus_key(&k)) {
+                                Some(Action::AttachRemoteRunning {
+                                    host,
+                                    pool_session,
+                                    force,
+                                }) => {
+                                    app.attaching = Some(pool_session.clone());
+                                    terminal.draw(|frame| app.draw(frame))?;
+                                    attach_pool_session(&mut app, host, pool_session, force, true)
+                                        .await;
+                                    app.attaching = None;
+                                }
+                                // Still resolves to a window (so the failure was
+                                // transient), or nothing to attach to: report
+                                // the original error rather than silently
+                                // retrying focus on the same id.
+                                _ => app.set_status(format!("Focus failed: {e}"), true),
+                            }
                         }
                     }
                     Action::NewSessionSplit { agent, cwd, host } => {
@@ -1495,7 +1600,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         host,
                         pool_session,
                         force,
-                    } => attach_pool_session(&mut app, host, pool_session, force).await,
+                    } => {
+                        attach_pool_session(&mut app, host, pool_session, force, true).await;
+                        app.attaching = None;
+                    }
                     Action::RestartAll { sessions } => {
                         let total = sessions.len();
                         let mut ok = 0usize;
@@ -1543,5 +1651,31 @@ mod tests {
         ));
         // Floor elapsed → due again.
         assert!(detach_prune_due(Some(now - DETACH_PRUNE_MIN_INTERVAL), now));
+    }
+
+    /// Evidence (a focus gain, a preview capture that stopped answering) short-
+    /// circuits the heartbeat, but not without a floor of its own: focus events
+    /// flap, and every prune it lets through is a `snapshot()`.
+    #[test]
+    fn evidence_arms_the_prune_but_not_unboundedly() {
+        let now = Instant::now();
+
+        // Long enough since the last prune → armed, so the next tick is due.
+        let mut last = Some(now - EVIDENCE_PRUNE_MIN_INTERVAL);
+        arm_detach_prune(&mut last, now);
+        assert!(last.is_none());
+        assert!(detach_prune_due(last, now));
+
+        // A second signal moments later is ignored — the stamp stands, and the
+        // heartbeat is not yet due.
+        let mut last = Some(now);
+        arm_detach_prune(&mut last, now);
+        assert_eq!(last, Some(now));
+        assert!(!detach_prune_due(last, now));
+
+        // Never pruned at all: already armed, and arming again is harmless.
+        let mut last = None;
+        arm_detach_prune(&mut last, now);
+        assert!(last.is_none());
     }
 }

@@ -627,6 +627,16 @@ pub(super) struct App {
     /// id would linger, so the instant lets an unclaimed target age out (see
     /// [`PENDING_FOCUS_MAX_AGE`]).
     pub(super) pending_focus_window: Option<(WindowId, Instant)>,
+    /// The pool session an attach is running for *right now* — drives the
+    /// "Attaching…" overlay.
+    ///
+    /// An attach runs inline in the run loop: it plans the argv, spawns a window
+    /// and (for a remote host) waits on the terminal backend, so the frame is
+    /// frozen for the whole call. Set from the action *before* the pre-action
+    /// draw and cleared when the attach returns, so `Enter` on a detached row
+    /// acknowledges the keypress immediately instead of reading as a dead key
+    /// for the round trip (§9).
+    pub(super) attaching: Option<String>,
     /// Local windows whose launch just failed (`FailedToStart`), queued by
     /// `reload_sessions` for the run loop to bring to the foreground. The
     /// launcher can't focus its own window (it may be headless/remote — window
@@ -1051,6 +1061,7 @@ impl App {
             recent_cwds: Vec::new(),
             workdir_completion: None,
             pending_focus_window: None,
+            attaching: None,
             failed_launch_focus_queue: Vec::new(),
             reap_window_queue: Vec::new(),
             window_tab_cache: HashMap::new(),
@@ -2322,27 +2333,38 @@ impl App {
             let attention = s.status.needs_attention() && !review_pending;
             // A pooled session with no window on this screen sinks below plain
             // idle — it's running somewhere else, so it shouldn't compete for
-            // the eye with what's in front of you. An attention state still
-            // outranks: a parked approval prompt is urgent regardless of
-            // whether a window happens to be bound (§9).
+            // the eye with what's in front of you (§9).
+            //
+            // It is tested **above** the follow-up and review tiers on purpose.
+            // Those two are soft "get to this when you can" signals, and
+            // `follow_up` is auto-armed on every Active→Idle — so a detached
+            // session that merely finished a turn used to float into the
+            // attention block and sit near the top of the list for good, which
+            // is the opposite of what the tier exists for. What still outranks
+            // detachment is a *live* blocking prompt (`attention`: approval,
+            // decision, failed launch): that's urgent regardless of whether a
+            // window happens to be bound here.
             let detached = self.is_detached_row(s);
-            // Ranks 1–3 partition exactly what `is_attention_row` unions (an
-            // unmuted needs-attention or at-rest follow-up row); kept split here
-            // because ordering needs the finer tiers. If the predicate there
-            // changes, revisit this arithmetic to keep the jump target and the
-            // sort in agreement.
+            // Ranks 1–3 cover what `is_attention_row` unions (an unmuted
+            // needs-attention or at-rest follow-up row); kept split here because
+            // ordering needs the finer tiers, and with the detached tier taking
+            // precedence over 2/3 an attention row that is also detached lands
+            // in 6 while staying a valid `s` jump target — deliberate: `s` is an
+            // explicit "take me to what wants me", the tier is only about where
+            // the row sits at rest. If the predicate there changes, revisit this
+            // arithmetic to keep the jump target and the sort in agreement.
             let rank: u8 = if flags.muted {
                 7
             } else if flags.pinned {
                 0
             } else if attention {
                 1
+            } else if detached {
+                6
             } else if flags.follow_up && !active {
                 2
             } else if review_pending {
                 3
-            } else if detached {
-                6
             } else if !active {
                 4
             } else {
@@ -2486,6 +2508,10 @@ impl App {
     /// path and the local spawn path.
     pub(super) fn record_window_binding(&mut self, host: HostId, token: String, window: WindowId) {
         self.window_bindings.record(host, token, window);
+        // Bindings feed `is_detached_row`, which is a *sort key*: binding a
+        // window lifts the row out of the detached tier, so the cached visible
+        // order has to be recomputed even though no session changed.
+        self.mark_dirty();
     }
 
     /// Mint a fresh, opaque `launch_id` for a local launcher the dashboard is
@@ -2512,7 +2538,16 @@ impl App {
         if self.window_bindings.is_empty() {
             return Vec::new();
         }
-        self.window_bindings.prune_dead(live)
+        let dropped = self.window_bindings.prune_dead(live);
+        if !dropped.is_empty() {
+            // The dropped rows just became detached, and detachment is a sort
+            // key — without invalidating the visible cache they'd draw the
+            // unplugged icon (computed live) while staying put in the old order
+            // until some unrelated reload happened to bump the version. Nothing
+            // reloads when an attach window closes, so "until" could be minutes.
+            self.mark_dirty();
+        }
+        dropped
     }
 
     /// The follow-up flag auto-mark / auto-clear transitions to apply after a
@@ -2916,6 +2951,31 @@ impl App {
         s.pool_session.is_some() && self.window_id_for_session(s).is_none()
     }
 
+    /// What the preview panel says when it has no captured text.
+    ///
+    /// The preview is a `capture_text` of the row's **local** window, so a row
+    /// without one has nothing to show — ever, not "yet". Saying `(loading…)`
+    /// there is a lie that never resolves, and the old fallback for a
+    /// window-less row said `(no session selected)`, which is wrong in the one
+    /// case it fires most: a detached pooled session, where a row very much *is*
+    /// selected. Each window-less case names its own reason instead, so the
+    /// panel explains the emptiness rather than implying a stuck fetch.
+    pub(super) fn preview_placeholder(&self) -> String {
+        let Some(s) = self.selected_session_ref() else {
+            return "(no session selected)".to_string();
+        };
+        if let Some(identity) = self.foreign_terminal(s) {
+            return format!("(session lives in {identity} — no preview here)");
+        }
+        if self.is_detached_row(s) {
+            return "(detached — attach with Enter to preview)".to_string();
+        }
+        if self.window_id_for_session(s).is_none() {
+            return "(no window to preview)".to_string();
+        }
+        "(loading…)".to_string()
+    }
+
     /// Queue an attach window for every session on a just-reconnected host that
     /// the dashboard expects to be attached to but isn't (§7).
     ///
@@ -2986,6 +3046,24 @@ impl App {
             self.clear_follow_up(key);
         }
         action
+    }
+
+    /// Re-point the cursor at `key`'s row and re-decide what `Enter` should do
+    /// on it — the retry half of the focus-failure path.
+    ///
+    /// Finding the row by **identity** rather than reusing the old index is the
+    /// whole point: the retry runs after a prune, detachment is a sort key, so
+    /// the row the user acted on has usually just sunk to the detached tier and
+    /// its old index now belongs to some other session. Re-deciding by index
+    /// would attach a window to whichever row slid into that slot.
+    pub(super) fn refocus_key(&mut self, key: &FlagKey) -> Option<Action> {
+        let idx = self
+            .visible_sessions()
+            .iter()
+            .position(|s| matches_key(s, key))?;
+        self.table_state.select(Some(idx));
+        let s = self.selected_session()?;
+        self.focus_or_attach(&s)
     }
 
     pub(super) fn selected_cwd(&self) -> Option<String> {
