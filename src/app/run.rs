@@ -14,7 +14,7 @@ use crate::backend::{Backend, LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId};
 use crate::terminal::{
-    self, Capabilities, SessionsLayout, SpawnCommand, SpawnSpec, SpawnTarget, WindowId,
+    self, Capabilities, SessionsLayout, SpawnCommand, SpawnSpec, SpawnTarget, Tab, WindowId,
 };
 
 use std::collections::HashSet;
@@ -43,6 +43,31 @@ const DETACH_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// throttle is unit-tested without a wall clock.
 fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
+}
+
+/// Drop every binding whose window is missing from `tabs`, and persist what's
+/// left. Returns whether anything was dropped.
+///
+/// Two properties this exists to hold, both easy to get wrong at a call site:
+///
+/// * **It takes a real snapshot, never an absent one.** A failed `snapshot()`
+///   is not "no windows are alive" — feeding an empty live-set to
+///   `prune_detached_sessions` drops *every* binding, so one transient
+///   `kitten @ ls` / `list-panes` error would strand every session as detached
+///   (and, for a pooled one, arm auto-reattach to respawn a window it already
+///   has). Callers must only reach here with a snapshot that succeeded.
+/// * **The prune reaches `window-bindings.json`.** That file is what the
+///   external `focus` bell resolves against and what the next startup re-seeds
+///   from, and `reload_sessions` — its only other writer — may not run for a
+///   long while: closing an attach window changes nothing the dashboard
+///   watches, which is the whole reason the timer prune below exists.
+pub(super) fn prune_detached_from_tabs(app: &mut App, tabs: &[Tab]) -> bool {
+    let live: HashSet<WindowId> = tabs.iter().flat_map(|t| &t.windows).cloned().collect();
+    let dropped = !app.prune_detached_sessions(&live).is_empty();
+    if dropped {
+        app.write_window_bindings_file();
+    }
+    dropped
 }
 
 /// Open (or re-scope) the resume picker on `host` **immediately**, then fetch
@@ -1003,15 +1028,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             app.save_session_snapshot();
             // Detach detection (§5): if a remote attach window died (laptop
             // slept, ssh dropped), drop its binding so the row leaves cleanly.
-            if detach_prune {
+            // Only with a snapshot in hand: a failed one means "we don't know",
+            // not "nothing is alive" (see `prune_detached_from_tabs`). The floor
+            // isn't stamped on a failure either — the timer below picks the
+            // retry up in this same iteration and stamps it there.
+            if detach_prune && let Some(tabs) = &tabs {
                 last_detach_prune = Some(Instant::now());
-                let live: HashSet<WindowId> = tabs
-                    .iter()
-                    .flatten()
-                    .flat_map(|t| &t.windows)
-                    .cloned()
-                    .collect();
-                app.prune_detached_sessions(&live);
+                prune_detached_from_tabs(&mut app, tabs);
             }
             needs_redraw = true;
         }

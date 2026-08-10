@@ -27,6 +27,21 @@ fn redirect_state_dir_for_tests() {
     });
 }
 
+/// Serialises the tests that read `window-bindings.json` back off disk.
+///
+/// `redirect_state_dir_for_tests` gives the whole test *process* one state dir,
+/// so every test shares that file while cargo runs them on parallel threads. A
+/// test that writes it and then reads it back can otherwise observe another
+/// test's projection — which fails in both directions: a missing precondition,
+/// or worse, a post-condition that passes because someone else's write happened
+/// to omit the token being asserted about.
+fn bindings_file_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poisoning is irrelevant here — the guard protects a scratch file, and a
+    // panicking test has already failed on its own terms.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct TestDashboard {
     app: App,
     terminal: Terminal<TestBackend>,
@@ -813,6 +828,7 @@ fn foreign_terminal_row_is_window_inert() {
 
 #[test]
 fn seed_preserves_foreign_binding_through_rewrite() {
+    let _guard = bindings_file_guard();
     use crate::state::{HostId, WindowBinding};
     use crate::terminal::WindowId;
     // A persisted binding from another terminal instance is held inert (never in
@@ -859,6 +875,7 @@ fn seed_preserves_foreign_binding_through_rewrite() {
 
 #[test]
 fn prune_leaves_foreign_binding_intact() {
+    let _guard = bindings_file_guard();
     use crate::state::{HostId, WindowBinding};
     use crate::terminal::WindowId;
     use std::collections::HashSet;
@@ -956,15 +973,17 @@ fn enter_on_foreign_terminal_row_reports_it() {
 
 #[test]
 fn window_bindings_file_round_trips_through_seed() {
+    let _guard = bindings_file_guard();
     use crate::state::HostId;
     use crate::terminal::WindowId;
     // The reload writes window-bindings.json; a restarted dashboard seeds from it
     // and re-resolves a live local session by its launch_id (§15.7 recovery), plus
-    // a remote session by its pool_session. This is the sole test that touches the
-    // shared window-bindings.json file. The state dir is only created below, after
-    // the first TestDashboard::new redirects `state_dir()` into a per-process
-    // tempdir — creating it before the redirect would make the wrong dir and the
-    // atomic write would silently fail.
+    // a remote session by its pool_session. It is no longer the only test to
+    // touch the shared window-bindings.json file, hence `bindings_file_guard`.
+    // The state dir is only created below, after the first TestDashboard::new
+    // redirects `state_dir()` into a per-process tempdir — creating it before
+    // the redirect would make the wrong dir and the atomic write would silently
+    // fail.
     let pid = std::process::id(); // a live pid so the seed keeps the local entry
     let mut s = session(pid, "/home/test/a", SessionStatus::Idle);
     s.launch_id = Some("L-rt".into());
@@ -4155,4 +4174,56 @@ fn only_a_changed_connection_string_reconnects() {
     );
     // …as does adding or dropping a host.
     assert_ne!(App::conn_identities(&before), App::conn_identities(&[]));
+}
+
+/// A prune must reach `window-bindings.json`, not just the in-memory map.
+///
+/// The timer prune exists precisely for the case where **no reload runs** —
+/// closing an attach window moves no state file and produces no host delta — and
+/// `reload_sessions` is the file's only other writer. Left unpersisted, the file
+/// keeps naming a dead window for the external `focus` bell to resolve against,
+/// and the next startup re-seeds the stale binding.
+#[test]
+fn pruning_a_dead_window_rewrites_the_bindings_file() {
+    let _guard = bindings_file_guard();
+    use crate::state::{HostId, WindowBinding};
+    use crate::terminal::WindowId;
+
+    let mut d = TestDashboard::new(120, 10);
+    let _ = std::fs::create_dir_all(crate::state::state_dir());
+    d.app.terminal_identity = Some("kitty:me".into());
+
+    // A pooled remote row with a live attach window, recorded and persisted the
+    // way an attach does it.
+    let mut s = session(1, "/srv/proj", SessionStatus::Idle);
+    s.host = HostId("box".into());
+    s.pool_session = Some("cm-claude-1".into());
+    d.set_sessions(vec![s]);
+    d.app.record_window_binding(
+        HostId("box".into()),
+        "cm-claude-1".into(),
+        WindowId::from(300u64),
+    );
+    d.app.write_window_bindings_file();
+    let on_disk: Vec<WindowBinding> =
+        crate::state::read_json(&crate::state::window_bindings_path()).unwrap_or_default();
+    assert!(
+        on_disk.iter().any(|b| b.token == "cm-claude-1"),
+        "precondition: the binding should be on disk: {on_disk:?}"
+    );
+
+    // The window is gone from the terminal: prune, and the file must follow.
+    assert!(super::run::prune_detached_from_tabs(&mut d.app, &[]));
+    assert!(
+        d.app
+            .window_bindings
+            .window_for(&HostId("box".into()), "cm-claude-1")
+            .is_none()
+    );
+    let on_disk: Vec<WindowBinding> =
+        crate::state::read_json(&crate::state::window_bindings_path()).unwrap_or_default();
+    assert!(
+        !on_disk.iter().any(|b| b.token == "cm-claude-1"),
+        "the dropped binding is still on disk: {on_disk:?}"
+    );
 }
