@@ -535,6 +535,38 @@ fn resume_picker_names_the_host_it_lists() {
     );
 }
 
+/// The picker's live settings belong to the picker, not to the dashboard's
+/// footer ribbon: `Ctrl-t` has to visibly do something *inside* the popup the
+/// user is looking at. The ribbon keeps the static labels only.
+#[test]
+fn the_workdir_picker_carries_its_agent_on_its_own_status_line() {
+    let mut d = TestDashboard::new(120, 20);
+    d.press(KeyCode::Char('O'));
+    let out = d.render();
+    let footer_line = out
+        .lines()
+        .find(|l| l.contains("Agent"))
+        .unwrap_or_else(|| panic!("no agent status line in the popup:\n{out}"));
+    assert!(footer_line.contains("Claude"), "{footer_line}");
+    // The value moved off the bottom bar; only the key label is left there.
+    let bar = out.lines().last().unwrap();
+    assert!(bar.contains("Ctrl-t"), "{bar}");
+    assert!(
+        !bar.contains("Claude"),
+        "the bar must not carry the value: {bar}"
+    );
+
+    // Flipping the backend rewrites that line, not the bar.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let out = d.render();
+    assert!(
+        out.lines()
+            .any(|l| l.contains("Agent") && l.contains("Codex")),
+        "status line should follow Ctrl-t:\n{out}"
+    );
+}
+
 #[test]
 fn enter_on_running_remote_session_emits_attach() {
     use crate::state::HostId;

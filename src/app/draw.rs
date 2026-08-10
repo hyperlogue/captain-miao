@@ -15,8 +15,8 @@ use crate::state::{HostId, LauncherState, SessionStatus};
 use super::format::{
     DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, WIDE_PUA_GLYPHS, ansi_to_lines,
     bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width, elapsed_cell,
-    fade_style, format_elapsed, format_tokens, hint_badge, hint_key, hint_label, hint_pair,
-    model_color, model_label, override_indicator_cell, pill, session_display_name, truncate_str,
+    fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
+    override_indicator_cell, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::{App, DirEditFocus, HostTally, InputMode, PickerKind};
@@ -1627,33 +1627,27 @@ impl App {
                 spans
             }
             InputMode::Picker => {
+                // Static labels only. The *values* these keys change — the
+                // agent, the host — live on the popup's own bottom line now
+                // (`App::refresh_picker_footer`), where they sit beside the list
+                // they govern instead of down here among fixed hint text.
                 let mut spans = hint_pair("type", "filter");
                 spans.extend(hint_pair("↑/↓", "navigate"));
                 spans.extend(hint_pair("Enter", "select"));
                 spans.extend(hint_pair("Esc", "clear/cancel"));
-                // In the new-session picker, Ctrl-t flips the backend for this
-                // launch and Ctrl-d forgets the highlighted recent cwd; show
-                // both, plus the backend currently chosen. With remotes
-                // configured, Ctrl-h also cycles the host this launch opens on.
-                // The backend / host values ride the label pill in their own
-                // colour rather than the dim default.
-                if let Some(active) = &self.picker
-                    && let PickerKind::Workdir { agent, host, .. } = &active.kind
-                {
-                    spans.extend(hint_pair("Ctrl-d", "drop dir"));
-                    spans.extend(hint_key("Ctrl-t"));
-                    spans.extend(hint_label(vec![Span::styled(
-                        agent.label(),
-                        Style::default().fg(config::get().colors.ui.title_fg),
-                    )]));
-                    if self.backends.len() > 1 {
-                        let host_color = self.host_label_color(host);
-                        spans.extend(hint_key("Ctrl-h"));
-                        spans.extend(hint_label(vec![Span::styled(
-                            host.0.clone(),
-                            Style::default().fg(host_color),
-                        )]));
+                let multi_host = self.backends.len() > 1;
+                match self.picker.as_ref().map(|a| &a.kind) {
+                    Some(PickerKind::Workdir { .. }) => {
+                        spans.extend(hint_pair("Ctrl-d", "drop dir"));
+                        spans.extend(hint_pair("Ctrl-t", "agent"));
+                        if multi_host {
+                            spans.extend(hint_pair("Ctrl-h", "host"));
+                        }
                     }
+                    Some(PickerKind::Resume { .. }) if multi_host => {
+                        spans.extend(hint_pair("Ctrl-h", "host"));
+                    }
+                    _ => {}
                 }
                 spans
             }

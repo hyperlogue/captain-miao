@@ -453,6 +453,17 @@ pub(in crate::app) struct Picker {
     /// Transient error shown under the search line (e.g. "not a directory").
     /// Cleared on the next edit. Set by the caller via `set_error`.
     pub error: Option<String>,
+    /// A status line pinned to the **bottom of the popup**, on a lifted
+    /// background so it reads as chrome rather than as another list row.
+    ///
+    /// This is where a picker's live *settings* live — the agent and host a new
+    /// session will open on, the host a resume list is scoped to. They used to
+    /// ride the dashboard's footer ribbon beside the key hints, which put a
+    /// changing value inside a strip of fixed labels: the eye had to leave the
+    /// popup to find what the popup was about, and `Ctrl-t` appeared to do
+    /// nothing until you looked away from it. The bottom bar keeps only the
+    /// static hints now.
+    pub footer: Option<Line<'static>>,
 }
 
 impl Picker {
@@ -468,6 +479,7 @@ impl Picker {
             free_input: false,
             handles_tab: false,
             error: None,
+            footer: None,
         }
     }
 
@@ -637,8 +649,33 @@ impl Picker {
         };
         let title = format!(" {} ({counter}) ", self.title);
         let block = Block::default().borders(Borders::ALL).title(title);
-        let inner = block.inner(popup);
+        let mut inner = block.inner(popup);
         frame.render_widget(block, popup);
+
+        // Carve the status line off the bottom before the list is laid out, so
+        // it never overlaps a row. Skipped on a popup too short to spare the row
+        // — the list is the point.
+        let footer_area = match &self.footer {
+            Some(_) if inner.height >= 4 => {
+                let area = Rect {
+                    y: inner.bottom() - 1,
+                    height: 1,
+                    ..inner
+                };
+                inner.height -= 1;
+                Some(area)
+            }
+            _ => None,
+        };
+        // Painted now rather than after the list, so the `visible == 0` early
+        // return below can't drop it.
+        if let (Some(area), Some(line)) = (footer_area, &self.footer) {
+            let bg = crate::config::get().colors.picker.highlight_bg;
+            frame.render_widget(
+                Paragraph::new(line.clone()).style(Style::default().bg(bg)),
+                area,
+            );
+        }
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

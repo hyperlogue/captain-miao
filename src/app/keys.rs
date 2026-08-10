@@ -735,6 +735,9 @@ impl App {
             let cur = all.iter().position(|a| a == agent).unwrap_or(0);
             *agent = all[(cur + 1) % all.len()];
             active.picker.title = super::format::workdir_picker_title(*agent, host);
+            // The popup's own status line carries the chosen agent (§9), so it
+            // has to be rebuilt with it.
+            self.refresh_picker_footer();
             return None;
         }
         // Ctrl-H in the workdir picker cycles the host this launch opens on —
@@ -752,6 +755,7 @@ impl App {
             active.picker.title = super::format::workdir_picker_title(*agent, host);
             // Drop the `active` borrow before the reseed (it re-borrows self).
             self.reseed_workdir_for_host();
+            self.refresh_picker_footer();
             return None;
         }
         // The same `Ctrl-h` in the *resume* picker re-scopes it to the next

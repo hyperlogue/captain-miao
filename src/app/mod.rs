@@ -12,6 +12,8 @@ mod run;
 pub use run::{read_dashboard_window_id, run};
 
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::TableState;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -3362,6 +3364,7 @@ impl App {
             kind: PickerKind::Resume { host, candidates },
         });
         self.input_mode = InputMode::Picker;
+        self.refresh_picker_footer();
     }
 
     /// Repopulate the open resume picker for a different host — the `Ctrl-h`
@@ -3378,6 +3381,46 @@ impl App {
             active.picker.items = items;
             active.picker.set_text("");
             active.kind = PickerKind::Resume { host, candidates };
+        }
+        self.refresh_picker_footer();
+    }
+
+    /// Rebuild the open picker's bottom status line from its kind. Called
+    /// wherever the values it shows can change: opening, `Ctrl-t`, `Ctrl-h`, and
+    /// the arrival of an async item list.
+    ///
+    /// Only the two pickers that carry per-launch settings get one — the rest
+    /// have nothing to say that their title doesn't already.
+    pub(super) fn refresh_picker_footer(&mut self) {
+        let ui = &crate::config::get().colors.ui;
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let value = Style::default().fg(ui.title_fg).bold();
+        let host_span = |app: &Self, host: &HostId| {
+            Span::styled(format!("{} {}", app.host_icon(host), host.0), value)
+        };
+        let Some(active) = self.picker.as_ref() else {
+            return;
+        };
+        let spans: Vec<Span<'static>> = match &active.kind {
+            PickerKind::Workdir { agent, host } => {
+                let mut spans = vec![
+                    Span::styled(" Agent ", dim),
+                    Span::styled(agent.label().to_string(), value),
+                ];
+                // The host half only exists when there's more than one to be on.
+                if self.backends.len() > 1 {
+                    spans.push(Span::styled("   Host ", dim));
+                    spans.push(host_span(self, host));
+                }
+                spans
+            }
+            PickerKind::Resume { host, .. } => {
+                vec![Span::styled(" Host ", dim), host_span(self, host)]
+            }
+            _ => Vec::new(),
+        };
+        if let Some(active) = self.picker.as_mut() {
+            active.picker.footer = (!spans.is_empty()).then(|| Line::from(spans));
         }
     }
 
@@ -3559,6 +3602,7 @@ impl App {
             kind: PickerKind::Workdir { agent, host },
         });
         self.input_mode = InputMode::Picker;
+        self.refresh_picker_footer();
     }
 
     /// Build picker items for a list of cwds shown against `host`'s home. Only a
