@@ -646,6 +646,40 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
     assert_eq!(d.app.selected_window_id(), Some(WindowId::from(900u64)));
 }
 
+/// The host glyph shares the workdir-icon column rather than holding a Host
+/// column of its own — `<host>│<workdir>`, and no `Host` header anywhere.
+#[test]
+fn the_host_glyph_shares_the_workdir_icon_column() {
+    let mut d = TestDashboard::new(140, 12);
+    d.app.terminal_identity = Some("kitty:me".into());
+    let mut foreign = session(1, "/home/test/elsewhere", SessionStatus::Idle);
+    foreign.terminal = Some("zellij:other".into());
+    let mine = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![foreign, mine]);
+
+    let out = d.render();
+    assert!(
+        !out.contains("Host"),
+        "the Host column should be gone:\n{out}"
+    );
+    // The foreign row wears the "lives elsewhere" glyph, divided from its
+    // workdir icon; the same-terminal row pads the divider away.
+    // Everything left of the name is the row's icon cell — the detail panel's
+    // own border lives well to the right of it.
+    let icons = |name: &str| {
+        let line = out
+            .lines()
+            .find(|l| l.contains(name) && l.contains("Idle"))
+            .unwrap_or_else(|| panic!("no {name} row:\n{out}"));
+        line.split(name).next().unwrap().to_string()
+    };
+    let foreign_icons = icons("session-1");
+    assert!(foreign_icons.contains('\u{29C9}'), "{foreign_icons:?}");
+    assert!(foreign_icons.contains('\u{2502}'), "{foreign_icons:?}");
+    let plain_icons = icons("session-2");
+    assert!(!plain_icons.contains('\u{2502}'), "{plain_icons:?}");
+}
+
 #[test]
 fn foreign_terminal_row_is_window_inert() {
     use crate::state::HostId;

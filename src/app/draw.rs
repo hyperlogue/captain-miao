@@ -925,20 +925,26 @@ impl App {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    /// The Host-column cell for a row and whether it's a *foreign-terminal* tag
-    /// rather than a host: the terminal kind (`kitty` / `zellij`) for a local
-    /// row that lives in another terminal instance, and otherwise the host's
-    /// **emoji** (§9) — configurable per host in the hosts panel exactly like
-    /// the workdir icons, with a deterministic fallback.
+    /// The host half of a row's icon cell, and whether it's a *foreign-terminal*
+    /// marker rather than a host: the host's **emoji** (§9) — configurable per
+    /// host in the hosts panel exactly like the workdir icons, with a
+    /// deterministic fallback — or the "lives in another terminal instance"
+    /// glyph for a local row this backend can't drive.
     ///
-    /// An icon rather than a name because the column is a glance-level "which
-    /// box is this?", and a name either truncates to noise or eats six cells of
-    /// a row that has better uses for them. `None` for a row on this machine
-    /// with nothing unusual about it. Drives both the column width and the cell
-    /// so the two can't disagree.
-    fn host_column_label(&self, s: &LauncherState) -> Option<(String, bool)> {
-        if let Some(identity) = self.foreign_terminal(s) {
-            return Some((terminal_kind(&identity).to_string(), true));
+    /// This used to be its own `Host` column. It now shares the workdir-icon
+    /// column as `<host>│<workdir>`: both answer "where is this?", they read
+    /// better as one glyph pair than as two columns a table apart, and the merge
+    /// hands the freed width back to the elastic last-prompt column.
+    ///
+    /// An icon rather than a name because it's a glance-level "which box is
+    /// this?", and a name either truncates to noise or eats six cells. The
+    /// foreign case loses its `kitty`/`zellij` wording in the trade — the row is
+    /// already dimmed, and the detail panel names the instance in full. `None`
+    /// for a row on this machine with nothing unusual about it. Drives both the
+    /// column width and the cell so the two can't disagree.
+    fn host_icon_cell(&self, s: &LauncherState) -> Option<(String, bool)> {
+        if self.foreign_terminal(s).is_some() {
+            return Some((FOREIGN_TERMINAL_GLYPH.to_string(), true));
         }
         // `backends[0]` is this machine — under pooled-localhost its id is a
         // hostname, not "local", so compare against the backend rather than
@@ -1015,27 +1021,16 @@ impl App {
             spans.push(Span::raw(" "));
             Line::from(spans)
         };
-        // Show a compact Host column when remote hosts are federated, or when a
-        // local row lives in another terminal instance (it doubles as a "lives
-        // elsewhere" tag). A pure-local dashboard with no foreign rows looks
-        // exactly as before. Width fits the widest label (remote host or
-        // terminal-kind tag).
+        // Show the host half of the icon column when remote hosts are federated,
+        // or when a local row lives in another terminal instance (it doubles as
+        // a "lives elsewhere" tag). A pure-local dashboard with no foreign rows
+        // looks exactly as before. Width fits the widest glyph.
         // The narrow layout trims the table to status / workdir icon / name, so
-        // the Host column is dropped there along with the other extra columns.
+        // the host half is dropped there along with the other extra columns.
         let any_foreign = visible.iter().any(|s| self.foreign_terminal(s).is_some());
         let show_host = !narrow && (self.backends.len() > 1 || any_foreign);
-        let host_width = if show_host {
-            visible
-                .iter()
-                .filter_map(|s| self.host_column_label(s).map(|(t, _)| t.width()))
-                .max()
-                .unwrap_or(4)
-                .clamp(4, 16) as u16
-        } else {
-            0
-        };
 
-        let mut header_cells = if narrow {
+        let header_cells = if narrow {
             vec![
                 Cell::from(""),
                 Cell::from("Status"),
@@ -1053,9 +1048,6 @@ impl App {
                 Cell::from(Line::from("Updated").alignment(Alignment::Right)),
             ]
         };
-        if show_host {
-            header_cells.insert(4, Cell::from("Host"));
-        }
         let header = Row::new(header_cells).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -1079,6 +1071,24 @@ impl App {
             .max()
             .unwrap_or(1)
             .max(1) as u16;
+        // The host glyphs share that column, ahead of a divider (see
+        // `host_icon_cell`). Sized off the widest so the divider — and therefore
+        // every workdir icon behind it — lines up down the table.
+        let host_icons: Vec<Option<(String, bool)>> = if show_host {
+            visible.iter().map(|s| self.host_icon_cell(s)).collect()
+        } else {
+            Vec::new()
+        };
+        let host_width = host_icons
+            .iter()
+            .flatten()
+            .map(|(g, _)| g.as_str().width())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
+        // host glyph + the `│` divider, or nothing at all when there's no host
+        // half to show.
+        let host_slot = if show_host { host_width + 1 } else { 0 };
 
         // The Name column is a fixed max-width column (a dynamic fill looked
         // untidy): the truncate width plus 10 cells of headroom. The title is
@@ -1095,14 +1105,15 @@ impl App {
             // Zip the pre-resolved icon marks in by value so each row's icon
             // String isn't cloned a second time.
             .zip(icon_marks)
-            .map(|(s, (icon, icon_color))| {
+            .enumerate()
+            .map(|(row_idx, (s, (icon, icon_color)))| {
                 let flags = self.flags_of(&super::flag_key(s));
                 let muted = flags.muted;
                 let important = flags.pinned;
                 let follow_up = flags.follow_up;
                 // A row that lives in another terminal instance is visible but
-                // window-inert (D6) — dimmed, with its terminal kind tagged in the
-                // Host column.
+                // window-inert (D6) — dimmed, and flagged with
+                // `FOREIGN_TERMINAL_GLYPH` in the icon column's host half.
                 let foreign = self.foreign_terminal(s).is_some();
                 let status_text = s.status.label();
                 let name = truncate_str(
@@ -1124,16 +1135,49 @@ impl App {
                 } else {
                     Cell::from(name)
                 };
-                // Right-aligned so 1-cell defaults sit flush against 4-cell
-                // custom labels in the same column.
-                let icon_line = Line::from(icon).alignment(Alignment::Right);
-                let icon_cell = if muted {
-                    Cell::from(icon_line).style(Style::default().add_modifier(Modifier::DIM))
-                } else {
-                    Cell::from(icon_line).style(Style::default().fg(icon_color))
-                };
+                // `<host>│<workdir>` when a host half applies, else the workdir
+                // icon alone. Each half is right-aligned inside its own slot, so
+                // 1-cell defaults sit flush against wider custom labels and the
+                // divider lines up down the table. A row with no host glyph pads
+                // the divider away rather than drawing a bar with nothing on its
+                // left.
+                let mut icon_spans: Vec<Span<'static>> = Vec::new();
+                if show_host {
+                    let host_glyph = host_icons.get(row_idx).and_then(|o| o.as_ref());
+                    let text = host_glyph.map(|(g, _)| g.as_str()).unwrap_or("");
+                    icon_spans.push(Span::raw(
+                        " ".repeat((host_width as usize).saturating_sub(text.width())),
+                    ));
+                    match host_glyph {
+                        Some((glyph, foreign)) => {
+                            let style = if *foreign {
+                                Style::default().add_modifier(Modifier::DIM)
+                            } else {
+                                Style::default()
+                            };
+                            icon_spans.push(Span::styled(glyph.clone(), style));
+                            icon_spans.push(Span::styled(
+                                "\u{2502}",
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
+                        }
+                        None => icon_spans.push(Span::raw(" ")),
+                    }
+                }
+                icon_spans.push(Span::raw(
+                    " ".repeat((icon_width as usize).saturating_sub(dir_icon_width(&icon))),
+                ));
+                icon_spans.push(Span::styled(
+                    icon,
+                    if muted {
+                        Style::default().add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(icon_color)
+                    },
+                ));
+                let icon_cell = Cell::from(Line::from(icon_spans));
                 // The narrow layout keeps only status / workdir icon / name; the
-                // context, last-prompt, updated, and host columns are dropped.
+                // context, last-prompt and updated columns are dropped.
                 let mut row_cells = vec![override_cell, status_cell, icon_cell, name_cell];
                 if !narrow {
                     let ctx_tokens = s.context_tokens;
@@ -1152,22 +1196,6 @@ impl App {
                         Cell::from(last_prompt).style(Style::default().add_modifier(Modifier::DIM)),
                     );
                     row_cells.push(elapsed);
-                    if show_host {
-                        // Blank for an ordinary local row; a colored label for a
-                        // remote one; a dim terminal-kind tag for a
-                        // foreign-terminal local one.
-                        let host_cell = match self.host_column_label(s) {
-                            Some((tag, true)) => {
-                                Cell::from(tag).style(Style::default().add_modifier(Modifier::DIM))
-                            }
-                            Some((tag, false)) => {
-                                let color = self.host_label_color(&s.host);
-                                Cell::from(tag).style(Style::default().fg(color))
-                            }
-                            None => Cell::from(""),
-                        };
-                        row_cells.insert(4, host_cell);
-                    }
                 }
                 let row = Row::new(row_cells);
                 if muted || search_active || foreign {
@@ -1187,20 +1215,21 @@ impl App {
         // bounded), so they get hard `Length` constraints. Name and prompt
         // share the leftover space — name caps at the truncate width but
         // shrinks before status does on narrow viewports.
-        let mut constraints = if narrow {
+        let icon_col_width = host_slot + icon_width;
+        let constraints = if narrow {
             // Status / icon stay fixed-width; the name column fills the rest and
             // the ratatui table clips it when it doesn't fit.
             vec![
                 Constraint::Length(3),
                 Constraint::Length(status_width),
-                Constraint::Length(icon_width),
+                Constraint::Length(icon_col_width),
                 Constraint::Min(10),
             ]
         } else {
             vec![
                 Constraint::Length(3),
                 Constraint::Length(status_width),
-                Constraint::Length(icon_width),
+                Constraint::Length(icon_col_width),
                 // Name is a fixed max-width column (see `name_col_max`). Last
                 // prompt is the elastic column: `Fill` soaks up the slack when
                 // there's room and yields (truncates) first when there isn't, so
@@ -1211,9 +1240,6 @@ impl App {
                 Constraint::Length(ELAPSED_MAX_WIDTH),
             ]
         };
-        if show_host {
-            constraints.insert(4, Constraint::Length(host_width));
-        }
         let table = Table::new(rows, constraints)
             .header(header)
             // Top rule only — no side or bottom borders, so the list runs flush
@@ -1678,11 +1704,13 @@ impl App {
     }
 }
 
-/// The terminal *kind* of an instance identity — the `kitty` / `zellij` prefix
-/// before the first `:` — for a compact "lives elsewhere" row tag.
-fn terminal_kind(identity: &str) -> &str {
-    identity.split_once(':').map(|(k, _)| k).unwrap_or(identity)
-}
+/// Stands in for a host emoji on a local row that lives in **another terminal
+/// instance** — window-inert here, so it reads as "elsewhere" rather than as a
+/// machine. One dim glyph, since the row is already dimmed and the detail panel
+/// names the instance in full; the `kitty`/`zellij` wording it replaced needed a
+/// column of its own, which is exactly what merging into the icon column gave
+/// up.
+const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
 
 /// Squeeze arbitrary text — up to and including a host's multi-line refusal —
 /// onto one row of `max` cells.
