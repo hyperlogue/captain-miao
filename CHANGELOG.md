@@ -5,7 +5,7 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-09
 
 ### Added
 
@@ -35,6 +35,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `miao --version` prints the digest of everything a binary carries, which is what
   tells two builds of the same version apart.
 
+  **The host decides which build it can run.** `uname` reports an architecture
+  but never a libc, so rather than guess, the deploy offers a candidate and lets
+  the host rule on it: the binary is staged, run there via a new `miao-server
+  self-check`, and only moved into place if it passes. That check resolves a
+  user account — the thing a static build silently cannot do on an LDAP/SSSD
+  host, where a plain `--version` would pass and the first attach would then
+  fail. A host that can't run the glibc build falls back to a static musl one,
+  and what it accepted is remembered, so this runs once per host rather than
+  once per connect. A `miao-server` already on the host's PATH is now kept when
+  its *protocol* is compatible rather than only when its version matches
+  exactly, and a daemon already running is left alone.
+
+  **A dashboard that carries nothing for a host can still reach it.** Payloads
+  resolve through a chain — `$CAPTAIN_MIAO_SERVER_<TARGET>`, then
+  `$CAPTAIN_MIAO_SERVER_DIR`, then whatever the binary embeds, then a local
+  cache — and, when all of those are exhausted, by downloading the published
+  server for that target. The download asks first and a refusal is the default,
+  so an ordinary release build can serve a NixOS or Alpine host it carries
+  nothing for, and never leaves the machine without being asked.
+
 - **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
   By default a session *is* its terminal window and closing it ends the session.
   Pooled mode runs each of this machine's sessions in a local pty pool instead,
@@ -45,6 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no scrollback replay on reattach, and one client at a time. Needs
   `miao-server` on `PATH`; without it the dashboard says so and keeps
   the default behaviour.
+
+- **A Home Manager module.** `programs.captain-miao.enable = true` puts `miao`
+  on your PATH, and `programs.captain-miao.server.enable = true` puts
+  `miao-server` there — which is the entire setup a Nix host needs to be
+  reachable from another machine's dashboard, since a server that host builds
+  for itself runs where a deployed generic-glibc binary cannot even start. No
+  systemd unit: the daemon starts on demand and exits when idle. (Set
+  `users.users.<name>.linger = true` on NixOS if you want pooled sessions to
+  survive your last logout.)
 
 - **`Space H` — a default host** for new-session operations, the exact analog of
   `Space a`'s default backend, persisted and shown in the header once you have
@@ -58,10 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Release binaries are about 15% smaller.** Link-time optimisation is now on
-  for release builds, which takes `miao` from 7.6 MB to 6.6 MB and the same
-  proportion off `miao-server`. Costs about 90 seconds of build time;
-  debug builds are untouched.
+- **Release binaries are about 20% smaller.** Link-time optimisation is now on
+  for release builds, taking `miao` from 7.6 MB to 6.6 MB and the same
+  proportion off `miao-server`; dropping 11 crates from the dashboard's
+  dependency tree (a regex engine pulled in by a log-filter syntax nothing used,
+  and a terminal-colour chain for `--help`) takes it to 6.1 MB. LTO costs about
+  90 seconds of build time; debug builds are untouched. Two visible
+  consequences: `--help` is no longer coloured, and third-party crates no longer
+  log at ERROR by default — set `RUST_LOG` if you want theirs.
 
 - **Remote hosts: the whole feature is now implemented** (still behind the
   `remote` cargo feature until it's verified end to end against a real host).
@@ -80,8 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when you leave the row, and removal asks first. When something is wrong the
   panel now says *what* — "miao-server not found", "version mismatch
   (found 0.3.1, need 0.4.0)" — where the header used to show only a warning
-  triangle. The header itself carries just a count (`hosts 3 ⚠1`), so it stays
-  glanceable however many hosts you have.
+  triangle, and **`l` opens that host's whole connection log**: every step of
+  probe, deploy, daemon start and handshake, with the host's own replies quoted
+  in full, for when a one-line reason isn't enough to explain the failure. The
+  header carries a `☁` tally rather than a raw count — one number per bucket
+  (healthy, failing, dialing), with empty buckets left out — so an all-green
+  fleet reads as a single number and a problem announces itself by a number
+  appearing.
 
 - **`r` lists one host at a time** (named in the picker title, `Ctrl-h` to
   switch) instead of merging every host's resumable sessions into one list whose
@@ -122,6 +160,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can't shadow the new one. Sessions already running keep hooks pointing at the
   absolute path of the binary that launched them, so restart them once the old
   path is gone (npm removes it; `cargo install` leaves it in place).
+
+### Known limitations
+
+- **Remote hosts over SSH are experimental and off by default.** The whole
+  cross-host lifecycle is implemented, but it has not been verified end to end
+  against a real remote host. Build with `--features remote` to try it; without
+  it the dashboard is strictly local-only.
+- **`t` (move window to tab) is unsupported on zellij**, which has no CLI to
+  reparent a pane across tabs. The key reports it and the help entry is hidden.
+- **The Linux dashboard binaries are glibc builds** (glibc 2.35, so Ubuntu
+  22.04+, Debian 12+, RHEL 9+); on Alpine or a musl system, build from source.
+  This is about the dashboard you run, not the hosts you reach: `miao-server` is
+  published for musl too, and a host that can't run the glibc build is served
+  the static one automatically.
 
 ## [0.2.1] - 2026-08-02
 
@@ -244,6 +296,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...HEAD
+[unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hyperlogue/captain-miao/releases/tag/v0.2.0

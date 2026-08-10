@@ -306,7 +306,7 @@ build; each release also publishes the servers on their own, which is what
 `miao --version` says what any given binary is carrying:
 
 ```
-miao 0.2.1
+miao 0.3.0
 embedded miao-server:
   aarch64-unknown-linux-gnu     3.2 MiB  36fd6ac00444
   x86_64-unknown-linux-gnu      3.4 MiB  c1a3cd563639
