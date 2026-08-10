@@ -337,8 +337,10 @@ pub(crate) fn run_attach(
                     let path = crate::state::state_dir()
                         .join("logs")
                         .join(format!("attach-{name}.log"));
+                    // 0700 like the rest of the state tree: the log records the
+                    // launcher command line and the session's cwd.
                     if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                        let _ = crate::state::create_dir_all_private(parent);
                     }
                     path.display().to_string()
                 });
