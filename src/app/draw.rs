@@ -740,13 +740,16 @@ impl App {
                 Style::default().fg(ui.title_fg),
             ),
         ]);
-        // The host cluster — default host, then the ☁ tally — appears only once
-        // there's a choice to make. Both hang off the *same* emptiness check, so
-        // a zero-remote user sees neither: naming a default host is meaningless
-        // when localhost is the only one, exactly like the Host column.
+        // The host cluster — the ☁️ tally, then the default host — appears only
+        // once there's a choice to make. Both hang off the *same* emptiness
+        // check, so a zero-remote user sees neither: naming a default host is
+        // meaningless when localhost is the only one. The tally leads because it
+        // is the alarm: a number *appearing* there is what should catch the eye,
+        // and the default host beside it is the steady-state label.
         let tally = self.remote_host_tally();
         if !tally.is_empty() {
             let host = self.default_host_or_local();
+            right_segs.push(host_tally_spans(&tally, ui));
             right_segs.push(vec![
                 Span::styled(
                     "Default host: ",
@@ -757,7 +760,6 @@ impl App {
                     Style::default().fg(self.host_label_color(&host)),
                 ),
             ]);
-            right_segs.push(host_tally_spans(&tally, ui));
         }
         if self.sleep_inhibitor.is_active() {
             right_segs.push(vec![Span::styled(
@@ -1695,7 +1697,7 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
     truncate_str(&flat, max)
 }
 
-/// The header's `☁` host tally: one colored number per bucket, good → error →
+/// The header's ☁️ host tally: one colored number per bucket, good → error →
 /// down. It is an **aggregate**, never per-host detail — which host, and *why*
 /// (including a `Failed` reason), lives one `Space h` away in the hosts panel,
 /// so the header stays glanceable at any host count (§9).
@@ -1706,11 +1708,14 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
 /// width, so color is what tells the buckets apart — which is also why a
 /// failing host (a diagnosis waiting to be read) is loud where a merely
 /// re-dialing one, expected to clear on its own, is dim.
+///
+/// The cloud carries an explicit **variation selector** (`U+2601 U+FE0F`) and is
+/// *not* dimmed. Bare `U+2601` is a text-presentation glyph: terminals render it
+/// as a hairline outline in the foreground colour, which DIM then washes out to
+/// invisible — reported as "I cannot see the cloud icon". The emoji
+/// presentation is a filled, self-coloured 2-cell glyph that reads at a glance.
 pub(super) fn host_tally_spans(tally: &HostTally, ui: &config::UiColors) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        "\u{2601}",
-        Style::default().add_modifier(Modifier::DIM),
-    )];
+    let mut spans = vec![Span::raw("\u{2601}\u{FE0F}")];
     for (count, style) in [
         (tally.good, Style::default().fg(Color::Green)),
         (

@@ -2769,12 +2769,14 @@ fn the_host_tally_prints_only_the_non_empty_buckets() {
             .map(|s| s.content.to_string())
             .collect::<String>()
     };
+    // The cloud carries its emoji variation selector: the bare U+2601 is a
+    // hairline text glyph that vanished against the header.
     // All healthy: one green number, nothing else — the quiet case stays quiet.
-    assert_eq!(text(3, 0, 0), "\u{2601} 3");
+    assert_eq!(text(3, 0, 0), "\u{2601}\u{fe0f} 3");
     // A problem announces itself by a number appearing, not by a 0 changing.
-    assert_eq!(text(2, 1, 0), "\u{2601} 2 1");
-    assert_eq!(text(0, 0, 2), "\u{2601} 2");
-    assert_eq!(text(1, 2, 3), "\u{2601} 1 2 3");
+    assert_eq!(text(2, 1, 0), "\u{2601}\u{fe0f} 2 1");
+    assert_eq!(text(0, 0, 2), "\u{2601}\u{fe0f} 2");
+    assert_eq!(text(1, 2, 3), "\u{2601}\u{fe0f} 1 2 3");
 }
 
 #[test]
