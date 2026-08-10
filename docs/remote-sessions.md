@@ -520,23 +520,50 @@ outlives the binding: `prune_dead` drops a binding when its window dies but
 leaves the expectation, while an explicit `D` clears it. That one distinction —
 "the link dropped" vs "you detached" — is the whole basis of auto-reattach (§7).
 
-**The prune runs on a timer, not only off a reload.** Closing an attach window
-is invisible to every change signal the dashboard has: the pooled session keeps
-running untouched, so no state file moves and the host pushes no delta. Gating
-the prune on the reload branch therefore left the binding in place indefinitely
-— the row kept resolving to a window that no longer existed, so it showed
-neither the detached marker nor the detached tier, and `Enter` silently focused
-a dead window instead of re-attaching. The run loop now also prunes on its own
-schedule, still floored to `DETACH_PRUNE_MIN_INTERVAL` (what makes a periodic
-`list-panes` affordable on zellij) and still gated on `has_remote()` (so a purely
-local dashboard never snapshots for this at all).
+**The attach window reports its own end; the prune is the backstop.** Closing an
+attach window is invisible to every change signal the dashboard has: the pooled
+session keeps running untouched, so no state file moves and the host pushes no
+delta — and neither Kitty nor zellij has a window-closed callback. Detection was
+therefore a periodic `snapshot()` of the whole window tree, which is both a poll
+and, on zellij, an expensive one (`list-panes`, ~20ms per pane).
 
-**Evidence short-circuits the heartbeat.** A ten-second floor is affordable but
-not *responsive* — the user closes an attach window, looks back at the dashboard,
-and sees a row still claiming to be attached. Nothing pushes a signal for a
-closed window, so the prune is armed by the closest proxies available, each
-floored at `EVIDENCE_PRUNE_MIN_INTERVAL` (2s, because focus events flap and every
-prune is a `snapshot()`):
+So the attach command is **wrapped in a shell that reports its exit**
+(`report_on_exit_argv` → `miao attach-exited` → a `DetachReport` sentinel in the
+sessions dir → the dashboard's watcher → `App::apply_detach_reports`). The
+mechanism is deliberately the same shape as the `focus` bell: a sentinel in a
+directory already under `notify`, not a socket or a signal, because the reporter
+runs from a dying window's trap — it must not block, must not need the dashboard
+to be reachable, and must survive the dashboard being restarted between the write
+and the read. Three properties earn it:
+
+- **It covers every way an attach ends, not just a closed window.** The window
+  closing SIGHUPs the wrapper (hence the `HUP` trap beside `EXIT`), while an
+  in-session shpool detach or a dropped ssh ends the attach process normally. The
+  old snapshot only ever saw the first of the three; the other two left a bound
+  row that was no longer attached to anything.
+- **It is scoped to the exact question.** The binding asks "does *my* window
+  still exist", which is local knowledge — no host round trip can answer it
+  better, and the host's own `attached` bit answers a different question (see
+  §10.2).
+- **It cannot invent a binding**, only retire one. A report for a binding we no
+  longer hold (the prune or a `D` got there first) is a no-op.
+
+The script takes the exe, host, token and attach argv as **positional
+parameters** — nothing is interpolated into it. The attach argv holds ssh options
+and a session name, and splicing those into a script is how quoting bugs become
+command injection. A `$d` latch keeps the EXIT/HUP pair from reporting twice.
+With no resolvable `current_exe` there is nothing to report *with*, so the argv
+is spawned unwrapped and the backstop covers it.
+
+What no trap can cover is the terminal emulator being killed outright. So the
+periodic prune stays — floored at `DETACH_PRUNE_MIN_INTERVAL`, now **60s**
+because it is no longer the primary path, and still gated on `has_remote()` (a
+purely local dashboard never snapshots for this at all).
+
+**Evidence short-circuits the heartbeat.** For the cases the report can't reach,
+the prune is also armed by the closest proxies available, each floored at
+`EVIDENCE_PRUNE_MIN_INTERVAL` (2s, because focus events flap and every prune is a
+`snapshot()`):
 
 - **The dashboard regaining focus** — the move that *follows* closing a session
   window, and the moment a stale binding starts lying.

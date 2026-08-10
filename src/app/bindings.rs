@@ -82,6 +82,25 @@ impl WindowBindings {
         removed
     }
 
+    /// Retire the binding for `(host, token)` because its window is gone,
+    /// returning the window it pointed at.
+    ///
+    /// The single-key form of [`WindowBindings::prune_dead`], and it keeps that
+    /// one's semantics rather than [`WindowBindings::remove`]'s: the
+    /// expected-attached memory **survives**. The caller is a detach report from
+    /// a window that ended, which is "the link dropped", not "you detached" — a
+    /// closed window and a killed ssh are indistinguishable from here, and both
+    /// should come back when the host reconnects. Only `D` retires the
+    /// expectation.
+    pub(crate) fn prune_token(&mut self, host: &HostId, token: &str) -> Option<WindowId> {
+        let inner = self.by_host.get_mut(host)?;
+        let removed = inner.remove(token);
+        if inner.is_empty() {
+            self.by_host.remove(host);
+        }
+        removed
+    }
+
     /// Tokens on `host` the dashboard expects to be attached to but currently
     /// holds no window for — the auto-reattach work list after a reconnect (§7).
     pub(crate) fn expected_without_window(&self, host: &HostId) -> Vec<String> {

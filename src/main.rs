@@ -102,6 +102,21 @@ enum Commands {
         #[arg(long)]
         window_id: Option<terminal::WindowId>,
     },
+
+    /// Report that an attach window's session ended, so the dashboard can drop
+    /// its window binding at once instead of waiting for a periodic window-tree
+    /// snapshot to notice. Invoked by the wrapper the dashboard puts around
+    /// every attach command — not something to run by hand, hence hidden.
+    #[command(hide = true)]
+    AttachExited {
+        /// The host the attached session lives on.
+        #[arg(long)]
+        host: String,
+
+        /// The session's binding token (its pool session name).
+        #[arg(long)]
+        token: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -126,6 +141,10 @@ fn requires_terminal(command: &Option<Commands>) -> bool {
         // launcher socket); it never touches a terminal and runs wherever the
         // agent runs.
         Some(Commands::Hook { .. }) => false,
+        // A detach report is one file write, fired from a dying attach window's
+        // trap. It drives no window, and gating it on the terminal would make it
+        // fail exactly when the terminal is going away — the case it exists for.
+        Some(Commands::AttachExited { .. }) => false,
         // A pooled launcher carries `--pool-session` in its passthrough args here
         // (stripped later); it runs on a headless pool host, not in a terminal.
         Some(Commands::Claude { args } | Commands::Codex { args }) => {
@@ -179,6 +198,16 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Commands::Hook { event, sock, agent }) => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
+        }
+        Some(Commands::AttachExited { host, token }) => {
+            // A sentinel drop and nothing else — the dashboard's watcher on the
+            // sessions dir turns it into a binding retirement. Deliberately not
+            // a socket or a signal: this runs from a dying window's trap, so it
+            // must not block, must not need the dashboard to be reachable, and
+            // must survive the dashboard being restarted between the write and
+            // the read.
+            state::write_detach_report(&host, &token);
+            Ok(())
         }
         Some(Commands::Focus { window_id }) => {
             // The terminal instance this focus process *drives* (the active

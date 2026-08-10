@@ -18,6 +18,8 @@ use crate::terminal::{
 };
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     Action, App, InputMode, PendingConfirm, PickerKind, RestartSpec, ResumeLoad,
@@ -28,15 +30,21 @@ use super::{
 /// scroll-up depth. The draw side (`draw_preview`) parses/scrolls within this.
 const PREVIEW_CAPTURE_LINES: usize = 2000;
 
-/// Floor between remote-detach-prune terminal snapshots. Detach detection is
-/// not latency-critical, but on the zellij backend a `snapshot()` is
-/// `list-panes` (~20ms/pane, ~475ms at 22 panes), so while a remote attach
-/// binding exists it must not force one on *every* debounced reload as busy
-/// sessions churn their state files. The prune runs at most once per interval
-/// — but a tab-cache refresh that needs the snapshot anyway may still prune off
-/// the same data, so the throttle never starves the tab cache (see the reload
-/// loop's snapshot gate).
-const DETACH_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+/// Floor between *backstop* detach-prune terminal snapshots.
+///
+/// Detachment is event-driven now: the attach window reports its own end
+/// (`report_on_exit_argv` → `state::DetachReport`), which covers a closed
+/// window, an in-session shpool detach and a dropped ssh alike. What no trap can
+/// cover is the terminal emulator dying outright, so this heartbeat stays as the
+/// thing that eventually notices — and, being a backstop rather than the primary
+/// path, it can be slow. Which matters, because on zellij a `snapshot()` is
+/// `list-panes` (~20ms/pane, ~475ms at 22 panes) awaited inline in the loop.
+///
+/// A tab-cache refresh that needs the snapshot anyway may still prune off the
+/// same data, so the throttle never starves the tab cache (see the reload loop's
+/// snapshot gate), and real evidence short-circuits it entirely
+/// ([`arm_detach_prune`]).
+const DETACH_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Floor on *evidence-driven* detach prunes — the ones armed by something that
 /// suggests a bound window just died (the dashboard regaining focus after the
@@ -69,6 +77,34 @@ fn arm_detach_prune(last_detach_prune: &mut Option<Instant>, now: Instant) {
     if last_detach_prune.is_none_or(|t| now.duration_since(t) >= EVIDENCE_PRUNE_MIN_INTERVAL) {
         *last_detach_prune = None;
     }
+}
+
+/// Watch the sessions dir for detach reports, flipping `dirty` on any change.
+///
+/// A watcher of its own rather than a ride on the local backend's: under pooled
+/// localhost `backends[0]` is a socket client with no filesystem watcher at all,
+/// and the reports are written here regardless. It is also *not* routed through
+/// `fs_dirty` — retiring a binding needs no session re-read, so making it wait
+/// out the reload debounce would only delay the one thing this exists to make
+/// immediate. Best-effort: without the watcher, reports are still drained on
+/// each reload, and the periodic prune remains the backstop.
+fn start_detach_report_watcher(dirty: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher as _;
+    let sink = dirty.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // Access events (our own reads, including the drain's) would otherwise
+        // wake us in a loop.
+        if res.is_ok_and(|e| !matches!(e.kind, notify::EventKind::Access(_))) {
+            sink.store(true, Ordering::Relaxed);
+        }
+    })
+    .ok()?;
+    let dir = state::sessions_dir();
+    if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+        tracing::warn!("could not watch {} for detach reports: {e}", dir.display());
+        return None;
+    }
+    Some(watcher)
 }
 
 /// Drop every binding whose window is missing from `tabs`, and persist what's
@@ -644,6 +680,16 @@ async fn attach_pool_session(
             return;
         }
     };
+    // Wrap the attach so the window reports its own end (§5). This is what makes
+    // detachment an *event*: the wrapper's trap fires whether the user closed the
+    // window (SIGHUP), detached inside shpool, or the ssh dropped, and the report
+    // lands in a directory the dashboard watches — no window-tree polling in the
+    // path at all. Best-effort: with no resolvable exe there is nothing to report
+    // with, so the attach runs unwrapped and the periodic prune covers it.
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string));
+    let argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &host.0, &pool_session);
     let spec = SpawnSpec {
         cwd: app.home_dir.clone(),
         // An attach window is a session view, so it gets the current session
@@ -907,6 +953,11 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     app.load_work_tabs();
     // Drain bell sentinels accumulated while the dashboard wasn't running.
     app.apply_bell_signals(state::drain_bell_flag_pids());
+    // Same for detach reports: the bindings were just re-seeded from disk, and
+    // any attach window that ended while we were down left one of these behind.
+    // Without this the stale binding would survive the restart and the row would
+    // read as attached until the first snapshot prune.
+    app.apply_detach_reports(state::drain_detach_reports());
     // Don't auto-focus pre-existing failed-launch rows at startup — yanking
     // focus the instant the dashboard opens would be jarring. The initial
     // `reload_sessions` above already queued any, so clear it; focusing only
@@ -948,6 +999,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut fs_dirty = false;
     let mut last_reload: Option<Instant> = None;
     let mut last_detach_prune: Option<Instant> = None;
+    // Detach reports: an attach window telling us its session ended. The watcher
+    // must outlive the loop, so it is bound here (dropping it stops the watch).
+    let detach_reports = Arc::new(AtomicBool::new(false));
+    let _detach_report_watcher = start_detach_report_watcher(detach_reports.clone());
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
     // Deadline armed by an action that races a launcher's state-file write
@@ -961,6 +1016,23 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             settle_reload_at = None;
             fs_dirty = true;
             last_reload = None;
+        }
+        // An attach window reporting that its session ended — the event that
+        // makes detachment prompt without polling the window tree (§5). Handled
+        // before the reload block so the retired binding is already gone if a
+        // reload runs this same iteration, and outside it because retiring a
+        // binding needs no session re-read.
+        if detach_reports.swap(false, Ordering::Relaxed)
+            && app.apply_detach_reports(state::drain_detach_reports())
+        {
+            // A report can queue the ended attach's held pane for reaping, and
+            // no reload need run this iteration to drain it.
+            for wid in std::mem::take(&mut app.reap_window_queue) {
+                if let Err(e) = terminal::get().close_window(&wid).await {
+                    tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
+                }
+            }
+            needs_redraw = true;
         }
         // Take each backend's change signal and coalesce (§5). One uniform
         // question per host: the local backend's watcher fires on every state

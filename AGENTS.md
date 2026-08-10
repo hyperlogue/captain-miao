@@ -130,6 +130,7 @@ readable. Pinned by `state_dirs_and_files_are_owner_only`.
 
 - `sessions/{pid}.json` — launcher state files (atomic write via temp+rename)
 - `sessions/bell-{pid}.flag` — bell sentinels dropped by `miao focus --window-id`
+- `sessions/detach-{pid}.flag` — detach reports (`{host, token}`) dropped by an attach window's wrapper when its attach ends, so the dashboard retires the window binding on an event instead of a window-tree poll. Drained (and deleted) by the dashboard; safe to delete
 - `dashboard.pid` — dashboard singleton lock
 - `dashboard-window-id` — for the `focus` command, written as `<terminal-identity>|<window-id>` so a focus process in another terminal declines instead of driving a same-numbered foreign window
 - `window-bindings.json` — the dashboard's persisted window↔session bindings (`window_id`, `host`, `launcher_pid`, `token`, `terminal`); same-terminal entries are validated/pruned against live rows, foreign-terminal entries are carried verbatim so a dashboard backend switch loses nothing
@@ -425,25 +426,44 @@ it uses no ssh and has its own config flag.
   expectation, while an explicit `D` clears it. That distinction — "the link
   dropped" vs "you detached" — is what auto-reattach runs on: on a host's
   reconnect epoch bump, every remembered `(host, pool_session)` without a window
-  gets one respawned (without stealing focus). The prune runs **on a timer**, not
-  only inside the reload branch: closing an attach window changes no state file
-  and produces no host delta, so a reload-gated prune left the binding forever
-  and the row read as attached-but-inert (no detached marker, `Enter` focusing a
-  dead window). Still floored to `DETACH_PRUNE_MIN_INTERVAL` and gated on
-  `has_remote()`, and additionally on the dashboard being **focused** — the
-  snapshot is a `list-panes` on zellij, and an idle background dashboard used to
-  pay none; what the prune detects only matters when you look back at the row.
-  That heartbeat is affordable but not *responsive*, so **evidence short-circuits
-  it** (`arm_detach_prune`, floored at `EVIDENCE_PRUNE_MIN_INTERVAL` = 2s, since
-  focus events flap and each prune is a snapshot): the dashboard **regaining
-  focus** — the move that follows closing a session window, and the moment a
-  stale binding starts lying — and a **preview capture that stopped answering**
-  (a window that won't serve `get-text`/`dump-screen` is usually gone) each arm
-  the next tick's prune. A *failed focus* is stronger still: it snapshots right
-  there, prunes, and re-runs the focus-or-attach decision so `Enter` stays one
-  press (see Key bindings). None of the three retires a binding on its own —
-  one failed rc call, or one unreadable window, isn't proof the window is gone,
-  and only a real snapshot may prune. Neither prune site may run on a
+  gets one respawned (without stealing focus).
+- **A binding is retired by an *event*: the attach window reports its own end.**
+  Closing an attach window changes no state file and produces no host delta, and
+  neither Kitty nor zellij has a window-closed callback — so detection used to be
+  a periodic `snapshot()` of the whole window tree, which on zellij is the
+  ~20ms-per-pane `list-panes`. Every attach command is now wrapped in a shell
+  that reports its exit (`backend::report_on_exit_argv` → the hidden
+  `miao attach-exited` → a `DetachReport` sentinel in the sessions dir → the
+  dashboard's own watcher → `App::apply_detach_reports`), the same shape as the
+  `focus` bell and for the same reasons: it runs from a dying window's trap, so
+  it must not block, must not need the dashboard reachable, and must survive a
+  dashboard restart between the write and the read. It covers **every** way an
+  attach ends, not just a closed window — the close SIGHUPs the wrapper (hence
+  the `HUP` trap beside `EXIT`, with a `$d` latch so the pair reports once),
+  while an in-session shpool detach or a dropped ssh ends the process normally;
+  the snapshot only ever saw the first. The script takes the exe, host, token and
+  attach argv as **positional parameters** — nothing is interpolated, because the
+  argv holds ssh options and a session name and splicing those into a script is
+  how quoting bugs become command injection. It can only ever *retire* a binding,
+  never invent one, so a report for a binding we no longer hold is a no-op. The
+  watcher is the dashboard's own rather than a ride on the local backend's:
+  pooled-localhost replaces `backends[0]` with a socket client that has no
+  filesystem watcher, and it is kept off `fs_dirty` since retiring a binding
+  needs no session re-read.
+- **The periodic prune is now the backstop**, for the one case no trap can cover:
+  the terminal emulator killed outright. Floored at
+  `DETACH_PRUNE_MIN_INTERVAL` — **60s**, affordable precisely because it is no
+  longer the primary path — gated on `has_remote()` and on the dashboard being
+  **focused** (what it detects only matters when you look back at the row).
+  **Evidence short-circuits it** (`arm_detach_prune`, floored at
+  `EVIDENCE_PRUNE_MIN_INTERVAL` = 2s, since focus events flap and each prune is a
+  snapshot): the dashboard **regaining focus** and a **preview capture that
+  stopped answering** each arm the next tick's prune. A *failed focus* is
+  stronger still: it snapshots right there, prunes, and re-runs the
+  focus-or-attach decision so `Enter` stays one press (see Key bindings). None of
+  the three retires a binding on its own — one failed rc call, or one unreadable
+  window, isn't proof the window is gone, and only a real snapshot may prune.
+  Neither prune site may run on a
   **failed** snapshot: an absent snapshot is "we don't know", and feeding its
   empty live-set to `prune_dead` drops *every* binding — hence the shared
   `prune_detached_from_tabs`, which also persists `window-bindings.json` (the

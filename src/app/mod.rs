@@ -2550,6 +2550,45 @@ impl App {
         dropped
     }
 
+    /// Retire the bindings named by a batch of detach reports — the attach
+    /// windows that just told us their session ended (§5).
+    ///
+    /// This is the event that replaces polling for the common case. It is
+    /// deliberately allowed to be *wrong in one direction only*: a report can
+    /// arrive for a binding we no longer hold (the snapshot prune beat it, or the
+    /// user pressed `D`), which is a no-op; it can never invent a window, because
+    /// only a live attach can send one. The snapshot prune stays as the backstop
+    /// for the reverse case — a report that never came because the terminal was
+    /// killed outright.
+    ///
+    /// Returns whether anything changed, so the caller can redraw. The
+    /// expected-attached memory survives (see `prune_token`), so a host coming
+    /// back still restores the window.
+    pub(super) fn apply_detach_reports(&mut self, reports: Vec<state::DetachReport>) -> bool {
+        let mut changed = false;
+        for report in reports {
+            let host = HostId(report.host);
+            let Some(window) = self.window_bindings.prune_token(&host, &report.token) else {
+                continue;
+            };
+            changed = true;
+            // Same rule as a departed row's window (D2): on zellij the attach
+            // pane is `hold: true`, so a dropped ssh leaves an exited pane buried
+            // invisibly in the shared sessions tab, inflating every `list-panes`.
+            // On kitty it stays visible as forensics. A window the user closed is
+            // already gone, so the close is a no-op there.
+            if self.capabilities.floating_sessions {
+                self.reap_window_queue.push(window);
+            }
+        }
+        if changed {
+            // Detachment is a sort key, and this path runs outside any reload.
+            self.mark_dirty();
+            self.write_window_bindings_file();
+        }
+        changed
+    }
+
     /// The follow-up flag auto-mark / auto-clear transitions to apply after a
     /// reload — a pure function of the previous status map and the freshly
     /// collected sessions, returning `(key, want)` pairs the caller feeds to

@@ -789,6 +789,53 @@ impl RemoteBackend {
     }
 }
 
+/// The shell script that wraps an attach so the window reports its own end.
+///
+/// Positional parameters (`sh -c SCRIPT sh <exe> <host> <token> <argv…>`) rather
+/// than interpolation: the attach argv holds ssh options and a session name, and
+/// splicing any of that into a script is how quoting bugs become command
+/// injection. Nothing here is substituted — the text is a constant.
+///
+/// Traps `HUP` as well as `EXIT` because the two ends differ: closing the window
+/// tears down the pty, which SIGHUPs the wrapper mid-`wait`, while an in-session
+/// shpool detach or a dropped ssh returns normally. `INT`/`TERM` are along for
+/// the ride. The `$d` latch keeps the pair from reporting twice — after a HUP
+/// handler returns, the interrupted wait unwinds and the script still exits
+/// through its EXIT trap.
+const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; shift 3; \
+     trap 'if [ -z \"$d\" ]; then d=1; \"$e\" attach-exited --host \"$h\" --token \"$t\"; fi' \
+     EXIT HUP INT TERM; \
+     \"$@\"";
+
+/// Wrap an attach argv so the window reports back when the attach ends, giving
+/// the dashboard an *event* for detachment instead of a periodic window-tree
+/// snapshot (`cm_core::state::DetachReport`).
+///
+/// `exe` is this dashboard's own binary (`current_exe`), re-invoked as
+/// `miao attach-exited`; it is passed rather than re-derived so the caller owns
+/// the failure case — with no resolvable exe there is nothing to report *with*,
+/// and the argv is returned unwrapped so the attach still works.
+pub(crate) fn report_on_exit_argv(
+    argv: Vec<String>,
+    exe: Option<&str>,
+    host: &str,
+    token: &str,
+) -> Vec<String> {
+    let Some(exe) = exe else { return argv };
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        ATTACH_REPORT_SCRIPT.to_string(),
+        // `$0`. Names the wrapper in `ps`, and is never executed.
+        "miao-attach".to_string(),
+        exe.to_string(),
+        host.to_string(),
+        token.to_string(),
+    ];
+    wrapped.extend(argv);
+    wrapped
+}
+
 /// The argv for the window that attaches to a pool session: over ssh for a
 /// remote host (`ssh -t <target> miao-server attach <name>`), or directly for
 /// a same-host socket transport (`miao-server attach <name>`). `-t` forces a
@@ -3624,6 +3671,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The attach wrapper has to do two things and no more: run the attach
+    /// unchanged, and report exactly once when it ends. Run for real, because
+    /// the failure modes here are shell semantics — a trap that never fires, a
+    /// double report, an argv mangled by quoting — none of which a string
+    /// comparison would catch.
+    #[test]
+    fn the_attach_wrapper_runs_the_attach_and_reports_its_end() {
+        let dir = scratch_home("attach-wrapper");
+        let reporter = dir.join("reporter.sh");
+        // Stands in for `miao attach-exited`, appending its argv so a second
+        // report would be visible as a second line.
+        std::fs::write(
+            &reporter,
+            format!("#!/bin/sh\necho \"$@\" >> {}/reports\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The "attach": a payload that records the argv it was handed, spaces
+        // and all, so quoting damage shows up.
+        let payload = dir.join("attach.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\necho \"$@\" > {}/attached\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let argv = report_on_exit_argv(
+            vec![
+                payload.display().to_string(),
+                "attach".into(),
+                "cm-claude 7".into(), // a space, to catch splatted quoting
+            ],
+            Some(reporter.to_str().unwrap()),
+            "box",
+            "cm-claude-7-1",
+        );
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("attached")).unwrap(),
+            "attach cm-claude 7\n",
+            "the attach argv must reach the command untouched"
+        );
+        // Exactly one report, carrying the binding's identity. Two lines would
+        // mean the EXIT/HUP trap pair fired twice — the latch is what stops it.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("reports")).unwrap(),
+            "attach-exited --host box --token cm-claude-7-1\n"
+        );
+    }
+
+    /// Closing the window is the case the whole mechanism exists for, and it
+    /// arrives as a SIGHUP mid-attach rather than as a clean exit.
+    #[test]
+    fn the_attach_wrapper_reports_when_the_window_is_closed() {
+        let dir = scratch_home("attach-wrapper-hup");
+        let reporter = dir.join("reporter.sh");
+        std::fs::write(
+            &reporter,
+            format!("#!/bin/sh\necho \"$@\" >> {}/reports\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        use std::os::unix::process::CommandExt as _;
+        // A long-lived "attach", killed the way a closing pty kills one: the
+        // terminal SIGHUPs the whole foreground process *group*, so the wrapper
+        // and the attach under it die together. Signalling only the wrapper
+        // would leave the payload running and prove less than it looks.
+        let argv = report_on_exit_argv(
+            vec!["sleep".into(), "30".into()],
+            Some(reporter.to_str().unwrap()),
+            "box",
+            "cm-1",
+        );
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // Let the wrapper install its trap and start the payload.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: a plain `kill(2)` on a group this test created and owns.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGHUP) };
+        child.wait().unwrap();
+        // The trap spawns the reporter; give it a moment to land.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("reports")).unwrap(),
+            "attach-exited --host box --token cm-1\n",
+            "a closed window must report exactly once"
+        );
+    }
+
+    /// With no resolvable exe there is nothing to report *with*, and an attach
+    /// window that works beats one that reports: the argv passes through.
+    #[test]
+    fn the_attach_wrapper_is_skipped_without_a_reporter() {
+        let argv = vec!["ssh".to_string(), "box".to_string()];
+        assert_eq!(report_on_exit_argv(argv.clone(), None, "box", "cm-1"), argv);
     }
 
     #[test]

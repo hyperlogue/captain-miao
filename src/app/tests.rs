@@ -1163,6 +1163,57 @@ fn pruning_a_binding_resorts_the_list() {
     assert_eq!(order(&d), vec![2, 1]);
 }
 
+/// A detach report is the *event* that replaces polling the window tree: the
+/// attach window tells us its session ended, and the row must go detached (and
+/// re-sort) without waiting for a snapshot. Crucially it behaves like
+/// `prune_dead`, not like `D` — the expected-attached memory survives, because a
+/// closed window and a dropped ssh are indistinguishable from here and both
+/// should come back when the host reconnects.
+#[test]
+fn a_detach_report_retires_the_binding_but_not_the_expectation() {
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![away, here]);
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+    assert!(!d.app.is_detached_row(&d.app.sessions[0].clone()));
+
+    let changed = d.app.apply_detach_reports(vec![DetachReport {
+        host: "box".into(),
+        token: "cm-away".into(),
+    }]);
+    assert!(changed);
+    assert!(d.app.is_detached_row(&d.app.sessions[0].clone()));
+    // The row sank on the strength of the report alone — no snapshot involved.
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(order, vec![2, 1]);
+    // …and auto-reattach still knows to bring it back on a reconnect.
+    assert_eq!(
+        d.app.window_bindings.expected_without_window(&host),
+        vec!["cm-away".to_string()]
+    );
+
+    // A report for a binding we no longer hold is a no-op, not a wobble: the
+    // snapshot prune or a `D` may well have got there first.
+    assert!(!d.app.apply_detach_reports(vec![DetachReport {
+        host: "box".into(),
+        token: "cm-away".into(),
+    }]));
+}
+
 /// The preview panel is a capture of the row's *local* window, so a detached row
 /// has nothing to show — ever, not "yet". It used to claim "(no session
 /// selected)" in the one case it fires most often.

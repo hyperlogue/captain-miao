@@ -907,6 +907,92 @@ pub fn drain_bell_flag_pids() -> Vec<u32> {
     pids
 }
 
+/// One attach window reporting that its attach process has ended — the
+/// event that replaces polling the terminal for "is that window still there?".
+///
+/// The dashboard binds a pooled session to the local window it opened, and the
+/// binding can only be retired by learning the window died. Nothing pushes that:
+/// the pooled session keeps running, so no state file moves and no host delta
+/// fires, and neither Kitty nor zellij has a window-closed callback — which is
+/// why detection used to be a periodic `snapshot()` of the whole window tree.
+/// So the attach command is wrapped in a shell that reports its own exit
+/// (`report_on_exit_argv`), and the report lands here as a sentinel in the
+/// sessions dir — a directory the dashboard already watches, so the wake is
+/// inotify/FSEvents rather than a clock.
+///
+/// The window closing SIGHUPs the wrapper, and an in-session shpool detach or a
+/// dropped ssh ends the attach process on its own, so the same report covers
+/// every way an attach can end. What it can't cover is the terminal emulator
+/// being killed outright (no trap runs), which is why the periodic prune stays
+/// as a backstop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetachReport {
+    /// The host whose session this attach window was showing.
+    pub host: String,
+    /// The session's binding token — its `pool_session` name.
+    pub token: String,
+}
+
+/// `detach-{reporter pid}.flag`, in the sessions dir. The `.flag` extension
+/// keeps it invisible to [`read_all_launcher_states`] (which reads `*.json`),
+/// exactly like the bell sentinels; the pid only has to make the *name* unique
+/// among concurrent reporters, since the identity that matters is in the body.
+fn detach_report_path(dir: &Path, reporter_pid: u32) -> PathBuf {
+    dir.join(format!("detach-{reporter_pid}.flag"))
+}
+
+/// Drop the sentinel for `(host, token)`. Best-effort by nature: the report is
+/// a courtesy that makes the dashboard prompt, and the periodic prune is what
+/// makes it *correct*, so a failure here costs latency and nothing else.
+pub fn write_detach_report(host: &str, token: &str) {
+    write_detach_report_in(&sessions_dir(), host, token);
+}
+
+/// [`write_detach_report`] against an explicit directory, so the round trip is
+/// testable without redirecting the whole process's state dir.
+fn write_detach_report_in(dir: &Path, host: &str, token: &str) {
+    let _ = create_dir_all_private(dir);
+    let path = detach_report_path(dir, std::process::id());
+    let report = DetachReport {
+        host: host.to_string(),
+        token: token.to_string(),
+    };
+    if let Err(e) = write_json_atomic(&path, &report) {
+        tracing::debug!("could not write detach report {}: {e}", path.display());
+    }
+}
+
+/// Pop every detach report currently present. Drained in one pass like the bell
+/// sentinels, so a burst (a host dropping five attach windows at once) costs one
+/// readdir. An unparseable sentinel is still removed — it can only ever be a
+/// torn write, and leaving it would make the dashboard re-read it forever.
+pub fn drain_detach_reports() -> Vec<DetachReport> {
+    drain_detach_reports_in(&sessions_dir())
+}
+
+fn drain_detach_reports_in(dir: &Path) -> Vec<DetachReport> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_report = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("detach-") && n.ends_with(".flag"));
+        if !is_report {
+            continue;
+        }
+        let report: Option<DetachReport> = read_json(&path);
+        let _ = std::fs::remove_file(&path);
+        if let Some(report) = report {
+            reports.push(report);
+        }
+    }
+    reports
+}
+
 pub fn read_all_launcher_states() -> Vec<LauncherState> {
     let dir = sessions_dir();
     let entries = match std::fs::read_dir(&dir) {
@@ -993,6 +1079,48 @@ mod tests {
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |pid| pid == 20).is_some());
         // The name exists but only on dead launchers → no hit (resurrection).
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |_| false).is_none());
+    }
+
+    /// The detach sentinel is the whole event path's payload, so it has to
+    /// survive the round trip and then *be gone* — a report read twice would
+    /// retire a binding the user has since re-attached.
+    #[test]
+    fn detach_reports_round_trip_and_drain_once() {
+        let dir = std::env::temp_dir().join(format!("cm-detach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            drain_detach_reports_in(&dir).is_empty(),
+            "no dir, no reports"
+        );
+        write_detach_report_in(&dir, "box", "cm-claude-7-1");
+        assert_eq!(
+            drain_detach_reports_in(&dir),
+            vec![DetachReport {
+                host: "box".into(),
+                token: "cm-claude-7-1".into(),
+            }]
+        );
+        assert!(drain_detach_reports_in(&dir).is_empty(), "drained once");
+
+        // A torn write is removed rather than re-read forever, and doesn't take
+        // a good sentinel down with it.
+        std::fs::write(dir.join("detach-999999.flag"), b"{ truncated").unwrap();
+        write_detach_report_in(&dir, "box", "cm-2");
+        let drained = drain_detach_reports_in(&dir);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].token, "cm-2");
+        assert!(drain_detach_reports_in(&dir).is_empty());
+
+        // The sentinel must stay invisible to the state-file reader: it shares
+        // the sessions dir with `{pid}.json`, and a `.flag` is not a session.
+        write_detach_report_in(&dir, "box", "cm-3");
+        let jsons = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count();
+        assert_eq!(jsons, 0);
     }
 
     /// State files carry the user's prompt text, so they must not be readable by
