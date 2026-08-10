@@ -9,8 +9,8 @@ use crossterm::terminal::SetTitle;
 use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 
-use crate::agent::{AgentControl, ResumeCandidate};
-use crate::backend::{LaunchPlan, OpenSpec, ShellPlan};
+use crate::agent::AgentControl;
+use crate::backend::{Backend, LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId};
 use crate::terminal::{
@@ -19,7 +19,10 @@ use crate::terminal::{
 
 use std::collections::HashSet;
 
-use super::{Action, App, InputMode, PendingConfirm, RestartSpec, SessionSnapshotEntry};
+use super::{
+    Action, App, InputMode, PendingConfirm, PickerKind, RestartSpec, ResumeLoad,
+    SessionSnapshotEntry,
+};
 
 /// Lines of terminal output captured for the preview panel — its vertical
 /// scroll-up depth. The draw side (`draw_preview`) parses/scrolls within this.
@@ -42,50 +45,112 @@ fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
 }
 
-/// One host's resumable list, most-recent-first and capped, plus any errors.
-/// Walks transcript dirs in process (local) or makes a blocking RPC (remote),
-/// so it runs inside `block_in_place`.
+/// Open (or re-scope) the resume picker on `host` **immediately**, then fetch
+/// its list without blocking the UI.
 ///
 /// Scoped to a single host on purpose (§9): the cross-host union this replaced
 /// made the resume picker's scope implicit and its cost proportional to the
 /// number of configured hosts. `Ctrl-h` inside the picker switches host, and the
 /// title says which one you're looking at.
-fn list_resumable_on_host(
-    app: &App,
-    host: &HostId,
-    limit: usize,
-) -> (Vec<ResumeCandidate>, Vec<String>) {
-    let Some(backend) = app.backend_for(host) else {
-        return (Vec::new(), vec![format!("unknown host {}", host.0)]);
-    };
-    tokio::task::block_in_place(|| backend.list_resumable(limit))
+///
+/// The fetch used to run inline on a `block_in_place`, which for a remote host
+/// is an ssh round trip — pressing `r`, or `Ctrl-h` onto a remote, froze every
+/// frame until it answered. Now the popup appears first, marked loading, and
+/// [`apply_resume_load`] fills it in when the reply arrives. A **local** host
+/// still resolves inline: it's an in-process directory walk, and routing it
+/// through a task would only add a frame of "Loading…" flicker.
+fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
+    let limit = config::get().launcher.resume_list_limit;
+    app.resume_seq += 1;
+    let seq = app.resume_seq;
+    if reseed {
+        app.reseed_resume_picker(host.clone(), Vec::new());
+    } else {
+        app.open_resume_picker(host.clone(), Vec::new());
+    }
+    app.set_picker_loading(true);
+    match app.backend_for(&host) {
+        None => apply_resume_load(
+            app,
+            ResumeLoad {
+                seq,
+                reseed,
+                host: host.clone(),
+                candidates: Vec::new(),
+                errors: vec![format!("unknown host {}", host.0)],
+            },
+        ),
+        // Remote: hand the blocking round trip to a pool thread. The `Arc` clone
+        // is why `Backend::Remote` holds one — a spawned task can't borrow the
+        // `App` that owns the backend.
+        Some(Backend::Remote(remote)) => {
+            let remote = std::sync::Arc::clone(remote);
+            let tx = app.resume_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let (candidates, errors) = remote.list_resumable(limit);
+                let _ = tx.send(ResumeLoad {
+                    seq,
+                    reseed,
+                    host,
+                    candidates,
+                    errors,
+                });
+            });
+        }
+        Some(backend) => {
+            let (candidates, errors) =
+                tokio::task::block_in_place(|| backend.list_resumable(limit));
+            apply_resume_load(
+                app,
+                ResumeLoad {
+                    seq,
+                    reseed,
+                    host,
+                    candidates,
+                    errors,
+                },
+            );
+        }
+    }
 }
 
-/// Open (or re-seed) the resume picker on `host`, reporting an empty/failed
-/// list on the status line. Shared by `r` and the picker's `Ctrl-h` switch so
-/// the two can't drift on the empty-list wording.
-fn show_resume_picker(app: &mut App, host: HostId, reseed: bool) {
-    let limit = config::get().launcher.resume_list_limit;
-    let (candidates, errors) = list_resumable_on_host(app, &host, limit);
-    if !candidates.is_empty() {
-        if reseed {
-            app.reseed_resume_picker(host, candidates);
-        } else {
-            app.open_resume_picker(host, candidates);
+/// Fill the open resume picker in from a completed fetch, or say why it's empty.
+///
+/// A stale reply (the user has since switched hosts) is dropped, as is one that
+/// arrives after the picker closed. An empty answer is reported per
+/// [`ResumeLoad::reseed`]: a fresh `r` closes the popup and puts the reason on
+/// the status line — the pre-async behaviour, and there is nothing in an empty
+/// popup to act on — while a failed `Ctrl-h` switch keeps it open on the error
+/// so the next host is one keystroke away.
+fn apply_resume_load(app: &mut App, load: ResumeLoad) {
+    if load.seq != app.resume_seq {
+        return;
+    }
+    if !matches!(
+        app.picker.as_ref().map(|a| &a.kind),
+        Some(PickerKind::Resume { .. })
+    ) {
+        return;
+    }
+    if !load.candidates.is_empty() {
+        app.reseed_resume_picker(load.host, load.candidates);
+        app.set_picker_loading(false);
+        return;
+    }
+    let msg = if load.errors.is_empty() {
+        format!("No resumable sessions on {}", load.host.0)
+    } else {
+        format!("List sessions failed: {}", load.errors.join("; "))
+    };
+    app.set_picker_loading(false);
+    if load.reseed {
+        if let Some(active) = app.picker.as_mut() {
+            active.picker.set_error(msg);
         }
         return;
     }
-    let msg = if errors.is_empty() {
-        format!("No resumable sessions on {}", host.0)
-    } else {
-        format!("List sessions failed: {}", errors.join("; "))
-    };
-    // A failed switch keeps the picker open on its previous host rather than
-    // dumping the user back to the table with nothing to act on.
-    if reseed && let Some(active) = app.picker.as_mut() {
-        active.picker.set_error(msg);
-        return;
-    }
+    app.picker = None;
+    app.input_mode = InputMode::Normal;
     app.set_status(msg, true);
 }
 
@@ -835,6 +900,14 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 fs_dirty = true;
             }
         }
+        // Resumable lists finishing their background fetch. Drained
+        // unconditionally: a reply for a picker the user has closed or
+        // re-scoped is discarded inside `apply_resume_load`, so leaving them
+        // queued would only make the *next* picker read a stale answer.
+        while let Ok(load) = app.resume_loads.try_recv() {
+            apply_resume_load(&mut app, load);
+            needs_redraw = true;
+        }
         // A host asking whether it may download a server. Only taken while
         // nothing else owns the screen: a question left in the channel simply
         // waits, where popping it here would clobber an open picker or a
@@ -1139,10 +1212,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     Action::FetchResumeList { host } => {
                         // One host's list, chosen by the default host (`Space H`)
                         // and switchable in-picker with `Ctrl-h`.
-                        show_resume_picker(&mut app, host, false);
+                        start_resume_load(&mut app, host, false);
                     }
                     Action::SwitchResumeHost { host } => {
-                        show_resume_picker(&mut app, host, true);
+                        start_resume_load(&mut app, host, true);
                     }
                     Action::KillSession {
                         host,

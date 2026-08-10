@@ -47,9 +47,14 @@ pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
 
 /// Per-host session management. `Local` is in-process; `Remote` speaks the wire
 /// protocol to a `miao-server` over a (possibly ssh-forwarded) socket.
+///
+/// `Remote` is behind an `Arc` because the dashboard hands clones to background
+/// tasks (see [`RemoteBackend::list_resumable`]); `Local` is boxed only to keep
+/// the two arms the same size, since one `Backend` per host exists for the
+/// process lifetime and the allocation is paid once at startup.
 pub(crate) enum Backend {
-    Local(LocalHost),
-    Remote(RemoteBackend),
+    Local(Box<LocalHost>),
+    Remote(Arc<RemoteBackend>),
 }
 
 /// Connection health of a backend, surfaced in the header aggregate and, in
@@ -222,11 +227,11 @@ pub(crate) struct AttachPlan {
 
 impl Backend {
     pub(crate) fn local() -> Self {
-        Backend::Local(LocalHost {
+        Backend::Local(Box::new(LocalHost {
             inner: LocalBackend::new(),
             changed: Arc::new(AtomicBool::new(false)),
             watcher: None,
-        })
+        }))
     }
 
     /// The host this backend manages — `local` for in-process, the configured
@@ -593,7 +598,7 @@ impl RemoteBackend {
     /// Connection failure leaves an empty mirror (host shows as having no
     /// sessions); the task then retries with backoff, re-snapshotting on each
     /// reconnect, until the backend is dropped.
-    pub(crate) fn connect(transport: Transport, host: HostId) -> Self {
+    pub(crate) fn connect(transport: Transport, host: HostId) -> Arc<Self> {
         // Capture the ssh target before the transport is moved into the task —
         // `open_session` needs it to build the attach window's argv.
         let attach_target = match &transport {
@@ -625,7 +630,10 @@ impl RemoteBackend {
             },
             rx,
         ));
-        Self {
+        // `Arc` because the dashboard hands clones to background tasks: a
+        // blocking round trip (the resume list) must not be made from the UI
+        // thread, and a task can't borrow the `App` that owns the backend.
+        Arc::new(Self {
             host,
             attach_target,
             transport_is_local,
@@ -639,7 +647,7 @@ impl RemoteBackend {
             dirty,
             reconnect_epoch,
             log,
-        }
+        })
     }
 
     /// Current connection health, for the header surface.
@@ -695,11 +703,14 @@ impl RemoteBackend {
     /// The remote Claude name-manifest index isn't served; remote rows get
     /// their titles from `name`/`first_prompt`, which the remote server stamps
     /// onto every session it pushes. So the index is empty for a remote host.
-    fn session_index(&mut self) -> SessionIndex {
+    fn session_index(&self) -> SessionIndex {
         SessionIndex::default()
     }
 
-    fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
+    /// `pub(crate)` because the dashboard calls it *off* the UI thread through
+    /// an `Arc<RemoteBackend>` clone, bypassing the `Backend` seam — see
+    /// `run::start_resume_load`. Blocking: it is an ssh round trip.
+    pub(crate) fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
         match self.request(|req_id| ClientFrame::ListResumable { req_id, limit }) {
             Some(ServerFrame::Resumable {
                 candidates, errors, ..

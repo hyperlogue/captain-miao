@@ -91,6 +91,12 @@ const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 pub struct LauncherConfig {
     pub approval_grace_secs: u64,
     pub max_recent_cwds: usize,
+    /// How many resumable sessions the `r` picker asks a host for, most-recent
+    /// first. Deliberately small: the list is a *recency* affordance — you
+    /// resume something you were just working on, and anything older is found by
+    /// typing in the filter, not by scrolling. It was 200, which on a remote
+    /// host meant serialising two hundred transcript scans across ssh before the
+    /// popup could show anything.
     pub resume_list_limit: usize,
     /// Title templates for the tab a new / resumed session opens in.
     /// Placeholders: `{agent}` → the backend label ("Claude"/"Codex"),
@@ -127,7 +133,7 @@ impl Default for LauncherConfig {
         Self {
             approval_grace_secs: 2,
             max_recent_cwds: 50,
-            resume_list_limit: 200,
+            resume_list_limit: 50,
             new_tab_title: DEFAULT_TAB_TITLE.to_string(),
             resume_tab_title: DEFAULT_TAB_TITLE.to_string(),
             default_agent: "claude".to_string(),

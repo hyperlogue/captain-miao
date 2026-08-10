@@ -464,6 +464,10 @@ pub(in crate::app) struct Picker {
     /// nothing until you looked away from it. The bottom bar keeps only the
     /// static hints now.
     pub footer: Option<Line<'static>>,
+    /// The items are still being fetched (a remote `ListResumable` round trip).
+    /// Only changes the empty-list message — the picker is fully interactive
+    /// meanwhile, so a slow host can't hold the UI.
+    pub loading: bool,
 }
 
 impl Picker {
@@ -480,6 +484,7 @@ impl Picker {
             handles_tab: false,
             error: None,
             footer: None,
+            loading: false,
         }
     }
 
@@ -742,7 +747,9 @@ impl Picker {
 
         let list_area = chunks[2];
         if visible == 0 {
-            let msg = if total == 0 {
+            let msg = if self.loading {
+                "Loading…"
+            } else if total == 0 {
                 if self.free_input {
                     "Type a path and press Enter."
                 } else {

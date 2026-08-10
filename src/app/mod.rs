@@ -274,6 +274,27 @@ pub(super) struct ActivePicker {
     pub(in crate::app) kind: PickerKind,
 }
 
+/// One host's resumable list, delivered back to the run loop from the
+/// background fetch that [`App::start_resume_load`] kicked off.
+#[derive(Debug)]
+pub(super) struct ResumeLoad {
+    /// The `App::resume_seq` value the request was issued under. A reply whose
+    /// seq is no longer current belongs to a host the user has already switched
+    /// away from and is dropped — otherwise a slow host's answer would land on
+    /// top of a fast one the user is already reading.
+    pub(super) seq: u64,
+    /// Whether the request re-scoped an already-open picker (`Ctrl-h`) rather
+    /// than opening one. Decides what an *empty* answer does: a fresh open
+    /// closes the popup and reports on the status line (there is nothing to act
+    /// on, and the popup only ever existed to hold the pending list), while a
+    /// switch keeps it open on the error so the user can try another host
+    /// instead of being dumped back to the table.
+    pub(super) reseed: bool,
+    pub(super) host: HostId,
+    pub(super) candidates: Vec<ResumeCandidate>,
+    pub(super) errors: Vec<String>,
+}
+
 /// Persisted dashboard overrides (pin/mute/needs-input) so they survive restarts.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DashboardOverrides {
@@ -573,6 +594,18 @@ pub(super) struct App {
     /// simply waits in the channel.
     pub(super) download_prompts:
         tokio::sync::mpsc::UnboundedReceiver<crate::backend::DownloadPrompt>,
+    /// Resumable lists arriving from a background fetch, and the sequence number
+    /// that tells a live one from a stale one.
+    ///
+    /// A remote `ListResumable` is a blocking round trip over ssh; running it on
+    /// the UI thread froze the dashboard for its whole duration, which is what
+    /// made `Ctrl-h` in the resume picker feel broken. The picker now opens
+    /// empty and interactive, and the list lands here when it lands. `seq` is
+    /// bumped per request, so a user who switches hosts twice in a second gets
+    /// the *second* answer, not whichever host replied last.
+    pub(super) resume_loads: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
+    pub(super) resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
+    pub(super) resume_seq: u64,
     /// Active directory-mark popup. `Some` iff `input_mode == InputMode::DirEdit`.
     pub(super) dir_edit: Option<DirEditState>,
     /// Active hosts popup. `Some` iff `input_mode == InputMode::HostEdit`.
@@ -956,6 +989,7 @@ impl App {
         // immediately, and with no channel set it would (safely) refuse.
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::backend::set_download_consent(download_tx);
+        let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
         // Surface config problems the TUI would otherwise hide (it swallows
@@ -1008,6 +1042,9 @@ impl App {
             picker: None,
             pending_confirm: None,
             download_prompts: download_rx,
+            resume_loads: resume_rx,
+            resume_tx,
+            resume_seq: 0,
             dir_edit: None,
             host_edit: None,
             directory_marks: HashMap::new(),
@@ -3359,6 +3396,17 @@ impl App {
         self.refresh_picker_footer();
     }
 
+    /// Mark the open picker as still fetching its items (or done). Only affects
+    /// the empty-list message and the footer's trailing note — the picker stays
+    /// interactive throughout, which is the whole point of loading off the UI
+    /// thread.
+    pub(super) fn set_picker_loading(&mut self, loading: bool) {
+        if let Some(active) = self.picker.as_mut() {
+            active.picker.loading = loading;
+        }
+        self.refresh_picker_footer();
+    }
+
     /// Rebuild the open picker's bottom status line from its kind. Called
     /// wherever the values it shows can change: opening, `Ctrl-t`, `Ctrl-h`, and
     /// the arrival of an async item list.
@@ -3388,6 +3436,9 @@ impl App {
                 }
                 spans
             }
+            // No loading note here: the list area already says so, and while a
+            // fetch is in flight the items are always empty, so the two would
+            // only ever appear together.
             PickerKind::Resume { host, .. } => {
                 vec![Span::styled(" Host ", dim), host_span(self, host)]
             }

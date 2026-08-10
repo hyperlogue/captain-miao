@@ -567,6 +567,47 @@ fn the_workdir_picker_carries_its_agent_on_its_own_status_line() {
     );
 }
 
+/// A remote resume list is an ssh round trip, so the popup opens before it and
+/// says so. Without this the whole UI froze until the host answered — worst on
+/// the `Ctrl-h` host switch, which read as a hang.
+#[test]
+fn the_resume_picker_opens_before_its_list_arrives() {
+    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::state::HostId;
+    use std::time::SystemTime;
+
+    let mut d = TestDashboard::new(140, 20);
+    d.app
+        .open_resume_picker(HostId("buildbox".into()), Vec::new());
+    d.app.set_picker_loading(true);
+    let out = d.render();
+    assert!(out.contains("Resume Session on buildbox"), "{out}");
+    assert!(out.contains("Loading…"), "no pending message:\n{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.contains("Host") && l.contains("buildbox")),
+        "status line should name the host being loaded:\n{out}"
+    );
+
+    // The arriving list replaces both.
+    d.app.reseed_resume_picker(
+        HostId("buildbox".into()),
+        vec![ResumeCandidate {
+            agent: AgentControl::Claude,
+            session_id: "bbbb2222".into(),
+            cwd: "/srv/remote-proj".into(),
+            first_prompt: Some("fix the thing".into()),
+            custom_title: None,
+            git_branch: None,
+            mtime: SystemTime::UNIX_EPOCH,
+        }],
+    );
+    d.app.set_picker_loading(false);
+    let out = d.render();
+    assert!(!out.contains("Loading…"), "{out}");
+    assert!(out.contains("fix the thing"), "{out}");
+}
+
 #[test]
 fn enter_on_running_remote_session_emits_attach() {
     use crate::state::HostId;
