@@ -1220,6 +1220,72 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
     }]));
 }
 
+/// Attaching and detaching flip `is_detached_row`, which is a *sort key* — so a
+/// binding change slides the selected row to the other end of the list while the
+/// cursor, being a bare index, stays put and silently re-points at whichever
+/// session took its slot. The cursor must follow the session instead.
+#[test]
+fn the_cursor_follows_a_session_across_an_attach_detach_resort() {
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![away, here]);
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    let index_of = |d: &TestDashboard, pid: u32| {
+        d.app
+            .visible_sessions()
+            .iter()
+            .position(|s| s.launcher_pid == pid)
+            .expect("row is visible")
+    };
+    // Park the cursor on the attached pooled row.
+    let attached_at = index_of(&d, 1);
+    d.app.table_state.select(Some(attached_at));
+
+    // Its attach window reports its end: the row sinks into the detached tier
+    // and the other row rises into the index it vacated.
+    assert!(d.app.apply_detach_reports(vec![DetachReport {
+        host: "box".into(),
+        token: "cm-away".into(),
+        status: Some(0),
+    }]));
+    let detached_at = index_of(&d, 1);
+    assert_ne!(
+        detached_at, attached_at,
+        "the detach must actually re-sort the row, or this test proves nothing"
+    );
+    assert_eq!(
+        d.app.selected_pid(),
+        Some(1),
+        "the cursor follows the session that detached, not the index it left"
+    );
+    assert_eq!(d.app.table_state.selected(), Some(detached_at));
+
+    // Re-attaching floats it back out of the tier; the cursor rides along again.
+    d.app
+        .record_window_binding(host, "cm-away".into(), WindowId::from(901u64));
+    assert_eq!(d.app.selected_pid(), Some(1));
+    assert_eq!(d.app.table_state.selected(), Some(index_of(&d, 1)));
+
+    // And an explicit `D` (the same retire, minus the report) keeps it too.
+    d.app
+        .retire_window_binding(&HostId("box".into()), "cm-away");
+    assert_eq!(
+        d.app.selected_pid(),
+        Some(1),
+        "`D` sinks the row it acts on — the cursor stays on that session"
+    );
+}
+
 /// A dropped ssh leaves the attach window behind (it is spawned `hold: true`),
 /// showing a dead session's last frame while the row says detached — and `Enter`
 /// then opens a *second* window beside it. So a spent attach's window is closed.

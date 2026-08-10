@@ -2571,11 +2571,35 @@ impl App {
     /// so the dashboard can resolve and prune it. Used by both the remote attach
     /// path and the local spawn path.
     pub(super) fn record_window_binding(&mut self, host: HostId, token: String, window: WindowId) {
+        let selected = self.selected_key();
         self.window_bindings.record(host, token, window);
         // Bindings feed `is_detached_row`, which is a *sort key*: binding a
         // window lifts the row out of the detached tier, so the cached visible
         // order has to be recomputed even though no session changed.
         self.mark_dirty();
+        // …and that re-sort moves the row out from under the cursor. This is the
+        // `Enter`-on-a-detached-row path, so the row that just climbed the list
+        // is the very one the user is acting on — the cursor follows it rather
+        // than staying on an index that now names whatever slid down into it. It
+        // matters just as much for a background auto-reattach, which must not
+        // drag the cursor off whatever the user is looking at.
+        if let Some(key) = selected {
+            self.reselect(&key);
+        }
+    }
+
+    /// Retire the binding for `(host, token)` — the explicit `D` detach, where
+    /// the user closes the attach window but leaves the pooled session running.
+    /// The row stays; it just sinks into the detached tier, so this goes through
+    /// the same invalidate-and-follow dance as every other binding change rather
+    /// than poking `window_bindings` directly.
+    pub(super) fn retire_window_binding(&mut self, host: &HostId, token: &str) {
+        let selected = self.selected_key();
+        self.window_bindings.remove(host, token);
+        self.mark_dirty();
+        if let Some(key) = selected {
+            self.reselect(&key);
+        }
     }
 
     /// Mint a fresh, opaque `launch_id` for a local launcher the dashboard is
@@ -2602,6 +2626,7 @@ impl App {
         if self.window_bindings.is_empty() {
             return Vec::new();
         }
+        let selected = self.selected_key();
         let dropped = self.window_bindings.prune_dead(live);
         if !dropped.is_empty() {
             // The dropped rows just became detached, and detachment is a sort
@@ -2610,6 +2635,12 @@ impl App {
             // until some unrelated reload happened to bump the version. Nothing
             // reloads when an attach window closes, so "until" could be minutes.
             self.mark_dirty();
+            // The re-sort sinks those rows to the detached tier; keep the cursor
+            // on the session it was on, whether or not that session is one of
+            // them.
+            if let Some(key) = selected {
+                self.reselect(&key);
+            }
         }
         dropped
     }
@@ -2630,6 +2661,7 @@ impl App {
     /// expected-attached memory survives (see `prune_token`), so a host coming
     /// back still restores the window.
     pub(super) fn apply_detach_reports(&mut self, reports: Vec<state::DetachReport>) -> bool {
+        let selected = self.selected_key();
         let mut changed = false;
         for report in reports {
             let host = HostId(report.host);
@@ -2658,6 +2690,13 @@ impl App {
         if changed {
             // Detachment is a sort key, and this path runs outside any reload.
             self.mark_dirty();
+            // A report arrives on its own schedule — the user is looking at the
+            // list, not pressing anything — so a row sinking into the detached
+            // tier must not take the cursor with it, nor hand it to whichever
+            // row rises into the vacated index.
+            if let Some(key) = selected {
+                self.reselect(&key);
+            }
             self.write_window_bindings_file();
         }
         changed
@@ -3212,10 +3251,24 @@ impl App {
         // Re-select the same session at its new (lower) position rather than
         // leaving the cursor at the old index (which would land on whichever
         // row slid up into it).
+        self.reselect(&key);
+    }
+
+    /// Re-anchor the table cursor on `key`'s row at its (possibly new) index,
+    /// clamping when that session is no longer visible.
+    ///
+    /// The list is sorted, so any mutation that changes a **sort key** slides
+    /// rows past a cursor that is only an index — the index survives, the
+    /// session it names does not. Every caller that changes one and wants the
+    /// user to keep pointing at the same session goes through here. Two do:
+    /// clearing a follow-up bell drops a row from the attention rank to the
+    /// idle rank, and binding or retiring a window flips `is_detached_row`,
+    /// which sorts a row into (or out of) the detached tier at the bottom.
+    pub(super) fn reselect(&mut self, key: &FlagKey) {
         match self
             .visible_sessions()
             .iter()
-            .position(|s| matches_key(s, &key))
+            .position(|s| matches_key(s, key))
         {
             Some(idx) => self.table_state.select(Some(idx)),
             None => self.clamp_selection(),

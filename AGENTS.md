@@ -487,7 +487,15 @@ it uses no ssh and has its own config flag.
   binding **marks the app dirty**: `is_detached_row` is a *sort key* but the
   visible order is cached against `mutation_version`, so a prune otherwise
   re-iconed the row while leaving it in its old slot until some unrelated reload
-  bumped the version — and nothing reloads when an attach window closes.
+  bumped the version — and nothing reloads when an attach window closes. It also
+  **re-anchors the cursor** (`App::reselect`, shared with `clear_follow_up`):
+  that re-sort moves the row across the whole list, and the selection is a bare
+  index, so attaching or detaching otherwise left the cursor pointing at
+  whichever session slid into the vacated slot. Every binding mutation goes
+  through the `App` methods that do both — `record_window_binding`,
+  `retire_window_binding` (the `D` path), `prune_detached_sessions`,
+  `apply_detach_reports` — never `window_bindings` directly. `reload_sessions`
+  already re-found its selection by key for the same reason.
 - **The detached tier outranks the soft attention signals** (§9). A detached row
   sorts to the bottom below plain idle, above only muted; pinned and *live*
   attention (approval / decision / failed launch) still float above it, but

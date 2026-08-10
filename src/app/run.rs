@@ -1516,7 +1516,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         // Enter re-attaches). closing the window would also trip the
                         // reload's `prune_detached_sessions`, but doing it here makes
                         // the UI update without waiting for the snapshot.
-                        app.window_bindings.remove(&host, &token);
+                        app.retire_window_binding(&host, &token);
                         let _ = terminal::get().close_window(&window_id).await;
                         app.set_status("Detached (session still running)".to_string(), false);
                         // Re-render the now window-less row and rewrite the
