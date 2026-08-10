@@ -1786,6 +1786,7 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
 /// presentation is a filled, self-coloured 2-cell glyph that reads at a glance.
 pub(super) fn host_tally_spans(tally: &HostTally, ui: &config::UiColors) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw("\u{2601}\u{FE0F}")];
+    let mut first = true;
     for (count, style) in [
         (tally.good, Style::default().fg(Color::Green)),
         (
@@ -1797,7 +1798,18 @@ pub(super) fn host_tally_spans(tally: &HostTally, ui: &config::UiColors) -> Vec<
         (tally.down, Style::default().add_modifier(Modifier::DIM)),
     ] {
         if count > 0 {
-            spans.push(Span::raw(" "));
+            // No separator before the *first* number. `unicode-width` measures
+            // the VS16 sequence as 2 cells and ratatui reserves them, but a
+            // terminal that paints the glyph 1 cell wide then leaves the second
+            // blank — so an explicit space on top read as a two-cell gulf
+            // between the cloud and the count. Dropping it gives one visual
+            // space in that case and a tight `☁️1` where the glyph really is two
+            // cells; either way at most one space. Numbers still separate from
+            // each other, where nothing else does the job.
+            if !first {
+                spans.push(Span::raw(" "));
+            }
+            first = false;
             spans.push(Span::styled(count.to_string(), style));
         }
     }

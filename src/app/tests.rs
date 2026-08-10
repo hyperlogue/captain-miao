@@ -3006,11 +3006,17 @@ fn the_host_tally_prints_only_the_non_empty_buckets() {
     // The cloud carries its emoji variation selector: the bare U+2601 is a
     // hairline text glyph that vanished against the header.
     // All healthy: one green number, nothing else — the quiet case stays quiet.
-    assert_eq!(text(3, 0, 0), "\u{2601}\u{fe0f} 3");
+    // No separator before the first count: `unicode-width` measures the VS16
+    // sequence as 2 cells and ratatui reserves both, so a terminal that paints
+    // the glyph 1 cell wide leaves the second blank — an explicit space on top
+    // of that read as a two-cell gulf between the cloud and its number.
+    assert_eq!(text(3, 0, 0), "\u{2601}\u{fe0f}3");
     // A problem announces itself by a number appearing, not by a 0 changing.
-    assert_eq!(text(2, 1, 0), "\u{2601}\u{fe0f} 2 1");
-    assert_eq!(text(0, 0, 2), "\u{2601}\u{fe0f} 2");
-    assert_eq!(text(1, 2, 3), "\u{2601}\u{fe0f} 1 2 3");
+    // The numbers still separate from *each other* — nothing else tells them
+    // apart at this width.
+    assert_eq!(text(2, 1, 0), "\u{2601}\u{fe0f}2 1");
+    assert_eq!(text(0, 0, 2), "\u{2601}\u{fe0f}2");
+    assert_eq!(text(1, 2, 3), "\u{2601}\u{fe0f}1 2 3");
 }
 
 #[test]
