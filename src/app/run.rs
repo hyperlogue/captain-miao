@@ -1049,20 +1049,31 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // showed neither the detached marker nor the detached tier, and `Enter`
         // silently focused a dead window instead of re-attaching.
         //
-        // This costs no more than before: `DETACH_PRUNE_MIN_INTERVAL` already
+        // The *worst* case is unchanged — `DETACH_PRUNE_MIN_INTERVAL` already
         // bounded the prune at one snapshot per interval, and both sites share
-        // the same `last_detach_prune`, so the worst case is unchanged — the
-        // prune now simply *reaches* that bound instead of firing only when a
-        // reload happens to coincide. `has_remote()` still keeps a purely local
-        // dashboard from snapshotting for this at all.
-        if app.window_bindings.has_remote() && detach_prune_due(last_detach_prune, Instant::now()) {
+        // `last_detach_prune` — but the idle case is not, and that is the one
+        // that matters: an idle dashboard used to snapshot never, because no
+        // reload fired to carry the prune. On zellij a `snapshot()` is
+        // `list-panes`, ~20ms per pane (~475ms at 22) awaited inline in this
+        // loop, which AGENTS.md is explicit about keeping off recurring paths.
+        //
+        // So the timer is gated on the dashboard being **focused**. What it
+        // detects is a window the user just closed, and the moment that matters
+        // is when they look back at the row — within one interval of focusing,
+        // which is exactly when this fires. A dashboard sitting in a background
+        // tab pays nothing. `focused` starts true and stays true on a terminal
+        // without focus reporting, so the gate can only ever *remove* work from
+        // a terminal that told us we aren't being watched. `has_remote()` still
+        // keeps a purely local dashboard from snapshotting for this at all.
+        if app.focused
+            && app.window_bindings.has_remote()
+            && detach_prune_due(last_detach_prune, Instant::now())
+        {
             last_detach_prune = Some(Instant::now());
-            if let Ok(tabs) = terminal::get().snapshot().await {
-                let live: HashSet<WindowId> =
-                    tabs.iter().flat_map(|t| &t.windows).cloned().collect();
-                if !app.prune_detached_sessions(&live).is_empty() {
-                    needs_redraw = true;
-                }
+            if let Ok(tabs) = terminal::get().snapshot().await
+                && prune_detached_from_tabs(&mut app, &tabs)
+            {
+                needs_redraw = true;
             }
         }
 

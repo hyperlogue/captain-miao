@@ -430,8 +430,16 @@ it uses no ssh and has its own config flag.
   and produces no host delta, so a reload-gated prune left the binding forever
   and the row read as attached-but-inert (no detached marker, `Enter` focusing a
   dead window). Still floored to `DETACH_PRUNE_MIN_INTERVAL` and gated on
-  `has_remote()`; a *failed focus* resets the floor rather than dropping the
-  binding, since one failed rc call isn't proof the window is gone.
+  `has_remote()`, and additionally on the dashboard being **focused** — the
+  snapshot is a `list-panes` on zellij, and an idle background dashboard used to
+  pay none; what the prune detects only matters when you look back at the row.
+  A *failed focus* resets the floor rather than dropping the binding, since one
+  failed rc call isn't proof the window is gone. Neither prune site may run on a
+  **failed** snapshot: an absent snapshot is "we don't know", and feeding its
+  empty live-set to `prune_dead` drops *every* binding — hence the shared
+  `prune_detached_from_tabs`, which also persists `window-bindings.json` (the
+  timer can fire when no reload will, and that file is what the `focus` bell
+  resolves against and the next startup re-seeds from).
 - **Config.** Hosts are mutable TUI state (`hosts.json`: label, ssh target /
   socket, emoji icon), managed via the `Space h` **hosts panel** — a list view
   with live conn state, running/attached counts, daemon version and latency.
