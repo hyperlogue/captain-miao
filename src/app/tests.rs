@@ -4115,3 +4115,44 @@ fn sessions_layout_label_round_trips() {
     assert_eq!(SessionsLayout::from_label("bogus"), None);
     assert_eq!(SessionsLayout::default(), SessionsLayout::Stacked);
 }
+
+/// Committing a hosts-panel row used to rebuild every backend, so changing an
+/// emoji dropped and re-dialled every connection. The gate is what a backend is
+/// actually built from — label and target — so a cosmetic edit is free.
+#[test]
+fn only_a_changed_connection_string_reconnects() {
+    use super::hosts::HostConfig;
+    let host = |label: &str, ssh: &str, icon: &str| HostConfig {
+        label: label.into(),
+        ssh: Some(ssh.into()),
+        socket: None,
+        icon: Some(icon.into()),
+    };
+    let before = vec![host("box", "user@box", "🖥")];
+
+    // Icon-only: identical identities, so no rebuild.
+    assert_eq!(
+        App::conn_identities(&before),
+        App::conn_identities(&[host("box", "user@box", "🛰")])
+    );
+    // Target, label, and transport kind each move it.
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[host("box", "user@other", "🖥")])
+    );
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[host("box2", "user@box", "🖥")])
+    );
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[HostConfig {
+            label: "box".into(),
+            ssh: None,
+            socket: Some("/run/x.sock".into()),
+            icon: Some("🖥".into()),
+        }])
+    );
+    // …as does adding or dropping a host.
+    assert_ne!(App::conn_identities(&before), App::conn_identities(&[]));
+}

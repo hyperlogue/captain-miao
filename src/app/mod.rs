@@ -1827,14 +1827,22 @@ impl App {
         out
     }
 
-    /// Persist the panel's host rows and reconnect the backends **without
-    /// closing the panel** (§9).
+    /// Persist the panel's host rows **without closing the panel** (§9), and
+    /// reconnect only if the *connections* actually changed.
     ///
     /// The old flow staged every edit behind a separate `s` Save, which was one
     /// more thing to forget — and, worse, meant a freshly added host showed no
     /// connection state until you'd saved and reopened. Now every mutation
     /// persists as it happens (add, edit-commit, confirmed remove), so the
     /// panel's live conn-state column animates the new host connecting in place.
+    ///
+    /// The catch that made that unpleasant: committing a row rebuilt *every*
+    /// backend, so opening the panel, changing an emoji, and pressing Enter
+    /// dropped every connection task and re-dialled every host — a multi-second
+    /// storm for a cosmetic edit, and one that reset the auto-reattach epochs
+    /// besides. So the rebuild is gated on [`Self::conn_identities`]: what a
+    /// backend is *built from* is the label and the target, and nothing else in
+    /// this panel touches those. An icon-only edit just re-reads the icon map.
     pub(super) fn apply_host_edits(&mut self) {
         let Some(state) = self.host_edit.as_ref() else {
             return;
@@ -1860,8 +1868,41 @@ impl App {
                 }
             })
             .collect();
+        let before = Self::conn_identities(&hosts::load_hosts());
         hosts::save_hosts(&configs);
+        if before == Self::conn_identities(&configs) {
+            self.refresh_host_icons();
+            self.mark_dirty();
+            return;
+        }
         self.rebuild_remote_backends();
+    }
+
+    /// What each configured host's backend is *built from*, in order: the label
+    /// (which becomes its `HostId`) and the transport it dials. Two host lists
+    /// with equal identities produce byte-identical backends, so a rebuild
+    /// between them would only churn live connections — see
+    /// [`Self::apply_host_edits`]. Pure, so the gate is unit-testable.
+    pub(in crate::app) fn conn_identities(
+        hosts: &[hosts::HostConfig],
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        hosts
+            .iter()
+            .map(|h| (h.label.clone(), h.ssh.clone(), h.socket.clone()))
+            .collect()
+    }
+
+    /// Re-read just the per-host emoji from `hosts.json`, leaving every
+    /// connection task alone. The cheap half of [`Self::rebuild_remote_backends`].
+    fn refresh_host_icons(&mut self) {
+        self.host_icons = hosts::load_hosts()
+            .into_iter()
+            .filter_map(|h| {
+                let icon = h.icon.filter(|i| !i.trim().is_empty())?;
+                let host = HostId(h.label);
+                (!host.is_local()).then_some((host, icon))
+            })
+            .collect();
     }
 
     /// Close the hosts panel. Edits are already persisted (see

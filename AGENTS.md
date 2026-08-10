@@ -430,11 +430,15 @@ it uses no ssh and has its own config flag.
   socket, emoji icon), managed via the `Space h` **hosts panel** — a list view
   with live conn state, running/attached counts, daemon version and latency.
   There is no Save step: adding persists + connects immediately, edits apply on
-  row commit, removal is behind a `y/N`. There is no per-host **colour** — the
-  emoji says the same thing better, so the field is gone from the panel and
-  ignored in `hosts.json`. The per-host **emoji** appears only when more than one
-  host exists, and it shares the **workdir-icon column** (`<host>│<workdir>`)
-  rather than holding a Host column of its own.
+  row commit, removal is behind a `y/N`. A row commit **only reconnects when the
+  connection actually changed** (`conn_identities` — label + target, the two
+  things a backend is built from): an icon-only edit used to drop and re-dial
+  every host, which is a multi-second storm for a cosmetic change and reset the
+  auto-reattach epochs besides. There is no per-host **colour** — the emoji says
+  the same thing better, so the field is gone from the panel and ignored in
+  `hosts.json`. The per-host **emoji** appears only when more than one host
+  exists, and it shares the **workdir-icon column** (`<host>│<workdir>`) rather
+  than holding a Host column of its own.
 - **Pooled localhost** (`[launcher] pooled = true`, opt-in). Makes
   `backends[0]` a `RemoteBackend` over `LocalSocket` to *this* host's daemon,
   **replacing** `Backend::local()` (never alongside — both read the same
