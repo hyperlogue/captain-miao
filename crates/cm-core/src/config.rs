@@ -93,10 +93,14 @@ pub struct LauncherConfig {
     pub max_recent_cwds: usize,
     /// How many resumable sessions the `r` picker asks a host for, most-recent
     /// first. Deliberately small: the list is a *recency* affordance — you
-    /// resume something you were just working on, and anything older is found by
-    /// typing in the filter, not by scrolling. It was 200, which on a remote
+    /// resume something you were just working on. It was 200, which on a remote
     /// host meant serialising two hundred transcript scans across ssh before the
     /// popup could show anything.
+    ///
+    /// It is a hard truncation **at the source**, not a display cap: the
+    /// picker's filter runs client-side over exactly these items, so a session
+    /// past the limit cannot be typed into view — raising this value is the only
+    /// way to reach it.
     pub resume_list_limit: usize,
     /// Title templates for the tab a new / resumed session opens in.
     /// Placeholders: `{agent}` → the backend label ("Claude"/"Codex"),
