@@ -94,17 +94,21 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
         app.open_resume_picker(host.clone(), Vec::new());
     }
     app.set_picker_loading(true);
+    // One shape for the reply whichever arm answers, so the seq/reseed/host
+    // bookkeeping can't drift between the inline paths and the spawned one.
+    let load = move |host: HostId, (candidates, errors)| ResumeLoad {
+        seq,
+        reseed,
+        host,
+        candidates,
+        errors,
+    };
     match app.backend_for(&host) {
-        None => apply_resume_load(
-            app,
-            ResumeLoad {
-                seq,
-                reseed,
-                host: host.clone(),
-                candidates: Vec::new(),
-                errors: vec![format!("unknown host {}", host.0)],
-            },
-        ),
+        None => {
+            let errors = vec![format!("unknown host {}", host.0)];
+            let reply = load(host, (Vec::new(), errors));
+            apply_resume_load(app, reply);
+        }
         // Remote: hand the blocking round trip to a pool thread. The `Arc` clone
         // is why `Backend::Remote` holds one — a spawned task can't borrow the
         // `App` that owns the backend.
@@ -112,29 +116,14 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
             let remote = std::sync::Arc::clone(remote);
             let tx = app.resume_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let (candidates, errors) = remote.list_resumable(limit);
-                let _ = tx.send(ResumeLoad {
-                    seq,
-                    reseed,
-                    host,
-                    candidates,
-                    errors,
-                });
+                let listed = remote.list_resumable(limit);
+                let _ = tx.send(load(host, listed));
             });
         }
         Some(backend) => {
-            let (candidates, errors) =
-                tokio::task::block_in_place(|| backend.list_resumable(limit));
-            apply_resume_load(
-                app,
-                ResumeLoad {
-                    seq,
-                    reseed,
-                    host,
-                    candidates,
-                    errors,
-                },
-            );
+            let listed = tokio::task::block_in_place(|| backend.list_resumable(limit));
+            let reply = load(host, listed);
+            apply_resume_load(app, reply);
         }
     }
 }
@@ -158,7 +147,22 @@ fn apply_resume_load(app: &mut App, load: ResumeLoad) {
         return;
     }
     if !load.candidates.is_empty() {
+        // The popup was interactive while the fetch ran (that's the point), so
+        // anything in the filter is the user's. `reseed_resume_picker` clears it
+        // — right for a `Ctrl-h` host switch, where the query was aimed at the
+        // host you just left, but wrong for the list you were already waiting
+        // for — so carry it back across.
+        let typed = app
+            .picker
+            .as_ref()
+            .map(|a| a.picker.input.text().to_string())
+            .unwrap_or_default();
         app.reseed_resume_picker(load.host, load.candidates);
+        if !typed.is_empty()
+            && let Some(active) = app.picker.as_mut()
+        {
+            active.picker.set_text(typed);
+        }
         app.set_picker_loading(false);
         return;
     }
