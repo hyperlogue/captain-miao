@@ -1871,7 +1871,7 @@ impl App {
         let before = Self::conn_identities(&hosts::load_hosts());
         hosts::save_hosts(&configs);
         if before == Self::conn_identities(&configs) {
-            self.refresh_host_icons();
+            self.refresh_host_icons(&configs);
             self.mark_dirty();
             return;
         }
@@ -1892,15 +1892,16 @@ impl App {
             .collect()
     }
 
-    /// Re-read just the per-host emoji from `hosts.json`, leaving every
-    /// connection task alone. The cheap half of [`Self::rebuild_remote_backends`].
-    fn refresh_host_icons(&mut self) {
-        self.host_icons = hosts::load_hosts()
-            .into_iter()
+    /// Re-derive just the per-host emoji, leaving every connection task alone.
+    /// The cheap half of [`Self::rebuild_remote_backends`]. Takes the configs the
+    /// caller already holds rather than re-reading the file it just wrote.
+    fn refresh_host_icons(&mut self, hosts: &[hosts::HostConfig]) {
+        self.host_icons = hosts
+            .iter()
             .filter_map(|h| {
-                let icon = h.icon.filter(|i| !i.trim().is_empty())?;
-                let host = HostId(h.label);
-                (!host.is_local()).then_some((host, icon))
+                let icon = h.icon.as_ref().filter(|i| !i.trim().is_empty())?;
+                let host = HostId(h.label.clone());
+                (!host.is_local()).then_some((host, icon.clone()))
             })
             .collect();
     }

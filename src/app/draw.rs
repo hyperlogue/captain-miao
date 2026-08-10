@@ -464,7 +464,9 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        let form_h: u16 = if state.editing { 7 } else { 0 };
+        // Three field rows + at most one per-field hint, plus a little slack.
+        // (It was 7 while a fourth `Color` field existed.)
+        let form_h: u16 = if state.editing { 6 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
