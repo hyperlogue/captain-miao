@@ -1579,7 +1579,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                                     .await
                                     .map(|_| "Switched to work tab")
                             } else {
-                                let title = super::work_tab_title(&cwd);
+                                let title = super::work_tab_title(&host, &cwd);
                                 match terminal::get()
                                     .spawn(SpawnSpec {
                                         cwd: spawn_cwd.clone(),

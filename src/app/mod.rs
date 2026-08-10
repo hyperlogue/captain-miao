@@ -856,11 +856,29 @@ pub(super) fn cwd_basename(cwd: &str) -> &str {
         .unwrap_or(cwd)
 }
 
-/// Title stamped on a `(host, cwd)` work tab: the cwd's basename. Shared by the
-/// spawn (which sets it) and [`App::live_work_tab`] (which requires it to still
-/// match, guarding against zellij's recycled tab ids).
-pub(super) fn work_tab_title(cwd: &str) -> String {
-    cwd_basename(cwd).to_string()
+/// Title stamped on a `(host, cwd)` work tab: the cwd's basename, prefixed with
+/// the host (`box:proj`) for every host but this machine. The prefix is the only
+/// way the host reaches the tab bar — a work tab is spawned with an explicit tab
+/// title, and on both backends an explicit title permanently overrides the
+/// follow-the-active-window's-title default, so the `[hostname]` an ssh login
+/// shell emits over OSC 0/2 updates the *window* title and can never reach the
+/// *tab* label. Keeping it static rather than letting ssh own it is deliberate:
+/// [`App::live_work_tab`] validates a recorded tab by requiring this exact
+/// title, which is one of the three checks that defeat zellij's recycled tab
+/// ids. Hence the signature is the work-tab map key's two halves and nothing
+/// else — the spawn and the validation can't derive different answers.
+///
+/// A pooled-localhost host is labelled too (its `HostId` is the machine's
+/// hostname, not `local`): its `w` opens an in-process shell, but such a
+/// dashboard is federating other hosts as well, so naming every host uniformly
+/// beats leaving exactly one of them unlabelled.
+pub(super) fn work_tab_title(host: &HostId, cwd: &str) -> String {
+    let base = cwd_basename(cwd);
+    if host.is_local() {
+        base.to_string()
+    } else {
+        format!("{host}:{base}")
+    }
 }
 
 /// The emoji-picker rows, built once from the static `emojis` data and cached.
@@ -2105,7 +2123,7 @@ impl App {
 
     /// The recorded work tab for `(host, cwd)`, validated against the live tab
     /// tree in `tabs`. The tab must still exist, still carry the title the spawn
-    /// stamped on it (the cwd basename), and — when a window id was recorded —
+    /// stamped on it ([`work_tab_title`]), and — when a window id was recorded —
     /// still contain that window: zellij recycles a closed highest tab's id (its
     /// tab counter is max-plus-one over live tabs), so an id + title match alone
     /// could send `w` into an unrelated tab that inherited the number and was
@@ -2116,7 +2134,7 @@ impl App {
     /// through to spawning a fresh work tab.
     pub(super) fn live_work_tab(&mut self, key: &(HostId, String), tabs: &[Tab]) -> Option<TabId> {
         let work_tab = self.work_tabs.get(key)?;
-        let expected = work_tab_title(&key.1);
+        let expected = work_tab_title(&key.0, &key.1);
         let matched = tabs
             .iter()
             .find(|t| t.id == work_tab.tab_id && t.title == expected);

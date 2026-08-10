@@ -4199,6 +4199,57 @@ fn live_work_tab_validates_recorded_window_in_tab() {
 }
 
 #[test]
+fn work_tab_title_names_the_host_for_a_remote_tab() {
+    use super::work_tab_title;
+    // This machine's work tabs stay bare — the host adds nothing.
+    assert_eq!(
+        work_tab_title(&crate::state::HostId::local(), "/home/test/proj"),
+        "proj"
+    );
+    // A remote tab is an ssh session whose own `[hostname]` title can only ever
+    // reach the *window* title, never the tab label (the spawn sets an explicit
+    // tab title, which overrides the follow-the-window default on both
+    // backends). So the host rides in the title we stamp.
+    assert_eq!(
+        work_tab_title(&crate::state::HostId("box".into()), "~/proj"),
+        "box:proj"
+    );
+
+    // …and the spawn and the validation must agree on it, or every remote `w`
+    // prunes its own entry and spawns a duplicate tab. `live_work_tab` derives
+    // the expected title from the same key, so a tab wearing the prefixed title
+    // validates and a bare-basename one (a pre-prefix `work-tabs.json` entry)
+    // does not.
+    let mut d = TestDashboard::new(120, 18);
+    let key = (crate::state::HostId("box".into()), "~/proj".to_string());
+    let entry = super::WorkTab {
+        tab_id: TabId::from(4),
+        window_id: Some(WindowId::from(8)),
+    };
+    d.app.work_tabs.insert(key.clone(), entry.clone());
+    let live = vec![crate::terminal::Tab {
+        id: TabId::from(4),
+        title: "box:proj".into(),
+        is_focused: false,
+        windows: vec![WindowId::from(8)],
+    }];
+    assert_eq!(d.app.live_work_tab(&key, &live), Some(TabId::from(4)));
+
+    d.app.work_tabs.insert(key.clone(), entry);
+    let legacy = vec![crate::terminal::Tab {
+        id: TabId::from(4),
+        title: "proj".into(),
+        is_focused: false,
+        windows: vec![WindowId::from(8)],
+    }];
+    assert_eq!(
+        d.app.live_work_tab(&key, &legacy),
+        None,
+        "a pre-prefix entry fails the title check and self-heals into a fresh spawn"
+    );
+}
+
+#[test]
 fn work_tabs_persist_across_restart() {
     // The work-tab map must survive a dashboard restart: the terminal keeps the
     // tabs alive, so `w` should return to them instead of spawning duplicates.
