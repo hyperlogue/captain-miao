@@ -3937,7 +3937,24 @@ impl App {
         if self.backends.first().is_some_and(|b| &b.host_id() == host) {
             return "🏠".to_string();
         }
-        const FALLBACK: [&str; 8] = ["🖥", "🛰", "🐧", "📦", "⚙", "🌐", "🔷", "🧊"];
+        // Each glyph that has a text presentation carries an explicit variation
+        // selector (`U+FE0F`), for the same reason the header's ☁️ tally does:
+        // bare `U+1F5A5` / `U+1F6F0` / `U+2699` render as hairline monochrome
+        // outlines in the row's foreground colour, and this icon is now the row's
+        // *only* host marker (the Host column's name and the per-host colour both
+        // went away), so one that washes out leaves the row saying nothing about
+        // where it lives. The selector also makes `unicode-width` agree with the
+        // two cells the terminal paints, which is what the icon column pads to.
+        const FALLBACK: [&str; 8] = [
+            "🖥\u{FE0F}",
+            "🛰\u{FE0F}",
+            "🐧",
+            "📦",
+            "⚙\u{FE0F}",
+            "🌐",
+            "🔷",
+            "🧊",
+        ];
         FALLBACK[format::stable_index(&host.0, FALLBACK.len())].to_string()
     }
 }

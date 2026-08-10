@@ -1068,10 +1068,14 @@ impl App {
         } else {
             Vec::new()
         };
+        // Measured with `dir_icon_width`, the same ruler the workdir half uses —
+        // it shares the column, so a second ruler would only let the divider
+        // disagree with itself, and its `[1, DIR_ICON_MAX_CHARS]` clamp is what
+        // keeps an over-long configured "emoji" from widening the whole column.
         let host_width = host_icons
             .iter()
             .flatten()
-            .map(|(g, _)| g.as_str().width())
+            .map(|(g, _)| dir_icon_width(g))
             .max()
             .unwrap_or(1)
             .max(1) as u16;
@@ -1133,9 +1137,9 @@ impl App {
                 let mut icon_spans: Vec<Span<'static>> = Vec::new();
                 if show_host {
                     let host_glyph = host_icons.get(row_idx).and_then(|o| o.as_ref());
-                    let text = host_glyph.map(|(g, _)| g.as_str()).unwrap_or("");
+                    let glyph_w = host_glyph.map_or(0, |(g, _)| dir_icon_width(g));
                     icon_spans.push(Span::raw(
-                        " ".repeat((host_width as usize).saturating_sub(text.width())),
+                        " ".repeat((host_width as usize).saturating_sub(glyph_w)),
                     ));
                     match host_glyph {
                         Some((glyph, foreign)) => {

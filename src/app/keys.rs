@@ -992,7 +992,18 @@ impl App {
                         match state.focus {
                             HostField::Label => r.label.push(c),
                             HostField::Target => r.target.push(c),
-                            HostField::Icon => r.icon.push(c),
+                            // Capped like the directory-mark icon, and for the
+                            // same reason now that the two share one table
+                            // column: past ~4 cells an "icon" stops reading as a
+                            // mark and just widens the column for every row.
+                            HostField::Icon => {
+                                use unicode_width::UnicodeWidthStr;
+                                let mut next = r.icon.clone();
+                                next.push(c);
+                                if next.width() <= DIR_ICON_MAX_CHARS {
+                                    r.icon = next;
+                                }
+                            }
                         }
                     }
                 }
