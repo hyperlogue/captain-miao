@@ -909,7 +909,6 @@ impl App {
     fn handle_host_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let ncol = super::format::DIR_COLORS.len();
         let editing = self.host_edit.as_ref()?.editing;
 
         // The log view owns the keyboard while it's open — it replaces the list,
@@ -963,23 +962,12 @@ impl App {
                     state.focus = match state.focus {
                         HostField::Label => HostField::Target,
                         HostField::Target => HostField::Icon,
-                        HostField::Icon => HostField::Color,
-                        HostField::Color => HostField::Label,
+                        HostField::Icon => HostField::Label,
                     }
                 }
                 KeyCode::Char('t') if ctrl && state.focus == HostField::Target => {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
                         r.is_socket = !r.is_socket;
-                    }
-                }
-                KeyCode::Left if state.focus == HostField::Color => {
-                    if let Some(r) = state.rows.get_mut(state.cursor) {
-                        r.color_idx = (r.color_idx + ncol - 1) % ncol;
-                    }
-                }
-                KeyCode::Right if state.focus == HostField::Color => {
-                    if let Some(r) = state.rows.get_mut(state.cursor) {
-                        r.color_idx = (r.color_idx + 1) % ncol;
                     }
                 }
                 KeyCode::Backspace => {
@@ -994,7 +982,6 @@ impl App {
                             HostField::Icon => {
                                 r.icon.pop();
                             }
-                            HostField::Color => {}
                         }
                     }
                 }
@@ -1006,7 +993,6 @@ impl App {
                             HostField::Label => r.label.push(c),
                             HostField::Target => r.target.push(c),
                             HostField::Icon => r.icon.push(c),
-                            HostField::Color => {}
                         }
                     }
                 }

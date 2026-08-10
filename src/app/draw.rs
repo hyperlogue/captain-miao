@@ -482,7 +482,6 @@ impl App {
             } else {
                 "  "
             };
-            let color = DIR_COLORS[r.color_idx].1;
             let label = if r.label.trim().is_empty() {
                 "(unnamed)".to_string()
             } else {
@@ -497,7 +496,10 @@ impl App {
             let mut spans = vec![
                 Span::raw(marker),
                 Span::raw(format!("{icon} ")),
-                Span::styled(format!("{label:<14}"), Style::default().fg(color).bold()),
+                Span::styled(
+                    format!("{label:<14}"),
+                    Style::default().fg(config::get().colors.ui.title_fg).bold(),
+                ),
             ];
             // Everything before the status: marker (2) + icon and its space (3)
             // + the padded label (14). A `Failed` reason quotes the host and can
@@ -582,14 +584,6 @@ impl App {
                 Span::raw(r.target.clone()),
                 cursor(state.focus == super::HostField::Target),
             ]);
-            let mut color_spans: Vec<Span<'static>> = Vec::new();
-            for (idx, (_, c)) in DIR_COLORS.iter().enumerate() {
-                let mut st = Style::default().fg(*c);
-                if idx == r.color_idx {
-                    st = st.add_modifier(Modifier::REVERSED);
-                }
-                color_spans.push(Span::styled("\u{25CF} ", st));
-            }
             let icon_line = Line::from(vec![
                 Span::raw(if r.icon.trim().is_empty() {
                     format!("{} (auto)", self.host_icon(&HostId(r.label.clone())))
@@ -606,11 +600,6 @@ impl App {
                     target_line,
                 ),
                 field_row(state.focus == super::HostField::Icon, "Icon", icon_line),
-                field_row(
-                    state.focus == super::HostField::Color,
-                    "Color",
-                    Line::from(color_spans),
-                ),
             ];
             // Per-field hints for the two non-obvious affordances.
             match state.focus {
@@ -757,7 +746,7 @@ impl App {
                 ),
                 Span::styled(
                     format!("{} {}", self.host_icon(&host), host.0),
-                    Style::default().fg(self.host_label_color(&host)),
+                    Style::default().fg(ui.title_fg),
                 ),
             ]);
         }
@@ -1674,7 +1663,8 @@ impl App {
                     spans
                 } else if host_edit.is_some_and(|h| h.editing) {
                     let mut spans = hint_pair("Tab", "field");
-                    spans.extend(hint_pair("←→", "color/type"));
+                    spans.extend(hint_pair("^t", "ssh/socket"));
+                    spans.extend(hint_pair("^e", "emoji"));
                     spans.extend(hint_pair("Enter", "done"));
                     spans.extend(hint_pair("Esc", "back"));
                     spans

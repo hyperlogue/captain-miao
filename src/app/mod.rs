@@ -442,9 +442,8 @@ pub(super) struct HostRow {
     /// ssh target (`user@host`) or, when `is_socket`, a socket path.
     pub(in crate::app) target: String,
     pub(in crate::app) is_socket: bool,
-    pub(in crate::app) color_idx: usize,
-    /// Per-host emoji for the Host column, picked with the same searchable
-    /// picker as the workdir marks. Empty = derive one from the label.
+    /// Per-host emoji shown beside the workdir icon, picked with the same
+    /// searchable picker as the workdir marks. Empty = derive one from the label.
     pub(in crate::app) icon: String,
 }
 
@@ -453,7 +452,6 @@ pub(super) enum HostField {
     Label,
     Target,
     Icon,
-    Color,
 }
 
 /// The remote hosts, counted by how usable each one is — see
@@ -682,9 +680,7 @@ pub(super) struct App {
     /// Monotonic counter behind [`App::mint_launch_id`]; pid-namespaced into the
     /// token so it's unique across dashboards.
     pub(super) next_launch_id: u64,
-    /// Per-host color for the host column, from the hosts config.
-    pub(super) host_colors: HashMap<HostId, ratatui::style::Color>,
-    /// Per-host emoji for the host column, from the hosts config. A host with
+    /// Per-host emoji for the icon column, from the hosts config. A host with
     /// none configured falls back to a deterministic emoji derived from its
     /// label, so the column always reads as icons rather than truncated names.
     pub(super) host_icons: HashMap<HostId, String>,
@@ -869,15 +865,11 @@ fn plural_sessions(n: usize) -> &'static str {
     if n == 1 { "session" } else { "sessions" }
 }
 
-/// Resolve a host-label color: a hex / basic name via `config::parse_color`, or
-/// one of the directory-palette names (orange/pink/teal/…) the popup offers but
-/// `parse_color` doesn't know — so every palette pick round-trips to the table.
 /// What [`App::build_backends_from_config`] produces: the backends plus the
 /// per-host display attributes the table reads. A named struct rather than a
-/// tuple because the two `HashMap`s are otherwise positionally swappable.
+/// tuple so a second attribute can join without every call site shifting.
 pub(super) struct HostSetup {
     pub backends: Vec<Backend>,
-    pub host_colors: HashMap<HostId, ratatui::style::Color>,
     pub host_icons: HashMap<HostId, String>,
 }
 
@@ -931,11 +923,6 @@ fn resume_picker_title(host: &HostId) -> String {
     }
 }
 
-fn host_color(name: &str) -> Option<ratatui::style::Color> {
-    crate::config::parse_color(name)
-        .or_else(|| format::dir_color_index(name).map(|i| format::DIR_COLORS[i].1))
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct SessionFlags {
     #[serde(default)]
@@ -982,7 +969,6 @@ impl App {
 
         let HostSetup {
             mut backends,
-            host_colors,
             host_icons,
         } = Self::build_backends_from_config();
         // Every backend reports its own changes now (§5), so the run loop needs
@@ -1041,7 +1027,6 @@ impl App {
             terminal_identity: crate::terminal::get().identity(),
             foreign_bindings: Vec::new(),
             next_launch_id: 0,
-            host_colors,
             host_icons,
             default_host: HostId::local(),
             recent_dirs_cache: HashMap::new(),
@@ -1470,7 +1455,10 @@ impl App {
                 if !state.is_connected() {
                     item = item.with_secondary(state.label().to_string());
                 }
-                item.with_prefix(self.host_icon(host), self.host_label_color(host))
+                item.with_prefix(
+                    self.host_icon(host),
+                    crate::config::get().colors.ui.title_fg,
+                )
             })
             .collect();
         let mut picker = Picker::new("Default host for new sessions", items);
@@ -1674,13 +1662,11 @@ impl App {
     /// spawned and every row is local. Pooled-localhost is deliberately *not*
     /// gated by it — it uses no ssh and is opt-in by its own config flag.
     fn build_backends_from_config() -> HostSetup {
-        let mut host_colors: HashMap<HostId, ratatui::style::Color> = HashMap::new();
         let mut host_icons: HashMap<HostId, String> = HashMap::new();
         let mut backends = vec![Self::this_machine_backend()];
         if !REMOTE_ENABLED {
             return HostSetup {
                 backends,
-                host_colors,
                 host_icons,
             };
         }
@@ -1691,9 +1677,6 @@ impl App {
             // `(host, pid)` keying relies on `is_local()`.
             if host.is_local() {
                 continue;
-            }
-            if let Some(c) = h.color.as_deref().and_then(host_color) {
-                host_colors.insert(host.clone(), c);
             }
             if let Some(icon) = h.icon.filter(|i| !i.trim().is_empty()) {
                 host_icons.insert(host.clone(), icon);
@@ -1713,7 +1696,6 @@ impl App {
         }
         HostSetup {
             backends,
-            host_colors,
             host_icons,
         }
     }
@@ -1750,12 +1732,10 @@ impl App {
     fn rebuild_remote_backends(&mut self) {
         let HostSetup {
             mut backends,
-            host_colors,
             host_icons,
         } = Self::build_backends_from_config();
         self.backend_events = backends.iter_mut().map(Backend::subscribe).collect();
         self.backends = backends;
-        self.host_colors = host_colors;
         self.host_icons = host_icons;
         // Stale per-host caches would otherwise outlive the host they describe.
         self.recent_dirs_cache.clear();
@@ -1767,11 +1747,6 @@ impl App {
         let rows = hosts::load_hosts()
             .into_iter()
             .map(|h| HostRow {
-                color_idx: h
-                    .color
-                    .as_deref()
-                    .and_then(format::dir_color_index)
-                    .unwrap_or(0),
                 is_socket: h.socket.is_some(),
                 target: h.socket.or(h.ssh).unwrap_or_default(),
                 icon: h.icon.unwrap_or_default(),
@@ -1843,7 +1818,6 @@ impl App {
                 hosts::HostConfig {
                     icon: (!icon.is_empty()).then_some(icon),
                     label: r.label.trim().to_string(),
-                    color: Some(format::DIR_COLORS[r.color_idx].0.to_string()),
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
                 }
@@ -3858,11 +3832,7 @@ impl App {
         cm_core::paths::collapse_home(path, &self.home_dir).into()
     }
 
-    /// The display color for a host label: its configured color, else the
-    /// theme's `title_fg` (Cyan by default). Shared by the table's Host column
-    /// and the picker footer's `Ctrl-h` host hint so an unconfigured host reads
-    /// identically at both.
-    /// The emoji shown for a host in the table's Host column and the host
+    /// The emoji shown for a host in the table's icon column and the host
     /// pickers: the configured one, else a deterministic emoji derived from the
     /// label — so a host always reads as an icon (§9) without the user having
     /// configured anything, and the same host keeps the same glyph run to run.
@@ -3877,13 +3847,6 @@ impl App {
         }
         const FALLBACK: [&str; 8] = ["🖥", "🛰", "🐧", "📦", "⚙", "🌐", "🔷", "🧊"];
         FALLBACK[format::stable_index(&host.0, FALLBACK.len())].to_string()
-    }
-
-    pub(super) fn host_label_color(&self, host: &HostId) -> ratatui::style::Color {
-        self.host_colors
-            .get(host)
-            .copied()
-            .unwrap_or_else(|| crate::config::get().colors.ui.title_fg)
     }
 }
 

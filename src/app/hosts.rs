@@ -1,6 +1,12 @@
 //! Remote-host configuration for the federated dashboard. Mutable runtime state
 //! (managed in the TUI, persisted to `hosts.json`), not static config — each
 //! entry is a host the dashboard mirrors over a `miao-server` socket.
+//!
+//! A host used to carry a `color` alongside its `icon`. It was dropped: the two
+//! said the same thing, the icon says it better (an emoji is self-coloured and
+//! distinguishes far more than a palette of eight), and one affordance per
+//! concept is one fewer field to Tab past. `serde` ignores the leftover key, so
+//! an older `hosts.json` still loads — the colour is simply forgotten.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +21,7 @@ pub(super) struct HostConfig {
     /// local daemon under pooled-localhost. Overrides `ssh` when set.
     #[serde(default)]
     pub socket: Option<String>,
-    /// Color (name or `#rrggbb`) for this host's icon in the table.
-    #[serde(default)]
-    pub color: Option<String>,
-    /// Emoji shown in the Host column — the same affordance workdir marks have
+    /// Emoji shown beside the workdir icon — the same affordance workdir marks have
     /// (`Space i`), for the same reason: at a glance an icon separates hosts far
     /// faster than a truncated label, and it costs one cell instead of six.
     /// Empty/absent falls back to a deterministic emoji derived from the label,
