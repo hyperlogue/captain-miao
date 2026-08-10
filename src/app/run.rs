@@ -1016,6 +1016,33 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             needs_redraw = true;
         }
 
+        // The same detach prune, on a timer rather than off a reload.
+        //
+        // Closing an attach window is invisible to every change signal the
+        // dashboard has: the pooled session keeps running untouched, so no state
+        // file moves and the host pushes no delta. Running the prune only inside
+        // the reload branch therefore left the binding in place indefinitely —
+        // the row kept resolving to a window that no longer existed, so it
+        // showed neither the detached marker nor the detached tier, and `Enter`
+        // silently focused a dead window instead of re-attaching.
+        //
+        // This costs no more than before: `DETACH_PRUNE_MIN_INTERVAL` already
+        // bounded the prune at one snapshot per interval, and both sites share
+        // the same `last_detach_prune`, so the worst case is unchanged — the
+        // prune now simply *reaches* that bound instead of firing only when a
+        // reload happens to coincide. `has_remote()` still keeps a purely local
+        // dashboard from snapshotting for this at all.
+        if app.window_bindings.has_remote() && detach_prune_due(last_detach_prune, Instant::now()) {
+            last_detach_prune = Some(Instant::now());
+            if let Ok(tabs) = terminal::get().snapshot().await {
+                let live: HashSet<WindowId> =
+                    tabs.iter().flat_map(|t| &t.windows).cloned().collect();
+                if !app.prune_detached_sessions(&live).is_empty() {
+                    needs_redraw = true;
+                }
+            }
+        }
+
         // Preview debounce: mark dirty when selection differs from cached preview,
         // then fetch after a short settle period so rapid navigation doesn't block.
         let selected_wid = app.selected_window_id();
@@ -1184,6 +1211,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         // before the client switches tabs.
                         if let Err(e) = terminal::get().focus_window(&id).await {
                             app.set_status(format!("Focus failed: {e}"), true);
+                            // Most likely the window is gone (an attach window
+                            // the user closed). Don't drop the binding on the
+                            // strength of one failed rc call — a transient error
+                            // would then strand a live session as "detached".
+                            // Instead let the *next* tick's snapshot decide,
+                            // right away rather than up to the floor later.
+                            last_detach_prune = None;
                         }
                     }
                     Action::NewSessionSplit { agent, cwd, host } => {

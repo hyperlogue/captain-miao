@@ -520,6 +520,21 @@ outlives the binding: `prune_dead` drops a binding when its window dies but
 leaves the expectation, while an explicit `D` clears it. That one distinction —
 "the link dropped" vs "you detached" — is the whole basis of auto-reattach (§7).
 
+**The prune runs on a timer, not only off a reload.** Closing an attach window
+is invisible to every change signal the dashboard has: the pooled session keeps
+running untouched, so no state file moves and the host pushes no delta. Gating
+the prune on the reload branch therefore left the binding in place indefinitely
+— the row kept resolving to a window that no longer existed, so it showed
+neither the detached marker nor the detached tier, and `Enter` silently focused
+a dead window instead of re-attaching. The run loop now also prunes on its own
+schedule, still floored to `DETACH_PRUNE_MIN_INTERVAL` (what makes a periodic
+`list-panes` affordable on zellij) and still gated on `has_remote()` (so a purely
+local dashboard never snapshots for this at all). A **failed focus** resets the
+floor rather than dropping the binding itself: one failed rc call is not proof
+the window is gone, and treating it as proof would strand a live session as
+"detached" — so the next tick's snapshot decides, immediately instead of up to an
+interval later.
+
 ## 7. Lifecycle flows, condensed
 
 One discovery path covers every host: **a launcher writes its state file;

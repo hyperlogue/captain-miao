@@ -425,7 +425,13 @@ it uses no ssh and has its own config flag.
   expectation, while an explicit `D` clears it. That distinction — "the link
   dropped" vs "you detached" — is what auto-reattach runs on: on a host's
   reconnect epoch bump, every remembered `(host, pool_session)` without a window
-  gets one respawned (without stealing focus).
+  gets one respawned (without stealing focus). The prune runs **on a timer**, not
+  only inside the reload branch: closing an attach window changes no state file
+  and produces no host delta, so a reload-gated prune left the binding forever
+  and the row read as attached-but-inert (no detached marker, `Enter` focusing a
+  dead window). Still floored to `DETACH_PRUNE_MIN_INTERVAL` and gated on
+  `has_remote()`; a *failed focus* resets the floor rather than dropping the
+  binding, since one failed rc call isn't proof the window is gone.
 - **Config.** Hosts are mutable TUI state (`hosts.json`: label, ssh target /
   socket, emoji icon), managed via the `Space h` **hosts panel** — a list view
   with live conn state, running/attached counts, daemon version and latency.
