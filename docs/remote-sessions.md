@@ -1033,6 +1033,18 @@ has no remote. Until it has, the feature ships off by default behind the
 
 ### 10.4 Smaller deferred items
 
+- **Extra ssh args for the main connection.** The `Ports` field (§9) is the one
+  connection knob the panel exposes, because a forward is the one that
+  *shouldn't* live in `~/.ssh/config`: it is state you want up while working on
+  a host and gone when you aren't, not a permanent property of the machine.
+  Everything about *how to reach* the host — port, `ProxyJump`, identity file —
+  belongs in a `Host` block there, where it also covers the attach windows and
+  the `w` shell for free. The gap left is per-connection tuning that ssh_config
+  can't scope to us (`-C`, keepalive and window sizes, an extra `-o`): a
+  free-form field for that would have to apply to the **main connection only**,
+  since anything spliced into `ssh_common_opts` is re-sent by every attach
+  window — and a forward-shaped arg there would collide with the master on each
+  one.
 - **Per-host keep-awake and remote focus/bell.** The sleep inhibitor and the
   `miao focus` bell are both client-side and only meaningful for sessions with a
   local window; a remote session that wants attention currently reaches the

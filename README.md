@@ -311,6 +311,13 @@ several, separated by spaces or commas. They come up with the connection and
 back with it after a reconnect, and a spec that doesn't parse is shown in red on
 the host's row rather than being passed to ssh.
 
+Everything about *how to reach* a host — a non-default port, a jump host, an
+identity file — belongs in `~/.ssh/config` instead. captain-miao runs a plain
+`ssh <target>`, so a `Host` block there covers the connection, the attach
+windows and the `w` shell alike. Forwards are the exception, and that is why
+they live in the panel: they are something you want up while you're working on
+that host and gone when you aren't, not a permanent property of the machine.
+
 **Getting the daemon onto each host.** Either install `miao-server`
 there yourself (any copy on `PATH` matching your dashboard's version is used as
 is, and never touched), or let the dashboard carry one and deploy it for you:
