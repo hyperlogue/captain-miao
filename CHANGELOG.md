@@ -5,6 +5,27 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Port forwards, per remote host.** An agent working on another machine starts
+  a dev server, a preview, a debugger — the `Ports` field in the hosts panel
+  (`Space h`, edit a row, `Tab` to it) is how you reach them from here. Write
+  `3000` to put its `localhost:3000` on yours, `8080:3000` to land it on a
+  different local port, `8080:db:5432` to reach something beside the host
+  itself, or prefix `R:` / `D:` for a reverse forward or a SOCKS proxy; several
+  are separated by spaces or commas, and a pasted `-L 8080:localhost:3000`
+  works as typed.
+
+  The forwards belong to the host rather than to a terminal you remembered to
+  leave open: they come up with the connection, come back with it after a
+  reconnect, and go away when the host is suspended or removed. They ride the
+  ssh connection captain-miao already holds, so there is nothing extra to
+  authenticate. A port that is already taken costs you that one forward and
+  nothing else, and a spec that isn't valid is shown in red on the host's row
+  instead of being handed to ssh.
+
 ## [0.3.0] - 2026-08-11
 
 ### Added

@@ -3547,6 +3547,47 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     assert_eq!(d.app.input_mode, InputMode::HostEdit);
 }
 
+/// Port forwards are configured on the host they belong to — the panel's fourth
+/// field — and read back on that host's own row, canonicalised.
+///
+/// The row line is the only place a forward is ever visible: nothing else in the
+/// dashboard says a local port is being answered by another machine. So it has
+/// to show what ssh is actually told, and it has to distinguish a spec that will
+/// be dropped from one that will be honoured.
+#[test]
+fn the_hosts_panel_configures_port_forwards() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    // `a` adds a row on Label; Tab walks Label → Target → Ports.
+    d.press(KeyCode::Char('a'));
+    for c in "box".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Tab);
+    for c in "user@box".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus,
+        super::HostField::Ports
+    );
+    for c in "8080:3000, d:1080 nope".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    let row = &d.app.host_edit.as_ref().unwrap().rows[0];
+    assert_eq!(row.target, "user@box");
+    assert_eq!(row.forwards, "8080:3000, d:1080 nope");
+
+    let out = d.render();
+    // Canonicalised: the shorthand is for typing, the row is the record.
+    assert!(out.contains("L 8080:localhost:3000"), "{out}");
+    assert!(out.contains("D 1080"), "{out}");
+    // The unparseable one is called out rather than drawn like a working
+    // forward — it is silently dropped when the host connects.
+    assert!(out.contains("!nope"), "{out}");
+}
+
 #[test]
 fn a_host_status_is_flattened_and_truncated_to_its_row() {
     use super::draw::one_line;
@@ -4936,6 +4977,7 @@ fn only_a_changed_connection_string_reconnects() {
         socket: None,
         icon: Some(icon.into()),
         disabled: false,
+        forwards: Vec::new(),
     };
     let before = vec![host("box", "user@box", "🖥")];
 
@@ -4961,6 +5003,18 @@ fn only_a_changed_connection_string_reconnects() {
             socket: Some("/run/x.sock".into()),
             icon: Some("🖥".into()),
             disabled: false,
+            forwards: Vec::new(),
+        }])
+    );
+    // A port forward is part of the ssh child's argv, so changing the set has to
+    // reach `rebuild_remote_backends` — nothing else re-runs `setup_ssh`, and a
+    // forward that only takes effect after the next unrelated reconnect would
+    // read as the field simply not working.
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[HostConfig {
+            forwards: vec!["8080:3000".into()],
+            ..host("box", "user@box", "🖥")
         }])
     );
     // Suspending a host moves it too — `disabled` decides whether a backend is

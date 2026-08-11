@@ -710,14 +710,47 @@ decides what they mean**.
   host shows live connection state (including the `Failed` reason verbatim),
   running/attached session counts, the daemon version from `Welcome`, and a
   latency sample; its ssh/socket target sits on a dim second line. Editing a
-  row exposes label / target (`^t` toggles ssh↔socket) / **icon** (`^e` opens
-  the same searchable emoji picker as `Space i`) / color. There is **no Save
+  row exposes label / target (`^t` toggles ssh↔socket) / **ports** (the forwards
+  below) / **icon** (`^e` opens the same searchable emoji picker as `Space i`).
+  There is **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
   removes behind a `y/N` confirm. A `Failed` reason is **flattened and
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.
+- **`Ports` — per-host ssh port forwards** (`src/port_forward.rs`). An agent
+  working on a remote host serves things: a dev server, a preview, a debugger.
+  The forward that reaches them belongs to the host, not to a terminal you
+  remembered to leave open, so it is configured beside the target and lives for
+  exactly as long as the connection — up on connect, back on reconnect, gone
+  when the host is suspended or deleted. Written as one text field, comma- or
+  space-separated, with two shorthands over ssh's grammar (`3000` =
+  `3000:localhost:3000`, `8080:3000` = `8080:localhost:3000`) and an optional
+  `L:`/`R:`/`D:` prefix; a pasted `-L 8080:localhost:3000` is understood as
+  typed. Three things make it work rather than merely exist:
+  - **The specs ride the transport's own `-N -L` child**, so there is no second
+    connection to authenticate (the ControlMaster is shared), supervise or
+    reconnect — the forwards inherit the connection task's whole lifecycle for
+    free.
+  - **They are parsed before ssh sees them.** A forward that fails to *bind* is
+    survivable (`ExitOnForwardFailure` stays at its default `no`, deliberately —
+    a busy port must cost one forward, not the link to the host), but a spec ssh
+    cannot *parse* is a usage error that exits the child, which the connection
+    task then reads as a dead transport and re-dials forever. So
+    `build_backends_from_config` passes on only what parsed, and the panel row
+    draws the rest behind a red `!` — dropped-and-visible, never
+    dropped-and-silent.
+  - **`-O cancel` before every request.** A forward asked for by a multiplexed
+    client is registered with the *master*, not with that client's session — the
+    same fact that makes the transport's own `-L` need a cancel. So one that was
+    deleted from the field would otherwise hold its port for as long as the
+    master lives, and one still in the field would make the re-request fail,
+    which for a mux client is fatal. Nothing enumerates a master's live
+    forwards, so `REQUESTED_FORWARDS` remembers what this process asked each
+    target for and cancels that set ∪ the new one, then requests. Editing the
+    field changes `conn_identities`, so a commit rebuilds the backend and that
+    whole pass runs immediately.
 - **`l` — the connection log** (per host, in the panel). The row gets one line
   for a failure whose reason is routinely a paragraph, and the *sequence* is
   what diagnoses: "probed the host, decided to deploy, the deploy came back with

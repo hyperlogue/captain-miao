@@ -40,6 +40,17 @@ pub(super) struct HostConfig {
     /// upgrade.
     #[serde(default)]
     pub disabled: bool,
+    /// ssh port forwards held open for exactly as long as this host is
+    /// connected — `8080:3000` to reach its dev server, `R:9000` to expose one
+    /// of yours to it. Stored as the user typed them, not as parsed forwards:
+    /// the panel is where a typo is visible and fixable, and canonicalising on
+    /// load would rewrite their text out from under them. Parsed (and the
+    /// malformed ones dropped) at backend-build time by
+    /// [`crate::port_forward::valid`].
+    ///
+    /// Ignored for a `socket` host — there is no ssh hop there to carry them.
+    #[serde(default)]
+    pub forwards: Vec<String>,
 }
 
 /// Load the configured hosts, or an empty list if none / unreadable.

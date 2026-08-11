@@ -165,7 +165,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
 | `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
 | `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, which has only the one) |
-| `Space h` / `Space s`          | Hosts panel (add, edit, suspend with `c`, connection log with `l`) / attach to a session, kicking the client holding it |
+| `Space h` / `Space s`          | Hosts panel (add, edit, port forwards, suspend with `c`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `?`                            | Show the full key list (help overlay)                                  |
 | `/`                            | Search                                                                 |
 | `q` / `Ctrl-c`                 | Quit                                                                   |
@@ -301,6 +301,15 @@ pool, and the dashboard attaches local windows to them over ssh, so a dropped
 connection or a slept laptop detaches windows without touching the sessions —
 and reconnecting brings them all back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
+
+**Port forwards** are configured per host, in the same panel. An agent on a
+remote box starts a dev server; the `Ports` field is how you open it in the
+browser here. Write `3000` for `localhost:3000` on both ends, `8080:3000` to
+land it on a different local port, `8080:db:5432` to reach something other than
+the host itself, or prefix `R:` / `D:` for a reverse forward or a SOCKS proxy —
+several, separated by spaces or commas. They come up with the connection and
+back with it after a reconnect, and a spec that doesn't parse is shown in red on
+the host's row rather than being passed to ssh.
 
 **Getting the daemon onto each host.** Either install `miao-server`
 there yourself (any copy on `PATH` matching your dashboard's version is used as

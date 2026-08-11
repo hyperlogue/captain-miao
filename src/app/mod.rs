@@ -533,13 +533,38 @@ pub(super) struct HostRow {
     pub(in crate::app) icon: String,
     /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
     pub(in crate::app) disabled: bool,
+    /// Port forwards as one line of text — see [`hosts::HostConfig::forwards`].
+    /// Edited as text rather than as a list of rows because the whole set is
+    /// nearly always one or two specs, and a sub-list inside a popup row would
+    /// need its own cursor, its own add/remove keys and its own footer.
+    pub(in crate::app) forwards: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum HostField {
     Label,
     Target,
+    Ports,
     Icon,
+}
+
+/// What one configured host's backend is built *from* — see
+/// [`App::conn_identities`], which is the gate deciding whether committing a
+/// panel row reconnects anything. A named struct rather than a tuple because
+/// every field is either a `String` or an `Option<String>`: two of them being
+/// swapped at a call site would compile, and would then reconnect on the wrong
+/// edits forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::app) struct ConnIdentity {
+    label: String,
+    ssh: Option<String>,
+    socket: Option<String>,
+    disabled: bool,
+    /// The raw specs, not the parsed forwards: an edit that only fixes a typo
+    /// in a *malformed* spec changes nothing ssh is told, but it does change
+    /// what the next connect will try — and the panel showing it as valid while
+    /// nothing dialled it would be a lie.
+    forwards: Vec<String>,
 }
 
 /// The remote hosts, counted by how usable each one is — see
@@ -2037,7 +2062,15 @@ impl App {
                 // One short, OS-limit-safe local socket per host; ssh forwards
                 // the remote server's socket onto it.
                 let local_sock = crate::state::remote_forward_sock(&host.0);
-                let t = Transport::Ssh { target, local_sock };
+                // The user's forwards ride that same child, so only specs that
+                // *parse* may be passed on: a malformed one is a usage error
+                // that exits it, and the transport would flap forever on a typo.
+                let forwards = crate::port_forward::valid(&h.forwards);
+                let t = Transport::Ssh {
+                    target,
+                    local_sock,
+                    forwards,
+                };
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             }
         }
@@ -2099,6 +2132,9 @@ impl App {
                 target: h.socket.or(h.ssh).unwrap_or_default(),
                 icon: h.icon.unwrap_or_default(),
                 disabled: h.disabled,
+                // Round-trips exactly: a spec can hold neither a comma nor a
+                // space, so this join is the inverse of `parse_list`'s split.
+                forwards: h.forwards.join(", "),
                 label: h.label,
             })
             .collect::<Vec<_>>();
@@ -2178,6 +2214,7 @@ impl App {
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
                     disabled: r.disabled,
+                    forwards: crate::port_forward::parse_list(&r.forwards),
                 }
             })
             .collect();
@@ -2189,7 +2226,25 @@ impl App {
             self.mark_dirty(Cursor::HoldIndex);
             return;
         }
+        // A host that just left the ssh set — deleted, suspended, renamed, or
+        // switched to a socket — still holds its port forwards on the shared
+        // ControlMaster, which outlives the backend about to be dropped (and
+        // which an open attach window keeps alive indefinitely). Retire them
+        // before the rebuild, while there is still a record of what they were.
+        crate::backend::retire_unlisted_forwards(&Self::forward_keys(&configs));
         self.rebuild_remote_backends();
+    }
+
+    /// `(label, ssh target)` for every host that will still get an ssh backend —
+    /// the live set [`crate::backend::retire_unlisted_forwards`] measures
+    /// against. A suspended or socket host is *absent*, not present-and-empty:
+    /// it dials nothing, so nothing should be forwarding on its behalf.
+    fn forward_keys(hosts: &[hosts::HostConfig]) -> Vec<(String, String)> {
+        hosts
+            .iter()
+            .filter(|h| !h.disabled && h.socket.is_none())
+            .filter_map(|h| Some((h.label.clone(), h.ssh.clone()?)))
+            .collect()
     }
 
     /// What each configured host's backend is *built from*, in order: the label
@@ -2198,12 +2253,16 @@ impl App {
     /// byte-identical backends, so a rebuild between them would only churn live
     /// connections — see [`Self::apply_host_edits`]. Pure, so the gate is
     /// unit-testable.
-    pub(in crate::app) fn conn_identities(
-        hosts: &[hosts::HostConfig],
-    ) -> Vec<(String, Option<String>, Option<String>, bool)> {
+    pub(in crate::app) fn conn_identities(hosts: &[hosts::HostConfig]) -> Vec<ConnIdentity> {
         hosts
             .iter()
-            .map(|h| (h.label.clone(), h.ssh.clone(), h.socket.clone(), h.disabled))
+            .map(|h| ConnIdentity {
+                label: h.label.clone(),
+                ssh: h.ssh.clone(),
+                socket: h.socket.clone(),
+                disabled: h.disabled,
+                forwards: h.forwards.clone(),
+            })
             .collect()
     }
 

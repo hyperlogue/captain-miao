@@ -26,7 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::BufReader;
@@ -35,6 +35,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{ResumeCandidate, SessionIndex};
+use crate::port_forward::PortForward;
 use crate::protocol::{
     ClientFrame, PROTOCOL_MIN, PROTOCOL_VERSION, ServerFrame, protocol_compatible, read_frame,
     write_frame,
@@ -526,7 +527,16 @@ pub(crate) enum Transport {
     /// ensure the daemon is running + learn its socket path (`daemon ensure`),
     /// then run a forward-only `ssh -N -L <local_sock>:<remote_sock> target`
     /// child (the tunnel, killed when this backend drops; the daemon persists).
-    Ssh { target: String, local_sock: PathBuf },
+    Ssh {
+        target: String,
+        local_sock: PathBuf,
+        /// The user's own port forwards for this host, already parsed (see
+        /// [`crate::port_forward`]). They ride the same child as the transport's
+        /// own `-L`, which is what gives them the lifetime the user asked for —
+        /// "while I'm connected to this host" — with no second connection to
+        /// authenticate, supervise or reconnect.
+        forwards: Vec<PortForward>,
+    },
 }
 
 /// One in-flight request the connection task must answer by `req_id`.
@@ -2277,11 +2287,16 @@ async fn connection_task(
                 log.info(format!("connecting to local socket {}", p.display()));
                 Some((p.clone(), None))
             }
-            Transport::Ssh { target, local_sock } => {
+            Transport::Ssh {
+                target,
+                local_sock,
+                forwards,
+            } => {
                 log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
                     target,
                     local_sock,
+                    forwards,
                     &remote_exe,
                     &mut failure,
                     &mut Provisioning {
@@ -2461,9 +2476,16 @@ async fn connect_with_retry(sock: &Path, attempts: u32) -> Option<UnixStream> {
 /// dropping the backend (or a reconnect) kills only the tunnel, never the daemon
 /// or its sessions. The returned child is `kill_on_drop`. Returns None if ssh or
 /// the remote binary fails. Requires key/agent auth (BatchMode).
+///
+/// The user's configured `forwards` ride that same child, so they are up for
+/// exactly as long as the host is connected and come back with it on a
+/// reconnect. `ExitOnForwardFailure` stays at its default `no` on purpose: a
+/// port already in use must cost the user that one forward, not the dashboard's
+/// link to the host.
 async fn setup_ssh(
     target: &str,
     local_sock: &Path,
+    forwards: &[PortForward],
     remote_exe: &Arc<Mutex<String>>,
     failure: &mut Option<String>,
     prov: &mut Provisioning<'_>,
@@ -2566,6 +2588,7 @@ async fn setup_ssh(
         .arg(target)
         .status()
         .await;
+    cancel_user_forwards(prov.host, target, &opts, forwards).await;
 
     // Clear any stale local socket and ensure its parent dir exists.
     if let Some(parent) = local_sock.parent() {
@@ -2591,16 +2614,137 @@ async fn setup_ssh(
     let stderr = std::fs::File::create(&err_path)
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
-    detached("ssh")
-        .args(&opts)
+    let mut cmd = detached("ssh");
+    cmd.args(&opts)
         .arg("-N")
         .arg("-L")
-        .arg(format!("{}:{}", local_sock.display(), remote_sock))
-        .arg(target)
+        .arg(format!("{}:{}", local_sock.display(), remote_sock));
+    if !forwards.is_empty() {
+        // Logged, because a forward that fails to bind only says so in ssh's
+        // stderr file — the panel's `l` view should at least show what was asked
+        // for, so "why is nothing on :8080" starts from the right spec.
+        log.info(format!(
+            "port forwards: {}",
+            forwards
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        for f in forwards {
+            cmd.arg(f.flag()).arg(f.spec());
+        }
+    }
+    cmd.arg(target)
         .stderr(stderr)
         .kill_on_drop(true)
         .spawn()
         .ok()
+}
+
+/// Every port-forward spec this process has asked a given ssh target's
+/// ControlMaster for, so the next connect can take them back down.
+///
+/// A forward requested by a multiplexed *client* is registered with the
+/// **master**, not with the client's own session — which is why the transport's
+/// `-L` needs its own `-O cancel` above, and why a forward the user has since
+/// deleted would otherwise hold its port until the master itself expires
+/// (`ControlPersist`, refreshed by every attach window). Nothing enumerates a
+/// master's live forwards, so remembering what we asked for is the only way to
+/// name them again.
+///
+/// Keyed by `(host label, ssh target)` rather than by target alone: two panel
+/// rows may name the same machine, and each has to manage its own set — keyed
+/// only by target, connecting one would tear down the other's forwards.
+static REQUESTED_FORWARDS: LazyLock<Mutex<HashMap<ForwardKey, Vec<PortForward>>>> =
+    LazyLock::new(Mutex::default);
+
+/// `(host label, ssh target)` — which panel row's forwards these are, and where
+/// they were asked for. See [`REQUESTED_FORWARDS`].
+type ForwardKey = (String, String);
+
+/// Cancel every forward this process has requested for this host, including the
+/// ones about to be re-requested.
+///
+/// Cancelling the *current* set too is not waste: a re-request of a forward the
+/// master already holds fails, and unlike the transport's unix socket (where the
+/// master quietly binds nothing) a mux client treats a refused forward request
+/// as fatal — so leaving a live one in place is how a reconnect would kill the
+/// very child it just spawned. Cancel-then-request is idempotent; the forward is
+/// down only for the moment the connection is being re-established anyway.
+///
+/// Every failure here is expected and ignorable: no master up yet (the first
+/// connect), no such forward (the common case), or an ssh too old to cancel a
+/// dynamic one. `detached` swallows the diagnostics.
+async fn cancel_user_forwards(
+    host: &HostId,
+    target: &str,
+    opts: &[String],
+    forwards: &[PortForward],
+) {
+    let stale = {
+        let mut memo = REQUESTED_FORWARDS.lock().unwrap();
+        let seen = memo
+            .entry((host.0.clone(), target.to_string()))
+            .or_default();
+        let mut all = std::mem::replace(seen, forwards.to_vec());
+        for f in forwards {
+            if !all.contains(f) {
+                all.push(f.clone());
+            }
+        }
+        all
+    };
+    cancel_forwards(target, opts, &stale).await;
+}
+
+/// Retire the forwards of every host that is no longer asking for one — it was
+/// deleted, suspended, renamed, or switched to a socket transport.
+///
+/// Dropping the backend kills its ssh child, but a forward outlives that child
+/// by construction (it belongs to the master, see [`REQUESTED_FORWARDS`]), and
+/// any open attach window keeps that master alive indefinitely. Without this,
+/// suspending a host would leave its ports answered by a machine the panel says
+/// is disconnected — with nothing left running to name the forward and take it
+/// back down.
+///
+/// `live` is `(label, target)` for every host that will still get an ssh
+/// backend. Fire-and-forget: the caller is committing a panel edit and must not
+/// block on an ssh round trip per forward.
+pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
+    let retired: Vec<(ForwardKey, Vec<PortForward>)> = {
+        let mut memo = REQUESTED_FORWARDS.lock().unwrap();
+        let gone: Vec<ForwardKey> = memo.keys().filter(|k| !live.contains(k)).cloned().collect();
+        gone.into_iter()
+            .filter_map(|k| memo.remove(&k).map(|f| (k, f)))
+            .collect()
+    };
+    for ((_, target), forwards) in retired {
+        if forwards.is_empty() {
+            continue;
+        }
+        tokio::spawn(async move {
+            let opts = ssh_common_opts(&state::ssh_control_path(&target));
+            cancel_forwards(&target, &opts, &forwards).await;
+        });
+    }
+}
+
+/// One `-O cancel` per spec rather than one command carrying all of them: a
+/// single unsupported flag would fail the whole batch, taking the forwards that
+/// *could* have been cancelled down with it.
+async fn cancel_forwards(target: &str, opts: &[String], forwards: &[PortForward]) {
+    for f in forwards {
+        let _ = detached("ssh")
+            .args(opts)
+            .arg("-O")
+            .arg("cancel")
+            .arg(f.flag())
+            .arg(f.spec())
+            .arg(target)
+            .status()
+            .await;
+    }
 }
 
 /// Handshake, subscribe, then multiplex the pushed session stream into the
