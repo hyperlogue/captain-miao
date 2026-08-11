@@ -545,7 +545,7 @@ fn work_tab_title_names_the_worktree_and_its_repo() {
     );
     assert_eq!(
         d.app.work_tab_title(&box_host, wt),
-        "🚀 proj@feature-auth",
+        "[🚀] proj@feature-auth",
         "a remote worktree tab keeps both halves behind the host icon"
     );
     // Two worktrees of one repo get distinct tabs, so `w` in one can't land a
@@ -4724,14 +4724,15 @@ fn work_tab_title_names_the_host_for_a_remote_tab() {
     // reach the *window* title, never the tab label (the spawn sets an explicit
     // tab title, which overrides the follow-the-window default on both
     // backends). So the host rides in the title we stamp — as its icon, which
-    // costs the basename two cells instead of the label's six.
-    assert_eq!(d.app.work_tab_title(&box_host, "~/proj"), "🚀 proj");
+    // costs the basename two cells instead of the label's six, bracketed so the
+    // glyph doesn't run into the basename.
+    assert_eq!(d.app.work_tab_title(&box_host, "~/proj"), "[🚀] proj");
     // An unconfigured host still gets a glyph, so the prefix is never empty.
     let unconfigured = d
         .app
         .work_tab_title(&crate::state::HostId("other".into()), "~/proj");
     assert!(
-        unconfigured.ends_with(" proj") && unconfigured != " proj",
+        unconfigured.ends_with("] proj") && !unconfigured.starts_with("[]"),
         "a host with no configured icon falls back to a deterministic one: {unconfigured}"
     );
 
@@ -4748,7 +4749,7 @@ fn work_tab_title_names_the_host_for_a_remote_tab() {
     d.app.work_tabs.insert(key.clone(), entry.clone());
     let live = vec![crate::terminal::Tab {
         id: TabId::from(4),
-        title: "🚀 proj".into(),
+        title: "[🚀] proj".into(),
         is_focused: false,
         windows: vec![WindowId::from(8)],
     }];

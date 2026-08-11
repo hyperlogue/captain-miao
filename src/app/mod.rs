@@ -2362,16 +2362,18 @@ impl App {
     }
 
     /// Title stamped on a `(host, cwd)` work tab: the cwd's basename, prefixed
-    /// with the host's icon (`🖥️ proj`) for every host but this machine. The
-    /// prefix is the only way the host reaches the tab bar — a work tab is
-    /// spawned with an explicit tab title, and on both backends an explicit
-    /// title permanently overrides the follow-the-active-window's-title default,
-    /// so the `[hostname]` an ssh login shell emits over OSC 0/2 updates the
-    /// *window* title and can never reach the *tab* label. It is the emoji
-    /// rather than the label for the same reason the table's host column is
-    /// ([`App::host_icon`]): a tab bar has a handful of cells per tab, and one
-    /// glyph the eye already associates with the host beats six characters of
-    /// `box:` eaten out of the basename.
+    /// with the host's icon in brackets (`[🖥️] proj`) for every host but this
+    /// machine. The prefix is the only way the host reaches the tab bar — a work
+    /// tab is spawned with an explicit tab title, and on both backends an
+    /// explicit title permanently overrides the follow-the-active-window's-title
+    /// default, so the `[hostname]` an ssh login shell emits over OSC 0/2
+    /// updates the *window* title and can never reach the *tab* label. It is the
+    /// emoji rather than the label for the same reason the table's host column
+    /// is ([`App::host_icon`]): a tab bar has a handful of cells per tab, and
+    /// one glyph the eye already associates with the host beats six characters
+    /// of `box:` eaten out of the basename. The brackets are what keep it
+    /// reading as a prefix — an emoji and a word separated by one space run
+    /// together at tab-bar size.
     ///
     /// Keeping the title static rather than letting ssh own it is deliberate:
     /// [`App::live_work_tab`] validates a recorded tab by requiring this exact
@@ -2398,7 +2400,7 @@ impl App {
         if host.is_local() {
             base.into_owned()
         } else {
-            format!("{} {base}", self.host_icon(host))
+            format!("[{}] {base}", self.host_icon(host))
         }
     }
 
