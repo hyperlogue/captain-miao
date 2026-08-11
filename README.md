@@ -6,14 +6,14 @@
 
 <img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
 
-A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/) and [zellij](https://zellij.dev/).
+A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
 
 https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
 
 When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
 Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
-Kitty or zellij you already run (every session is a native window or pane,
+Kitty, zellij or tmux you already run (every session is a native window or pane,
 controlled through the terminal's own protocol), so it stays one small, focused
 tool and the rest of your workflow is yours to compose.
 
@@ -31,7 +31,7 @@ tool and the rest of your workflow is yours to compose.
 
 ## Requirements
 
-- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), or **zellij** ≥ 0.44 (run captain-miao inside the zellij session; no extra setup needed).
+- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
 - **Claude Code** and/or **Codex** on your `PATH`.
 
 ## Installation
@@ -101,15 +101,55 @@ Looser alternatives: `allow_remote_control socket-only` (off the escape-code cha
 
 **Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
 
+## tmux setup
+
+There is none — that's the point. tmux's CLI is trusted by the server that owns
+your session's socket, so there is no password, listen address or allowlist to
+configure (contrast Kitty above). Start the dashboard inside a tmux pane and it
+drives that server:
+
+```sh
+tmux
+miao
+```
+
+Requires **tmux ≥ 3.2**. Verified against 3.7b; the 3.2 floor is a documentation
+claim, not yet a tested one, so on an older tmux prefer to check before relying
+on it.
+
+**What's different on tmux:**
+
+- **Every session gets its own tmux window** — there is no Stacked layout. tmux
+  has no floating panes that survive a client switch (`display-popup` is
+  client-bound and transient) and no non-tiling layout; the closest emulation
+  (one window with the active pane zoomed) costs a real pty resize on every
+  switch — a slow agent repaint — and a background spawn *unzooms* the window,
+  disturbing the session you're watching. So `Space l` is not offered, and the
+  header's `Layout:` indicator is hidden.
+- **`t` (move window to tab) works** — the first multiplexer backend where it
+  does, since `break-pane`/`join-pane` are real CLI commands (zellij's equivalent
+  is keybind-only).
+- **The `miao focus` bell binding works**, kitty-style, because `run-shell -b`
+  runs a background command with formats expanded. Add to `~/.tmux.conf`:
+
+  ```conf
+  bind-key -n F12 run-shell -b "miao focus --window-id '#{pane_id}'"
+  ```
+
+- **Window titles captain-miao sets are pinned** (`automatic-rename off`,
+  `allow-rename off`) on the windows it creates, so an application's title escape
+  can't rename them out from under the work-tab (`w`) lookup. Your own windows are
+  untouched.
+
 ## Usage
 
-Run the dashboard inside a supported terminal (Kitty or zellij):
+Run the dashboard inside a supported terminal (Kitty, zellij or tmux):
 
 ```sh
 miao
 ```
 
-> `miao` must be launched from within Kitty or a zellij session; it exits with an error otherwise. When run inside a zellij session it auto-selects the zellij backend (override with `[terminal] backend` in the config).
+> `miao` must be launched from within Kitty or a zellij/tmux session; it exits with an error otherwise. Inside a multiplexer it auto-selects that backend — zellij first, then tmux, else Kitty (override with `[terminal] backend` in the config). Both multiplexers deliberately beat an ambient Kitty: nested inside Kitty, every pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty backend would drive the wrong window.
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
@@ -178,8 +218,8 @@ captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml`
 
 ```toml
 [terminal]
-backend = "kitty"            # "kitty" | "zellij"; unset auto-detects (zellij inside a zellij session, else Kitty)
-sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this)
+backend = "kitty"            # "kitty" | "zellij" | "tmux"; unset auto-detects (zellij, then tmux, else Kitty)
+sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this; tmux is always per-tab)
 
 [kitty]
 rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
@@ -339,7 +379,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 - [ ] **Remote hosts over SSH**: one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle — open, resume, attach, detach, steal, kill, restart, fork, auto-reattach on reconnect — is implemented behind the `remote` cargo feature (`cargo build --release --features remote`); what's left is verifying it end to end against a real host, so it stays off by default until then. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
-- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty and zellij today), so other terminals and multiplexers (tmux, WezTerm, …) can slot in.
+- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in. The tmux backend has been probe-verified on 3.7b only; the 3.2 floor it claims is still untested.
 
 ## License
 

@@ -771,13 +771,18 @@ impl App {
         // actively being inhibited. Flat text on the bar, with a trailing space
         // so it clears the terminal edge.
         let mut right_segs: Vec<Vec<Span<'static>>> = Vec::new();
-        right_segs.push(vec![
-            Span::styled("Layout: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(
-                self.sessions_layout.label(),
-                Style::default().fg(ui.title_fg),
-            ),
-        ]);
+        // The layout indicator names a *choice*; on a backend that has only one
+        // arrangement (tmux — a tab per session either way) it would report state
+        // the user can't change, so it hides with its `Space l` key.
+        if self.capabilities.layout_is_a_choice() {
+            right_segs.push(vec![
+                Span::styled("Layout: ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    self.sessions_layout.label(),
+                    Style::default().fg(ui.title_fg),
+                ),
+            ]);
+        }
         right_segs.push(vec![
             Span::styled(
                 "Default agent: ",
@@ -1541,8 +1546,12 @@ impl App {
             cmd(Command::EditDir),
             cmd(Command::ToggleKeepAwake),
             cmd(Command::DefaultAgent),
-            cmd(Command::SessionsLayout),
         ]);
+        // Both layouts spawn a tab per session on a backend with no shared-tab
+        // arrangement (tmux), so the toggle has nothing to switch between.
+        if self.capabilities.layout_is_a_choice() {
+            lines.push(cmd(Command::SessionsLayout));
+        }
         // The default-host choice only exists once there's more than one host.
         if self.backends.len() > 1 {
             lines.push(cmd(Command::DefaultHost));
@@ -1591,6 +1600,12 @@ impl App {
                 let prefix = self.pending_prefix.expect("is_some checked");
                 let mut spans = hint_badge(prefix.display());
                 for (key, command) in self.keymap.continuations(prefix) {
+                    // Same gate as the `?` overlay: don't advertise a layout
+                    // toggle on a backend where both layouts are the same thing.
+                    if command == Command::SessionsLayout && !self.capabilities.layout_is_a_choice()
+                    {
+                        continue;
+                    }
                     spans.extend(hint_pair(&key, command.short_label()));
                 }
                 spans

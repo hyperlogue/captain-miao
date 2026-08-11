@@ -19,6 +19,7 @@ use crate::config::{self, ConfiguredBackend};
 
 pub mod graphics;
 pub mod kitty;
+pub mod tmux;
 pub mod zellij;
 
 // `WindowId`/`TabId` (serialized into state + on the wire) and the launcher's
@@ -206,6 +207,21 @@ impl Default for Capabilities {
     }
 }
 
+impl Capabilities {
+    /// Whether [`SessionsLayout`] is a meaningful choice on this backend —
+    /// **derived**, not a capability field of its own, because it is exactly the
+    /// question "does this backend have any shared-tab arrangement to offer?".
+    ///
+    /// A backend with neither ([`tmux`]) resolves *both* layouts to
+    /// [`SpawnTarget::NewTab`], so `Space l` would toggle a persisted label that
+    /// changes nothing. The dashboard reports that instead and hides the key's
+    /// `?`-help entry and the header indicator — the established pattern for the
+    /// unsupported `t` on zellij.
+    pub fn layout_is_a_choice(self) -> bool {
+        self.window_stacking || self.floating_sessions
+    }
+}
+
 /// A terminal-emulator backend. The methods are the primitives that genuinely
 /// differ per backend; derived reads are free functions in this module.
 #[async_trait]
@@ -340,17 +356,29 @@ fn tail_lines(s: &str, n: usize) -> &str {
 static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 
 /// Which backend `get()` should build: a config override wins, then a live
-/// zellij session, then Kitty as the status-quo fallback. Pure (env reads stay
-/// at the `get()` edge) so the precedence is unit-tested without touching the
-/// process-global env or the `OnceLock`.
+/// zellij session, then a live tmux server, then Kitty as the status-quo
+/// fallback. Pure (env reads stay at the `get()` edge) so the precedence is
+/// unit-tested without touching the process-global env or the `OnceLock`.
 ///
-/// Zellij must beat the ambient Kitty env: when zellij runs nested inside Kitty,
-/// every zellij pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty backend
-/// would drive the wrong (outer) window. Only an explicit override overrides that.
-fn detect_backend(over: Option<ConfiguredBackend>, in_zellij: bool) -> ConfiguredBackend {
+/// **Both multiplexers must beat the ambient Kitty env**: when either runs nested
+/// inside Kitty, every pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty
+/// backend would drive the wrong (outer) window. Only an explicit override
+/// overrides that.
+///
+/// **Zellij stays ahead of tmux.** When both are live the two are nested and the
+/// env alone can't say which is inner; any fixed order is a guess for one of the
+/// two nestings, and keeping zellij first means adding tmux changes nothing for
+/// existing zellij users. The wrong guess is corrected the same way the
+/// nested-zellij-in-Kitty case already is: pin `[terminal] backend`.
+fn detect_backend(
+    over: Option<ConfiguredBackend>,
+    in_zellij: bool,
+    in_tmux: bool,
+) -> ConfiguredBackend {
     match over {
         Some(b) => b,
         None if in_zellij => ConfiguredBackend::Zellij,
+        None if in_tmux => ConfiguredBackend::Tmux,
         None => ConfiguredBackend::Kitty,
     }
 }
@@ -365,12 +393,14 @@ fn detect_backend(over: Option<ConfiguredBackend>, in_zellij: bool) -> Configure
 /// it exported its process env (`KITTY_PID`).
 pub fn supported_terminal_present() -> bool {
     let in_zellij = zellij::ZellijTerminal::from_env().is_some();
-    match detect_backend(config::get().terminal.backend, in_zellij) {
-        // `get()` builds the zellij backend only when a session is live; when it
-        // isn't (config pinned zellij outside one) `get()` falls back to Kitty,
-        // so the gate then requires Kitty just like the Kitty arm below.
+    let in_tmux = tmux::TmuxTerminal::from_env().is_some();
+    match detect_backend(config::get().terminal.backend, in_zellij, in_tmux) {
+        // `get()` builds a multiplexer backend only when one is actually live;
+        // when it isn't (config pinned zellij/tmux outside one) `get()` falls
+        // back to Kitty, so the gate then requires Kitty like the Kitty arm.
         ConfiguredBackend::Zellij if in_zellij => true,
-        ConfiguredBackend::Zellij | ConfiguredBackend::Kitty => {
+        ConfiguredBackend::Tmux if in_tmux => true,
+        ConfiguredBackend::Zellij | ConfiguredBackend::Tmux | ConfiguredBackend::Kitty => {
             std::env::var_os("KITTY_PID").is_some()
         }
     }
@@ -397,10 +427,16 @@ pub async fn verify_control() -> Result<()> {
 /// present (`get()` must always return a backend).
 pub fn get() -> &'static dyn Terminal {
     &**BACKEND.get_or_init(|| {
-        // Build the zellij backend up front so `is_some()` is the single
-        // in-zellij signal (`from_env` already filters an empty session name).
+        // Build each multiplexer backend up front so `is_some()` is the single
+        // in-<mux> signal (`from_env` already filters an empty session name /
+        // an unparseable `TMUX`).
         let zellij = zellij::ZellijTerminal::from_env();
-        match detect_backend(config::get().terminal.backend, zellij.is_some()) {
+        let tmux = tmux::TmuxTerminal::from_env();
+        match detect_backend(
+            config::get().terminal.backend,
+            zellij.is_some(),
+            tmux.is_some(),
+        ) {
             ConfiguredBackend::Zellij => match zellij {
                 Some(z) => Box::new(z) as Box<dyn Terminal>,
                 // Only reachable when the config forced zellij with no session
@@ -408,6 +444,18 @@ pub fn get() -> &'static dyn Terminal {
                 None => {
                     tracing::warn!(
                         "[terminal] backend = \"zellij\" but ZELLIJ_SESSION_NAME is unset; \
+                         falling back to Kitty"
+                    );
+                    Box::new(kitty::KittyTerminal)
+                }
+            },
+            ConfiguredBackend::Tmux => match tmux {
+                Some(t) => Box::new(t) as Box<dyn Terminal>,
+                // Same fallback as zellij's: the config pinned tmux with no
+                // server env to drive.
+                None => {
+                    tracing::warn!(
+                        "[terminal] backend = \"tmux\" but TMUX is unset or unparseable; \
                          falling back to Kitty"
                     );
                     Box::new(kitty::KittyTerminal)

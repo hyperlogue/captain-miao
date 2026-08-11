@@ -529,6 +529,17 @@ impl App {
                 None
             }
             Command::SessionsLayout => {
+                // On a backend with no shared-tab arrangement (tmux) both layouts
+                // spawn a tab per session, so the toggle would only flip a label.
+                if !self.capabilities.layout_is_a_choice() {
+                    self.set_status(
+                        "This terminal backend gives every session its own tab; \
+                         there is no other layout to switch to"
+                            .to_string(),
+                        true,
+                    );
+                    return None;
+                }
                 self.toggle_sessions_layout();
                 None
             }

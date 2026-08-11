@@ -79,22 +79,31 @@ fn tail_lines_returns_last_n() {
 #[test]
 fn detect_backend_override_beats_env() {
     // An explicit `[terminal] backend` pins the backend regardless of env —
-    // including forcing Kitty while inside a nested zellij (and vice versa).
-    assert_eq!(
-        detect_backend(Some(ConfiguredBackend::Kitty), true),
-        ConfiguredBackend::Kitty
-    );
-    assert_eq!(
-        detect_backend(Some(ConfiguredBackend::Zellij), false),
-        ConfiguredBackend::Zellij
-    );
+    // including forcing Kitty while inside a nested multiplexer (and vice versa).
+    for (in_zellij, in_tmux) in [(true, true), (true, false), (false, true), (false, false)] {
+        assert_eq!(
+            detect_backend(Some(ConfiguredBackend::Kitty), in_zellij, in_tmux),
+            ConfiguredBackend::Kitty
+        );
+        assert_eq!(
+            detect_backend(Some(ConfiguredBackend::Tmux), in_zellij, in_tmux),
+            ConfiguredBackend::Tmux
+        );
+        assert_eq!(
+            detect_backend(Some(ConfiguredBackend::Zellij), in_zellij, in_tmux),
+            ConfiguredBackend::Zellij
+        );
+    }
 }
 
 #[test]
-fn detect_backend_zellij_beats_kitty_when_unset() {
-    // No override: a live zellij session wins over the ambient Kitty env
-    // (nested zellij shares the outer KITTY_WINDOW_ID), else Kitty is the
-    // status-quo fallback.
-    assert_eq!(detect_backend(None, true), ConfiguredBackend::Zellij);
-    assert_eq!(detect_backend(None, false), ConfiguredBackend::Kitty);
+fn detect_backend_prefers_zellij_then_tmux_then_kitty() {
+    // No override: a live multiplexer wins over the ambient Kitty env (a nested
+    // mux shares the outer KITTY_WINDOW_ID), else Kitty is the status-quo
+    // fallback. Zellij stays ahead of tmux when both are live — the env can't
+    // say which is inner, and this order keeps existing zellij users unchanged.
+    assert_eq!(detect_backend(None, true, true), ConfiguredBackend::Zellij);
+    assert_eq!(detect_backend(None, true, false), ConfiguredBackend::Zellij);
+    assert_eq!(detect_backend(None, false, true), ConfiguredBackend::Tmux);
+    assert_eq!(detect_backend(None, false, false), ConfiguredBackend::Kitty);
 }

@@ -136,14 +136,15 @@ pub struct TerminalConfig {
 }
 
 /// A `[terminal] backend` value. Serde-renamed so the config reads
-/// `backend = "kitty"` / `"zellij"`; any other string fails the parse loudly
-/// (the loader logs it and falls back to defaults) rather than silently picking
-/// a backend.
+/// `backend = "kitty"` / `"zellij"` / `"tmux"`; any other string fails the parse
+/// loudly (the loader logs it and falls back to defaults) rather than silently
+/// picking a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfiguredBackend {
     Kitty,
     Zellij,
+    Tmux,
 }
 
 // -- kitty --
@@ -389,6 +390,8 @@ mod tests {
         assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Zellij));
         let cfg: Config = toml::from_str("[terminal]\nbackend = \"kitty\"").unwrap();
         assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Kitty));
+        let cfg: Config = toml::from_str("[terminal]\nbackend = \"tmux\"").unwrap();
+        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Tmux));
         // An unknown value fails the parse loudly rather than being ignored.
         assert!(toml::from_str::<Config>("[terminal]\nbackend = \"wezterm\"").is_err());
     }

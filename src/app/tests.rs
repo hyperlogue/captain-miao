@@ -4401,15 +4401,13 @@ fn spawn_target_respects_capabilities_and_layout() {
     use crate::terminal::{Capabilities, SessionsLayout, SpawnTarget};
 
     let kitty = Capabilities::default();
-    // The backend's real value, not a hand-built literal, so a future
-    // capability field can't silently diverge from what zellij reports.
+    // The backends' real values, not hand-built literals, so a future
+    // capability field can't silently diverge from what a backend reports.
     let zellij = crate::terminal::zellij::CAPABILITIES;
-    // Neither stacks nor floats.
-    let bare = Capabilities {
-        window_stacking: false,
-        floating_sessions: false,
-        ..kitty
-    };
+    // tmux: neither stacks nor floats — the one backend that exercises the
+    // Stacked fallback arm below (it was dead code before tmux existed).
+    let bare = crate::terminal::tmux::CAPABILITIES;
+    assert!(!bare.window_stacking && !bare.floating_sessions);
 
     // Per-tab: a fresh tab per session on every backend.
     for caps in [kitty, zellij, bare] {
@@ -4431,11 +4429,19 @@ fn spawn_target_respects_capabilities_and_layout() {
         resolve_spawn_target(zellij, SessionsLayout::Stacked),
         SpawnTarget::Floating
     ));
-    // Stacked: a backend that neither stacks nor floats → a tab per session.
+    // Stacked: a backend that neither stacks nor floats (tmux) → a tab per
+    // session, i.e. the same answer as Per-tab.
     assert!(matches!(
         resolve_spawn_target(bare, SessionsLayout::Stacked),
         SpawnTarget::NewTab
     ));
+
+    // …which is exactly why `Space l` is not offered there: both layouts resolve
+    // to the same target, so the toggle would only flip a persisted label. The
+    // key, its `?`-help entry and the header indicator all hang off this.
+    assert!(!bare.layout_is_a_choice());
+    assert!(kitty.layout_is_a_choice());
+    assert!(zellij.layout_is_a_choice());
 }
 
 #[test]
