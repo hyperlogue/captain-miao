@@ -534,19 +534,26 @@ fn worktree_paths_resolve_to_their_repo_root() {
 
 #[test]
 fn work_tab_title_names_the_worktree_and_its_repo() {
-    use crate::app::work_tab_title;
     use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 18);
+    let box_host = HostId("box".into());
+    d.app.host_icons.insert(box_host.clone(), "🚀".into());
     let wt = "~/proj/.claude/worktrees/feature-auth";
-    assert_eq!(work_tab_title(&HostId::local(), wt), "proj@feature-auth");
     assert_eq!(
-        work_tab_title(&HostId("box".into()), wt),
-        "box:proj@feature-auth"
+        d.app.work_tab_title(&HostId::local(), wt),
+        "proj@feature-auth"
+    );
+    assert_eq!(
+        d.app.work_tab_title(&box_host, wt),
+        "🚀 proj@feature-auth",
+        "a remote worktree tab keeps both halves behind the host icon"
     );
     // Two worktrees of one repo get distinct tabs, so `w` in one can't land a
     // shell on the other's branch.
     assert_ne!(
-        work_tab_title(&HostId::local(), wt),
-        work_tab_title(&HostId::local(), "~/proj/.claude/worktrees/other")
+        d.app.work_tab_title(&HostId::local(), wt),
+        d.app
+            .work_tab_title(&HostId::local(), "~/proj/.claude/worktrees/other")
     );
 }
 
@@ -4704,19 +4711,28 @@ fn live_work_tab_validates_recorded_window_in_tab() {
 
 #[test]
 fn work_tab_title_names_the_host_for_a_remote_tab() {
-    use super::work_tab_title;
+    let mut d = TestDashboard::new(120, 18);
+    let box_host = crate::state::HostId("box".into());
+    d.app.host_icons.insert(box_host.clone(), "🚀".into());
     // This machine's work tabs stay bare — the host adds nothing.
     assert_eq!(
-        work_tab_title(&crate::state::HostId::local(), "/home/test/proj"),
+        d.app
+            .work_tab_title(&crate::state::HostId::local(), "/home/test/proj"),
         "proj"
     );
     // A remote tab is an ssh session whose own `[hostname]` title can only ever
     // reach the *window* title, never the tab label (the spawn sets an explicit
     // tab title, which overrides the follow-the-window default on both
-    // backends). So the host rides in the title we stamp.
-    assert_eq!(
-        work_tab_title(&crate::state::HostId("box".into()), "~/proj"),
-        "box:proj"
+    // backends). So the host rides in the title we stamp — as its icon, which
+    // costs the basename two cells instead of the label's six.
+    assert_eq!(d.app.work_tab_title(&box_host, "~/proj"), "🚀 proj");
+    // An unconfigured host still gets a glyph, so the prefix is never empty.
+    let unconfigured = d
+        .app
+        .work_tab_title(&crate::state::HostId("other".into()), "~/proj");
+    assert!(
+        unconfigured.ends_with(" proj") && unconfigured != " proj",
+        "a host with no configured icon falls back to a deterministic one: {unconfigured}"
     );
 
     // …and the spawn and the validation must agree on it, or every remote `w`
@@ -4724,8 +4740,7 @@ fn work_tab_title_names_the_host_for_a_remote_tab() {
     // the expected title from the same key, so a tab wearing the prefixed title
     // validates and a bare-basename one (a pre-prefix `work-tabs.json` entry)
     // does not.
-    let mut d = TestDashboard::new(120, 18);
-    let key = (crate::state::HostId("box".into()), "~/proj".to_string());
+    let key = (box_host, "~/proj".to_string());
     let entry = super::WorkTab {
         tab_id: TabId::from(4),
         window_id: Some(WindowId::from(8)),
@@ -4733,13 +4748,13 @@ fn work_tab_title_names_the_host_for_a_remote_tab() {
     d.app.work_tabs.insert(key.clone(), entry.clone());
     let live = vec![crate::terminal::Tab {
         id: TabId::from(4),
-        title: "box:proj".into(),
+        title: "🚀 proj".into(),
         is_focused: false,
         windows: vec![WindowId::from(8)],
     }];
     assert_eq!(d.app.live_work_tab(&key, &live), Some(TabId::from(4)));
 
-    d.app.work_tabs.insert(key.clone(), entry);
+    d.app.work_tabs.insert(key.clone(), entry.clone());
     let legacy = vec![crate::terminal::Tab {
         id: TabId::from(4),
         title: "proj".into(),
@@ -4750,6 +4765,17 @@ fn work_tab_title_names_the_host_for_a_remote_tab() {
         d.app.live_work_tab(&key, &legacy),
         None,
         "a pre-prefix entry fails the title check and self-heals into a fresh spawn"
+    );
+
+    // Re-iconing the host takes the same self-healing path: the open tab no
+    // longer wears the title the key now derives, so it is pruned rather than
+    // reused under a stale glyph.
+    d.app.work_tabs.insert(key.clone(), entry);
+    d.app.host_icons.insert(key.0.clone(), "🐧".into());
+    assert_eq!(
+        d.app.live_work_tab(&key, &live),
+        None,
+        "a tab wearing the previous icon fails the title check"
     );
 }
 

@@ -982,37 +982,6 @@ pub(super) fn display_basename(cwd: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Title stamped on a `(host, cwd)` work tab: the cwd's basename, prefixed with
-/// the host (`box:proj`) for every host but this machine. The prefix is the only
-/// way the host reaches the tab bar — a work tab is spawned with an explicit tab
-/// title, and on both backends an explicit title permanently overrides the
-/// follow-the-active-window's-title default, so the `[hostname]` an ssh login
-/// shell emits over OSC 0/2 updates the *window* title and can never reach the
-/// *tab* label. Keeping it static rather than letting ssh own it is deliberate:
-/// [`App::live_work_tab`] validates a recorded tab by requiring this exact
-/// title, which is one of the three checks that defeat zellij's recycled tab
-/// ids. Hence the signature is the work-tab map key's two halves and nothing
-/// else — the spawn and the validation can't derive different answers.
-///
-/// A pooled-localhost host is labelled too (its `HostId` is the machine's
-/// hostname, not `local`): its `w` opens an in-process shell, but such a
-/// dashboard is federating other hosts as well, so naming every host uniformly
-/// beats leaving exactly one of them unlabelled.
-///
-/// A worktree cwd is titled `<repo>@<worktree>`: the map stays keyed on the
-/// real cwd, so each worktree gets its own shell rather than sharing the
-/// checkout's — they are different branches, and a test run in the wrong one is
-/// worse than an extra tab — and the title is what keeps the tab bar readable
-/// once two of them are open.
-pub(super) fn work_tab_title(host: &HostId, cwd: &str) -> String {
-    let base = display_basename(cwd);
-    if host.is_local() {
-        base.into_owned()
-    } else {
-        format!("{host}:{base}")
-    }
-}
-
 /// The emoji-picker rows, built once from the static `emojis` data and cached.
 /// `open_emoji_picker` clones the returned list per open instead of rebuilding
 /// ~2k rows from scratch each time (`Ctrl-E`).
@@ -2392,11 +2361,53 @@ impl App {
         self.window_tab_cache = crate::terminal::window_tab_map(tabs);
     }
 
+    /// Title stamped on a `(host, cwd)` work tab: the cwd's basename, prefixed
+    /// with the host's icon (`🖥️ proj`) for every host but this machine. The
+    /// prefix is the only way the host reaches the tab bar — a work tab is
+    /// spawned with an explicit tab title, and on both backends an explicit
+    /// title permanently overrides the follow-the-active-window's-title default,
+    /// so the `[hostname]` an ssh login shell emits over OSC 0/2 updates the
+    /// *window* title and can never reach the *tab* label. It is the emoji
+    /// rather than the label for the same reason the table's host column is
+    /// ([`App::host_icon`]): a tab bar has a handful of cells per tab, and one
+    /// glyph the eye already associates with the host beats six characters of
+    /// `box:` eaten out of the basename.
+    ///
+    /// Keeping the title static rather than letting ssh own it is deliberate:
+    /// [`App::live_work_tab`] validates a recorded tab by requiring this exact
+    /// title, which is one of the three checks that defeat zellij's recycled tab
+    /// ids. Hence it takes the work-tab map key's two halves and nothing else —
+    /// the spawn and the validation can't derive different answers. Changing a
+    /// host's icon in the hosts panel *does* invalidate its open work tabs: the
+    /// recorded ones fail the title check, are pruned, and the next `w` spawns a
+    /// fresh tab wearing the new icon — the same self-healing path a pre-icon
+    /// `work-tabs.json` entry takes.
+    ///
+    /// A pooled-localhost host is iconed too (its `HostId` is the machine's
+    /// hostname, not `local`): its `w` opens an in-process shell, but such a
+    /// dashboard is federating other hosts as well, so marking every host
+    /// uniformly beats leaving exactly one of them unmarked.
+    ///
+    /// A worktree cwd is titled `<repo>@<worktree>`: the map stays keyed on the
+    /// real cwd, so each worktree gets its own shell rather than sharing the
+    /// checkout's — they are different branches, and a test run in the wrong one
+    /// is worse than an extra tab — and the title is what keeps the tab bar
+    /// readable once two of them are open.
+    pub(super) fn work_tab_title(&self, host: &HostId, cwd: &str) -> String {
+        let base = display_basename(cwd);
+        if host.is_local() {
+            base.into_owned()
+        } else {
+            format!("{} {base}", self.host_icon(host))
+        }
+    }
+
     /// The recorded work tab for `(host, cwd)`, validated against the live tab
     /// tree in `tabs`. The tab must still exist, still carry the title the spawn
-    /// stamped on it ([`work_tab_title`]), and — when a window id was recorded —
-    /// still contain that window: zellij recycles a closed highest tab's id (its
-    /// tab counter is max-plus-one over live tabs), so an id + title match alone
+    /// stamped on it ([`App::work_tab_title`]), and — when a window id was
+    /// recorded — still contain that window: zellij recycles a closed highest
+    /// tab's id (its tab counter is max-plus-one over live tabs), so an id +
+    /// title match alone
     /// could send `w` into an unrelated tab that inherited the number and was
     /// renamed to the same basename. zellij pane ids never recycle, so the
     /// window-in-tab check pins the identity. An entry with no window id (seeded
@@ -2404,8 +2415,8 @@ impl App {
     /// A failed check prunes the entry and returns `None`, so the caller falls
     /// through to spawning a fresh work tab.
     pub(super) fn live_work_tab(&mut self, key: &(HostId, String), tabs: &[Tab]) -> Option<TabId> {
+        let expected = self.work_tab_title(&key.0, &key.1);
         let work_tab = self.work_tabs.get(key)?;
-        let expected = work_tab_title(&key.0, &key.1);
         let matched = tabs
             .iter()
             .find(|t| t.id == work_tab.tab_id && t.title == expected);
