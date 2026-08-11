@@ -5,9 +5,61 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-08-09
+## [0.3.0] - 2026-08-11
 
 ### Added
+
+- 🧪 **captain-miao runs in tmux.** The third terminal backend, alongside Kitty
+  and zellij: start the dashboard inside a tmux pane and it drives that server —
+  spawning sessions, focusing them, previewing them, and moving them between
+  windows. There is nothing to configure, because tmux's CLI is already trusted
+  by the socket that owns your session (contrast Kitty's remote-control setup).
+  Two things work here that don't on zellij: `t` (move a session to another tab)
+  is real, since `break-pane`/`join-pane` are actual commands, and the `miao
+  focus` bell keybinding has a direct analog via `run-shell -b`. One thing
+  doesn't: tmux has no arrangement that keeps several sessions in one window
+  without a pty resize on every switch, so every session gets its own tmux
+  window and the layout toggle isn't offered.
+
+  **Experimental**: probe-verified against tmux 3.7b only. The documented ≥ 3.2
+  floor is a claim, not a tested one.
+
+- 🧪 **Start a session in its own git worktree.** `Ctrl-g` in the new-session
+  picker launches into a fresh worktree, so an agent working on one thing can't
+  touch the checkout you're working in. It asks for a name as it arms — type
+  `feature-auth` for `.claude/worktrees/feature-auth` on a
+  `worktree-feature-auth` branch (a `#1234` PR reference works too), or just
+  press Enter and let the agent name it.
+
+  captain-miao doesn't create, name or clean up worktrees — it passes
+  `--worktree` and Claude Code does the rest, including blocking edits that would
+  reach your main checkout. Resuming or restarting a worktree session returns it
+  to the same worktree without asking again. Worktree rows share their project's
+  directory icon and colour, and `w` opens a per-worktree shell tab titled
+  `<repo>@<worktree>`. Codex has no equivalent flag yet, so the key is hidden
+  when it's the selected backend.
+
+  **Experimental**: newly added and lightly exercised.
+
+- **Choose how sessions are arranged.** `Space l` switches between **stacked** —
+  every session consolidated into one shared `miao:sessions` tab, one visible at
+  a time, the dashboard doing the switching — and **per-tab**, one tab per
+  session, switchable natively in the tab bar. Stacked is the default and matches
+  the previous behaviour; per-tab trades a busier tab bar for being able to reach
+  sessions without the dashboard. The choice is remembered, and applies to *new*
+  sessions: restart with `Space e` / `Space E` to migrate the ones already
+  running. On tmux, where both would mean the same thing, the key isn't offered.
+
+- **The dashboard's own tab says how many sessions want you.** It labels itself
+  `miao (2)`, or a plain `miao` at zero, so the tab bar answers "does anything
+  need me?" without switching to the dashboard at all. The count is over every
+  session, not just the ones a search filter is showing.
+
+- **Suspend a host instead of deleting it.** `c` in the hosts panel parks a host:
+  its row, target and icon stay, but nothing dials it, it contributes no
+  sessions, and it drops out of the header's host tally rather than counting as
+  down. Press `c` again to bring it back. Useful for a machine that's off for the
+  week and was otherwise a permanent red number.
 
 - **The dashboard can deploy its own server to a remote host.** Connecting to a
   host with no `miao-server` — or one built from a different version —
@@ -22,9 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and writes them into the finished dashboard. It produces a plain `miao` alongside
   a `miao-bundle-linux` carrying servers for both Linux architectures (single-arch
   variants too, if your fleet is only one). A regular build is unchanged and
-  costs nothing extra; bundling both arches costs about 7 MB. Prebuilt downloads
-  (npm, GitHub Releases) are the plain build for now — bundling them waits on
-  remote hosts leaving experimental.
+  costs nothing extra; bundling both arches costs about 7 MB. Releases now
+  publish the bundled Linux build alongside the plain one, so you can pick which
+  you want without building it yourself.
 
   **Where the servers come from is up to you.** `--from build` (the default)
   cross-compiles them from the sources beside you, against an old glibc (2.28 —
@@ -87,6 +139,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Keep-awake counts only sessions on this machine.** A busy session on a
+  *remote* host no longer keeps your laptop awake.
+
+- **The resume picker is scoped to one host, and no longer freezes the UI.** It
+  loads off the UI thread, so opening it (or switching hosts with `Ctrl-h`) is
+  immediate rather than blocking every frame on an ssh round trip, and it shows
+  the 50 most recent sessions on the *default* host instead of a merged list
+  across all of them. Your typed filter survives the list arriving.
+
+- **The hosts panel is easier to read at a glance.** The per-host colour is gone
+  — the emoji icon already said it — and the host now shares the workdir-icon
+  column (`🖥│📁`) instead of holding a column of its own. `l` opens a host's
+  full connection log (every step of probe → deploy → handshake, with the host's
+  own replies quoted), which is the answer to "the row says the deploy failed but
+  won't tell me why". Editing a host only reconnects when the connection actually
+  changed, so renaming one or picking a new emoji no longer re-dials your whole
+  fleet.
+
+- **A picker's live settings sit on the picker.** Which agent and host a launch
+  will use now render on the popup's own bottom line rather than in the footer
+  ribbon, so `Ctrl-t` shows its effect where you're already looking.
+
+- **Attach windows report their own end instead of being polled for.** Closing an
+  attach window used to be noticed by periodically listing the whole window tree
+  — which on zellij costs about 20 ms per pane. Each attach now reports when it
+  ends, so a detached row updates immediately and covers every way an attach can
+  finish (a closed window, an in-session detach, a dropped ssh), not just the one
+  a snapshot could see. It also cleans up the dead window it leaves behind —
+  unless that window is holding an error message, which is the only copy you get.
+
+- **Pooled sessions are created by their first attach.** A remote session used to
+  be created detached and then attached to, which meant the agent's TUI ran its
+  terminal capability probes into a pty nobody was reading, got no answer, and
+  fell back to legacy key encoding for the session's whole life — Shift+Enter
+  arrived as a bare Enter. The session is now born with a real terminal on the
+  far end, and inherits your terminal's `TERM` (validated on the host) and
+  truecolor support.
+
 - **Release binaries are about 20% smaller.** Link-time optimisation is now on
   for release builds, taking `miao` from 7.6 MB to 6.6 MB and the same
   proportion off `miao-server`; dropping 11 crates from the dashboard's
@@ -96,9 +186,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consequences: `--help` is no longer coloured, and third-party crates no longer
   log at ERROR by default — set `RUST_LOG` if you want theirs.
 
-- **Remote hosts: the whole feature is now implemented** (still behind the
-  `remote` cargo feature until it's verified end to end against a real host).
-  Restart and fork work on any host; windows you had open come back by
+- **Remote hosts are on by default.** The feature was gated behind a `remote`
+  cargo feature while it was unverified; it has now been used against real hosts,
+  so it is part of the standard build and `Space h` just works. Restart and fork
+  work on any host; windows you had open come back by
   themselves when a slept laptop or a dropped connection reconnects, while a
   session you detached with `D` stays detached; pins and mutes on a pooled host
   are stored by that host, so every dashboard watching it agrees and they
@@ -161,19 +252,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute path of the binary that launched them, so restart them once the old
   path is gone (npm removes it; `cargo install` leaves it in place).
 
-### Known limitations
+### Fixed
 
-- **Remote hosts over SSH are experimental and off by default.** The whole
-  cross-host lifecycle is implemented, but it has not been verified end to end
-  against a real remote host. Build with `--features remote` to try it; without
-  it the dashboard is strictly local-only.
-- **`t` (move window to tab) is unsupported on zellij**, which has no CLI to
-  reparent a pane across tabs. The key reports it and the help entry is hidden.
-- **The Linux dashboard binaries are glibc builds** (glibc 2.35, so Ubuntu
-  22.04+, Debian 12+, RHEL 9+); on Alpine or a musl system, build from source.
-  This is about the dashboard you run, not the hosts you reach: `miao-server` is
-  published for musl too, and a host that can't run the glibc build is served
-  the static one automatically.
+- **The cursor stays on the session you selected.** Anything that re-sorted the
+  table — a session changing status, a bell clearing, a window attaching or
+  detaching — used to leave the highlight on whichever row slid into that slot,
+  so the next `x` or `Enter` could act on a session you never picked.
+- **`w` works on a remote host whose login shell is fish.** The shell command was
+  POSIX-only, so on a fish account the work tab flashed open and shut.
+- **A failed window-tree snapshot no longer drops every window binding.** A
+  single transient terminal error could detach every row at once.
 
 ## [0.2.1] - 2026-08-02
 

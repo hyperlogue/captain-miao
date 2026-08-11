@@ -79,11 +79,13 @@ jobs:
       # needs to arrange for the embedded server payloads: those ride an
       # environment variable (CM_SERVER_PAYLOAD_MANIFEST) that CI never sets, so
       # `build.rs` embeds nothing and lints see the ordinary build.
+      # Default features only — which now includes `remote`, so one step covers
+      # what used to take two. The `--no-default-features` (local-only) build is
+      # still expected to compile, but it is not gated here: `REMOTE_ENABLED` is
+      # a runtime const rather than `#[cfg]`, so that build compiles the very
+      # same code and there is almost nothing for a second lint pass to find.
       - name: clippy
         run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: clippy (remote hosts)
-        run: nix develop --command cargo clippy -p captain-miao --all-targets --features remote --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

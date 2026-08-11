@@ -28,10 +28,26 @@ tool and the rest of your workflow is yours to compose.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
 - **Pin, mute, mark:** pin important sessions to the top, mute the ones you don't need right now, and flag the ones to follow up on.
 - **Sessions that outlive their window** (opt-in): run them in a local pty pool so closing the terminal — or logging out — doesn't end them, and a dashboard on another machine can attach to the same ones.
+- **Sessions on other machines:** federate several hosts into one dashboard, each running its sessions in its own pty pool, so a dropped connection or a slept laptop detaches windows without touching the sessions.
+- 🧪 **Isolated worktrees:** start a session in a fresh git worktree so it can't touch your main checkout — see [Experimental](#experimental).
+
+## Experimental
+
+Two parts of captain-miao are usable but not yet load-bearing. They're marked 🧪
+throughout this README, and each is listed here with what specifically is
+unproven — so you can judge the risk rather than guess at it.
+
+| Feature | State | What's unverified |
+| --- | --- | --- |
+| **tmux backend** | On by default when you run inside tmux | Probe-verified against **tmux 3.7b only**. The documented ≥ 3.2 floor is a claim, not a tested one, and the backend's live test doesn't yet run in CI. |
+| **Worktrees** (`Ctrl-g`) | On, Claude Code only | Newly added and lightly exercised. captain-miao only passes `--worktree`; the worktree itself is the agent's, so the blast radius is small — but the flag has not been through a real multi-week workflow. |
+
+Everything else — the dashboard, Kitty and zellij, both agent backends, pooled
+local sessions, and remote hosts — is the supported path.
 
 ## Requirements
 
-- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
+- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or 🧪 **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
 - **Claude Code** and/or **Codex** on your `PATH`.
 
 ## Installation
@@ -101,46 +117,6 @@ Looser alternatives: `allow_remote_control socket-only` (off the escape-code cha
 
 **Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
 
-## tmux setup
-
-There is none — that's the point. tmux's CLI is trusted by the server that owns
-your session's socket, so there is no password, listen address or allowlist to
-configure (contrast Kitty above). Start the dashboard inside a tmux pane and it
-drives that server:
-
-```sh
-tmux
-miao
-```
-
-Requires **tmux ≥ 3.2**. Verified against 3.7b; the 3.2 floor is a documentation
-claim, not yet a tested one, so on an older tmux prefer to check before relying
-on it.
-
-**What's different on tmux:**
-
-- **Every session gets its own tmux window** — there is no Stacked layout. tmux
-  has no floating panes that survive a client switch (`display-popup` is
-  client-bound and transient) and no non-tiling layout; the closest emulation
-  (one window with the active pane zoomed) costs a real pty resize on every
-  switch — a slow agent repaint — and a background spawn *unzooms* the window,
-  disturbing the session you're watching. So `Space l` is not offered, and the
-  header's `Layout:` indicator is hidden.
-- **`t` (move window to tab) works** — the first multiplexer backend where it
-  does, since `break-pane`/`join-pane` are real CLI commands (zellij's equivalent
-  is keybind-only).
-- **The `miao focus` bell binding works**, kitty-style, because `run-shell -b`
-  runs a background command with formats expanded. Add to `~/.tmux.conf`:
-
-  ```conf
-  bind-key -n F12 run-shell -b "miao focus --window-id '#{pane_id}'"
-  ```
-
-- **Window titles captain-miao sets are pinned** (`automatic-rename off`,
-  `allow-rename off`) on the windows it creates, so an application's title escape
-  can't rename them out from under the work-tab (`w`) lookup. Your own windows are
-  untouched.
-
 ## Usage
 
 Run the dashboard inside a supported terminal (Kitty, zellij or tmux):
@@ -179,7 +155,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `s`                            | Jump to the next session needing attention                             |
 | `m` / `p` / `i`                | Mute / pin / toggle needs-input on the selected session                |
 | `y`                            | Copy the selected session id to the clipboard                          |
-| `t` / `w`                      | Move window to tab (Kitty only) / switch to or open the cwd's work tab |
+| `t` / `w`                      | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab |
 | `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                        |
 | `Ctrl-u` / `Ctrl-d`            | Scroll the preview up / down                                           |
 | `R`                            | Refresh the preview now                                                |
@@ -188,15 +164,18 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `Space e` / `Space E`          | Restart the selected / all idle sessions                               |
 | `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
 | `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
-| `Space l`                      | Switch session layout (stacked in one tab / one tab per session)       |
-| `Space h` / `Space s`          | Hosts panel / attach to a session, kicking the client holding it       |
+| `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, which has only the one) |
+| `Space h` / `Space s`          | Hosts panel (add, edit, suspend with `c`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `?`                            | Show the full key list (help overlay)                                  |
 | `/`                            | Search                                                                 |
 | `q` / `Ctrl-c`                 | Quit                                                                   |
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
-In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, `Ctrl-d` drops the highlighted recent directory, and `Ctrl-g` starts the session in a fresh **git worktree**.
+In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, `Ctrl-d` drops the highlighted recent directory, and 🧪 `Ctrl-g` starts the session in a fresh **git worktree**.
+
+> 🧪 **Worktrees are experimental** — newly added and lightly exercised. See
+> [Experimental](#experimental).
 
 `Ctrl-g` also asks for a name: type one and press Enter for
 `.claude/worktrees/<name>` on a `worktree-<name>` branch (a `#1234` PR reference
@@ -316,8 +295,7 @@ dashboard says so and falls back to the default behaviour. On Linux, also run
 
 ### Running sessions on other machines
 
-Remote-host support is behind a cargo feature while it's being verified; build
-with `cargo build --release --features remote`, then add hosts with `Space h`.
+Add hosts with `Space h`.
 Each host runs a `miao-server` daemon holding its sessions in a pty
 pool, and the dashboard attaches local windows to them over ssh, so a dropped
 connection or a slept laptop detaches windows without touching the sessions —
@@ -394,9 +372,13 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 ## Roadmap
 
-- [ ] **Remote hosts over SSH**: one dashboard federating sessions across several machines, with per-host pty pools so remote sessions survive ssh drops, laptop sleep, and dashboard restarts. The full lifecycle — open, resume, attach, detach, steal, kill, restart, fork, auto-reattach on reconnect — is implemented behind the `remote` cargo feature (`cargo build --release --features remote`); what's left is verifying it end to end against a real host, so it stays off by default until then. Design notes: [docs/remote-sessions.md](docs/remote-sessions.md).
+Graduating the two 🧪 [experimental](#experimental) features is the near-term
+work:
+
+- [ ] 🧪 **tmux**: probe-verified on 3.7b only, and its live-server test doesn't run in CI yet. tmux is the one backend that *can* be tested headlessly — a server on a socket is the whole dependency — so putting that test in CI, and pinning the claimed ≥ 3.2 floor with it, is what graduates it.
+- [ ] 🧪 **Worktrees**: shipped for Claude Code, which owns the worktree itself. Codex has [no equivalent flag yet](https://github.com/openai/codex/issues/12862); when it lands, captain-miao needs one match arm.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
-- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in. The tmux backend has been probe-verified on 3.7b only; the 3.2 floor it claims is still untested.
+- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
 ## License
 

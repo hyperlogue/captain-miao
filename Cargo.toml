@@ -70,16 +70,16 @@ flate2 = "1"
 sha2 = "0.11"
 
 [features]
-default = []
+default = ["remote"]
 # Remote (SSH) hosts — the federated multi-host dashboard (docs/remote-sessions.md).
-# **Work in progress**, so it is OFF by default: the full lifecycle is implemented
-# but has not been verified end-to-end against a real remote host, and restart /
-# fork are still local-only. The gate is deliberately a *runtime* const
-# (`app::REMOTE_ENABLED`) rather than `#[cfg]` on ~240 references across the
-# dashboard: the same code compiles either way (so both configurations stay
-# type-checked, clippy-clean, and covered by the same tests), and with the
-# feature off the dashboard simply never reads `hosts.json` and never constructs
-# a `Backend::Remote`, leaving it local-only.
+# ON by default since 0.3.0: it has been verified against real hosts. The flag is
+# kept so a build can still opt out (`--no-default-features`) and be strictly
+# local-only. The gate is deliberately a *runtime* const (`app::REMOTE_ENABLED`)
+# rather than `#[cfg]` on ~240 references across the dashboard: the same code
+# compiles either way, and with the feature off the dashboard simply never reads
+# `hosts.json` and never constructs a `Backend::Remote`. CI lints and tests the
+# default (feature-on) build only — with the gate being a runtime const there is
+# essentially nothing a second pass could find that the first doesn't.
 remote = []
 
 # Dev-only: the logo/cat alpha-mask assets are generated once by

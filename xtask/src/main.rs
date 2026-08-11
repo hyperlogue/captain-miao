@@ -264,14 +264,12 @@ const VARIANTS: &[Variant] = &[
         name: "",
         features: &[],
         servers: &[],
-        what: "local sessions only — the default, and what ships today",
+        what: "the default: local sessions, plus remote hosts that already have miao-server",
     },
-    Variant {
-        name: "remote",
-        features: &["remote"],
-        servers: &[],
-        what: "remote hosts, which must already have miao-server",
-    },
+    // No `remote` variant: the feature is on by default since 0.3.0, so such a
+    // build would be byte-identical to the plain one and only confuse `--list`.
+    // The plain build reaches remote hosts that already have `miao-server`; the
+    // bundles below are for hosts that don't.
     Variant {
         name: "bundle-linux-x86_64",
         features: &[],
@@ -713,8 +711,9 @@ mod tests {
                     v.label()
                 );
             }
-            // Carrying a server implies the gate that reaches it — one-way, since
-            // the `remote` variant enables it and deliberately carries nothing.
+            // Carrying a server implies the gate that reaches it. Still asserted
+            // now that `remote` is a default feature: `cargo_features` names it
+            // explicitly so a bundle keeps working if the default ever changes.
             assert!(
                 !v.bundles() || v.cargo_features().contains(&REMOTE_FEATURE),
                 "{} carries servers the build could never reach",
