@@ -1236,6 +1236,16 @@ impl App {
     /// the cursor on whichever session took its slot. Every answer in [`Cursor`]
     /// is deliberately in use here, so there is no safe default to pick
     /// silently; making the caller name one is the whole point.
+    ///
+    /// **Call this only once the mutation has fully landed.** Unlike the bare
+    /// version bump it replaced, every arm below *reads* the visible order —
+    /// `clamp_selection`/`reset_selection`/`reselect` all resolve it, which
+    /// recomputes the index list and re-caches it under the freshly bumped
+    /// version. Invalidating mid-mutation therefore doesn't invalidate anything:
+    /// it re-caches the *stale* projection as current, and since `cached_visible`
+    /// holds indices into `sessions`, a later shrink of that Vec then indexes out
+    /// of bounds. `reload_sessions` did exactly that and panicked on every reload
+    /// that dropped a row.
     pub(super) fn mark_dirty(&mut self, cursor: Cursor) {
         // Read the anchor *before* the bump, while the cached order still
         // describes the pre-mutation list.
@@ -2336,18 +2346,25 @@ impl App {
             .map(|s| (flag_key(s), s.status.clone()))
             .collect();
 
-        // The one site that re-anchors by hand rather than through a `Cursor`:
-        // the rows don't exist yet (`collect_sessions` is the next line), and
-        // the restore at the end of this function has priority rules a cursor
-        // can't express — a just-spawned session claims the selection over the
-        // prior one (`pending_focus_window`).
-        self.mark_dirty(Cursor::HoldIndex);
         let fresh = self.collect_sessions();
         // Keep the pre-reload rows so a departed one (its state file vanished —
         // crash / SIGKILL, not a clean kill) can have its held pane reaped: on a
         // floating-sessions backend the exited pane is an invisible leak. A no-op
         // on kitty (`reap_departed_windows` returns nothing there).
         let prev_sessions = std::mem::replace(&mut self.sessions, fresh);
+        // Invalidate **after** the swap, never before. `mark_dirty` doesn't just
+        // bump the version any more — every cursor policy *reads* the visible
+        // order, so calling it while `self.sessions` still held the old rows
+        // recomputed the pre-reload index list and re-cached it under the
+        // post-reload version. Nothing then recomputed it (a plain reload with no
+        // status transition bumps nothing else), so the frame below indexed the
+        // new, shorter `sessions` with old indices and panicked.
+        //
+        // The one site that re-anchors by hand rather than through a `Cursor`:
+        // the restore at the end of this function has priority rules a cursor
+        // can't express — a just-spawned session claims the selection over the
+        // prior one (`pending_focus_window`).
+        self.mark_dirty(Cursor::HoldIndex);
         let reaped = self.reap_departed_windows(&prev_sessions);
         self.reap_window_queue.extend(reaped);
         self.session_indexes = self.refresh_session_indexes();

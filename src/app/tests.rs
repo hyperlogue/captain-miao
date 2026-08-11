@@ -90,6 +90,13 @@ impl TestDashboard {
             }
         }
         self.app.sessions = sessions;
+        // Invalidate like `reload_sessions` does, and for the same reason: the
+        // visible order is a cached list of *indices into `sessions`*, so
+        // replacing that Vec without bumping the version leaves a projection of
+        // the previous rows looking current — which reads as the old order and
+        // panics outright once the row count drops. A harness that skipped this
+        // is why the live `reload_sessions` ordering bug had no failing test.
+        self.app.mark_dirty(Cursor::HoldIndex);
         let len = self.app.visible_sessions().len();
         if len > 0 && self.app.table_state.selected().is_none() {
             self.app.table_state.select(Some(0));
@@ -2055,6 +2062,42 @@ fn clearing_the_search_filter_returns_the_cursor_to_the_top() {
         d.app.nth_visible(1).map(|s| s.launcher_pid),
         filtered_pid,
         "index 1 means a different session now — which is why holding it was a bug"
+    );
+}
+
+/// `mark_dirty` may only run once a mutation has landed, because every cursor
+/// policy *resolves* the visible order and so re-caches it under the freshly
+/// bumped version. `reload_sessions` used to invalidate before swapping
+/// `sessions`, which re-cached the pre-reload index list as current; the next
+/// read then indexed the new, shorter Vec with an old index and panicked. This
+/// replays that exact sequence.
+#[test]
+fn invalidating_before_the_rows_change_would_cache_the_stale_order() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![
+        session(1, "/home/test/a", SessionStatus::Idle),
+        session(2, "/home/test/b", SessionStatus::Idle),
+        session(3, "/home/test/c", SessionStatus::Idle),
+    ]);
+    let _ = d.app.visible_sessions(); // a frame drew the list: the cache is warm
+
+    // `reload_sessions`' shape: collect, swap, *then* invalidate. A session that
+    // exited leaves one fewer row and — on a plain reload — bumps nothing else.
+    let fresh = vec![session(1, "/home/test/a", SessionStatus::Idle)];
+    let _prev = std::mem::replace(&mut d.app.sessions, fresh);
+    d.app.mark_dirty(Cursor::HoldIndex);
+
+    let visible = d.app.visible_sessions();
+    assert_eq!(
+        visible.len(),
+        1,
+        "the visible order must describe the rows that exist now"
+    );
+    assert_eq!(visible[0].launcher_pid, 1);
+    assert_eq!(
+        d.app.table_state.selected(),
+        Some(0),
+        "clamped to the new len"
     );
 }
 
