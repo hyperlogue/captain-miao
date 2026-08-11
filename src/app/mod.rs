@@ -1572,15 +1572,33 @@ impl App {
         self.mark_dirty(Cursor::HoldIndex);
     }
 
-    /// True iff at least one tracked session is currently working — `Active`,
-    /// `Compacting`, or `BackgroundActive` (a short-term background task the
-    /// agent is waiting on, which can itself peg the CPU), via `is_busy`. Used to
-    /// decide when to actually run caffeinate; sleep during Idle /
+    /// Whether a session runs on the machine the dashboard runs on.
+    ///
+    /// Keyed on `backends[0]`'s host rather than [`HostId::is_local`]: under
+    /// pooled-localhost this machine's own sessions are served by a
+    /// remote-*shaped* backend tagged with the hostname, and they are still ours
+    /// — they die with this machine exactly like direct-local ones.
+    pub(super) fn runs_on_this_machine(&self, s: &LauncherState) -> bool {
+        self.backends.first().is_some_and(|b| b.host_id() == s.host)
+    }
+
+    /// True iff at least one session **on this machine** is currently working —
+    /// `Active`, `Compacting`, or `BackgroundActive` (a short-term background task
+    /// the agent is waiting on, which can itself peg the CPU), via `is_busy`. Used
+    /// to decide when to actually run caffeinate; sleep during Idle /
     /// WaitingForApproval / BackgroundServer is fine because the agent isn't
     /// working (a parked long-running dev server is deliberately not counted —
     /// see `is_busy`) and macOS just pauses the process either way.
+    ///
+    /// **Remote sessions never keep this machine awake.** They run in the far
+    /// host's pty pool, wholly detached from this dashboard — suspending the
+    /// laptop watching them costs them nothing (the attach window reconnects on
+    /// wake, which is what the pool is *for*), so caffeinating a machine for work
+    /// happening on another one is pure battery burn.
     pub(super) fn has_active_session(&self) -> bool {
-        self.sessions.iter().any(|s| s.status.is_busy())
+        self.sessions
+            .iter()
+            .any(|s| s.status.is_busy() && self.runs_on_this_machine(s))
     }
 
     /// Reconcile the caffeinate subprocess with the (toggle, active-session)

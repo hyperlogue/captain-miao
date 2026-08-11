@@ -3495,6 +3495,32 @@ fn prevent_sleep_default_matches_support() {
     assert_eq!(d.app.prevent_sleep_enabled, crate::sleep::supported());
 }
 
+/// Keep-awake is about *this* machine's power state. A remote session runs in
+/// the far host's pty pool and neither notices nor cares whether the laptop
+/// watching it sleeps, so caffeinating for one burns battery for nothing.
+#[test]
+fn a_busy_remote_session_does_not_keep_this_machine_awake() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 10);
+    let mut remote = session(1, "/srv/proj", SessionStatus::Active);
+    remote.host = HostId("box".into());
+    remote.pool_session = Some("miao-box-1".into());
+    d.set_sessions(vec![remote.clone()]);
+    assert!(remote.status.is_busy(), "the row is busy, just not ours");
+    assert!(
+        !d.app.has_active_session(),
+        "a remote session must not hold the inhibitor"
+    );
+
+    // The same status on this machine does keep it awake — the gate is locality,
+    // not a narrower reading of "busy".
+    d.set_sessions(vec![
+        remote,
+        session(2, "/home/test/here", SessionStatus::Active),
+    ]);
+    assert!(d.app.has_active_session());
+}
+
 #[test]
 fn review_pending_does_not_inhibit_sleep() {
     // A session blocked on a human review (`ReviewPending`) is an *attention*

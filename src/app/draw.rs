@@ -999,11 +999,7 @@ impl App {
         if self.foreign_terminal(s).is_some() {
             return Some((FOREIGN_TERMINAL_GLYPH.to_string(), true));
         }
-        // `backends[0]` is this machine — under pooled-localhost its id is a
-        // hostname, not "local", so compare against the backend rather than
-        // testing `is_local()`.
-        let this_machine = self.backends.first().map(|b| b.host_id());
-        if this_machine.as_ref() == Some(&s.host) {
+        if self.runs_on_this_machine(s) {
             return None;
         }
         Some((self.host_icon(&s.host), false))
