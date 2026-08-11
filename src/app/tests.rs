@@ -1411,6 +1411,7 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
         host: "box".into(),
         token: "cm-away".into(),
         status: Some(0),
+        held_secs: Some(600),
     }]);
     assert!(changed);
     assert!(d.app.is_detached_row(&d.app.sessions[0].clone()));
@@ -1427,9 +1428,9 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
         d.app.window_bindings.expected_without_window(&host),
         vec!["cm-away".to_string()]
     );
-    // The window it was bound to is queued for closing: it is `hold: true`, so
-    // it outlived the attach and is now a corpse the next `Enter` would spawn a
-    // sibling for.
+    // The window it was bound to is queued for closing — the backstop for the
+    // window the wrapper didn't close itself, which the next `Enter` would
+    // otherwise spawn a sibling for.
     assert_eq!(d.app.reap_window_queue, vec![WindowId::from(900u64)]);
 
     // A report for a binding we no longer hold is a no-op, not a wobble: the
@@ -1438,6 +1439,7 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
         host: "box".into(),
         token: "cm-away".into(),
         status: Some(0),
+        held_secs: Some(600),
     }]));
 }
 
@@ -1478,6 +1480,7 @@ fn the_cursor_follows_a_session_across_an_attach_detach_resort() {
         host: "box".into(),
         token: "cm-away".into(),
         status: Some(0),
+        held_secs: Some(600),
     }]));
     let detached_at = index_of(&d, 1);
     assert_ne!(
@@ -1507,11 +1510,11 @@ fn the_cursor_follows_a_session_across_an_attach_detach_resort() {
     );
 }
 
-/// A dropped ssh leaves the attach window behind (it is spawned `hold: true`),
-/// showing a dead session's last frame while the row says detached — and `Enter`
-/// then opens a *second* window beside it. So a spent attach's window is closed.
-/// But a *refused* attach's window is the only place its error exists, so that
-/// one stays: the two are told apart by exit status plus how long it ran.
+/// A window left behind by a dropped ssh shows a dead session's last frame while
+/// the row says detached — and `Enter` then opens a *second* window beside it.
+/// So a spent attach's window is closed. But a *refused* attach's window is the
+/// only place its error exists, so that one stays: the two are told apart by
+/// exit status plus how long it ran.
 #[test]
 fn a_spent_attach_window_is_closed_but_a_refused_one_is_kept() {
     use super::attach_window_is_spent;
@@ -1535,6 +1538,48 @@ fn a_spent_attach_window_is_closed_but_a_refused_one_is_kept() {
     // copy of that message.
     assert!(!attach_window_is_spent(Duration::from_millis(200), Some(1)));
     assert!(!attach_window_is_spent(Duration::from_secs(2), Some(255)));
+}
+
+/// The duration that decides the above comes from the *wrapper*, which measured
+/// it in wall clock, not from the binding, whose age is an `Instant` — and
+/// CLOCK_MONOTONIC does not advance while the machine is suspended. A laptop
+/// that slept through an attach and woke to a dead ssh is the case: hours of
+/// attach, seconds of monotonic age, and reading the binding would file the
+/// overnight drop as a refused attach and strand its window on screen.
+#[test]
+fn a_report_is_judged_by_the_wrappers_clock_not_the_bindings() {
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    d.set_sessions(vec![away]);
+    // Bound just now, so the binding's own age is milliseconds — the shape a
+    // suspend leaves behind, and inside `ATTACH_STARTUP_GRACE`.
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    assert!(d.app.apply_detach_reports(vec![DetachReport {
+        host: "box".into(),
+        token: "cm-away".into(),
+        // ssh's mid-session drop — the status that can't decide alone.
+        status: Some(255),
+        held_secs: Some(8 * 60 * 60),
+    }]));
+    assert_eq!(
+        d.app.reap_window_queue,
+        vec![WindowId::from(900u64)],
+        "an eight-hour attach that dropped is spent, whatever the binding's \
+         monotonic age says"
+    );
+    assert!(
+        !d.app.status_is_error,
+        "and it is not announced as a failed attach"
+    );
 }
 
 /// The preview panel is a capture of the row's *local* window, so a detached row

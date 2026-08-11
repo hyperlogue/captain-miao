@@ -691,12 +691,13 @@ async fn attach_pool_session(
             return;
         }
     };
-    // Wrap the attach so the window reports its own end (§5). This is what makes
-    // detachment an *event*: the wrapper's trap fires whether the user closed the
-    // window (SIGHUP), detached inside shpool, or the ssh dropped, and the report
-    // lands in a directory the dashboard watches — no window-tree polling in the
-    // path at all. Best-effort: with no resolvable exe there is nothing to report
-    // with, so the attach runs unwrapped and the periodic prune covers it.
+    // Wrap the attach so the window reports its own end (§5) and holds itself
+    // open if the attach is refused. This is what makes detachment an *event*:
+    // the wrapper's trap fires whether the user closed the window (SIGHUP),
+    // detached inside shpool, or the ssh dropped, and the report lands in a
+    // directory the dashboard watches — no window-tree polling in the path at
+    // all. With no resolvable exe the report is skipped (the periodic prune
+    // covers it), but the wrapper still runs: it owns the hold.
     let exe = crate::backend::reporter_exe();
     let argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &host.0, &pool_session);
     let spec = SpawnSpec {
@@ -707,7 +708,12 @@ async fn attach_pool_session(
         target: resolve_spawn_target(app.capabilities, app.sessions_layout),
         command: SpawnCommand::Exec(argv),
         title: Some(format!("{} attach", host.0)),
-        hold: true,
+        // The wrapper holds, not the terminal — kitty's `--hold` runs the user's
+        // *login shell* once the command exits (`kitten run-shell`), so every
+        // ended attach became a live local fish prompt wearing a session's
+        // title, en masse after a sleep dropped every ssh at once. Left to the
+        // wrapper, a spent attach's window simply closes.
+        hold: false,
         take_focus: false,
         stack: true,
     };

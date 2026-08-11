@@ -119,10 +119,16 @@ enum Commands {
         token: String,
 
         /// The attach command's exit status, which tells a session that ran and
-        /// ended from one that was refused on arrival — the dashboard leaves the
+        /// ended from one that was refused on arrival — the wrapper holds the
         /// latter's window open so its error stays readable.
         #[arg(long)]
         status: Option<i32>,
+
+        /// Wall-clock seconds the attach ran, measured by the wrapper. The
+        /// dashboard's own binding age is monotonic and so stops during a
+        /// suspend; this doesn't.
+        #[arg(long)]
+        held_secs: Option<u64>,
     },
 }
 
@@ -210,6 +216,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             host,
             token,
             status,
+            held_secs,
         }) => {
             // A sentinel drop and nothing else — the dashboard's watcher on the
             // sessions dir turns it into a binding retirement. Deliberately not
@@ -217,7 +224,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             // must not block, must not need the dashboard to be reachable, and
             // must survive the dashboard being restarted between the write and
             // the read.
-            state::write_detach_report(&host, &token, status);
+            state::write_detach_report(&host, &token, status, held_secs);
             Ok(())
         }
         Some(Commands::Focus { window_id }) => {

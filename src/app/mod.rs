@@ -1044,22 +1044,29 @@ pub(super) fn flag_key(s: &LauncherState) -> FlagKey {
 /// died" rather than "it never got going". Sized for the slow half of a real
 /// attach — an ssh handshake plus shpool's connect — not for a refusal, which
 /// comes back at once.
-const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
+///
+/// Also handed to the attach wrapper (`backend::report_on_exit_argv`), which
+/// applies the same test to decide whether to hold its window open, so the two
+/// can't drift.
+pub(crate) const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
 
 /// Whether a finished attach's window has anything left worth looking at, given
 /// how long it ran and how it exited.
 ///
-/// The window is spawned `hold: true`, so it outlives the attach either way, and
-/// the two outcomes want opposite treatment:
+/// The wrapper applies this same test to decide whether to keep its window (see
+/// [`ATTACH_STARTUP_GRACE`], which it is passed), so the two outcomes agree on
+/// which windows are on screen; this side decides what the dashboard does about
+/// them:
 ///
 /// * **Spent** — it attached, ran, and ended (a clean detach, a broken pipe, a
-///   dead ControlMaster). What's on screen is a dead session's last frame, the
-///   row is already detached, and `Enter` opens a *fresh* window beside it. Close
-///   it.
+///   dead ControlMaster). The wrapper exits, so the window is already closing;
+///   the close here is the backstop for a wrapper that never ran (no resolvable
+///   reporter exe) or a backend that held the window anyway.
 /// * **Refused** — it exited non-zero almost immediately: the busy guard, a
-///   stale name, an ssh that couldn't authenticate. The window is holding the
-///   only copy of that error (the dashboard never sees the attach's stderr), so
-///   it stays.
+///   stale name, an ssh that couldn't authenticate. The wrapper is holding the
+///   window at its "press Enter" prompt, because it has the only copy of that
+///   error (the dashboard never sees the attach's stderr), so the dashboard
+///   leaves it alone and points at it instead.
 ///
 /// 129/130/143 are 128 + HUP/INT/TERM — exactly the signals the wrapper traps,
 /// and each one means the window was torn down under it (closing a window
@@ -3006,14 +3013,24 @@ impl App {
                 continue;
             };
             changed = true;
-            if attach_window_is_spent(retired.held_for, report.status) {
-                // Spawned `hold: true`, so the window outlives the attach. That
-                // window is now a corpse wearing a session's clothes: it shows
-                // whatever the dead ssh left on screen, `Enter` on the row opens
-                // a *second* window beside it, and on zellij it sits invisible in
-                // the shared sessions tab inflating every `list-panes`. A window
-                // the user closed themselves is already gone, so the close is a
-                // no-op there.
+            // The wrapper's own wall-clock measurement wins over the binding's
+            // age, which is an `Instant` and so does not advance while the
+            // machine is suspended: a laptop that slept through an eight-hour
+            // attach would otherwise judge it by the minutes it was awake for.
+            let held_for = report
+                .held_secs
+                .map_or(retired.held_for, Duration::from_secs);
+            if attach_window_is_spent(held_for, report.status) {
+                // The wrapper exits on a spent attach, so the window is closing
+                // under its own steam and this is usually a no-op — as it is for
+                // a window the user closed themselves. It still earns its place
+                // for the attach that ran *unwrapped* (no resolvable reporter
+                // exe, so this report came from somewhere else) and for any
+                // backend that holds an exited command pane regardless: left
+                // behind, the window is a corpse wearing a session's clothes —
+                // `Enter` on the row opens a *second* window beside it, and on
+                // zellij it sits invisible in the shared sessions tab inflating
+                // every `list-panes`.
                 self.reap_window_queue.push(retired.window);
             } else {
                 // Refused on arrival — the window is holding the reason (busy,

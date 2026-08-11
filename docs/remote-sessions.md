@@ -548,18 +548,32 @@ and the read. Three properties earn it:
 - **It cannot invent a binding**, only retire one. A report for a binding we no
   longer hold (the prune or a `D` got there first) is a no-op.
 
-**The report cleans up the window too — unless that window is holding an error.**
-The window is spawned `hold: true`, so it outlives its attach. After a dropped
-ssh that leaves a corpse: it shows a dead session's last frame while the row
-reads detached, and the next `Enter` opens a *second* window beside it. (A dead
-ControlMaster does this to every attach window on the host at once.) So the
-report closes it. But an attach *refused on arrival* — the busy guard, a stale
-name, ssh auth — is holding the only copy of that error, since the dashboard
-never sees an attach's stderr; that window stays, and the row gets a status line
-pointing at it.
+**The wrapper also decides whether its window survives the attach.** A window
+left behind is a corpse: it shows a dead session's last frame while the row reads
+detached, and the next `Enter` opens a *second* window beside it. (A dead
+ControlMaster does this to every attach window on the host at once.) But an
+attach *refused on arrival* — the busy guard, a stale name, ssh auth — holds the
+only copy of that error, since the dashboard never sees an attach's stderr; that
+window has to stay, and the row gets a status line pointing at it.
+
+**The terminal cannot be asked to do this half of it.** Spawning the window
+`hold: true` was the first attempt and it is wrong on Kitty, whose `--hold` is
+not a freeze: kitty rewrites the command to `kitten run-shell --shell=<login
+shell> … -- <cmd>` and runs that shell once the command exits ("at a shell
+prompt. The shell will be run after the launched command exits"). So every ended
+attach became a live *local* shell wearing a session's title — a fish prompt
+where an agent had been, arriving en masse the moment a laptop woke and every ssh
+dropped at once. So the window is spawned `hold: false` and
+`ATTACH_REPORT_SCRIPT` holds it itself, with a `read` behind a "press Enter to
+close" line: uniform across all three backends, and unmistakably a dead window
+rather than a shell.
 
 `attach_window_is_spent` is the rule, pure and tested, over the wrapper's exit
-status and how long the binding lived:
+status and how long the attach ran. The wrapper applies it to decide whether to
+hold (it is passed `ATTACH_STARTUP_GRACE` rather than duplicating the number);
+the dashboard applies it to the report, to decide whether to say "see its window"
+and whether to close the window as a backstop — for an attach that ran unwrapped
+(no resolvable reporter exe), or a backend that held it anyway:
 
 | status | meaning | outcome |
 | --- | --- | --- |
@@ -574,12 +588,22 @@ into the signal case would close the window on every failed connection. Equally,
 duration cannot decide alone — it would keep a window for every session detached
 inside the grace.
 
-The script takes the exe, host, token and attach argv as **positional
+**The duration is the wrapper's, not the binding's.** The report carries
+`held_secs`, measured in wall clock (`date`) around the attach, and the dashboard
+prefers it to how long the binding lived — which is an `Instant`, i.e.
+CLOCK_MONOTONIC, which does not advance while the machine is suspended. Reading
+the binding, a laptop that slept through an eight-hour attach and woke to a dead
+ssh judged it by the minutes it had been awake for: inside the grace, so filed as
+a refusal, so the window stayed. That is the same event as the `--hold` fish
+prompt above, and it wanted fixing in both places.
+
+The script takes the exe, host, token, grace and attach argv as **positional
 parameters** — nothing is interpolated into it. The attach argv holds ssh options
 and a session name, and splicing those into a script is how quoting bugs become
 command injection. A `$d` latch keeps the EXIT/HUP pair from reporting twice.
-With no resolvable `current_exe` there is nothing to report *with*, so the argv
-is spawned unwrapped and the backstop covers it.
+With no resolvable `current_exe` there is nothing to report *with*, so `$e`
+arrives empty and the report is skipped — but the wrapper still runs, because the
+hold is its job too, and the backstop covers the missing report.
 
 What no trap can cover is the terminal emulator being killed outright. So the
 periodic prune stays — floored at `DETACH_PRUNE_MIN_INTERVAL`, now **60s**

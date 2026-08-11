@@ -37,6 +37,11 @@ first commit. Everything else here is a constraint you can break by accident.
   via `--settings` and torn down on exit.
 - **Let `list-panes` onto a hot path (zellij).** ~20ms *per pane* server-side.
   Never on focus, spawn, or restart.
+- **Ask the terminal to `hold` a window you want to read after its command
+  dies.** kitty's `--hold` is not a freeze: it rewrites the command to `kitten
+  run-shell … -- <cmd>` and starts the user's **login shell** when that exits, so
+  a dropped ssh leaves a live local shell wearing a session's title. The attach
+  wrapper does its own holding (`ATTACH_REPORT_SCRIPT`).
 
 ### Always
 
@@ -347,6 +352,12 @@ handler. Funnel new entry points through those rather than adding a third.
   terminal killed outright. Neither may run on a **failed** snapshot — an absent
   snapshot is "we don't know", and feeding its empty live-set drops every
   binding.
+- **That same wrapper decides its window's fate**, since the terminal can't be
+  asked to (see the `hold` rule above): an attach *refused on arrival* stays,
+  holding the only copy of its error; anything else exits and the window closes.
+  It reports the duration it measured, because the dashboard's binding age is an
+  `Instant` and stops during a suspend — the exact case that made an overnight
+  drop read as a refusal.
 - **Pooled localhost** (`[launcher] pooled`) *replaces* `backends[0]`, never sits
   alongside it — both read the same dir and `collect_sessions` doesn't dedup.
 - `--force` bypasses only the *busy* guard; the stale-name guard is never

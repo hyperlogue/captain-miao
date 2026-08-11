@@ -799,29 +799,55 @@ impl RemoteBackend {
     }
 }
 
-/// The shell script that wraps an attach so the window reports its own end.
+/// The shell script that wraps an attach so the window reports its own end —
+/// **and holds the window itself when the attach was refused on arrival.**
 ///
-/// Positional parameters (`sh -c SCRIPT sh <exe> <host> <token> <argv…>`) rather
-/// than interpolation: the attach argv holds ssh options and a session name, and
-/// splicing any of that into a script is how quoting bugs become command
-/// injection. Nothing here is substituted — the text is a constant.
+/// Positional parameters (`sh -c SCRIPT sh <exe> <host> <token> <grace> <argv…>`)
+/// rather than interpolation: the attach argv holds ssh options and a session
+/// name, and splicing any of that into a script is how quoting bugs become
+/// command injection. Nothing here is substituted — the text is a constant.
 ///
 /// Traps `HUP` as well as `EXIT` because the two ends differ: closing the window
 /// tears down the pty, which SIGHUPs the wrapper mid-`wait`, while an in-session
 /// shpool detach or a dropped ssh returns normally. `INT`/`TERM` are along for
 /// the ride. The `$d` latch keeps the pair from reporting twice — after a HUP
 /// handler returns, the interrupted wait unwinds and the script still exits
-/// through its EXIT trap.
+/// through its EXIT trap, and the explicit `r` call on the normal path latches
+/// against its own EXIT trap the same way.
 ///
-/// `c=$?` is the *first* thing the handler does: it is the attach's exit status,
-/// and the latch test below would otherwise overwrite it. The dashboard uses it
-/// to tell an attach that ran and ended from one that was refused on arrival,
-/// and so whether the window still has something worth reading in it.
-const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; shift 3; \
-     trap 'c=$?; if [ -z \"$d\" ]; then d=1; \
-     \"$e\" attach-exited --host \"$h\" --token \"$t\" --status \"$c\"; fi' \
-     EXIT HUP INT TERM; \
-     \"$@\"";
+/// `r $?` passes the attach's exit status as the handler's *first* expansion,
+/// before anything else can overwrite it. The dashboard uses it to tell an
+/// attach that ran and ended from one that was refused on arrival.
+///
+/// **The hold is the wrapper's job, not the terminal's** — a `--hold` window on
+/// Kitty is not a frozen corpse: kitty rewrites the command to `kitten run-shell
+/// … -- <cmd>` and **runs the user's login shell** once it exits (`--hold`'s own
+/// documentation: "at a shell prompt. The shell will be run after the launched
+/// command exits"). So every ended attach turned into a live local shell wearing
+/// a session's title — a fish prompt where an agent used to be, most visibly
+/// after a laptop sleep drops every ssh at once. Holding here instead makes the
+/// window's fate a property of the attach on all three backends: refused → stay
+/// with the error on screen and an obviously dead window, anything else → exit
+/// and let the window close.
+///
+/// The refusal test mirrors `app::attach_window_is_spent`, whose doc carries the
+/// reasoning (ssh reports a mid-session drop and a failure to connect with the
+/// same 255, so status alone can't decide). `$g` is that function's grace,
+/// passed in rather than duplicated as a literal. The elapsed seconds are wall
+/// clock — `date`, not the dashboard's monotonic binding age, which stops during
+/// a suspend and would read an overnight attach as a refusal.
+const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; g=$4; shift 4; \
+     s=$(date +%s); \
+     r() { q=$1; if [ -z \"$d\" ]; then d=1; if [ -n \"$e\" ]; then \
+     \"$e\" attach-exited --host \"$h\" --token \"$t\" --status \"$q\" \
+     --held-secs \"$(( $(date +%s) - s ))\"; fi; fi; }; \
+     trap 'r $?' EXIT HUP INT TERM; \
+     \"$@\"; c=$?; r \"$c\"; n=$(( $(date +%s) - s )); \
+     if [ \"$c\" -ne 0 ] && [ \"$c\" -ne 129 ] && [ \"$c\" -ne 130 ] \
+     && [ \"$c\" -ne 143 ] && [ \"$n\" -lt \"$g\" ]; then \
+     printf '\\n[captain-miao] attach to %s exited with status %s. \
+Press Enter to close this window.\\n' \"$t\" \"$c\"; read x; fi; \
+     exit \"$c\"";
 
 /// This dashboard's own binary, for the attach wrapper to re-invoke as
 /// `miao attach-exited`. `None` when it can't be named, which costs the report
@@ -858,30 +884,33 @@ fn resolve_reporter_exe(exe: PathBuf, exists: impl Fn(&Path) -> bool) -> Option<
     exists(Path::new(stripped)).then(|| stripped.to_string())
 }
 
-/// Wrap an attach argv so the window reports back when the attach ends, giving
-/// the dashboard an *event* for detachment instead of a periodic window-tree
-/// snapshot (`cm_core::state::DetachReport`).
+/// Wrap an attach argv in [`ATTACH_REPORT_SCRIPT`], so the window reports back
+/// when the attach ends — giving the dashboard an *event* for detachment instead
+/// of a periodic window-tree snapshot (`cm_core::state::DetachReport`) — and
+/// holds itself open when the attach was refused on arrival.
 ///
 /// `exe` is this dashboard's own binary ([`reporter_exe`]), re-invoked as
 /// `miao attach-exited`; it is passed rather than re-derived so the caller owns
-/// the failure case — with no resolvable exe there is nothing to report *with*,
-/// and the argv is returned unwrapped so the attach still works.
+/// the failure case. `None` reaches the script as an **empty** `$e`, which skips
+/// the report and nothing else: the wrapper still has to run, because it is what
+/// keeps a refused attach's error on screen now that the terminal's own `--hold`
+/// is not used. The periodic prune covers the missing report.
 pub(crate) fn report_on_exit_argv(
     argv: Vec<String>,
     exe: Option<&str>,
     host: &str,
     token: &str,
 ) -> Vec<String> {
-    let Some(exe) = exe else { return argv };
     let mut wrapped = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         ATTACH_REPORT_SCRIPT.to_string(),
         // `$0`. Names the wrapper in `ps`, and is never executed.
         "miao-attach".to_string(),
-        exe.to_string(),
+        exe.unwrap_or_default().to_string(),
         host.to_string(),
         token.to_string(),
+        crate::app::ATTACH_STARTUP_GRACE.as_secs().to_string(),
     ];
     wrapped.extend(argv);
     wrapped
@@ -3910,9 +3939,76 @@ mod tests {
         // Exactly one report, carrying the binding's identity. Two lines would
         // mean the EXIT/HUP trap pair fired twice — the latch is what stops it.
         assert_eq!(
-            std::fs::read_to_string(dir.join("reports")).unwrap(),
-            "attach-exited --host box --token cm-claude-7-1 --status 0\n"
+            reported_once(&dir),
+            "attach-exited --host box --token cm-claude-7-1 --status 0"
         );
+    }
+
+    /// The single report line, minus its `--held-secs` tail. The duration is
+    /// wall clock off `date +%s`, so a test that finishes in microseconds still
+    /// reports 1 whenever it straddles a second boundary — pinning the number
+    /// would be a flake, and every caller here cares about the identity and the
+    /// status. Asserting a lone line is the part that matters: two would mean
+    /// the EXIT/HUP trap pair reported twice.
+    fn reported_once(dir: &Path) -> String {
+        let reports = std::fs::read_to_string(dir.join("reports")).unwrap();
+        let line = reports.strip_suffix('\n').expect("one terminated line");
+        assert!(!line.contains('\n'), "reported more than once: {reports:?}");
+        let (head, secs) = line.split_once(" --held-secs ").expect("a held-secs tail");
+        assert!(
+            secs.parse::<u64>().is_ok_and(|s| s <= 2),
+            "the wrapper must report the attach's own short duration: {secs:?}"
+        );
+        head.to_string()
+    }
+
+    /// The other half of the wrapper's job: a *refused* attach keeps its window,
+    /// because the error it printed exists nowhere else. Run for real — the
+    /// whole point is that the script blocks rather than returning, which no
+    /// string comparison can show.
+    ///
+    /// The two exits are the pair `attach_window_is_spent` separates, and they
+    /// are checked the same way: run the wrapper with its stdin closed, so the
+    /// `read` that holds the window hits EOF instead of hanging the test, and
+    /// look at whether the prompt was printed at all.
+    #[test]
+    fn the_attach_wrapper_holds_the_window_only_for_a_refused_attach() {
+        let dir = scratch_home("attach-wrapper-hold");
+        let reporter = dir.join("reporter.sh");
+        std::fs::write(&reporter, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `sh -c 'exit N'` stands in for the attach: 255 is what ssh reports for
+        // both a refusal and a mid-session drop, so it is the status that has to
+        // be told apart by how long it took.
+        let run = |args: Vec<String>| -> String {
+            let argv = report_on_exit_argv(args, Some(reporter.to_str().unwrap()), "box", "cm-1");
+            let out = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // Refused on arrival: non-zero, immediately. The window stays, and says
+        // why it is still there.
+        let refused = run(vec!["sh".into(), "-c".into(), "exit 255".into()]);
+        assert!(
+            refused.contains("attach to cm-1 exited with status 255"),
+            "a refused attach must hold its window: {refused:?}"
+        );
+        // Ran and ended: the window closes, so nothing is printed. `sleep` for
+        // longer than the grace would make this test that slow, so the case is
+        // covered by the statuses that are spent whatever the duration — a clean
+        // exit and the signals the wrapper traps.
+        for spent in ["exit 0", "exit 129", "exit 143"] {
+            let out = run(vec!["sh".into(), "-c".into(), spent.into()]);
+            assert!(
+                out.is_empty(),
+                "a spent attach must let its window close ({spent}): {out:?}"
+            );
+        }
     }
 
     /// Closing the window is the case the whole mechanism exists for, and it
@@ -3953,10 +4049,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(
-            std::fs::read_to_string(dir.join("reports")).unwrap(),
+            reported_once(&dir),
             // 129 = 128 + SIGHUP: the status the dashboard reads as "the window
             // went away", never as a refused attach.
-            "attach-exited --host box --token cm-1 --status 129\n",
+            "attach-exited --host box --token cm-1 --status 129",
             "a closed window must report exactly once, with the signal status"
         );
     }
@@ -3995,12 +4091,44 @@ mod tests {
         );
     }
 
-    /// With no resolvable exe there is nothing to report *with*, and an attach
-    /// window that works beats one that reports: the argv passes through.
+    /// With no resolvable exe there is nothing to report *with* — but the
+    /// wrapper still runs, because it also owns the window's hold. So the argv
+    /// is wrapped either way, with an empty `$e` standing for "don't report",
+    /// and the attach itself must still reach the command untouched.
     #[test]
-    fn the_attach_wrapper_is_skipped_without_a_reporter() {
-        let argv = vec!["ssh".to_string(), "box".to_string()];
-        assert_eq!(report_on_exit_argv(argv.clone(), None, "box", "cm-1"), argv);
+    fn the_attach_wrapper_runs_unreported_without_a_reporter() {
+        let dir = scratch_home("attach-wrapper-noexe");
+        let payload = dir.join("attach.sh");
+        std::fs::write(
+            &payload,
+            format!("#!/bin/sh\necho \"$@\" > {}/attached\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let argv = report_on_exit_argv(
+            vec![
+                payload.display().to_string(),
+                "attach".into(),
+                "cm-1".into(),
+            ],
+            None,
+            "box",
+            "cm-1",
+        );
+        // The empty exe rides in the reporter's slot rather than collapsing the
+        // positional parameters, which would shift the attach argv left by one.
+        assert_eq!(argv[4], "");
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "the attach must run without a reporter");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("attached")).unwrap(),
+            "attach cm-1\n"
+        );
     }
 
     #[test]
