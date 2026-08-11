@@ -493,6 +493,8 @@ pub(super) struct HostRow {
     /// Per-host emoji shown beside the workdir icon, picked with the same
     /// searchable picker as the workdir marks. Empty = derive one from the label.
     pub(in crate::app) icon: String,
+    /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
+    pub(in crate::app) disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1931,6 +1933,13 @@ impl App {
             if let Some(icon) = h.icon.filter(|i| !i.trim().is_empty()) {
                 host_icons.insert(host.clone(), icon);
             }
+            // A suspended host keeps its row in the panel (and its icon above) but
+            // gets no backend at all: no connection task, no ssh, no rows, and
+            // nothing in the header tally to explain. `c` in the panel brings it
+            // back — which is the whole point of not making the user delete it.
+            if h.disabled {
+                continue;
+            }
             if let Some(sock) = h.socket {
                 // A configured socket path is a daemon on *this* machine (a
                 // manual forward, or a test rig) — see `Transport::LocalSocket`.
@@ -2001,6 +2010,7 @@ impl App {
                 is_socket: h.socket.is_some(),
                 target: h.socket.or(h.ssh).unwrap_or_default(),
                 icon: h.icon.unwrap_or_default(),
+                disabled: h.disabled,
                 label: h.label,
             })
             .collect::<Vec<_>>();
@@ -2079,6 +2089,7 @@ impl App {
                     label: r.label.trim().to_string(),
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
+                    disabled: r.disabled,
                 }
             })
             .collect();
@@ -2094,16 +2105,17 @@ impl App {
     }
 
     /// What each configured host's backend is *built from*, in order: the label
-    /// (which becomes its `HostId`) and the transport it dials. Two host lists
-    /// with equal identities produce byte-identical backends, so a rebuild
-    /// between them would only churn live connections — see
-    /// [`Self::apply_host_edits`]. Pure, so the gate is unit-testable.
+    /// (which becomes its `HostId`), the transport it dials, and whether it is
+    /// dialled at all. Two host lists with equal identities produce
+    /// byte-identical backends, so a rebuild between them would only churn live
+    /// connections — see [`Self::apply_host_edits`]. Pure, so the gate is
+    /// unit-testable.
     pub(in crate::app) fn conn_identities(
         hosts: &[hosts::HostConfig],
-    ) -> Vec<(String, Option<String>, Option<String>)> {
+    ) -> Vec<(String, Option<String>, Option<String>, bool)> {
         hosts
             .iter()
-            .map(|h| (h.label.clone(), h.ssh.clone(), h.socket.clone()))
+            .map(|h| (h.label.clone(), h.ssh.clone(), h.socket.clone(), h.disabled))
             .collect()
     }
 

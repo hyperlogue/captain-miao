@@ -28,6 +28,18 @@ pub(super) struct HostConfig {
     /// so a host always has *some* icon without the user configuring one.
     #[serde(default)]
     pub icon: Option<String>,
+    /// Suspended: the host stays configured and stays in the panel, but no
+    /// backend is built for it, so nothing dials it and it contributes no rows.
+    /// Toggled with `c` in the hosts panel — the answer to a host that is down,
+    /// noisy, or simply not in use today, where the alternative was deleting it
+    /// and retyping the target later.
+    ///
+    /// Spelled as the negative deliberately: `#[serde(default)]` on a `bool` is
+    /// `false`, so both an older `hosts.json` and `HostConfig::default()` mean
+    /// *enabled* — an `enabled` field would silently disable every host on
+    /// upgrade.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// Load the configured hosts, or an empty list if none / unreadable.

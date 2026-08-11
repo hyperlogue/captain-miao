@@ -4660,6 +4660,7 @@ fn only_a_changed_connection_string_reconnects() {
         ssh: Some(ssh.into()),
         socket: None,
         icon: Some(icon.into()),
+        disabled: false,
     };
     let before = vec![host("box", "user@box", "🖥")];
 
@@ -4684,6 +4685,17 @@ fn only_a_changed_connection_string_reconnects() {
             ssh: None,
             socket: Some("/run/x.sock".into()),
             icon: Some("🖥".into()),
+            disabled: false,
+        }])
+    );
+    // Suspending a host moves it too — `disabled` decides whether a backend is
+    // built at all, so the toggle has to reach `rebuild_remote_backends` rather
+    // than being filed as another cosmetic edit.
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[HostConfig {
+            disabled: true,
+            ..host("box", "user@box", "🖥")
         }])
     );
     // …as does adding or dropping a host.

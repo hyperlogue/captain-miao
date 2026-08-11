@@ -1036,6 +1036,20 @@ impl App {
                     state.editing = true;
                     state.focus = HostField::Label;
                 }
+                // Suspend / resume the host. No confirm: unlike `d` it destroys
+                // nothing — the row, its target and its icon all stay — and the
+                // same key puts it straight back. No status line either: this
+                // mode's footer renders key hints, so a message would only
+                // surface, stale, once the panel closed — and the row itself
+                // answers immediately (dimmed, reading `disconnected`, or
+                // animating back through `connecting`).
+                KeyCode::Char('c') if state.cursor < n => {
+                    let row = &mut state.rows[state.cursor];
+                    row.disabled = !row.disabled;
+                    // Persists and rebuilds: `disabled` is part of what a backend
+                    // is built from, so this drops (or dials) the connection now.
+                    self.apply_host_edits();
+                }
                 // Removal is destructive (it drops the host and its mirror), so
                 // it asks first.
                 KeyCode::Char('d') if state.cursor < n => {

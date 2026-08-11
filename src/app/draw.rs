@@ -552,20 +552,34 @@ impl App {
             } else {
                 r.icon.clone()
             };
+            // A suspended host is dimmed whole: it has no backend, so every live
+            // number the row would otherwise carry is simply absent, and the row
+            // should read as parked rather than as broken.
+            let label_style = if r.disabled {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(config::get().colors.ui.title_fg).bold()
+            };
             let mut spans = vec![
                 Span::raw(marker),
                 Span::raw(format!("{icon} ")),
-                Span::styled(
-                    format!("{label:<14}"),
-                    Style::default().fg(config::get().colors.ui.title_fg).bold(),
-                ),
+                Span::styled(format!("{label:<14}"), label_style),
             ];
             // Everything before the status: marker (2) + icon and its space (3)
             // + the padded label (14). A `Failed` reason quotes the host and can
             // run for paragraphs, so it is truncated to what's left rather than
             // being allowed to run off the popup — `l` is where it's read whole.
             let status_width = (list_area.width as usize).saturating_sub(2 + 3 + 14);
-            spans.extend(self.host_status_spans(&host, status_width));
+            if r.disabled {
+                // Not `host_status_spans`' "not connected", which means "there is
+                // no backend for this row *yet*" — this one is a decision.
+                spans.push(Span::styled(
+                    "disconnected",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            } else {
+                spans.extend(self.host_status_spans(&host, status_width));
+            }
             lines.push(Line::from(spans));
             // The target is secondary detail — one indented dim line, so the
             // status line above stays scannable across many hosts.
@@ -1744,6 +1758,7 @@ impl App {
                     // not exist.
                     let mut spans = hint_pair("a", "add");
                     spans.extend(hint_pair("e", "edit"));
+                    spans.extend(hint_pair("c", "connect/disconnect"));
                     spans.extend(hint_pair("d", "delete"));
                     spans.extend(hint_pair("l", "log"));
                     spans.extend(hint_pair("Esc", "close"));
