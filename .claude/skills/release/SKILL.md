@@ -103,10 +103,11 @@ alongside.
 Check these before pushing a tag — each one fails the release rather than
 degrading:
 
-- **`NPM_TOKEN` repository secret** — an npm automation token with publish rights
-  on the `@hyperlogue` scope. Without it the GitHub Release still lands and the
-  npm steps fail; a re-run after adding it converges, since every publish step is
-  idempotent.
+- **npm Trusted Publishing (OIDC)** — there is no `NPM_TOKEN`; each of the five
+  packages is linked on npmjs.com to this repo and to `release.yml` by filename.
+  If a package isn't linked (a newly added platform package, or the workflow was
+  renamed) the GitHub Release still lands and the npm steps fail on auth; a re-run
+  after fixing the link converges, since every publish step is idempotent.
 - **The repo must be public** — the `ubuntu-22.04-arm` runner the aarch64 Linux
   build uses is free only for public repos; on a private repo that matrix leg
   never gets a runner.

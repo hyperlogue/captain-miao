@@ -15,8 +15,13 @@ name: release
 # stamped from that one Cargo source by stage-npm-packages.sh, so the launcher's
 # pins can't drift from the packages they name.
 #
-# Requires an `NPM_TOKEN` repository secret (an npm automation token with publish
-# rights on the @hyperlogue scope).
+# npm auth is **Trusted Publishing** (OIDC), not a stored token: each of the five
+# packages is linked on npmjs.com to this repo AND this workflow *filename*, and
+# `npm publish` exchanges the job's id-token for a short-lived credential. So
+# there is no long-lived secret for a compromised job to exfiltrate, and a publish
+# attempted from anywhere else has nothing to authenticate with. Two consequences:
+# renaming this file breaks every publish until the registry config is updated,
+# and a newly added platform package must be linked before its first release.
 on:
   push:
     tags:
@@ -197,8 +202,8 @@ jobs:
       # npm preserves tarball file modes, so a 0644 binary would EACCES on every
       # install — verify the staged package kept the exec bit. Deliberately does
       # NOT exec the binary: build.yml already smoke-tests every natively-runnable
-      # target, and running an unverified artifact inside the job that holds
-      # NPM_TOKEN would let a poisoned binary rewrite the other three platform
+      # target, and running an unverified artifact inside the one job that can
+      # publish would let a poisoned binary rewrite the other three platform
       # packages before they're published.
       - name: Check the staged binaries
         run: |
@@ -208,12 +213,12 @@ jobs:
             echo "  ok $d"
           done
 
-      # setup-node wires NODE_AUTH_TOKEN for the registry. Node 24 for npm >= 11:
-      # that's the floor for npm Trusted Publishing (OIDC), which this job's
-      # existing `id-token: write` already satisfies. Once the packages are linked
-      # to this workflow on npmjs.com, npm uses OIDC automatically and the
-      # long-lived NPM_TOKEN secret can be deleted; until then it falls back to
-      # the token, so this is safe to land ahead of that one-time registry config.
+      # setup-node points npm at the registry. Node 24 for npm >= 11: that's the
+      # floor for Trusted Publishing (OIDC), which this job's `id-token: write`
+      # feeds. Deliberately no NODE_AUTH_TOKEN — npm mints its own short-lived
+      # credential from the id-token, so an empty `_authToken` line in .npmrc is
+      # not a fallback but a failure. An auth error from `npm publish` below means
+      # the registry-side link is missing, not that a secret went stale.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -225,11 +230,10 @@ jobs:
       # yet. Each publish is idempotent (skip if this version already exists) so a
       # re-run after a partial failure converges. --provenance attests the actual
       # binary bytes, not just the launcher shim. --ignore-scripts because a
-      # package lifecycle hook would otherwise run with the token in its env; no
-      # package declares one today, and this keeps it that way.
+      # package lifecycle hook would otherwise run inside the publish, alongside
+      # the minted credential; no package declares one today, and this keeps it
+      # that way.
       - name: Publish platform binary packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           npm --version
@@ -273,8 +277,6 @@ jobs:
       # attestation — free for a public repo whose repository URL already matches.
       - name: Publish npm launcher
         working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           V=$(jq -r .version package.json)

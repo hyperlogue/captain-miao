@@ -1098,18 +1098,24 @@ real tty for raw mode, resizes, and the kitty graphics protocol.
   the `chmod 0755` that follows would then follow it out of the staging dir.
 - The publish job does **not exec** the staged binary (`test -x` only). build.yml
   already smoke-tests every natively-runnable target, and running an unverified
-  artifact inside the job holding `NPM_TOKEN` would let a poisoned linux-x64
+  artifact inside the one job that can publish would let a poisoned linux-x64
   binary rewrite the other three packages before they publish.
-- Needs an `NPM_TOKEN` repo secret; `--provenance` needs `id-token: write` (already
-  set) and a `repository.url` matching the repo the workflow runs in. Publishes
-  run `--ignore-scripts` so a package lifecycle hook can never run with the token
-  in its env. The publish job declares `environment: release` — **configure that
-  environment with required reviewers, plus a `v*` tag ruleset**, or the gate is
-  nominal (GitHub creates a missing environment implicitly and unprotected). Node
-  is pinned to 24 for npm ≥ 11, the floor for npm **Trusted Publishing** (OIDC):
-  link the packages to this workflow on npmjs.com and the long-lived `NPM_TOKEN`
-  can be deleted — npm picks OIDC up automatically and falls back to the token
-  until then.
+- **npm auth is Trusted Publishing (OIDC) — there is no `NPM_TOKEN` secret.** Each
+  of the five packages is linked on npmjs.com to this repo *and this workflow
+  filename*, and `npm publish` trades the job's id-token for a short-lived
+  credential; Node is pinned to 24 for the npm ≥ 11 floor that needs, and no
+  `NODE_AUTH_TOKEN` is set (an empty `_authToken` is a failure, not a fallback).
+  So a publish is only possible from `release.yml` on this repo, and there is no
+  long-lived credential for a compromised job to exfiltrate — but **renaming the
+  workflow file breaks publishing**, and a newly added platform package must be
+  linked before its first release. An auth error means the registry-side link is
+  missing. `--provenance` needs `id-token: write` (already set) and a
+  `repository.url` matching the repo. Publishes run `--ignore-scripts` so a
+  package lifecycle hook can never run alongside the minted credential. The
+  publish job declares `environment: release` — **configure that environment with
+  required reviewers, plus a `v*` tag ruleset**, or the gate is nominal (GitHub
+  creates a missing environment implicitly and unprotected); if the npm-side
+  trusted-publisher config also names an environment, it must be this one.
 
 ## Committing
 
