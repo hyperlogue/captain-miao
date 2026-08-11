@@ -51,7 +51,7 @@ use tokio::process::Command;
 
 use super::{
     SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
-    tail_lines,
+    tail_lines, wrap_env,
 };
 
 /// Title of the shared tab hosting every session's floating pane. Looked up
@@ -378,21 +378,6 @@ fn floating_new_pane_args(
     }
     push_exec_tail(&mut args, close_on_exit, exec);
     args
-}
-
-/// Wrap an exec argv so the pane gets the dashboard's `PATH`: zellij pane
-/// commands inherit the zellij *server*'s environment (whatever shell started
-/// `zellij` originally), not the caller's, so a bare `captain-miao …` argv may
-/// not resolve. `/usr/bin/env` is POSIX-placed and needs no PATH itself.
-fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
-    let Some(path) = path else {
-        return argv.to_vec();
-    };
-    let mut wrapped = Vec::with_capacity(argv.len() + 2);
-    wrapped.push("/usr/bin/env".to_string());
-    wrapped.push(format!("PATH={path}"));
-    wrapped.extend(argv.iter().cloned());
-    wrapped
 }
 
 /// The zellij backend's fixed capabilities: no cross-tab reparent CLI, so `t`
@@ -779,17 +764,6 @@ mod tests {
         assert!(args.contains(&"--name=-x".to_string()));
         // No bare value element that begins with `-` (the failure mode).
         assert!(!args.iter().any(|a| a == "-x" || a == "/tmp/-weird"));
-    }
-
-    #[test]
-    fn wrap_env_prefixes_env_path() {
-        let argv = vec!["miao".to_string(), "claude".to_string()];
-        assert_eq!(
-            wrap_env(&argv, Some("/a:/b")),
-            vec!["/usr/bin/env", "PATH=/a:/b", "miao", "claude"]
-        );
-        // No PATH to forward → argv unchanged.
-        assert_eq!(wrap_env(&argv, None), argv);
     }
 
     /// `resolve_spawn_target` never yields SharedStackTab on zellij (it's the

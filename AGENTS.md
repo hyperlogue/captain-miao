@@ -204,6 +204,21 @@ config**: the CLI is trusted via the socket, so `verify_control` is the no-op
 default. Vocabulary: a captain-miao **tab** is a tmux *window* (`@N`), a
 captain-miao **window** is a tmux *pane* (`%N`).
 
+The parse lives in **cm-core** (`parse_tmux_env` → `TmuxEnv`), not in the backend,
+for the reason every identity read shares: the launcher stamps
+`LauncherState.terminal` from the same `TMUX` string, so a second copy of the
+parser would let the two drift and quietly turn every tmux binding *foreign*. It
+also owns one non-obvious correction. `TMUX` reports the session **id bare**
+(`…,4242,0`), and a bare `0` is a session **name** to every tmux target lookup —
+probe-verified on 3.7b: with a session called `work`, `new-window -t 0:` fails
+outright with `can't find session: 0` (so *no* session could be spawned), and with
+two sessions live `list-panes -t 0` silently answers for the wrong one. So
+`TmuxEnv::session` is already in the `$N` id form and is what both scoped call
+sites spend; nothing may spend the raw field. The `#[ignore]`d integration test
+builds its backend from a real `TMUX` value for exactly this reason — hand-filling
+`session` with the session's *name*, as it originally did, passes while the
+shipped code fails.
+
 **What the probe pass established** (3.7b), because each one shapes the code:
 
 - **`list-panes -s` is cheap** — ~4ms at 28 panes (vs zellij's ~475ms at 22), so
@@ -230,7 +245,11 @@ captain-miao **window** is a tmux *pane* (`%N`).
   blank rows included — so a capture is trimmed of trailing blanks before
   `tail_lines`, or every pane that hasn't filled its screen previews as empty
   lines. (Kitty and zellij fetch a full scrollback and share the wart; fixing it
-  there is a separate change, deliberately not made blind.)
+  there is a separate change, deliberately not made blind.) It is captured
+  **without `-J`**: that flag rejoins wrapped lines, and the preview panel clips
+  rather than wraps (`h`/`l` pan it), so a line the pane shows as two rows would
+  arrive as one and render as its first panel-width with the rest reachable only
+  by scrolling right — where the other two backends return the two rows.
 - **Pane commands inherit the tmux *server*'s environment** (a variable exported
   for the `tmux` client does not reach the pane), same failure class as zellij —
   so an `Exec` argv is wrapped in `/usr/bin/env PATH=<dashboard PATH> …`. The

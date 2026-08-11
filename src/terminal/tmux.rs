@@ -5,6 +5,13 @@
 //! zellij backend's `ZELLIJ_SESSION_NAME` pinning. Window and pane ids are tmux's
 //! own `@N`/`%N`, which are opaque strings to captain-miao and serialize as-is.
 //!
+//! **The session is scoped by id (`$N`), not by name.** `TMUX` reports the id
+//! bare (`…,4242,0`) and every tmux target lookup reads a bare `0` as a session
+//! *name* — so `new-window -t 0:` fails with `can't find session: 0` on any
+//! session the user named, and `list-panes -t 0` silently answers for the
+//! current session instead. `cm_core::terminal::parse_tmux_env` sigils it once,
+//! where the identity is derived, so no caller can spend the raw field.
+//!
 //! Vocabulary: a captain-miao **tab** is a tmux *window* (`@N`), a captain-miao
 //! **window** (one session's pane) is a tmux *pane* (`%N`). tmux's own "session"
 //! has no captain-miao analog; like zellij, the backend pins the one it started
@@ -18,10 +25,12 @@
 //! - **`new-window -P -F` prints both ids atomically**, with `-d`, `-c`, `-n` and
 //!   a command, so *every* spawn returns a fully-populated [`SpawnResult`] and
 //!   seeds the dashboard's window→tab cache. There is no pane-id recovery path.
-//! - **Chained (`\;`) option-sets target the session's *current* pane/window, not
-//!   the one `new-window -d` just created** — so `hold` cannot ride along on the
-//!   spawn invocation and needs a second call with an explicit `-t %N`. Getting
-//!   this wrong silently sets the option on whatever pane the user was looking at.
+//! - **Chained (`\;`) commands with no `-t` target the session's *current*
+//!   pane/window, not the one `new-window -d` just created** — so `hold` cannot
+//!   ride along on the spawn invocation and needs a second call with an explicit
+//!   `-t %N`. Getting this wrong silently sets the option on whatever pane the
+//!   user was looking at. Chaining is fine once *every* command carries its own
+//!   `-t`, which is how `pin_title` and `focus_window` each fit in one call.
 //! - **Ids reset when the server restarts on the same socket path** (`%1`/`@1`
 //!   again), which is why the terminal identity carries the server pid — see
 //!   `cm_core::terminal::tmux_identity_parts`.
@@ -41,7 +50,11 @@
 //!   its pane is alive and its error is the last thing on screen.
 //! - **`capture-pane` returns the whole visible screen**, blank rows included, so
 //!   a capture is trimmed of trailing blanks before being tailed — otherwise every
-//!   pane that hasn't filled its screen previews as empty lines.
+//!   pane that hasn't filled its screen previews as empty lines. It is captured
+//!   **without `-J`**: rejoining wrapped lines would hand the preview one long
+//!   logical line where the pane (and both other backends) show two, and the
+//!   preview panel clips rather than wraps, so the remainder would only be
+//!   reachable by scrolling right.
 //! - **`-n` titles need renaming pinned off.** An explicit `-n` already disables
 //!   `automatic-rename`, but `allow-rename` lets the *application* retitle the
 //!   window with an OSC escape — which agents emit — silently invalidating the
@@ -49,7 +62,7 @@
 //! - **Stacked is not implementable here** (`window_stacking: false,
 //!   floating_sessions: false`): `display-popup` is client-bound and transient, and
 //!   the zoom emulation costs a real pty resize per switch (measured 80x12 → 80x24)
-//!   while a background split *unzooms* the window. See the design doc §6.
+//!   while a background split *unzooms* the window. See `design/tmux-backend.md` §6.
 
 use std::sync::Mutex;
 
@@ -59,7 +72,7 @@ use tokio::process::Command;
 
 use super::{
     Capabilities, SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget,
-    Terminal, WindowId, tail_lines,
+    Terminal, WindowId, tail_lines, wrap_env,
 };
 
 /// The format `snapshot` requests, one line per pane. The free-text field
@@ -77,7 +90,8 @@ pub struct TmuxTerminal {
     /// The server pid from `TMUX`, carried only to build the instance identity
     /// (see `tmux_identity_parts` for why the pid is part of the key).
     server_pid: String,
-    /// The tmux session this backend scopes itself to, captured at startup.
+    /// The tmux session this backend scopes itself to, captured at startup, as a
+    /// **target** (`$N` — tmux's session-id form, see `cm_core::terminal::TmuxEnv`).
     session: String,
     /// The dashboard's own pane (`TMUX_PANE`). Reported as `current_window`; the
     /// backend never needs it to restore focus (tmux creates without focusing
@@ -92,20 +106,25 @@ pub struct TmuxTerminal {
 
 impl TmuxTerminal {
     /// Construct from the environment. `None` when not inside a tmux pane, or
-    /// when `TMUX` doesn't parse into a socket + server pid (a pane we can't
-    /// namespace to a server is one we refuse to drive — see
-    /// [`cm_core::terminal::tmux_identity`]).
+    /// when `TMUX` doesn't parse into a socket + server pid + session id (a pane
+    /// we can't namespace to a server is one we refuse to drive — see
+    /// [`cm_core::terminal::parse_tmux_env`]).
     pub fn from_env() -> Option<Self> {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let tmux = clean(std::env::var("TMUX").ok())?;
-        let (socket, server_pid, session) = parse_tmux_env(&tmux)?;
+        // cm-core owns this parse. The launcher stamps `LauncherState.terminal`
+        // from the very same string, and the dashboard matches bindings against
+        // `identity()` built from it here — a second copy of the parser would let
+        // the two drift, at which point every tmux binding reads as foreign and
+        // silently goes inert.
+        let env = cm_core::terminal::parse_tmux_env(&tmux)?;
         let own_pane = clean(std::env::var("TMUX_PANE").ok())
             .filter(|s| pane_id(s).is_ok())
             .map(WindowId);
         Some(Self {
-            socket,
-            server_pid,
-            session,
+            socket: env.socket,
+            server_pid: env.server_pid,
+            session: env.session,
             own_pane,
             saved_window_name: Mutex::new(None),
         })
@@ -146,35 +165,31 @@ impl TmuxTerminal {
         let Ok(id) = window_id(tab.as_str()) else {
             return;
         };
-        for opt in ["automatic-rename", "allow-rename"] {
-            if let Err(e) = self
-                .tmux_cmd(&["set-option", "-w", "-t", id, opt, "off"])
-                .await
-            {
-                tracing::debug!("pinning {opt} on {id} failed: {e}");
-            }
+        // One invocation, two chained commands — safe here because *both* carry
+        // an explicit `-t` (see the `hold` note in `spawn` for the case where
+        // chaining is not). Halving the round trips also narrows the window
+        // between `new-window` and the `remain-on-exit` that follows.
+        if let Err(e) = self
+            .tmux_cmd(&[
+                "set-option",
+                "-w",
+                "-t",
+                id,
+                "automatic-rename",
+                "off",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                id,
+                "allow-rename",
+                "off",
+            ])
+            .await
+        {
+            tracing::debug!("pinning the title of {id} failed: {e}");
         }
     }
-}
-
-/// Split a raw `TMUX` value (`<socket_path>,<server_pid>,<session_id>`) into its
-/// three parts. Splits from the **right**: a socket path may contain a comma,
-/// the two trailing fields cannot. Rejects a non-numeric server pid, so a value
-/// we don't understand fails closed instead of minting a bogus identity.
-fn parse_tmux_env(tmux: &str) -> Option<(String, String, String)> {
-    let mut parts = tmux.rsplitn(3, ',');
-    let session = parts.next()?.trim();
-    let server_pid = parts.next()?.trim();
-    let socket = parts.next()?.trim();
-    if socket.is_empty() || server_pid.is_empty() || !server_pid.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((
-        socket.to_string(),
-        server_pid.to_string(),
-        session.to_string(),
-    ))
 }
 
 /// Validate a tmux id of the form `<sigil><digits>`, failing closed. The shared
@@ -311,27 +326,11 @@ fn trim_trailing_blank_lines(s: &str) -> &str {
     s.trim_end_matches(['\n', '\r', ' ', '\t'])
 }
 
-/// Wrap an exec argv so the pane gets the dashboard's `PATH`: tmux pane commands
-/// inherit the tmux *server*'s environment (whatever shell started the server,
-/// possibly days ago), not the caller's, so a bare `miao …` argv may not resolve.
-/// `/usr/bin/env` is POSIX-placed and needs no PATH itself. Verbatim the zellij
-/// fix, for the identical reason.
-fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
-    let Some(path) = path else {
-        return argv.to_vec();
-    };
-    let mut wrapped = Vec::with_capacity(argv.len() + 2);
-    wrapped.push("/usr/bin/env".to_string());
-    wrapped.push(format!("PATH={path}"));
-    wrapped.extend(argv.iter().cloned());
-    wrapped
-}
-
 /// The tmux backend's fixed capabilities. `move_to_tab` is **true** — the first
 /// multiplexer backend where it is, since `break-pane`/`join-pane` are real CLI
 /// commands (contrast zellij, whose `BreakPane` is keybind-only). Neither Stacked
 /// arrangement exists here: no floating panes that survive a client switch, and
-/// no non-tiling layout (design doc §6), so `resolve_spawn_target` falls back to
+/// no non-tiling layout (`design/tmux-backend.md` §6), so `resolve_spawn_target` falls back to
 /// a tab per session. Exported so tests assert against the real value rather than
 /// a hand-built literal that could silently diverge when a field is added.
 pub(crate) const CAPABILITIES: Capabilities = Capabilities {
@@ -467,19 +466,25 @@ impl Terminal for TmuxTerminal {
 
     async fn capture_text(&self, id: &WindowId, max_lines: usize) -> Result<String> {
         // `-p` to stdout, `-e` to keep SGR styling (matching kitty's `get-text`
-        // and zellij's `--ansi`), `-J` to rejoin wrapped lines. `-S -N` reaches N
-        // lines *into history*, so the result is N plus the whole visible screen
-        // — still far less than fetching the entire scrollback, which is what
-        // both other backends must do. The screen's unused rows are blank, so
-        // they come off before `tail_lines` trims to exactly `max_lines`;
-        // otherwise a half-empty pane previews as blank lines.
+        // and zellij's `--ansi`). `-S -N` reaches N lines *into history*, so the
+        // result is N plus the whole visible screen — still far less than
+        // fetching the entire scrollback, which is what both other backends must
+        // do. The screen's unused rows are blank, so they come off before
+        // `tail_lines` trims to exactly `max_lines`; otherwise a half-empty pane
+        // previews as blank lines.
+        //
+        // Deliberately **no `-J`**: it rejoins wrapped lines, and the preview
+        // panel clips rather than wraps (`h`/`l` pan it). A 40-char line from an
+        // 80-wide pane would come back as one logical line and render as the
+        // first panel-width of it, with the rest reachable only by scrolling
+        // right — where the pane itself shows two rows and the other two backends
+        // return two. Screen rows are the unit a fixed-height panel wants.
         let start = format!("-{max_lines}");
         let raw = self
             .tmux_cmd(&[
                 "capture-pane",
                 "-p",
                 "-e",
-                "-J",
                 "-t",
                 pane_id(id.as_str())?,
                 "-S",
@@ -599,7 +604,9 @@ mod tests {
         TmuxTerminal {
             socket: "/tmp/tmux-1000/default".into(),
             server_pid: "4242".into(),
-            session: "work".into(),
+            // The `$N` id form `from_env` produces, not a session *name*: the
+            // field is spent directly as a `-t` target.
+            session: "$0".into(),
             own_pane: Some(WindowId("%3".into())),
             saved_window_name: Mutex::new(None),
         }
@@ -689,26 +696,24 @@ mod tests {
         assert_eq!(parse_window_name("plain"), ("plain".into(), false));
     }
 
+    /// The backend's session field is a **target**, and the only target form a
+    /// numeric id has is `$N`. `TMUX` carries it bare, which every tmux lookup
+    /// reads as a session *name* — probe-verified on 3.7b: with a session called
+    /// `work`, `new-window -t 0:` fails outright, and with two sessions
+    /// `list-panes -t 0` silently answers for the wrong one. The parse (and the
+    /// sigil) live in cm-core so the launcher's identity can't drift from ours.
     #[test]
-    fn tmux_env_splits_from_the_right() {
-        assert_eq!(
-            parse_tmux_env("/tmp/tmux-1000/default,4242,0"),
-            Some(("/tmp/tmux-1000/default".into(), "4242".into(), "0".into()))
-        );
-        // A socket path with a comma still parses.
-        assert_eq!(
-            parse_tmux_env("/tmp/od,d/s,4242,0").map(|t| t.0),
-            Some("/tmp/od,d/s".into())
-        );
-        assert_eq!(parse_tmux_env("/tmp/s,notapid,0"), None);
-        assert_eq!(parse_tmux_env("/tmp/s,4242"), None);
-        assert_eq!(parse_tmux_env(""), None);
+    fn the_session_scope_is_a_target_not_a_bare_id() {
+        let env = cm_core::terminal::parse_tmux_env("/tmp/tmux-1000/default,4242,0").expect("TMUX");
+        assert_eq!(env.session, "$0", "a bare `0` would be a session *name*");
+        // …and that is exactly what the spawn scopes to.
+        assert!(new_window_args(&env.session, "/tmp", None, false, None).contains(&"$0:".into()));
     }
 
     #[test]
     fn new_window_args_shape() {
         let args = new_window_args(
-            "work",
+            "$0",
             "/tmp/proj",
             Some("proj"),
             false,
@@ -722,7 +727,7 @@ mod tests {
                 "-F",
                 SPAWN_FORMAT,
                 "-t",
-                "work:",
+                "$0:",
                 "-c",
                 "/tmp/proj",
                 "-d",
@@ -733,7 +738,7 @@ mod tests {
         );
         // take_focus: true drops `-d` — tmux's native "create without focusing"
         // means there is never a focus snap-back to undo (contrast zellij).
-        let args = new_window_args("work", "/tmp", None, true, None);
+        let args = new_window_args("$0", "/tmp", None, true, None);
         assert!(!args.iter().any(|a| a == "-d"));
         assert!(!args.iter().any(|a| a == "-n"));
     }
@@ -763,16 +768,6 @@ mod tests {
         assert_eq!(trim_trailing_blank_lines("a\n\nb\n\n"), "a\n\nb");
         assert_eq!(trim_trailing_blank_lines("\n\n"), "");
         assert_eq!(trim_trailing_blank_lines(""), "");
-    }
-
-    #[test]
-    fn wrap_env_prefixes_env_path() {
-        let argv = vec!["miao".to_string(), "claude".to_string()];
-        assert_eq!(
-            wrap_env(&argv, Some("/a:/b")),
-            vec!["/usr/bin/env", "PATH=/a:/b", "miao", "claude"]
-        );
-        assert_eq!(wrap_env(&argv, None), argv);
     }
 
     #[test]
@@ -837,11 +832,24 @@ mod tests {
         ])
         .await;
         let server_pid = run(argv("display-message -p #{pid}")).await;
+        // Build the backend from a real `TMUX` value, exactly as `from_env`
+        // would, rather than hand-filling the fields. The session is deliberately
+        // *named* (`it`) while `TMUX` reports its bare id, so this is the one
+        // thing that catches spending that id as a `-t` target: with `session`
+        // hand-set to `"it"` every command below passes and the shipped backend
+        // still fails on `can't find session: <id>`.
+        let tmux_env = format!(
+            "{socket},{server_pid},{}",
+            run(argv("display-message -p #{session_id}"))
+                .await
+                .trim_start_matches('$')
+        );
+        let parsed = cm_core::terminal::parse_tmux_env(&tmux_env).expect("TMUX parses");
 
         let term = TmuxTerminal {
             socket: socket.clone(),
             server_pid: server_pid.clone(),
-            session: "it".into(),
+            session: parsed.session,
             own_pane: None,
             saved_window_name: Mutex::new(None),
         };
@@ -957,7 +965,7 @@ mod tests {
         let dashboard = TmuxTerminal {
             socket: socket.clone(),
             server_pid: server_pid.clone(),
-            session: "it".into(),
+            session: term.session.clone(),
             own_pane: Some(own_pane.clone()),
             saved_window_name: Mutex::new(None),
         };

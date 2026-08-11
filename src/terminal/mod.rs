@@ -382,6 +382,25 @@ fn tail_lines(s: &str, n: usize) -> &str {
         .unwrap_or(s)
 }
 
+/// Wrap an exec argv so the spawned pane gets the dashboard's `PATH`.
+///
+/// Shared by both multiplexer backends because they have the identical problem:
+/// a pane command inherits the **server**'s environment (whatever shell started
+/// zellij, or a tmux server that may predate this shell by days), not the
+/// caller's, so a bare `miao …` argv may not resolve. `/usr/bin/env` is
+/// POSIX-placed and needs no PATH itself. Kitty doesn't need it — it spawns from
+/// the process that asked.
+fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
+    let Some(path) = path else {
+        return argv.to_vec();
+    };
+    let mut wrapped = Vec::with_capacity(argv.len() + 2);
+    wrapped.push("/usr/bin/env".to_string());
+    wrapped.push(format!("PATH={path}"));
+    wrapped.extend(argv.iter().cloned());
+    wrapped
+}
+
 // ---- global accessor (mirrors config::get()) ----
 
 static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
@@ -441,8 +460,9 @@ pub fn supported_terminal_present() -> bool {
 /// the second half of the startup gate, kept beside the first so both live with
 /// the detection they depend on. [`supported_terminal_present`] picks the
 /// backend from the env; this asks *that* backend to prove the control channel
-/// works ([`Terminal::verify_control`]), which is a no-op for zellij and a real
-/// `kitten @` round-trip for Kitty.
+/// works ([`Terminal::verify_control`]), which is a no-op for zellij and tmux —
+/// both CLIs are trusted by the session they run in, so there is nothing to
+/// misconfigure — and a real `kitten @` round-trip for Kitty.
 ///
 /// The error is a ready-to-print, multi-line diagnosis naming the fix, because
 /// its only caller (the dashboard, in `main`) prints it and exits: a dashboard

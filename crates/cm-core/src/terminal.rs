@@ -230,25 +230,58 @@ pub fn tmux_identity_parts(socket: &str, server_pid: &str) -> String {
     format!("tmux:{socket},{server_pid}")
 }
 
-/// The identity of the tmux server named by a raw `TMUX` value
-/// (`<socket_path>,<server_pid>,<session_id>`), or `None` when it doesn't parse.
+/// What a raw `TMUX` value names. Parsed here, in cm-core, because both readers
+/// must agree byte for byte: the launcher stamps `LauncherState.terminal` from
+/// this env, and the dashboard's tmux backend builds the identity it matches
+/// against from the same string. Two copies of the parser would let a binding
+/// read as foreign — i.e. inert — the moment they drifted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxEnv {
+    /// The server socket, the `-S` every call is pinned to.
+    pub socket: String,
+    /// The server pid — part of the instance identity, see [`tmux_identity_parts`].
+    pub server_pid: String,
+    /// The **session target**, already in tmux's `$N` id form.
+    ///
+    /// `TMUX` carries the session id *bare* (`…,4242,0`), and a bare `0` is a
+    /// session **name** to every tmux target lookup — so `-t 0` finds a session
+    /// called `0` if one exists, silently falls through to the current session
+    /// otherwise, and `new-window -t 0:` just fails with `can't find session: 0`
+    /// (all three probe-verified on 3.7b). Sigil it here, once, so no caller can
+    /// spend the raw field as a target.
+    pub session: String,
+}
+
+/// Parse a raw `TMUX` value (`<socket_path>,<server_pid>,<session_id>`), or
+/// `None` when it doesn't parse.
 ///
 /// Split from the **right**, because a socket path may itself contain a comma
-/// while the two trailing fields cannot. A non-numeric server pid means this
-/// isn't a `TMUX` value we understand, so it fails closed rather than minting an
-/// identity that could collide with a real one.
-pub fn tmux_identity(tmux_env: &str) -> Option<String> {
+/// while the two trailing fields cannot. A non-numeric server pid or session id
+/// means this isn't a `TMUX` value we understand, so it fails closed rather than
+/// minting an identity that could collide with a real one — or a `-t` target
+/// that names the wrong session.
+pub fn parse_tmux_env(tmux_env: &str) -> Option<TmuxEnv> {
     // rsplitn yields right-to-left: session id, server pid, then the remainder
     // (the socket path, commas and all).
     let mut parts = tmux_env.rsplitn(3, ',');
-    let _session = parts.next()?;
+    let session = parts.next()?.trim();
     let server_pid = parts.next()?.trim();
     let socket = parts.next()?.trim();
-    if socket.is_empty() || server_pid.is_empty() || !server_pid.bytes().all(|b| b.is_ascii_digit())
-    {
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if socket.is_empty() || !numeric(server_pid) || !numeric(session) {
         return None;
     }
-    Some(tmux_identity_parts(socket, server_pid))
+    Some(TmuxEnv {
+        socket: socket.to_string(),
+        server_pid: server_pid.to_string(),
+        session: format!("${session}"),
+    })
+}
+
+/// The identity of the tmux server named by a raw `TMUX` value, or `None` when
+/// it doesn't parse. Thin wrapper over [`parse_tmux_env`].
+pub fn tmux_identity(tmux_env: &str) -> Option<String> {
+    parse_tmux_env(tmux_env).map(|e| tmux_identity_parts(&e.socket, &e.server_pid))
 }
 
 /// The identity of a Kitty instance, keyed by its remote-control socket (what a
@@ -376,6 +409,27 @@ mod tests {
         assert_eq!(tmux_identity(""), None);
         assert_eq!(tmux_identity("/tmp/s,4242"), None);
         assert_eq!(tmux_identity(",4242,0"), None);
+    }
+
+    #[test]
+    fn the_session_target_carries_tmux_s_id_sigil() {
+        // `TMUX` holds the session id bare, and a bare `0` is a session *name* to
+        // every tmux target lookup — `new-window -t 0:` fails outright unless a
+        // session happens to be called `0`, and `list-panes -t 0` silently falls
+        // through to the current session. The `$` is what makes it an id.
+        let env = parse_tmux_env("/tmp/tmux-1000/default,4242,0").expect("parses");
+        assert_eq!(env.socket, "/tmp/tmux-1000/default");
+        assert_eq!(env.server_pid, "4242");
+        assert_eq!(env.session, "$0");
+        // A socket path with a comma still parses (split from the right).
+        assert_eq!(
+            parse_tmux_env("/tmp/od,d/s,4242,7").map(|e| (e.socket, e.session)),
+            Some(("/tmp/od,d/s".into(), "$7".into()))
+        );
+        // A non-numeric or empty session id is not a `TMUX` we understand:
+        // sigilling it would mint a target that names nothing.
+        assert_eq!(parse_tmux_env("/tmp/s,4242,"), None);
+        assert_eq!(parse_tmux_env("/tmp/s,4242,not-an-id"), None);
     }
 
     #[test]

@@ -107,3 +107,17 @@ fn detect_backend_prefers_zellij_then_tmux_then_kitty() {
     assert_eq!(detect_backend(None, false, true), ConfiguredBackend::Tmux);
     assert_eq!(detect_backend(None, false, false), ConfiguredBackend::Kitty);
 }
+
+/// Both multiplexer backends share this: a pane command inherits the *server*'s
+/// environment, so an exec argv is re-pointed at the dashboard's `PATH`. One
+/// test, since there is now one implementation.
+#[test]
+fn wrap_env_prefixes_env_path() {
+    let argv = vec!["miao".to_string(), "claude".to_string()];
+    assert_eq!(
+        wrap_env(&argv, Some("/a:/b")),
+        vec!["/usr/bin/env", "PATH=/a:/b", "miao", "claude"]
+    );
+    // No PATH to forward → argv unchanged.
+    assert_eq!(wrap_env(&argv, None), argv);
+}
