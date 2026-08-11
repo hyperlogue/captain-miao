@@ -5,7 +5,6 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::SetTitle;
 use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 
@@ -907,9 +906,9 @@ pub async fn run() -> Result<()> {
     // backend simply has no watcher to own.
 
     let mut terminal = ratatui::init();
-    // Advertise our tab/window title; kitty's default tab_title_template
-    // surfaces it as the tab label. User templates may ignore it.
-    let _ = execute!(std::io::stdout(), SetTitle("miao"));
+    // No tab label here: the run loop owns it now (it carries the live attention
+    // count), and there is nothing to say about a dashboard that hasn't read the
+    // sessions yet.
     // Probe the terminal palette for the paw's status tints and the cat's colours
     // now: raw mode is on (ratatui::init) so the OSC-4 reply isn't line-buffered,
     // but mouse/focus reporting and the event loop haven't started reading stdin
@@ -932,6 +931,12 @@ pub async fn run() -> Result<()> {
 
     // Teardown must run even on an error path.
     let result = run_app(&mut terminal).await;
+    // Hand the tab label back. On a multiplexer the label is server-side state
+    // that outlives this process, so leaving it would stamp a dead dashboard's
+    // count on somebody else's tab (see `Terminal::restore_own_tab_title`).
+    if let Err(e) = terminal::get().restore_own_tab_title().await {
+        tracing::debug!("restoring the dashboard tab title failed: {e}");
+    }
     leave_terminal_modes(kb_enhanced);
     ratatui::restore();
 
@@ -1008,6 +1013,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let detach_reports_watched = _detach_report_watcher.is_some();
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
+    // The tab label last pushed to the terminal, so the count is only re-sent
+    // when it actually moves.
+    let mut last_tab_title: Option<String> = None;
     // Deadline armed by an action that races a launcher's state-file write
     // (`arm_settle_reload`); drained at the top of the loop so the action itself
     // never blocks a frame on it.
@@ -1298,6 +1306,20 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // one thing this repaint drives (an advancing placement).
             app.render_logo_graphics();
             needs_redraw = false;
+        }
+
+        // Keep the dashboard's own tab labelled with the attention count, so the
+        // tab bar answers "does anything want me?" without switching here at all.
+        // Only on change: on a multiplexer this is a subprocess, and the count
+        // holds steady for minutes at a time. *After* the draw deliberately — the
+        // very first call resolves the dashboard's own tab, which on zellij costs
+        // a `list-panes`, and a cosmetic label must not hold up the first frame.
+        let tab_title = super::dashboard_tab_title(app.attention_count());
+        if last_tab_title.as_deref() != Some(tab_title.as_str()) {
+            if let Err(e) = terminal::get().set_own_tab_title(&tab_title).await {
+                tracing::debug!("setting the dashboard tab title failed: {e}");
+            }
+            last_tab_title = Some(tab_title);
         }
 
         // Tick fast while a cat walks so its motion stays smooth; otherwise idle at

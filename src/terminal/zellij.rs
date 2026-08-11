@@ -43,6 +43,8 @@
 //!   after a `new-tab` spawn), never on focus — a floating spawn needs none
 //!   (`new-pane` prints the pane id).
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -66,6 +68,26 @@ pub struct ZellijTerminal {
     /// after a `take_focus: false` spawn — zellij's `new-tab` always moves
     /// focus to the new tab; there is no `--dont-take-focus`.
     own_pane: Option<WindowId>,
+    /// Where [`OwnTab`] resolution got to. Behind a `Mutex` because the title is
+    /// set through `&self` like every other backend call.
+    own_tab: Mutex<OwnTab>,
+}
+
+/// The tab holding the dashboard's own pane, for `set_own_tab_title`.
+///
+/// Resolved lazily and **once**: the lookup costs a `list-panes` (~20ms *per
+/// pane*, the one expensive action) and the answer cannot change — zellij has no
+/// way to reparent a pane across tabs, which is the same limitation that makes
+/// `move_window_to_tab` unsupported here.
+#[derive(Debug)]
+enum OwnTab {
+    /// Not looked up yet.
+    Unknown,
+    /// Looked up and not found. Kept distinct from `Unknown` so a dashboard
+    /// whose pane isn't in the tree doesn't re-pay the scan on every change.
+    Absent,
+    /// The tab, and the name it had before the first rename.
+    Known(TabId, String),
 }
 
 impl ZellijTerminal {
@@ -81,7 +103,11 @@ impl ZellijTerminal {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .map(WindowId);
-        Some(Self { session, own_pane })
+        Some(Self {
+            session,
+            own_pane,
+            own_tab: Mutex::new(OwnTab::Unknown),
+        })
     }
 
     async fn zellij_cmd(&self, args: &[&str]) -> Result<String> {
@@ -161,6 +187,38 @@ impl ZellijTerminal {
         let tab_id = parse_tab_id(&stdout)?;
         self.refocus_own_pane().await;
         Ok(tab_id)
+    }
+
+    /// The tab holding the dashboard's own pane and the name it had when we first
+    /// asked — memoized, including the negative answer. See [`OwnTab`] for why
+    /// the answer can be cached for the life of the process.
+    async fn own_tab(&self) -> Option<(TabId, String)> {
+        match &*self.own_tab.lock().expect("own tab mutex") {
+            OwnTab::Known(id, name) => return Some((id.clone(), name.clone())),
+            OwnTab::Absent => return None,
+            OwnTab::Unknown => {}
+        }
+        let resolved = self.resolve_own_tab().await;
+        *self.own_tab.lock().expect("own tab mutex") = match &resolved {
+            Some((id, name)) => OwnTab::Known(id.clone(), name.clone()),
+            None => OwnTab::Absent,
+        };
+        resolved
+    }
+
+    /// One `list-panes` to find which tab holds `own_pane`, then one `list-tabs`
+    /// for that tab's current name. `None` at any missing step — the tab label is
+    /// cosmetic, so an unresolvable pane just goes unlabelled.
+    async fn resolve_own_tab(&self) -> Option<(TabId, String)> {
+        let own = self.own_pane.as_ref()?.as_str().parse::<u64>().ok()?;
+        let panes = self.terminal_panes().await.ok()?;
+        let tab_id = panes
+            .iter()
+            .find(|p| p["id"].as_u64() == Some(own))
+            .and_then(|p| p["tab_id"].as_u64())?;
+        let tabs = self.zellij_cmd(&["list-tabs", "-a", "-j"]).await.ok()?;
+        let name = find_tab_name_by_id(&tabs, tab_id).ok()??;
+        Some((TabId::from(tab_id), name))
     }
 }
 
@@ -260,6 +318,17 @@ fn find_tab_id_by_name(list_tabs_json: &str, name: &str) -> Result<Option<u64>> 
         .iter()
         .find(|t| t["name"].as_str() == Some(name))
         .and_then(|t| t["tab_id"].as_u64()))
+}
+
+/// The current name of the tab with stable id `tab_id` — the inverse lookup of
+/// [`find_tab_id_by_name`], for remembering what to put a renamed tab back to.
+fn find_tab_name_by_id(list_tabs_json: &str, tab_id: u64) -> Result<Option<String>> {
+    let tabs = parse_tabs_json(list_tabs_json)?;
+    Ok(tabs
+        .iter()
+        .find(|t| t["tab_id"].as_u64() == Some(tab_id))
+        .and_then(|t| t["name"].as_str())
+        .map(str::to_string))
 }
 
 /// Append the trailing `[--close-on-exit] [-- <argv>]` shared by the `NewTab`
@@ -499,6 +568,39 @@ impl Terminal for ZellijTerminal {
         anyhow::bail!("moving a pane to another tab is not supported by the zellij backend");
     }
 
+    /// Rename the tab holding the dashboard's pane. An OSC title reaches only the
+    /// *pane* name here, which the tab bar never shows, so this is a real
+    /// `rename-tab-by-id` — the stable-id addressing the rest of the backend uses
+    /// (`go-to-tab-by-id`, `close-tab-by-id`), and the one form probe-verified to
+    /// take a `list-tabs` `tab_id` rather than a position.
+    async fn set_own_tab_title(&self, title: &str) -> Result<()> {
+        let Some((tab, _)) = self.own_tab().await else {
+            return Ok(());
+        };
+        self.zellij_cmd(&["rename-tab-by-id", digits_id(tab.as_str())?, title])
+            .await?;
+        Ok(())
+    }
+
+    async fn restore_own_tab_title(&self) -> Result<()> {
+        // Read the memo rather than `own_tab()`: an unresolved tab means we never
+        // renamed anything, and resolving one on the way out would be an
+        // expensive `list-panes` for nothing.
+        let known = match &*self.own_tab.lock().expect("own tab mutex") {
+            OwnTab::Known(id, name) => Some((id.clone(), name.clone())),
+            _ => None,
+        };
+        let Some((tab, name)) = known.filter(|(_, name)| !name.is_empty()) else {
+            return Ok(());
+        };
+        // Renaming back is exact where `undo-rename-tab` is not: zellij freezes an
+        // auto name (`Tab #3`) at creation and never renumbers it, so restoring
+        // the captured string reproduces what the user saw either way.
+        self.zellij_cmd(&["rename-tab-by-id", digits_id(tab.as_str())?, &name])
+            .await?;
+        Ok(())
+    }
+
     fn capabilities(&self) -> super::Capabilities {
         CAPABILITIES
     }
@@ -605,6 +707,23 @@ mod tests {
         assert_eq!(first_pane_in_tab(&[], 0), None);
     }
 
+    /// The inverse lookup `restore_own_tab_title` restores from — a tab renamed
+    /// on the way in has to be put back by the name it *had*, and `undo-rename`
+    /// can't do that for a tab the user named themselves.
+    #[test]
+    fn find_tab_name_by_id_reads_the_current_name() {
+        assert_eq!(
+            find_tab_name_by_id(LIST_TABS, 1).unwrap().as_deref(),
+            Some("probe-tab")
+        );
+        assert_eq!(
+            find_tab_name_by_id(LIST_TABS, 0).unwrap().as_deref(),
+            Some("Tab #1")
+        );
+        assert_eq!(find_tab_name_by_id(LIST_TABS, 99).unwrap(), None);
+        assert!(find_tab_name_by_id("not json", 1).is_err());
+    }
+
     #[test]
     fn find_tab_id_by_name_matches_exact_title() {
         assert_eq!(
@@ -682,6 +801,7 @@ mod tests {
         let term = ZellijTerminal {
             session: "test".into(),
             own_pane: None,
+            own_tab: Mutex::new(OwnTab::Unknown),
         };
         let spec = SpawnSpec {
             cwd: "/tmp".into(),

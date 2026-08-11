@@ -51,6 +51,8 @@
 //!   the zoom emulation costs a real pty resize per switch (measured 80x12 → 80x24)
 //!   while a background split *unzooms* the window. See the design doc §6.
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -81,6 +83,11 @@ pub struct TmuxTerminal {
     /// backend never needs it to restore focus (tmux creates without focusing
     /// natively, via `-d`).
     own_pane: Option<WindowId>,
+    /// What the dashboard's window was called before the first
+    /// `set_own_tab_title`, plus whether `automatic-rename` was on — restored on
+    /// the way out. `None` until we have actually renamed it, so
+    /// `restore_own_tab_title` knows there is nothing to undo.
+    saved_window_name: Mutex<Option<(String, bool)>>,
 }
 
 impl TmuxTerminal {
@@ -100,6 +107,7 @@ impl TmuxTerminal {
             server_pid,
             session,
             own_pane,
+            saved_window_name: Mutex::new(None),
         })
     }
 
@@ -505,8 +513,81 @@ impl Terminal for TmuxTerminal {
         Ok(())
     }
 
+    /// Rename the tmux *window* holding the dashboard's pane. An OSC title would
+    /// reach only the pane title here — `allow-rename` is off by default, and
+    /// turning it on for the user's window to route a label through it would be a
+    /// far bigger footprint than a rename.
+    ///
+    /// `-t <pane>` is deliberate: tmux resolves a pane id to the window that holds
+    /// it (probe-verified), so the dashboard's window needs no separate lookup and
+    /// stays correct if the pane is moved between windows.
+    async fn set_own_tab_title(&self, title: &str) -> Result<()> {
+        let Some(pane) = self.own_pane.as_ref() else {
+            return Ok(());
+        };
+        let pane = pane_id(pane.as_str())?;
+        // Capture what to put back, once, before the first rename overwrites it.
+        // `automatic-rename` rides along because tmux turns it off itself on any
+        // explicit rename — leave that behind and the window stays pinned to its
+        // last count long after the dashboard is gone.
+        let unsaved = self
+            .saved_window_name
+            .lock()
+            .expect("saved window name mutex")
+            .is_none();
+        if unsaved {
+            let probed = self
+                .tmux_cmd(&["display-message", "-p", "-t", pane, WINDOW_NAME_FORMAT])
+                .await?;
+            *self
+                .saved_window_name
+                .lock()
+                .expect("saved window name mutex") = Some(parse_window_name(&probed));
+        }
+        self.tmux_cmd(&["rename-window", "-t", pane, title]).await?;
+        Ok(())
+    }
+
+    async fn restore_own_tab_title(&self) -> Result<()> {
+        let saved = self
+            .saved_window_name
+            .lock()
+            .expect("saved window name mutex")
+            .take();
+        // Nothing saved = never renamed, so there is nothing to undo.
+        let (Some((name, automatic)), Some(pane)) = (saved, self.own_pane.as_ref()) else {
+            return Ok(());
+        };
+        let pane = pane_id(pane.as_str())?;
+        self.tmux_cmd(&["rename-window", "-t", pane, &name]).await?;
+        if automatic {
+            // Re-derives the name from the running command, which is exactly what
+            // would have happened had we never renamed it.
+            self.tmux_cmd(&["set-option", "-w", "-t", pane, "automatic-rename", "on"])
+                .await?;
+        }
+        Ok(())
+    }
+
     fn capabilities(&self) -> Capabilities {
         CAPABILITIES
+    }
+}
+
+/// What `set_own_tab_title` asks about the dashboard's window before renaming it.
+const WINDOW_NAME_FORMAT: &str = "#{window_name}\t#{automatic-rename}";
+
+/// Parse a [`WINDOW_NAME_FORMAT`] reply into the name and whether tmux was
+/// auto-naming the window. A window name may contain anything, so the flag —
+/// rendered as `1`/`0` — goes last and the split is on the *last* tab.
+fn parse_window_name(reply: &str) -> (String, bool) {
+    let line = reply.trim_end_matches(['\n', '\r']);
+    match line.rsplit_once('\t') {
+        Some((name, automatic)) => (name.to_string(), automatic.trim() == "1"),
+        // No separator at all means a tmux that didn't render the format; keep
+        // the text as the name and assume auto-naming was off (the conservative
+        // half — restoring it on would rename a window we never touched).
+        None => (line.to_string(), false),
     }
 }
 
@@ -520,6 +601,7 @@ mod tests {
             server_pid: "4242".into(),
             session: "work".into(),
             own_pane: Some(WindowId("%3".into())),
+            saved_window_name: Mutex::new(None),
         }
     }
 
@@ -587,6 +669,24 @@ mod tests {
         assert!(parse_spawn_ids("%1").is_err());
         assert!(parse_spawn_ids("1 2").is_err());
         assert!(parse_spawn_ids("").is_err());
+    }
+
+    /// What the dashboard's window has to be put back to on the way out. A window
+    /// name is free text (an OSC-renamed one can hold a tab), so the split is on
+    /// the *last* separator and the `1`/`0` flag rides last.
+    #[test]
+    fn parse_window_name_splits_off_the_trailing_flag() {
+        assert_eq!(parse_window_name("zsh\t1\n"), ("zsh".into(), true));
+        assert_eq!(parse_window_name("miao\t0"), ("miao".into(), false));
+        // A name carrying the separator keeps all of it.
+        assert_eq!(
+            parse_window_name("build\tstage\t1"),
+            ("build\tstage".into(), true)
+        );
+        assert_eq!(parse_window_name("\t1"), ("".into(), true));
+        // No flag rendered at all: keep the text, and don't turn auto-naming on
+        // for a window we may never have renamed.
+        assert_eq!(parse_window_name("plain"), ("plain".into(), false));
     }
 
     #[test]
@@ -743,6 +843,7 @@ mod tests {
             server_pid: server_pid.clone(),
             session: "it".into(),
             own_pane: None,
+            saved_window_name: Mutex::new(None),
         };
 
         // -- spawn: one atomic create reports BOTH ids, which is the contract
@@ -845,6 +946,52 @@ mod tests {
             run(argv("display-message -p #{window_id}")).await,
             before,
             "join-pane -d must not drag the client"
+        );
+
+        // -- own-tab title: the dashboard labels the window holding its own pane
+        // with the attention count and hands the name back on the way out. Both
+        // halves are probed on a window tmux is *auto*-naming, because an explicit
+        // rename silently turns `automatic-rename` off — restore the name without
+        // the flag and the window stays frozen on a dead dashboard's count.
+        let own_pane = WindowId(run(argv("new-window -d -P -F #{pane_id} sleep 600")).await);
+        let dashboard = TmuxTerminal {
+            socket: socket.clone(),
+            server_pid: server_pid.clone(),
+            session: "it".into(),
+            own_pane: Some(own_pane.clone()),
+            saved_window_name: Mutex::new(None),
+        };
+        let probe_name = || {
+            run(vec![
+                "display-message".into(),
+                "-p".into(),
+                "-t".into(),
+                own_pane.to_string(),
+                WINDOW_NAME_FORMAT.into(),
+            ])
+        };
+        let before = probe_name().await;
+        assert!(
+            before.ends_with('1'),
+            "expected tmux to be auto-naming the fresh window: {before:?}"
+        );
+        dashboard
+            .set_own_tab_title("miao (2)")
+            .await
+            .expect("set_own_tab_title");
+        assert_eq!(
+            probe_name().await,
+            "miao (2)\t0",
+            "the rename must land on the pane's window, and tmux pins it"
+        );
+        dashboard
+            .restore_own_tab_title()
+            .await
+            .expect("restore_own_tab_title");
+        assert_eq!(
+            probe_name().await,
+            before,
+            "the name AND its auto-rename flag must both come back"
         );
 
         // -- close, then close again: a speculative close of a dead id is what

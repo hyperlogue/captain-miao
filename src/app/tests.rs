@@ -1434,6 +1434,48 @@ fn host_served_flags_are_adopted_onto_rows() {
     assert!(d.app.flags_of(&key).pin_seq > 0);
 }
 
+/// The tab label is what the dashboard says about itself while you are looking
+/// at some *other* tab, so the number behind it has to be the whole picture —
+/// and has to disappear when there is nothing to say.
+#[test]
+fn the_tab_label_carries_the_unfiltered_attention_count() {
+    use super::dashboard_tab_title;
+    let mut d = TestDashboard::new(120, 10);
+    let waiting = session(1, "/home/test/a", SessionStatus::WaitingForApproval);
+    let deciding = session(2, "/home/test/b", SessionStatus::WaitingForDecision);
+    d.set_sessions(vec![
+        waiting.clone(),
+        deciding.clone(),
+        session(3, "/home/test/c", SessionStatus::Active),
+    ]);
+    assert_eq!(d.app.attention_count(), 2);
+    assert_eq!(dashboard_tab_title(d.app.attention_count()), "miao (2)");
+
+    // A search narrows what you're looking at, never what wants you — and the
+    // label is read from a tab where the filter isn't even visible.
+    d.app.search_filter = Some("zzz".into());
+    d.app.mark_dirty(Cursor::Top); // what the search handler does; the order is cached
+    assert_eq!(d.app.visible_sessions().len(), 0);
+    assert_eq!(d.app.attention_count(), 2);
+
+    // Muting is the user saying "not this one", so it does come off the count.
+    d.app
+        .update_flags(super::flag_key(&waiting), Cursor::HoldIndex, |f| {
+            f.muted = true
+        });
+    assert_eq!(d.app.attention_count(), 1);
+    assert_eq!(dashboard_tab_title(d.app.attention_count()), "miao (1)");
+
+    // Nothing waiting reads as a bare name: a parenthesised zero that is always
+    // on screen is exactly the thing the count exists to *not* be.
+    d.app
+        .update_flags(super::flag_key(&deciding), Cursor::HoldIndex, |f| {
+            f.muted = true
+        });
+    assert_eq!(d.app.attention_count(), 0);
+    assert_eq!(dashboard_tab_title(0), "miao");
+}
+
 #[test]
 fn attention_sessions_sort_first() {
     let mut d = TestDashboard::new(120, 15);

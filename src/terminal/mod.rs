@@ -286,6 +286,37 @@ pub trait Terminal: Send + Sync {
     /// Move window `id` into another tab.
     async fn move_window_to_tab(&self, id: &WindowId, to: TabTarget) -> Result<()>;
 
+    /// Label the tab the *calling* process sits in. The dashboard keeps its
+    /// attention count there (`miao (2)`), so the tab bar answers "does anything
+    /// want me?" without switching to the dashboard at all.
+    ///
+    /// The default is an OSC title escape on this process's own stdout, which is
+    /// exactly what Kitty wants: its default `tab_title_template` is the active
+    /// window's title, so an app-set title *is* the tab label — and it costs no
+    /// `kitten @` command, which matters because the README's recommended rc
+    /// allowlist is a closed set of eight and a ninth would be denied outright on
+    /// every user running it. A multiplexer names its own tabs and overrides this
+    /// with a CLI rename instead (an OSC there reaches only the pane title).
+    ///
+    /// Best-effort by contract: the label is cosmetic, so callers log a failure
+    /// and carry on.
+    async fn set_own_tab_title(&self, title: &str) -> Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title))?;
+        Ok(())
+    }
+
+    /// Put back whatever the tab was called before the first
+    /// [`set_own_tab_title`](Terminal::set_own_tab_title), on the way out.
+    ///
+    /// Default: nothing to undo. An OSC title belongs to the window, which either
+    /// closes with the process or is retitled by the next shell prompt. A
+    /// multiplexer rename is different in kind — it is persistent state in the
+    /// server, so a dashboard that exited would otherwise leave its count stamped
+    /// on a tab it no longer runs in.
+    async fn restore_own_tab_title(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// What this backend can do beyond the required primitives, as one
     /// [`Capabilities`] value (per-flag rationale on its fields). A constant,
     /// not IO, hence sync; the default claims everything (Kitty).

@@ -994,6 +994,22 @@ pub(super) fn matches_key(s: &LauncherState, key: &FlagKey) -> bool {
     s.host == key.0 && s.launcher_pid == key.1
 }
 
+/// The dashboard's own tab label: the binary's name, carrying the attention
+/// count when there is one.
+///
+/// `0` renders as a bare `miao` rather than `miao (0)`. The number exists to
+/// catch the eye from a tab bar the dashboard isn't on; one that is *always*
+/// there stops doing that, and a parenthesised zero reads like a defect besides.
+/// Pure, so the one thing about this feature that is worth pinning is testable
+/// without a terminal.
+pub(super) fn dashboard_tab_title(attention: usize) -> String {
+    if attention == 0 {
+        "miao".to_string()
+    } else {
+        format!("miao ({attention})")
+    }
+}
+
 /// Pluralize "session" for the restart-confirmation prompts.
 fn plural_sessions(n: usize) -> &'static str {
     if n == 1 { "session" } else { "sessions" }
@@ -1270,6 +1286,19 @@ impl App {
 
     pub(super) fn is_follow_up(&self, key: &FlagKey) -> bool {
         self.flags_of(key).follow_up
+    }
+
+    /// How many sessions are soliciting attention right now — the number the
+    /// dashboard's own tab label carries (see [`dashboard_tab_title`]).
+    ///
+    /// Counted over *every* session, not the visible projection: a search filter
+    /// narrows what you are looking at, never what wants you, and the tab label is
+    /// read precisely when the dashboard is not on screen.
+    pub(super) fn attention_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| self.is_attention_row(s))
+            .count()
     }
 
     /// Whether a session is currently soliciting attention: an unmuted session
