@@ -88,6 +88,9 @@ pub(super) enum Action {
         cwd: String,
         /// Host to open on (local unless chosen with `Ctrl-h` in the picker).
         host: HostId,
+        /// Launch into a fresh agent-created git worktree under `cwd` rather
+        /// than in `cwd` itself (`Ctrl-g` in the picker).
+        worktree: bool,
     },
     FetchTabsForMove(WindowId),
     MoveWindow(WindowId, TabTarget),
@@ -254,6 +257,16 @@ pub(super) enum PickerKind {
         /// with `Ctrl-h` (per-launch only). A remote host opens the session in
         /// that host's pty pool and attaches over ssh (§8).
         host: HostId,
+        /// Launch into a fresh git worktree instead of the cwd itself, toggled
+        /// in-picker with `Ctrl-g` (per-launch only, never persisted — unlike
+        /// the agent and host defaults, isolation is a property of the *task*
+        /// you're starting, not a standing preference).
+        ///
+        /// Always `false` for an agent that can't do it
+        /// (`AgentControl::supports_worktrees`); a `Ctrl-t` onto such an agent
+        /// clears it rather than carrying a request that would be silently
+        /// dropped at launch.
+        worktree: bool,
     },
     /// Set the persistent default backend for new sessions (`Space a`).
     DefaultAgent,
@@ -3847,7 +3860,11 @@ impl App {
             return;
         };
         let spans: Vec<Span<'static>> = match &active.kind {
-            PickerKind::Workdir { agent, host } => {
+            PickerKind::Workdir {
+                agent,
+                host,
+                worktree,
+            } => {
                 let mut spans = vec![
                     Span::styled(" Agent ", dim),
                     Span::styled(agent.label().to_string(), value),
@@ -3856,6 +3873,13 @@ impl App {
                 if self.backends.len() > 1 {
                     spans.push(Span::styled("   Host ", dim));
                     spans.push(host_span(self, host));
+                }
+                // Shown only when armed, and only where it's possible. An
+                // agent without worktrees says nothing rather than showing a
+                // permanent "off" for a thing it can't do.
+                if *worktree && agent.supports_worktrees() {
+                    spans.push(Span::styled("   Worktree ", dim));
+                    spans.push(Span::styled("new".to_string(), value));
                 }
                 spans
             }
@@ -4047,7 +4071,16 @@ impl App {
             .with_tab_completion(true);
         self.picker = Some(ActivePicker {
             picker,
-            kind: PickerKind::Workdir { agent, host },
+            // Worktrees start off on every launch. There is no persisted
+            // default for it on purpose: `Space a`/`Space H` answer "what do I
+            // usually use", while isolation answers "is *this* task one that
+            // should not touch my checkout" — a question with a different
+            // answer nearly every time.
+            kind: PickerKind::Workdir {
+                agent,
+                host,
+                worktree: false,
+            },
         });
         self.input_mode = InputMode::Picker;
         self.refresh_picker_footer();

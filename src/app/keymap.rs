@@ -319,7 +319,7 @@ impl Command {
             Command::JumpBottom => "jump to bottom (last unmuted first)",
             Command::FocusSelected => "focus selected window",
             Command::NewSession => "new session (same tab)",
-            Command::NewSessionPrompt => "new session (prompt for cwd)",
+            Command::NewSessionPrompt => "new session (prompt for cwd; Ctrl-g for a worktree)",
             Command::ResumePicker => "resume picker",
             Command::ForkSession => "fork / resume selected in place",
             Command::CopySessionId => "copy selected session id to clipboard",

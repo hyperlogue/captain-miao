@@ -286,6 +286,10 @@ impl App {
                             .selected_session_ref()
                             .map(|s| s.host.clone())
                             .unwrap_or_else(HostId::local),
+                        // `o` is the no-questions path — same cwd, straight to a
+                        // window. Isolation is a decision, so it lives on `O`'s
+                        // picker (`Ctrl-w`) where it can be seen before Enter.
+                        worktree: false,
                     }),
                     None => {
                         self.open_workdir_picker();
@@ -630,11 +634,17 @@ impl App {
     /// is rejected: the picker stays open with an inline error.
     fn submit_workdir(&mut self, idx: Option<usize>) -> Option<Action> {
         let active = self.picker.as_ref()?;
-        let PickerKind::Workdir { agent, host } = &active.kind else {
+        let PickerKind::Workdir {
+            agent,
+            host,
+            worktree,
+        } = &active.kind
+        else {
             return None;
         };
         let agent = *agent;
         let host = host.clone();
+        let worktree = *worktree;
         // Extract everything from the picker up front so its borrow ends before we
         // call `&mut self` (set_error) and the blocking host RPCs below.
         let typed = active.picker.input.text().trim().to_string();
@@ -700,7 +710,12 @@ impl App {
         self.picker = None;
         self.workdir_completion = None;
         self.input_mode = InputMode::Normal;
-        Some(Action::NewSessionSplit { agent, cwd, host })
+        Some(Action::NewSessionSplit {
+            agent,
+            cwd,
+            host,
+            worktree,
+        })
     }
 
     /// Build the `ResumeSession` action shared by the resume picker and the
@@ -737,15 +752,53 @@ impl App {
         // for the path input.)
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('t'))
-            && let PickerKind::Workdir { agent, host, .. } = &mut active.kind
+            && let PickerKind::Workdir {
+                agent,
+                host,
+                worktree,
+            } = &mut active.kind
         {
             let all = AgentControl::ALL;
             let cur = all.iter().position(|a| a == agent).unwrap_or(0);
             *agent = all[(cur + 1) % all.len()];
+            // Switching onto an agent without worktrees disarms the request
+            // rather than holding it: it would be dropped at launch, and the
+            // footer hides it, so it would sit invisibly armed and then reappear
+            // on a switch back — a launch nobody asked for.
+            if !agent.supports_worktrees() {
+                *worktree = false;
+            }
             active.picker.title = super::format::workdir_picker_title(*agent, host);
             // The popup's own status line carries the chosen agent (§9), so it
             // has to be rebuilt with it.
             self.refresh_picker_footer();
+            return None;
+        }
+        // Ctrl-G in the workdir picker arms an isolated **g**it worktree for
+        // this launch — the agent creates it (see `AgentControl::worktree_args`),
+        // so the key is offered only for an agent that has the concept and is
+        // otherwise reported rather than silently ignored. Per-launch only:
+        // nothing about it is persisted.
+        //
+        // Deliberately *not* `Ctrl-W`, the obvious mnemonic: the picker's path
+        // input binds it to readline delete-previous-word (pinned by
+        // `picker_readline_ctrl_w_deletes_prev_word`), and an intercept here
+        // would take it away from every path the user types. Same reason
+        // `Ctrl-T`/`Ctrl-H` sit where they do — `a`/`e`/`b`/`f`/`d`/`u`/`k` are
+        // all spoken for by the input.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('g'))
+            && let PickerKind::Workdir {
+                agent, worktree, ..
+            } = &mut active.kind
+        {
+            if agent.supports_worktrees() {
+                *worktree = !*worktree;
+                self.refresh_picker_footer();
+            } else {
+                let label = agent.label();
+                self.set_status(format!("{label} has no worktree support"), true);
+            }
             return None;
         }
         // Ctrl-H in the workdir picker cycles the host this launch opens on —

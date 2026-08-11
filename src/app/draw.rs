@@ -1709,9 +1709,15 @@ impl App {
                 spans.extend(hint_pair("Esc", "clear/cancel"));
                 let multi_host = self.backends.len() > 1;
                 match self.picker.as_ref().map(|a| &a.kind) {
-                    Some(PickerKind::Workdir { .. }) => {
+                    Some(PickerKind::Workdir { agent, .. }) => {
                         spans.extend(hint_pair("Ctrl-d", "drop dir"));
                         spans.extend(hint_pair("Ctrl-t", "agent"));
+                        // Hidden for an agent that has no worktrees, the same
+                        // rule as `t` on zellij and `Space l` on tmux: don't
+                        // offer a key that can only report it does nothing.
+                        if agent.supports_worktrees() {
+                            spans.extend(hint_pair("Ctrl-g", "worktree"));
+                        }
                         if multi_host {
                             spans.extend(hint_pair("Ctrl-h", "host"));
                         }

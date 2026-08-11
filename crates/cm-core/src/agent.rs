@@ -78,6 +78,44 @@ impl AgentControl {
         }
     }
 
+    /// Extra args that launch this agent into an isolated git **worktree**, or
+    /// `None` when the agent has no worktree concept.
+    ///
+    /// The worktree itself is entirely the *agent's* — captain-miao never runs
+    /// `git worktree add`. Claude Code creates it under
+    /// `.claude/worktrees/<name>/` on a new branch, honours `worktree.baseRef`
+    /// and `.worktreeinclude`, blocks edits that would reach the main checkout,
+    /// and cleans up when the session exits; a resume returns the session to it
+    /// with no help from us. Owning any of that here would mean a second,
+    /// disagreeing implementation of a thing the agent already does better.
+    ///
+    /// `name` is the worktree name; `None` lets the agent generate one (Claude
+    /// mints e.g. `bright-running-fox`). Codex 0.147 has no equivalent flag, so
+    /// it answers `None` and the dashboard hides the affordance — the same shape
+    /// as [`Self::session_watch_path`] and [`Self::bg_shells`], which are
+    /// likewise Claude-only.
+    pub fn worktree_args(self, name: Option<&str>) -> Option<Vec<String>> {
+        match self {
+            AgentControl::Claude => {
+                let mut v = vec!["--worktree".to_string()];
+                // A `#`-prefixed PR number is a legitimate name (`--worktree
+                // "#1234"` branches from that PR), so nothing here inspects it.
+                if let Some(name) = name.filter(|n| !n.is_empty()) {
+                    v.push(name.to_string());
+                }
+                Some(v)
+            }
+            AgentControl::Codex => None,
+        }
+    }
+
+    /// Whether this agent can launch into an isolated worktree. Derived from
+    /// [`Self::worktree_args`] rather than matched separately, so the UI gate
+    /// and the argv can never disagree about which agents support it.
+    pub fn supports_worktrees(self) -> bool {
+        self.worktree_args(None).is_some()
+    }
+
     // -- Dashboard-side: filesystem watching, transcript reading, naming --
 
     /// Filesystem paths whose changes should trigger a dashboard reload —

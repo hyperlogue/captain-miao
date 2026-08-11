@@ -524,6 +524,11 @@ async fn launch_agent(
     resume: Option<(&str, bool)>,
     copy: &LaunchCopy,
     host: &HostId,
+    // `worktree`: launch into a fresh agent-created worktree rather than `cwd`
+    // itself. Only ever set on a brand-new session — a resume returns the
+    // session to the worktree it was already in (the agent tracks that
+    // binding), so asking for one here would be a second, conflicting request.
+    worktree: bool,
 ) {
     // The cwd goes into the recent list of the host it lands on — never another
     // one's, so a mac path can't pollute a Linux box's picker.
@@ -540,6 +545,11 @@ async fn launch_agent(
         agent,
         cwd: cwd.to_string(),
         resume: resume.map(|(id, fork)| (id.to_string(), fork)),
+        // Empty name: the agent generates one (Claude mints e.g.
+        // `bright-running-fox`). Naming it is a follow-up — it needs a second
+        // input in the picker, and an unnamed worktree is also the one Claude
+        // cleans up without prompting on exit.
+        worktree: worktree.then(String::new),
     };
     let plan = {
         let Some(backend) = app.backend_for(host) else {
@@ -805,6 +815,11 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
         Some((session_id.as_str(), false)),
         &LAUNCH_COPY_RESTART,
         &host,
+        // A restart resumes, and a resumed session is returned to whatever
+        // worktree it was in by the agent itself — so a restarted worktree
+        // session keeps its isolation without being asked for it again, and
+        // asking would create a *second* worktree beside the one it resumes to.
+        false,
     )
     .await;
     // Detect launch failure: launch_agent flips `status_is_error` to true on
@@ -1468,8 +1483,22 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                             }
                         }
                     }
-                    Action::NewSessionSplit { agent, cwd, host } => {
-                        launch_agent(&mut app, agent, &cwd, None, &LAUNCH_COPY_NEW, &host).await;
+                    Action::NewSessionSplit {
+                        agent,
+                        cwd,
+                        host,
+                        worktree,
+                    } => {
+                        launch_agent(
+                            &mut app,
+                            agent,
+                            &cwd,
+                            None,
+                            &LAUNCH_COPY_NEW,
+                            &host,
+                            worktree,
+                        )
+                        .await;
                     }
                     Action::FetchTabsForMove(window_id) => match terminal::get().snapshot().await {
                         Ok(tabs) => app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs)),
@@ -1674,6 +1703,11 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                             Some((session_id.as_str(), fork)),
                             &LAUNCH_COPY_RESUME,
                             &host,
+                            // As in `restart_one`: the agent re-enters the
+                            // session's own worktree on resume. (A `--fork-session`
+                            // deliberately starts in the launch directory, which
+                            // is the agent's call, not ours to override.)
+                            false,
                         )
                         .await;
                     }

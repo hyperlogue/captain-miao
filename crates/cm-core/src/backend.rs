@@ -36,6 +36,15 @@ pub struct OpenSpec {
     /// `Some((session_id, fork))` to resume an existing session (`fork` continues
     /// it on a branch instead of in place); `None` for a brand-new session.
     pub resume: Option<(String, bool)>,
+    /// `Some(name)` launches the session in an isolated git worktree; an empty
+    /// name lets the agent generate one. `None` is an ordinary launch.
+    ///
+    /// `#[serde(default)]` because this rides the wire: an older server decodes
+    /// a newer client's spec by skipping the field, and a newer server decodes
+    /// an older client's by defaulting it — the additive rule that keeps v4 the
+    /// last refusing protocol bump.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 /// How the client attaches a *local* window to a session `open_session` made
@@ -373,6 +382,17 @@ impl LocalBackend {
         if let Some((session_id, fork)) = &spec.resume {
             argv.extend(spec.agent.resume_args(session_id, *fork));
         }
+        // A worktree request the agent can't honour is dropped rather than
+        // failing the launch: `worktree_args` is the single authority on which
+        // agents have the concept, and the dashboard already hides the toggle
+        // for the rest, so reaching here with `Some` means the two disagreed.
+        // Losing the isolation is the recoverable half of that; refusing to open
+        // a session the user asked for is not.
+        if let Some(name) = &spec.worktree
+            && let Some(args) = spec.agent.worktree_args(Some(name))
+        {
+            argv.extend(args);
+        }
         LaunchPlan::SpawnLocal { argv }
     }
 
@@ -567,10 +587,19 @@ mod tests {
     /// `open_session` argv[0] is the resolved exe path (varies by environment),
     /// so the tests assert on the agent-facing tail.
     fn open_argv(agent: AgentControl, resume: Option<(&str, bool)>) -> Vec<String> {
+        open_argv_worktree(agent, resume, None)
+    }
+
+    fn open_argv_worktree(
+        agent: AgentControl,
+        resume: Option<(&str, bool)>,
+        worktree: Option<&str>,
+    ) -> Vec<String> {
         let plan = LocalBackend::default().open_session(&OpenSpec {
             agent,
             cwd: "/work".to_string(),
             resume: resume.map(|(id, fork)| (id.to_string(), fork)),
+            worktree: worktree.map(str::to_string),
         });
         plan.argv()[1..].to_vec()
     }
@@ -579,6 +608,30 @@ mod tests {
     fn open_session_new_session_argv() {
         assert_eq!(open_argv(AgentControl::Claude, None), ["claude", "/work"]);
         assert_eq!(open_argv(AgentControl::Codex, None), ["codex", "/work"]);
+    }
+
+    #[test]
+    fn open_session_worktree_argv() {
+        // An empty name asks the agent to generate one, so no name is passed.
+        assert_eq!(
+            open_argv_worktree(AgentControl::Claude, None, Some("")),
+            ["claude", "/work", "--worktree"]
+        );
+        assert_eq!(
+            open_argv_worktree(AgentControl::Claude, None, Some("feature-auth")),
+            ["claude", "/work", "--worktree", "feature-auth"]
+        );
+        // A `#N` name is a PR to branch from, and must reach the agent intact.
+        assert_eq!(
+            open_argv_worktree(AgentControl::Claude, None, Some("#1234")),
+            ["claude", "/work", "--worktree", "#1234"]
+        );
+        // Codex has no worktree flag: the request is dropped, not turned into
+        // an argument it would reject (which would fail the whole launch).
+        assert_eq!(
+            open_argv_worktree(AgentControl::Codex, None, Some("feature-auth")),
+            ["codex", "/work"]
+        );
     }
 
     #[test]
@@ -629,6 +682,7 @@ mod tests {
             agent: AgentControl::Claude,
             cwd: "~/proj".to_string(),
             resume: None,
+            worktree: None,
         });
         assert_eq!(plan.argv()[2], root.join("proj").display().to_string());
 

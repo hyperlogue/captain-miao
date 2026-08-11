@@ -494,6 +494,83 @@ fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
 }
 
 #[test]
+fn workdir_picker_ctrl_g_arms_a_worktree_for_this_launch() {
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+
+    // Off by default, and the footer offers the key for Claude.
+    d.press(KeyCode::Char('O'));
+    assert_eq!(d.app.input_mode, InputMode::Picker);
+    let out = d.render();
+    assert!(out.contains("Ctrl-g"), "footer should offer the key: {out}");
+    assert!(!out.contains("Worktree"), "off by default: {out}");
+
+    // Ctrl-g arms it; the popup's own status line says so.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert!(d.render().contains("Worktree"));
+
+    // Ctrl-w is *not* the toggle — it stays readline delete-previous-word on
+    // the path input, which is why the toggle isn't spelled with the obvious
+    // mnemonic. Typing a two-word path and killing back leaves the first.
+    for c in "/tmp/aa /tmp/bb".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    let out = d.render();
+    assert!(out.contains("Worktree"), "still armed: {out}");
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+    for c in "/tmp/x".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { worktree, .. }) => assert!(worktree),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.press(KeyCode::Char('O'));
+
+    // Arm it on Claude, then switch to Codex: the request is dropped rather
+    // than held invisibly, since Codex has no worktree flag to spend it on.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert!(d.render().contains("Worktree"));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let out = d.render();
+    assert!(out.contains("New Codex Session"));
+    assert!(!out.contains("Worktree"), "disarmed on switch: {out}");
+    assert!(!out.contains("Ctrl-g"), "hint hidden for Codex: {out}");
+
+    // And pressing it on Codex reports rather than silently doing nothing.
+    // Asserted on the status field, not the frame: an open picker's hint ribbon
+    // owns the footer row the status would otherwise paint into.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert_eq!(
+        d.app.status_msg.as_deref(),
+        Some("Codex has no worktree support")
+    );
+    assert!(d.app.status_is_error);
+
+    for c in "/tmp/x".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { worktree, .. }) => assert!(!worktree),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+#[test]
 fn workdir_picker_defaults_to_local_host() {
     let mut d = TestDashboard::new(120, 10);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);

@@ -4177,6 +4177,7 @@ mod tests {
             agent: AgentControl::Claude,
             cwd: "/work".to_string(),
             resume: None,
+            worktree: None,
         };
         let backend = Backend::Remote(remote);
         assert!(tokio::task::block_in_place(|| backend.open_session(&spec)).is_err());
@@ -4195,6 +4196,7 @@ mod tests {
             agent: AgentControl::Claude,
             cwd: "/work".to_string(),
             resume: None,
+            worktree: None,
         };
         let plan = tokio::task::block_in_place(|| backend.open_session(&spec)).unwrap();
         match plan {

@@ -196,7 +196,15 @@ Press `?` in the dashboard for the complete list. Highlights:
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
-In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, and `Ctrl-d` drops the highlighted recent directory.
+In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, `Ctrl-d` drops the highlighted recent directory, and `Ctrl-g` starts the session in a fresh **git worktree**.
+
+Worktrees are created by the agent, not by captain-miao: `Ctrl-g` adds `--worktree`
+to the launch, and Claude Code does the rest — a new branch under
+`.claude/worktrees/`, `.worktreeinclude` files copied in, edits to your main
+checkout blocked, and a keep-or-remove prompt when the session exits. Resuming or
+restarting a worktree session returns it to the same worktree without asking
+again. Codex has no equivalent, so the key is hidden when it's the selected
+backend.
 
 **Custom keybindings.** Every Normal-mode command above is remappable via a `[keybinds]` table in `~/.config/captain-miao/config.toml`. Map a command id to a key (or list of keys); an empty list unbinds it:
 
