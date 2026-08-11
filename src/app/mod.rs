@@ -368,6 +368,33 @@ pub(super) struct DirectoryMarks {
     pub marks: HashMap<String, DirectoryMark>,
 }
 
+/// What the table cursor does across a mutation that changes a **sort key**.
+///
+/// The session list is filtered and sorted, and the selection is an index into
+/// that projection — so pinning, muting, a status flip, an attach or a detach
+/// all move rows past a cursor that cannot feel it. Every such mutation goes
+/// through [`App::mark_dirty`], which takes one of these; there is no default,
+/// because all four are genuinely in use and picking one silently is how the
+/// cursor ends up on a session the user never chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Cursor {
+    /// Stay on the session the cursor is on, wherever the re-sort moves it.
+    /// The common case, and what a user means by "I was looking at this one".
+    FollowSession,
+    /// Move to a specific session, identified **before** the mutation. Clearing
+    /// a follow-up bell uses this to advance to the next triage target: the row
+    /// being cleared is exactly the one you're done with.
+    Follow(FlagKey),
+    /// Leave the index alone (clamped) and let whatever re-sorts into it come
+    /// to the cursor. Muting wants this — you're working down a list, so the
+    /// next row should arrive under your finger. It is also the honest answer
+    /// when a mutation invalidates the caches for *rendering* reasons without
+    /// reordering anything.
+    HoldIndex,
+    /// Back to the top, because the list is now a different list (search).
+    Top,
+}
+
 /// The live identity of a `(host, cwd)` work tab: the tab captain-miao spawned
 /// plus the id of the window it created inside it. The window id pins the tab's
 /// identity beyond its recycled-prone id + title — zellij pane ids never recycle,
@@ -1179,8 +1206,58 @@ impl App {
         }
     }
 
-    pub(super) fn mark_dirty(&mut self) {
+    /// Invalidate the derived caches (visible order, dir labels) after a
+    /// mutation, and apply `cursor` to the table selection.
+    ///
+    /// The cursor argument is **required, with no default**, because the
+    /// selection is a bare index into the *sorted* projection: any mutation
+    /// that touches a sort key slides rows past it, so the index survives while
+    /// the session it names does not. Bumping the version invalidates the order
+    /// cache and says nothing about the index derived from it — which is
+    /// precisely how four binding paths ended up re-iconing a row and leaving
+    /// the cursor on whichever session took its slot. Every answer in [`Cursor`]
+    /// is deliberately in use here, so there is no safe default to pick
+    /// silently; making the caller name one is the whole point.
+    pub(super) fn mark_dirty(&mut self, cursor: Cursor) {
+        // Read the anchor *before* the bump, while the cached order still
+        // describes the pre-mutation list.
+        let anchor = matches!(cursor, Cursor::FollowSession)
+            .then(|| self.anchored_key())
+            .flatten();
         self.mutation_version = self.mutation_version.wrapping_add(1);
+        match cursor {
+            // No anchor (cold cache — see `anchored_key`) degrades to holding
+            // the index, which is what this did before the cursor existed.
+            Cursor::FollowSession => match anchor {
+                Some(key) => self.reselect(&key),
+                None => self.clamp_selection(),
+            },
+            Cursor::Follow(key) => self.reselect(&key),
+            Cursor::HoldIndex => self.clamp_selection(),
+            Cursor::Top => self.reset_selection(),
+        }
+    }
+
+    /// The selected session's key as of the **last computed** visible order, or
+    /// `None` when that cache is cold.
+    ///
+    /// Deliberately does not recompute on a miss, unlike every other reader.
+    /// [`mark_dirty`](Self::mark_dirty) calls this after the mutation has
+    /// already landed, so a recompute would sort the *new* list and hand back
+    /// the session that just took the cursor's slot — the exact wrong answer,
+    /// and one indistinguishable from the right one. `None` instead lets the
+    /// caller fall back to holding the index. In the running dashboard the
+    /// cache is warm whenever this runs (every frame draws the list, and
+    /// mutations land between frames); a cold read is a test that mutated
+    /// before anything rendered.
+    fn anchored_key(&self) -> Option<FlagKey> {
+        let i = self.table_state.selected()?;
+        let cache = self.cached_visible.borrow();
+        let (version, indices) = cache.as_ref()?;
+        if *version != self.mutation_version {
+            return None;
+        }
+        self.sessions.get(*indices.get(i)?).map(flag_key)
     }
 
     pub(super) fn flags_of(&self, key: &FlagKey) -> SessionFlags {
@@ -1225,7 +1302,7 @@ impl App {
             if !alive.contains(&pid) || self.flags_of(&key).follow_up {
                 continue;
             }
-            self.update_flags(key, |f| {
+            self.update_flags(key, Cursor::FollowSession, |f| {
                 f.follow_up = true;
                 f.muted = false;
             });
@@ -1268,7 +1345,7 @@ impl App {
             } else {
                 mine.pin_seq
             };
-            self.update_flags(key, move |f| {
+            self.update_flags(key, Cursor::FollowSession, move |f| {
                 f.pinned = host_flags.pinned;
                 f.muted = host_flags.muted;
                 f.follow_up = host_flags.follow_up;
@@ -1301,7 +1378,16 @@ impl App {
 
     /// Mutate a session's flags; removes the entry entirely if the result is
     /// all-false to keep the map sparse.
-    pub(super) fn update_flags(&mut self, key: FlagKey, update: impl FnOnce(&mut SessionFlags)) {
+    /// Every flag here (pinned / muted / follow-up) is a sort key, so this takes
+    /// a [`Cursor`] like any other re-sorting mutation rather than picking one
+    /// for its callers — muting and clearing a bell deliberately want different
+    /// answers from the rest.
+    pub(super) fn update_flags(
+        &mut self,
+        key: FlagKey,
+        cursor: Cursor,
+        update: impl FnOnce(&mut SessionFlags),
+    ) {
         let mut f = self.flags_of(&key);
         update(&mut f);
         if f.is_default() {
@@ -1309,7 +1395,7 @@ impl App {
         } else {
             self.flags.insert(key, f);
         }
-        self.mark_dirty();
+        self.mark_dirty(cursor);
     }
 
     /// Re-adopt status flags carried over from a restart. Each restart records
@@ -1350,16 +1436,20 @@ impl App {
             self.flags.insert(key, f);
             self.pending_flag_restores.remove(&wid);
         }
-        self.mark_dirty();
+        // Restored pins float rows up; the user keeps whatever they were on.
+        self.mark_dirty(Cursor::FollowSession);
         true
     }
 
     /// Update the search filter. Wrapping this in a setter is important: it
-    /// bumps `mutation_version`, invalidating the visible/dir-labels caches.
+    /// bumps `mutation_version`, invalidating the visible/dir-labels caches —
+    /// and, since a filter change makes this a different list, sends the cursor
+    /// back to the top. Owning that here rather than at the four key handlers is
+    /// what fixed `ClearSearch`, the one of them that had forgotten to do it.
     pub(super) fn set_search_filter(&mut self, filter: Option<String>) {
         if self.search_filter != filter {
             self.search_filter = filter;
-            self.mark_dirty();
+            self.mark_dirty(Cursor::Top);
         }
     }
 
@@ -1449,7 +1539,8 @@ impl App {
         {
             self.sessions_layout = l;
         }
-        self.mark_dirty();
+        // Startup: nothing is selected yet, and none of these reorder the list.
+        self.mark_dirty(Cursor::HoldIndex);
     }
 
     /// True iff at least one tracked session is currently working — `Active`,
@@ -1852,7 +1943,8 @@ impl App {
         // Stale per-host caches would otherwise outlive the host they describe.
         self.recent_dirs_cache.clear();
         self.reconnect_epochs.clear();
-        self.mark_dirty();
+        // The rows themselves arrive on the next reload, which re-anchors then.
+        self.mark_dirty(Cursor::HoldIndex);
     }
 
     pub(super) fn open_host_edit(&mut self) {
@@ -1946,8 +2038,9 @@ impl App {
         let before = Self::conn_identities(&hosts::load_hosts());
         hosts::save_hosts(&configs);
         if before == Self::conn_identities(&configs) {
+            // An icon-only edit: rendering changed, the order did not.
             self.refresh_host_icons(&configs);
-            self.mark_dirty();
+            self.mark_dirty(Cursor::HoldIndex);
             return;
         }
         self.rebuild_remote_backends();
@@ -2184,7 +2277,12 @@ impl App {
             .map(|s| (flag_key(s), s.status.clone()))
             .collect();
 
-        self.mark_dirty();
+        // The one site that re-anchors by hand rather than through a `Cursor`:
+        // the rows don't exist yet (`collect_sessions` is the next line), and
+        // the restore at the end of this function has priority rules a cursor
+        // can't express — a just-spawned session claims the selection over the
+        // prior one (`pending_focus_window`).
+        self.mark_dirty(Cursor::HoldIndex);
         let fresh = self.collect_sessions();
         // Keep the pre-reload rows so a departed one (its state file vanished —
         // crash / SIGKILL, not a clean kill) can have its held pane reaped: on a
@@ -2218,7 +2316,7 @@ impl App {
         let mut overrides_changed = false;
         let transitions = self.follow_up_transitions(&prev_status, &self.sessions);
         for (key, want) in transitions {
-            self.update_flags(key, |f| f.follow_up = want);
+            self.update_flags(key, Cursor::HoldIndex, |f| f.follow_up = want);
             overrides_changed = true;
         }
         // Bring a just-failed launch's held window to the foreground exactly
@@ -2571,21 +2669,13 @@ impl App {
     /// so the dashboard can resolve and prune it. Used by both the remote attach
     /// path and the local spawn path.
     pub(super) fn record_window_binding(&mut self, host: HostId, token: String, window: WindowId) {
-        let selected = self.selected_key();
         self.window_bindings.record(host, token, window);
         // Bindings feed `is_detached_row`, which is a *sort key*: binding a
-        // window lifts the row out of the detached tier, so the cached visible
-        // order has to be recomputed even though no session changed.
-        self.mark_dirty();
-        // …and that re-sort moves the row out from under the cursor. This is the
+        // window lifts the row out of the detached tier. This is the
         // `Enter`-on-a-detached-row path, so the row that just climbed the list
-        // is the very one the user is acting on — the cursor follows it rather
-        // than staying on an index that now names whatever slid down into it. It
-        // matters just as much for a background auto-reattach, which must not
-        // drag the cursor off whatever the user is looking at.
-        if let Some(key) = selected {
-            self.reselect(&key);
-        }
+        // is the very one the user is acting on — and a background auto-reattach
+        // must not drag the cursor off whatever they were looking at either.
+        self.mark_dirty(Cursor::FollowSession);
     }
 
     /// Retire the binding for `(host, token)` — the explicit `D` detach, where
@@ -2594,12 +2684,8 @@ impl App {
     /// the same invalidate-and-follow dance as every other binding change rather
     /// than poking `window_bindings` directly.
     pub(super) fn retire_window_binding(&mut self, host: &HostId, token: &str) {
-        let selected = self.selected_key();
         self.window_bindings.remove(host, token);
-        self.mark_dirty();
-        if let Some(key) = selected {
-            self.reselect(&key);
-        }
+        self.mark_dirty(Cursor::FollowSession);
     }
 
     /// Mint a fresh, opaque `launch_id` for a local launcher the dashboard is
@@ -2626,7 +2712,6 @@ impl App {
         if self.window_bindings.is_empty() {
             return Vec::new();
         }
-        let selected = self.selected_key();
         let dropped = self.window_bindings.prune_dead(live);
         if !dropped.is_empty() {
             // The dropped rows just became detached, and detachment is a sort
@@ -2634,13 +2719,9 @@ impl App {
             // unplugged icon (computed live) while staying put in the old order
             // until some unrelated reload happened to bump the version. Nothing
             // reloads when an attach window closes, so "until" could be minutes.
-            self.mark_dirty();
-            // The re-sort sinks those rows to the detached tier; keep the cursor
-            // on the session it was on, whether or not that session is one of
-            // them.
-            if let Some(key) = selected {
-                self.reselect(&key);
-            }
+            // The re-sort then sinks them to the detached tier, so the cursor
+            // stays on the session it was on, whether or not it is one of them.
+            self.mark_dirty(Cursor::FollowSession);
         }
         dropped
     }
@@ -2661,7 +2742,6 @@ impl App {
     /// expected-attached memory survives (see `prune_token`), so a host coming
     /// back still restores the window.
     pub(super) fn apply_detach_reports(&mut self, reports: Vec<state::DetachReport>) -> bool {
-        let selected = self.selected_key();
         let mut changed = false;
         for report in reports {
             let host = HostId(report.host);
@@ -2689,14 +2769,11 @@ impl App {
         }
         if changed {
             // Detachment is a sort key, and this path runs outside any reload.
-            self.mark_dirty();
             // A report arrives on its own schedule — the user is looking at the
             // list, not pressing anything — so a row sinking into the detached
             // tier must not take the cursor with it, nor hand it to whichever
             // row rises into the vacated index.
-            if let Some(key) = selected {
-                self.reselect(&key);
-            }
+            self.mark_dirty(Cursor::FollowSession);
             self.write_window_bindings_file();
         }
         changed
@@ -3243,15 +3320,27 @@ impl App {
         if !self.is_follow_up(&key) {
             return;
         }
-        self.update_flags(key.clone(), |f| f.follow_up = false);
+        // The row drops from the attention rank to the idle rank and slides
+        // down; the cursor goes with it rather than staying at an index that
+        // now names whichever row rose into it.
+        self.update_flags(key, Cursor::FollowSession, |f| f.follow_up = false);
         self.save_overrides();
         // Persist the flag change into the restart snapshot too, so a crash
         // before the next reload doesn't restore the stale flag on recovery.
         self.save_session_snapshot();
-        // Re-select the same session at its new (lower) position rather than
-        // leaving the cursor at the old index (which would land on whichever
-        // row slid up into it).
-        self.reselect(&key);
+    }
+
+    /// The session sitting just after the selected row, or just before it when
+    /// the selection is last. Read *before* a mutation, to name the row the
+    /// cursor should advance to once the selected one re-sorts away
+    /// ([`Cursor::Follow`]).
+    fn neighbor_of_selected(&self) -> Option<FlagKey> {
+        let idx = self.table_state.selected()?;
+        let visible = self.visible_sessions();
+        visible
+            .get(idx + 1)
+            .or_else(|| idx.checked_sub(1).and_then(|p| visible.get(p)))
+            .map(|s| flag_key(s))
     }
 
     /// Re-anchor the table cursor on `key`'s row at its (possibly new) index,
@@ -3279,34 +3368,36 @@ impl App {
         let Some(key) = self.selected_key() else {
             return;
         };
-        // `pid` (a copy) drives the cursor-follow logic below; `key` keys flags.
+        // `pid` (a copy) labels the status line; `key` keys flags.
         let pid = key.1;
-        let old_idx = self.table_state.selected();
         let was = self.flags_of(&key);
-        // Clearing needs-input re-sorts the marked row down and away from the
-        // cursor, so we capture which session sat just after it (or just before,
-        // when it's at the end) *before* the toggle and move the cursor there
-        // afterwards. Only that one arm needs the pre-mutation order — every other
-        // toggle just follows the session itself — so compute it lazily instead of
-        // snapshotting the whole visible order on every toggle.
-        let follow_target: Option<FlagKey> =
-            if matches!(flag, SessionFlag::FollowUp) && was.follow_up {
-                old_idx.and_then(|idx| {
-                    let visible_before = self.visible_sessions();
-                    visible_before
-                        .get(idx + 1)
-                        .or_else(|| idx.checked_sub(1).and_then(|p| visible_before.get(p)))
-                        .map(|s| flag_key(s))
-                })
-            } else {
-                None
-            };
+        // Every flag is a sort key, and this one operation wants all three
+        // cursor policies depending on which way it's going — which is exactly
+        // why `mark_dirty` makes the choice explicit instead of assuming one.
+        // Decided here, before the toggle, because the clearing arm needs the
+        // pre-mutation order to name its target.
+        let cursor = match flag {
+            // Muting sinks the row (or hides it outright): hold the index so
+            // the next session arrives under the cursor. Muting is something
+            // you do in a run, so the cursor should stay where the work is.
+            SessionFlag::Mute if !was.muted => Cursor::HoldIndex,
+            // Clearing needs-input drops the row out of the attention tier, so
+            // don't ride it down — advance to the session that sat just after
+            // it (or just before, when it sat at the end). Falls back to the row
+            // itself when it has no neighbour.
+            SessionFlag::FollowUp if was.follow_up => {
+                Cursor::Follow(self.neighbor_of_selected().unwrap_or_else(|| key.clone()))
+            }
+            // Unmute / pin / marking needs-input: the row floats up and the
+            // cursor rides with it, so the user stays on what they just flagged.
+            _ => Cursor::FollowSession,
+        };
         // Mute is mutually exclusive with pin/follow-up: turning any of them on
         // clears the others. Turning pin/follow-up on clears mute.
         let now_on = match flag {
             SessionFlag::Mute => {
                 let on = !was.muted;
-                self.update_flags(key.clone(), |f| {
+                self.update_flags(key.clone(), cursor, |f| {
                     f.muted = on;
                     if on {
                         f.pinned = false;
@@ -3323,7 +3414,7 @@ impl App {
                 } else {
                     0
                 };
-                self.update_flags(key.clone(), move |f| {
+                self.update_flags(key.clone(), cursor, move |f| {
                     f.pinned = on;
                     f.pin_seq = seq;
                     if on {
@@ -3334,7 +3425,7 @@ impl App {
             }
             SessionFlag::FollowUp => {
                 let on = !was.follow_up;
-                self.update_flags(key.clone(), |f| {
+                self.update_flags(key.clone(), cursor, |f| {
                     f.follow_up = on;
                     if on {
                         f.muted = false;
@@ -3352,39 +3443,9 @@ impl App {
             self.save_overrides();
         }
 
-        let len = self.visible_len();
-        if len > 0 {
-            let target = match (flag, now_on) {
-                // Mute: stay at the same row index so the next session slides up.
-                (SessionFlag::Mute, true) => old_idx.unwrap_or(0).min(len - 1),
-                // Clearing needs-input: the row drops out of the attention tier,
-                // so don't keep the cursor on it. Move to the session that was
-                // just after it (or the one just before it when it sat at the
-                // end), following that session to wherever the re-sort floated it.
-                (SessionFlag::FollowUp, false) => {
-                    let visible = self.visible_sessions();
-                    // Fallback chain kept identical: next → prev → self → 0.
-                    follow_target
-                        .as_ref()
-                        .and_then(|tk| visible.iter().position(|s| matches_key(s, tk)))
-                        .or_else(|| visible.iter().position(|s| matches_key(s, &key)))
-                        .unwrap_or(0)
-                }
-                // Unmute / Pin / marking needs-input: follow the session itself.
-                // Marking floats the row up to the attention tier and the cursor
-                // rides with it, so the user stays on the session they just
-                // flagged.
-                (SessionFlag::Mute, false)
-                | (SessionFlag::Pin, _)
-                | (SessionFlag::FollowUp, true) => self
-                    .visible_sessions()
-                    .iter()
-                    .position(|s| matches_key(s, &key))
-                    .unwrap_or(0),
-            };
-            self.table_state.select(Some(target));
-        }
-
+        // No cursor work here: the `Cursor` handed to `update_flags` above
+        // already placed it, which is the point of routing the policy through
+        // `mark_dirty` rather than re-deriving a target after the fact.
         let label = match (flag, now_on) {
             (SessionFlag::Mute, true) => "Muted",
             (SessionFlag::Mute, false) => "Unmuted",

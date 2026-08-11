@@ -5,7 +5,7 @@ use crate::state::{LauncherState, SessionStatus};
 use crate::terminal::{TabId, TabInfo, TabTarget, WindowId};
 
 use super::format::{ansi_to_lines, base64_encode, default_dir_emoji_and_color, format_coarse_age};
-use super::{Action, App, InputMode};
+use super::{Action, App, Cursor, InputMode};
 
 // -- Test harness --
 
@@ -1109,7 +1109,9 @@ fn a_follow_up_bell_does_not_lift_a_detached_row() {
     let here = session(2, "/home/test/here", SessionStatus::Idle);
     d.set_sessions(vec![away, here]);
     d.app
-        .update_flags((HostId("box".into()), 1), |f| f.follow_up = true);
+        .update_flags((HostId("box".into()), 1), Cursor::HoldIndex, |f| {
+            f.follow_up = true
+        });
 
     let order: Vec<u32> = d
         .app
@@ -1482,10 +1484,13 @@ fn review_pending_ranks_below_follow_up_above_idle() {
     d.set_sessions(vec![approval, follow, review, idle]);
 
     // Mark pid 2 needs-input (follow_up) so it occupies the follow-up tier.
-    d.app
-        .update_flags(super::flag_key(&d.app.sessions[1]), |f| {
+    d.app.update_flags(
+        super::flag_key(&d.app.sessions[1]),
+        Cursor::HoldIndex,
+        |f| {
             f.follow_up = true;
-        });
+        },
+    );
 
     // Tiers, top to bottom: attention (approval) > follow-up-flagged >
     // ReviewPending > plain idle. So ReviewPending (pid 3) ranks *below* the
@@ -1512,7 +1517,8 @@ fn clearing_follow_up_on_focus_keeps_cursor_on_the_session() {
 
     // Mark pid 1 needs-input so it floats to the follow-up tier at the top.
     let key = super::flag_key(&d.app.sessions[0]);
-    d.app.update_flags(key.clone(), |f| f.follow_up = true);
+    d.app
+        .update_flags(key.clone(), Cursor::HoldIndex, |f| f.follow_up = true);
     assert_eq!(
         d.app
             .visible_sessions()
@@ -1771,7 +1777,9 @@ fn follow_up_transitions_mark_and_clear() {
         server_to_idle.clone(),
     ];
     d.app
-        .update_flags(flag_key(&muted_to_idle), |f| f.muted = true);
+        .update_flags(flag_key(&muted_to_idle), Cursor::HoldIndex, |f| {
+            f.muted = true
+        });
 
     let prev: HashMap<FlagKey, SessionStatus> = [
         (flag_key(&active_to_idle), SessionStatus::Active),
@@ -1807,7 +1815,9 @@ fn follow_up_transitions_mark_and_clear() {
     // A flagged session that goes back to Active clears the flag.
     let resumed = session(6, "/home/test/f", SessionStatus::Active);
     d.app
-        .update_flags(flag_key(&resumed), |f| f.follow_up = true);
+        .update_flags(flag_key(&resumed), Cursor::HoldIndex, |f| {
+            f.follow_up = true
+        });
     let prev: HashMap<FlagKey, SessionStatus> =
         [(flag_key(&resumed), SessionStatus::ReviewPending)].into();
     let got = d
@@ -1875,8 +1885,11 @@ fn clearing_needs_input_on_last_row_moves_to_previous() {
         session(1, "/home/test/a", SessionStatus::WaitingForApproval),
         session(2, "/home/test/b", SessionStatus::Idle),
     ]);
-    d.app
-        .update_flags(super::flag_key(&d.app.sessions[1]), |f| f.follow_up = true);
+    d.app.update_flags(
+        super::flag_key(&d.app.sessions[1]),
+        Cursor::HoldIndex,
+        |f| f.follow_up = true,
+    );
 
     // Select the flagged last row (order is [1, 2]).
     d.app.table_state.select(Some(1));
@@ -1954,6 +1967,112 @@ fn search_mode_filters() {
     d.press(KeyCode::Esc);
     assert!(d.app.search_filter.is_none());
     assert_eq!(d.app.visible_sessions().len(), 3);
+}
+
+/// Clearing the filter makes the list a different list, so the cursor goes back
+/// to the top. `ClearSearch` used to be the one search path that forgot — its
+/// three siblings each called `reset_selection()` by hand — leaving the cursor
+/// on an index that now named an unrelated session. `set_search_filter` owns the
+/// policy now (`Cursor::Top`), so all four get it.
+#[test]
+fn clearing_the_search_filter_returns_the_cursor_to_the_top() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![
+        session_with_prompt(1, "/home/test/alpha", SessionStatus::Active, "aaa one"),
+        // The unmatched row sits *between* the two matches, so the filtered
+        // list is not a prefix of the full one and index 1 genuinely changes
+        // meaning when the filter drops.
+        session_with_prompt(2, "/home/test/beta", SessionStatus::Active, "zzz two"),
+        session_with_prompt(3, "/home/test/gamma", SessionStatus::Active, "aab three"),
+    ]);
+
+    // Filter to the two `aa` rows and lock it in.
+    d.press(KeyCode::Char('/'));
+    for c in "aa".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert_eq!(d.app.visible_sessions().len(), 2);
+
+    // Put the cursor on the second match.
+    d.app.table_state.select(Some(1));
+    let filtered_pid = d.app.selected_pid();
+
+    // Esc clears the filter: the list grows back to three, so index 1 now names
+    // a different session than it did a moment ago.
+    d.press(KeyCode::Esc);
+    assert!(d.app.search_filter.is_none());
+    assert_eq!(d.app.visible_sessions().len(), 3);
+    assert_eq!(
+        d.app.table_state.selected(),
+        Some(0),
+        "clearing the filter resets the cursor rather than leaving a stale index"
+    );
+    assert_ne!(
+        d.app.nth_visible(1).map(|s| s.launcher_pid),
+        filtered_pid,
+        "index 1 means a different session now — which is why holding it was a bug"
+    );
+}
+
+/// The `mark_dirty` contract itself: the cursor argument is what decides where
+/// the selection lands across a re-sort, and the two answers are genuinely
+/// different. Driven by mutating `flags` directly, so the only thing under test
+/// is the cursor policy — `update_flags` would apply one of its own.
+#[test]
+fn mark_dirty_cursor_decides_where_the_selection_lands() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![
+        session(1, "/home/test/a", SessionStatus::Idle),
+        session(2, "/home/test/b", SessionStatus::Idle),
+        session(3, "/home/test/c", SessionStatus::Idle),
+    ]);
+    let pid_at = |d: &TestDashboard, i: usize| d.app.nth_visible(i).map(|s| s.launcher_pid);
+    assert_eq!(pid_at(&d, 2), Some(3), "pid 3 starts at the bottom");
+    d.app.table_state.select(Some(2));
+
+    // Pin the bottom row so it floats to the top — a re-sort under the cursor.
+    // Straight into `flags`, so the version is untouched until `mark_dirty`.
+    let pin = |d: &mut TestDashboard| {
+        d.app
+            .flags
+            .entry((crate::state::HostId::local(), 3))
+            .or_default()
+            .pinned = true;
+    };
+    let unpin = |d: &mut TestDashboard| {
+        d.app.flags.remove(&(crate::state::HostId::local(), 3));
+    };
+
+    pin(&mut d);
+    d.app.mark_dirty(Cursor::FollowSession);
+    assert_eq!(
+        d.app.selected_pid(),
+        Some(3),
+        "FollowSession rides the row to its new rank"
+    );
+    assert_eq!(d.app.table_state.selected(), Some(0));
+
+    // Same mutation, the other policy: the index stays and whatever re-sorted
+    // into it comes to the cursor.
+    unpin(&mut d);
+    d.app.mark_dirty(Cursor::HoldIndex);
+    d.app.table_state.select(Some(2));
+    let _ = d.app.visible_sessions(); // warm the order cache, as a frame would
+    pin(&mut d);
+    d.app.mark_dirty(Cursor::HoldIndex);
+    assert_eq!(d.app.table_state.selected(), Some(2), "HoldIndex holds it");
+    assert_eq!(
+        d.app.selected_pid(),
+        pid_at(&d, 2),
+        "…so the cursor now names whichever session slid into that slot"
+    );
+    assert_ne!(d.app.selected_pid(), Some(3), "which is not the pinned one");
+
+    // And Top ignores both.
+    d.app.mark_dirty(Cursor::Top);
+    assert_eq!(d.app.table_state.selected(), Some(0));
 }
 
 fn picker_input_text(app: &super::App) -> &str {
@@ -3978,10 +4097,11 @@ fn restart_restores_pin_with_fresh_seq_above_existing() {
     let restarted_wid = restarted.window_id.clone().unwrap();
     d.set_sessions(vec![live, restarted]);
     // A live pinned session already holds the lowest seq.
-    d.app.update_flags((crate::state::HostId::local(), 1), |f| {
-        f.pinned = true;
-        f.pin_seq = 1;
-    });
+    d.app
+        .update_flags((crate::state::HostId::local(), 1), Cursor::HoldIndex, |f| {
+            f.pinned = true;
+            f.pin_seq = 1;
+        });
     d.app.next_pin_seq = 1;
     // Restore a pin onto pid 2 carrying a stale seq from the previous run.
     d.app.pending_flag_restores.insert(
@@ -4065,7 +4185,9 @@ fn override_glyph_gets_wide_symbol_fixup() {
     let mut d = TestDashboard::new(120, 18);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
     d.app
-        .update_flags((crate::state::HostId::local(), 1), |f| f.pinned = true);
+        .update_flags((crate::state::HostId::local(), 1), Cursor::HoldIndex, |f| {
+            f.pinned = true
+        });
     d.render();
 
     let buf = d.terminal.backend().buffer();

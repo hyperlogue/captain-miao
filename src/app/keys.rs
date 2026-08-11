@@ -564,7 +564,6 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.set_search_filter(None);
                 self.search_input.clear();
-                self.reset_selection();
                 None
             }
             KeyCode::Enter => {
@@ -572,7 +571,6 @@ impl App {
                 let filter = self.current_search_filter();
                 self.set_search_filter(filter);
                 self.search_input.clear();
-                self.reset_selection();
                 None
             }
             // Editing (insert, backspace, cursor motion, readline keys) is
@@ -584,7 +582,6 @@ impl App {
                 if matches!(self.search_input.handle_key(key), TextInputEvent::Changed) {
                     let filter = self.current_search_filter();
                     self.set_search_filter(filter);
-                    self.reset_selection();
                 }
                 None
             }
