@@ -198,13 +198,22 @@ Pressing `Space` (the leader) shows a which-key strip of the available follow-up
 
 In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, `Ctrl-d` drops the highlighted recent directory, and `Ctrl-g` starts the session in a fresh **git worktree**.
 
-Worktrees are created by the agent, not by captain-miao: `Ctrl-g` adds `--worktree`
-to the launch, and Claude Code does the rest — a new branch under
-`.claude/worktrees/`, `.worktreeinclude` files copied in, edits to your main
-checkout blocked, and a keep-or-remove prompt when the session exits. Resuming or
-restarting a worktree session returns it to the same worktree without asking
-again. Codex has no equivalent, so the key is hidden when it's the selected
-backend.
+`Ctrl-g` also asks for a name: type one and press Enter for
+`.claude/worktrees/<name>` on a `worktree-<name>` branch (a `#1234` PR reference
+works too), or just press Enter to let the agent name it. `Esc` there means "no
+worktree after all".
+
+Worktrees are created by the agent, not by captain-miao: `Ctrl-g` adds
+`--worktree` to the launch, and Claude Code does the rest — the branch,
+`.worktreeinclude` files copied in, edits to your main checkout blocked, and a
+keep-or-remove prompt when the session exits. Resuming or restarting a worktree
+session returns it to the same worktree without asking again. Codex has no
+equivalent, so the key is hidden when it's the selected backend.
+
+Worktree rows keep their project's identity: the directory icon and colour you
+set with `Space i` are shared with the repo (set it once, every worktree of it
+follows), while `w` opens a work tab per worktree — they're different branches —
+titled `<repo>@<worktree>` so the tab bar stays readable.
 
 **Custom keybindings.** Every Normal-mode command above is remappable via a `[keybinds]` table in `~/.config/captain-miao/config.toml`. Map a command id to a key (or list of keys); an empty list unbinds it:
 

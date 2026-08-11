@@ -289,7 +289,7 @@ impl App {
                         // `o` is the no-questions path — same cwd, straight to a
                         // window. Isolation is a decision, so it lives on `O`'s
                         // picker (`Ctrl-w`) where it can be seen before Enter.
-                        worktree: false,
+                        worktree: None,
                     }),
                     None => {
                         self.open_workdir_picker();
@@ -644,7 +644,7 @@ impl App {
         };
         let agent = *agent;
         let host = host.clone();
-        let worktree = *worktree;
+        let worktree = worktree.as_ref().map(|a| a.requested_name());
         // Extract everything from the picker up front so its borrow ends before we
         // call `&mut self` (set_error) and the blocking host RPCs below.
         let typed = active.picker.input.text().trim().to_string();
@@ -736,6 +736,36 @@ impl App {
             self.input_mode = InputMode::Normal;
             return None;
         };
+        // While naming a worktree the keyboard belongs to that field, so this
+        // runs ahead of every other picker binding — including the readline
+        // edits and the Ctrl-t/Ctrl-h switches, which would otherwise eat the
+        // ordinary letters a name is made of. Enter commits the name and hands
+        // the keyboard back to the path input; Esc disarms the request
+        // entirely, which is the only way `Ctrl-g` can be taken back.
+        if let PickerKind::Workdir {
+            worktree: Some(arm),
+            ..
+        } = &mut active.kind
+            && arm.naming
+        {
+            match key.code {
+                KeyCode::Enter => {
+                    arm.naming = false;
+                    self.refresh_picker_footer();
+                }
+                KeyCode::Esc => {
+                    if let PickerKind::Workdir { worktree, .. } = &mut active.kind {
+                        *worktree = None;
+                    }
+                    self.refresh_picker_footer();
+                }
+                _ => {
+                    arm.name.handle_key(key);
+                    self.refresh_picker_footer();
+                }
+            }
+            return None;
+        }
         // Ctrl-D in the workdir picker forgets the highlighted recent cwd.
         // Intercept before the picker forwards it to TextInput as readline
         // delete-forward, which would otherwise be mostly a no-op here.
@@ -766,7 +796,7 @@ impl App {
             // footer hides it, so it would sit invisibly armed and then reappear
             // on a switch back — a launch nobody asked for.
             if !agent.supports_worktrees() {
-                *worktree = false;
+                *worktree = None;
             }
             active.picker.title = super::format::workdir_picker_title(*agent, host);
             // The popup's own status line carries the chosen agent (§9), so it
@@ -792,13 +822,24 @@ impl App {
                 agent, worktree, ..
             } = &mut active.kind
         {
-            if agent.supports_worktrees() {
-                *worktree = !*worktree;
-                self.refresh_picker_footer();
-            } else {
+            if !agent.supports_worktrees() {
                 let label = agent.label();
                 self.set_status(format!("{label} has no worktree support"), true);
+                return None;
             }
+            // Arming drops straight into the name field, so `Ctrl-g` + Enter is
+            // the auto-named case and `Ctrl-g` + text + Enter is the named one —
+            // no separate key to reach the name, and no way to arm without
+            // being shown that naming was an option. Pressing it while already
+            // armed disarms.
+            *worktree = match worktree.take() {
+                Some(_) => None,
+                None => Some(super::WorktreeArm {
+                    naming: true,
+                    ..Default::default()
+                }),
+            };
+            self.refresh_picker_footer();
             return None;
         }
         // Ctrl-H in the workdir picker cycles the host this launch opens on —

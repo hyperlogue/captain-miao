@@ -381,12 +381,24 @@ the way it does:
   create a *second* worktree beside the one it just re-entered. `restart_one`
   and `Action::ResumeSession` therefore hard-code `false`, and a restarted
   worktree session keeps its isolation for free.
-- **The name is empty by default**, i.e. the agent generates one
-  (`bright-running-fox`). That is also the case Claude removes without prompting
-  on a clean exit — a *named* worktree prompts instead, and a captain-miao row
-  killed with `x` never gets to answer a prompt. Named worktrees are a follow-up
-  and want a second picker input; `worktree_args` already passes a name through,
-  including a `#1234` PR reference, and a test pins that.
+- **`Ctrl-g` arms *and* names in one press.** It drops straight into a name
+  field on the picker's footer, so `Ctrl-g` Enter is the auto-named case
+  (`bright-running-fox`) and `Ctrl-g` `feature-auth` Enter is the named one —
+  no second key to reach the name, and no way to arm without being shown that
+  naming was an option. `Esc` there disarms, which is the only way to take the
+  `Ctrl-g` back. The name is passed through verbatim, so a `#1234` PR reference
+  reaches the agent intact. What the name buys is **identity** — the directory
+  and the `worktree-<name>` branch, which is what shows up in a PR; it does
+  *not* change cleanup, which turns on whether the **session** is named
+  (`/rename`) and whether the worktree holds work.
+- **The name is edited in place, and its intercept runs before every other
+  picker binding.** In place because the workdir picker *is* `self.picker`: a
+  sub-picker would have to stash and restore it, and a modal hiding the path
+  list would separate two decisions that are made together. First because the
+  name is ordinary letters — `Ctrl-t`/`Ctrl-h`/`Ctrl-d` and the readline edits
+  would otherwise eat them, and `Ctrl-t` in particular *disarms* on an agent
+  switch, so a `t` typed into a name silently threw the whole request away
+  (which is exactly what happened before the intercept moved).
 - **Codex has no worktree concept** (0.147: no such flag), so `worktree_args`
   answers `None` — the same shape as `session_watch_path`/`bg_shells`, which are
   likewise Claude-only. `supports_worktrees()` is *derived* from it rather than
@@ -406,12 +418,29 @@ the way it does:
   that shouldn't touch my checkout", which has a different answer nearly every
   time.
 
-Two known rough edges, both from the row's cwd becoming the worktree path (the
-`CwdChanged` hook already delivers this, so it applies to a mid-session
-`EnterWorktree` too): a directory **mark** is keyed by cwd, so a worktree row
-loses the parent repo's icon/colour; and `work-tabs.json` is keyed `(host, cwd)`,
-so `w` opens a work tab in the worktree rather than the checkout. Neither is
-obviously wrong, but neither was chosen.
+**A worktree cwd is resolved back to its repo where identity is at stake, and
+kept where isolation is.** `split_worktree` splits `<root>/.claude/worktrees/<name>`
+into its two halves — pure string work, no `git rev-parse` and no filesystem,
+because the dashboard must answer this for **remote** rows whose filesystem it
+cannot touch, and on render paths where a subprocess per row is out of the
+question. (Cost: a worktree relocated by a `WorktreeCreate` hook, or made by
+hand elsewhere, isn't recognized and reads as an ordinary directory. The name
+may contain `/`, so the whole remainder is the name.) Then:
+
+- **Directory marks key on the repo root** (`dir_mark_key`, used by both
+  `effective_dir_mark` and `open_dir_edit` — normalizing only the read would
+  make `Space i` write under a key nothing reads back). Every worktree of a
+  project wears the project's icon and colour, including the *default* pair,
+  which is seeded from the path and would otherwise change per worktree.
+- **Work tabs stay keyed on the real cwd**, so each worktree gets its own
+  shell: they are different branches, and a test run in the wrong one is worse
+  than an extra tab. What changes is the title — `work_tab_title` and
+  `{basename}` in the session-tab template both use `display_basename`, which
+  renders `<repo>@<worktree>`. Several repos can hold a `feature-auth`, and the
+  tab bar is the one place with no other clue which checkout a tab belongs to.
+
+All of this applies to a mid-session `EnterWorktree` too, since `CwdChanged`
+already moves the row's cwd.
 
 Not integrated, deliberately: Claude's **`--tmux`** flag. It creates its *own*
 tmux session for the worktree — on the same server, so the identity

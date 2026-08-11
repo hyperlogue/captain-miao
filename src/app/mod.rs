@@ -88,9 +88,10 @@ pub(super) enum Action {
         cwd: String,
         /// Host to open on (local unless chosen with `Ctrl-h` in the picker).
         host: HostId,
-        /// Launch into a fresh agent-created git worktree under `cwd` rather
-        /// than in `cwd` itself (`Ctrl-g` in the picker).
-        worktree: bool,
+        /// `Some(name)` launches into a fresh agent-created git worktree rather
+        /// than in `cwd` itself (`Ctrl-g` in the picker); an empty name lets the
+        /// agent generate one.
+        worktree: Option<String>,
     },
     FetchTabsForMove(WindowId),
     MoveWindow(WindowId, TabTarget),
@@ -229,6 +230,30 @@ impl Action {
     }
 }
 
+/// An armed worktree request inside the workdir picker.
+///
+/// The name is edited **in place** rather than in a second popup: the workdir
+/// picker *is* `self.picker`, so a sub-picker would have to stash and restore
+/// it, and a modal that hides the path list to ask for a name would take the
+/// two decisions apart when they're made together. Instead `naming` moves the
+/// keyboard onto this field and back, leaving the path input's text, filter and
+/// highlight untouched the whole time.
+#[derive(Debug, Default)]
+pub(crate) struct WorktreeArm {
+    /// Worktree name; empty means "let the agent generate one". Passed through
+    /// verbatim, so a `#1234` PR reference reaches the agent intact.
+    pub(crate) name: self::picker::TextInput,
+    /// While set, picker keys edit [`Self::name`] instead of the path.
+    pub(crate) naming: bool,
+}
+
+impl WorktreeArm {
+    /// The name as the launch should carry it, trimmed. Empty ⇒ agent-generated.
+    fn requested_name(&self) -> String {
+        self.name.text().trim().to_string()
+    }
+}
+
 /// Interpretation of the current picker's submission. Holds the raw list the
 /// picker items were built from so the picker's `Submit(idx)` event can be
 /// mapped back to a concrete `Action`.
@@ -257,16 +282,16 @@ pub(super) enum PickerKind {
         /// with `Ctrl-h` (per-launch only). A remote host opens the session in
         /// that host's pty pool and attaches over ssh (§8).
         host: HostId,
-        /// Launch into a fresh git worktree instead of the cwd itself, toggled
-        /// in-picker with `Ctrl-g` (per-launch only, never persisted — unlike
-        /// the agent and host defaults, isolation is a property of the *task*
-        /// you're starting, not a standing preference).
+        /// `Some` to launch into a fresh git worktree instead of the cwd
+        /// itself, armed in-picker with `Ctrl-g` (per-launch only, never
+        /// persisted — unlike the agent and host defaults, isolation is a
+        /// property of the *task* you're starting, not a standing preference).
         ///
-        /// Always `false` for an agent that can't do it
+        /// Always `None` for an agent that can't do it
         /// (`AgentControl::supports_worktrees`); a `Ctrl-t` onto such an agent
         /// clears it rather than carrying a request that would be silently
         /// dropped at launch.
-        worktree: bool,
+        worktree: Option<WorktreeArm>,
     },
     /// Set the persistent default backend for new sessions (`Space a`).
     DefaultAgent,
@@ -898,6 +923,65 @@ pub(super) fn cwd_basename(cwd: &str) -> &str {
         .unwrap_or(cwd)
 }
 
+/// Path segment the agent puts its worktrees under, relative to the repo root.
+const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
+
+/// Split a cwd into `(repo root, worktree name)` when it sits inside the
+/// agent's default worktree layout, else `(cwd, None)`.
+///
+/// Pure string work on purpose — no `git rev-parse`, no filesystem. The
+/// dashboard is a viewer that must answer this for **remote** rows too, whose
+/// filesystem it cannot touch, and it answers it on render paths where a
+/// subprocess per row is out of the question. The cost is that a worktree
+/// relocated by a `WorktreeCreate` hook, or one made by hand with
+/// `git worktree add ../elsewhere`, isn't recognized — it just reads as an
+/// ordinary directory, which is the same behaviour as before this existed.
+///
+/// The name may itself contain `/` (the agent allows `feature/auth`), so the
+/// whole remainder is the name rather than its first segment.
+pub(super) fn split_worktree(cwd: &str) -> (&str, Option<&str>) {
+    let trimmed = cwd.trim_end_matches('/');
+    // Filesystem root: trimming ate the whole string, and `""` is not a path.
+    if trimmed.is_empty() {
+        return (cwd, None);
+    }
+    match trimmed.find(WORKTREE_SEGMENT) {
+        Some(i) => {
+            let name = &trimmed[i + WORKTREE_SEGMENT.len()..];
+            let root = &trimmed[..i];
+            // A trailing `/.claude/worktrees` with nothing after it is the
+            // container, not a worktree.
+            if name.is_empty() {
+                (trimmed, None)
+            } else {
+                (root, Some(name))
+            }
+        }
+        None => (trimmed, None),
+    }
+}
+
+/// The key a cwd's directory mark (icon + colour) is stored and looked up
+/// under: the **repo root**, so every worktree of a project inherits the mark
+/// the project was given and `Space i` on a worktree row edits that one mark
+/// rather than minting a per-worktree copy nothing else reads. A mark answers
+/// "which project is this row", and a worktree does not change the answer.
+pub(super) fn dir_mark_key(cwd: &str) -> &str {
+    split_worktree(cwd).0
+}
+
+/// Basename for display, naming both halves inside a worktree
+/// (`captain-miao@feature-auth`) and the plain basename elsewhere. Used for tab
+/// titles, where the worktree name alone would be an orphan — several repos can
+/// hold a `feature-auth`, and the tab bar is the one place with no other clue
+/// which checkout a tab belongs to.
+pub(super) fn display_basename(cwd: &str) -> std::borrow::Cow<'_, str> {
+    match split_worktree(cwd) {
+        (root, Some(name)) => format!("{}@{}", cwd_basename(root), name).into(),
+        (path, None) => cwd_basename(path).into(),
+    }
+}
+
 /// Title stamped on a `(host, cwd)` work tab: the cwd's basename, prefixed with
 /// the host (`box:proj`) for every host but this machine. The prefix is the only
 /// way the host reaches the tab bar — a work tab is spawned with an explicit tab
@@ -914,10 +998,16 @@ pub(super) fn cwd_basename(cwd: &str) -> &str {
 /// hostname, not `local`): its `w` opens an in-process shell, but such a
 /// dashboard is federating other hosts as well, so naming every host uniformly
 /// beats leaving exactly one of them unlabelled.
+///
+/// A worktree cwd is titled `<repo>@<worktree>`: the map stays keyed on the
+/// real cwd, so each worktree gets its own shell rather than sharing the
+/// checkout's — they are different branches, and a test run in the wrong one is
+/// worse than an extra tab — and the title is what keeps the tab bar readable
+/// once two of them are open.
 pub(super) fn work_tab_title(host: &HostId, cwd: &str) -> String {
-    let base = cwd_basename(cwd);
+    let base = display_basename(cwd);
     if host.is_local() {
-        base.to_string()
+        base.into_owned()
     } else {
         format!("{host}:{base}")
     }
@@ -1879,7 +1969,10 @@ impl App {
     /// from the path. The index is needed by the popup to seed its color
     /// cursor; row rendering ignores it.
     pub(super) fn effective_dir_mark(&self, cwd: &str) -> (String, ratatui::style::Color, usize) {
-        let key = cwd.trim_end_matches('/');
+        // Keyed on the repo root, so a worktree row wears its project's mark
+        // (and its *default* emoji/colour, which are seeded from the path — an
+        // unmarked repo would otherwise change appearance per worktree).
+        let key = dir_mark_key(cwd);
         let (default_icon, default_color_idx) = format::default_dir_emoji_and_color(key);
         let Some(mark) = self.directory_marks.get(key) else {
             return (
@@ -1901,7 +1994,10 @@ impl App {
         let Some(s) = self.selected_session() else {
             return;
         };
-        let cwd = s.cwd.trim_end_matches('/').to_string();
+        // The editor edits the *project's* mark, so a worktree row resolves to
+        // its repo root here too — otherwise `Space i` would write under a key
+        // `effective_dir_mark` never reads back.
+        let cwd = dir_mark_key(&s.cwd).to_string();
         let (_, _, color_idx) = self.effective_dir_mark(&cwd);
         let mut custom = self::picker::TextInput::new();
         if let Some(mark) = self.directory_marks.get(&cwd)
@@ -3877,9 +3973,22 @@ impl App {
                 // Shown only when armed, and only where it's possible. An
                 // agent without worktrees says nothing rather than showing a
                 // permanent "off" for a thing it can't do.
-                if *worktree && agent.supports_worktrees() {
+                if let Some(arm) = worktree.as_ref().filter(|_| agent.supports_worktrees()) {
                     spans.push(Span::styled("   Worktree ", dim));
-                    spans.push(Span::styled("new".to_string(), value));
+                    let name = arm.name.text();
+                    if arm.naming {
+                        // A block cursor, since the real one sits in the path
+                        // input above and can't be in two places.
+                        spans.push(Span::styled(name.to_string(), value));
+                        spans.push(Span::styled("▏", value));
+                        spans.push(Span::styled(" Enter done  Esc cancel", dim));
+                    } else if name.trim().is_empty() {
+                        // Named by the agent, so say that rather than showing an
+                        // empty value that reads like a field we failed to fill.
+                        spans.push(Span::styled("auto-named".to_string(), value));
+                    } else {
+                        spans.push(Span::styled(name.trim().to_string(), value));
+                    }
                 }
                 spans
             }
@@ -4079,7 +4188,7 @@ impl App {
             kind: PickerKind::Workdir {
                 agent,
                 host,
-                worktree: false,
+                worktree: None,
             },
         });
         self.input_mode = InputMode::Picker;

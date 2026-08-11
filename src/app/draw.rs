@@ -1709,6 +1709,17 @@ impl App {
                 spans.extend(hint_pair("Esc", "clear/cancel"));
                 let multi_host = self.backends.len() > 1;
                 match self.picker.as_ref().map(|a| &a.kind) {
+                    // Naming a worktree owns the keyboard, so the ribbon shows
+                    // only what works there rather than a list of keys the
+                    // intercept is swallowing.
+                    Some(PickerKind::Workdir {
+                        worktree: Some(arm),
+                        ..
+                    }) if arm.naming => {
+                        spans = hint_pair("type", "worktree name (blank = auto)");
+                        spans.extend(hint_pair("Enter", "done"));
+                        spans.extend(hint_pair("Esc", "no worktree"));
+                    }
                     Some(PickerKind::Workdir { agent, .. }) => {
                         spans.extend(hint_pair("Ctrl-d", "drop dir"));
                         spans.extend(hint_pair("Ctrl-t", "agent"));

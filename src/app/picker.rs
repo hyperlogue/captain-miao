@@ -12,7 +12,7 @@ use super::format::{centered_rect, truncate_str};
 /// A single-line text input with a cursor and readline-style keybinds
 /// (Ctrl-A/E/B/F/D/U/K/W, Alt-B/F/D, Home/End, arrow keys).
 #[derive(Debug, Default, Clone)]
-pub(in crate::app) struct TextInput {
+pub(crate) struct TextInput {
     buf: String,
     /// Byte offset into `buf`. Always at a char boundary.
     cursor: usize,
@@ -22,7 +22,7 @@ pub(in crate::app) struct TextInput {
 /// printable edits without a string diff, and catch Enter/Esc without
 /// hardcoding char checks at every call site.
 #[derive(Debug, PartialEq)]
-pub(in crate::app) enum TextInputEvent {
+pub(crate) enum TextInputEvent {
     /// Key didn't touch the buffer (e.g. an arrow pressed at the edge).
     Noop,
     /// Buffer changed.

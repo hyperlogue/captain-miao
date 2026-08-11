@@ -494,6 +494,63 @@ fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
 }
 
 #[test]
+fn worktree_paths_resolve_to_their_repo_root() {
+    use crate::app::{dir_mark_key, display_basename, split_worktree};
+
+    assert_eq!(
+        split_worktree("/home/u/proj/.claude/worktrees/feature-auth"),
+        ("/home/u/proj", Some("feature-auth"))
+    );
+    // Host-canonical `~` paths are the wire form, so they must work verbatim.
+    assert_eq!(
+        split_worktree("~/proj/.claude/worktrees/wt"),
+        ("~/proj", Some("wt"))
+    );
+    // A name may contain `/` (the agent allows `feature/auth`), so the whole
+    // remainder is the name rather than its first segment.
+    assert_eq!(
+        split_worktree("~/proj/.claude/worktrees/feature/auth"),
+        ("~/proj", Some("feature/auth"))
+    );
+    assert_eq!(split_worktree("/home/u/proj"), ("/home/u/proj", None));
+    assert_eq!(split_worktree("/home/u/proj/"), ("/home/u/proj", None));
+    // The container itself is not a worktree.
+    assert_eq!(
+        split_worktree("/home/u/proj/.claude/worktrees"),
+        ("/home/u/proj/.claude/worktrees", None)
+    );
+
+    // Every worktree of a repo shares one directory mark — the repo's.
+    assert_eq!(
+        dir_mark_key("~/proj/.claude/worktrees/a"),
+        dir_mark_key("~/proj/.claude/worktrees/b")
+    );
+    assert_eq!(dir_mark_key("~/proj/.claude/worktrees/a"), "~/proj");
+
+    // Tab titles name both halves: `feature-auth` alone doesn't say which repo.
+    assert_eq!(display_basename("~/proj/.claude/worktrees/wt"), "proj@wt");
+    assert_eq!(display_basename("~/proj"), "proj");
+}
+
+#[test]
+fn work_tab_title_names_the_worktree_and_its_repo() {
+    use crate::app::work_tab_title;
+    use crate::state::HostId;
+    let wt = "~/proj/.claude/worktrees/feature-auth";
+    assert_eq!(work_tab_title(&HostId::local(), wt), "proj@feature-auth");
+    assert_eq!(
+        work_tab_title(&HostId("box".into()), wt),
+        "box:proj@feature-auth"
+    );
+    // Two worktrees of one repo get distinct tabs, so `w` in one can't land a
+    // shell on the other's branch.
+    assert_ne!(
+        work_tab_title(&HostId::local(), wt),
+        work_tab_title(&HostId::local(), "~/proj/.claude/worktrees/other")
+    );
+}
+
+#[test]
 fn workdir_picker_ctrl_g_arms_a_worktree_for_this_launch() {
     let mut d = TestDashboard::new(120, 30);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
@@ -505,29 +562,98 @@ fn workdir_picker_ctrl_g_arms_a_worktree_for_this_launch() {
     assert!(out.contains("Ctrl-g"), "footer should offer the key: {out}");
     assert!(!out.contains("Worktree"), "off by default: {out}");
 
-    // Ctrl-g arms it; the popup's own status line says so.
-    d.app
-        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-    assert!(d.render().contains("Worktree"));
-
-    // Ctrl-w is *not* the toggle — it stays readline delete-previous-word on
-    // the path input, which is why the toggle isn't spelled with the obvious
-    // mnemonic. Typing a two-word path and killing back leaves the first.
+    // Ctrl-w is readline delete-previous-word on the path input — which is why
+    // the toggle isn't spelled with the obvious mnemonic. Pinned here as well
+    // as in its own test, because this is the picker the collision would hit.
     for c in "/tmp/aa /tmp/bb".chars() {
         d.press(KeyCode::Char(c));
     }
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-    let out = d.render();
-    assert!(out.contains("Worktree"), "still armed: {out}");
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-
     for c in "/tmp/x".chars() {
         d.press(KeyCode::Char(c));
     }
+
+    // Ctrl-g arms it and drops into the name field, so Enter alone commits an
+    // empty name — the agent-generated case — and leaves the path untouched.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    let out = d.render();
+    assert!(out.contains("Worktree"), "armed: {out}");
+    assert!(out.contains("Esc cancel"), "naming: {out}");
+    d.press(KeyCode::Enter);
+    let out = d.render();
+    assert!(
+        out.contains("auto-named"),
+        "empty name reads as auto: {out}"
+    );
+
     match d.press(KeyCode::Enter) {
-        Some(Action::NewSessionSplit { worktree, .. }) => assert!(worktree),
+        Some(Action::NewSessionSplit { worktree, cwd, .. }) => {
+            assert_eq!(worktree.as_deref(), Some(""));
+            assert_eq!(cwd, "/tmp/x", "naming must not disturb the path");
+        }
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn workdir_picker_names_the_worktree() {
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.press(KeyCode::Char('O'));
+    for c in "/tmp/x".chars() {
+        d.press(KeyCode::Char(c));
+    }
+
+    // While naming, ordinary letters build the name rather than filtering the
+    // list, and the keys that would otherwise switch agent/host are inert.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    for c in "feature-auth".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let out = d.render();
+    assert!(out.contains("feature-auth"), "{out}");
+    assert!(
+        out.contains("New Claude Session"),
+        "Ctrl-t must not switch agent mid-name: {out}"
+    );
+
+    d.press(KeyCode::Enter);
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { worktree, cwd, .. }) => {
+            assert_eq!(worktree.as_deref(), Some("feature-auth"));
+            assert_eq!(cwd, "/tmp/x");
+        }
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+#[test]
+fn workdir_picker_esc_while_naming_disarms_the_worktree() {
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.press(KeyCode::Char('O'));
+    for c in "/tmp/x".chars() {
+        d.press(KeyCode::Char(c));
+    }
+
+    // Esc while naming disarms rather than closing the picker: `Ctrl-g` opened
+    // the field, so Esc is how that press is taken back.
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.input_mode, InputMode::Picker, "picker stays open");
+    let out = d.render();
+    assert!(!out.contains("Worktree"), "disarmed: {out}");
+
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { worktree, .. }) => assert_eq!(worktree, None),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
 }
@@ -543,6 +669,8 @@ fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert!(d.render().contains("Worktree"));
+    // Leave the name field first: while naming, Ctrl-t is deliberately inert.
+    d.press(KeyCode::Enter);
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
     let out = d.render();
@@ -565,7 +693,7 @@ fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
         d.press(KeyCode::Char(c));
     }
     match d.press(KeyCode::Enter) {
-        Some(Action::NewSessionSplit { worktree, .. }) => assert!(!worktree),
+        Some(Action::NewSessionSplit { worktree, .. }) => assert_eq!(worktree, None),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
 }

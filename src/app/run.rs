@@ -508,12 +508,14 @@ pub(super) fn resolve_spawn_target(caps: Capabilities, layout: SessionsLayout) -
 }
 
 /// Expand a session-tab title template: `{agent}` → the backend label,
-/// `{basename}` → the cwd's last path component, `{cwd}` → the full path.
+/// `{basename}` → the cwd's last path component (`<repo>@<worktree>` inside a
+/// worktree, so per-tab layout distinguishes two sessions on one repo),
+/// `{cwd}` → the full path.
 pub(super) fn expand_tab_title(template: &str, agent: AgentControl, cwd: &str) -> String {
-    let basename = super::cwd_basename(cwd);
+    let basename = super::display_basename(cwd);
     template
         .replace("{agent}", agent.label())
-        .replace("{basename}", basename)
+        .replace("{basename}", basename.as_ref())
         .replace("{cwd}", cwd)
 }
 
@@ -524,11 +526,12 @@ async fn launch_agent(
     resume: Option<(&str, bool)>,
     copy: &LaunchCopy,
     host: &HostId,
-    // `worktree`: launch into a fresh agent-created worktree rather than `cwd`
-    // itself. Only ever set on a brand-new session — a resume returns the
-    // session to the worktree it was already in (the agent tracks that
-    // binding), so asking for one here would be a second, conflicting request.
-    worktree: bool,
+    // `worktree`: `Some(name)` launches into a fresh agent-created worktree
+    // rather than `cwd` itself; an empty name lets the agent generate one. Only
+    // ever set on a brand-new session — a resume returns the session to the
+    // worktree it was already in (the agent tracks that binding), so asking for
+    // one here would be a second, conflicting request.
+    worktree: Option<String>,
 ) {
     // The cwd goes into the recent list of the host it lands on — never another
     // one's, so a mac path can't pollute a Linux box's picker.
@@ -545,11 +548,9 @@ async fn launch_agent(
         agent,
         cwd: cwd.to_string(),
         resume: resume.map(|(id, fork)| (id.to_string(), fork)),
-        // Empty name: the agent generates one (Claude mints e.g.
-        // `bright-running-fox`). Naming it is a follow-up — it needs a second
-        // input in the picker, and an unnamed worktree is also the one Claude
-        // cleans up without prompting on exit.
-        worktree: worktree.then(String::new),
+        // An empty name is meaningful: the agent generates one (Claude mints
+        // e.g. `bright-running-fox`), which is what `Ctrl-g` + Enter asks for.
+        worktree,
     };
     let plan = {
         let Some(backend) = app.backend_for(host) else {
@@ -819,7 +820,7 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
         // worktree it was in by the agent itself — so a restarted worktree
         // session keeps its isolation without being asked for it again, and
         // asking would create a *second* worktree beside the one it resumes to.
-        false,
+        None,
     )
     .await;
     // Detect launch failure: launch_agent flips `status_is_error` to true on
@@ -1707,7 +1708,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                             // session's own worktree on resume. (A `--fork-session`
                             // deliberately starts in the launch directory, which
                             // is the agent's call, not ours to override.)
-                            false,
+                            None,
                         )
                         .await;
                     }
