@@ -1043,10 +1043,23 @@ real tty for raw mode, resizes, and the kitty graphics protocol.
   files into your commit. If staging or committing hits a blocker, pause and ask.
 - **Commit once the work is fully complete.** As long as the work is done with no
   open decision or unanswered question left for the user, go ahead and commit it
-  yourself (commit only; pushing still waits for the user). Prefer small, focused
-  commits over one big commit. If there's still an open question, decision, or
-  unexpected tradeoff, finish the work but leave `git add` / `commit` / `push` to
-  the user unless they explicitly ask.
+  yourself (commit only; pushing still waits for the user). If there's still an
+  open question, decision, or unexpected tradeoff, finish the work but leave
+  `git add` / `commit` / `push` to the user unless they explicitly ask.
+- **Prefer several small, self-contained commits over one large one.** Split the
+  work along the seams it already has: a refactor that makes room for a change
+  goes in ahead of the change, a fix travels with the test that pins it, a doc
+  update rides with the behaviour it describes. The bar for each piece is that it
+  **stands on its own** — it builds, its tests pass, and its subject names one
+  thing — so it can be read, reverted, or bisected without dragging the rest
+  along. Where the two pull apart, **self-contained wins**: a single logical
+  change that spans several crates stays one commit rather than becoming three
+  that don't compile in sequence, and a mechanical rename touching forty files is
+  still one commit. Commit each piece as it lands rather than finishing
+  everything and slicing the diff apart afterwards — that ordering is what makes
+  the pieces genuinely independent instead of retroactively partitioned. When you
+  land several in a row, re-run the concurrent-committer check before each one:
+  another session's stage→commit window can open between two of yours.
 
 ### Commit message format
 
