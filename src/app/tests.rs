@@ -5483,21 +5483,3 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
         "the dropped binding is still on disk: {on_disk:?}"
     );
 }
-
-#[test]
-fn tmp_visual_dump() {
-    use crate::state::HostId;
-    let mut d = TestDashboard::new(96, 11);
-    let mut away = session(4, "/srv/away", SessionStatus::Idle);
-    away.host = HostId("box".into());
-    away.pool_session = Some("cm-away".into());
-    d.set_sessions(vec![
-        session(1, "/home/test/plain", SessionStatus::Active),
-        session(2, "/home/test/followup", SessionStatus::Idle),
-        session(3, "/home/test/pinned", SessionStatus::Idle),
-        away,
-    ]);
-    d.app.update_flags((HostId::local(), 2), Cursor::HoldIndex, |f| f.follow_up = true);
-    d.app.update_flags((HostId::local(), 3), Cursor::HoldIndex, |f| f.pinned = true);
-    println!("{}", d.render());
-}
