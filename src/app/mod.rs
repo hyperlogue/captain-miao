@@ -822,10 +822,10 @@ pub(super) struct App {
     /// the dashboard runs outside a managed terminal.
     pub(super) terminal_identity: Option<String>,
     /// This dashboard's own `TERM`, read once at startup. The yardstick the
-    /// detail panel measures a row's [`LauncherState::term`] against: same value
+    /// detail panel measures a row's [`LauncherState::terminfo`] against: same value
     /// means the session renders against the same terminfo we do and there is
     /// nothing to say, so the panel dims it.
-    pub(super) term: Option<String>,
+    pub(super) terminfo: Option<String>,
     /// Persisted window bindings from `window-bindings.json` whose `terminal`
     /// differs from [`App::terminal_identity`] — bindings another terminal's
     /// dashboard owns. Held out of `window_bindings` (never resolved, validated,
@@ -1375,7 +1375,7 @@ impl App {
             pending_reattach: Vec::new(),
             window_bindings: bindings::WindowBindings::default(),
             terminal_identity: crate::terminal::get().identity(),
-            term: std::env::var("TERM")
+            terminfo: std::env::var("TERM")
                 .ok()
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),

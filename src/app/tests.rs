@@ -191,7 +191,8 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         // hand-launched fallback (no launch_id, self-reported window_id).
         launch_id: Some(format!("launch-{pid}")),
         terminal: None,
-        term: None,
+        terminfo: None,
+        terminfo_missing: None,
         flags: None,
         attached: None,
         host: crate::state::HostId::local(),
@@ -3767,16 +3768,16 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     let mut d = TestDashboard::new(160, 20);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;
-    d.app.term = Some("xterm-kitty".into());
+    d.app.terminfo = Some("xterm-kitty".into());
 
     let mut pooled = session(1, "/srv/away", SessionStatus::Idle);
     pooled.host = HostId("box".into());
     pooled.pool_session = Some("cm-away".into());
     // Created from Kitty onto a host with no kitty terminfo: the pool wrapper
     // rewrote it, and every window since has inherited the rewrite.
-    pooled.term = Some("xterm-256color".into());
+    pooled.terminfo = Some("xterm-256color".into());
     let mut here = session(2, "/home/test/here", SessionStatus::Idle);
-    here.term = Some("xterm-kitty".into());
+    here.terminfo = Some("xterm-kitty".into());
     d.set_sessions(vec![pooled, here]);
 
     let select = |d: &mut TestDashboard, pid: u32| {
@@ -3818,12 +3819,53 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
 
     // A host too old to send the field says so rather than inventing one.
     let mut unknown = session(3, "/home/test/old", SessionStatus::Idle);
-    unknown.term = None;
+    unknown.terminfo = None;
     d.set_sessions(vec![unknown]);
     select(&mut d, 3);
     let out = d.render();
-    assert!(out.contains("Term"));
+    assert!(out.contains("Terminfo"));
     assert!(!out.contains("xterm"), "no terminfo invented: {out}");
+}
+
+/// A terminfo the host had to *substitute* is the one case that earns a warning
+/// rather than a value: the agent has been rendering against a stand-in since
+/// the session was created and will keep doing so, and the name of the missing
+/// entry is the fix. Absent whenever nothing was substituted, so it can't nag.
+#[test]
+fn a_substituted_terminfo_names_what_the_host_is_missing() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(160, 20);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    // The warning is a continuation line under the value, so the panel needs
+    // its full height — with the preview on, the box ends at `Terminfo`.
+    d.app.preview_visible = false;
+    d.app.terminfo = Some("xterm-kitty".into());
+
+    let mut downgraded = session(1, "/srv/away", SessionStatus::Idle);
+    downgraded.host = HostId("box".into());
+    downgraded.pool_session = Some("cm-away".into());
+    downgraded.terminfo = Some("xterm-256color".into());
+    downgraded.terminfo_missing = Some("xterm-kitty".into());
+    d.set_sessions(vec![downgraded]);
+    d.app.table_state.select(Some(0));
+    let out = d.render();
+    assert!(
+        out.contains("host has no xterm-kitty"),
+        "the missing entry must be named: {out}"
+    );
+
+    // Nothing substituted → no warning, even though the terminfo differs from
+    // this dashboard's (a session created from some other terminal).
+    let mut plain = session(2, "/srv/other", SessionStatus::Idle);
+    plain.host = HostId("box".into());
+    plain.pool_session = Some("cm-other".into());
+    plain.terminfo = Some("xterm-256color".into());
+    d.set_sessions(vec![plain]);
+    d.app.table_state.select(Some(0));
+    let out = d.render();
+    assert!(out.contains("xterm-256color"));
+    assert!(!out.contains("host has no"), "no warning invented: {out}");
 }
 
 #[test]

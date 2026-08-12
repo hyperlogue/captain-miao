@@ -979,13 +979,30 @@ impl App {
         // value that differs is what stays bright. No badge, no colour: a
         // mismatch is usually benign, and yellow would cry wolf on every remote
         // row.
-        let term = match s.term.as_deref() {
-            Some(t) if Some(t) == self.term.as_deref() => {
+        let terminfo = match s.terminfo.as_deref() {
+            Some(t) if Some(t) == self.terminfo.as_deref() => {
                 Span::styled(t.to_string(), Style::default().add_modifier(Modifier::DIM))
             }
             Some(t) => Span::raw(t.to_string()),
             None => Span::raw("—"),
         };
+        // A *substituted* terminfo is the one case that earns a warning rather
+        // than a value: the host had no entry for what the attaching terminal
+        // asked for, so the agent has been rendering against a stand-in for the
+        // whole session, and will keep doing so — the value is frozen at
+        // create. Unlike a plain mismatch this is both a real fidelity loss and
+        // a one-command fix, so it names the missing entry (that name *is* the
+        // fix) on its own continuation line, where the panel's width can hold
+        // it. Absent whenever nothing was substituted, so it never nags.
+        let terminfo_missing = s.terminfo_missing.as_deref().map(|want| {
+            Line::from(vec![
+                label(""),
+                Span::styled(
+                    format!("host has no {want}"),
+                    Style::default().fg(ui.attention_fg),
+                ),
+            ])
+        });
         let prompt = s.last_prompt.as_deref().unwrap_or("—");
         // Truncate the first prompt to a single line so a long opener doesn't
         // wrap into a wall of text above the last prompt.
@@ -1008,11 +1025,14 @@ impl App {
                 label("PID"),
                 Span::raw(format!("{child} (win {window}, tab {tab})")),
             ]),
-            Line::from(vec![label("Term"), term]),
+            Line::from(vec![label("Terminfo"), terminfo]),
+        ];
+        lines.extend(terminfo_missing);
+        lines.extend([
             Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
             Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
             Line::from(vec![label("Dir"), Span::raw(cwd)]),
-        ];
+        ]);
 
         if let Some(err) = &s.last_error {
             lines.push(Line::from(""));
