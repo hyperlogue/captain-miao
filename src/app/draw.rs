@@ -1213,14 +1213,19 @@ impl App {
                 // window-inert (D6) — dimmed, and flagged with
                 // `FOREIGN_TERMINAL_GLYPH` in the icon column's host half.
                 let foreign = self.foreign_terminal(s).is_some();
+                // Running on its host with no window on this screen (§9). It
+                // already sinks to its own sort tier; dimming says the same
+                // thing where the eye lands first, so a screenful of detached
+                // rows reads as background rather than as a list you're behind
+                // on. The plug glyph alone was too quiet for that.
+                let detached = self.is_detached_row(s);
                 let status_text = s.status.label();
                 let name = truncate_str(
                     &session_display_name(s, self.index_of(s), &self.random_names),
                     name_col_max as usize,
                 );
 
-                let override_cell =
-                    override_indicator_cell(follow_up, important, muted, self.is_detached_row(s));
+                let override_cell = override_indicator_cell(follow_up, important, muted, detached);
                 let status_fg = super::format::status_fg(&s.status, follow_up);
                 let status_cell = if muted {
                     Cell::from(status_text).style(Style::default().add_modifier(Modifier::DIM))
@@ -1296,7 +1301,7 @@ impl App {
                     row_cells.push(elapsed);
                 }
                 let row = Row::new(row_cells);
-                if muted || search_active || foreign {
+                if muted || search_active || foreign || detached {
                     row.style(Style::default().add_modifier(Modifier::DIM))
                 } else {
                     row

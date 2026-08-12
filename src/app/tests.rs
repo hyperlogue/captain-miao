@@ -142,6 +142,26 @@ fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
     output
 }
 
+/// Position of an **ASCII** needle in the rendered buffer, scanning cell by
+/// cell rather than over `buffer_to_string` so the caller gets coordinates it
+/// can ask for a style at. Cell-wise because a wide glyph earlier in the row
+/// makes a byte offset into the flattened line meaningless.
+fn find_cell(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+    let bytes = needle.as_bytes();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width.saturating_sub(bytes.len() as u16) {
+            if bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| buf[(x + i as u16, y)].symbol().as_bytes() == [*b])
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
 // -- Mock builders --
 
 fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
@@ -1290,6 +1310,34 @@ fn detached_rows_sink_below_plain_idle() {
         .map(|s| s.launcher_pid)
         .collect();
     assert_eq!(order, vec![2, 1], "the detached row should sort last");
+}
+
+/// …and it *reads* as background too. The sort tier alone only helps once you
+/// know the ordering rule; dimming the whole row says "running elsewhere"
+/// where the eye already is. The plug glyph is two cells at the far left and
+/// was carrying that on its own.
+#[test]
+fn a_detached_row_draws_dim() {
+    use crate::state::HostId;
+    use ratatui::style::Modifier;
+    let mut d = TestDashboard::new(120, 12);
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into()); // pooled, but unbound
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![away, here]);
+    d.render();
+
+    let buf = d.terminal.backend().buffer();
+    let dim_at = |needle: &str| {
+        let (x, y) = find_cell(buf, needle).unwrap_or_else(|| panic!("{needle} not drawn"));
+        buf[(x, y)].style().add_modifier.contains(Modifier::DIM)
+    };
+    assert!(dim_at("session-1"), "the detached row must draw dim");
+    assert!(
+        !dim_at("session-2"),
+        "a row with a window here must keep full brightness"
+    );
 }
 
 /// …but an attention state still outranks: a parked approval prompt is urgent
