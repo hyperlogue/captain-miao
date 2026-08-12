@@ -13,9 +13,9 @@ use crate::config;
 use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
-    DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, WIDE_PUA_GLYPHS, ansi_to_lines,
-    bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width, elapsed_cell,
-    fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
+    DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, ansi_to_lines, bar_segments, bar_style,
+    centered_rect, context_pressure_style, dir_icon_width, elapsed_cell, fade_style,
+    format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
     override_indicator_cell, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
@@ -1036,7 +1036,6 @@ impl App {
     }
 
     fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
-        use unicode_width::UnicodeWidthStr;
         self.last_table_rect = Some(area);
         // Chrome above the data rows is the top rule + the table header (2
         // rows); there's no bottom border to subtract now.
@@ -1303,14 +1302,14 @@ impl App {
             // Status / icon stay fixed-width; the name column fills the rest and
             // the ratatui table clips it when it doesn't fit.
             vec![
-                Constraint::Length(3),
+                Constraint::Length(OVERRIDE_COL_WIDTH),
                 Constraint::Length(status_width),
                 Constraint::Length(icon_col_width),
                 Constraint::Min(10),
             ]
         } else {
             vec![
-                Constraint::Length(3),
+                Constraint::Length(OVERRIDE_COL_WIDTH),
                 Constraint::Length(status_width),
                 Constraint::Length(icon_col_width),
                 // Name is a fixed max-width column (see `name_col_max`). Last
@@ -1345,39 +1344,6 @@ impl App {
             .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_stateful_widget(table, area, &mut self.table_state);
-
-        // Fix up Nerd Font PUA glyphs in the override column — see
-        // `WIDE_PUA_GLYPHS` for the full explanation. Briefly: those glyphs
-        // are 1 cell per `unicode-width` but Kitty paints them as 2, so the
-        // padding cell after them gets written and clobbers the right half.
-        // We rewrite the buffer cell's symbol to glyph+space, bumping its
-        // reported width to 2 so ratatui's diff auto-skips the next cell.
-        //
-        // These glyphs only ever appear in the 3-wide override column, so we
-        // scan just those columns. But that column does NOT start at
-        // `area.left()`: the always-reserved highlight-symbol gutter
-        // (`selection_symbol`'s width) sits in front of it. (There's no left
-        // border to skip — the block draws only top/bottom rules.) Scanning
-        // from `area.left()` lands on the gutter and misses the glyphs entirely
-        // — they then only get the fix-up on a full-row repaint (e.g. while the
-        // row is selected, when the highlight bg repaints every cell), and at
-        // rest a neighbour-column update clobbers the glyph's right half. Offset
-        // past the gutter.
-        let gutter = ui.selection_symbol.width() as u16;
-        let x_start = area.left().saturating_add(gutter);
-        let x_end = area.right().min(x_start.saturating_add(3));
-        let buf = frame.buffer_mut();
-        for y in area.top()..area.bottom() {
-            for x in x_start..x_end {
-                let new_symbol = WIDE_PUA_GLYPHS
-                    .iter()
-                    .find(|(narrow, _)| buf[(x, y)].symbol() == *narrow)
-                    .map(|(_, wide)| *wide);
-                if let Some(s) = new_symbol {
-                    buf[(x, y)].set_symbol(s);
-                }
-            }
-        }
     }
 
     fn draw_preview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1812,6 +1778,12 @@ impl App {
 /// column of its own, which is exactly what merging into the icon column gave
 /// up.
 const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
+
+/// Width of the leading override column: two emoji slots, each 2 cells wide.
+/// Sized here rather than inline because both the narrow and wide constraint
+/// lists have to agree with what `override_indicator_cell` builds — a column
+/// narrower than the line right-aligned into it silently clips the bell.
+const OVERRIDE_COL_WIDTH: u16 = 4;
 
 /// Squeeze arbitrary text — up to and including a host's multi-line refusal —
 /// onto one row of `max` cells.

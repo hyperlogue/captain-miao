@@ -458,32 +458,38 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
     icon.width().clamp(1, DIR_ICON_MAX_CHARS)
 }
 
-/// Renders the override column using Nerd Font glyphs. Bell sits on the left
-/// and a secondary indicator (pin or mute) sits on the right; without a bell,
-/// pin or mute occupies the left position alone. Pin wins over mute when both
-/// flags are set. See `WIDE_PUA_GLYPHS` for the post-render fix-up that keeps
-/// these wide glyphs from being clipped by neighboring writes.
+/// Renders the override column using emoji. Bell sits on the left and a
+/// secondary indicator (pin or mute) sits on the right; without a bell, pin or
+/// mute occupies the left position alone. Pin wins over mute when both flags
+/// are set.
 ///
-/// Layout note: each glyph claims 1 ratatui cell but Kitty paints it 2 cells
-/// wide. With the column at `Length(3)` and the WIDE_PUA_GLYPHS post-process,
-/// a left-glyph at buf N auto-skips buf N+1; a right-glyph at buf N+2
-/// auto-skips buf N+3 (the column spacer), giving a tight `[L][L][R][R]`
-/// visual layout with no gap between glyphs.
+/// Layout note: every glyph here is emoji-presentation by default, so
+/// `unicode-width` measures it 2 and the terminal paints it 2 — the column is
+/// `Length(4)` and the two slots pack tight (`[L][L][R][R]`) with no separator
+/// between them. That agreement is the reason to prefer emoji over the Nerd
+/// Font PUA glyphs this column used to carry: those measure 1 and paint 2, so
+/// ratatui's diff never skipped the following cell and a neighbouring column's
+/// update clipped the glyph's right half — which needed a post-render buffer
+/// fix-up in `draw_table` to undo. Keep any replacement glyph in that same
+/// class: no text-presentation symbol, and nothing that needs a VS16 to become
+/// emoji, or the tight layout silently goes back to being half-painted.
 pub(super) fn override_indicator_cell(
     follow_up: bool,
     pinned: bool,
     muted: bool,
     detached: bool,
 ) -> Cell<'static> {
-    // nf-oct-bell, nf-cod-pinned, nf-md-sleep, nf-md-link_off
-    let bell = Span::styled("\u{f49a}", Style::default().fg(Color::Yellow));
-    let pin = Span::styled("\u{eba0}", Style::default().fg(Color::Blue));
-    let mute = Span::styled("\u{f04b2}", Style::default().add_modifier(Modifier::DIM));
+    // The styles only reach a terminal that renders these monochrome; a color
+    // emoji font paints its own hues and ignores the fg. Kept anyway so such a
+    // terminal still gets the accent, and so a muted row reads dim throughout.
+    let bell = Span::styled("\u{1F514}", Style::default().fg(Color::Yellow)); // 🔔 bell
+    let pin = Span::styled("\u{1F4CC}", Style::default().fg(Color::Blue)); // 📌 pushpin
+    let mute = Span::styled("\u{1F4A4}", Style::default().add_modifier(Modifier::DIM)); // 💤 zzz
     // A pooled session still running on its host with no window on this screen
     // (§9). It joins the existing icon set rather than getting a column of its
     // own, and ranks last among the secondaries: pin and mute are things the
     // *user* chose, detached is just where the session happens to be.
-    let unplugged = Span::styled("\u{f0d1d}", Style::default().add_modifier(Modifier::DIM));
+    let unplugged = Span::styled("\u{1F50C}", Style::default().add_modifier(Modifier::DIM)); // 🔌 plug
     let secondary = if pinned {
         Some(pin)
     } else if muted {
@@ -495,47 +501,13 @@ pub(super) fn override_indicator_cell(
     };
 
     let line = match (follow_up, secondary) {
-        (true, Some(s)) => Line::from(vec![bell, Span::raw(" "), s]),
+        (true, Some(s)) => Line::from(vec![bell, s]),
         (true, None) => Line::from(vec![bell]),
         (false, Some(s)) => Line::from(vec![s]),
         (false, None) => Line::from(""),
     };
     Cell::from(line.alignment(Alignment::Right))
 }
-
-/// Pairs of (narrow, wide) symbols for Nerd Font glyphs that suffer a width
-/// disagreement between `unicode-width` (says 1) and Kitty's actual rendering
-/// with a Nerd Font (paints 2 cells). `draw_table` post-processes the buffer
-/// after the Table widget renders: any cell whose symbol matches the narrow
-/// form is rewritten in place to the wide form (glyph + trailing space).
-///
-/// Why post-process instead of constructing the Cell with the wide string up
-/// front: ratatui's Table writes Cell content via `Buffer::set_string`, which
-/// iterates *graphemes* and stores each in its own buffer cell — so
-/// `Cell::from("\u{f49a} ")` ends up as two width-1 buffer cells (glyph at N,
-/// space at N+1), not one width-2 cell. The width-2 trick only works if a
-/// single buffer cell's `symbol()` is the multi-grapheme string, which is
-/// only reachable via `Cell::set_symbol` directly on the buffer.
-///
-/// What the width-2 symbol fixes: ratatui's `Buffer::diff` (see
-/// ratatui-0.30 `src/buffer/buffer.rs`) sets `to_skip = symbol.width() - 1`
-/// after each emitted cell. With a width-2 symbol the next buffer cell is
-/// auto-skipped, so its padding-space write never reaches the terminal — and
-/// Kitty's wide-rendered glyph keeps its right half intact even when adjacent
-/// columns (Status text, elapsed time) update on later frames. The trailing
-/// space is harmless: it gets painted at visual column N+2 and is immediately
-/// overwritten by the Status column's first character.
-///
-/// Why not `Cell::set_skip(true)` on the cell after the glyph: that excludes
-/// the cell from *all* updates including bg-style changes. Highlighted rows
-/// then leave that cell with the prior frame's bg, producing a visible
-/// dark-cell gap inside the selection highlight. Going the wide-symbol route
-/// keeps the cell on the normal update path so row highlights paint cleanly.
-pub(super) const WIDE_PUA_GLYPHS: &[(&str, &str)] = &[
-    ("\u{f49a}", "\u{f49a} "),
-    ("\u{eba0}", "\u{eba0} "),
-    ("\u{f04b2}", "\u{f04b2} "),
-];
 
 /// Display-cell budget for an auto-title folded from the first prompt. A
 /// deliberate `/rename` is short by nature and shown in full; a first prompt is
