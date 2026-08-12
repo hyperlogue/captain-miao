@@ -1314,8 +1314,8 @@ fn detached_rows_sink_below_plain_idle() {
 
 /// …and it *reads* as background too. The sort tier alone only helps once you
 /// know the ordering rule; dimming the whole row says "running elsewhere"
-/// where the eye already is. The plug glyph is two cells at the far left and
-/// was carrying that on its own.
+/// where the eye already is. The override glyph is two cells at the far left
+/// and was carrying that on its own.
 #[test]
 fn a_detached_row_draws_dim() {
     use crate::state::HostId;
@@ -1340,17 +1340,20 @@ fn a_detached_row_draws_dim() {
     );
 }
 
-/// …but an attention state still outranks: a parked approval prompt is urgent
-/// regardless of whether a window happens to be bound here.
+/// …and no status lifts it back out — not even a live blocking prompt. A
+/// parked approval or decision is urgent, but it's urgent *elsewhere*: it
+/// can't be answered until the row is attached, so seating it above the
+/// sessions on this screen buries the work that can be done now.
 #[test]
-fn attention_outranks_detached() {
+fn an_attention_state_does_not_lift_a_detached_row() {
     use crate::state::HostId;
     let mut d = TestDashboard::new(120, 12);
-    let mut waiting = session(1, "/srv/away", SessionStatus::WaitingForApproval);
+    let mut waiting = session(1, "/srv/away", SessionStatus::WaitingForDecision);
     waiting.host = HostId("box".into());
     waiting.pool_session = Some("cm-away".into());
     let here = session(2, "/home/test/here", SessionStatus::Idle);
-    d.set_sessions(vec![waiting, here]);
+    let working = session(3, "/home/test/work", SessionStatus::Active);
+    d.set_sessions(vec![waiting, here, working]);
 
     let order: Vec<u32> = d
         .app
@@ -1358,14 +1361,43 @@ fn attention_outranks_detached() {
         .iter()
         .map(|s| s.launcher_pid)
         .collect();
-    assert_eq!(order, vec![1, 2]);
+    assert_eq!(
+        order,
+        vec![2, 3, 1],
+        "a detached decision prompt still sorts below every live row"
+    );
 }
 
-/// A *follow-up bell*, however, does not lift a detached row back up. The bell
-/// is auto-armed on every Active→Idle, so a detached session that merely
-/// finished a turn would otherwise float into the attention block and stay
-/// there — the exact opposite of what the detached tier is for. Only a live
-/// blocking prompt (the test above) outranks detachment.
+/// The one thing that does outrank detachment is an explicit pin: `p` is the
+/// user saying "keep this in front of me" about that exact row, which is the
+/// whole job of the flag — unlike a status, which the dashboard infers.
+#[test]
+fn a_pin_lifts_a_detached_row() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into()); // pooled, but unbound
+    let here = session(2, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![away, here]);
+    d.app
+        .update_flags((HostId("box".into()), 1), Cursor::HoldIndex, |f| {
+            f.pinned = true
+        });
+
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(order, vec![1, 2], "the pinned detached row leads");
+}
+
+/// A *follow-up bell* is the same call for a softer signal. The bell is
+/// auto-armed on every Active→Idle, so a detached session that merely finished
+/// a turn would otherwise float into the attention block and stay there — the
+/// exact opposite of what the detached tier is for.
 #[test]
 fn a_follow_up_bell_does_not_lift_a_detached_row() {
     use crate::state::HostId;
@@ -5450,4 +5482,22 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
         !on_disk.iter().any(|b| b.token == "cm-claude-1"),
         "the dropped binding is still on disk: {on_disk:?}"
     );
+}
+
+#[test]
+fn tmp_visual_dump() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(96, 11);
+    let mut away = session(4, "/srv/away", SessionStatus::Idle);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into());
+    d.set_sessions(vec![
+        session(1, "/home/test/plain", SessionStatus::Active),
+        session(2, "/home/test/followup", SessionStatus::Idle),
+        session(3, "/home/test/pinned", SessionStatus::Idle),
+        away,
+    ]);
+    d.app.update_flags((HostId::local(), 2), Cursor::HoldIndex, |f| f.follow_up = true);
+    d.app.update_flags((HostId::local(), 3), Cursor::HoldIndex, |f| f.pinned = true);
+    println!("{}", d.render());
 }

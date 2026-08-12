@@ -892,17 +892,19 @@ decides what they mean**.
   ever needs softening, the recorded refinement is: hide *unless* the row has
   an attention state.)
 - **Detached sessions**: a pooled row with no bound window gets its own icon
-  (joining the pinned/follow-up set) and its own sort tier at the
-  **bottom**, below plain idle — it's running somewhere else, so it shouldn't
-  compete for the eye with what's in front of you. A *live* attention state
-  still outranks: a parked approval, decision or failed launch is urgent
-  regardless of a window. The soft signals do **not**: the detached tier is
-  tested above the follow-up and review-pending tiers, because `follow_up` is
-  auto-armed on every Active→Idle — so a detached session that merely finished a
-  turn used to float into the attention block and stay near the top for good,
-  precisely inverting the tier. (It remains a valid `s` jump target either way:
-  `s` is an explicit "take me to what wants me", the tier is only about where a
-  row sits at rest.) The preview panel names the case rather than showing
+  (joining the pinned/follow-up set) and its own sort tier at the very
+  **bottom** — it's running somewhere else, so it shouldn't compete for the eye
+  with what's in front of you. Detachment is the **first sort key**: no status
+  lifts a row out of the tier, not a follow-up bell and not a live approval or
+  decision prompt. Those are urgent, but urgent *elsewhere* — nothing there can
+  be answered until you attach, so seating it above the sessions on this screen
+  buries the work you can actually do now, and `follow_up` is auto-armed on
+  every Active→Idle, so a detached session that merely finished a turn would
+  homestead the attention block. The single exception is an explicit **pin**:
+  `p` is the user naming that row, not the dashboard inferring. (A detached row
+  remains a valid `s` jump target either way: `s` is an explicit "take me to
+  what wants me", the tier is only about where a row sits at rest.) The preview
+  panel names the case rather than showing
   `(loading…)` for a fetch that will never arrive — there is no local window to
   capture. New / resumed / forked sessions auto-attach on create.
 - **`o`** on a row opens another session on *that row's host + cwd*, not

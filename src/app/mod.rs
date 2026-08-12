@@ -2824,34 +2824,36 @@ impl App {
             // follow-up — sorted by updated_at like the other attention tiers.
             let review_pending = matches!(s.status, SessionStatus::ReviewPending);
             let attention = s.status.needs_attention() && !review_pending;
-            // A pooled session with no window on this screen sinks below plain
-            // idle — it's running somewhere else, so it shouldn't compete for
+            // A pooled session with no window on this screen sinks to the very
+            // bottom — it's running somewhere else, so it shouldn't compete for
             // the eye with what's in front of you (§9).
             //
-            // It is tested **above** the follow-up and review tiers on purpose.
-            // Those two are soft "get to this when you can" signals, and
-            // `follow_up` is auto-armed on every Active→Idle — so a detached
-            // session that merely finished a turn used to float into the
-            // attention block and sit near the top of the list for good, which
-            // is the opposite of what the tier exists for. What still outranks
-            // detachment is a *live* blocking prompt (`attention`: approval,
-            // decision, failed launch): that's urgent regardless of whether a
-            // window happens to be bound here.
+            // Detachment is the **first** key after an explicit pin: no status
+            // lifts a row out of the tier, not even a live approval or decision
+            // prompt. Those are urgent, but they are urgent *elsewhere* — the
+            // prompt can't be answered until you attach, so seating it above
+            // the sessions actually on this screen buries the work you can do
+            // now. `follow_up` is the same argument twice over, since it is
+            // auto-armed on every Active→Idle, so a detached session that
+            // merely finished a turn would otherwise homestead the attention
+            // block. The one thing that still wins is `pinned`: that's a
+            // deliberate per-row "keep this in front of me", and honouring it
+            // is the whole point of the key.
             let detached = self.is_detached_row(s);
             // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
             // or at-rest follow-up row); kept split here because ordering needs
             // the finer tiers, and with the detached tier taking precedence over
-            // 2/3 an attention row that is also detached lands in 6 while
+            // all three an attention row that is also detached lands in 6 while
             // staying a valid `s` jump target — deliberate: `s` is an explicit
             // "take me to what wants me", the tier is only about where the row
             // sits at rest. If the predicate there changes, revisit this
             // arithmetic to keep the jump target and the sort in agreement.
             let rank: u8 = if flags.pinned {
                 0
-            } else if attention {
-                1
             } else if detached {
                 6
+            } else if attention {
+                1
             } else if flags.follow_up && !active {
                 2
             } else if review_pending {
