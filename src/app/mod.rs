@@ -1511,8 +1511,9 @@ impl App {
     /// needs a live response (approval / decision / failed-to-start, plus
     /// review-pending via `needs_attention`) or carries a user follow-up flag
     /// while at rest. This is the union of the attention sort-ranks in
-    /// `compute_visible_indices` (which splits it into finer tiers for ordering);
-    /// `jump_to_next_attention` uses it directly.
+    /// `compute_visible_indices` (which splits it into finer tiers for
+    /// ordering); `jump_to_next_attention` uses it minus the detached rows,
+    /// which it can't act on from here.
     pub(super) fn is_attention_row(&self, s: &LauncherState) -> bool {
         let flags = self.flags_of(&flag_key(s));
         s.status.needs_attention() || (flags.follow_up && !s.status.is_busy())
@@ -2853,11 +2854,11 @@ impl App {
             // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
             // or at-rest follow-up row); kept split here because ordering needs
             // the finer tiers, and with the detached tier taking precedence over
-            // all three an attention row that is also detached lands in 6 while
-            // staying a valid `s` jump target — deliberate: `s` is an explicit
-            // "take me to what wants me", the tier is only about where the row
-            // sits at rest. If the predicate there changes, revisit this
-            // arithmetic to keep the jump target and the sort in agreement.
+            // all three an attention row that is also detached lands in 6.
+            // `jump_to_next_attention` skips that same row for the same reason
+            // it sinks here — the prompt can't be answered until you attach —
+            // so the sort and the jump target stay in agreement. Changing the
+            // predicate on either side means revisiting the other.
             let rank: u8 = if flags.pinned {
                 0
             } else if detached {
@@ -3885,17 +3886,43 @@ impl App {
     /// Jump to the next session that needs attention (approval, decision, or
     /// needs-input). Pressing again cycles through all such sessions, wrapping
     /// around to the first one after the last.
+    ///
+    /// **Detached rows are not targets.** `s` is a "take me to the work waiting
+    /// on me" key, and the work on a row with no window here can't be done from
+    /// here: the prompt is unanswerable until the row is attached, so landing
+    /// the cursor on it costs a keypress and gives back nothing. It is the same
+    /// argument that sinks the row to its own tier in `compute_visible_indices`
+    /// — the two now agree. When *only* detached rows want attention the key
+    /// says so rather than claiming nothing does, since the icons on screen say
+    /// otherwise.
     pub(super) fn jump_to_next_attention(&mut self) {
         let visible = self.visible_sessions();
         let current = self.table_state.selected().unwrap_or(usize::MAX);
+        let mut skipped_detached = false;
         let attention_indices: Vec<usize> = visible
             .iter()
             .enumerate()
-            .filter(|(_, s)| self.is_attention_row(s))
+            .filter(|(_, s)| {
+                if !self.is_attention_row(s) {
+                    return false;
+                }
+                if self.is_detached_row(s) {
+                    skipped_detached = true;
+                    return false;
+                }
+                true
+            })
             .map(|(i, _)| i)
             .collect();
         if attention_indices.is_empty() {
-            self.set_status("No sessions need attention".to_string(), false);
+            self.set_status(
+                if skipped_detached {
+                    "Only detached sessions need attention".to_string()
+                } else {
+                    "No sessions need attention".to_string()
+                },
+                false,
+            );
             return;
         }
         // Pick the first attention index strictly after current, or wrap to the first.

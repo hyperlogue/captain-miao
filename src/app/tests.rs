@@ -1431,6 +1431,52 @@ fn an_attention_state_does_not_lift_a_detached_row() {
     );
 }
 
+/// …and `s` doesn't take you there either. The jump key means "take me to the
+/// work waiting on me", which a detached row can't offer: its prompt is
+/// unanswerable until the row is attached, so landing the cursor there costs a
+/// keypress and gives nothing back. When the detached row is the *only* thing
+/// wanting attention the key says so, rather than claiming nothing does while
+/// an attention icon sits on screen.
+#[test]
+fn the_attention_jump_skips_a_detached_row() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let mut away = session(1, "/srv/away", SessionStatus::WaitingForDecision);
+    away.host = HostId("box".into());
+    away.pool_session = Some("cm-away".into()); // pooled, but unbound
+    let here = session(2, "/home/test/here", SessionStatus::WaitingForDecision);
+    let working = session(3, "/home/test/work", SessionStatus::Active);
+    d.set_sessions(vec![away, here, working]);
+    let order: Vec<u32> = d
+        .app
+        .visible_sessions()
+        .iter()
+        .map(|s| s.launcher_pid)
+        .collect();
+    assert_eq!(order, vec![2, 3, 1]);
+
+    // Sitting on the one live attention row, `s` has nowhere else to go — the
+    // detached decision prompt at index 2 is not a candidate.
+    d.app.table_state.select(Some(0));
+    d.press(KeyCode::Char('s'));
+    assert_eq!(d.selected(), Some(0));
+    assert_eq!(
+        d.app.status_msg.as_deref(),
+        Some("Only one session needs attention")
+    );
+
+    // With the live row at rest, only the detached one still wants something.
+    // The cursor stays put and the status names why.
+    d.app.sessions[1].status = SessionStatus::Idle;
+    d.app.mark_dirty(Cursor::HoldIndex);
+    d.press(KeyCode::Char('s'));
+    assert_eq!(d.selected(), Some(0));
+    assert_eq!(
+        d.app.status_msg.as_deref(),
+        Some("Only detached sessions need attention")
+    );
+}
+
 /// The one thing that does outrank detachment is an explicit pin: `p` is the
 /// user saying "keep this in front of me" about that exact row, which is the
 /// whole job of the flag — unlike a status, which the dashboard infers.
