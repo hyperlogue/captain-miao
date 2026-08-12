@@ -1988,7 +1988,6 @@ fn host_served_flags_are_adopted_onto_rows() {
     s.pool_session = Some("cm-1".into());
     s.flags = Some(HostFlags {
         pinned: true,
-        muted: false,
         follow_up: false,
     });
     d.app.sessions = vec![s];
@@ -2024,20 +2023,26 @@ fn the_tab_label_carries_the_unfiltered_attention_count() {
     assert_eq!(d.app.visible_sessions().len(), 0);
     assert_eq!(d.app.attention_count(), 2);
 
-    // Muting is the user saying "not this one", so it does come off the count.
-    d.app
-        .update_flags(super::flag_key(&waiting), Cursor::HoldIndex, |f| {
-            f.muted = true
-        });
+    // Answering one of them takes it off the count.
+    let mut answered = waiting.clone();
+    answered.status = SessionStatus::Idle;
+    d.set_sessions(vec![
+        answered,
+        deciding.clone(),
+        session(3, "/home/test/c", SessionStatus::Active),
+    ]);
     assert_eq!(d.app.attention_count(), 1);
     assert_eq!(dashboard_tab_title(d.app.attention_count()), "miao (1)");
 
     // Nothing waiting reads as a bare name: a parenthesised zero that is always
     // on screen is exactly the thing the count exists to *not* be.
-    d.app
-        .update_flags(super::flag_key(&deciding), Cursor::HoldIndex, |f| {
-            f.muted = true
-        });
+    let mut decided = deciding.clone();
+    decided.status = SessionStatus::Idle;
+    d.set_sessions(vec![
+        session(1, "/home/test/a", SessionStatus::Idle),
+        decided,
+        session(3, "/home/test/c", SessionStatus::Active),
+    ]);
     assert_eq!(d.app.attention_count(), 0);
     assert_eq!(dashboard_tab_title(0), "miao");
 }
@@ -2358,8 +2363,8 @@ fn follow_up_transitions_mark_and_clear() {
 
     let mut d = TestDashboard::new(120, 15);
 
-    // Each rest-entering transition marks follow_up; a muted row is skipped even
-    // though it entered rest too. Entering `BackgroundServer` (parking a
+    // Each rest-entering transition marks follow_up; a row already carrying the
+    // bell is skipped even though it entered rest too. Entering `BackgroundServer` (parking a
     // long-running dev server) also arms the bell — but only on a real transition
     // into it, not for a Server row seen for the first time (prev is None at
     // startup). Entering the *busy* `BackgroundActive` (a short-term task) does
@@ -2368,7 +2373,7 @@ fn follow_up_transitions_mark_and_clear() {
     let bg_to_idle = session(2, "/home/test/b", SessionStatus::Idle);
     let review_to_idle = session(3, "/home/test/c", SessionStatus::Idle);
     let compacting_to_compacted = session(4, "/home/test/d", SessionStatus::Compacted);
-    let muted_to_idle = session(5, "/home/test/e", SessionStatus::Idle);
+    let flagged_to_idle = session(5, "/home/test/e", SessionStatus::Idle);
     let active_to_server = session(6, "/home/test/f", SessionStatus::BackgroundServer);
     let fresh_server = session(7, "/home/test/g", SessionStatus::BackgroundServer);
     let active_to_bg = session(8, "/home/test/h", SessionStatus::BackgroundActive);
@@ -2378,15 +2383,15 @@ fn follow_up_transitions_mark_and_clear() {
         bg_to_idle.clone(),
         review_to_idle.clone(),
         compacting_to_compacted.clone(),
-        muted_to_idle.clone(),
+        flagged_to_idle.clone(),
         active_to_server.clone(),
         fresh_server.clone(),
         active_to_bg.clone(),
         server_to_idle.clone(),
     ];
     d.app
-        .update_flags(flag_key(&muted_to_idle), Cursor::HoldIndex, |f| {
-            f.muted = true
+        .update_flags(flag_key(&flagged_to_idle), Cursor::HoldIndex, |f| {
+            f.follow_up = true
         });
 
     let prev: HashMap<FlagKey, SessionStatus> = [
@@ -2397,7 +2402,7 @@ fn follow_up_transitions_mark_and_clear() {
             flag_key(&compacting_to_compacted),
             SessionStatus::Compacting,
         ),
-        (flag_key(&muted_to_idle), SessionStatus::Active),
+        (flag_key(&flagged_to_idle), SessionStatus::Active),
         (flag_key(&active_to_server), SessionStatus::Active),
         // fresh_server has no prev entry → prev is None (dashboard just started).
         (flag_key(&active_to_bg), SessionStatus::Active),
@@ -4862,11 +4867,10 @@ fn restart_restores_flags_to_new_pid_by_window() {
     let s = session(7, "/home/test/proj", SessionStatus::Idle);
     let new_wid = s.window_id.clone().unwrap();
     d.set_sessions(vec![s]);
-    // The session that died was muted and waiting on a follow-up.
+    // The session that died was waiting on a follow-up.
     d.app.pending_flag_restores.insert(
         new_wid,
         super::SessionFlags {
-            muted: true,
             follow_up: true,
             ..Default::default()
         },
@@ -4874,7 +4878,6 @@ fn restart_restores_flags_to_new_pid_by_window() {
 
     assert!(d.app.apply_pending_flag_restores());
     let f = d.app.flags_of(&(crate::state::HostId::local(), 7));
-    assert!(f.muted);
     assert!(f.follow_up);
     assert!(!f.pinned);
     // Consumed: a later reload must not re-apply it.
@@ -4924,13 +4927,17 @@ fn restart_restore_waits_until_session_reappears() {
     d.app.pending_flag_restores.insert(
         WindowId::from(9999),
         super::SessionFlags {
-            muted: true,
+            follow_up: true,
             ..Default::default()
         },
     );
     assert!(!d.app.apply_pending_flag_restores());
     // Nothing applied, entry retained for a later reload.
-    assert!(!d.app.flags_of(&(crate::state::HostId::local(), 1)).muted);
+    assert!(
+        !d.app
+            .flags_of(&(crate::state::HostId::local(), 1))
+            .follow_up
+    );
     assert_eq!(d.app.pending_flag_restores.len(), 1);
 }
 
@@ -4945,7 +4952,6 @@ fn snapshot_entry_flags_roundtrip_and_back_compat() {
         cwd: "/home/test/proj".to_string(),
         session_id: "sess-1".to_string(),
         flags: SessionFlags {
-            muted: true,
             pinned: true,
             pin_seq: 3,
             follow_up: false,

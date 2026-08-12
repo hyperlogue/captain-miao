@@ -745,7 +745,7 @@ Three layers, strictly ordered by authority:
    the daemon), plus the host's persisted `recent-cwds.json`.
 4. **Dashboard — projections + preferences**: mirrors and the host-stamped row
    list in memory; on disk `hosts.json` (targets, labels, colors, icons),
-   `window-bindings.json`, `dashboard-overrides.json` (pins/mutes for
+   `window-bindings.json`, `dashboard-overrides.json` (pins/bells for
    *direct-local* rows, plus keep-awake / default agent / default host /
    layout), `dashboard-sessions.json` (crash-recovery snapshot — direct-local
    by design, since a pooled session survives a dashboard crash on its own and
@@ -757,7 +757,7 @@ calls it) so a remote pid can't collide with a local one.
 
 **Multi-dashboard semantics**: several dashboards on one host are supported by
 construction — each is just another subscriber, and now they agree on
-pins/mutes too (the flags sidecar, pushed as a `Delta` to every subscriber).
+pins/bells too (the flags sidecar, pushed as a `Delta` to every subscriber).
 All shared mutable state lives in host-fs files with **last-writer-wins**
 semantics, accepted as-is. Steal-attach is an action, not state. Nothing
 coordinates concurrent writers beyond atomic file replacement, by decision.
@@ -908,7 +908,7 @@ decides what they mean**.
   ever needs softening, the recorded refinement is: hide *unless* the row has
   an attention state.)
 - **Detached sessions**: a pooled row with no bound window gets its own icon
-  (joining the pinned/muted/follow-up set) and its own sort tier at the
+  (joining the pinned/follow-up set) and its own sort tier at the
   **bottom**, below plain idle — it's running somewhere else, so it shouldn't
   compete for the eye with what's in front of you. A *live* attention state
   still outranks: a parked approval, decision or failed launch is urgent
@@ -951,7 +951,7 @@ decides what they mean**.
 - **`w` work tab** — `shell_plan` decides: an in-process shell for this
   machine, an `ssh -t <host>` tab that cds into the session's cwd for a remote.
 - **Fork and restart** work on any host.
-- **Preferences**: pins/mutes/follow-ups on a pooled host's rows are stored
+- **Preferences**: pins/follow-ups on a pooled host's rows are stored
   **server-side** (§8) and adopted onto `App.flags` at reload, so every
   dashboard attached to that host — and a phone-ssh user on the box — sees the
   same ones, and they survive a dashboard restart. `pin_seq` stays client-side:

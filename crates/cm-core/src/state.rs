@@ -246,7 +246,7 @@ pub fn window_bindings_path() -> PathBuf {
 
 /// The host-side per-session flags sidecar (`docs/remote-sessions.md` §9): a
 /// `SessionKey → SessionFlags` map the **server-core** owns, so every dashboard
-/// attached to a host sees the same pins/mutes and they survive a dashboard
+/// attached to a host sees the same pins/bells and they survive a dashboard
 /// restart. Deliberately a sidecar rather than a field on the launcher's state
 /// file: that file has exactly one writer (its launcher), and flags are set by
 /// someone else entirely.
@@ -669,7 +669,7 @@ pub struct LauncherState {
     /// `host`) so it reaches the dashboard off the state file / wire.
     #[serde(default)]
     pub terminal: Option<String>,
-    /// Per-session flags (pinned / muted / follow-up) as the **owning host**
+    /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
     /// served — never written by the launcher (single-writer rule). `None` from
     /// a backend that doesn't serve flags (a plain local dashboard, which keeps
@@ -693,13 +693,18 @@ pub struct LauncherState {
 /// Per-session flags a host owns on behalf of every dashboard watching it
 /// (`docs/remote-sessions.md` §9). Persisted in the daemon's sidecar
 /// ([`session_flags_path`]), overlaid onto served rows, and updated by
-/// `ClientFrame::SetSessionFlags` — so pins and mutes are the same for every
+/// `ClientFrame::SetSessionFlags` — so pins and bells are the same for every
 /// dashboard attached to the host, and survive a dashboard restart.
+///
+/// This carried a third flag, `muted`, until it was dropped as unused. Both
+/// directions of a version-mixed pair keep working: `#[serde(default)]` fills
+/// it in for an old peer's frame that omits it, and serde drops the unknown
+/// field from an old peer's frame that still sends it — the mute simply has no
+/// effect anywhere.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionFlags {
     pub pinned: bool,
-    pub muted: bool,
     pub follow_up: bool,
 }
 

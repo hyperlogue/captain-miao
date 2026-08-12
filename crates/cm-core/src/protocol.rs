@@ -68,7 +68,7 @@ pub enum ClientFrame {
     /// session, then replies `Opened` with its name.
     OpenSession { req_id: u64, spec: OpenSpec },
     /// Set the host-owned flags for a session, so every dashboard watching the
-    /// host agrees on its pins/mutes. Reply: `FlagsSet`.
+    /// host agrees on its pins/bells. Reply: `FlagsSet`.
     SetSessionFlags {
         req_id: u64,
         key: SessionKey,
@@ -238,7 +238,6 @@ mod tests {
                 key: SessionKey::from_launcher_pid(4242),
                 flags: SessionFlags {
                     pinned: true,
-                    muted: false,
                     follow_up: true,
                 },
             },

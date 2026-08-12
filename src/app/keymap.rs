@@ -236,7 +236,6 @@ pub(super) enum Command {
     ScrollPreviewLeft,
     ScrollPreviewRight,
     // Flags
-    ToggleMute,
     TogglePin,
     ToggleFollowUp,
     // Modes
@@ -286,7 +285,6 @@ impl Command {
             Command::ScrollPreviewDown => "scroll_down",
             Command::ScrollPreviewLeft => "scroll_left",
             Command::ScrollPreviewRight => "scroll_right",
-            Command::ToggleMute => "mute",
             Command::TogglePin => "pin",
             Command::ToggleFollowUp => "needs_input",
             Command::Search => "search",
@@ -316,7 +314,7 @@ impl Command {
         match self {
             Command::SelectNext => "next session",
             Command::SelectPrev => "previous session",
-            Command::JumpBottom => "jump to bottom (last unmuted first)",
+            Command::JumpBottom => "jump to bottom",
             Command::FocusSelected => "focus selected window",
             Command::NewSession => "new session (same tab)",
             Command::NewSessionPrompt => "new session (prompt for cwd; Ctrl-g for a worktree)",
@@ -333,7 +331,6 @@ impl Command {
             Command::ScrollPreviewDown => "scroll preview down",
             Command::ScrollPreviewLeft => "scroll preview left",
             Command::ScrollPreviewRight => "scroll preview right",
-            Command::ToggleMute => "mute",
             Command::TogglePin => "pin",
             Command::ToggleFollowUp => "toggle needs-input (idle only)",
             Command::Search => "search",
@@ -376,7 +373,6 @@ impl Command {
             Command::ScrollPreviewDown => "scroll down",
             Command::ScrollPreviewLeft => "scroll left",
             Command::ScrollPreviewRight => "scroll right",
-            Command::ToggleMute => "mute",
             Command::TogglePin => "pin",
             Command::ToggleFollowUp => "needs-input",
             Command::Search => "search",
@@ -422,7 +418,6 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ScrollPreviewDown,  &["ctrl+d"]),
     (Command::ScrollPreviewLeft,  &["h", "left", "<"]),
     (Command::ScrollPreviewRight, &["l", "right", ">"]),
-    (Command::ToggleMute,         &["m"]),
     (Command::TogglePin,          &["p"]),
     (Command::ToggleFollowUp,     &["i"]),
     (Command::Search,             &["/"]),

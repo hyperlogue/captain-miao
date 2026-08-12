@@ -76,7 +76,6 @@ pub(super) enum DragTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum SessionFlag {
-    Mute,
     Pin,
     FollowUp,
 }
@@ -334,11 +333,11 @@ pub(super) struct ResumeLoad {
     pub(super) errors: Vec<String>,
 }
 
-/// Persisted dashboard overrides (pin/mute/needs-input) so they survive restarts.
+/// Persisted dashboard overrides (pin/needs-input) so they survive restarts.
+/// A file written before mute was removed still carries a `muted` list; serde
+/// drops it as an unknown field, which is exactly the wanted migration.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DashboardOverrides {
-    #[serde(default)]
-    muted: Vec<u32>,
     #[serde(default)]
     pinned: Vec<u32>,
     #[serde(default)]
@@ -383,7 +382,7 @@ pub(super) struct SessionSnapshotEntry {
     pub window_id: WindowId,
     pub cwd: String,
     pub session_id: String,
-    /// Status flags (pinned / muted / follow-up) the session carried at
+    /// Status flags (pinned / follow-up) the session carried at
     /// snapshot time, so a crash-recovery restart can re-adopt them. Defaulted
     /// for snapshots written before this field existed.
     #[serde(default)]
@@ -910,7 +909,7 @@ pub(super) struct App {
     /// second click on the same row within `DOUBLE_CLICK_THRESHOLD` is treated
     /// as a double-click and focuses that session's window.
     pub(super) last_click: Option<(Instant, usize)>,
-    /// Per-session override flags (muted / pinned / follow-up), sparse:
+    /// Per-session override flags (pinned / follow-up), sparse:
     /// sessions with no overrides are not represented. `follow_up` is
     /// auto-added on Active→Idle transitions; the other two are only set
     /// via explicit user toggles (`m` / `p`).
@@ -1273,8 +1272,6 @@ fn resume_picker_title(host: &HostId) -> String {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct SessionFlags {
     #[serde(default)]
-    pub muted: bool,
-    #[serde(default)]
     pub pinned: bool,
     /// Monotonic sequence number assigned when `pinned` was last set true.
     /// Higher = more recently pinned. Used to order pinned sessions so the
@@ -1289,7 +1286,7 @@ pub(super) struct SessionFlags {
 
 impl SessionFlags {
     pub fn is_default(&self) -> bool {
-        !self.muted && !self.pinned && !self.follow_up
+        !self.pinned && !self.follow_up
     }
 }
 
@@ -1489,10 +1486,6 @@ impl App {
         self.flags.get(key).copied().unwrap_or_default()
     }
 
-    pub(super) fn is_muted(&self, key: &FlagKey) -> bool {
-        self.flags_of(key).muted
-    }
-
     pub(super) fn is_follow_up(&self, key: &FlagKey) -> bool {
         self.flags_of(key).follow_up
     }
@@ -1510,15 +1503,15 @@ impl App {
             .count()
     }
 
-    /// Whether a session is currently soliciting attention: an unmuted session
-    /// that either needs a live response (approval / decision / failed-to-start,
-    /// plus review-pending via `needs_attention`) or carries a user follow-up
-    /// flag while at rest. This is the union of the attention sort-ranks in
+    /// Whether a session is currently soliciting attention: one that either
+    /// needs a live response (approval / decision / failed-to-start, plus
+    /// review-pending via `needs_attention`) or carries a user follow-up flag
+    /// while at rest. This is the union of the attention sort-ranks in
     /// `compute_visible_indices` (which splits it into finer tiers for ordering);
     /// `jump_to_next_attention` uses it directly.
     pub(super) fn is_attention_row(&self, s: &LauncherState) -> bool {
         let flags = self.flags_of(&flag_key(s));
-        !flags.muted && (s.status.needs_attention() || (flags.follow_up && !s.status.is_busy()))
+        s.status.needs_attention() || (flags.follow_up && !s.status.is_busy())
     }
 
     /// Apply bell sentinels dropped into the sessions dir by
@@ -1542,7 +1535,6 @@ impl App {
             }
             self.update_flags(key, Cursor::FollowSession, |f| {
                 f.follow_up = true;
-                f.muted = false;
             });
             changed = true;
         }
@@ -1553,7 +1545,7 @@ impl App {
 
     /// Adopt the flags a host serves for its own sessions (§9).
     ///
-    /// Pins and mutes for a pooled host live in that host's sidecar, not in this
+    /// Pins and bells for a pooled host live in that host's sidecar, not in this
     /// dashboard's `dashboard-overrides.json`, so every dashboard attached to
     /// the host — and a phone-ssh user on the box itself — sees the same ones,
     /// and they survive a dashboard restart. `App.flags` stays the single
@@ -1569,10 +1561,7 @@ impl App {
             .collect();
         for (key, host_flags) in served {
             let mine = self.flags_of(&key);
-            if mine.pinned == host_flags.pinned
-                && mine.muted == host_flags.muted
-                && mine.follow_up == host_flags.follow_up
-            {
+            if mine.pinned == host_flags.pinned && mine.follow_up == host_flags.follow_up {
                 continue;
             }
             // Newly pinned by someone else: issue a local sequence number so it
@@ -1585,7 +1574,6 @@ impl App {
             };
             self.update_flags(key, Cursor::FollowSession, move |f| {
                 f.pinned = host_flags.pinned;
-                f.muted = host_flags.muted;
                 f.follow_up = host_flags.follow_up;
                 f.pin_seq = seq;
             });
@@ -1606,7 +1594,6 @@ impl App {
         }
         let wire = HostSessionFlags {
             pinned: flags.pinned,
-            muted: flags.muted,
             follow_up: flags.follow_up,
         };
         tokio::task::block_in_place(|| {
@@ -1616,10 +1603,10 @@ impl App {
 
     /// Mutate a session's flags; removes the entry entirely if the result is
     /// all-false to keep the map sparse.
-    /// Every flag here (pinned / muted / follow-up) is a sort key, so this takes
-    /// a [`Cursor`] like any other re-sorting mutation rather than picking one
-    /// for its callers — muting and clearing a bell deliberately want different
-    /// answers from the rest.
+    /// Every flag here (pinned / follow-up) is a sort key, so this takes a
+    /// [`Cursor`] like any other re-sorting mutation rather than picking one
+    /// for its callers — clearing a bell deliberately wants a different answer
+    /// from setting one.
     pub(super) fn update_flags(
         &mut self,
         key: FlagKey,
@@ -1711,9 +1698,6 @@ impl App {
             if !host.is_local() {
                 continue;
             }
-            if f.muted {
-                overrides.muted.push(*pid);
-            }
             if f.follow_up {
                 overrides.follow_up.push(*pid);
             }
@@ -1733,9 +1717,6 @@ impl App {
         };
         self.flags.clear();
         // Persisted flags are local (see save_overrides) — re-key under `local`.
-        for pid in overrides.muted {
-            self.flags.entry((HostId::local(), pid)).or_default().muted = true;
-        }
         // The persisted order is oldest first — assign sequence numbers so the
         // last-pinned session keeps the highest seq.
         for (i, pid) in overrides.pinned.iter().enumerate() {
@@ -2670,7 +2651,7 @@ impl App {
         self.reap_window_queue.extend(reaped);
         self.session_indexes = self.refresh_session_indexes();
         // Adopt the host-owned flags for rows whose host serves them, so every
-        // dashboard watching that host agrees about pins and mutes (§9). Done
+        // dashboard watching that host agrees about pins and bells (§9). Done
         // before the follow-up transitions below, which read `flags_of`.
         self.adopt_host_flags();
         // Forget attach expectations for sessions their host no longer reports,
@@ -2884,17 +2865,15 @@ impl App {
             // decision, failed launch): that's urgent regardless of whether a
             // window happens to be bound here.
             let detached = self.is_detached_row(s);
-            // Ranks 1–3 cover what `is_attention_row` unions (an unmuted
-            // needs-attention or at-rest follow-up row); kept split here because
-            // ordering needs the finer tiers, and with the detached tier taking
-            // precedence over 2/3 an attention row that is also detached lands
-            // in 6 while staying a valid `s` jump target — deliberate: `s` is an
-            // explicit "take me to what wants me", the tier is only about where
-            // the row sits at rest. If the predicate there changes, revisit this
+            // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
+            // or at-rest follow-up row); kept split here because ordering needs
+            // the finer tiers, and with the detached tier taking precedence over
+            // 2/3 an attention row that is also detached lands in 6 while
+            // staying a valid `s` jump target — deliberate: `s` is an explicit
+            // "take me to what wants me", the tier is only about where the row
+            // sits at rest. If the predicate there changes, revisit this
             // arithmetic to keep the jump target and the sort in agreement.
-            let rank: u8 = if flags.muted {
-                7
-            } else if flags.pinned {
+            let rank: u8 = if flags.pinned {
                 0
             } else if attention {
                 1
@@ -2927,12 +2906,6 @@ impl App {
             (rank, time_key)
         });
         indices
-    }
-
-    /// Index of the last non-muted session in the current visible list.
-    pub(super) fn last_unmuted_index(&self) -> Option<usize> {
-        let visible = self.visible_sessions();
-        visible.iter().rposition(|s| !self.is_muted(&flag_key(s)))
     }
 
     /// Live sessions across every backend, each tagged with its host so per-row
@@ -3235,8 +3208,8 @@ impl App {
     /// `update_flags`. Sibling of `newly_failed_windows`; extracted so the
     /// transition is unit-testable (`reload_sessions` itself is driven only
     /// through fs events). A session that just entered a rest state and isn't
-    /// muted or already flagged gets `true`; one back to Active that still
-    /// carries the flag gets `false`.
+    /// already flagged gets `true`; one back to Active that still carries the
+    /// flag gets `false`.
     pub(super) fn follow_up_transitions(
         &self,
         prev_status: &HashMap<FlagKey, SessionStatus>,
@@ -3271,7 +3244,7 @@ impl App {
                 // Idle above, like Active.)
                 let parked_server = s.status == SessionStatus::BackgroundServer
                     && prev.is_some_and(|p| *p != SessionStatus::BackgroundServer);
-                if (entered_rest || parked_server) && !flags.muted && !flags.follow_up {
+                if (entered_rest || parked_server) && !flags.follow_up {
                     Some((flag_key(s), true))
                 } else if s.status == SessionStatus::Active && flags.follow_up {
                     Some((flag_key(s), false))
@@ -3824,16 +3797,12 @@ impl App {
         // `pid` (a copy) labels the status line; `key` keys flags.
         let pid = key.1;
         let was = self.flags_of(&key);
-        // Every flag is a sort key, and this one operation wants all three
+        // Every flag is a sort key, and this one operation wants different
         // cursor policies depending on which way it's going — which is exactly
         // why `mark_dirty` makes the choice explicit instead of assuming one.
         // Decided here, before the toggle, because the clearing arm needs the
         // pre-mutation order to name its target.
         let cursor = match flag {
-            // Muting sinks the row (or hides it outright): hold the index so
-            // the next session arrives under the cursor. Muting is something
-            // you do in a run, so the cursor should stay where the work is.
-            SessionFlag::Mute if !was.muted => Cursor::HoldIndex,
             // Clearing needs-input drops the row out of the attention tier, so
             // don't ride it down — advance to the session that sat just after
             // it (or just before, when it sat at the end). Falls back to the row
@@ -3841,24 +3810,11 @@ impl App {
             SessionFlag::FollowUp if was.follow_up => {
                 Cursor::Follow(self.neighbor_of_selected().unwrap_or_else(|| key.clone()))
             }
-            // Unmute / pin / marking needs-input: the row floats up and the
-            // cursor rides with it, so the user stays on what they just flagged.
+            // Pin / marking needs-input: the row floats up and the cursor rides
+            // with it, so the user stays on what they just flagged.
             _ => Cursor::FollowSession,
         };
-        // Mute is mutually exclusive with pin/follow-up: turning any of them on
-        // clears the others. Turning pin/follow-up on clears mute.
         let now_on = match flag {
-            SessionFlag::Mute => {
-                let on = !was.muted;
-                self.update_flags(key.clone(), cursor, |f| {
-                    f.muted = on;
-                    if on {
-                        f.pinned = false;
-                        f.follow_up = false;
-                    }
-                });
-                on
-            }
             SessionFlag::Pin => {
                 let on = !was.pinned;
                 let seq = if on {
@@ -3870,9 +3826,6 @@ impl App {
                 self.update_flags(key.clone(), cursor, move |f| {
                     f.pinned = on;
                     f.pin_seq = seq;
-                    if on {
-                        f.muted = false;
-                    }
                 });
                 on
             }
@@ -3880,9 +3833,6 @@ impl App {
                 let on = !was.follow_up;
                 self.update_flags(key.clone(), cursor, |f| {
                     f.follow_up = on;
-                    if on {
-                        f.muted = false;
-                    }
                 });
                 on
             }
@@ -3900,8 +3850,6 @@ impl App {
         // already placed it, which is the point of routing the policy through
         // `mark_dirty` rather than re-deriving a target after the fact.
         let label = match (flag, now_on) {
-            (SessionFlag::Mute, true) => "Muted",
-            (SessionFlag::Mute, false) => "Unmuted",
             (SessionFlag::Pin, true) => "Pinned",
             (SessionFlag::Pin, false) => "Unpinned",
             (SessionFlag::FollowUp, true) => "Marked needs input",

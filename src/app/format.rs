@@ -459,9 +459,8 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
 }
 
 /// Renders the override column using emoji. Bell sits on the left and a
-/// secondary indicator (pin or mute) sits on the right; without a bell, pin or
-/// mute occupies the left position alone. Pin wins over mute when both flags
-/// are set.
+/// secondary indicator (pin or detached) sits on the right; without a bell, the
+/// secondary occupies the left position alone.
 ///
 /// Layout note: every glyph here is emoji-presentation by default, so
 /// `unicode-width` measures it 2 and the terminal paints it 2 — the column is
@@ -476,24 +475,20 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
 pub(super) fn override_indicator_cell(
     follow_up: bool,
     pinned: bool,
-    muted: bool,
     detached: bool,
 ) -> Cell<'static> {
     // The styles only reach a terminal that renders these monochrome; a color
     // emoji font paints its own hues and ignores the fg. Kept anyway so such a
-    // terminal still gets the accent, and so a muted row reads dim throughout.
+    // terminal still gets the accent.
     let bell = Span::styled("\u{1F514}", Style::default().fg(Color::Yellow)); // 🔔 bell
     let pin = Span::styled("\u{1F4CC}", Style::default().fg(Color::Blue)); // 📌 pushpin
-    let mute = Span::styled("\u{1F4A4}", Style::default().add_modifier(Modifier::DIM)); // 💤 zzz
     // A pooled session still running on its host with no window on this screen
     // (§9). It joins the existing icon set rather than getting a column of its
-    // own, and ranks last among the secondaries: pin and mute are things the
-    // *user* chose, detached is just where the session happens to be.
+    // own, and ranks below the pin: a pin is something the *user* chose,
+    // detached is just where the session happens to be.
     let unplugged = Span::styled("\u{1F50C}", Style::default().add_modifier(Modifier::DIM)); // 🔌 plug
     let secondary = if pinned {
         Some(pin)
-    } else if muted {
-        Some(mute)
     } else if detached {
         Some(unplugged)
     } else {

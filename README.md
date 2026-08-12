@@ -26,7 +26,7 @@ tool and the rest of your workflow is yours to compose.
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
-- **Pin, mute, mark:** pin important sessions to the top, mute the ones you don't need right now, and flag the ones to follow up on.
+- **Pin and mark:** pin important sessions to the top, and flag the ones to follow up on.
 - **Sessions that outlive their window** (opt-in): run them in a local pty pool so closing the terminal — or logging out — doesn't end them, and a dashboard on another machine can attach to the same ones.
 - **Sessions on other machines:** federate several hosts into one dashboard, each running its sessions in its own pty pool, so a dropped connection or a slept laptop detaches windows without touching the sessions.
 - 🧪 **Isolated worktrees:** start a session in a fresh git worktree so it can't touch your main checkout — see [Experimental](#experimental).
@@ -153,7 +153,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session |
 | `x` / `D`                      | Kill the selected session / detach from it, leaving it running         |
 | `s`                            | Jump to the next session needing attention                             |
-| `m` / `p` / `i`                | Mute / pin / toggle needs-input on the selected session                |
+| `p` / `i`                      | Pin / toggle needs-input on the selected session                       |
 | `y`                            | Copy the selected session id to the clipboard                          |
 | `t` / `w`                      | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab |
 | `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                        |

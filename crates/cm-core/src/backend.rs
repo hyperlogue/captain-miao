@@ -221,7 +221,7 @@ impl LocalBackend {
     }
 
     /// Stamp the host-owned per-session state onto the rows being served: the
-    /// flags sidecar (so every dashboard sees the same pins/mutes) and the
+    /// flags sidecar (so every dashboard sees the same pins/bells) and the
     /// pool's live attached bit (so the UI knows whether a steal even applies).
     fn overlay_host_state(&self, sessions: &mut [LauncherState]) {
         let flags = read_session_flags();

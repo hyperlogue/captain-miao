@@ -903,7 +903,7 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
     }
 
     // Carry the old session's status flags onto the relaunched window so the
-    // restart preserves pinned / muted / follow-up. `launch_agent` set
+    // restart preserves pinned / follow-up. `launch_agent` set
     // `pending_focus_window` to the new window id on success; the actual flag
     // copy happens in `reload_sessions` once the new launcher appears.
     if !flags.is_default()

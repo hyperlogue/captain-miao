@@ -1206,7 +1206,6 @@ impl App {
             .enumerate()
             .map(|(row_idx, (s, (icon, icon_color)))| {
                 let flags = self.flags_of(&super::flag_key(s));
-                let muted = flags.muted;
                 let important = flags.pinned;
                 let follow_up = flags.follow_up;
                 // A row that lives in another terminal instance is visible but
@@ -1225,13 +1224,9 @@ impl App {
                     name_col_max as usize,
                 );
 
-                let override_cell = override_indicator_cell(follow_up, important, muted, detached);
+                let override_cell = override_indicator_cell(follow_up, important, detached);
                 let status_fg = super::format::status_fg(&s.status, follow_up);
-                let status_cell = if muted {
-                    Cell::from(status_text).style(Style::default().add_modifier(Modifier::DIM))
-                } else {
-                    Cell::from(status_text).style(Style::default().fg(status_fg))
-                };
+                let status_cell = Cell::from(status_text).style(Style::default().fg(status_fg));
                 let name_cell = if search_active {
                     // Cancel the row-level DIM so the name column stays bright.
                     Cell::from(name).style(Style::default().remove_modifier(Modifier::DIM))
@@ -1270,14 +1265,7 @@ impl App {
                 icon_spans.push(Span::raw(
                     " ".repeat((icon_width as usize).saturating_sub(dir_icon_width(&icon))),
                 ));
-                icon_spans.push(Span::styled(
-                    icon,
-                    if muted {
-                        Style::default().add_modifier(Modifier::DIM)
-                    } else {
-                        Style::default().fg(icon_color)
-                    },
-                ));
+                icon_spans.push(Span::styled(icon, Style::default().fg(icon_color)));
                 let icon_cell = Cell::from(Line::from(icon_spans));
                 // The narrow layout keeps only status / workdir icon / name; the
                 // context, last-prompt and updated columns are dropped.
@@ -1301,7 +1289,7 @@ impl App {
                     row_cells.push(elapsed);
                 }
                 let row = Row::new(row_cells);
-                if muted || search_active || foreign || detached {
+                if search_active || foreign || detached {
                     row.style(Style::default().add_modifier(Modifier::DIM))
                 } else {
                     row
@@ -1549,7 +1537,6 @@ impl App {
             cmd(Command::JumpAttention),
             Line::from(""),
             section("Flags"),
-            cmd(Command::ToggleMute),
             cmd(Command::TogglePin),
             cmd(Command::ToggleFollowUp),
             Line::from(""),

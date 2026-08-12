@@ -258,17 +258,9 @@ impl App {
                 None
             }
             Command::JumpBottom => {
-                // Jump to last un-muted session. If the cursor is already
-                // at/past that row, fall through to the true last row.
                 let len = self.visible_len();
                 if len > 0 {
-                    let last_unmuted = self.last_unmuted_index();
-                    let current = self.table_state.selected().unwrap_or(0);
-                    let target = match last_unmuted {
-                        Some(idx) if current < idx => idx,
-                        _ => len - 1,
-                    };
-                    self.table_state.select(Some(target));
+                    self.table_state.select(Some(len - 1));
                 }
                 None
             }
@@ -422,10 +414,6 @@ impl App {
             }
             Command::ScrollPreviewRight => {
                 self.scroll_preview_right();
-                None
-            }
-            Command::ToggleMute => {
-                self.toggle_session_flag(SessionFlag::Mute);
                 None
             }
             Command::TogglePin => {
