@@ -1401,6 +1401,10 @@ fn only_a_user_closed_window_ends_its_session() {
     // what survived; ending it is the opposite of what's wanted.
     assert!(!closed_by_the_user(Some(255)));
     // An in-session shpool detach returned cleanly: already "leave it running".
+    // A session *stolen* from us lands here too — libshpool's steal sends the
+    // sitting client a `Detach` and its attach simply exits (`guard_plain_
+    // reattach`), so the window we lose to someone else must not take the
+    // session they just took over with it.
     assert!(!closed_by_the_user(Some(0)));
     // A reporter that couldn't tell must never be read as intent.
     assert!(!closed_by_the_user(None));
@@ -1413,6 +1417,55 @@ fn only_a_user_closed_window_ends_its_session() {
     // its way out, taking the dashboard with it, so those 129s are waiting at
     // the next startup. Acting on them would end every session on the host.
     assert_ne!(ReportOrigin::Backlog, ReportOrigin::Live);
+}
+
+/// `D` closes its window exactly the way the user's own close does, so it
+/// produces an identical 129 — which under `on_window_close = "close"` would end
+/// the very session `D` exists to keep running. Nothing in the report tells them
+/// apart. What separates them is **ordering**: `D` retires the binding before
+/// closing the window, so the report finds nothing to retire and stops at the
+/// `continue` above the policy.
+///
+/// That ordering was merely tidy when the report only retired a binding; it is
+/// load-bearing now, and this is what pins it. The same shape protects `x` and
+/// restart, which don't retire first but have already ended the session, so
+/// their late 129 finds no row and resolves no key.
+#[test]
+fn detaching_before_the_close_is_what_keeps_d_from_killing() {
+    use super::ReportOrigin;
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    d.set_sessions(vec![away]);
+    d.app.on_window_close = crate::config::OnWindowClose::Close;
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    // `D`: retire, *then* close the window (`Action::DetachRemote`).
+    d.app.retire_window_binding(&host, "cm-away");
+    // The close the user never sees, arriving as the same 129 a hand-close makes.
+    assert!(
+        !d.app.apply_detach_reports(
+            vec![DetachReport {
+                host: "box".into(),
+                token: "cm-away".into(),
+                status: Some(129),
+                held_secs: Some(600),
+            }],
+            ReportOrigin::Live
+        ),
+        "a report for an already-retired binding must be a no-op"
+    );
+    assert!(
+        d.app.pending_session_close.is_empty(),
+        "`D` must leave the session running — that is the whole point of it"
+    );
 }
 
 /// The whole-batch version of the above, through `apply_detach_reports`: a
@@ -4716,14 +4769,20 @@ fn snapshot_entry_flags_roundtrip_and_back_compat() {
 }
 
 #[test]
-fn override_glyph_gets_wide_symbol_fixup() {
-    // Regression: the Nerd Font pin glyph in the override column must be
-    // rewritten to its width-2 form ("glyph "), so ratatui's diff skips the
-    // trailing cell and Kitty's 2-cell-wide render survives a partial repaint.
-    // The fix-up scan has to clear the highlight-symbol gutter to land on the
-    // override column (the panel has no left border to skip); an off-by-gutter
-    // scan leaves the glyph narrow, and it half-renders at rest (only a
-    // full-row repaint — e.g. selecting the row — papers over it).
+fn override_glyph_is_a_self_measuring_wide_emoji() {
+    // The override column's tight two-slot layout rests on the glyph measuring
+    // exactly what the terminal paints. These are emoji-presentation
+    // codepoints, so `unicode-width` says 2 and ratatui parks the glyph in one
+    // buffer cell, blanks the cell behind it, and its diff then skips that cell
+    // — which is what keeps a neighbouring column's update from clipping the
+    // glyph's right half. The Nerd Font PUA glyphs this column used to carry
+    // measured 1 and painted 2, and needed a post-render buffer fix-up to fake
+    // the same thing. A replacement glyph that measures 1 (text presentation,
+    // or emoji only via VS16) puts that bug straight back.
+    use unicode_width::UnicodeWidthStr;
+    let pin = "\u{1F4CC}";
+    assert_eq!(pin.width(), 2, "pin glyph must measure two cells");
+
     let mut d = TestDashboard::new(120, 18);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
     d.app
@@ -4733,20 +4792,25 @@ fn override_glyph_gets_wide_symbol_fixup() {
     d.render();
 
     let buf = d.terminal.backend().buffer();
-    let pin = "\u{eba0}";
-    let glyph_cells: Vec<&str> = (0..buf.area.height)
+    let hits: Vec<(u16, u16)> = (0..buf.area.height)
         .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-        .map(|(x, y)| buf[(x, y)].symbol())
-        .filter(|s| s.contains(pin))
+        .filter(|&(x, y)| buf[(x, y)].symbol().contains(pin))
         .collect();
     assert_eq!(
-        glyph_cells.len(),
+        hits.len(),
         1,
-        "expected exactly one pin glyph cell, got {glyph_cells:?}"
+        "expected exactly one pin glyph cell, got {hits:?}"
+    );
+    let (x, y) = hits[0];
+    assert_eq!(
+        buf[(x, y)].symbol(),
+        pin,
+        "pin glyph must sit in its cell bare — no padding grapheme appended"
     );
     assert_eq!(
-        glyph_cells[0], "\u{eba0} ",
-        "pin glyph must carry the width-2 fix-up symbol, not the bare narrow form"
+        buf[(x + 1, y)].symbol(),
+        " ",
+        "the cell the glyph paints over must stay blank"
     );
 }
 
