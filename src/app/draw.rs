@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -861,7 +863,12 @@ impl App {
         let tally = self.remote_host_tally();
         if !tally.is_empty() {
             let host = self.default_host_or_local();
-            right_segs.push(host_tally_spans(&tally, ui));
+            // Lit unless a host is mid-dial and this is the blink's dark half.
+            right_segs.push(host_tally_spans(
+                &tally,
+                ui,
+                self.connect_blink_phase().unwrap_or(true),
+            ));
             right_segs.push(vec![
                 Span::styled(
                     "Default host: ",
@@ -893,6 +900,24 @@ impl App {
             Paragraph::new(Line::from(right)).alignment(Alignment::Right),
             bar,
         );
+    }
+
+    /// The header ☁️'s blink phase right now: `Some(lit)` while any host is
+    /// still dialing, `None` when none is — which is also the run loop's
+    /// "nothing to animate" signal, so an idle dashboard keeps drawing no frames
+    /// at all.
+    ///
+    /// The blink is client-driven rather than `SLOW_BLINK`: the attribute is a
+    /// terminal's option to ignore (and the multiplexers in the middle another
+    /// chance to drop it), and this indicator has to survive all of them.
+    pub(super) fn connect_blink_phase(&self) -> Option<bool> {
+        if self.remote_host_tally().connecting == 0 {
+            return None;
+        }
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Some(connect_blink_lit(since_epoch))
     }
 
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -1255,7 +1280,7 @@ impl App {
         // lands on the titles being filtered. The row-level DIM below covers
         // all cells; the Name cell removes it to stay bright.
         let search_active = self.input_mode == InputMode::Search;
-        let rows: Vec<Row> = visible
+        let mut rows: Vec<Row> = visible
             .iter()
             // Zip the pre-resolved icon marks in by value so each row's icon
             // String isn't cloned a second time.
@@ -1356,6 +1381,29 @@ impl App {
                 }
             })
             .collect();
+
+        // A host still dialing mirrors no sessions yet, so the table would
+        // otherwise read as complete while rows are still on their way — worst
+        // at startup, where an empty list looks like an answer. The line goes
+        // *in the table*, where the missing rows will appear, rather than in the
+        // panel title. It is chrome, not a session: dim, unselectable
+        // (`visible_index_at` bounds clicks by `visible_len`), and uncounted by
+        // the title's total, so a full list simply clips it like any other
+        // trailing row.
+        if let Some(label) = connecting_row_label(&self.connecting_hosts()) {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    // The Name column: indented under the names it is standing
+                    // in for. Trailing columns are simply absent — ratatui draws
+                    // the cells a row has and leaves the rest blank.
+                    Cell::from(label),
+                ])
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            );
+        }
 
         // Status column fits the longest enum label (and the "Status" header
         // floor) — recomputed from `SessionStatus::ALL` so adding a variant
@@ -1866,6 +1914,38 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
     truncate_str(&flat, max)
 }
 
+/// The session table's trailing "still loading" line, or `None` when nothing is
+/// dialing. Names the host while there's exactly one — the common case, and the
+/// answer to "which box am I waiting on" without a trip to `Space h` — and falls
+/// back to a count rather than a list, which would outgrow the Name column. The
+/// `…` is the same "there's more coming" mark the truncations use. Pure.
+pub(super) fn connecting_row_label(hosts: &[HostId]) -> Option<String> {
+    match hosts {
+        [] => None,
+        [one] => Some(format!("loading sessions from {}…", one.0)),
+        many => Some(format!(
+            "loading sessions from {} remote hosts…",
+            many.len()
+        )),
+    }
+}
+
+/// How long the connecting ☁️ stays lit, then dark, in one blink. Slow on
+/// purpose and lit for most of the cycle: this says "hold on", not "look here",
+/// so the cloud must still read as a steady header glyph out of the corner of an
+/// eye — a fast or half-dark blink turns a routine handshake into an alarm.
+const CONNECT_BLINK_LIT: Duration = Duration::from_millis(900);
+const CONNECT_BLINK_DARK: Duration = Duration::from_millis(500);
+
+/// The blink phase at `since_epoch` — `true` while the cloud is lit. Pure, and a
+/// function of the wall clock rather than a stored anchor so every draw agrees on
+/// the phase without the App carrying animation state; a clock step just moves
+/// the blink along, which nothing depends on.
+pub(super) fn connect_blink_lit(since_epoch: Duration) -> bool {
+    let period = (CONNECT_BLINK_LIT + CONNECT_BLINK_DARK).as_millis();
+    since_epoch.as_millis() % period < CONNECT_BLINK_LIT.as_millis()
+}
+
 /// The header's ☁️ host tally: one colored number per bucket, good → error →
 /// down. It is an **aggregate**, never per-host detail — which host, and *why*
 /// (including a `Failed` reason), lives one `Space h` away in the hosts panel,
@@ -1878,25 +1958,54 @@ pub(super) fn one_line(text: &str, max: usize) -> String {
 /// failing host (a diagnosis waiting to be read) is loud where a merely
 /// re-dialing one, expected to clear on its own, is dim.
 ///
+/// The one exception is a host still *dialing*, which prints no number of its
+/// own and instead forces the connected count on screen at zero: the alternative
+/// is a header that reads "one host, and it's fine" through the whole handshake,
+/// with the number then not moving when the link finally lands.
+///
 /// The cloud carries an explicit **variation selector** (`U+2601 U+FE0F`) and is
 /// *not* dimmed. Bare `U+2601` is a text-presentation glyph: terminals render it
 /// as a hairline outline in the foreground colour, which DIM then washes out to
 /// invisible — reported as "I cannot see the cloud icon". The emoji
 /// presentation is a filled, self-coloured 2-cell glyph that reads at a glance.
-pub(super) fn host_tally_spans(tally: &HostTally, ui: &config::UiColors) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::raw("\u{2601}\u{FE0F}")];
+///
+/// `lit` is the blink phase from [`connect_blink_lit`], and only a *dialing*
+/// tally ever passes `false`: the cloud drops out for the dark half, replaced by
+/// the two spaces `unicode-width` measures the VS16 sequence as, so the
+/// right-aligned cluster beside it doesn't step sideways once a second. Blinking
+/// the glyph rather than the numbers keeps the animation on the thing that means
+/// "link", and off the counts a user is trying to read. Pure.
+pub(super) fn host_tally_spans(
+    tally: &HostTally,
+    ui: &config::UiColors,
+    lit: bool,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(if lit { "\u{2601}\u{FE0F}" } else { "  " })];
     let mut first = true;
-    for (count, style) in [
-        (tally.good, Style::default().fg(Color::Green)),
+    for (count, shown, style) in [
+        // The connected count is printed even at zero while a host is still
+        // dialing — "☁️0" is the honest reading of a link that hasn't come up,
+        // and it's the number that ticks up as hosts land. Everywhere else an
+        // empty bucket stays silent.
+        (
+            tally.good,
+            tally.good > 0 || tally.connecting > 0,
+            Style::default().fg(Color::Green),
+        ),
         (
             tally.error,
+            tally.error > 0,
             Style::default()
                 .fg(ui.attention_fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        (tally.down, Style::default().add_modifier(Modifier::DIM)),
+        (
+            tally.down,
+            tally.down > 0,
+            Style::default().add_modifier(Modifier::DIM),
+        ),
     ] {
-        if count > 0 {
+        if shown {
             // No separator before the *first* number. `unicode-width` measures
             // the VS16 sequence as 2 cells and ratatui reserves them, but a
             // terminal that paints the glyph 1 cell wide then leaves the second

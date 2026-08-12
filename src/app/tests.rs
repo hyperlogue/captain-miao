@@ -4218,10 +4218,19 @@ fn a_host_status_is_flattened_and_truncated_to_its_row() {
 fn the_host_tally_prints_only_the_non_empty_buckets() {
     let ui = crate::config::UiColors::default();
     let text = |good, error, down| {
-        super::draw::host_tally_spans(&super::HostTally { good, error, down }, &ui)
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect::<String>()
+        super::draw::host_tally_spans(
+            &super::HostTally {
+                good,
+                error,
+                down,
+                connecting: 0,
+            },
+            &ui,
+            true,
+        )
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect::<String>()
     };
     // The cloud carries its emoji variation selector: the bare U+2601 is a
     // hairline text glyph that vanished against the header.
@@ -4237,6 +4246,85 @@ fn the_host_tally_prints_only_the_non_empty_buckets() {
     assert_eq!(text(2, 1, 0), "\u{2601}\u{fe0f}2 1");
     assert_eq!(text(0, 0, 2), "\u{2601}\u{fe0f}2");
     assert_eq!(text(1, 2, 3), "\u{2601}\u{fe0f}1 2 3");
+}
+
+/// A host that is still dialing is the one bucket with no number of its own: it
+/// blinks the cloud, and forces the *connected* count on screen at zero so the
+/// header can't be read as "one host, up" while the handshake is still running.
+#[test]
+fn a_dialing_host_blinks_the_cloud_and_holds_the_count_at_zero() {
+    use super::draw::{connect_blink_lit, host_tally_spans};
+    let ui = crate::config::UiColors::default();
+    let text = |tally: &super::HostTally, lit| {
+        host_tally_spans(tally, &ui, lit)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>()
+    };
+    let dialing = super::HostTally {
+        connecting: 1,
+        ..Default::default()
+    };
+    assert_eq!(text(&dialing, true), "\u{2601}\u{fe0f}0");
+    // The dark half swaps the cloud for exactly the width `unicode-width`
+    // measures it as, so the right-aligned header cluster holds still.
+    assert_eq!(text(&dialing, false), "  0");
+    // The count is the truth as it stands, not a placeholder: a second host
+    // already up shows as 1 while the first one dials.
+    let mixed = super::HostTally {
+        good: 1,
+        connecting: 1,
+        ..Default::default()
+    };
+    assert_eq!(text(&mixed, true), "\u{2601}\u{fe0f}1");
+    // A dropped link still gets its own dim number — dialing is not "down".
+    let dropped = super::HostTally {
+        down: 1,
+        connecting: 1,
+        ..Default::default()
+    };
+    assert_eq!(text(&dropped, true), "\u{2601}\u{fe0f}0 1");
+    // Settled hosts never blink: nothing dialing, so the phase is never dark.
+    assert_eq!(
+        text(
+            &super::HostTally {
+                good: 2,
+                ..Default::default()
+            },
+            true
+        ),
+        "\u{2601}\u{fe0f}2"
+    );
+
+    // Lit for most of the cycle, and it does come back around — a "wait a
+    // moment" hint, not a strobe.
+    use std::time::Duration;
+    assert!(connect_blink_lit(Duration::ZERO));
+    assert!(connect_blink_lit(Duration::from_millis(899)));
+    assert!(!connect_blink_lit(Duration::from_millis(900)));
+    assert!(!connect_blink_lit(Duration::from_millis(1399)));
+    assert!(connect_blink_lit(Duration::from_millis(1400)));
+    // Nothing accumulates across the wrap: the same phase a period later.
+    assert!(!connect_blink_lit(Duration::from_millis(900 + 1400)));
+}
+
+/// The table's trailing line while a host is still dialing. Its whole job is to
+/// distinguish "no sessions there" from "not asked yet", so it names the host
+/// when there is one to name and counts them when there isn't.
+#[test]
+fn the_loading_line_names_one_host_and_counts_several() {
+    use super::draw::connecting_row_label;
+    use crate::state::HostId;
+    let host = |s: &str| HostId(s.into());
+    assert_eq!(connecting_row_label(&[]), None);
+    assert_eq!(
+        connecting_row_label(&[host("box")]).as_deref(),
+        Some("loading sessions from box…")
+    );
+    assert_eq!(
+        connecting_row_label(&[host("box"), host("buildbox")]).as_deref(),
+        Some("loading sessions from 2 remote hosts…")
+    );
 }
 
 #[test]

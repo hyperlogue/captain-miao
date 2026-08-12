@@ -1105,6 +1105,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let detach_reports_watched = _detach_report_watcher.is_some();
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
+    // The connecting cloud's blink phase as last drawn: `None` while nothing is
+    // dialing, so the steady state costs no frames at all.
+    let mut last_blink_phase: Option<bool> = None;
     // The tab label last pushed to the terminal, so the count is only re-sent
     // when it actually moves.
     let mut last_tab_title: Option<String> = None;
@@ -1414,6 +1417,18 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // own), so keep the frame ticking — each redraw calls render_logo_graphics,
         // which advances the cat — until it leaves the row and clears the flag.
         if app.cat_walking() {
+            needs_redraw = true;
+        }
+
+        // The header ☁️ blinks while a host is dialing — also client-driven, and
+        // on the same terms as the age label: an idle dashboard draws nothing on
+        // its own, so a frame per *phase flip* is what animates it. Comparing
+        // phases rather than redrawing on "is connecting" keeps that to roughly
+        // one frame a second, and the flip back to `None` repaints the settled
+        // cloud once, lit.
+        let blink_phase = app.connect_blink_phase();
+        if blink_phase != last_blink_phase {
+            last_blink_phase = blink_phase;
             needs_redraw = true;
         }
 

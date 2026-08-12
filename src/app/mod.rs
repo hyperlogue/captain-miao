@@ -567,21 +567,26 @@ pub(in crate::app) struct ConnIdentity {
 }
 
 /// The remote hosts, counted by how usable each one is — see
-/// [`App::remote_host_tally`]. Three numbers rather than one "unhealthy" count
-/// because the header colors them apart: a host that is *failing* (a diagnosis
-/// waiting in the hosts panel) is a different call to action than one merely
-/// re-dialing.
+/// [`App::remote_host_tally`]. Separate numbers rather than one "unhealthy"
+/// count because the header colors them apart: a host that is *failing* (a
+/// diagnosis waiting in the hosts panel) is a different call to action than one
+/// merely re-dialing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct HostTally {
     pub(super) good: usize,
     pub(super) error: usize,
     pub(super) down: usize,
+    /// Hosts still dialing — deliberately *not* folded into `down`, and the one
+    /// bucket the header prints no number for. A number appearing beside the
+    /// cloud reads as a problem, and a host mid-handshake isn't one yet; it
+    /// blinks the cloud instead (`draw::host_tally_spans`).
+    pub(super) connecting: usize,
 }
 
 impl HostTally {
     /// No remote hosts configured at all (every bucket empty).
     pub(super) fn is_empty(&self) -> bool {
-        self.good == 0 && self.error == 0 && self.down == 0
+        self.good == 0 && self.error == 0 && self.down == 0 && self.connecting == 0
     }
 }
 
@@ -2971,11 +2976,28 @@ impl App {
                 ConnState::Connected => tally.good += 1,
                 // Reachable but unusable, with a diagnosis behind it.
                 ConnState::Failed(_) => tally.error += 1,
-                // Link dropped, or not up yet — the reconnect loop is on it.
-                ConnState::Disconnected | ConnState::Connecting => tally.down += 1,
+                // Link dropped — the reconnect loop is on it.
+                ConnState::Disconnected => tally.down += 1,
+                // Not up *yet*: nothing has gone wrong, so this is the one
+                // bucket the header animates rather than counts.
+                ConnState::Connecting => tally.connecting += 1,
             }
         }
         tally
+    }
+
+    /// Remote hosts whose first snapshot is still in flight, in `backends`
+    /// order. A dialing host mirrors no rows yet, so the session table looks
+    /// complete while sessions are still on their way — this is what the
+    /// table's trailing "loading" line (`draw::connecting_row_label`) and the
+    /// header's blinking cloud both hang off.
+    pub(super) fn connecting_hosts(&self) -> Vec<HostId> {
+        self.backends
+            .iter()
+            .skip(1)
+            .filter(|b| matches!(b.conn_state(), ConnState::Connecting))
+            .map(|b| b.host_id())
+            .collect()
     }
 
     /// Every configured host paired with its live connection state — the hosts
