@@ -450,8 +450,7 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         // `target/release/cm`, so leaving it in place would be a lie the moment
         // the next one overwrote it.
         let from = ws.target_dir.join("release").join(DASHBOARD_BIN);
-        std::fs::copy(&from, &to)
-            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        install(&from, &to)?;
 
         verify(&to, v.servers)?;
         built.push((v.artifact(), std::fs::metadata(&to).map(|m| m.len())?));
@@ -660,11 +659,7 @@ fn prepare_servers(ws: &Workspace, args: &PrepareServersArgs) -> Result<()> {
         let dir = out_dir.join(&p.target);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let to = dir.join(SERVER_BIN);
-        std::fs::copy(&p.bin_path, &to)
-            .with_context(|| format!("copying {} to {}", p.bin_path.display(), to.display()))?;
-        // cargo already produces 0755, but a fetched or hand-supplied binary may
-        // have arrived without it, and this is the file that goes into a tarball.
-        set_executable(&to)?;
+        install(&p.bin_path, &to)?;
         println!(
             "  {}  {}  {}",
             to.display(),
@@ -672,6 +667,37 @@ fn prepare_servers(ws: &Workspace, args: &PrepareServersArgs) -> Result<()> {
             &p.sha256[..12]
         );
     }
+    Ok(())
+}
+
+/// Put `from` at `to` as a **new file**, never by rewriting the one already
+/// there.
+///
+/// The rename is not about atomicity, it is about the inode. macOS binds an
+/// executable's code signature to the vnode it ran from, and rewriting that same
+/// inode with a differently-signed image can leave the stale blob attached: every
+/// later exec of the path dies with `SIGKILL (Code Signature Invalid)` — kernel
+/// log `load code signature error 2`, `codesign -v` still says the file is fine —
+/// while the identical bytes run from any other path. Both callers hit exactly
+/// the pattern that binds it: they rebuild onto a fixed name, and [`verify`] runs
+/// each artifact the moment it lands. Landing a fresh inode each time sidesteps
+/// the cache, and it also *cures* a path already poisoned by an older build, so
+/// nobody has to learn any of this to get unstuck.
+///
+/// Both artifacts are executables, so this chmods as well: cargo already produces
+/// 0755, but a fetched or hand-supplied binary may have arrived without it, and
+/// `prepare-servers` output is what goes into a release tarball. Doing it before
+/// the rename means the final path is never briefly non-executable.
+fn install(from: &Path, to: &Path) -> Result<()> {
+    let name = to
+        .file_name()
+        .ok_or_else(|| anyhow!("{} names no file", to.display()))?;
+    let tmp = to.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    std::fs::copy(from, &tmp)
+        .with_context(|| format!("copying {} to {}", from.display(), tmp.display()))?;
+    set_executable(&tmp)?;
+    std::fs::rename(&tmp, to)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), to.display()))?;
     Ok(())
 }
 
@@ -935,5 +961,39 @@ mod tests {
         // And the musl builds exist *only* as published assets — the case the
         // runtime source chain fetches.
         assert!(PUBLISHED_TARGETS.iter().any(|t| t.contains("-musl")));
+    }
+
+    /// The whole point of [`install`]: the artifact that lands is a *different
+    /// file* from the one it replaced, because macOS keeps a signature bound to
+    /// the old inode and kills every exec of a path rewritten in place. Asserted
+    /// on the inode rather than the bytes — the bytes were never the part that
+    /// went wrong.
+    #[test]
+    fn installing_over_an_artifact_replaces_the_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("xtask-install-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new, to) = (dir.join("old"), dir.join("new"), dir.join("artifact"));
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+
+        install(&old, &to).unwrap();
+        let first = std::fs::metadata(&to).unwrap().ino();
+        install(&new, &to).unwrap();
+        let second = std::fs::metadata(&to).unwrap();
+
+        assert_ne!(first, second.ino(), "install rewrote the artifact in place");
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert_eq!(second.mode() & 0o777, 0o755, "artifact is not executable");
+        // And it leaves nothing behind to be mistaken for an artifact.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(strays.is_empty(), "install left {strays:?} behind");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

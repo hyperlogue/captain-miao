@@ -146,6 +146,10 @@ Anything local to one module is in that module's doc instead.
   Unset (every ordinary build) the table is empty; set *and wrong* is a hard
   build error, never a quiet empty table. `build.rs` watches each archive, so
   never rewrite one with identical bytes — it forces a full LTO relink.
+- **Land a built executable on a fresh inode** (`xtask`'s `install`), never by
+  copying over the file already there. macOS binds a signature to the vnode an
+  executable ran from, and a path rewritten in place then dies on every exec with
+  `SIGKILL (Code Signature Invalid)` while the same bytes run fine elsewhere.
 - **Drop the `captain-` prefix on shipping binaries and keep it everywhere
   else** — Cargo/npm packages, nix attrs, `~/.config` + `~/.local/state` +
   `~/.cache` dirs. `xtask/src/server.rs` carries both `SERVER_PKG` and
