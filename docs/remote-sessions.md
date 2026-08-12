@@ -588,6 +588,33 @@ into the signal case would close the window on every failed connection. Equally,
 duration cannot decide alone — it would keep a window for every session detached
 inside the grace.
 
+**A window the user closed ends its session** — `[remote] on_window_close`,
+default `close`, the same host RPC `x` makes. Closing a window by hand reads as
+"I'm done with this", and the alternative leaves a pooled session running with
+nothing on screen to show for it. `detach` opts out; either way the binding is
+retired, since the policy decides the session's fate, never the window's.
+
+Two guards keep that from eating sessions nobody meant to end, and both are the
+same distinction the rest of this section turns on — *the attach ended* versus
+*the window was taken away*:
+
+- **Only status `129`** (128 + SIGHUP: the terminal tearing the pty down under a
+  live attach) is a user close (`closed_by_the_user`). ssh's 255 covers a dropped
+  link and a failure to connect; `0` is an in-session detach; `130`/`143` arrive
+  by routes that aren't a window closing. None of them end a session — the
+  session is what *survived* the failure, and ending it would turn every flaky
+  link and every laptop resume into lost work.
+- **Only reports drained while the dashboard is running** (`ReportOrigin::Live`).
+  A quitting terminal SIGHUPs every attach window on its way out and takes the
+  dashboard — living in that same terminal — with it, so those reports are
+  waiting at the next startup, wearing a status identical to a deliberate close.
+  Acting on the startup backlog would end every session on the host because you
+  quit kitty.
+
+Within those, closing a *tab* still closes the windows in it, so under `stacked`
+one gesture ends every session sharing `miao:sessions`. That is the policy
+working, not a bug, and the run loop says how many it closed.
+
 **The duration is the wrapper's, not the binding's.** The report carries
 `held_secs`, measured in wall clock (`date`) around the attach, and the dashboard
 prefers it to how long the binding lived — which is an `Instant`, i.e.

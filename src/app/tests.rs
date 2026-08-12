@@ -1384,6 +1384,124 @@ fn pruning_a_binding_resorts_the_list() {
     assert_eq!(order(&d), vec![2, 1]);
 }
 
+/// Closing a window ends its session (`[remote] on_window_close`, default
+/// `close`) — but only when it was the **user** who closed it. Every other way
+/// an attach can end must leave the session running, and the dangerous
+/// direction is the one this pins: a laptop waking to a dead link reports one
+/// per window, and closing sessions there would turn a flaky network into lost
+/// work.
+#[test]
+fn only_a_user_closed_window_ends_its_session() {
+    use super::{ReportOrigin, closed_by_the_user};
+
+    // 129 = 128 + SIGHUP: the terminal tore the pty down under a live attach,
+    // which is what closing a window (or its tab) does.
+    assert!(closed_by_the_user(Some(129)));
+    // ssh's 255 — a dropped link *and* a failure to connect. The session is
+    // what survived; ending it is the opposite of what's wanted.
+    assert!(!closed_by_the_user(Some(255)));
+    // An in-session shpool detach returned cleanly: already "leave it running".
+    assert!(!closed_by_the_user(Some(0)));
+    // A reporter that couldn't tell must never be read as intent.
+    assert!(!closed_by_the_user(None));
+    // Spent, so their windows close — but they reach the wrapper by routes that
+    // aren't a window closing, and the default here ends a session.
+    assert!(!closed_by_the_user(Some(130)));
+    assert!(!closed_by_the_user(Some(143)));
+
+    // And the origin gate: a quitting terminal SIGHUPs every attach window on
+    // its way out, taking the dashboard with it, so those 129s are waiting at
+    // the next startup. Acting on them would end every session on the host.
+    assert_ne!(ReportOrigin::Backlog, ReportOrigin::Live);
+}
+
+/// The whole-batch version of the above, through `apply_detach_reports`: a
+/// user-closed window queues its session for closing, a dropped link does not,
+/// and a backlogged report never does whatever its status says.
+#[test]
+fn a_reported_window_close_queues_only_its_own_session() {
+    use super::ReportOrigin;
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let pooled = |pid: u32, token: &str| {
+        let mut s = session(pid, "/srv/work", SessionStatus::Idle);
+        s.host = host.clone();
+        s.pool_session = Some(token.to_string());
+        s.window_id = None;
+        s
+    };
+    d.set_sessions(vec![
+        pooled(1, "cm-one"),
+        pooled(2, "cm-two"),
+        pooled(3, "cm-three"),
+    ]);
+    for (token, wid) in [("cm-one", 901u64), ("cm-two", 902), ("cm-three", 903)] {
+        d.app
+            .record_window_binding(host.clone(), token.into(), WindowId::from(wid));
+    }
+
+    // Pinned rather than inherited: the default is `Close`, but a developer
+    // whose own config says otherwise must not see this test fail.
+    d.app.on_window_close = crate::config::OnWindowClose::Close;
+
+    let report = |token: &str, status: i32| DetachReport {
+        host: "box".into(),
+        token: token.into(),
+        status: Some(status),
+        held_secs: Some(600),
+    };
+    // A live 129 — the user closed this one.
+    assert!(
+        d.app
+            .apply_detach_reports(vec![report("cm-one", 129)], ReportOrigin::Live)
+    );
+    // A live 255 — the link died under it.
+    assert!(
+        d.app
+            .apply_detach_reports(vec![report("cm-two", 255)], ReportOrigin::Live)
+    );
+    // A backlogged 129 — indistinguishable from a terminal quit, so no.
+    assert!(
+        d.app
+            .apply_detach_reports(vec![report("cm-three", 129)], ReportOrigin::Backlog)
+    );
+
+    let queued: Vec<String> = d
+        .app
+        .pending_session_close
+        .iter()
+        .map(|(_, key)| key.to_string())
+        .collect();
+    assert_eq!(
+        queued,
+        vec![crate::state::SessionKey::from_launcher_pid(1).to_string()],
+        "only the user-closed window's session is queued"
+    );
+    // All three bindings are retired either way — the policy decides the
+    // session's fate, never whether the window is still bound.
+    assert!(d.app.window_bindings.window_for(&host, "cm-two").is_none());
+    assert!(
+        d.app
+            .window_bindings
+            .window_for(&host, "cm-three")
+            .is_none()
+    );
+
+    // `detach` opts out entirely: the same user-closed window queues nothing.
+    d.app.pending_session_close.clear();
+    d.app.on_window_close = crate::config::OnWindowClose::Detach;
+    d.app
+        .record_window_binding(host.clone(), "cm-two".into(), WindowId::from(902u64));
+    assert!(
+        d.app
+            .apply_detach_reports(vec![report("cm-two", 129)], ReportOrigin::Live)
+    );
+    assert!(d.app.pending_session_close.is_empty());
+}
+
 /// A detach report is the *event* that replaces polling the window tree: the
 /// attach window tells us its session ended, and the row must go detached (and
 /// re-sort) without waiting for a snapshot. Crucially it behaves like
@@ -1392,6 +1510,7 @@ fn pruning_a_binding_resorts_the_list() {
 /// should come back when the host reconnects.
 #[test]
 fn a_detach_report_retires_the_binding_but_not_the_expectation() {
+    use super::ReportOrigin;
     use crate::state::{DetachReport, HostId};
     use crate::terminal::WindowId;
     let _guard = bindings_file_guard();
@@ -1407,12 +1526,15 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
         .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
     assert!(!d.app.is_detached_row(&d.app.sessions[0].clone()));
 
-    let changed = d.app.apply_detach_reports(vec![DetachReport {
-        host: "box".into(),
-        token: "cm-away".into(),
-        status: Some(0),
-        held_secs: Some(600),
-    }]);
+    let changed = d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(0),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live,
+    );
     assert!(changed);
     assert!(d.app.is_detached_row(&d.app.sessions[0].clone()));
     // The row sank on the strength of the report alone — no snapshot involved.
@@ -1435,12 +1557,15 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
 
     // A report for a binding we no longer hold is a no-op, not a wobble: the
     // snapshot prune or a `D` may well have got there first.
-    assert!(!d.app.apply_detach_reports(vec![DetachReport {
-        host: "box".into(),
-        token: "cm-away".into(),
-        status: Some(0),
-        held_secs: Some(600),
-    }]));
+    assert!(!d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(0),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
 }
 
 /// Attaching and detaching flip `is_detached_row`, which is a *sort key* — so a
@@ -1449,6 +1574,7 @@ fn a_detach_report_retires_the_binding_but_not_the_expectation() {
 /// session took its slot. The cursor must follow the session instead.
 #[test]
 fn the_cursor_follows_a_session_across_an_attach_detach_resort() {
+    use super::ReportOrigin;
     use crate::state::{DetachReport, HostId};
     use crate::terminal::WindowId;
     let _guard = bindings_file_guard();
@@ -1476,12 +1602,15 @@ fn the_cursor_follows_a_session_across_an_attach_detach_resort() {
 
     // Its attach window reports its end: the row sinks into the detached tier
     // and the other row rises into the index it vacated.
-    assert!(d.app.apply_detach_reports(vec![DetachReport {
-        host: "box".into(),
-        token: "cm-away".into(),
-        status: Some(0),
-        held_secs: Some(600),
-    }]));
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(0),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
     let detached_at = index_of(&d, 1);
     assert_ne!(
         detached_at, attached_at,
@@ -1548,6 +1677,7 @@ fn a_spent_attach_window_is_closed_but_a_refused_one_is_kept() {
 /// overnight drop as a refused attach and strand its window on screen.
 #[test]
 fn a_report_is_judged_by_the_wrappers_clock_not_the_bindings() {
+    use super::ReportOrigin;
     use crate::state::{DetachReport, HostId};
     use crate::terminal::WindowId;
     let _guard = bindings_file_guard();
@@ -1563,13 +1693,16 @@ fn a_report_is_judged_by_the_wrappers_clock_not_the_bindings() {
     d.app
         .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
 
-    assert!(d.app.apply_detach_reports(vec![DetachReport {
-        host: "box".into(),
-        token: "cm-away".into(),
-        // ssh's mid-session drop — the status that can't decide alone.
-        status: Some(255),
-        held_secs: Some(8 * 60 * 60),
-    }]));
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            // ssh's mid-session drop — the status that can't decide alone.
+            status: Some(255),
+            held_secs: Some(8 * 60 * 60),
+        }],
+        ReportOrigin::Live
+    ));
     assert_eq!(
         d.app.reap_window_queue,
         vec![WindowId::from(900u64)],

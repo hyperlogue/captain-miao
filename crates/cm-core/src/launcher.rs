@@ -241,11 +241,17 @@ fn cleanup_launcher_files(launcher_pid: u32, sock_path: &Path, settings_path: &P
 
 /// Hold a launch that never produced an agent (direnv blocked on the session's
 /// `.envrc`, a missing `claude`/`codex`, a spawn failure) as a visible
-/// `FailedToStart` row instead of letting it vanish. The new-session window is
-/// `--hold`'d, so we print the error there (the agent never got to), stamp it
-/// onto the state file as `last_error`, and **block** until the user dismisses
-/// it — closing the window (kitty SIGHUP) or killing the row (the dashboard
-/// SIGTERMs `launcher_pid`, since there's no child) — then tear the files down.
+/// `FailedToStart` row instead of letting it vanish. We print the error to the
+/// window (the agent never got to), stamp it onto the state file as
+/// `last_error`, and **block** until the user dismisses it — closing the window
+/// (kitty SIGHUP) or killing the row (the dashboard SIGTERMs `launcher_pid`,
+/// since there's no child) — then tear the files down.
+///
+/// **The block is what keeps the window**, not the terminal: the dashboard
+/// spawns session windows `hold: false`, because a terminal's own hold is not a
+/// freeze (kitty runs the user's login shell in the window once the command
+/// exits). So a launcher that returns takes its window with it, and one that
+/// wants to be read stays alive — which is what this does.
 ///
 /// Recording the failure on the state file (rather than driving the terminal)
 /// keeps the launcher terminal-free: the dashboard surfaces the row and focuses

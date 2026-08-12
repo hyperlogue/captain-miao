@@ -32,6 +32,7 @@ use self::format::{
 };
 use self::picker::{Picker, PickerItem};
 use crate::backend::{Backend, BackendEvents, ConnState, RemoteBackend, Transport};
+use crate::config;
 
 /// Whether remote (SSH) host support is compiled in — the `remote` cargo
 /// feature, **off by default** because the feature is a work in progress
@@ -741,10 +742,24 @@ pub(super) struct App {
     /// by `reload_sessions` (row removal) and the startup binding seed (dead-local
     /// -pid bindings), drained by the run loop, which calls `close_window`
     /// best-effort. Only populated on a `floating_sessions` backend (zellij), where
-    /// a `hold: true` session's exited pane is an invisible leak buried in the
-    /// shared sessions tab; on kitty the held window stays visible as crash
-    /// forensics, so nothing is queued.
+    /// an exited session's pane is an invisible leak buried in the shared
+    /// sessions tab; elsewhere a window on screen is one whose occupant chose to
+    /// stay, so nothing is queued.
     pub(super) reap_window_queue: Vec<WindowId>,
+    /// What closing a session's window does to the session — `[remote]
+    /// on_window_close`, resolved once at construction. Held rather than read
+    /// from `config::get()` at the report, so the behaviour is a property of
+    /// this dashboard rather than of whatever config file the test runner's
+    /// machine happens to have.
+    pub(super) on_window_close: config::OnWindowClose,
+    /// Sessions to end on their host because the user closed the window showing
+    /// them and [`Self::on_window_close`] says `close` (the default). Filled by
+    /// `apply_detach_reports`, drained by the run loop, which does the RPC.
+    ///
+    /// Queued rather than done inline for the reason every host call is: a
+    /// remote kill is a blocking round trip, and `apply_detach_reports` runs on
+    /// the UI thread outside `block_in_place`.
+    pub(super) pending_session_close: Vec<(HostId, cm_core::state::SessionKey)>,
     /// Cached window→tab map for resolving local sessions' (display-only)
     /// `tab_id`. The launcher no longer snapshots the terminal for this (window
     /// control is presentation-layer; it may be headless/remote), so the
@@ -1084,6 +1099,45 @@ pub(crate) const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// that couldn't determine one) reads as clean — closing a window that had an
 /// error in it is a milder failure than leaving a corpse on screen after every
 /// dropped link.
+/// Where a batch of detach reports came from, which decides whether ending the
+/// session behind a closed window is on the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReportOrigin {
+    /// Drained while the dashboard was running, so it watched the window die:
+    /// a close is the user's doing and `[remote] on_window_close` applies.
+    Live,
+    /// Drained at startup — reports left by windows that died while the
+    /// dashboard was down. **Never** ends a session, because the biggest batch
+    /// of these is the one a quitting terminal produces: it SIGHUPs every attach
+    /// window on its way out, and the dashboard (living in that same terminal)
+    /// dies with them. By status alone that is indistinguishable from the user
+    /// closing each window by hand, so quitting the terminal would end every
+    /// session on the host.
+    Backlog,
+}
+
+/// Whether an attach ended because the **window** was taken away from it, rather
+/// than because the attach itself finished or failed.
+///
+/// This is the whole basis for `[remote] on_window_close`, so it is deliberately
+/// narrow — 129 and nothing else:
+///
+/// * `129` (128 + SIGHUP) — the terminal tore the pty down under a live attach.
+///   That is what closing a window (or its tab) does, and nothing else routinely
+///   produces it.
+/// * `255` — ssh, for a dropped link *and* a failure to connect alike. The
+///   window goes away here too, but the session is precisely what survived the
+///   failure; ending it would turn every flaky link, and every laptop resume,
+///   into lost work.
+/// * `0` — the attach returned: an in-session shpool detach, which already means
+///   "leave it running".
+/// * `130`/`143` — SIGINT/SIGTERM. Spent, so the window closes, but they reach
+///   the wrapper by routes that aren't a window closing (a Ctrl-C in the pane, a
+///   stray `kill`), and the default here ends a session. Not worth the guess.
+fn closed_by_the_user(status: Option<i32>) -> bool {
+    status == Some(129)
+}
+
 fn attach_window_is_spent(held_for: Duration, status: Option<i32>) -> bool {
     match status {
         None | Some(0) => true,
@@ -1277,6 +1331,8 @@ impl App {
             attaching: None,
             failed_launch_focus_queue: Vec::new(),
             reap_window_queue: Vec::new(),
+            on_window_close: cfg.remote.on_window_close,
+            pending_session_close: Vec::new(),
             window_tab_cache: HashMap::new(),
             work_tabs: HashMap::new(),
             session_indexes: HashMap::new(),
@@ -3005,7 +3061,18 @@ impl App {
     /// Returns whether anything changed, so the caller can redraw. The
     /// expected-attached memory survives (see `prune_token`), so a host coming
     /// back still restores the window.
-    pub(super) fn apply_detach_reports(&mut self, reports: Vec<state::DetachReport>) -> bool {
+    ///
+    /// `origin` gates the one destructive thing this does — ending the session
+    /// behind a window the user closed (see [`closed_by_the_user`]). A
+    /// dashboard-initiated close must therefore **retire the binding before
+    /// closing the window** (`D` does; `x` and restart have already ended the
+    /// session, so their report's kill is a no-op on a corpse). A close-without-
+    /// kill path that skipped the retire would read as the user's.
+    pub(super) fn apply_detach_reports(
+        &mut self,
+        reports: Vec<state::DetachReport>,
+        origin: ReportOrigin,
+    ) -> bool {
         let mut changed = false;
         for report in reports {
             let host = HostId(report.host);
@@ -3013,6 +3080,16 @@ impl App {
                 continue;
             };
             changed = true;
+            // Closing the window is a request to end the session, unless the
+            // user asked otherwise — but only when it was the *user* who closed
+            // it, and only for a report we saw arrive (§`ReportOrigin`).
+            if origin == ReportOrigin::Live
+                && closed_by_the_user(report.status)
+                && self.on_window_close == config::OnWindowClose::Close
+                && let Some(key) = self.pooled_session_key(&host, &report.token)
+            {
+                self.pending_session_close.push((host.clone(), key));
+            }
             // The wrapper's own wall-clock measurement wins over the binding's
             // age, which is an `Instant` and so does not advance while the
             // machine is suspended: a laptop that slept through an eight-hour
@@ -3051,6 +3128,18 @@ impl App {
             self.write_window_bindings_file();
         }
         changed
+    }
+
+    /// The `SessionKey` of the pooled session `token` names on `host`, for the
+    /// host to re-resolve to a pid at signal time (§the key is opaque here).
+    /// `None` once the row is gone — a session that already ended needs no
+    /// ending, which is what makes a report arriving after `x` or a restart a
+    /// no-op rather than a signal at a recycled pid.
+    fn pooled_session_key(&self, host: &HostId, token: &str) -> Option<state::SessionKey> {
+        self.sessions
+            .iter()
+            .find(|s| &s.host == host && s.pool_session.as_deref() == Some(token))
+            .map(|s| s.key())
     }
 
     /// The follow-up flag auto-mark / auto-clear transitions to apply after a
@@ -3141,9 +3230,12 @@ impl App {
     /// drop that stale binding, and return the window for the run loop to
     /// `close_window` best-effort.
     ///
-    /// Gated to `floating_sessions` backends (D2): on kitty the held window is
-    /// visible in a tab and deliberately kept as crash forensics, so nothing is
-    /// reaped and bindings are left untouched. A departed *remote* row is only
+    /// Gated to `floating_sessions` backends (D2): zellij is where a departed
+    /// session's pane can linger *invisibly*. Elsewhere the window is a visible
+    /// tab whose occupant now decides its own fate — sessions spawn `hold:
+    /// false`, so a launcher or attach that returns takes the window with it,
+    /// and one still on screen is one still running or deliberately held. A
+    /// departed *remote* row is only
     /// reaped when its host is still `Connected` — a disconnect clears the mirror
     /// (every row departs) yet the pool session and its local attach window live
     /// on, and reconnect brings the row back, so tearing that attach window down

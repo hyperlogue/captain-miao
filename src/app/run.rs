@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    Action, App, InputMode, PendingConfirm, PickerKind, RestartSpec, ResumeLoad,
+    Action, App, InputMode, PendingConfirm, PickerKind, ReportOrigin, RestartSpec, ResumeLoad,
     SessionSnapshotEntry,
 };
 
@@ -583,6 +583,17 @@ async fn launch_agent(
             (host.clone(), launch_id)
         }
     };
+    // A remote *open* lands in an attach window exactly like `Enter` on a
+    // detached row, so it gets the same wrapper (`attach_pool_session`): without
+    // it this window is the one attach that never reports its own end — its
+    // binding waits on the 60s prune, closing it never reads as the user's, and
+    // a refusal has nothing to hold it open. A direct-local spawn *is* the
+    // launcher, which does its own holding (`hold_failed_launch`), so it is left
+    // alone.
+    if matches!(plan, LaunchPlan::AttachRemote { .. }) {
+        let exe = crate::backend::reporter_exe();
+        argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &bind_host.0, &bind_token);
+    }
 
     let launcher_cfg = &config::get().launcher;
     // The configured titles are templates ({agent}/{basename}/{cwd}), so the
@@ -619,7 +630,17 @@ async fn launch_agent(
         target,
         command: SpawnCommand::Exec(argv),
         title: wants_title.then_some(tab_title),
-        hold: true,
+        // Whoever occupies the window holds it, never the terminal — kitty's
+        // `--hold` runs the user's *login shell* once the command exits, so a
+        // held window is a live local shell wearing a session's title rather
+        // than the readable corpse this used to assume. Both occupants already
+        // do their own: a remote attach through the wrapper above, and a direct
+        // local launcher through `hold_failed_launch`, which writes the
+        // `FailedToStart` row and then blocks until the window is closed or the
+        // row killed. What is lost is a *crashed* agent's last frame, which only
+        // the terminal's hold was keeping — the launcher exits as soon as the
+        // agent does, whatever its status.
+        hold: false,
         take_focus: false,
         // Kitty reads the flag on a NewTab / SharedStackTab spawn (`goto-layout
         // stack` on the tab it creates). zellij session spawns are Floating and
@@ -751,6 +772,46 @@ async fn attach_pool_session(
 /// to, after its host came back (§7). Same spawn path as an interactive attach,
 /// minus the focus yank: a reconnect restoring five windows must not fight the
 /// user for the cursor.
+/// End the sessions whose windows the user closed, per `[remote]
+/// on_window_close` (`App::pending_session_close`). The same host RPC `x` makes,
+/// so the host re-resolves the key to a live pid at signal time.
+///
+/// Failure is silent by design. The queue is filled from a *report*, which
+/// arrives after the fact and can only ever race the session's own end — a
+/// window closed on a host that has since dropped, or a session `x` already
+/// killed. There is no keypress to answer here and nothing the user could do
+/// about it, so a failed close belongs in the log, not the status line. The
+/// count is worth saying: with the default policy a closed tab full of sessions
+/// ends all of them at once, and silence about that would be worse.
+/// Returns whether anything was closed, so the caller can arm the settle reload
+/// that picks up the departed rows (the deadline is the loop's own local).
+async fn close_reported_sessions(app: &mut App) -> bool {
+    let queued = std::mem::take(&mut app.pending_session_close);
+    if queued.is_empty() {
+        return false;
+    }
+    let mut closed = 0usize;
+    for (host, key) in queued {
+        let Some(backend) = app.backend_for(&host) else {
+            continue;
+        };
+        if tokio::task::block_in_place(|| backend.kill_session(&key)) {
+            closed += 1;
+        } else {
+            tracing::debug!("close-on-window-close: {host:?} {key} was already gone");
+        }
+    }
+    if closed == 0 {
+        return false;
+    }
+    let plural = if closed == 1 { "session" } else { "sessions" };
+    app.set_status(
+        format!("Closed {closed} {plural} with their windows"),
+        false,
+    );
+    true
+}
+
 async fn reattach_session(app: &mut App, host: HostId, pool_session: String) {
     let previously_focused = app.pending_focus_window.clone();
     attach_pool_session(app, host, pool_session, false, false).await;
@@ -983,7 +1044,11 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     // any attach window that ended while we were down left one of these behind.
     // Without this the stale binding would survive the restart and the row would
     // read as attached until the first snapshot prune.
-    app.apply_detach_reports(state::drain_detach_reports());
+    // `Backlog`, not `Live`: these are the windows that died while the dashboard
+    // was down, and a terminal quitting produces one per attach window on its
+    // way out — so `[remote] on_window_close` must not read them as the user
+    // closing each window by hand.
+    app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Backlog);
     // Don't auto-focus pre-existing failed-launch rows at startup — yanking
     // focus the instant the dashboard opens would be jarring. The initial
     // `reload_sessions` above already queued any, so clear it; focusing only
@@ -1056,7 +1121,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // reload runs this same iteration, and outside it because retiring a
         // binding needs no session re-read.
         if detach_reports.swap(false, Ordering::Relaxed)
-            && app.apply_detach_reports(state::drain_detach_reports())
+            && app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live)
         {
             // A report can queue the ended attach's held pane for reaping, and
             // no reload need run this iteration to drain it.
@@ -1064,6 +1129,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 if let Err(e) = terminal::get().close_window(&wid).await {
                     tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
                 }
+            }
+            if close_reported_sessions(&mut app).await {
+                arm_settle_reload(&mut settle_reload_at);
             }
             needs_redraw = true;
         }
@@ -1133,7 +1201,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // dashboard whose watcher failed to start. The reap queue is drained
             // just below either way.
             if !detach_reports_watched {
-                app.apply_detach_reports(state::drain_detach_reports());
+                app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live);
             }
             // Bring just-failed launch windows (direnv blocked, missing agent) to
             // the foreground. `reload_sessions` queued them on the transition
@@ -1152,6 +1220,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 if let Err(e) = terminal::get().close_window(&wid).await {
                     tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
                 }
+            }
+            // The reload's own drain above can queue these too.
+            if close_reported_sessions(&mut app).await {
+                arm_settle_reload(&mut settle_reload_at);
             }
             // Auto-reattach (§7): a host that just came back gets an attach
             // window respawned for every session the dashboard remembers having

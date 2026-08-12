@@ -103,6 +103,13 @@ Anything local to one module is in that module's doc instead.
   (`record_window_binding`, `retire_window_binding`, `prune_detached_sessions`,
   `apply_detach_reports`) — never `window_bindings` directly. They mark dirty
   *and* re-anchor the cursor, both of which a raw write misses.
+- **Retire a binding before closing the window yourself.** A detach report for a
+  binding we still hold reads as the *user* closing that window, which ends the
+  session under `[remote] on_window_close` (default `close`). Only status `129`
+  counts as a user close — ssh's 255 (dropped link) and an in-session detach's 0
+  must keep the session, or a flaky network becomes lost work — and a report
+  drained at **startup** never ends anything, since a quitting terminal SIGHUPs
+  every attach window on its way out.
 - **Branch on host, capability, or connection state — never on locality.**
   `capabilities() -> {pooled, shell}` is what detach/steal/the detached tier key
   on, which is why they work under pooled-localhost.

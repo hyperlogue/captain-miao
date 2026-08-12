@@ -34,6 +34,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub thresholds: ThresholdsConfig,
     pub polling: PollingConfig,
+    /// Behaviour of pooled (remote) sessions the dashboard holds a window for.
+    pub remote: RemoteConfig,
     /// Reused from `cm-core` (the launcher/daemon read the same section).
     pub launcher: LauncherConfig,
     /// Reused from `cm-core`.
@@ -145,6 +147,37 @@ pub enum ConfiguredBackend {
     Kitty,
     Zellij,
     Tmux,
+}
+
+// -- remote --
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// What closing a pooled session's window means. See [`OnWindowClose`].
+    pub on_window_close: OnWindowClose,
+}
+
+/// `[remote] on_window_close`: what to do with the session behind a window the
+/// **user** closed.
+///
+/// Only a deliberate close reaches this. A window that goes away because its
+/// attach died — a dropped ssh, a laptop resuming to a dead link, a refused
+/// attach — always detaches, since the session is the thing that survived the
+/// failure and killing it would turn every flaky link into lost work. The two
+/// are told apart by the exit status the wrapper reports: 129 (128 + SIGHUP) is
+/// the terminal tearing the window down under a live attach; ssh's 255 and an
+/// in-session detach's 0 are not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnWindowClose {
+    /// End the session on its host, as `x` would. The default: a window closed
+    /// by hand reads as "I'm done with this", and the alternative leaves a
+    /// pooled session running with nothing showing it.
+    #[default]
+    Close,
+    /// Leave the session running, detached — `D`'s behaviour, for every close.
+    Detach,
 }
 
 // -- kitty --
