@@ -886,13 +886,24 @@ impl RemoteBackend {
 /// name, and splicing any of that into a script is how quoting bugs become
 /// command injection. Nothing here is substituted — the text is a constant.
 ///
-/// Traps `HUP` as well as `EXIT` because the two ends differ: closing the window
-/// tears down the pty, which SIGHUPs the wrapper mid-`wait`, while an in-session
-/// shpool detach or a dropped ssh returns normally. `INT`/`TERM` are along for
-/// the ride. The `$d` latch keeps the pair from reporting twice — after a HUP
-/// handler returns, the interrupted wait unwinds and the script still exits
-/// through its EXIT trap, and the explicit `r` call on the normal path latches
-/// against its own EXIT trap the same way.
+/// **`HUP` reports 129 outright instead of `$?`, and that is what makes
+/// `[remote] on_window_close` work at all.** A terminal can end a window two
+/// ways and only one of them signals the attach: it may `killpg(SIGHUP)` the
+/// foreground group — the child dies of the signal, so `$?` is 129 — or it may
+/// just close the pty master, which SIGHUPs the *session leader alone* (POSIX'
+/// controlling process). This wrapper is that leader. ssh is then never
+/// signalled; it finds its tty gone and exits **255**, the very status a dropped
+/// link produces. Inheriting `$?` therefore reported a deliberate window close
+/// as a network failure on any terminal taking the second route, and the session
+/// was detached instead of ended. The signal *this* process receives is the one
+/// fact both routes agree on, so `HUP` names its own status and `$?` is left to
+/// the ends that really are the attach's own.
+///
+/// The handler still runs late — a shell defers a trap until the foreground
+/// command it is waiting on returns — but it runs *first*, ahead of the `r "$c"`
+/// on the normal path, and the `$d` latch makes whoever reports first the only
+/// one who reports. That latch is equally what stops the surviving `EXIT` trap
+/// from sending a second report as the script unwinds.
 ///
 /// `r $?` passes the attach's exit status as the handler's *first* expansion,
 /// before anything else can overwrite it. The dashboard uses it to tell an
@@ -920,7 +931,7 @@ const ATTACH_REPORT_SCRIPT: &str = "e=$1; h=$2; t=$3; g=$4; shift 4; \
      r() { q=$1; if [ -z \"$d\" ]; then d=1; if [ -n \"$e\" ]; then \
      \"$e\" attach-exited --host \"$h\" --token \"$t\" --status \"$q\" \
      --held-secs \"$(( $(date +%s) - s ))\"; fi; fi; }; \
-     trap 'r $?' EXIT HUP INT TERM; \
+     trap 'r 129' HUP; trap 'r $?' EXIT INT TERM; \
      \"$@\"; c=$?; r \"$c\"; n=$(( $(date +%s) - s )); \
      if [ \"$c\" -ne 0 ] && [ \"$c\" -ne 129 ] && [ \"$c\" -ne 130 ] \
      && [ \"$c\" -ne 143 ] && [ \"$n\" -lt \"$g\" ]; then \
@@ -4172,10 +4183,10 @@ mod tests {
         std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         use std::os::unix::process::CommandExt as _;
-        // A long-lived "attach", killed the way a closing pty kills one: the
-        // terminal SIGHUPs the whole foreground process *group*, so the wrapper
-        // and the attach under it die together. Signalling only the wrapper
-        // would leave the payload running and prove less than it looks.
+        // A long-lived "attach", killed the way one kind of closing window kills
+        // one: the terminal SIGHUPs the whole foreground process *group*, so the
+        // wrapper and the attach under it die together. The other kind — only
+        // the wrapper signalled — is its own test below, and is the harder one.
         let argv = report_on_exit_argv(
             vec!["sleep".into(), "30".into()],
             Some(reporter.to_str().unwrap()),
@@ -4201,6 +4212,58 @@ mod tests {
             // went away", never as a refused attach.
             "attach-exited --host box --token cm-1 --status 129",
             "a closed window must report exactly once, with the signal status"
+        );
+    }
+
+    /// The other way a window ends, and the one that used to be reported wrong.
+    ///
+    /// A terminal that merely closes the pty master signals the *session leader
+    /// alone* — this wrapper — and never touches ssh, which then finds its tty
+    /// gone and exits 255 all by itself. 255 is also what a dropped link gives,
+    /// so a wrapper inheriting `$?` called a deliberate close a network failure
+    /// and the session was detached rather than ended. The SIGHUP the wrapper
+    /// itself took is the fact that separates them, and it must win over the
+    /// status of a payload nobody signalled.
+    #[test]
+    fn a_window_close_outranks_the_status_of_an_unsignalled_attach() {
+        let dir = scratch_home("attach-wrapper-leader-hup");
+        let reporter = dir.join("reporter.sh");
+        std::fs::write(
+            &reporter,
+            format!("#!/bin/sh\necho \"$@\" >> {}/reports\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        use std::os::unix::process::CommandExt as _;
+        // Stands in for ssh outliving the hangup by a moment and then exiting
+        // with the status that means "this connection is unusable".
+        let argv = report_on_exit_argv(
+            vec!["sh".into(), "-c".into(), "sleep 1; exit 255".into()],
+            Some(reporter.to_str().unwrap()),
+            "box",
+            "cm-1",
+        );
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            // The hold reads from stdin when it thinks an attach was refused;
+            // the real window is gone by then, so give it the same EOF.
+            .stdin(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Positive pid, not the negated group: only the leader is signalled,
+        // which is the whole point of the case.
+        // SAFETY: a plain `kill(2)` on a child this test spawned and owns.
+        unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+        child.wait().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(
+            reported_once(&dir),
+            "attach-exited --host box --token cm-1 --status 129",
+            "a hung-up wrapper must report the close, not the attach's own 255"
         );
     }
 

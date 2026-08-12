@@ -86,6 +86,12 @@ Anything local to one module is in that module's doc instead.
   dies.** kitty's `--hold` starts the user's login shell when the command exits,
   so a dropped ssh leaves a live local shell wearing a session's title. The
   attach wrapper does its own holding (`ATTACH_REPORT_SCRIPT`).
+- **Fold the attach wrapper's `HUP` trap back into the `EXIT` one.**
+  `trap 'r 129' HUP` is separate on purpose: a terminal that ends a window by
+  closing the pty master (rather than `killpg`-ing the group) signals only the
+  session leader, so ssh is left to exit **255** on its own — and a trap
+  inheriting `$?` then reports a deliberate close as a dropped link, silently
+  disabling `[remote] on_window_close`.
 - **Add a 9th `kitten @` command** without updating the README's rc allowlist —
   every user on the recommended config gets a hard denial on it.
 - **Pass Claude's `--tmux`.** It makes its own tmux session on the same server,

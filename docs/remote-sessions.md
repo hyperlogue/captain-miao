@@ -537,7 +537,7 @@ to be reachable, and must survive the dashboard being restarted between the writ
 and the read. Three properties earn it:
 
 - **It covers every way an attach ends, not just a closed window.** The window
-  closing SIGHUPs the wrapper (hence the `HUP` trap beside `EXIT`), while an
+  closing SIGHUPs the wrapper (hence its own `HUP` trap, below), while an
   in-session shpool detach or a dropped ssh ends the attach process normally. The
   old snapshot only ever saw the first of the three; the other two left a bound
   row that was no longer attached to anything.
@@ -578,7 +578,7 @@ and whether to close the window as a backstop — for an attach that ran unwrapp
 | status | meaning | outcome |
 | --- | --- | --- |
 | `0` / absent | clean end, or a reporter that couldn't tell | spent → close |
-| `129` / `130` / `143` | 128 + HUP/INT/TERM, the signals the wrapper traps: the window was torn down under it | spent → close |
+| `129` / `130` / `143` | the window was torn down under the attach — `129` is the wrapper's own hangup (below), `130`/`143` the other signals it traps | spent → close |
 | anything else | ambiguous | spent only past `ATTACH_STARTUP_GRACE` (10s) |
 
 Both halves are load-bearing, and the signal row is spelled out rather than
@@ -598,9 +598,19 @@ Two guards keep that from eating sessions nobody meant to end, and both are the
 same distinction the rest of this section turns on — *the attach ended* versus
 *the window was taken away*:
 
-- **Only status `129`** (128 + SIGHUP: the terminal tearing the pty down under a
-  live attach) is a user close (`closed_by_the_user`). ssh's 255 covers a dropped
-  link and a failure to connect; `0` is an in-session detach; `130`/`143` arrive
+- **Only status `129`** is a user close (`closed_by_the_user`) — and the wrapper
+  reports it from **the SIGHUP it takes itself**, never from the attach's exit
+  status. That indirection is the load-bearing part, because a terminal ends a
+  window one of two ways. It may `killpg(SIGHUP)` the foreground group, which
+  kills ssh with the signal and yields 129 of its own accord; or it may simply
+  close the pty master, which by POSIX signals the *session leader* alone — the
+  wrapper. ssh is then never signalled: it finds its tty gone and exits **255**,
+  identical to a dropped link. A wrapper passing `$?` through therefore read
+  every deliberate close on that second route as a network failure and detached
+  instead of closing, which is exactly the bug this rule exists to prevent.
+  `trap 'r 129' HUP` makes the two routes agree, and which one a given terminal
+  picks stops mattering. ssh's 255 still covers a genuine dropped link and a
+  failure to connect; `0` is an in-session detach or a steal; `130`/`143` arrive
   by routes that aren't a window closing. None of them end a session — the
   session is what *survived* the failure, and ending it would turn every flaky
   link and every laptop resume into lost work.
