@@ -485,12 +485,15 @@ pub(super) fn override_indicator_cell(
     // A pooled session still running on its host with no window on this screen
     // (§9). It joins the existing icon set rather than getting a column of its
     // own, and ranks below the pin: a pin is something the *user* chose,
-    // detached is just where the session happens to be.
-    let unplugged = Span::styled("\u{1F50C}", Style::default().add_modifier(Modifier::DIM)); // 🔌 plug
+    // out-of-sight is just where the session happens to be. The glyph says
+    // "you can't see this one" rather than naming a transport, because the
+    // state is about *where the window is*, not about a link — a pooled
+    // localhost session with no window here is detached on the same machine.
+    let out_of_sight = Span::styled("\u{1F648}", Style::default().add_modifier(Modifier::DIM)); // 🙈 see-no-evil
     let secondary = if pinned {
         Some(pin)
     } else if detached {
-        Some(unplugged)
+        Some(out_of_sight)
     } else {
         None
     };

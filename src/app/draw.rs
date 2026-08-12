@@ -1211,7 +1211,7 @@ impl App {
                 // already sinks to its own sort tier; dimming says the same
                 // thing where the eye lands first, so a screenful of detached
                 // rows reads as background rather than as a list you're behind
-                // on. The plug glyph alone was too quiet for that.
+                // on. The override glyph alone was too quiet for that.
                 let detached = self.is_detached_row(s);
                 let status_text = s.status.label();
                 let name = truncate_str(
