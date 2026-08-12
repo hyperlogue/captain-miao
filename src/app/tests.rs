@@ -1340,6 +1340,67 @@ fn a_detached_row_draws_dim() {
     );
 }
 
+/// Two rows can both be "no window here" for opposite reasons: free to take, or
+/// held by somebody else's terminal. `Enter` behaves differently on each (the
+/// second needs a steal), so they must not wear the same glyph. The host's
+/// attached-bit overlay is what separates them — and an *unknown* bit (an
+/// unreadable pool) must read as free, never as held.
+#[test]
+fn a_row_held_by_another_client_reads_apart_from_a_free_one() {
+    use super::format::Detached;
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let mut free = session(1, "/srv/free", SessionStatus::Idle);
+    free.host = HostId("box".into());
+    free.pool_session = Some("cm-free".into());
+    free.attached = Some(false);
+    let mut held = session(2, "/srv/held", SessionStatus::Idle);
+    held.host = HostId("box".into());
+    held.pool_session = Some("cm-held".into());
+    held.attached = Some(true);
+    let mut unknown = session(3, "/srv/unknown", SessionStatus::Idle);
+    unknown.host = HostId("box".into());
+    unknown.pool_session = Some("cm-unknown".into());
+    unknown.attached = None; // the pool couldn't be read
+    let here = session(4, "/home/test/here", SessionStatus::Idle);
+    d.set_sessions(vec![free, held, unknown, here]);
+
+    let kind = |d: &TestDashboard, pid: u32| {
+        let s = d
+            .app
+            .sessions
+            .iter()
+            .find(|s| s.launcher_pid == pid)
+            .expect("row exists")
+            .clone();
+        d.app.detached_kind(&s)
+    };
+    assert_eq!(kind(&d, 1), Some(Detached::Free));
+    assert_eq!(kind(&d, 2), Some(Detached::HeldElsewhere));
+    assert_eq!(kind(&d, 3), Some(Detached::Free), "unknown is not held");
+    assert_eq!(kind(&d, 4), None, "a row with a window here isn't detached");
+
+    // Both glyphs actually reach the override column, and they differ.
+    let out = d.render();
+    assert!(out.contains('\u{1F648}'), "the free row keeps 🙈");
+    assert!(out.contains('\u{1F440}'), "the held row draws 👀");
+
+    // The preview panel says which one you're looking at, and names the steal by
+    // its live binding rather than a hardcoded key.
+    d.app.table_state.select(Some(
+        d.app
+            .visible_sessions()
+            .iter()
+            .position(|s| s.launcher_pid == 2)
+            .expect("held row is visible"),
+    ));
+    let placeholder = d.app.preview_placeholder();
+    assert!(
+        placeholder.contains("another terminal") && placeholder.contains("Space s"),
+        "unexpected placeholder: {placeholder}"
+    );
+}
+
 /// …and no status lifts it back out — not even a live blocking prompt. A
 /// parked approval or decision is urgent, but it's urgent *elsewhere*: it
 /// can't be answered until the row is attached, so seating it above the

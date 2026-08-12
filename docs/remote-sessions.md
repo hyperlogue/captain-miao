@@ -917,6 +917,16 @@ decides what they mean**.
   panel names the case rather than showing
   `(loading…)` for a fetch that will never arrive — there is no local window to
   capture. New / resumed / forked sessions auto-attach on create.
+  - **Free vs. held by another client** is a split in the *glyph*, not in the
+    tier: `🙈` for a pty nobody holds, `👀` for one another terminal is attached
+    to (the host's attached-bit overlay, §10.2). The distinction is worth
+    drawing because `Enter` differs — a free row attaches, a held one needs the
+    steal, which the preview panel spells out by its live binding. It is
+    deliberately *not* a second sort tier: a row is out of sight either way, and
+    the order has no business flapping on another client's comings and goings.
+    An **unknown** bit (the pool couldn't be read) draws as free — an unreadable
+    pool must not put every row behind an implied steal, matching how the steal
+    confirm treats unknown.
 - **`o`** on a row opens another session on *that row's host + cwd*, not
   locally. With nothing selected it targets the default host.
 - **The workdir picker is host-aware and cache-first.** `Ctrl-h` cycles the

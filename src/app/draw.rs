@@ -953,10 +953,15 @@ impl App {
         // here — surface where it does live instead.
         let window = if let Some(identity) = self.foreign_terminal(s) {
             format!("in {identity}")
+        } else if let Some(w) = self.window_id_for_session(s) {
+            w.to_string()
+        } else if self.detached_kind(s) == Some(super::format::Detached::HeldElsewhere) {
+            // No window *here*, but the host says the pty has a client — say so
+            // rather than the bare `—` a free detached row gets, which reads as
+            // "nowhere" and is exactly the case this isn't.
+            "elsewhere".to_string()
         } else {
-            self.window_id_for_session(s)
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "—".to_string())
+            "—".to_string()
         };
         let tab = s
             .tab_id
@@ -1212,14 +1217,17 @@ impl App {
                 // thing where the eye lands first, so a screenful of detached
                 // rows reads as background rather than as a list you're behind
                 // on. The override glyph alone was too quiet for that.
-                let detached = self.is_detached_row(s);
+                // …and *which* detached it is picks the glyph: nobody there, or
+                // another client holding it.
+                let detached_kind = self.detached_kind(s);
+                let detached = detached_kind.is_some();
                 let status_text = s.status.label();
                 let name = truncate_str(
                     &session_display_name(s, self.index_of(s), &self.random_names),
                     name_col_max as usize,
                 );
 
-                let override_cell = override_indicator_cell(follow_up, important, detached);
+                let override_cell = override_indicator_cell(follow_up, important, detached_kind);
                 let status_fg = super::format::status_fg(&s.status, follow_up);
                 let status_cell = Cell::from(status_text).style(Style::default().fg(status_fg));
                 let name_cell = if search_active {

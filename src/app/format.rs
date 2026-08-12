@@ -458,6 +458,18 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
     icon.width().clamp(1, DIR_ICON_MAX_CHARS)
 }
 
+/// Why a row has no window on this screen — the two cases read differently, so
+/// the override column draws them differently (§9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Detached {
+    /// Running on its host with nobody attached: `Enter` takes it, no questions.
+    Free,
+    /// Some other client holds the pty. The host's attached-bit overlay is what
+    /// tells us; taking it back means a steal, which is why it can't wear the
+    /// same glyph as a free one.
+    HeldElsewhere,
+}
+
 /// Renders the override column using emoji. Bell sits on the left and a
 /// secondary indicator (pin or detached) sits on the right; without a bell, the
 /// secondary occupies the left position alone.
@@ -475,7 +487,7 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
 pub(super) fn override_indicator_cell(
     follow_up: bool,
     pinned: bool,
-    detached: bool,
+    detached: Option<Detached>,
 ) -> Cell<'static> {
     // The styles only reach a terminal that renders these monochrome; a color
     // emoji font paints its own hues and ignores the fg. Kept anyway so such a
@@ -490,12 +502,20 @@ pub(super) fn override_indicator_cell(
     // state is about *where the window is*, not about a link — a pooled
     // localhost session with no window here is detached on the same machine.
     let out_of_sight = Span::styled("\u{1F648}", Style::default().add_modifier(Modifier::DIM)); // 🙈 see-no-evil
+    // The same state seen from the other side: out of *our* sight because
+    // somebody else's terminal has it. Not dimmed — an out-of-sight row is
+    // background, but one held by another client is the row where `Enter`
+    // behaves differently (it needs a steal), so it earns the eye's stop. The
+    // two glyphs are deliberately a pair: covered eyes vs. someone else's.
+    let held_elsewhere = Span::raw("\u{1F440}"); // 👀 eyes
     let secondary = if pinned {
         Some(pin)
-    } else if detached {
-        Some(out_of_sight)
     } else {
-        None
+        match detached {
+            Some(Detached::Free) => Some(out_of_sight),
+            Some(Detached::HeldElsewhere) => Some(held_elsewhere),
+            None => None,
+        }
     };
 
     let line = match (follow_up, secondary) {

@@ -3581,6 +3581,31 @@ impl App {
         s.pool_session.is_some() && self.window_id_for_session(s).is_none()
     }
 
+    /// Which kind of detached a row is: free to take, or already held by another
+    /// client. `None` for a row with a window here.
+    ///
+    /// Presentation only — the *tier* stays one tier (a row is out of sight
+    /// either way, and the sort has no business flapping on another client's
+    /// comings and goings). The split matters because `Enter` doesn't behave the
+    /// same: a free row attaches, a held one needs the steal.
+    ///
+    /// `attached` is the host's overlay of libshpool's live bit, so `None` there
+    /// means *unknown* (the pool couldn't be read) and must not read as "someone
+    /// has it" — an unreadable pool would otherwise put every row behind an
+    /// implied steal. Unknown falls back to `Free`, matching how the steal
+    /// confirm treats it: offer the ordinary action, let the attach itself
+    /// refuse if it must.
+    pub(super) fn detached_kind(&self, s: &LauncherState) -> Option<format::Detached> {
+        if !self.is_detached_row(s) {
+            return None;
+        }
+        Some(if s.attached == Some(true) {
+            format::Detached::HeldElsewhere
+        } else {
+            format::Detached::Free
+        })
+    }
+
     /// What the preview panel says when it has no captured text.
     ///
     /// The preview is a `capture_text` of the row's **local** window, so a row
@@ -3597,8 +3622,18 @@ impl App {
         if let Some(identity) = self.foreign_terminal(s) {
             return format!("(session lives in {identity} — no preview here)");
         }
-        if self.is_detached_row(s) {
-            return "(detached — attach with Enter to preview)".to_string();
+        match self.detached_kind(s) {
+            Some(format::Detached::Free) => {
+                return "(detached — attach with Enter to preview)".to_string();
+            }
+            Some(format::Detached::HeldElsewhere) => {
+                // Name the steal by its live binding, so a remap shows through.
+                return match self.keymap.primary_key(keymap::Command::StealAttach) {
+                    Some(key) => format!("(attached in another terminal — {key} to steal it)"),
+                    None => "(attached in another terminal)".to_string(),
+                };
+            }
+            None => {}
         }
         if self.window_id_for_session(s).is_none() {
             return "(no window to preview)".to_string();
