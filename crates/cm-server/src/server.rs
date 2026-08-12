@@ -41,6 +41,7 @@ use crate::protocol::{
 };
 use crate::state::{self, LauncherState, SessionKey};
 use cm_core::agent::AgentControl;
+use cm_core::vitals::VitalsSampler;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -55,6 +56,11 @@ const SOCKET_CHECK: Duration = Duration::from_secs(5);
 /// Pause after a failed `accept` so a persistent fd exhaustion can't spin the
 /// serve loop hot while it drains.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+/// How often a subscribed connection is pushed a fresh CPU/memory sample, and
+/// so also the window each CPU percentage covers. Slow enough that an idle
+/// dashboard costs one tiny frame every few seconds, fast enough that the hosts
+/// panel reads as live while someone is looking at it.
+const VITALS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Build the `Opened` reply for an `OpenSession` request. With the `pty-pool`
 /// feature, starts the launcher in this host's pool and returns its session
@@ -625,6 +631,16 @@ async fn handle_conn(
 
     let mut subscribed = false;
     let mut last_sent: HashMap<SessionKey, LauncherState> = HashMap::new();
+    // One sampler per connection, so each client's CPU percentage is measured
+    // over its own push interval and the server keeps no cross-connection state
+    // (the same rule the session diff follows). The first tick fires
+    // immediately: memory is a straight reading and shows at once, while the
+    // CPU figure needs a second sample and appears one interval later.
+    let mut vitals = VitalsSampler::new();
+    let mut vitals_tick = tokio::time::interval(VITALS_INTERVAL);
+    // A client that was unreachable for a while (a suspended laptop) must not
+    // be handed a burst of back-dated samples on its return.
+    vitals_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -683,6 +699,14 @@ async fn handle_conn(
                     ClientFrame::Unknown => {
                         tracing::debug!("ignoring an unknown client frame (newer peer?)");
                     }
+                }
+            }
+            _ = vitals_tick.tick(), if subscribed => {
+                // A host whose counters we can't read reports nothing at all
+                // rather than a frame of nulls — and costs no traffic for it.
+                let sample = vitals.sample();
+                if !sample.is_empty() {
+                    write_frame(&mut wr, &ServerFrame::Vitals { vitals: sample }).await?;
                 }
             }
             recv = changes.recv(), if subscribed => {

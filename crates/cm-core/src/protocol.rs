@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::agent::ResumeCandidate;
 use crate::backend::OpenSpec;
 use crate::state::{LauncherState, SessionFlags, SessionKey};
+use crate::vitals::HostVitals;
 
 /// The protocol version this build speaks. v2 added `OpenSession`/`Opened`
 /// (remote spawn). v3 added the host-filesystem queries the workdir picker needs
@@ -109,6 +110,13 @@ pub enum ServerFrame {
     Delta { state: Box<LauncherState> },
     /// A session is gone (its launcher exited / its state file went away).
     Removed { key: SessionKey },
+    /// The host's own CPU/memory utilisation, pushed on a timer to a subscriber
+    /// (see [`crate::vitals`]). Pushed rather than polled because a percentage
+    /// is a *difference* between two readings, so the sampler must live where
+    /// the cadence is; a `req_id` round trip would make every client keep that
+    /// state on the far side of a link. Costs one small frame per interval and
+    /// nothing else — a client that ignores it stays entirely correct.
+    Vitals { vitals: HostVitals },
     /// Reply to `ListResumable`.
     Resumable {
         req_id: u64,
@@ -159,6 +167,7 @@ impl ServerFrame {
             | ServerFrame::Snapshot { .. }
             | ServerFrame::Delta { .. }
             | ServerFrame::Removed { .. }
+            | ServerFrame::Vitals { .. }
             | ServerFrame::Unknown => None,
         }
     }
@@ -333,7 +342,51 @@ mod tests {
             .req_id(),
             None
         );
+        assert_eq!(
+            ServerFrame::Vitals {
+                vitals: HostVitals::default()
+            }
+            .req_id(),
+            None
+        );
         assert_eq!(ServerFrame::Unknown.req_id(), None);
+    }
+
+    /// A daemon predating [`HostVitals`]' fields still decodes into it: the
+    /// frame is the additive shape v4 promised, not a new negotiation.
+    #[tokio::test]
+    async fn vitals_round_trip_and_decode_from_a_partial_sender() {
+        let frame = ServerFrame::Vitals {
+            vitals: HostVitals {
+                cpu_percent: Some(37.5),
+                mem_used_bytes: Some(8 << 30),
+                mem_total_bytes: Some(16 << 30),
+            },
+        };
+        let buf = encode_frame(&frame).unwrap();
+        let mut slice = buf.as_slice();
+        let got: ServerFrame = read_frame(&mut slice).await.unwrap().unwrap();
+        match got {
+            ServerFrame::Vitals { vitals } => {
+                assert_eq!(vitals.cpu_percent, Some(37.5));
+                assert_eq!(vitals.mem_percent(), Some(50.0));
+            }
+            other => panic!("wrong frame: {other:?}"),
+        }
+
+        let partial = br#"{"frame":"Vitals","vitals":{"cpu_percent":12.0}}"#;
+        let mut buf = Vec::new();
+        buf.extend((partial.len() as u32).to_be_bytes());
+        buf.extend_from_slice(partial);
+        let mut slice = buf.as_slice();
+        let got: ServerFrame = read_frame(&mut slice).await.unwrap().unwrap();
+        match got {
+            ServerFrame::Vitals { vitals } => {
+                assert_eq!(vitals.cpu_percent, Some(12.0));
+                assert_eq!(vitals.mem_percent(), None);
+            }
+            other => panic!("wrong frame: {other:?}"),
+        }
     }
 
     #[tokio::test]

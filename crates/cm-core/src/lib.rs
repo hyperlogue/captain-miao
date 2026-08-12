@@ -11,8 +11,8 @@
 //! that supervises an agent process, the [`hooks`] forwarder, the local
 //! server-core [`backend::LocalBackend`] + the shared open-session types, the
 //! opaque [`terminal`] ids + the launcher's `current_window` self-report, the
-//! host-canonical [`paths`] wire spelling, plus shared [`cli`] arg helpers and
-//! [`logging`] setup.
+//! host-canonical [`paths`] wire spelling, the host [`vitals`] a daemon samples
+//! for its own machine, plus shared [`cli`] arg helpers and [`logging`] setup.
 
 pub mod agent;
 pub mod agents;
@@ -27,3 +27,4 @@ pub mod paths;
 pub mod protocol;
 pub mod state;
 pub mod terminal;
+pub mod vitals;
