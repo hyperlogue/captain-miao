@@ -1205,8 +1205,9 @@ pub(super) fn dashboard_tab_title(attention: usize) -> String {
     }
 }
 
-/// Pluralize "session" for the restart-confirmation prompts.
-fn plural_sessions(n: usize) -> &'static str {
+/// Pluralize "session" for the restart-confirmation prompts and the hosts
+/// panel's per-host count.
+pub(super) fn plural_sessions(n: usize) -> &'static str {
     if n == 1 { "session" } else { "sessions" }
 }
 

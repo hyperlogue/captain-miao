@@ -396,7 +396,10 @@ impl App {
         if state.is_connected() {
             let (running, attached) = self.host_session_counts(host);
             spans.push(Span::styled(
-                format!("  {running} session(s), {attached} attached"),
+                format!(
+                    "  {running} {}, {attached} attached",
+                    super::plural_sessions(running)
+                ),
                 Style::default().add_modifier(Modifier::DIM),
             ));
             let mut trailer = String::new();
