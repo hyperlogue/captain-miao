@@ -51,6 +51,63 @@ pub(super) struct HostConfig {
     /// Ignored for a `socket` host — there is no ssh hop there to carry them.
     #[serde(default)]
     pub forwards: Vec<String>,
+    /// Extra ssh arguments for the dashboard's **own** connection to this host:
+    /// the probe, `daemon ensure` and the `-N -L` tunnel child, which together
+    /// are what establish the ControlMaster every later hop rides. Passed
+    /// verbatim, in order, ahead of the target.
+    ///
+    /// Not the place for host identity — port, `ProxyJump`, `IdentityFile` — all
+    /// of which belong in a `~/.ssh/config` `Host` block, since captain-miao
+    /// reaches a host by plain `ssh <target>` and a block there also covers the
+    /// attach windows and the `w` shell. What is left for this field is tuning
+    /// ssh_config can't scope to us alone: `-C`, keepalive and window sizes, an
+    /// extra `-o`.
+    ///
+    /// Ignored for a `socket` host, like [`Self::forwards`] and for the same
+    /// reason.
+    #[serde(default)]
+    pub ssh_args: Vec<String>,
+}
+
+/// Split the panel's `Args` field into tokens.
+///
+/// Whitespace only, with no quoting: the arguments this field is for are single
+/// tokens or `-o key=value` pairs, and the one common option whose value has a
+/// space in it — `ProxyCommand` — is exactly the kind that belongs in
+/// `~/.ssh/config` instead. A quoting grammar here would exist to serve the
+/// case the field is documented as not being for.
+pub(super) fn split_ssh_args(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_string).collect()
+}
+
+/// Pair each token with whether it is actually passed to ssh, in order.
+///
+/// The one thing refused is a **port forward** (`-L`/`-R`/`-D`, glued or with
+/// its value in the next token). Not because it wouldn't work — it would, once —
+/// but because it would work *outside* the lifecycle the `Ports` field exists to
+/// give it: nothing would cancel it when the row is edited, suspended or
+/// removed, so a forward added here would quietly outlive the host it belongs
+/// to. Two ways to ask for the same thing, one of which silently leaks, is worse
+/// than one way and a red token saying so.
+///
+/// A rejected flag takes its **value token with it**. Dropping `-L` alone would
+/// leave `8080:localhost:3000` as a bare positional, which ssh reads as the
+/// *hostname* — turning a refused forward into a connection to a machine that
+/// doesn't exist. Pure.
+pub(super) fn classify_ssh_args(args: &[String]) -> Vec<(String, bool)> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut drop_value = false;
+    for a in args {
+        // Case matters: `-L` is a local forward, `-l` is the login name.
+        let separated = matches!(a.as_str(), "-L" | "-R" | "-D");
+        let glued = !separated
+            && a.len() > 2
+            && (a.starts_with("-L") || a.starts_with("-R") || a.starts_with("-D"));
+        let keep = !(separated || glued || drop_value);
+        drop_value = separated;
+        out.push((a.clone(), keep));
+    }
+    out
 }
 
 /// Load the configured hosts, or an empty list if none / unreadable.

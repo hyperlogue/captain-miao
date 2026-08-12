@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing else, and a spec that isn't valid is shown in red on the host's row
   instead of being handed to ssh.
 
+- **Extra ssh arguments, per remote host.** The `Args` field beside `Ports`
+  takes anything you'd put on an ssh command line — `-C`, a keepalive, an extra
+  `-o` — passed through verbatim to captain-miao's own connection to that host.
+  It's for tuning ssh_config can't express, because ssh_config can't tell
+  captain-miao's connection apart from any other ssh to the same machine. Your
+  arguments go first, so an `-o` here wins over captain-miao's default for it.
+
+  How to *reach* a host — its port, a jump host, an identity file — still
+  belongs in `~/.ssh/config`, where it also covers the attach windows and the
+  `w` shell. And a port forward belongs in `Ports`: one written into `Args` is
+  marked in red and skipped, since nothing there would take it down again when
+  you remove it.
+
 ## [0.3.0] - 2026-08-11
 
 ### Added

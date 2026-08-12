@@ -1064,7 +1064,8 @@ impl App {
                     state.focus = match state.focus {
                         HostField::Label => HostField::Target,
                         HostField::Target => HostField::Ports,
-                        HostField::Ports => HostField::Icon,
+                        HostField::Ports => HostField::Args,
+                        HostField::Args => HostField::Icon,
                         HostField::Icon => HostField::Label,
                     }
                 }
@@ -1085,6 +1086,9 @@ impl App {
                             HostField::Ports => {
                                 r.forwards.pop();
                             }
+                            HostField::Args => {
+                                r.ssh_args.pop();
+                            }
                             HostField::Icon => {
                                 r.icon.pop();
                             }
@@ -1099,6 +1103,7 @@ impl App {
                             HostField::Label => r.label.push(c),
                             HostField::Target => r.target.push(c),
                             HostField::Ports => r.forwards.push(c),
+                            HostField::Args => r.ssh_args.push(c),
                             // Capped like the directory-mark icon, and for the
                             // same reason now that the two share one table
                             // column: past ~4 cells an "icon" stops reading as a

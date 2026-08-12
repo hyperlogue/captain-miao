@@ -521,8 +521,8 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        // Four field rows + at most one per-field hint, plus a little slack.
-        let form_h: u16 = if state.editing { 7 } else { 0 };
+        // Five field rows + at most one per-field hint, plus a little slack.
+        let form_h: u16 = if state.editing { 8 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
@@ -581,15 +581,20 @@ impl App {
             }
             lines.push(Line::from(spans));
             // The target is secondary detail — one indented dim line, so the
-            // status line above stays scannable across many hosts.
-            lines.push(Line::from(Span::styled(
+            // status line above stays scannable across many hosts. Extra ssh
+            // args ride that same line rather than earning one of their own:
+            // they *are* part of how this host is dialled, and read as the rest
+            // of the command the target starts.
+            let mut target_spans = vec![Span::styled(
                 format!(
                     "      {} {}",
                     if r.is_socket { "socket" } else { "ssh" },
                     r.target
                 ),
                 Style::default().add_modifier(Modifier::DIM),
-            )));
+            )];
+            target_spans.extend(ssh_arg_spans(&r.ssh_args));
+            lines.push(Line::from(target_spans));
             // A port forward is otherwise completely invisible — nothing else in
             // the dashboard says a local port is being answered by another
             // machine — so a host that has one spends a third line saying so.
@@ -666,6 +671,10 @@ impl App {
                 Span::raw(r.forwards.clone()),
                 cursor(state.focus == super::HostField::Ports),
             ]);
+            let args_line = Line::from(vec![
+                Span::raw(r.ssh_args.clone()),
+                cursor(state.focus == super::HostField::Args),
+            ]);
             let icon_line = Line::from(vec![
                 Span::raw(if r.icon.trim().is_empty() {
                     format!("{} (auto)", self.host_icon(&HostId(r.label.clone())))
@@ -682,6 +691,7 @@ impl App {
                     target_line,
                 ),
                 field_row(state.focus == super::HostField::Ports, "Ports", ports_line),
+                field_row(state.focus == super::HostField::Args, "Args", args_line),
                 field_row(state.focus == super::HostField::Icon, "Icon", icon_line),
             ];
             // Per-field hints for the non-obvious affordances. The Ports one is
@@ -694,6 +704,12 @@ impl App {
                 ))),
                 super::HostField::Ports => form_lines.push(Line::from(Span::styled(
                     "  3000  8080:3000  R:9000  D:1080   (ssh hosts only)",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                // Names where the *other* host settings go, because that is the
+                // question this field raises rather than answers.
+                super::HostField::Args => form_lines.push(Line::from(Span::styled(
+                    "  -C  -o ServerAliveInterval=30   port/jump: ~/.ssh/config",
                     Style::default().add_modifier(Modifier::DIM),
                 ))),
                 super::HostField::Icon => form_lines.push(Line::from(Span::styled(
@@ -1829,6 +1845,32 @@ pub(super) fn forward_spans(raw: &str, is_socket: bool) -> Vec<Span<'static>> {
         spans.push(Span::styled("  (ssh hosts only)", dim));
     }
     spans
+}
+
+/// A host row's extra ssh args, appended to its target line.
+///
+/// A token the connection will refuse — a port forward, which belongs in
+/// `Ports` where something cancels it (see [`super::hosts::classify_ssh_args`])
+/// — is drawn in the attention colour behind a `!`, the same shape the forward
+/// line uses for a spec that doesn't parse, and for the same reason: it is
+/// dropped on connect, and a row that drew it like a live argument would make
+/// that undiagnosable. Pure.
+pub(super) fn ssh_arg_spans(raw: &str) -> Vec<Span<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let args = super::hosts::split_ssh_args(raw);
+    super::hosts::classify_ssh_args(&args)
+        .into_iter()
+        .map(|(tok, keep)| {
+            if keep {
+                Span::styled(format!("  {tok}"), dim)
+            } else {
+                Span::styled(
+                    format!("  !{tok}"),
+                    Style::default().fg(config::get().colors.ui.attention_fg),
+                )
+            }
+        })
+        .collect()
 }
 
 /// The header's ☁️ host tally: one colored number per bucket, good → error →

@@ -761,9 +761,9 @@ decides what they mean**.
   host shows live connection state (including the `Failed` reason verbatim),
   running/attached session counts, the daemon version from `Welcome`, and a
   latency sample; its ssh/socket target sits on a dim second line. Editing a
-  row exposes label / target (`^t` toggles ssh↔socket) / **ports** (the forwards
-  below) / **icon** (`^e` opens the same searchable emoji picker as `Space i`).
-  There is **no Save
+  row exposes label / target (`^t` toggles ssh↔socket) / **ports** and **args**
+  (both below) / **icon** (`^e` opens the same searchable emoji picker as
+  `Space i`). There is **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
   removes behind a `y/N` confirm. A `Failed` reason is **flattened and
@@ -802,6 +802,42 @@ decides what they mean**.
     target for and cancels that set ∪ the new one, then requests. Editing the
     field changes `conn_identities`, so a commit rebuilds the backend and that
     whole pass runs immediately.
+- **`Args` — extra ssh arguments for the main connection.** Passed verbatim to
+  the invocations `setup_ssh` makes — the probe, `daemon ensure`, the `-O
+  cancel`s and the tunnel child — and to nothing else. That scope is not a
+  limitation to work around later: those calls are what *establish the
+  ControlMaster*, and on a multiplexed connection the connection-level options
+  belong to whoever opened it, so an attach window riding that master inherits
+  them without carrying them in its own argv. Splicing them into
+  `ssh_common_opts` instead would put them on every attach window, which for
+  anything forward-shaped means colliding with the master once per window.
+  - **Not for host identity.** Port, `ProxyJump`, `IdentityFile`,
+    `ProxyCommand` belong in a `~/.ssh/config` `Host` block: captain-miao
+    reaches a host by plain `ssh <target>`, so a block there already covers the
+    attach windows and the `w` shell too. What is left for this field is the
+    tuning ssh_config *can't* scope to us alone — `-C`, keepalive and window
+    sizes, an extra `-o`.
+  - **The user's args go first**, because ssh keeps the first value it obtains
+    for an option. Ours last would make the field silently inert for exactly its
+    motivating cases (`ConnectTimeout`, `ServerAliveInterval`, `ControlPersist`
+    are all already set by `ssh_common_opts`). The price is that `ControlPath`,
+    `ControlMaster` and `BatchMode` are overridable and each breaks something
+    real — the first two split the multiplexing this relies on, including the
+    `-O cancel` that retires forwards; the third lets ssh prompt on a child
+    whose stdin is `/dev/null`. Documented, not blocked: an escape hatch that
+    second-guesses isn't one.
+  - **One refusal: a port forward** (`classify_ssh_args`, `src/app/hosts.rs`).
+    `-L`/`-R`/`-D` would *work* here, once — and then sit outside the lifecycle
+    `Ports` exists to give it, with nothing to cancel it when the row is edited,
+    suspended or removed. The rejected flag takes its **value token** with it,
+    since a lone dropped `-L` would leave `8080:localhost:3000` as a bare
+    positional, which ssh reads as the hostname. Refused tokens draw on the row
+    behind a red `!`, the same shape a malformed forward spec uses.
+  - Unlike a spec in `Ports`, a bad argument here isn't pre-validated — it can't
+    be, that's the point of verbatim. It is still *diagnosable* rather than a
+    silent flap: the args reach `daemon ensure` before they reach the tunnel
+    child, and that call captures stderr into the `Failed` reason, so ssh's own
+    usage error is what the panel shows.
 - **`l` — the connection log** (per host, in the panel). The row gets one line
   for a failure whose reason is routinely a paragraph, and the *sequence* is
   what diagnoses: "probed the host, decided to deploy, the deploy came back with
@@ -1060,18 +1096,6 @@ has no remote. Until it has, the feature ships off by default behind the
 
 ### 10.4 Smaller deferred items
 
-- **Extra ssh args for the main connection.** The `Ports` field (§9) is the one
-  connection knob the panel exposes, because a forward is the one that
-  *shouldn't* live in `~/.ssh/config`: it is state you want up while working on
-  a host and gone when you aren't, not a permanent property of the machine.
-  Everything about *how to reach* the host — port, `ProxyJump`, identity file —
-  belongs in a `Host` block there, where it also covers the attach windows and
-  the `w` shell for free. The gap left is per-connection tuning that ssh_config
-  can't scope to us (`-C`, keepalive and window sizes, an extra `-o`): a
-  free-form field for that would have to apply to the **main connection only**,
-  since anything spliced into `ssh_common_opts` is re-sent by every attach
-  window — and a forward-shaped arg there would collide with the master on each
-  one.
 - **Per-host keep-awake and remote focus/bell.** The sleep inhibitor and the
   `miao focus` bell are both client-side and only meaningful for sessions with a
   local window; a remote session that wants attention currently reaches the

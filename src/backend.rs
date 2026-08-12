@@ -536,6 +536,12 @@ pub(crate) enum Transport {
         /// "while I'm connected to this host" — with no second connection to
         /// authenticate, supervise or reconnect.
         forwards: Vec<PortForward>,
+        /// Extra ssh arguments for this connection, verbatim. Applied to the
+        /// invocations [`setup_ssh`] makes and to nothing else, which is the
+        /// whole point: those are what establish the ControlMaster, so an option
+        /// set here lands on the connection every later hop rides — while an
+        /// attach window's own argv stays exactly what it was.
+        ssh_args: Vec<String>,
     },
 }
 
@@ -2320,12 +2326,16 @@ async fn connection_task(
                 target,
                 local_sock,
                 forwards,
+                ssh_args,
             } => {
                 log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
-                    target,
-                    local_sock,
-                    forwards,
+                    SshLink {
+                        target,
+                        local_sock,
+                        forwards,
+                        ssh_args,
+                    },
                     &remote_exe,
                     &mut failure,
                     &mut Provisioning {
@@ -2498,6 +2508,17 @@ async fn connect_with_retry(sock: &Path, attempts: u32) -> Option<UnixStream> {
     None
 }
 
+/// The [`Transport::Ssh`] fields [`setup_ssh`] dials with, borrowed as a group.
+/// Grouped for the same reason as [`ConnectionShared`]: four of these five
+/// parameters would otherwise be positional, and two are `&str`-ish enough to
+/// swap silently at the one call site.
+struct SshLink<'a> {
+    target: &'a str,
+    local_sock: &'a Path,
+    forwards: &'a [PortForward],
+    ssh_args: &'a [String],
+}
+
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
 /// socket path) with `daemon ensure`, then spawn a **forward-only** `ssh -N -L
 /// <local>:<remote> target` child that just holds the tunnel. The daemon is
@@ -2511,15 +2532,24 @@ async fn connect_with_retry(sock: &Path, attempts: u32) -> Option<UnixStream> {
 /// reconnect. `ExitOnForwardFailure` stays at its default `no` on purpose: a
 /// port already in use must cost the user that one forward, not the dashboard's
 /// link to the host.
+///
+/// `ssh_args` reaches every invocation below — including the probe, which is
+/// what creates the ControlMaster the attach windows later ride. That is why the
+/// field is worth having at all despite touching none of their argvs: on a
+/// multiplexed connection, connection-level options belong to whoever opened it.
 async fn setup_ssh(
-    target: &str,
-    local_sock: &Path,
-    forwards: &[PortForward],
+    link: SshLink<'_>,
     remote_exe: &Arc<Mutex<String>>,
     failure: &mut Option<String>,
     prov: &mut Provisioning<'_>,
     log: &ConnLog,
 ) -> Option<tokio::process::Child> {
+    let SshLink {
+        target,
+        local_sock,
+        forwards,
+        ssh_args,
+    } = link;
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
     // ssh below (the probe) already needs it — so ensure the short ssh-socket
@@ -2528,7 +2558,22 @@ async fn setup_ssh(
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    let opts = ssh_common_opts(&ctl);
+    // The user's args go **first**: ssh keeps the *first* value it obtains for an
+    // option, so ours would otherwise outrank theirs — and the cases this field
+    // exists for are exactly the ones we already set (`ConnectTimeout`,
+    // `ServerAliveInterval`, `ControlPersist`), which would make it a field that
+    // silently does nothing. The cost of that ordering is that `ControlPath`,
+    // `ControlMaster` and `BatchMode` are overridable too, and each breaks
+    // something real — the first two split the multiplexed connection this
+    // relies on (including the `-O cancel` that retires forwards), the third
+    // lets ssh prompt on a child whose stdin is `/dev/null`. Documented where
+    // the field is edited rather than blocked: an escape hatch that second-
+    // guesses is not one.
+    let mut opts: Vec<String> = ssh_args.to_vec();
+    opts.extend(ssh_common_opts(&ctl));
+    if !ssh_args.is_empty() {
+        log.info(format!("extra ssh args: {}", ssh_args.join(" ")));
+    }
 
     // Probe the host, auto-provision our binary if it's missing/stale and our
     // build can run there (open-decision #3), and resolve the command to invoke.

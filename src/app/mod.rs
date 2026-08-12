@@ -539,6 +539,8 @@ pub(super) struct HostRow {
     /// nearly always one or two specs, and a sub-list inside a popup row would
     /// need its own cursor, its own add/remove keys and its own footer.
     pub(in crate::app) forwards: String,
+    /// Extra ssh args as one line of text — see [`hosts::HostConfig::ssh_args`].
+    pub(in crate::app) ssh_args: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -546,6 +548,7 @@ pub(super) enum HostField {
     Label,
     Target,
     Ports,
+    Args,
     Icon,
 }
 
@@ -566,6 +569,8 @@ pub(in crate::app) struct ConnIdentity {
     /// what the next connect will try — and the panel showing it as valid while
     /// nothing dialled it would be a lie.
     forwards: Vec<String>,
+    /// Extra ssh args, raw for the same reason as `forwards`.
+    ssh_args: Vec<String>,
 }
 
 /// The remote hosts, counted by how usable each one is — see
@@ -2129,10 +2134,27 @@ impl App {
                 // *parse* may be passed on: a malformed one is a usage error
                 // that exits it, and the transport would flap forever on a typo.
                 let forwards = crate::port_forward::valid(&h.forwards);
+                // Verbatim, minus anything `classify_ssh_args` refuses — see
+                // there for why a forward asked for here is refused rather than
+                // honoured.
+                let ssh_args = hosts::classify_ssh_args(&h.ssh_args)
+                    .into_iter()
+                    .filter_map(|(tok, keep)| {
+                        if !keep {
+                            tracing::warn!(
+                                target: "captain_miao::ssh",
+                                "{}: ignoring `{tok}` in the host's ssh args — use the Ports field for forwards",
+                                host.0
+                            );
+                        }
+                        keep.then_some(tok)
+                    })
+                    .collect();
                 let t = Transport::Ssh {
                     target,
                     local_sock,
                     forwards,
+                    ssh_args,
                 };
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             }
@@ -2198,6 +2220,7 @@ impl App {
                 // Round-trips exactly: a spec can hold neither a comma nor a
                 // space, so this join is the inverse of `parse_list`'s split.
                 forwards: h.forwards.join(", "),
+                ssh_args: h.ssh_args.join(" "),
                 label: h.label,
             })
             .collect::<Vec<_>>();
@@ -2278,6 +2301,7 @@ impl App {
                     ssh: (!r.is_socket).then_some(target),
                     disabled: r.disabled,
                     forwards: crate::port_forward::parse_list(&r.forwards),
+                    ssh_args: hosts::split_ssh_args(&r.ssh_args),
                 }
             })
             .collect();
@@ -2325,6 +2349,7 @@ impl App {
                 socket: h.socket.clone(),
                 disabled: h.disabled,
                 forwards: h.forwards.clone(),
+                ssh_args: h.ssh_args.clone(),
             })
             .collect()
     }

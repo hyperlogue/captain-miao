@@ -333,6 +333,15 @@ windows and the `w` shell alike. Forwards are the exception, and that is why
 they live in the panel: they are something you want up while you're working on
 that host and gone when you aren't, not a permanent property of the machine.
 
+The **`Args`** field beside it takes extra ssh arguments, passed verbatim, for
+the dashboard's own connection to that host — `-C`, a keepalive, an extra `-o`.
+They go on the connection that every attach window then rides, so setting one
+here is how you tune a link that ssh_config can't single out (it can't tell
+captain-miao's connection from any other ssh to the same machine). Your
+arguments come first, so an `-o` here overrides captain-miao's own default.
+Forwards belong in `Ports`, not here — one written here is marked in red and
+skipped, because nothing would take it back down when you remove it.
+
 **Getting the daemon onto each host.** Either install `miao-server`
 there yourself (any copy on `PATH` matching your dashboard's version is used as
 is, and never touched), or let the dashboard carry one and deploy it for you:
