@@ -267,16 +267,6 @@ pub fn is_process_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Env var the host's pool wrapper (`server_pool::POOL_SHELL`) leaves behind
-/// when it had to substitute a terminfo the host doesn't carry, naming the one
-/// that was asked for. Set *only* on that path, so its presence is the signal.
-///
-/// Lives in core because the two ends are in different crates and must agree on
-/// it byte for byte: the wrapper (cm-server) exports it, the launcher (here)
-/// reads it into [`LauncherState::terminfo_missing`] on its way past. Pinned
-/// from the wrapper's side by `pool_shell_reports_a_substituted_terminfo`.
-pub const TERMINFO_MISSING_VAR: &str = "CM_TERMINFO_MISSING";
-
 // -- Attach guards (shared by miao-server and miao-client) --
 
 /// Exit code of `attach` when the pool session already has a client attached.
@@ -698,20 +688,6 @@ pub struct LauncherState {
     /// to send the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminfo: Option<String>,
-    /// The terminfo the attaching client actually asked for, when the host had
-    /// no entry for it and the pool wrapper substituted [`Self::terminfo`] in
-    /// its place — `None` whenever no substitution happened, so the presence of
-    /// a value *is* the warning.
-    ///
-    /// Read from [`TERMINFO_MISSING_VAR`], which is the only way to know: the
-    /// substitution happens in a shell that has already exited by the time
-    /// anything else could look, and the effective `TERM` alone can't say
-    /// whether it was chosen or imposed. Worth surfacing rather than swallowing
-    /// because it is both a real fidelity loss (the agent's TUI falls back on
-    /// key encodings and capabilities the real terminal has) and a one-command
-    /// fix — `infocmp -x <name> | ssh <host> tic -x -`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminfo_missing: Option<String>,
     /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
     /// served — never written by the launcher (single-writer rule). `None` from
@@ -1133,7 +1109,6 @@ mod tests {
             launch_id: None,
             terminal: None,
             terminfo: None,
-            terminfo_missing: None,
             flags: None,
             attached: None,
             host: HostId::default(),

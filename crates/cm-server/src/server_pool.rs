@@ -37,7 +37,7 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 /// host-verification finding). `case "$TERM"` behaves identically for an unset
 /// TERM under plain sh (no `set -u`): it expands empty. Pinned by
 /// `pool_shell_has_no_template_braces`.
-const POOL_SHELL: &str = r#"case "$TERM" in ""|dumb) TERM=xterm-256color;; *) if infocmp "$TERM" >/dev/null 2>&1; then :; else CM_TERMINFO_MISSING="$TERM"; export CM_TERMINFO_MISSING; TERM=xterm-256color; fi;; esac; export TERM; case "$COLORTERM" in "") COLORTERM=truecolor; export COLORTERM;; esac; exec "$@""#;
+const POOL_SHELL: &str = r#"case "$TERM" in ""|dumb) TERM=xterm-256color;; *) infocmp "$TERM" >/dev/null 2>&1 || TERM=xterm-256color;; esac; export TERM; case "$COLORTERM" in "") COLORTERM=truecolor; export COLORTERM;; esac; exec "$@""#;
 
 /// Verify the pool is live before opening a session in it. The pool now runs
 /// **in this same process** (the daemon starts it on a thread — see
@@ -328,11 +328,7 @@ mod tests {
             assert!(out.status.success(), "wrapper failed for {vars:?}");
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter(|l| {
-                    l.starts_with("TERM=")
-                        || l.starts_with("COLORTERM=")
-                        || l.starts_with("CM_TERMINFO_MISSING=")
-                })
+                .filter(|l| l.starts_with("TERM=") || l.starts_with("COLORTERM="))
                 .map(str::to_string)
                 .collect()
         };
@@ -367,33 +363,16 @@ mod tests {
                 unknown.contains(&"TERM=xterm-256color".to_string()),
                 "a TERM this host has no terminfo for must be downgraded: {unknown:?}"
             );
-            // …and says so, or the downgrade is invisible for the session's
-            // whole life. The launcher reads this on its way past.
+            // The downgrade is otherwise invisible for the session's whole
+            // life: it is `LauncherState::terminfo` — the value the launcher
+            // stamps from this very environment — that carries it to the
+            // dashboard, which is why the wrapper must leave a *usable* name
+            // here rather than unset the variable.
             assert!(
-                unknown
-                    .contains(&"CM_TERMINFO_MISSING=xterm-kitty-not-a-real-terminfo".to_string()),
-                "a downgrade must name what it substituted away from: {unknown:?}"
-            );
-            // The pass-through path must stay silent, or the presence of the
-            // variable stops meaning anything.
-            assert!(
-                !read_env(&[("TERM", "xterm-256color")])
-                    .iter()
-                    .any(|l| l.starts_with("CM_TERMINFO_MISSING=")),
-                "a TERM the host knows must not report a substitution"
+                !unknown.contains(&"TERM=".to_string()),
+                "the wrapper must never leave TERM empty: {unknown:?}"
             );
         }
-    }
-
-    /// The wrapper and the launcher are in different crates and agree only on
-    /// the spelling of this variable, so pin it from the side that exports it.
-    #[test]
-    fn pool_shell_reports_a_substituted_terminfo() {
-        assert!(
-            POOL_SHELL.contains(cm_core::state::TERMINFO_MISSING_VAR),
-            "POOL_SHELL must export {} on the downgrade path",
-            cm_core::state::TERMINFO_MISSING_VAR
-        );
     }
 
     /// A reservation round-trips, and claiming it is *consuming* it — the second

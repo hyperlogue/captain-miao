@@ -3220,7 +3220,6 @@ mod tests {
             launch_id: None,
             terminal: None,
             terminfo: None,
-            terminfo_missing: None,
             flags: None,
             attached: None,
             host: crate::state::HostId::local(),

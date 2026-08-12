@@ -48,17 +48,10 @@ pub async fn run(
     // derived anywhere else: inside a pool pty this is the *creating* client's
     // `TERM` (possibly rewritten by the host's pool wrapper), which no other
     // process is in a position to know. See `LauncherState::terminfo`.
-    let nonblank_env = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    let terminfo = nonblank_env("TERM");
-    // …and, if the host's pool wrapper had to substitute that value, what it
-    // substituted *away from*. Nothing downstream can reconstruct this, so if
-    // the launcher doesn't carry it past here it is lost (see the field doc).
-    let terminfo_missing = nonblank_env(state::TERMINFO_MISSING_VAR);
+    let terminfo = std::env::var("TERM")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 
     let mut launcher_state = LauncherState {
         agent,
@@ -82,7 +75,6 @@ pub async fn run(
         launch_id,
         terminal,
         terminfo,
-        terminfo_missing,
         // Host-owned overlays: the server-core stamps these onto the rows it
         // serves. The launcher never writes them (single-writer rule).
         flags: None,
@@ -1381,7 +1373,6 @@ mod tests {
             launch_id: None,
             terminal: None,
             terminfo: None,
-            terminfo_missing: None,
             flags: None,
             attached: None,
             host: HostId::local(),

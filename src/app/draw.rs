@@ -422,8 +422,8 @@ impl App {
             // session?", which is the other half of the question the latency
             // starts. Percentages rather than absolutes because the row is a
             // scannable line, not a monitor — `l` is where detail goes. Absent
-            // until the first poll comes back (and on a daemon too old to
-            // answer), which shows as the numbers simply not being there.
+            // until the daemon's first push (and on a daemon too old to send
+            // any), which shows as the numbers simply not being there.
             if let Some(v) = backend.vitals() {
                 if let Some(cpu) = v.cpu_percent {
                     trailer.push_str(&format!("  cpu {cpu:.0}%"));
@@ -1029,23 +1029,31 @@ impl App {
             Some(t) => Span::raw(t.to_string()),
             None => Span::raw("—"),
         };
-        // A *substituted* terminfo is the one case that earns a warning rather
-        // than a value: the host had no entry for what the attaching terminal
-        // asked for, so the agent has been rendering against a stand-in for the
-        // whole session, and will keep doing so — the value is frozen at
-        // create. Unlike a plain mismatch this is both a real fidelity loss and
-        // a one-command fix, so it names the missing entry (that name *is* the
-        // fix) on its own continuation line, where the panel's width can hold
-        // it. Absent whenever nothing was substituted, so it never nags.
-        let terminfo_missing = s.terminfo_missing.as_deref().map(|want| {
-            Line::from(vec![
-                label(""),
-                Span::styled(
-                    format!("host has no {want}"),
-                    Style::default().fg(ui.attention_fg),
-                ),
-            ])
-        });
+        // …and when it isn't ours, a second line naming what this terminal is,
+        // in the attention colour. The bright value above says *that* they
+        // differ; this says what to do about it, because the remedy is the
+        // same whichever way the difference arose — the host lacking our
+        // terminfo, or another emulator having created the session: install
+        // this name there (`infocmp -x <name> | ssh <host> tic -x -`) and the
+        // sessions this terminal opens keep it.
+        //
+        // Derived rather than reported: the host *could* tell us it had to
+        // substitute, but only through a wire field carrying a value that is
+        // this one in every case worth acting on, so the comparison earns its
+        // keep and the field doesn't.
+        let terminfo_mismatch = self
+            .terminfo
+            .as_deref()
+            .filter(|ours| s.terminfo.is_some() && s.terminfo.as_deref() != Some(*ours))
+            .map(|ours| {
+                Line::from(vec![
+                    label(""),
+                    Span::styled(
+                        format!("not yours ({ours})"),
+                        Style::default().fg(ui.attention_fg),
+                    ),
+                ])
+            });
         let prompt = s.last_prompt.as_deref().unwrap_or("—");
         // Truncate the first prompt to a single line so a long opener doesn't
         // wrap into a wall of text above the last prompt.
@@ -1070,7 +1078,7 @@ impl App {
             ]),
             Line::from(vec![label("Terminfo"), terminfo]),
         ];
-        lines.extend(terminfo_missing);
+        lines.extend(terminfo_mismatch);
         lines.extend([
             Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
             Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),

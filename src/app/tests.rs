@@ -192,7 +192,6 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         launch_id: Some(format!("launch-{pid}")),
         terminal: None,
         terminfo: None,
-        terminfo_missing: None,
         flags: None,
         attached: None,
         host: crate::state::HostId::local(),
@@ -3873,12 +3872,12 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     assert!(!out.contains("xterm"), "no terminfo invented: {out}");
 }
 
-/// A terminfo the host had to *substitute* is the one case that earns a warning
-/// rather than a value: the agent has been rendering against a stand-in since
-/// the session was created and will keep doing so, and the name of the missing
-/// entry is the fix. Absent whenever nothing was substituted, so it can't nag.
+/// A terminfo that isn't this terminal's earns a warning under the value naming
+/// what this terminal is — the name to install on the host, which is the remedy
+/// however the difference arose. It must not fire when they agree, or on a row
+/// whose terminfo we don't know.
 #[test]
-fn a_substituted_terminfo_names_what_the_host_is_missing() {
+fn a_foreign_terminfo_warns_and_names_this_terminal() {
     use crate::state::HostId;
     let mut d = TestDashboard::new(160, 20);
     d.app.panels_initialized = true;
@@ -3892,26 +3891,38 @@ fn a_substituted_terminfo_names_what_the_host_is_missing() {
     downgraded.host = HostId("box".into());
     downgraded.pool_session = Some("cm-away".into());
     downgraded.terminfo = Some("xterm-256color".into());
-    downgraded.terminfo_missing = Some("xterm-kitty".into());
     d.set_sessions(vec![downgraded]);
     d.app.table_state.select(Some(0));
     let out = d.render();
     assert!(
-        out.contains("host has no xterm-kitty"),
-        "the missing entry must be named: {out}"
+        out.contains("not yours (xterm-kitty)"),
+        "the warning must name this terminal: {out}"
     );
 
-    // Nothing substituted → no warning, even though the terminfo differs from
-    // this dashboard's (a session created from some other terminal).
-    let mut plain = session(2, "/srv/other", SessionStatus::Idle);
-    plain.host = HostId("box".into());
-    plain.pool_session = Some("cm-other".into());
-    plain.terminfo = Some("xterm-256color".into());
-    d.set_sessions(vec![plain]);
+    // Same terminfo → nothing to warn about.
+    let mut same = session(2, "/srv/other", SessionStatus::Idle);
+    same.host = HostId("box".into());
+    same.pool_session = Some("cm-other".into());
+    same.terminfo = Some("xterm-kitty".into());
+    d.set_sessions(vec![same]);
     d.app.table_state.select(Some(0));
     let out = d.render();
-    assert!(out.contains("xterm-256color"));
-    assert!(!out.contains("host has no"), "no warning invented: {out}");
+    assert!(!out.contains("not yours"), "no warning invented: {out}");
+
+    // Unknown terminfo (a host too old to send it) is not a mismatch — there is
+    // nothing to compare, and warning on absence would light up every row
+    // served by an older daemon.
+    let mut unknown = session(3, "/srv/old", SessionStatus::Idle);
+    unknown.host = HostId("box".into());
+    unknown.pool_session = Some("cm-old".into());
+    unknown.terminfo = None;
+    d.set_sessions(vec![unknown]);
+    d.app.table_state.select(Some(0));
+    let out = d.render();
+    assert!(
+        !out.contains("not yours"),
+        "absence is not a mismatch: {out}"
+    );
 }
 
 #[test]
