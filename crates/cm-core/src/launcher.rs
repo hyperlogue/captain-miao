@@ -44,6 +44,14 @@ pub async fn run(
     // window-op namespace either way — a Kitty window id and a zellij pane id
     // both look like a bare integer.
     let terminal = crate::terminal::current_terminal_identity();
+    // …and the terminfo the agent will render against. Read here rather than
+    // derived anywhere else: inside a pool pty this is the *creating* client's
+    // `TERM` (possibly rewritten by the host's pool wrapper), which no other
+    // process is in a position to know. See `LauncherState::term`.
+    let term = std::env::var("TERM")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 
     let mut launcher_state = LauncherState {
         agent,
@@ -66,6 +74,7 @@ pub async fn run(
         pool_session,
         launch_id,
         terminal,
+        term,
         // Host-owned overlays: the server-core stamps these onto the rows it
         // serves. The launcher never writes them (single-writer rule).
         flags: None,
@@ -1363,6 +1372,7 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            term: None,
             flags: None,
             attached: None,
             host: HostId::local(),

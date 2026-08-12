@@ -191,6 +191,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         // hand-launched fallback (no launch_id, self-reported window_id).
         launch_id: Some(format!("launch-{pid}")),
         terminal: None,
+        term: None,
         flags: None,
         attached: None,
         host: crate::state::HostId::local(),
@@ -3752,6 +3753,77 @@ fn wide_layout_keeps_full_columns_and_detail() {
         "wide table keeps the last-prompt column"
     );
     assert!(out.contains("PID"), "wide detail keeps the full field set");
+}
+
+/// A pooled session's `TERM` is whatever the client that *created* the pty
+/// sent, frozen there for the session's whole life — so a row can be rendering
+/// against a terminfo that has nothing to do with the window you are looking at
+/// it through, and nothing said so. The detail panel says so. A value matching
+/// this dashboard's own terminfo has nothing to report and draws dim.
+#[test]
+fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
+    use crate::state::HostId;
+    use ratatui::style::Modifier;
+    let mut d = TestDashboard::new(160, 20);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.term = Some("xterm-kitty".into());
+
+    let mut pooled = session(1, "/srv/away", SessionStatus::Idle);
+    pooled.host = HostId("box".into());
+    pooled.pool_session = Some("cm-away".into());
+    // Created from Kitty onto a host with no kitty terminfo: the pool wrapper
+    // rewrote it, and every window since has inherited the rewrite.
+    pooled.term = Some("xterm-256color".into());
+    let mut here = session(2, "/home/test/here", SessionStatus::Idle);
+    here.term = Some("xterm-kitty".into());
+    d.set_sessions(vec![pooled, here]);
+
+    let select = |d: &mut TestDashboard, pid: u32| {
+        let at = d
+            .app
+            .visible_sessions()
+            .iter()
+            .position(|s| s.launcher_pid == pid)
+            .expect("row is visible");
+        d.app.table_state.select(Some(at));
+    };
+    let style_of = |d: &TestDashboard, needle: &str| {
+        let buf = d.terminal.backend().buffer();
+        let (x, y) = find_cell(buf, needle).unwrap_or_else(|| panic!("{needle} not drawn"));
+        buf[(x, y)].style()
+    };
+
+    select(&mut d, 1);
+    let out = d.render();
+    assert!(out.contains("Term"), "the panel carries a Term field");
+    assert!(out.contains("xterm-256color"));
+    assert!(
+        !style_of(&d, "xterm-256color")
+            .add_modifier
+            .contains(Modifier::DIM),
+        "a terminfo that isn't this terminal's stays bright"
+    );
+
+    // The same field on a row that renders the way this dashboard does has
+    // nothing to report, so it recedes.
+    select(&mut d, 2);
+    d.render();
+    assert!(
+        style_of(&d, "xterm-kitty")
+            .add_modifier
+            .contains(Modifier::DIM),
+        "a matching terminfo draws dim"
+    );
+
+    // A host too old to send the field says so rather than inventing one.
+    let mut unknown = session(3, "/home/test/old", SessionStatus::Idle);
+    unknown.term = None;
+    d.set_sessions(vec![unknown]);
+    select(&mut d, 3);
+    let out = d.render();
+    assert!(out.contains("Term"));
+    assert!(!out.contains("xterm"), "no terminfo invented: {out}");
 }
 
 #[test]

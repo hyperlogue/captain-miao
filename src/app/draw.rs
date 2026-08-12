@@ -968,6 +968,24 @@ impl App {
             .as_ref()
             .map(|t| t.to_string())
             .unwrap_or_else(|| "—".to_string());
+        // The terminfo the session renders against. Interesting mostly for a
+        // *pooled* row, where libshpool froze it at the first attach and every
+        // window since has inherited it — so a session opened from Kitty onto a
+        // host without kitty's terminfo has been `xterm-256color` all along,
+        // and this is the only place that says so.
+        //
+        // Matching this dashboard's own `TERM` says nothing, so it draws dim
+        // (the same "this is background" device the detached tier uses) and a
+        // value that differs is what stays bright. No badge, no colour: a
+        // mismatch is usually benign, and yellow would cry wolf on every remote
+        // row.
+        let term = match s.term.as_deref() {
+            Some(t) if Some(t) == self.term.as_deref() => {
+                Span::styled(t.to_string(), Style::default().add_modifier(Modifier::DIM))
+            }
+            Some(t) => Span::raw(t.to_string()),
+            None => Span::raw("—"),
+        };
         let prompt = s.last_prompt.as_deref().unwrap_or("—");
         // Truncate the first prompt to a single line so a long opener doesn't
         // wrap into a wall of text above the last prompt.
@@ -990,6 +1008,7 @@ impl App {
                 label("PID"),
                 Span::raw(format!("{child} (win {window}, tab {tab})")),
             ]),
+            Line::from(vec![label("Term"), term]),
             Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
             Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
             Line::from(vec![label("Dir"), Span::raw(cwd)]),

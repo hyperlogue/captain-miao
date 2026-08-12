@@ -554,6 +554,7 @@ mod tests {
             pool_session: None,
             launch_id: None,
             terminal: None,
+            term: None,
             flags: None,
             attached: None,
             host: HostId::local(),

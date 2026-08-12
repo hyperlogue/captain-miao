@@ -669,6 +669,25 @@ pub struct LauncherState {
     /// `host`) so it reaches the dashboard off the state file / wire.
     #[serde(default)]
     pub terminal: Option<String>,
+    /// `TERM` as the launcher process sees it — the terminfo the agent's TUI is
+    /// actually rendering against. Stamped once at startup (a process's env
+    /// doesn't change) and never updated.
+    ///
+    /// Worth its own field because for a **pooled** session this is neither
+    /// guessable nor stable-looking: libshpool takes `TERM` from the attach
+    /// header of the client that *creates* the session and injects it into the
+    /// pty's environment there and only there, so the value is frozen at the
+    /// first attach and every later window — a different emulator, a steal,
+    /// a reattach after a reboot — inherits it. On top of that the host's own
+    /// wrapper rewrites a `dumb`/empty/unknown-terminfo value to
+    /// `xterm-256color` (`server_pool::POOL_SHELL`), so a session opened from
+    /// Kitty onto a host without kitty's terminfo is running as
+    /// `xterm-256color` and nothing said so. This field is what says so.
+    ///
+    /// `None` from a launcher with no `TERM` at all, and from any host too old
+    /// to send the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
     /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
     /// served — never written by the launcher (single-writer rule). `None` from
@@ -1089,6 +1108,7 @@ mod tests {
             pool_session: pool.map(str::to_string),
             launch_id: None,
             terminal: None,
+            term: None,
             flags: None,
             attached: None,
             host: HostId::default(),
@@ -1107,6 +1127,34 @@ mod tests {
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |pid| pid == 20).is_some());
         // The name exists but only on dead launchers → no hit (resurrection).
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |_| false).is_none());
+    }
+
+    /// `term` was added late, so it has to be additive in both directions: a
+    /// state file (or wire frame) from a host that predates it must still
+    /// decode, and an absent value must read as "unknown" rather than as a
+    /// terminfo named "". The field is also skipped when empty, so an old peer
+    /// never sees it at all.
+    #[test]
+    fn a_state_without_a_term_still_decodes() {
+        let old = r#"{"agent":"claude","launcher_pid":7,"cwd":"/home/miao/p",
+            "status":"idle","updated_at":0}"#;
+        let s: LauncherState = serde_json::from_str(old).expect("old state decodes");
+        assert_eq!(s.term, None);
+        assert_eq!(s.launcher_pid, 7);
+
+        let encoded = serde_json::to_string(&s).expect("encodes");
+        assert!(
+            !encoded.contains("\"term\""),
+            "an unknown term must not go on the wire at all: {encoded}"
+        );
+        let with_term = LauncherState {
+            term: Some("xterm-kitty".into()),
+            ..s
+        };
+        let round: LauncherState =
+            serde_json::from_str(&serde_json::to_string(&with_term).expect("encodes"))
+                .expect("decodes");
+        assert_eq!(round.term.as_deref(), Some("xterm-kitty"));
     }
 
     /// The detach sentinel is the whole event path's payload, so it has to

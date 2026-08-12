@@ -126,10 +126,16 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
     //     profile), which is where the login PATH — and anything else a real
     //     login sets — comes from, so the launcher gets the environment a user's
     //     own session would, not a hand-copied PATH.
-    //   * Upgrade a `dumb`/empty `TERM` to `xterm-256color` (universally-present
-    //     terminfo) so the agent has color. (The pool session is created detached,
-    //     before any client attaches, so we can't yet know the attaching
-    //     terminal's TERM; a color-capable default is the safe choice.)
+    //   * Upgrade a `dumb`/empty `TERM` — or one this host has no terminfo entry
+    //     for — to `xterm-256color` (universally present) so the agent has color.
+    //     The create *is* the first attach, so `$TERM` here is that client's real
+    //     value (libshpool injects the attach header's env when it spawns the
+    //     command): the rewrite fires only where the host genuinely couldn't
+    //     render what the client sent, e.g. `xterm-kitty` on a box without
+    //     kitty's terminfo. Whatever survives this is the terminfo the session
+    //     keeps for life — later windows inherit it, whatever *they* are — which
+    //     is why the launcher records it (`LauncherState::term`) and the
+    //     dashboard's detail panel shows it.
     //   * Export `COLORTERM=truecolor`. TERM alone caps the agent at the 256-color
     //     palette — 24-bit support is gated on `COLORTERM` by every library that
     //     detects it, and the pool strips it like everything else, so a pooled
