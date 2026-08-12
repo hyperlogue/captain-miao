@@ -308,6 +308,14 @@ connection or a slept laptop detaches windows without touching the sessions —
 and reconnecting brings them all back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
 
+The panel itself is where each host reports in: connection state (with the
+reason when it failed), how many sessions it holds and how many you're attached
+to, its daemon version, its **CPU and memory utilisation**, and the round-trip
+latency — so "which box has room for this?" is answered before you launch, not
+after. The utilisation is measured by the host's own daemon and asked for only
+while the panel is open, so nothing is sampled or sent while you aren't
+looking; a host running an older `miao-server` simply shows no numbers.
+
 **Closing a session's window ends that session**, the same as `x` — closing it
 by hand reads as "I'm done with this", and the alternative is a pooled session
 running with nothing on screen to show it. Set `on_window_close = "detach"`

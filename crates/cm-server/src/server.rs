@@ -41,7 +41,7 @@ use crate::protocol::{
 };
 use crate::state::{self, LauncherState, SessionKey};
 use cm_core::agent::AgentControl;
-use cm_core::vitals::VitalsSampler;
+use cm_core::vitals::{HostVitals, VitalsSampler};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,11 +56,16 @@ const SOCKET_CHECK: Duration = Duration::from_secs(5);
 /// Pause after a failed `accept` so a persistent fd exhaustion can't spin the
 /// serve loop hot while it drains.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
-/// How often a subscribed connection is pushed a fresh CPU/memory sample, and
-/// so also the window each CPU percentage covers. Slow enough that an idle
-/// dashboard costs one tiny frame every few seconds, fast enough that the hosts
-/// panel reads as live while someone is looking at it.
-const VITALS_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a utilisation reading answers for. Shorter than the client's poll
+/// interval on purpose: one dashboard therefore gets a genuinely fresh probe
+/// every time it asks, while *several* watching the same host collapse onto one
+/// reading instead of one probe each.
+const VITALS_CACHE: Duration = Duration::from_secs(10);
+/// The gap between the two readings taken when the sampler has no usable
+/// previous one (the first poll, or the first after a long quiet spell). Long
+/// enough for the tick counters to move, short enough to be invisible in the
+/// reply — the alternative is a blank CPU column until the *next* poll.
+const VITALS_PRIME_GAP: Duration = Duration::from_millis(200);
 
 /// Build the `Opened` reply for an `OpenSession` request. With the `pty-pool`
 /// feature, starts the launcher in this host's pool and returns its session
@@ -436,6 +441,9 @@ async fn serve() -> Result<()> {
     // per-session flags sidecar and overlays the pool's live attached bit, so
     // every dashboard watching this host agrees about both.
     let backend = Arc::new(build_server_core());
+    // One probe for the whole daemon; see [`VitalsProbe`]. A tokio mutex because
+    // a cold probe holds it across a short sleep.
+    let vitals = Arc::new(tokio::sync::Mutex::new(VitalsProbe::new()));
     let host = host_label();
     // Count of live protocol connections; feeds the idle-exit check below.
     let conns = Arc::new(AtomicUsize::new(0));
@@ -474,6 +482,7 @@ async fn serve() -> Result<()> {
                     }
                 };
                 let backend = backend.clone();
+                let vitals = vitals.clone();
                 let changes = changes_tx.subscribe();
                 let flag_changes = changes_tx.clone();
                 let host = host.clone();
@@ -483,7 +492,9 @@ async fn serve() -> Result<()> {
                 let guard = ConnGuard::new(conns.clone());
                 tokio::spawn(async move {
                     let _guard = guard;
-                    if let Err(e) = handle_conn(stream, backend, changes, flag_changes, host).await {
+                    if let Err(e) =
+                        handle_conn(stream, backend, vitals, changes, flag_changes, host).await
+                    {
                         tracing::debug!("connection ended: {e}");
                     }
                 });
@@ -509,6 +520,50 @@ async fn serve() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// The host's utilisation, sampled on demand and held for [`VITALS_CACHE`].
+///
+/// Daemon-wide rather than per-connection — the deliberate exception to the
+/// "the server keeps zero cross-connection state" rule the session diff follows.
+/// A sample is a fact about the *host*, not about a client, so sharing it can't
+/// make two dashboards disagree; and sharing is the whole point, since it is
+/// what keeps N watchers to one probe. It also gives the CPU percentage a
+/// sensible window: consecutive polls difference against each other rather than
+/// each connection starting cold.
+struct VitalsProbe {
+    sampler: VitalsSampler,
+    last: Option<(Instant, HostVitals)>,
+}
+
+impl VitalsProbe {
+    fn new() -> Self {
+        Self {
+            sampler: VitalsSampler::new(),
+            last: None,
+        }
+    }
+
+    /// The current reading — cached, or freshly taken. `await`s only in the
+    /// priming case, and the caller holds the lock throughout so concurrent
+    /// askers queue behind one probe and then read its result from the cache.
+    async fn get(&mut self) -> HostVitals {
+        if let Some((at, vitals)) = self.last
+            && at.elapsed() < VITALS_CACHE
+        {
+            return vitals;
+        }
+        let mut vitals = self.sampler.sample();
+        // No CPU figure but the counters *are* readable: this is the first poll
+        // (or the first after `MAX_CPU_WINDOW` of quiet), so the reading just
+        // taken is the anchor and a second one a beat later completes it.
+        if vitals.cpu_percent.is_none() && self.sampler.has_reading() {
+            tokio::time::sleep(VITALS_PRIME_GAP).await;
+            vitals = self.sampler.sample();
+        }
+        self.last = Some((Instant::now(), vitals));
+        vitals
     }
 }
 
@@ -601,6 +656,7 @@ impl Drop for ConnGuard {
 async fn handle_conn(
     stream: tokio::net::UnixStream,
     backend: Arc<LocalBackend>,
+    vitals: Arc<tokio::sync::Mutex<VitalsProbe>>,
     mut changes: broadcast::Receiver<()>,
     flag_changes: broadcast::Sender<()>,
     host: String,
@@ -631,16 +687,6 @@ async fn handle_conn(
 
     let mut subscribed = false;
     let mut last_sent: HashMap<SessionKey, LauncherState> = HashMap::new();
-    // One sampler per connection, so each client's CPU percentage is measured
-    // over its own push interval and the server keeps no cross-connection state
-    // (the same rule the session diff follows). The first tick fires
-    // immediately: memory is a straight reading and shows at once, while the
-    // CPU figure needs a second sample and appears one interval later.
-    let mut vitals = VitalsSampler::new();
-    let mut vitals_tick = tokio::time::interval(VITALS_INTERVAL);
-    // A client that was unreachable for a while (a suspended laptop) must not
-    // be handed a burst of back-dated samples on its return.
-    vitals_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -692,6 +738,12 @@ async fn handle_conn(
                         let exists = backend.dir_exists(&path);
                         write_frame(&mut wr, &ServerFrame::DirChecked { req_id, exists }).await?;
                     }
+                    ClientFrame::GetVitals { req_id } => {
+                        // Cached across every connection, so a host watched by
+                        // three dashboards is still probed once per window.
+                        let vitals = vitals.lock().await.get().await;
+                        write_frame(&mut wr, &ServerFrame::Vitals { req_id, vitals }).await?;
+                    }
                     // A newer client's frame we don't know. Ignoring it keeps
                     // the connection alive (protocol §3 forward tolerance); a
                     // request-shaped one simply never gets its reply, which the
@@ -699,14 +751,6 @@ async fn handle_conn(
                     ClientFrame::Unknown => {
                         tracing::debug!("ignoring an unknown client frame (newer peer?)");
                     }
-                }
-            }
-            _ = vitals_tick.tick(), if subscribed => {
-                // A host whose counters we can't read reports nothing at all
-                // rather than a frame of nulls — and costs no traffic for it.
-                let sample = vitals.sample();
-                if !sample.is_empty() {
-                    write_frame(&mut wr, &ServerFrame::Vitals { vitals: sample }).await?;
                 }
             }
             recv = changes.recv(), if subscribed => {
@@ -787,4 +831,39 @@ fn host_label() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "captain-miao-host".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two properties of the on-demand probe, and both are why the client can
+    /// poll bluntly: the *first* answer already carries a CPU figure (it primes
+    /// rather than making the panel wait a whole interval for one), and a second
+    /// ask inside the window is served from the cache — which is what keeps a
+    /// host watched by several dashboards to one probe.
+    #[tokio::test]
+    async fn the_first_probe_primes_and_the_next_is_cached() {
+        let mut probe = VitalsProbe::new();
+        let first = probe.get().await;
+        // Exactly on the platforms whose counters we can read at all.
+        assert_eq!(first.cpu_percent.is_some(), probe.sampler.has_reading());
+
+        let stamp = probe.last.expect("a probe was taken").0;
+        let cached = probe.get().await;
+        assert_eq!(cached, first);
+        assert_eq!(
+            probe.last.unwrap().0,
+            stamp,
+            "a second ask inside the window must not re-read the host"
+        );
+
+        // Once it expires, the next ask probes again.
+        let Some(expired) = stamp.checked_sub(VITALS_CACHE * 2) else {
+            return; // monotonic clock too young to fake an expiry
+        };
+        probe.last = Some((expired, first));
+        let _ = probe.get().await;
+        assert!(probe.last.unwrap().0 > expired);
+    }
 }

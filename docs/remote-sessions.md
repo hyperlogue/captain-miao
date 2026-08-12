@@ -298,11 +298,41 @@ SetSessionFlags{req_id, key, flags}    FlagsSet{req_id, ok}
 ListRecentDirs{req_id}                 RecentDirs{req_id, cwds}
 CompletePath{req_id, prefix}           PathCompletions{req_id, matches}
 CheckDir{req_id, path}                 DirChecked{req_id, exists}
+GetVitals{req_id}                      Vitals{req_id, vitals}
 ```
 
 - `PROTOCOL_VERSION` = 4. Deltas are **per-session, full-state**: each
   connection diffs against what *it* last sent, so a late subscriber is correct
   from its own Snapshot on and the server keeps zero cross-connection state.
+- **`Vitals` is pulled, not pushed** (`cm_core::vitals`). Utilisation is
+  displayed in exactly one place — the hosts panel — which is open for seconds
+  at a time, so a push would spend a frame per host per interval through hours
+  in which nobody can see the answer. The dashboard asks **only while the panel
+  is open** (`Backend::poll_vitals`, every 15s, self-throttled so the run loop
+  can call it every pass), which also means nothing is measured, sent, or woken
+  the rest of the time.
+
+  Three consequences worth naming, because pulling moves work rather than
+  removing it:
+  * **The sampler still needs a cadence.** A CPU percentage is a *difference*
+    between two readings of a monotonic counter, so on-demand sampling has to
+    say what "now" means: `MAX_CPU_WINDOW` (60s) discards a previous reading too
+    old to describe the present, and the daemon then takes a second reading
+    200ms later so the *first* poll after opening the panel already carries a
+    figure instead of leaving the column blank for a whole interval.
+  * **The daemon caches for 10s**, deliberately shorter than the poll interval:
+    a lone dashboard therefore gets a genuinely fresh probe every time it asks,
+    while several watching one host collapse onto a single probe. The cache is
+    daemon-wide — the one deliberate exception to the zero-cross-connection-state
+    rule the session diff follows, and a safe one, since a sample is a fact
+    about the host rather than about a client.
+  * **A poll must be able to give up.** An older daemon *ignores* a frame it
+    can't decode (§3 forward tolerance), so the answer to `GetVitals` there is
+    silence; `request_within` puts a deadline on the wait, and the serve loop
+    prunes the pending entries whose caller has gone. On the client the reply is
+    deliberately **not** wired to the mirror's dirty flag: it changes no row, so
+    it raises a redraw-only signal the run loop honours while the panel is
+    open (§9).
 - **Session identity is opaque.** `SessionKey` — minted by the owning backend,
   never parsed above the seam — is the only identifier on seam or wire, and the
   mirror is keyed by it. The **server re-resolves key → current pid from the
@@ -779,8 +809,21 @@ decides what they mean**.
 
 - **`Space h` — the hosts panel**: a list view, not a staged edit form. Each
   host shows live connection state (including the `Failed` reason verbatim),
-  running/attached session counts, the daemon version from `Welcome`, and a
-  latency sample; its ssh/socket target sits on a dim second line. Editing a
+  running/attached session counts, the daemon version from `Welcome`, its
+  **CPU/memory utilisation**, and a latency sample; its ssh/socket target sits
+  on a dim second line.
+  - **Utilisation is the host's own measurement**, asked for over the protocol
+    while the panel is open (§3) rather than measured from here: only the host
+    can answer for a socket transport, and an `ssh host uptime` per poll would
+    be a process per poll per host reporting the *link's* view anyway. It sits
+    beside the latency because the two together are the launch decision —
+    reachable, and with room; and because the poll refreshes the latency sample
+    too, the whole line goes live while it is being read. Rendered as two
+    percentages, no absolutes and no colour threshold: the row is a scannable
+    line, and a pegged CPU on a build box is normal rather than an alert. A host
+    that reports nothing (an older daemon, an OS we can't read, a link that just
+    dropped) shows nothing rather than zeros, which on a utilisation display
+    would read as a definitely-idle host. Editing a
   row exposes label / target (`^t` toggles ssh↔socket) / **options** (below) /
   **icon** (`^e` opens the same searchable emoji picker as `Space i`). There is
   **no Save

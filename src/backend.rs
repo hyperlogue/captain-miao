@@ -40,6 +40,7 @@ use crate::protocol::{
     write_frame,
 };
 use crate::state::{self, HostId, LauncherState, SessionFlags, SessionKey};
+use cm_core::vitals::HostVitals;
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
 // re-exported so `crate::backend::…` paths across the dashboard resolve unchanged.
@@ -188,12 +189,97 @@ pub(crate) struct LocalHost {
 /// and connect/disconnect transitions.
 pub(crate) struct BackendEvents {
     changed: Arc<AtomicBool>,
+    /// A utilisation poll came back. Kept apart from `changed` because it must
+    /// *not* trigger a reload: it changes no row, only the two numbers on a
+    /// host's line in the panel that asked for it. `None` for a local backend,
+    /// which measures nothing (see [`Backend::vitals`]).
+    vitals: Option<Arc<AtomicBool>>,
 }
 
 impl BackendEvents {
     /// Whether this backend changed since the last call (and clear the signal).
     pub(crate) fn take(&self) -> bool {
         self.changed.swap(false, Ordering::Relaxed)
+    }
+
+    /// Whether a utilisation poll landed since the last call (and clear the
+    /// signal). Redraw-only: no row content depends on it.
+    pub(crate) fn take_vitals(&self) -> bool {
+        self.vitals
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::Relaxed))
+    }
+}
+
+/// How often the hosts panel asks a host for a fresh utilisation reading while
+/// it is open. Utilisation is a background fact, not a live meter: a number
+/// that ticks four times a minute is plenty to answer "has this box got room?",
+/// and the panel is a diagnostic surface, not a monitor. Longer than the
+/// daemon's own cache window on purpose, so a lone dashboard's every poll is a
+/// genuine probe rather than a repeat of the last answer.
+const VITALS_POLL: Duration = Duration::from_secs(15);
+/// How long a poll waits before giving up. Shorter than [`VITALS_POLL`] so a
+/// host that never answers can't stack requests, and long enough that a slow
+/// link (or a daemon priming its CPU counters) still lands.
+const VITALS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A host's last utilisation reading and the state of its polling: the answer,
+/// a "this is new" flag for the redraw, when we last asked, and whether an ask
+/// is still out.
+///
+/// One place rather than four fields on [`RemoteBackend`] because they are only
+/// ever read and written together — a store that forgets the flag is a panel
+/// that silently freezes, and a poll that forgets `inflight` is a second request
+/// stacked on a slow link's first.
+#[derive(Default)]
+pub(crate) struct VitalsCell {
+    latest: Mutex<Option<HostVitals>>,
+    changed: Arc<AtomicBool>,
+    /// When the last poll was *sent* (not answered), so a host that never
+    /// replies is retried on the same cadence as one that does rather than
+    /// hammered.
+    asked_at: Mutex<Option<Instant>>,
+    inflight: AtomicBool,
+}
+
+impl VitalsCell {
+    /// Claim the right to poll: `true` at most once per `interval`, and never
+    /// while a previous ask is still out. Stamps the attempt, so the caller
+    /// must actually make the request when it wins.
+    fn claim_poll(&self, interval: Duration) -> bool {
+        if self.inflight.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut asked = self.asked_at.lock().unwrap();
+        if asked.is_some_and(|t| t.elapsed() < interval) {
+            return false;
+        }
+        *asked = Some(Instant::now());
+        self.inflight.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Record a poll's outcome. `None` — an unreachable host, or one whose OS
+    /// reports nothing — clears the reading rather than leaving the last one to
+    /// stand for a host that has stopped answering.
+    fn settle(&self, vitals: Option<HostVitals>) {
+        *self.latest.lock().unwrap() = vitals;
+        self.inflight.store(false, Ordering::Relaxed);
+        self.changed.store(true, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<HostVitals> {
+        *self.latest.lock().unwrap()
+    }
+
+    /// Drop the reading on disconnect: numbers from before the link died are a
+    /// claim about a host we can no longer see, and stale ones next to a red
+    /// `disconnected` read as live. Also re-arms the poll, so the panel doesn't
+    /// wait out an interval that started before the reconnect.
+    fn clear(&self) {
+        *self.latest.lock().unwrap() = None;
+        *self.asked_at.lock().unwrap() = None;
+        self.changed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -293,10 +379,12 @@ impl Backend {
                 }
                 BackendEvents {
                     changed: h.changed.clone(),
+                    vitals: None,
                 }
             }
             Backend::Remote(b) => BackendEvents {
                 changed: b.dirty.clone(),
+                vitals: Some(b.vitals.changed.clone()),
             },
         }
     }
@@ -319,6 +407,55 @@ impl Backend {
             Backend::Local(_) => None,
             Backend::Remote(b) => *b.latency.lock().unwrap(),
         }
+    }
+
+    /// This host's last CPU/memory reading, as its daemon measured it. `None`
+    /// for a local backend — there is no daemon on this side of the seam, and
+    /// the dashboard deliberately measures nothing itself: a host reports its
+    /// own utilisation or none is shown. Also `None` while disconnected, and
+    /// until the first poll comes back.
+    pub(crate) fn vitals(&self) -> Option<HostVitals> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Remote(b) => b.vitals.get(),
+        }
+    }
+
+    /// Ask this host for a fresh reading, at most once per [`VITALS_POLL`] and
+    /// never twice at once. Returns immediately: the round trip runs on a
+    /// background task and lands in the cell, because the caller is the UI
+    /// thread and the far end is across an ssh link.
+    ///
+    /// Called only while the hosts panel is open — that is the entire reason
+    /// this is a poll rather than a subscription. Utilisation is displayed
+    /// nowhere else, and the panel is open for seconds at a time, so nothing is
+    /// measured, sent, or woken for the hours it isn't.
+    pub(crate) fn poll_vitals(&self) {
+        self.poll_vitals_paced(VITALS_POLL, VITALS_TIMEOUT);
+    }
+
+    /// [`poll_vitals`] with its cadence injected, so a test can drive the
+    /// throttle and the give-up path without waiting out the real intervals.
+    ///
+    /// [`poll_vitals`]: Self::poll_vitals
+    fn poll_vitals_paced(&self, interval: Duration, timeout: Duration) {
+        let Backend::Remote(b) = self else { return };
+        if !b.vitals.claim_poll(interval) {
+            return;
+        }
+        let backend = b.clone();
+        tokio::spawn(async move {
+            let reply = backend
+                .request_within(timeout, |req_id| ClientFrame::GetVitals { req_id })
+                .await;
+            backend.vitals.settle(match reply {
+                Some(ServerFrame::Vitals { vitals, .. }) => Some(vitals),
+                // Unreachable, or a daemon too old to know the frame — it
+                // ignores what it can't decode, so the answer is silence and
+                // the deadline is what ends the wait.
+                _ => None,
+            });
+        });
     }
 
     /// Live sessions on this host (those with a current state file).
@@ -659,6 +796,10 @@ pub(crate) struct RemoteBackend {
     /// there is no `Ping` frame, because every reply is already `req_id`-matched
     /// and timing one is free (§9).
     latency: Arc<Mutex<Option<Duration>>>,
+    /// The host's last pushed CPU/memory sample, beside the latency it is read
+    /// with: together they say whether a host is reachable *and* whether it has
+    /// room for more work.
+    vitals: Arc<VitalsCell>,
     /// Set by the connection task whenever the mirror or connection state
     /// changes (a pushed `Snapshot`/`Delta`/`Removed`, or a connect/disconnect).
     /// Read through [`BackendEvents`], the same handle a local backend's fs
@@ -699,6 +840,7 @@ impl RemoteBackend {
         let dirty = Arc::new(AtomicBool::new(false));
         let server_version = Arc::new(Mutex::new(None));
         let latency = Arc::new(Mutex::new(None));
+        let vitals = Arc::new(VitalsCell::default());
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
         let log = Arc::new(ConnLog::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -712,6 +854,7 @@ impl RemoteBackend {
                 dirty: dirty.clone(),
                 server_version: server_version.clone(),
                 latency: latency.clone(),
+                vitals: vitals.clone(),
                 reconnect_epoch: reconnect_epoch.clone(),
                 log: log.clone(),
             },
@@ -732,6 +875,7 @@ impl RemoteBackend {
             conn,
             server_version,
             latency,
+            vitals,
             dirty,
             reconnect_epoch,
             log,
@@ -748,14 +892,20 @@ impl RemoteBackend {
         self.log.entries()
     }
 
-    /// Send a request and block until its reply (or the task is gone). Returns
-    /// `None` if the connection task has exited. Samples the round-trip time on
-    /// the way through — the hosts panel's latency, with no dedicated frame.
-    fn request(&self, make: impl FnOnce(u64) -> ClientFrame) -> Option<ServerFrame> {
-        // A known-down host fails fast: queueing the request would block the
-        // caller (it's on a `block_in_place`) through the whole reconnect
-        // backoff. While merely dialing (Connecting) we still queue, so the very
-        // first request right after `connect()` rides the pending connection.
+    /// Hand a request to the connection task. Returns the reply channel and the
+    /// send instant, or `None` if the host is known-down or the task has exited.
+    ///
+    /// Split out of [`request`] so the async sibling shares one enqueue path —
+    /// including the fail-fast, which matters most there: queueing against a
+    /// down host would otherwise park the caller through the whole reconnect
+    /// backoff. While merely dialing (`Connecting`) we still queue, so the very
+    /// first request right after `connect()` rides the pending connection.
+    ///
+    /// [`request`]: Self::request
+    fn enqueue(
+        &self,
+        make: impl FnOnce(u64) -> ClientFrame,
+    ) -> Option<(oneshot::Receiver<ServerFrame>, Instant)> {
         if matches!(
             self.conn_state(),
             ConnState::Disconnected | ConnState::Failed(_)
@@ -771,8 +921,36 @@ impl RemoteBackend {
                 reply,
             })
             .ok()?;
-        let sent_at = Instant::now();
+        Some((rx, Instant::now()))
+    }
+
+    /// Send a request and block until its reply (or the task is gone). Returns
+    /// `None` if the connection task has exited. Samples the round-trip time on
+    /// the way through — the hosts panel's latency, with no dedicated frame.
+    fn request(&self, make: impl FnOnce(u64) -> ClientFrame) -> Option<ServerFrame> {
+        let (rx, sent_at) = self.enqueue(make)?;
         let reply = rx.blocking_recv().ok();
+        if reply.is_some() {
+            *self.latency.lock().unwrap() = Some(sent_at.elapsed());
+        }
+        reply
+    }
+
+    /// [`request`] for a caller already on the runtime, with a deadline.
+    ///
+    /// The deadline is not belt-and-braces: a peer that doesn't *know* a frame
+    /// ignores it (the v4 forward-tolerance contract), so a request this build
+    /// added is answered by silence on any older daemon. Without a timeout that
+    /// silence would park the caller until the connection ended.
+    ///
+    /// [`request`]: Self::request
+    async fn request_within(
+        &self,
+        within: Duration,
+        make: impl FnOnce(u64) -> ClientFrame,
+    ) -> Option<ServerFrame> {
+        let (rx, sent_at) = self.enqueue(make)?;
+        let reply = tokio::time::timeout(within, rx).await.ok()?.ok();
         if reply.is_some() {
             *self.latency.lock().unwrap() = Some(sent_at.elapsed());
         }
@@ -2355,6 +2533,7 @@ struct ConnectionShared {
     dirty: Arc<AtomicBool>,
     server_version: Arc<Mutex<Option<String>>>,
     latency: Arc<Mutex<Option<Duration>>>,
+    vitals: Arc<VitalsCell>,
     reconnect_epoch: Arc<AtomicU64>,
     log: Arc<ConnLog>,
 }
@@ -2378,6 +2557,7 @@ async fn connection_task(
         dirty,
         server_version,
         latency,
+        vitals,
         reconnect_epoch,
         log,
     } = shared;
@@ -2518,6 +2698,7 @@ async fn connection_task(
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
         mirror.lock().unwrap().clear();
         *latency.lock().unwrap() = None;
+        vitals.clear();
         standing_failure = match &outcome {
             ServeOutcome::HandshakeFailed(Some(reason)) => Some(reason.clone()),
             _ => None,
@@ -2994,6 +3175,11 @@ async fn serve(
             }
             req = requests.recv() => {
                 let Some(req) = req else { return ServeOutcome::BackendDropped };
+                // Drop the entries whose caller has given up (a `request_within`
+                // that timed out). A server that never answers a frame it can't
+                // decode would otherwise leave one behind per attempt, for as
+                // long as the connection lasts.
+                pending.retain(|_, tx| !tx.is_closed());
                 pending.insert(req.req_id, req.reply);
                 if write_frame(&mut wr, &req.frame).await.is_err() {
                     return ServeOutcome::ConnectionLost;
@@ -4734,6 +4920,19 @@ mod tests {
                         .await
                         .unwrap()
                 }
+                ClientFrame::GetVitals { req_id } => write_frame(
+                    &mut wr,
+                    &ServerFrame::Vitals {
+                        req_id,
+                        vitals: HostVitals {
+                            cpu_percent: Some(42.0),
+                            mem_used_bytes: Some(4 << 30),
+                            mem_total_bytes: Some(16 << 30),
+                        },
+                    },
+                )
+                .await
+                .unwrap(),
                 ClientFrame::OpenSession { req_id, spec } => {
                     // Derive the pool name from the spec so the test also
                     // confirms the spec rode the wire intact.
@@ -4906,6 +5105,116 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A poll fetches the host's reading, raises the redraw-only signal, and —
+    /// the part that matters — leaves the *session* signal alone, so it can
+    /// never reach the reload path. The throttle then holds the next ask back,
+    /// which is what keeps an open panel to one request per interval per host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vitals_poll_fetches_a_reading_without_arming_a_reload() {
+        let sock = std::env::temp_dir().join(format!("cm-test-vitals-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(mock_server(listener, vec![test_state(1)]));
+        let mut backend = Backend::Remote(RemoteBackend::connect(
+            Transport::LocalSocket(sock.clone()),
+            HostId("mock".into()),
+        ));
+        let events = backend.subscribe();
+        // Nothing is asked until the panel asks — the point of polling.
+        assert!(backend.vitals().is_none());
+
+        let mut tries = 0;
+        while backend.vitals().is_none() {
+            tries += 1;
+            assert!(tries < 300, "no reading ever arrived");
+            // Idempotent while one is in flight, so calling it every loop pass
+            // (as the run loop does) is safe.
+            backend.poll_vitals();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let vitals = backend.vitals().unwrap();
+        assert_eq!(vitals.cpu_percent, Some(42.0));
+        assert_eq!(vitals.mem_percent(), Some(25.0));
+        // Fresh once, then clear until the next reply.
+        assert!(events.take_vitals());
+        assert!(!events.take_vitals());
+        // The snapshot armed the session signal; drain it, and confirm the poll
+        // didn't arm it again.
+        assert!(events.take());
+        assert!(!events.take());
+
+        // Within the interval, further calls are no-ops: no new reply, so no
+        // new redraw signal.
+        for _ in 0..5 {
+            backend.poll_vitals();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!events.take_vitals());
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A daemon that predates `GetVitals` ignores it (v4 forward tolerance), so
+    /// the answer is silence — the poll must give up rather than park a task on
+    /// a reply that will never come, and must not leave the host looking busy
+    /// with a request forever in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poll_an_old_daemon_ignores_gives_up_and_re_arms() {
+        let sock =
+            std::env::temp_dir().join(format!("cm-test-vitmute-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        // `mute_mock` handshakes and snapshots, then answers nothing.
+        tokio::spawn(mute_mock(listener));
+        let backend = Backend::Remote(RemoteBackend::connect(
+            Transport::LocalSocket(sock.clone()),
+            HostId("mock".into()),
+        ));
+        while !matches!(backend.conn_state(), ConnState::Connected) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A tiny deadline stands in for the real one; nothing about giving up
+        // depends on its length.
+        let (interval, timeout) = (Duration::from_millis(200), Duration::from_millis(100));
+        backend.poll_vitals_paced(interval, timeout);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(backend.vitals().is_none());
+        // And the next interval polls again rather than being stuck in flight.
+        let Backend::Remote(remote) = &backend else {
+            unreachable!()
+        };
+        assert!(remote.vitals.claim_poll(interval));
+
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// Handshake and snapshot, then deliberate silence — an older daemon's
+    /// treatment of a frame it can't decode.
+    async fn mute_mock(listener: UnixListener) {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (rd, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+        let _hello: Option<ClientFrame> = read_frame(&mut rd).await.unwrap();
+        write_frame(
+            &mut wr,
+            &ServerFrame::Welcome {
+                server_version: "old".into(),
+                protocol: PROTOCOL_VERSION,
+                host: "mock".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let _sub: Option<ClientFrame> = read_frame(&mut rd).await.unwrap();
+        write_frame(&mut wr, &ServerFrame::Snapshot { sessions: vec![] })
+            .await
+            .unwrap();
+        while matches!(read_frame::<_, ClientFrame>(&mut rd).await, Ok(Some(_))) {}
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

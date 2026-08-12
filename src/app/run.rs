@@ -1158,6 +1158,26 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 fs_dirty = true;
             }
         }
+        // Host utilisation: asked for only while the panel that displays it is
+        // open, and only every `VITALS_POLL` (each backend throttles itself, so
+        // this can run every iteration). Nothing is measured, sent or woken for
+        // the hours the panel is closed — which is most of them.
+        if app.host_edit.is_some() {
+            for backend in &app.backends {
+                backend.poll_vitals();
+            }
+        }
+        // A reply is redraw-only: it changes no row, so it must not reach the
+        // reload path. Taken unconditionally (hence not folded into the `if`
+        // above) so a reply that lands as the panel closes drains here instead
+        // of banking a stale repaint for whenever it next opens.
+        let vitals_moved = app
+            .backend_events
+            .iter()
+            .fold(false, |acc, e| acc | e.take_vitals());
+        if vitals_moved && app.host_edit.is_some() {
+            needs_redraw = true;
+        }
         // Resumable lists finishing their background fetch. Drained
         // unconditionally: a reply for a picker the user has closed or
         // re-scoped is discarded inside `apply_resume_load`, so leaving them

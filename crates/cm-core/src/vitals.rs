@@ -1,9 +1,9 @@
 //! Whole-host CPU and memory utilisation — the two numbers that say whether a
-//! host is worth starting another session on, sampled by the process that *is*
-//! the host (the daemon) and pushed to every subscribed dashboard.
+//! host is worth starting another session on, measured by the process that *is*
+//! the host (the daemon) and answered on request.
 //!
 //! Sampled at the host rather than asked for over ssh: a `ssh host uptime` per
-//! tick is a process per tick per host, it can't answer for a socket transport
+//! poll is a process per poll per host, it can't answer for a socket transport
 //! (pooled-localhost has no ssh hop at all), and its numbers would be the
 //! *link's* view rather than the host's. The daemon already holds the
 //! connection, so the sample costs two small file reads.
@@ -12,14 +12,19 @@
 //!
 //! - **CPU utilisation is a difference, not a reading.** The kernel publishes
 //!   monotonic busy/idle counters, so a percentage exists only *between* two
-//!   samples — hence [`VitalsSampler`] is stateful and its first sample carries
-//!   no CPU figure. One sampler belongs to one connection: it is the push
-//!   cadence that defines the window the percentage is over.
+//!   readings — hence [`VitalsSampler`] is stateful, its first sample carries no
+//!   CPU figure, and the interval between calls is the window the percentage
+//!   covers. A caller that samples on demand rather than on a timer therefore
+//!   has to say what "now" means, which [`MAX_CPU_WINDOW`] decides: a reading
+//!   older than that describes a gap, not the present, and is discarded rather
+//!   than averaged across.
 //! - **Every field is optional, and absent means absent.** An OS we can't read,
 //!   a `/proc` that isn't mounted, a counter that went backwards — all report
 //!   `None`. Never `0`, which on a utilisation display reads as a definite
 //!   *idle* host, which is precisely the wrong thing to tell someone deciding
 //!   where to put work.
+
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +58,8 @@ impl HostVitals {
     }
 
     /// Whether nothing at all was sampled — an unsupported OS, or a host whose
-    /// counters are unreadable. The sender skips such a sample rather than
-    /// spending a frame to say "I know nothing".
+    /// counters are unreadable. Such a host reports absence rather than a
+    /// reading of zeros.
     pub fn is_empty(&self) -> bool {
         self.cpu_percent.is_none()
             && self.mem_used_bytes.is_none()
@@ -71,14 +76,23 @@ struct CpuTicks {
     total: u64,
 }
 
-/// Holds the previous CPU reading so the next one can be turned into a
-/// percentage. One per connection: the interval between [`sample`] calls *is*
-/// the window each percentage covers.
+/// How stale the previous CPU reading may be and still describe *now*.
+///
+/// Beyond it the percentage would be an average over the gap — a host pegged an
+/// hour ago and idle since would read as busy the moment someone looked, which
+/// is worse than no number at all. On-demand callers therefore get `None` after
+/// a long quiet spell and are expected to take a second reading a beat later
+/// (see [`VitalsSampler::has_reading`]).
+pub const MAX_CPU_WINDOW: Duration = Duration::from_secs(60);
+
+/// Holds the previous CPU reading, and when it was taken, so the next one can
+/// be turned into a percentage. The interval between [`sample`] calls *is* the
+/// window each percentage covers — capped by [`MAX_CPU_WINDOW`].
 ///
 /// [`sample`]: VitalsSampler::sample
 #[derive(Debug, Default)]
 pub struct VitalsSampler {
-    prev: Option<CpuTicks>,
+    prev: Option<(Instant, CpuTicks)>,
 }
 
 impl VitalsSampler {
@@ -86,18 +100,33 @@ impl VitalsSampler {
         Self::default()
     }
 
-    /// Read the host's current utilisation. The first call returns memory only
-    /// — there is no earlier reading to difference the CPU counters against.
+    /// Read the host's current utilisation. Carries no CPU figure when there is
+    /// no usable earlier reading to difference against — the first call, and
+    /// any call more than [`MAX_CPU_WINDOW`] after the last one.
     pub fn sample(&mut self) -> HostVitals {
+        self.sample_at(Instant::now())
+    }
+
+    /// Whether a *usable* previous reading is now held — i.e. whether sampling
+    /// again shortly would produce a CPU figure. What tells an on-demand caller
+    /// apart from a host with no CPU counters at all, where waiting to re-sample
+    /// would buy nothing.
+    pub fn has_reading(&self) -> bool {
+        self.prev.is_some()
+    }
+
+    /// The clock-injected body of [`sample`], so the window rule is testable
+    /// without sleeping.
+    ///
+    /// [`sample`]: VitalsSampler::sample
+    fn sample_at(&mut self, now: Instant) -> HostVitals {
         let ticks = read_cpu_ticks();
-        let cpu_percent = match (self.prev, ticks) {
-            (Some(prev), Some(cur)) => cpu_percent(prev, cur),
-            _ => None,
-        };
+        let cpu_percent = ticks.and_then(|cur| cpu_since(self.prev, cur, now));
         // Keep the last *successful* reading: a transient failure should cost
-        // one sample, not restart the whole differencing.
-        if ticks.is_some() {
-            self.prev = ticks;
+        // one sample, not restart the whole differencing. A stale one is
+        // replaced here too, which is what makes the very next sample usable.
+        if let Some(cur) = ticks {
+            self.prev = Some((now, cur));
         }
         let (mem_used_bytes, mem_total_bytes) = read_memory();
         HostVitals {
@@ -106,6 +135,18 @@ impl VitalsSampler {
             mem_total_bytes,
         }
     }
+}
+
+/// The CPU figure for `cur` given whatever previous reading is held: `None`
+/// when there is none, or when it is older than [`MAX_CPU_WINDOW`] and so
+/// describes a gap rather than the present. Pure — the whole freshness policy,
+/// with no clock and no `/proc` behind it.
+fn cpu_since(prev: Option<(Instant, CpuTicks)>, cur: CpuTicks, now: Instant) -> Option<f32> {
+    let (at, prev) = prev?;
+    if now.duration_since(at) > MAX_CPU_WINDOW {
+        return None;
+    }
+    cpu_percent(prev, cur)
 }
 
 /// Busy share of the interval between two readings.
@@ -379,10 +420,59 @@ mod tests {
     }
 
     /// The whole point of the sampler's state: a percentage needs two readings,
-    /// so the first sample is honest about not having one yet.
+    /// so the first sample is honest about not having one yet — and says so in
+    /// a way an on-demand caller can act on.
     #[test]
     fn the_first_sample_carries_no_cpu_figure() {
         let mut sampler = VitalsSampler::new();
+        assert!(!sampler.has_reading());
         assert_eq!(sampler.sample().cpu_percent, None);
+        // Now armed, so a caller knows a second sample would carry a figure.
+        assert_eq!(sampler.has_reading(), read_cpu_ticks().is_some());
+    }
+
+    /// A reading from before the window is a claim about a *gap*, not about
+    /// now, so it is dropped rather than averaged over. This is what makes an
+    /// on-demand caller safe: reopening the panel after an hour can't show what
+    /// the host was doing an hour ago.
+    #[test]
+    fn a_reading_older_than_the_window_is_not_averaged_across() {
+        let prev = CpuTicks {
+            busy: 100,
+            total: 1000,
+        };
+        let cur = CpuTicks {
+            busy: 150,
+            total: 1100,
+        };
+        // Instants are built by *adding* to one taken now — subtracting could
+        // underflow the monotonic clock on a freshly booted machine.
+        let at = Instant::now();
+        assert_eq!(
+            cpu_since(Some((at, prev)), cur, at + MAX_CPU_WINDOW),
+            Some(50.0)
+        );
+        assert_eq!(
+            cpu_since(
+                Some((at, prev)),
+                cur,
+                at + MAX_CPU_WINDOW + Duration::from_secs(1)
+            ),
+            None
+        );
+        // No previous reading at all — the first poll.
+        assert_eq!(cpu_since(None, cur, at), None);
+    }
+
+    /// The stale case still *stores* its reading, so the second sample an
+    /// on-demand caller takes a beat later has an anchor to difference against.
+    #[test]
+    fn a_stale_sample_still_re_arms_the_sampler() {
+        let mut sampler = VitalsSampler::new();
+        let start = Instant::now();
+        sampler.sample_at(start);
+        let late = start + MAX_CPU_WINDOW * 2;
+        assert_eq!(sampler.sample_at(late).cpu_percent, None);
+        assert_eq!(sampler.has_reading(), read_cpu_ticks().is_some());
     }
 }

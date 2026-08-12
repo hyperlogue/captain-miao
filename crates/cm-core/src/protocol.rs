@@ -84,6 +84,10 @@ pub enum ClientFrame {
     /// Whether `path` is a directory on the host's filesystem — the picker's
     /// submit-time validation. Reply: `DirChecked`.
     CheckDir { req_id: u64, path: String },
+    /// The host's CPU/memory utilisation right now. Reply: `Vitals`. Asked only
+    /// while a client is *showing* the answer (the hosts panel), which is why it
+    /// is a request at all — see [`ServerFrame::Vitals`].
+    GetVitals { req_id: u64 },
     /// A frame this build doesn't know — a *newer* peer's addition. Decoded
     /// rather than erroring, so the connection survives; the handler ignores it.
     #[serde(other)]
@@ -110,13 +114,16 @@ pub enum ServerFrame {
     Delta { state: Box<LauncherState> },
     /// A session is gone (its launcher exited / its state file went away).
     Removed { key: SessionKey },
-    /// The host's own CPU/memory utilisation, pushed on a timer to a subscriber
-    /// (see [`crate::vitals`]). Pushed rather than polled because a percentage
-    /// is a *difference* between two readings, so the sampler must live where
-    /// the cadence is; a `req_id` round trip would make every client keep that
-    /// state on the far side of a link. Costs one small frame per interval and
-    /// nothing else — a client that ignores it stays entirely correct.
-    Vitals { vitals: HostVitals },
+    /// Reply to `GetVitals`: the host's own CPU/memory utilisation (see
+    /// [`crate::vitals`]).
+    ///
+    /// Pulled rather than pushed. Utilisation is only ever *displayed* by the
+    /// hosts panel, which is open for seconds at a time, so a push would spend a
+    /// frame per host per interval for hours in which nobody can see the answer.
+    /// The client asks while it is showing it; the daemon caches its reading
+    /// briefly, so several dashboards watching one host cost it one probe rather
+    /// than one each.
+    Vitals { req_id: u64, vitals: HostVitals },
     /// Reply to `ListResumable`.
     Resumable {
         req_id: u64,
@@ -162,12 +169,12 @@ impl ServerFrame {
             | ServerFrame::FlagsSet { req_id, .. }
             | ServerFrame::RecentDirs { req_id, .. }
             | ServerFrame::PathCompletions { req_id, .. }
-            | ServerFrame::DirChecked { req_id, .. } => Some(*req_id),
+            | ServerFrame::DirChecked { req_id, .. }
+            | ServerFrame::Vitals { req_id, .. } => Some(*req_id),
             ServerFrame::Welcome { .. }
             | ServerFrame::Snapshot { .. }
             | ServerFrame::Delta { .. }
             | ServerFrame::Removed { .. }
-            | ServerFrame::Vitals { .. }
             | ServerFrame::Unknown => None,
         }
     }
@@ -342,14 +349,16 @@ mod tests {
             .req_id(),
             None
         );
+        assert_eq!(ServerFrame::Unknown.req_id(), None);
+        // Vitals is a *reply*, so it must route by req_id like any other.
         assert_eq!(
             ServerFrame::Vitals {
+                req_id: 11,
                 vitals: HostVitals::default()
             }
             .req_id(),
-            None
+            Some(11)
         );
-        assert_eq!(ServerFrame::Unknown.req_id(), None);
     }
 
     /// A daemon predating [`HostVitals`]' fields still decodes into it: the
@@ -357,6 +366,7 @@ mod tests {
     #[tokio::test]
     async fn vitals_round_trip_and_decode_from_a_partial_sender() {
         let frame = ServerFrame::Vitals {
+            req_id: 5,
             vitals: HostVitals {
                 cpu_percent: Some(37.5),
                 mem_used_bytes: Some(8 << 30),
@@ -367,21 +377,22 @@ mod tests {
         let mut slice = buf.as_slice();
         let got: ServerFrame = read_frame(&mut slice).await.unwrap().unwrap();
         match got {
-            ServerFrame::Vitals { vitals } => {
+            ServerFrame::Vitals { req_id, vitals } => {
+                assert_eq!(req_id, 5);
                 assert_eq!(vitals.cpu_percent, Some(37.5));
                 assert_eq!(vitals.mem_percent(), Some(50.0));
             }
             other => panic!("wrong frame: {other:?}"),
         }
 
-        let partial = br#"{"frame":"Vitals","vitals":{"cpu_percent":12.0}}"#;
+        let partial = br#"{"frame":"Vitals","req_id":6,"vitals":{"cpu_percent":12.0}}"#;
         let mut buf = Vec::new();
         buf.extend((partial.len() as u32).to_be_bytes());
         buf.extend_from_slice(partial);
         let mut slice = buf.as_slice();
         let got: ServerFrame = read_frame(&mut slice).await.unwrap().unwrap();
         match got {
-            ServerFrame::Vitals { vitals } => {
+            ServerFrame::Vitals { vitals, .. } => {
                 assert_eq!(vitals.cpu_percent, Some(12.0));
                 assert_eq!(vitals.mem_percent(), None);
             }

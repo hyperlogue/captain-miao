@@ -415,6 +415,21 @@ impl App {
                     trailer.push_str(" (older than ours)");
                 }
             }
+            // What the host says about itself, beside what the link says about
+            // it: utilisation answers "does this box have room for another
+            // session?", which is the other half of the question the latency
+            // starts. Percentages rather than absolutes because the row is a
+            // scannable line, not a monitor — `l` is where detail goes. Absent
+            // until the first poll comes back (and on a daemon too old to
+            // answer), which shows as the numbers simply not being there.
+            if let Some(v) = backend.vitals() {
+                if let Some(cpu) = v.cpu_percent {
+                    trailer.push_str(&format!("  cpu {cpu:.0}%"));
+                }
+                if let Some(mem) = v.mem_percent() {
+                    trailer.push_str(&format!("  mem {mem:.0}%"));
+                }
+            }
             // Sampled from ordinary request traffic — no `Ping` frame exists,
             // deliberately (§9). `None` just means nothing has been asked yet.
             if let Some(rtt) = backend.latency() {

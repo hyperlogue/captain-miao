@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Host CPU and memory in the hosts panel.** Each host row now carries its
+  utilisation beside the connection latency, so "which box has room for this
+  session?" is answered before you launch rather than after. The numbers are
+  measured by the host's own `miao-server`, and asked for only while the panel
+  is open, so nothing is sampled or sent while you aren't looking. A host
+  running an older server, or one whose OS we can't read, simply shows none —
+  never a misleading `0%`.
+
 - **Per-host ssh options.** Hosts (`Space h`) gained an `Options` field: ssh
   arguments, passed through verbatim to every ssh captain-miao runs for that
   host.
