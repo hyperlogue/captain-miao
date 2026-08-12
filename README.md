@@ -314,8 +314,11 @@ running with nothing on screen to show it. Set `on_window_close = "detach"`
 under `[remote]` for the opposite (every close behaves like `D`). This applies
 only to a window *you* close: an attach that ends because its link died always
 detaches, so a dropped ssh, a slept laptop, or a whole host going away never
-costs you a session. Note that closing a *tab* closes the windows in it — under
-`stacked`, that is every session sharing the `miao:sessions` tab.
+costs you a session. Nor does quitting the terminal, which closes every window
+at once — the session ends a second after its window does, and quitting takes
+the dashboard down well inside that. Note that closing a *tab* closes the
+windows in it — under `stacked`, that is every session sharing the
+`miao:sessions` tab.
 
 **Port forwards** are configured per host, in the same panel. An agent on a
 remote box starts a dev server; the `Ports` field is how you open it in the

@@ -776,6 +776,10 @@ async fn attach_pool_session(
 /// on_window_close` (`App::pending_session_close`). The same host RPC `x` makes,
 /// so the host re-resolves the key to a live pid at signal time.
 ///
+/// Only the ones whose `CLOSE_ON_WINDOW_CLOSE_DELAY` is up go out; the rest stay
+/// queued, and are dropped outright if the dashboard exits first — which is the
+/// whole point, since a terminal quitting takes the dashboard with it.
+///
 /// Failure is silent by design. The queue is filled from a *report*, which
 /// arrives after the fact and can only ever race the session's own end — a
 /// window closed on a host that has since dropped, or a session `x` already
@@ -783,10 +787,11 @@ async fn attach_pool_session(
 /// about it, so a failed close belongs in the log, not the status line. The
 /// count is worth saying: with the default policy a closed tab full of sessions
 /// ends all of them at once, and silence about that would be worse.
+///
 /// Returns whether anything was closed, so the caller can arm the settle reload
 /// that picks up the departed rows (the deadline is the loop's own local).
 async fn close_reported_sessions(app: &mut App) -> bool {
-    let queued = std::mem::take(&mut app.pending_session_close);
+    let queued = app.take_due_session_closes(Instant::now());
     if queued.is_empty() {
         return false;
     }
@@ -1130,9 +1135,14 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
                 }
             }
-            if close_reported_sessions(&mut app).await {
-                arm_settle_reload(&mut settle_reload_at);
-            }
+            needs_redraw = true;
+        }
+        // Sessions whose closed window has now waited out its delay. Checked
+        // every tick rather than beside the report that queued it: the wait is
+        // what makes the queue safe, and it comes due on an iteration that may
+        // carry no report and no reload of its own.
+        if close_reported_sessions(&mut app).await {
+            arm_settle_reload(&mut settle_reload_at);
             needs_redraw = true;
         }
         // Take each backend's change signal and coalesce (§5). One uniform
@@ -1220,10 +1230,6 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 if let Err(e) = terminal::get().close_window(&wid).await {
                     tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
                 }
-            }
-            // The reload's own drain above can queue these too.
-            if close_reported_sessions(&mut app).await {
-                arm_settle_reload(&mut settle_reload_at);
             }
             // Auto-reattach (§7): a host that just came back gets an attach
             // window respawned for every session the dashboard remembers having
@@ -1427,6 +1433,11 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // would land up to a poll interval late (100ms by default) on top of the
         // settle itself. A zero timeout just makes `poll` a non-blocking check.
         if let Some(t) = settle_reload_at {
+            poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
+        }
+        // Nor past a session close coming due, or an idle dashboard would fire
+        // the kill up to a poll interval after the delay it was waiting out.
+        if let Some(t) = app.next_session_close_due() {
             poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
         }
         if event::poll(poll_timeout)? {

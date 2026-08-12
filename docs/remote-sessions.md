@@ -610,6 +610,16 @@ same distinction the rest of this section turns on — *the attach ended* versus
   waiting at the next startup, wearing a status identical to a deliberate close.
   Acting on the startup backlog would end every session on the host because you
   quit kitty.
+- **And the kill waits `CLOSE_ON_WINDOW_CLOSE_DELAY` (1s)** before going out,
+  which closes the sliver the origin gate leaves: during a quit the dashboard is
+  briefly *still live*, and its watcher can drain a report the instant before its
+  own pty dies. It cannot outlive a second of that — no SIGHUP handler, and an
+  `event::poll` that fails on a dead pty — so anything still waiting is dropped
+  with it. The trade is deliberate: a dropped close leaves a session running,
+  which `x` fixes in a keystroke, where the reverse ends every session on the
+  host. Note this is the *only* guard that is a duration; it is here because the
+  question ("is this terminal going away?") has no authoritative answer that
+  survives the terminal going away.
 
 Within those, closing a *tab* still closes the windows in it, so under `stacked`
 one gesture ends every session sharing `miao:sessions`. That is the policy

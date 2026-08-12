@@ -1526,7 +1526,7 @@ fn a_reported_window_close_queues_only_its_own_session() {
         .app
         .pending_session_close
         .iter()
-        .map(|(_, key)| key.to_string())
+        .map(|p| p.key.to_string())
         .collect();
     assert_eq!(
         queued,
@@ -1553,6 +1553,74 @@ fn a_reported_window_close_queues_only_its_own_session() {
             .apply_detach_reports(vec![report("cm-two", 129)], ReportOrigin::Live)
     );
     assert!(d.app.pending_session_close.is_empty());
+}
+
+/// A queued close waits before it goes out, and that wait is the guard against
+/// the one event that looks exactly like a user closing every window at once: a
+/// terminal quitting. The dashboard dies with it in milliseconds, so anything
+/// still waiting is never sent — which only works if the queue really is
+/// time-gated rather than drained on sight.
+#[test]
+fn a_queued_close_waits_out_its_delay_before_going_anywhere() {
+    use super::{CLOSE_ON_WINDOW_CLOSE_DELAY, ReportOrigin};
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    use std::time::Instant;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    d.set_sessions(vec![away]);
+    d.app.on_window_close = crate::config::OnWindowClose::Close;
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    let queued_at = Instant::now();
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(129),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
+    let queued_after = Instant::now();
+
+    // Nothing goes out on the tick that queued it — a dashboard dying right here
+    // (its terminal quitting) takes the kill with it.
+    assert!(
+        d.app.take_due_session_closes(queued_at).is_empty(),
+        "a close must not fire on the tick that queued it"
+    );
+    assert!(
+        d.app
+            .take_due_session_closes(queued_at + CLOSE_ON_WINDOW_CLOSE_DELAY / 2)
+            .is_empty(),
+        "nor part way through the delay"
+    );
+    // Still queued, and the loop knows when to come back for it.
+    assert!(d.app.next_session_close_due().is_some());
+
+    // Measured from *after* the call, since the queue stamps its own `now`
+    // inside it — `queued_at + DELAY` would miss the deadline by that sliver.
+    let due = d
+        .app
+        .take_due_session_closes(queued_after + CLOSE_ON_WINDOW_CLOSE_DELAY);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].0, host);
+    assert_eq!(due[0].1, crate::state::SessionKey::from_launcher_pid(1));
+    // Taken once: the loop drains every tick, and a second pass must not
+    // re-signal a session already asked to end.
+    assert!(
+        d.app
+            .take_due_session_closes(queued_after + CLOSE_ON_WINDOW_CLOSE_DELAY * 10)
+            .is_empty()
+    );
+    assert!(d.app.next_session_close_due().is_none());
 }
 
 /// A detach report is the *event* that replaces polling the window tree: the

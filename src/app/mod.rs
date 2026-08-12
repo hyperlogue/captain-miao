@@ -758,13 +758,16 @@ pub(super) struct App {
     /// machine happens to have.
     pub(super) on_window_close: config::OnWindowClose,
     /// Sessions to end on their host because the user closed the window showing
-    /// them and [`Self::on_window_close`] says `close` (the default). Filled by
-    /// `apply_detach_reports`, drained by the run loop, which does the RPC.
+    /// them and [`Self::on_window_close`] says `close` (the default), each held
+    /// until its [`CLOSE_ON_WINDOW_CLOSE_DELAY`] is up. Filled by
+    /// `apply_detach_reports`, drained by the run loop via
+    /// [`Self::take_due_session_closes`], which does the RPC.
     ///
     /// Queued rather than done inline for the reason every host call is: a
     /// remote kill is a blocking round trip, and `apply_detach_reports` runs on
-    /// the UI thread outside `block_in_place`.
-    pub(super) pending_session_close: Vec<(HostId, cm_core::state::SessionKey)>,
+    /// the UI thread outside `block_in_place`. The *delay* on top is what makes
+    /// a terminal quitting non-destructive — see the constant.
+    pub(super) pending_session_close: Vec<PendingClose>,
     /// Cached window→tab map for resolving local sessions' (display-only)
     /// `tab_id`. The launcher no longer snapshots the terminal for this (window
     /// control is presentation-layer; it may be headless/remote), so the
@@ -1104,6 +1107,35 @@ pub(crate) const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// that couldn't determine one) reads as clean — closing a window that had an
 /// error in it is a milder failure than leaving a corpse on screen after every
 /// dropped link.
+/// How long a session waits between its window being closed and being ended
+/// (`[remote] on_window_close = "close"`).
+///
+/// The delay is the guard, not a nicety. A report says "this window's pty went
+/// away", and the case that must not be mistaken for a deliberate close is a
+/// terminal *quitting*, which tears down every window at once — the dashboard's
+/// own among them. `ReportOrigin::Backlog` covers the reports that arrive after
+/// we're gone; this covers the sliver where we're still running. The dashboard
+/// installs no SIGHUP handler and its `event::poll` fails on a dead pty, so it
+/// dies within milliseconds of that teardown: outliving a whole second of it is
+/// not something a quitting terminal does, while a session ending a second after
+/// you close its window reads as immediate.
+///
+/// A queued close is therefore **dropped if the dashboard exits first**, quit
+/// included. That is the right way round: the cost of dropping one is a session
+/// left running, which `x` fixes in a keystroke; the cost of the reverse is a
+/// terminal quit that ends every session on the host — the exact thing pooling
+/// exists to prevent.
+const CLOSE_ON_WINDOW_CLOSE_DELAY: Duration = Duration::from_secs(1);
+
+/// One session waiting out [`CLOSE_ON_WINDOW_CLOSE_DELAY`] before it is ended.
+pub(super) struct PendingClose {
+    pub(super) host: HostId,
+    pub(super) key: state::SessionKey,
+    /// When the kill may go out. Compared against a caller-supplied `now`, so
+    /// the wait is testable without one.
+    pub(super) due: Instant,
+}
+
 /// Where a batch of detach reports came from, which decides whether ending the
 /// session behind a closed window is on the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3113,7 +3145,11 @@ impl App {
                 && self.on_window_close == config::OnWindowClose::Close
                 && let Some(key) = self.pooled_session_key(&host, &report.token)
             {
-                self.pending_session_close.push((host.clone(), key));
+                self.pending_session_close.push(PendingClose {
+                    host: host.clone(),
+                    key,
+                    due: Instant::now() + CLOSE_ON_WINDOW_CLOSE_DELAY,
+                });
             }
             // The wrapper's own wall-clock measurement wins over the binding's
             // age, which is an `Instant` and so does not advance while the
@@ -3153,6 +3189,32 @@ impl App {
             self.write_window_bindings_file();
         }
         changed
+    }
+
+    /// Take the queued closes whose [`CLOSE_ON_WINDOW_CLOSE_DELAY`] has elapsed
+    /// by `now`, leaving the rest queued. `now` is passed rather than read so
+    /// the wait is testable without one.
+    pub(super) fn take_due_session_closes(
+        &mut self,
+        now: Instant,
+    ) -> Vec<(HostId, state::SessionKey)> {
+        let mut due = Vec::new();
+        self.pending_session_close.retain(|p| {
+            if p.due <= now {
+                due.push((p.host.clone(), p.key.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        due
+    }
+
+    /// When the earliest queued close comes due, so the run loop's input wait
+    /// doesn't sleep past it (the same clamp `settle_reload_at` gets). Without
+    /// it an idle dashboard would fire the kill up to one `event_poll_ms` late.
+    pub(super) fn next_session_close_due(&self) -> Option<Instant> {
+        self.pending_session_close.iter().map(|p| p.due).min()
     }
 
     /// The `SessionKey` of the pooled session `token` names on `host`, for the
