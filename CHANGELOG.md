@@ -9,35 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Port forwards, per remote host.** An agent working on another machine starts
-  a dev server, a preview, a debugger — the `Ports` field in the hosts panel
-  (`Space h`, edit a row, `Tab` to it) is how you reach them from here. Write
-  `3000` to put its `localhost:3000` on yours, `8080:3000` to land it on a
-  different local port, `8080:db:5432` to reach something beside the host
-  itself, or prefix `R:` / `D:` for a reverse forward or a SOCKS proxy; several
-  are separated by spaces or commas, and a pasted `-L 8080:localhost:3000`
-  works as typed.
+- **Per-host ssh options.** Hosts (`Space h`) gained an `Options` field: ssh
+  arguments, passed through verbatim to every ssh captain-miao runs for that
+  host.
 
-  The forwards belong to the host rather than to a terminal you remembered to
-  leave open: they come up with the connection, come back with it after a
-  reconnect, and go away when the host is suspended or removed. They ride the
-  ssh connection captain-miao already holds, so there is nothing extra to
-  authenticate. A port that is already taken costs you that one forward and
-  nothing else, and a spec that isn't valid is shown in red on the host's row
-  instead of being handed to ssh.
+  It's mostly for **port forwards**. An agent working on a remote box starts a
+  dev server, a preview, a debugger — `-L 8080:localhost:3000` here is how you
+  reach them, and unlike a hand-run `ssh -L` in a spare terminal, the forward
+  comes up with the connection, comes back after a reconnect, and goes away when
+  you delete it or suspend the host. A port that's already taken costs you that
+  one forward and nothing else.
 
-- **Extra ssh arguments, per remote host.** The `Args` field beside `Ports`
-  takes anything you'd put on an ssh command line — `-C`, a keepalive, an extra
-  `-o` — passed through verbatim to captain-miao's own connection to that host.
-  It's for tuning ssh_config can't express, because ssh_config can't tell
-  captain-miao's connection apart from any other ssh to the same machine. Your
-  arguments go first, so an `-o` here wins over captain-miao's default for it.
-
-  How to *reach* a host — its port, a jump host, an identity file — still
-  belongs in `~/.ssh/config`, where it also covers the attach windows and the
-  `w` shell. And a port forward belongs in `Ports`: one written into `Args` is
-  marked in red and skipped, since nothing there would take it down again when
-  you remove it.
+  Most other host settings belong in `~/.ssh/config`, which also covers the
+  attach windows and the `w` shell; this field is for what ssh_config can't
+  single out, since it can't tell captain-miao's connection from any other ssh
+  to the same machine. Your arguments go first, so an `-o` here wins over
+  captain-miao's default for it.
 
 ## [0.3.0] - 2026-08-11
 

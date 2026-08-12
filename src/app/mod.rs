@@ -533,21 +533,18 @@ pub(super) struct HostRow {
     pub(in crate::app) icon: String,
     /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
     pub(in crate::app) disabled: bool,
-    /// Port forwards as one line of text — see [`hosts::HostConfig::forwards`].
+    /// ssh arguments as one line of text — see [`hosts::HostConfig::options`].
     /// Edited as text rather than as a list of rows because the whole set is
-    /// nearly always one or two specs, and a sub-list inside a popup row would
-    /// need its own cursor, its own add/remove keys and its own footer.
-    pub(in crate::app) forwards: String,
-    /// Extra ssh args as one line of text — see [`hosts::HostConfig::ssh_args`].
-    pub(in crate::app) ssh_args: String,
+    /// nearly always one or two arguments, and a sub-list inside a popup row
+    /// would need its own cursor, its own add/remove keys and its own footer.
+    pub(in crate::app) options: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum HostField {
     Label,
     Target,
-    Ports,
-    Args,
+    Options,
     Icon,
 }
 
@@ -563,13 +560,10 @@ pub(in crate::app) struct ConnIdentity {
     ssh: Option<String>,
     socket: Option<String>,
     disabled: bool,
-    /// The raw specs, not the parsed forwards: an edit that only fixes a typo
-    /// in a *malformed* spec changes nothing ssh is told, but it does change
-    /// what the next connect will try — and the panel showing it as valid while
-    /// nothing dialled it would be a lie.
-    forwards: Vec<String>,
-    /// Extra ssh args, raw for the same reason as `forwards`.
-    ssh_args: Vec<String>,
+    /// The arguments as typed. Raw rather than split into options + forwards,
+    /// because a rebuild is what re-runs the split — gating on its *output*
+    /// would miss an edit that only moves a token between the two.
+    options: Vec<String>,
 }
 
 /// The remote hosts, counted by how usable each one is — see
@@ -2143,31 +2137,13 @@ impl App {
                 // One short, OS-limit-safe local socket per host; ssh forwards
                 // the remote server's socket onto it.
                 let local_sock = crate::state::remote_forward_sock(&host.0);
-                // The user's forwards ride that same child, so only specs that
-                // *parse* may be passed on: a malformed one is a usage error
-                // that exits it, and the transport would flap forever on a typo.
-                let forwards = crate::port_forward::valid(&h.forwards);
-                // Verbatim, minus anything `classify_ssh_args` refuses — see
-                // there for why a forward asked for here is refused rather than
-                // honoured.
-                let ssh_args = hosts::classify_ssh_args(&h.ssh_args)
-                    .into_iter()
-                    .filter_map(|(tok, keep)| {
-                        if !keep {
-                            tracing::warn!(
-                                target: "captain_miao::ssh",
-                                "{}: ignoring `{tok}` in the host's ssh args — use the Ports field for forwards",
-                                host.0
-                            );
-                        }
-                        keep.then_some(tok)
-                    })
-                    .collect();
+                // Verbatim: the transport splits the forwards out of them (they
+                // can ride only one of its calls), and everything else reaches
+                // every ssh this host takes.
                 let t = Transport::Ssh {
                     target,
                     local_sock,
-                    forwards,
-                    ssh_args,
+                    options: h.options,
                 };
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             }
@@ -2232,8 +2208,7 @@ impl App {
                 disabled: h.disabled,
                 // Round-trips exactly: a spec can hold neither a comma nor a
                 // space, so this join is the inverse of `parse_list`'s split.
-                forwards: h.forwards.join(", "),
-                ssh_args: h.ssh_args.join(" "),
+                options: h.options.join(" "),
                 label: h.label,
             })
             .collect::<Vec<_>>();
@@ -2313,8 +2288,7 @@ impl App {
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
                     disabled: r.disabled,
-                    forwards: crate::port_forward::parse_list(&r.forwards),
-                    ssh_args: hosts::split_ssh_args(&r.ssh_args),
+                    options: hosts::split_options(&r.options),
                 }
             })
             .collect();
@@ -2361,8 +2335,7 @@ impl App {
                 ssh: h.ssh.clone(),
                 socket: h.socket.clone(),
                 disabled: h.disabled,
-                forwards: h.forwards.clone(),
-                ssh_args: h.ssh_args.clone(),
+                options: h.options.clone(),
             })
             .collect()
     }

@@ -3899,18 +3899,17 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     assert_eq!(d.app.input_mode, InputMode::HostEdit);
 }
 
-/// Port forwards are configured on the host they belong to — the panel's fourth
-/// field — and read back on that host's own row, canonicalised.
+/// A host's ssh options are configured where the host is — the panel's third
+/// field — and read back on that host's own row, beside its target.
 ///
-/// The row line is the only place a forward is ever visible: nothing else in the
-/// dashboard says a local port is being answered by another machine. So it has
-/// to show what ssh is actually told, and it has to distinguish a spec that will
-/// be dropped from one that will be honoured.
+/// The row line is the only place they are ever visible, and a port forward
+/// among them has nothing else in the dashboard announcing it: nothing else says
+/// a local port is being answered by another machine.
 #[test]
-fn the_hosts_panel_configures_port_forwards() {
+fn the_hosts_panel_configures_a_hosts_ssh_options() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
-    // `a` adds a row on Label; Tab walks Label → Target → Ports.
+    // `a` adds a row on Label; Tab walks Label → Target → Options.
     d.press(KeyCode::Char('a'));
     for c in "box".chars() {
         d.press(KeyCode::Char(c));
@@ -3922,98 +3921,22 @@ fn the_hosts_panel_configures_port_forwards() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus,
-        super::HostField::Ports
+        super::HostField::Options
     );
-    for c in "8080:3000, d:1080 nope".chars() {
+    for c in "-C -L 8080:localhost:3000".chars() {
         d.press(KeyCode::Char(c));
     }
     let row = &d.app.host_edit.as_ref().unwrap().rows[0];
     assert_eq!(row.target, "user@box");
-    assert_eq!(row.forwards, "8080:3000, d:1080 nope");
+    assert_eq!(row.options, "-C -L 8080:localhost:3000");
 
+    // Shown as typed: this field has no grammar of its own to canonicalise to.
     let out = d.render();
-    // Canonicalised: the shorthand is for typing, the row is the record.
-    assert!(out.contains("L 8080:localhost:3000"), "{out}");
-    assert!(out.contains("D 1080"), "{out}");
-    // The unparseable one is called out rather than drawn like a working
-    // forward — it is silently dropped when the host connects.
-    assert!(out.contains("!nope"), "{out}");
-}
-
-/// The `Args` field is deliberately dumb — tokens go to ssh verbatim — with one
-/// refusal, and the refusal has to take the flag's **value** with it.
-///
-/// Dropping a lone `-L` would leave `8080:localhost:3000` as a bare positional,
-/// which ssh reads as the hostname: a refused forward would become a connection
-/// to a machine that doesn't exist, which is far worse than honouring it.
-#[test]
-fn the_ssh_args_field_refuses_forwards_and_their_values() {
-    use super::hosts::{classify_ssh_args, split_ssh_args};
-    let kept = |text: &str| {
-        classify_ssh_args(&split_ssh_args(text))
-            .into_iter()
-            .filter_map(|(t, keep)| keep.then_some(t))
-            .collect::<Vec<_>>()
-    };
-    // Ordinary options pass through untouched, in order.
-    assert_eq!(
-        kept("-C -o ServerAliveInterval=30"),
-        vec!["-C", "-o", "ServerAliveInterval=30"]
-    );
-    // A separated forward loses both tokens; a glued one loses its single token.
-    assert_eq!(kept("-C -L 8080:localhost:3000 -4"), vec!["-C", "-4"]);
-    assert_eq!(kept("-D1080 -C"), vec!["-C"]);
-    assert_eq!(kept("-R 9000:localhost:22"), Vec::<String>::new());
-    // Case matters: `-l` is the login name, not a local forward, and eating it
-    // would drop the user the connection is made as.
-    assert_eq!(kept("-l deploy"), vec!["-l", "deploy"]);
-    // The classification is reported per token, so the panel can mark exactly
-    // the ones that will be dropped.
-    assert_eq!(
-        classify_ssh_args(&split_ssh_args("-L 3000 -C")),
-        vec![
-            ("-L".to_string(), false),
-            ("3000".to_string(), false),
-            ("-C".to_string(), true),
-        ]
-    );
-}
-
-/// The `Args` field, end to end in the panel: `Tab` reaches it after `Ports`,
-/// text lands in the row, and the host's line shows what the connection will
-/// carry — with a refused forward marked rather than drawn like a live option.
-#[test]
-fn the_hosts_panel_configures_extra_ssh_args() {
-    let mut d = TestDashboard::new(120, 34);
-    d.app.open_host_edit();
-    d.press(KeyCode::Char('a'));
-    for c in "box".chars() {
-        d.press(KeyCode::Char(c));
-    }
-    d.press(KeyCode::Tab);
-    for c in "user@box".chars() {
-        d.press(KeyCode::Char(c));
-    }
-    // Label → Target → Ports → Args.
-    d.press(KeyCode::Tab);
-    d.press(KeyCode::Tab);
-    assert_eq!(
-        d.app.host_edit.as_ref().unwrap().focus,
-        super::HostField::Args
-    );
-    for c in "-C -L 9:9".chars() {
-        d.press(KeyCode::Char(c));
-    }
-    assert_eq!(
-        d.app.host_edit.as_ref().unwrap().rows[0].ssh_args,
-        "-C -L 9:9"
+    assert!(
+        out.contains("ssh user@box -C -L 8080:localhost:3000"),
+        "{out}"
     );
 
-    let out = d.render();
-    // The args ride the target line: this *is* how the host is dialled.
-    assert!(out.contains("ssh user@box  -C"), "{out}");
-    // …and the forward is called out, since Ports is where one belongs.
-    assert!(out.contains("!-L"), "{out}");
     // One more Tab reaches Icon, so the cycle still closes.
     d.press(KeyCode::Tab);
     assert_eq!(
@@ -5423,8 +5346,7 @@ fn only_a_changed_connection_string_reconnects() {
         socket: None,
         icon: Some(icon.into()),
         disabled: false,
-        forwards: Vec::new(),
-        ssh_args: Vec::new(),
+        options: Vec::new(),
     };
     let before = vec![host("box", "user@box", "🖥")];
 
@@ -5450,8 +5372,7 @@ fn only_a_changed_connection_string_reconnects() {
             socket: Some("/run/x.sock".into()),
             icon: Some("🖥".into()),
             disabled: false,
-            forwards: Vec::new(),
-            ssh_args: Vec::new(),
+            options: Vec::new(),
         }])
     );
     // A port forward is part of the ssh child's argv, so changing the set has to
@@ -5461,16 +5382,7 @@ fn only_a_changed_connection_string_reconnects() {
     assert_ne!(
         App::conn_identities(&before),
         App::conn_identities(&[HostConfig {
-            forwards: vec!["8080:3000".into()],
-            ..host("box", "user@box", "🖥")
-        }])
-    );
-    // Same for the extra ssh args: they are spliced into the options the probe
-    // dials with, so they only take effect on a connection built after the edit.
-    assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[HostConfig {
-            ssh_args: vec!["-C".into()],
+            options: vec!["-C".into()],
             ..host("box", "user@box", "🖥")
         }])
     );

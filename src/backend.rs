@@ -35,7 +35,6 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{ResumeCandidate, SessionIndex};
-use crate::port_forward::PortForward;
 use crate::protocol::{
     ClientFrame, PROTOCOL_MIN, PROTOCOL_VERSION, ServerFrame, protocol_compatible, read_frame,
     write_frame,
@@ -411,6 +410,7 @@ impl Backend {
             Backend::Remote(b) => Ok(AttachPlan {
                 argv: attach_argv(
                     b.attach_target.as_deref(),
+                    &b.ssh_options,
                     &b.remote_exe.lock().unwrap(),
                     session_name,
                     force,
@@ -430,7 +430,7 @@ impl Backend {
             }),
             Backend::Remote(b) => match b.attach_target.as_deref() {
                 Some(target) => Ok(ShellPlan::Spawn {
-                    argv: remote_shell_argv(target, cwd),
+                    argv: remote_shell_argv(target, &b.ssh_options, cwd),
                 }),
                 // Pooled localhost: the "remote" host is this machine, so the
                 // shell is the ordinary local one. `$HOME` never crosses the
@@ -530,19 +530,80 @@ pub(crate) enum Transport {
     Ssh {
         target: String,
         local_sock: PathBuf,
-        /// The user's own port forwards for this host, already parsed (see
-        /// [`crate::port_forward`]). They ride the same child as the transport's
-        /// own `-L`, which is what gives them the lifetime the user asked for —
-        /// "while I'm connected to this host" — with no second connection to
-        /// authenticate, supervise or reconnect.
-        forwards: Vec<PortForward>,
-        /// Extra ssh arguments for this connection, verbatim. Applied to the
-        /// invocations [`setup_ssh`] makes and to nothing else, which is the
-        /// whole point: those are what establish the ControlMaster, so an option
-        /// set here lands on the connection every later hop rides — while an
-        /// attach window's own argv stays exactly what it was.
-        ssh_args: Vec<String>,
+        /// The host's connection options, as the user typed them: ssh arguments,
+        /// verbatim, in order. Split by [`split_connection_options`] into the
+        /// options every ssh call for this host carries and the port forwards,
+        /// which exactly one call may.
+        options: Vec<String>,
     },
+}
+
+/// One port forward lifted out of a host's connection options — the flag and its
+/// argument, kept apart so `-O cancel` can name the same forward later.
+///
+/// A forward is the one ssh argument that cannot simply ride
+/// [`ssh_common_opts`] with the rest. An option is a property of the connection
+/// and repeating it is free; a forward is a *resource the connection holds*, and
+/// repeating it collides:
+///
+/// * within [`setup_ssh`], the probe opens the master and registers it, and
+///   `daemon ensure` then re-requests it against a master that already has it;
+/// * the transport's own housekeeping is `ssh <opts> -O cancel -L <sock> target`,
+///   and `-O cancel` cancels **every** forward named on its command line — so a
+///   `-L` living in `opts` would be torn down by us, once per reconnect;
+/// * every attach window would ask for it again, one collision per window.
+///
+/// So it goes on the `ssh -N -L` tunnel child and nowhere else. That is also the
+/// child whose lifetime the user means by "while I'm connected to this host".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Forward {
+    flag: String,
+    spec: String,
+}
+
+impl std::fmt::Display for Forward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.flag, self.spec)
+    }
+}
+
+/// Split a host's connection options into what every ssh call carries and the
+/// forwards, which only the tunnel child may (see [`Forward`]).
+///
+/// The only thing recognised is `-L`/`-R`/`-D`, glued or with its argument in
+/// the next token; everything else passes through untouched and unvalidated,
+/// which is the point of the field. Case matters — `-L` is a local forward,
+/// `-l` is the login name.
+///
+/// The glued form is normalised apart (`-D1080` → `-D` + `1080`) so the cancel
+/// names a forward the same way however it was typed. A trailing flag with no
+/// argument is **dropped**: it is a usage error on every ssh call that would
+/// carry it, and these reach `attach` and the `w` shell too. Pure.
+pub(crate) fn split_connection_options(args: &[String]) -> (Vec<String>, Vec<Forward>) {
+    let mut opts = Vec::new();
+    let mut forwards = Vec::new();
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        // `get` rather than a slice: a token can be any UTF-8 the user typed, and
+        // byte 2 need not be a char boundary.
+        let glued = a.len() > 2 && matches!(a.get(..2), Some("-L" | "-R" | "-D"));
+        if glued {
+            forwards.push(Forward {
+                flag: a[..2].to_string(),
+                spec: a[2..].to_string(),
+            });
+        } else if matches!(a.as_str(), "-L" | "-R" | "-D") {
+            if let Some(spec) = rest.next() {
+                forwards.push(Forward {
+                    flag: a.clone(),
+                    spec: spec.clone(),
+                });
+            }
+        } else {
+            opts.push(a.clone());
+        }
+    }
+    (opts, forwards)
 }
 
 /// One in-flight request the connection task must answer by `req_id`.
@@ -566,6 +627,10 @@ pub(crate) struct RemoteBackend {
     /// an ssh host (`ssh -t <target> miao-server attach <name>`), `None` for a
     /// direct socket transport (a same-host `miao-server attach <name>`).
     attach_target: Option<String>,
+    /// The host's connection options minus its forwards — everything that is
+    /// safe to repeat, which is what lets an attach window and the `w` shell
+    /// carry them too. Empty for a socket transport, which runs no ssh.
+    ssh_options: Vec<String>,
     /// Whether this backend's transport is [`Transport::LocalSocket`], i.e. the
     /// daemon is on *this* machine. Distinguishes pooled-localhost (where a
     /// missing ssh target is correct and a shell is in-process) from a
@@ -621,6 +686,12 @@ impl RemoteBackend {
             Transport::Ssh { target, .. } => Some(target.clone()),
             Transport::LocalSocket(_) => None,
         };
+        // Forwards are dropped here on purpose: an attach window must not ask
+        // for one (see [`Forward`]). The tunnel child is the only carrier.
+        let ssh_options = match &transport {
+            Transport::Ssh { options, .. } => split_connection_options(options).0,
+            Transport::LocalSocket(_) => Vec::new(),
+        };
         let transport_is_local = matches!(transport, Transport::LocalSocket(_));
         let mirror = Arc::new(Mutex::new(HashMap::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
@@ -652,6 +723,7 @@ impl RemoteBackend {
         Arc::new(Self {
             host,
             attach_target,
+            ssh_options,
             transport_is_local,
             mirror,
             requests: tx,
@@ -763,6 +835,7 @@ impl RemoteBackend {
             }) => Ok(LaunchPlan::AttachRemote {
                 argv: attach_argv(
                     self.attach_target.as_deref(),
+                    &self.ssh_options,
                     &self.remote_exe.lock().unwrap(),
                     &name,
                     // A session we just created can't already have a client, so
@@ -937,6 +1010,7 @@ pub(crate) fn report_on_exit_argv(
 /// worth the latency.
 fn attach_argv(
     target: Option<&str>,
+    options: &[String],
     remote_exe: &str,
     session_name: &str,
     force: bool,
@@ -944,7 +1018,7 @@ fn attach_argv(
     let mut argv = match target {
         Some(t) => {
             let mut v = vec!["ssh".to_string(), "-t".to_string()];
-            v.extend(ssh_common_opts(&state::ssh_control_path(t)));
+            v.extend(ssh_common_opts(&state::ssh_control_path(t), options));
             v.push(t.to_string());
             v.push(remote_exe.to_string());
             v
@@ -980,7 +1054,7 @@ fn attach_argv(
 /// **host-canonical** (§3), so a `~` form reaches the remote as a `"$HOME"` the
 /// login shell expands, where plain `'…'` quoting would render it inert. An
 /// empty `cwd` just drops the `cd`. Pure + unit-tested.
-fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
+fn remote_shell_argv(target: &str, options: &[String], cwd: &str) -> Vec<String> {
     let remote_cmd = if cwd.is_empty() {
         login_shell_safe("exec \"${SHELL:-/bin/sh}\" -l")
     } else {
@@ -991,7 +1065,7 @@ fn remote_shell_argv(target: &str, cwd: &str) -> Vec<String> {
         )
     };
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
-    argv.extend(ssh_common_opts(&state::ssh_control_path(target)));
+    argv.extend(ssh_common_opts(&state::ssh_control_path(target), options));
     argv.push(target.to_string());
     argv.push(remote_cmd);
     argv
@@ -1751,8 +1825,20 @@ fn detached(program: &str) -> Command {
 /// black-holed host can't wedge `setup_ssh` on the OS SYN timeout (~2 min) —
 /// which would strand the reconnect task in `Connecting` (ServerAlive* only
 /// governs an *established* link, not the initial `connect()`).
-fn ssh_common_opts(ctl: &Path) -> Vec<String> {
-    vec![
+///
+/// `extra` is the host's own connection options, and it goes **first**: ssh
+/// keeps the *first* value it obtains for an option, so ours ahead of theirs
+/// would make the field inert for exactly the settings it exists to change —
+/// `ConnectTimeout`, `ServerAliveInterval` and `ControlPersist` are all set
+/// right below. The price is that `ControlPath`, `ControlMaster` and `BatchMode`
+/// are overridable too, and each breaks something real: the first two split the
+/// multiplexing this depends on (including the `-O cancel` that retires
+/// forwards), the third lets ssh prompt on a child whose stdin is `/dev/null`.
+/// Documented where the field is edited rather than blocked — an escape hatch
+/// that second-guesses isn't one.
+fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
+    let mut opts: Vec<String> = extra.to_vec();
+    opts.extend([
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
@@ -1767,7 +1853,8 @@ fn ssh_common_opts(ctl: &Path) -> Vec<String> {
         "ServerAliveCountMax=3".into(),
         "-o".into(),
         format!("ControlPath={}", ctl.display()),
-    ]
+    ]);
+    opts
 }
 
 /// Run [`probe_script`] on the remote (this also primes the ControlMaster).
@@ -2325,16 +2412,14 @@ async fn connection_task(
             Transport::Ssh {
                 target,
                 local_sock,
-                forwards,
-                ssh_args,
+                options,
             } => {
                 log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
                     SshLink {
                         target,
                         local_sock,
-                        forwards,
-                        ssh_args,
+                        options,
                     },
                     &remote_exe,
                     &mut failure,
@@ -2509,14 +2594,15 @@ async fn connect_with_retry(sock: &Path, attempts: u32) -> Option<UnixStream> {
 }
 
 /// The [`Transport::Ssh`] fields [`setup_ssh`] dials with, borrowed as a group.
-/// Grouped for the same reason as [`ConnectionShared`]: four of these five
-/// parameters would otherwise be positional, and two are `&str`-ish enough to
-/// swap silently at the one call site.
+/// Grouped for the same reason as [`ConnectionShared`]: they would otherwise be
+/// three more positional parameters, two of them `&str`-ish enough to swap
+/// silently at the one call site.
 struct SshLink<'a> {
     target: &'a str,
     local_sock: &'a Path,
-    forwards: &'a [PortForward],
-    ssh_args: &'a [String],
+    /// The host's connection options as typed, split on arrival — see
+    /// [`split_connection_options`].
+    options: &'a [String],
 }
 
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
@@ -2527,16 +2613,11 @@ struct SshLink<'a> {
 /// or its sessions. The returned child is `kill_on_drop`. Returns None if ssh or
 /// the remote binary fails. Requires key/agent auth (BatchMode).
 ///
-/// The user's configured `forwards` ride that same child, so they are up for
+/// The forwards in the host's `options` ride that same child, so they are up for
 /// exactly as long as the host is connected and come back with it on a
 /// reconnect. `ExitOnForwardFailure` stays at its default `no` on purpose: a
 /// port already in use must cost the user that one forward, not the dashboard's
 /// link to the host.
-///
-/// `ssh_args` reaches every invocation below — including the probe, which is
-/// what creates the ControlMaster the attach windows later ride. That is why the
-/// field is worth having at all despite touching none of their argvs: on a
-/// multiplexed connection, connection-level options belong to whoever opened it.
 async fn setup_ssh(
     link: SshLink<'_>,
     remote_exe: &Arc<Mutex<String>>,
@@ -2547,9 +2628,10 @@ async fn setup_ssh(
     let SshLink {
         target,
         local_sock,
-        forwards,
-        ssh_args,
+        options,
     } = link;
+    let (extra, forwards) = split_connection_options(options);
+    let forwards = forwards.as_slice();
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
     // ssh below (the probe) already needs it — so ensure the short ssh-socket
@@ -2558,21 +2640,11 @@ async fn setup_ssh(
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    // The user's args go **first**: ssh keeps the *first* value it obtains for an
-    // option, so ours would otherwise outrank theirs — and the cases this field
-    // exists for are exactly the ones we already set (`ConnectTimeout`,
-    // `ServerAliveInterval`, `ControlPersist`), which would make it a field that
-    // silently does nothing. The cost of that ordering is that `ControlPath`,
-    // `ControlMaster` and `BatchMode` are overridable too, and each breaks
-    // something real — the first two split the multiplexed connection this
-    // relies on (including the `-O cancel` that retires forwards), the third
-    // lets ssh prompt on a child whose stdin is `/dev/null`. Documented where
-    // the field is edited rather than blocked: an escape hatch that second-
-    // guesses is not one.
-    let mut opts: Vec<String> = ssh_args.to_vec();
-    opts.extend(ssh_common_opts(&ctl));
-    if !ssh_args.is_empty() {
-        log.info(format!("extra ssh args: {}", ssh_args.join(" ")));
+    // Every ssh call below carries the host's options; only the tunnel child
+    // carries its forwards.
+    let opts = ssh_common_opts(&ctl, &extra);
+    if !options.is_empty() {
+        log.info(format!("connection options: {}", options.join(" ")));
     }
 
     // Probe the host, auto-provision our binary if it's missing/stale and our
@@ -2706,7 +2778,7 @@ async fn setup_ssh(
                 .join(", ")
         ));
         for f in forwards {
-            cmd.arg(f.flag()).arg(f.spec());
+            cmd.arg(&f.flag).arg(&f.spec);
         }
     }
     cmd.arg(target)
@@ -2730,7 +2802,7 @@ async fn setup_ssh(
 /// Keyed by `(host label, ssh target)` rather than by target alone: two panel
 /// rows may name the same machine, and each has to manage its own set — keyed
 /// only by target, connecting one would tear down the other's forwards.
-static REQUESTED_FORWARDS: LazyLock<Mutex<HashMap<ForwardKey, Vec<PortForward>>>> =
+static REQUESTED_FORWARDS: LazyLock<Mutex<HashMap<ForwardKey, Vec<Forward>>>> =
     LazyLock::new(Mutex::default);
 
 /// `(host label, ssh target)` — which panel row's forwards these are, and where
@@ -2750,12 +2822,7 @@ type ForwardKey = (String, String);
 /// Every failure here is expected and ignorable: no master up yet (the first
 /// connect), no such forward (the common case), or an ssh too old to cancel a
 /// dynamic one. `detached` swallows the diagnostics.
-async fn cancel_user_forwards(
-    host: &HostId,
-    target: &str,
-    opts: &[String],
-    forwards: &[PortForward],
-) {
+async fn cancel_user_forwards(host: &HostId, target: &str, opts: &[String], forwards: &[Forward]) {
     let stale = {
         let mut memo = REQUESTED_FORWARDS.lock().unwrap();
         let seen = memo
@@ -2786,7 +2853,7 @@ async fn cancel_user_forwards(
 /// backend. Fire-and-forget: the caller is committing a panel edit and must not
 /// block on an ssh round trip per forward.
 pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
-    let retired: Vec<(ForwardKey, Vec<PortForward>)> = {
+    let retired: Vec<(ForwardKey, Vec<Forward>)> = {
         let mut memo = REQUESTED_FORWARDS.lock().unwrap();
         let gone: Vec<ForwardKey> = memo.keys().filter(|k| !live.contains(k)).cloned().collect();
         gone.into_iter()
@@ -2798,7 +2865,7 @@ pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
             continue;
         }
         tokio::spawn(async move {
-            let opts = ssh_common_opts(&state::ssh_control_path(&target));
+            let opts = ssh_common_opts(&state::ssh_control_path(&target), &[]);
             cancel_forwards(&target, &opts, &forwards).await;
         });
     }
@@ -2807,14 +2874,14 @@ pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
 /// One `-O cancel` per spec rather than one command carrying all of them: a
 /// single unsupported flag would fail the whole batch, taking the forwards that
 /// *could* have been cancelled down with it.
-async fn cancel_forwards(target: &str, opts: &[String], forwards: &[PortForward]) {
+async fn cancel_forwards(target: &str, opts: &[String], forwards: &[Forward]) {
     for f in forwards {
         let _ = detached("ssh")
             .args(opts)
             .arg("-O")
             .arg("cancel")
-            .arg(f.flag())
-            .arg(f.spec())
+            .arg(&f.flag)
+            .arg(&f.spec)
             .arg(target)
             .status()
             .await;
@@ -2961,6 +3028,41 @@ mod tests {
         }
     }
 
+    /// A host's options are passed through untouched except for its forwards,
+    /// which have to be told apart because only one ssh call may carry them.
+    #[test]
+    fn connection_options_keep_everything_but_their_forwards() {
+        let split = |text: &str| {
+            let args: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+            let (opts, fwd) = split_connection_options(&args);
+            (opts, fwd.iter().map(|f| f.to_string()).collect::<Vec<_>>())
+        };
+
+        // Ordinary options pass through in order, with nothing lifted out.
+        let (opts, fwd) = split("-C -o ServerAliveInterval=30");
+        assert_eq!(opts, ["-C", "-o", "ServerAliveInterval=30"]);
+        assert!(fwd.is_empty());
+
+        // A forward is taken out from between them, separated or glued, and the
+        // glued form is normalised so `-O cancel` names it the same either way.
+        let (opts, fwd) = split("-C -L 8080:localhost:3000 -4 -D1080");
+        assert_eq!(opts, ["-C", "-4"]);
+        assert_eq!(fwd, ["-L 8080:localhost:3000", "-D 1080"]);
+
+        // Case matters: `-l` is the login name, and eating it would drop the
+        // user the connection is made as.
+        let (opts, fwd) = split("-l deploy");
+        assert_eq!(opts, ["-l", "deploy"]);
+        assert!(fwd.is_empty());
+
+        // A trailing flag with no argument is dropped rather than passed on: it
+        // is a usage error on every call that would carry it, and these reach
+        // the attach window and the `w` shell too.
+        let (opts, fwd) = split("-C -L");
+        assert_eq!(opts, ["-C"]);
+        assert!(fwd.is_empty());
+    }
+
     /// The tail of an ssh argv after the `-o` option block, so the assertions
     /// stay about *shape* rather than restating `ssh_common_opts`.
     fn ssh_tail(argv: &[String]) -> Vec<String> {
@@ -2974,7 +3076,7 @@ mod tests {
 
     #[test]
     fn attach_argv_ssh_vs_direct() {
-        let ssh = attach_argv(Some("user@box"), "miao-server", "s1", false);
+        let ssh = attach_argv(Some("user@box"), &[], "miao-server", "s1", false);
         assert_eq!(ssh[0], "ssh");
         assert_eq!(ssh[1], "-t");
         assert_eq!(ssh_tail(&ssh), ["user@box", "miao-server", "attach", "s1"]);
@@ -2985,23 +3087,23 @@ mod tests {
 
         // A socket transport (pooled localhost) needs no ssh hop at all.
         assert_eq!(
-            attach_argv(None, "miao-server", "s1", false),
+            attach_argv(None, &[], "miao-server", "s1", false),
             ["miao-server", "attach", "s1"]
         );
         // The steal is a flag on the attach, never on the create path.
         assert_eq!(
-            attach_argv(None, "miao-server", "s1", true),
+            attach_argv(None, &[], "miao-server", "s1", true),
             ["miao-server", "attach", "--force", "s1"]
         );
         // A deployed cache path is invoked in place of `miao-server`.
         let cache = "/home/u/.cache/captain-miao/bin/miao-server";
-        let ssh = attach_argv(Some("user@box"), cache, "s1", false);
+        let ssh = attach_argv(Some("user@box"), &[], cache, "s1", false);
         assert_eq!(ssh_tail(&ssh), ["user@box", cache, "attach", "s1"]);
     }
 
     #[test]
     fn remote_shell_argv_cds_and_execs_login_shell() {
-        let argv = remote_shell_argv("user@box", "/home/u/proj");
+        let argv = remote_shell_argv("user@box", &[], "/home/u/proj");
         assert_eq!(
             ssh_tail(&argv),
             [
@@ -3013,7 +3115,7 @@ mod tests {
         // something the *remote* shell expands. Single-quoting it — the obvious
         // thing — would make `cd '~/proj'` fail on every host. It rides outside
         // the `sh -c` wrapper precisely so it can keep its quotes.
-        let argv = remote_shell_argv("box", "~/proj");
+        let argv = remote_shell_argv("box", &[], "~/proj");
         assert_eq!(
             ssh_tail(&argv),
             [
@@ -3022,7 +3124,7 @@ mod tests {
             ]
         );
         // Empty cwd drops the `cd` and just opens a login shell.
-        let argv = remote_shell_argv("box", "");
+        let argv = remote_shell_argv("box", &[], "");
         assert_eq!(
             ssh_tail(&argv),
             ["box", "/bin/sh -c 'exec \"${SHELL:-/bin/sh}\" -l'"]
@@ -3041,7 +3143,7 @@ mod tests {
     /// rule [`login_shell_safe`] documents.
     #[test]
     fn remote_shell_command_parses_under_every_login_shell() {
-        let cmd = remote_shell_argv("box", "~/proj").pop().unwrap();
+        let cmd = remote_shell_argv("box", &[], "~/proj").pop().unwrap();
         let mut checked = 0;
         for (shell, check) in [
             ("/bin/sh", "-n"),
@@ -4371,7 +4473,7 @@ mod tests {
         if let Some(dir) = ctl.parent() {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let mut opts = ssh_common_opts(&ctl);
+        let mut opts = ssh_common_opts(&ctl, &[]);
         if let Ok(extra) = std::env::var("CM_TEST_SSH_OPTS") {
             opts.extend(extra.split_whitespace().map(str::to_string));
         }

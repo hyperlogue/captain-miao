@@ -771,83 +771,67 @@ decides what they mean**.
   host shows live connection state (including the `Failed` reason verbatim),
   running/attached session counts, the daemon version from `Welcome`, and a
   latency sample; its ssh/socket target sits on a dim second line. Editing a
-  row exposes label / target (`^t` toggles ssh↔socket) / **ports** and **args**
-  (both below) / **icon** (`^e` opens the same searchable emoji picker as
-  `Space i`). There is **no Save
+  row exposes label / target (`^t` toggles ssh↔socket) / **options** (below) /
+  **icon** (`^e` opens the same searchable emoji picker as `Space i`). There is
+  **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
   removes behind a `y/N` confirm. A `Failed` reason is **flattened and
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.
-- **`Ports` — per-host ssh port forwards** (`src/port_forward.rs`). An agent
-  working on a remote host serves things: a dev server, a preview, a debugger.
-  The forward that reaches them belongs to the host, not to a terminal you
-  remembered to leave open, so it is configured beside the target and lives for
-  exactly as long as the connection — up on connect, back on reconnect, gone
-  when the host is suspended or deleted. Written as one text field, comma- or
-  space-separated, with two shorthands over ssh's grammar (`3000` =
-  `3000:localhost:3000`, `8080:3000` = `8080:localhost:3000`) and an optional
-  `L:`/`R:`/`D:` prefix; a pasted `-L 8080:localhost:3000` is understood as
-  typed. Three things make it work rather than merely exist:
-  - **The specs ride the transport's own `-N -L` child**, so there is no second
-    connection to authenticate (the ControlMaster is shared), supervise or
-    reconnect — the forwards inherit the connection task's whole lifecycle for
-    free.
-  - **They are parsed before ssh sees them.** A forward that fails to *bind* is
-    survivable (`ExitOnForwardFailure` stays at its default `no`, deliberately —
-    a busy port must cost one forward, not the link to the host), but a spec ssh
-    cannot *parse* is a usage error that exits the child, which the connection
-    task then reads as a dead transport and re-dials forever. So
-    `build_backends_from_config` passes on only what parsed, and the panel row
-    draws the rest behind a red `!` — dropped-and-visible, never
-    dropped-and-silent.
-  - **`-O cancel` before every request.** A forward asked for by a multiplexed
-    client is registered with the *master*, not with that client's session — the
-    same fact that makes the transport's own `-L` need a cancel. So one that was
-    deleted from the field would otherwise hold its port for as long as the
-    master lives, and one still in the field would make the re-request fail,
-    which for a mux client is fatal. Nothing enumerates a master's live
-    forwards, so `REQUESTED_FORWARDS` remembers what this process asked each
-    target for and cancels that set ∪ the new one, then requests. Editing the
-    field changes `conn_identities`, so a commit rebuilds the backend and that
-    whole pass runs immediately.
-- **`Args` — extra ssh arguments for the main connection.** Passed verbatim to
-  the invocations `setup_ssh` makes — the probe, `daemon ensure`, the `-O
-  cancel`s and the tunnel child — and to nothing else. That scope is not a
-  limitation to work around later: those calls are what *establish the
-  ControlMaster*, and on a multiplexed connection the connection-level options
-  belong to whoever opened it, so an attach window riding that master inherits
-  them without carrying them in its own argv. Splicing them into
-  `ssh_common_opts` instead would put them on every attach window, which for
-  anything forward-shaped means colliding with the master once per window.
-  - **Not for host identity.** Port, `ProxyJump`, `IdentityFile`,
-    `ProxyCommand` belong in a `~/.ssh/config` `Host` block: captain-miao
-    reaches a host by plain `ssh <target>`, so a block there already covers the
-    attach windows and the `w` shell too. What is left for this field is the
-    tuning ssh_config *can't* scope to us alone — `-C`, keepalive and window
-    sizes, an extra `-o`.
-  - **The user's args go first**, because ssh keeps the first value it obtains
-    for an option. Ours last would make the field silently inert for exactly its
-    motivating cases (`ConnectTimeout`, `ServerAliveInterval`, `ControlPersist`
-    are all already set by `ssh_common_opts`). The price is that `ControlPath`,
-    `ControlMaster` and `BatchMode` are overridable and each breaks something
-    real — the first two split the multiplexing this relies on, including the
-    `-O cancel` that retires forwards; the third lets ssh prompt on a child
-    whose stdin is `/dev/null`. Documented, not blocked: an escape hatch that
-    second-guesses isn't one.
-  - **One refusal: a port forward** (`classify_ssh_args`, `src/app/hosts.rs`).
-    `-L`/`-R`/`-D` would *work* here, once — and then sit outside the lifecycle
-    `Ports` exists to give it, with nothing to cancel it when the row is edited,
-    suspended or removed. The rejected flag takes its **value token** with it,
-    since a lone dropped `-L` would leave `8080:localhost:3000` as a bare
-    positional, which ssh reads as the hostname. Refused tokens draw on the row
-    behind a red `!`, the same shape a malformed forward spec uses.
-  - Unlike a spec in `Ports`, a bad argument here isn't pre-validated — it can't
-    be, that's the point of verbatim. It is still *diagnosable* rather than a
-    silent flap: the args reach `daemon ensure` before they reach the tunnel
-    child, and that call captures stderr into the `Failed` reason, so ssh's own
-    usage error is what the panel shows.
+- **`Options` — per-host ssh arguments** (`hosts::split_options`,
+  `backend::split_connection_options`). Passed through verbatim to every ssh
+  captain-miao runs for that host, with no grammar of our own on top.
+
+  The feature has exactly two coherent shapes — a raw argument string, or a
+  structured editor where a forward is a row with a type and two endpoints — and
+  anything in between is a bespoke syntax to learn *and* a ceiling to hit. This
+  is the raw one. An earlier pass built the middle (a `Ports` field with `3000` /
+  `8080:3000` shorthands, canonicalisation, per-spec validation, plus a second
+  field for everything else) and it was more machinery than the problem.
+  - **What it is really for is forwards.** Host identity — port, `ProxyJump`,
+    `IdentityFile` — belongs in a `~/.ssh/config` `Host` block, which covers the
+    attach windows and the `w` shell too, since captain-miao reaches a host by
+    plain `ssh <target>`. What ssh_config *can't* express is anything scoped to
+    our connection alone, and a forward is not a property of the machine at all:
+    it is something you want up while working on that host and gone when you
+    aren't. That lifecycle is what the field adds over a hand-run `ssh -L`.
+  - **A forward can't ride `ssh_common_opts` with the rest**, which is the one
+    piece of real machinery left. An option is a property of the connection and
+    repeating it is free; a forward is a *resource the connection holds*, and
+    repeating it collides three ways: `daemon ensure` re-requests what the probe
+    already registered; the transport's own `ssh <opts> -O cancel -L <sock>
+    target` would name it too, and `-O cancel` cancels every forward on its
+    command line, so we would tear it down once per reconnect; and every attach
+    window would ask for it again. So `split_connection_options` lifts
+    `-L`/`-R`/`-D` (glued or separated, normalised apart) onto the `ssh -N -L`
+    tunnel child, and nothing else carries them. `ExitOnForwardFailure` stays at
+    its default `no`: a port already in use must cost that one forward, not the
+    link to the host.
+  - **The user's arguments go first**, because ssh keeps the first value it
+    obtains for an option. Ours first would make the field inert for exactly its
+    motivating settings — `ConnectTimeout`, `ServerAliveInterval` and
+    `ControlPersist` are all set by `ssh_common_opts`. The price is that
+    `ControlPath`, `ControlMaster` and `BatchMode` are overridable and each
+    breaks something real: the first two split the multiplexing this depends on
+    (including the `-O cancel` that retires forwards), the third lets ssh prompt
+    on a child whose stdin is `/dev/null`.
+  - **`-O cancel` before every request**, and on every host that leaves the ssh
+    set. A forward requested by a multiplexed client is registered with the
+    *master*, so one deleted from the field would hold its port for as long as
+    the master lives, and one still in the field would make the re-request fail.
+    Nothing enumerates a master's forwards, so `REQUESTED_FORWARDS` remembers
+    what this process asked each `(label, target)` for and cancels that set ∪ the
+    new one before requesting; `retire_unlisted_forwards` covers the host that
+    was deleted, suspended, renamed or switched to a socket, whose forwards would
+    otherwise outlive a row the panel calls disconnected.
+  - **Nothing is validated**, which is what verbatim means. A bad argument is
+    still diagnosable rather than a silent flap: it reaches `daemon ensure`
+    before the tunnel child, and that call captures stderr into the `Failed`
+    reason the panel shows. The one exception is a trailing `-L` with no
+    argument, dropped because it is a usage error on *every* call that would
+    carry it — including the attach window.
 - **`l` — the connection log** (per host, in the panel). The row gets one line
   for a failure whose reason is routinely a paragraph, and the *sequence* is
   what diagnoses: "probed the host, decided to deploy, the deploy came back with

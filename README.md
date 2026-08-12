@@ -320,30 +320,20 @@ the dashboard down well inside that. Note that closing a *tab* closes the
 windows in it — under `stacked`, that is every session sharing the
 `miao:sessions` tab.
 
-**Port forwards** are configured per host, in the same panel. An agent on a
-remote box starts a dev server; the `Ports` field is how you open it in the
-browser here. Write `3000` for `localhost:3000` on both ends, `8080:3000` to
-land it on a different local port, `8080:db:5432` to reach something other than
-the host itself, or prefix `R:` / `D:` for a reverse forward or a SOCKS proxy —
-several, separated by spaces or commas. They come up with the connection and
-back with it after a reconnect, and a spec that doesn't parse is shown in red on
-the host's row rather than being passed to ssh.
+**Per-host ssh options.** The `Options` field in the same panel takes ssh
+arguments, passed through verbatim to every ssh captain-miao runs for that host.
+It exists mainly for **port forwards** — an agent on a remote box starts a dev
+server, and `-L 8080:localhost:3000` is how you open it in the browser here. The
+forward comes up with the connection, comes back with it after a reconnect, and
+goes away when you remove it or suspend the host, which is the part a hand-run
+`ssh -L` in a spare terminal doesn't give you.
 
-Everything about *how to reach* a host — a non-default port, a jump host, an
-identity file — belongs in `~/.ssh/config` instead. captain-miao runs a plain
-`ssh <target>`, so a `Host` block there covers the connection, the attach
-windows and the `w` shell alike. Forwards are the exception, and that is why
-they live in the panel: they are something you want up while you're working on
-that host and gone when you aren't, not a permanent property of the machine.
-
-The **`Args`** field beside it takes extra ssh arguments, passed verbatim, for
-the dashboard's own connection to that host — `-C`, a keepalive, an extra `-o`.
-They go on the connection that every attach window then rides, so setting one
-here is how you tune a link that ssh_config can't single out (it can't tell
-captain-miao's connection from any other ssh to the same machine). Your
-arguments come first, so an `-o` here overrides captain-miao's own default.
-Forwards belong in `Ports`, not here — one written here is marked in red and
-skipped, because nothing would take it back down when you remove it.
+Most other host settings belong in `~/.ssh/config` instead — a non-default port,
+a jump host, an identity file are properties of the machine, and a `Host` block
+there also covers the attach windows and the `w` shell. Use this field for what
+ssh_config can't single out, since it can't tell captain-miao's connection from
+any other ssh to the same machine: a forward, `-C`, a keepalive. Your arguments
+go first, so an `-o` here overrides captain-miao's own default for it.
 
 **Getting the daemon onto each host.** Either install `miao-server`
 there yourself (any copy on `PATH` matching your dashboard's version is used as

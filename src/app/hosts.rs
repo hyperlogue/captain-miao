@@ -6,7 +6,9 @@
 //! said the same thing, the icon says it better (an emoji is self-coloured and
 //! distinguishes far more than a palette of eight), and one affordance per
 //! concept is one fewer field to Tab past. `serde` ignores the leftover key, so
-//! an older `hosts.json` still loads — the colour is simply forgotten.
+//! an older `hosts.json` still loads — the colour is simply forgotten. The same
+//! is true of the short-lived `forwards`/`ssh_args` pair that [`HostConfig::options`]
+//! replaced before either shipped.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,74 +42,41 @@ pub(super) struct HostConfig {
     /// upgrade.
     #[serde(default)]
     pub disabled: bool,
-    /// ssh port forwards held open for exactly as long as this host is
-    /// connected — `8080:3000` to reach its dev server, `R:9000` to expose one
-    /// of yours to it. Stored as the user typed them, not as parsed forwards:
-    /// the panel is where a typo is visible and fixable, and canonicalising on
-    /// load would rewrite their text out from under them. Parsed (and the
-    /// malformed ones dropped) at backend-build time by
-    /// [`crate::port_forward::valid`].
+    /// ssh arguments for this host's connection, as the user typed them: passed
+    /// through verbatim and in order, with no grammar of our own on top.
     ///
-    /// Ignored for a `socket` host — there is no ssh hop there to carry them.
+    /// This is a raw escape hatch on purpose. There are only two coherent shapes
+    /// for the feature — a raw argument string, or a structured editor where a
+    /// forward is a row with a type and two endpoints — and anything between the
+    /// two is a bespoke syntax the user has to learn *and* a ceiling they hit
+    /// anyway. Raw is the one that stays small.
+    ///
+    /// Most of what you'd reach for belongs in `~/.ssh/config` instead: a port,
+    /// `ProxyJump`, an `IdentityFile` are properties of the machine, and a
+    /// `Host` block there covers the attach windows and the `w` shell too. What
+    /// this field adds is what ssh_config can't scope to captain-miao alone —
+    /// tuning for *our* connection (`-C`, keepalives) and, above all, **port
+    /// forwards**, which are not a property of the machine at all: they are
+    /// something you want up while working on that host and gone when you're
+    /// not. A `-L`/`-R`/`-D` here is lifted onto the tunnel child by
+    /// [`crate::backend::split_connection_options`] so it lives and dies with
+    /// the connection.
+    ///
+    /// Ignored for a `socket` host — there is no ssh hop there to carry any of
+    /// it.
     #[serde(default)]
-    pub forwards: Vec<String>,
-    /// Extra ssh arguments for the dashboard's **own** connection to this host:
-    /// the probe, `daemon ensure` and the `-N -L` tunnel child, which together
-    /// are what establish the ControlMaster every later hop rides. Passed
-    /// verbatim, in order, ahead of the target.
-    ///
-    /// Not the place for host identity — port, `ProxyJump`, `IdentityFile` — all
-    /// of which belong in a `~/.ssh/config` `Host` block, since captain-miao
-    /// reaches a host by plain `ssh <target>` and a block there also covers the
-    /// attach windows and the `w` shell. What is left for this field is tuning
-    /// ssh_config can't scope to us alone: `-C`, keepalive and window sizes, an
-    /// extra `-o`.
-    ///
-    /// Ignored for a `socket` host, like [`Self::forwards`] and for the same
-    /// reason.
-    #[serde(default)]
-    pub ssh_args: Vec<String>,
+    pub options: Vec<String>,
 }
 
-/// Split the panel's `Args` field into tokens.
+/// Split the panel's `Options` field into tokens.
 ///
-/// Whitespace only, with no quoting: the arguments this field is for are single
-/// tokens or `-o key=value` pairs, and the one common option whose value has a
-/// space in it — `ProxyCommand` — is exactly the kind that belongs in
-/// `~/.ssh/config` instead. A quoting grammar here would exist to serve the
-/// case the field is documented as not being for.
-pub(super) fn split_ssh_args(text: &str) -> Vec<String> {
+/// Whitespace only, with no quoting. The one common ssh option whose value
+/// contains a space is `ProxyCommand`, which is exactly the kind that belongs in
+/// `~/.ssh/config` — so a quoting grammar here would exist to serve the case the
+/// field is documented as not being for, at the price of being one more syntax
+/// to get wrong. Pure.
+pub(super) fn split_options(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_string).collect()
-}
-
-/// Pair each token with whether it is actually passed to ssh, in order.
-///
-/// The one thing refused is a **port forward** (`-L`/`-R`/`-D`, glued or with
-/// its value in the next token). Not because it wouldn't work — it would, once —
-/// but because it would work *outside* the lifecycle the `Ports` field exists to
-/// give it: nothing would cancel it when the row is edited, suspended or
-/// removed, so a forward added here would quietly outlive the host it belongs
-/// to. Two ways to ask for the same thing, one of which silently leaks, is worse
-/// than one way and a red token saying so.
-///
-/// A rejected flag takes its **value token with it**. Dropping `-L` alone would
-/// leave `8080:localhost:3000` as a bare positional, which ssh reads as the
-/// *hostname* — turning a refused forward into a connection to a machine that
-/// doesn't exist. Pure.
-pub(super) fn classify_ssh_args(args: &[String]) -> Vec<(String, bool)> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut drop_value = false;
-    for a in args {
-        // Case matters: `-L` is a local forward, `-l` is the login name.
-        let separated = matches!(a.as_str(), "-L" | "-R" | "-D");
-        let glued = !separated
-            && a.len() > 2
-            && (a.starts_with("-L") || a.starts_with("-R") || a.starts_with("-D"));
-        let keep = !(separated || glued || drop_value);
-        drop_value = separated;
-        out.push((a.clone(), keep));
-    }
-    out
 }
 
 /// Load the configured hosts, or an empty list if none / unreadable.

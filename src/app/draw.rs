@@ -521,8 +521,8 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        // Five field rows + at most one per-field hint, plus a little slack.
-        let form_h: u16 = if state.editing { 8 } else { 0 };
+        // Four field rows + at most one per-field hint, plus a little slack.
+        let form_h: u16 = if state.editing { 7 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
@@ -581,26 +581,23 @@ impl App {
             }
             lines.push(Line::from(spans));
             // The target is secondary detail — one indented dim line, so the
-            // status line above stays scannable across many hosts. Extra ssh
-            // args ride that same line rather than earning one of their own:
-            // they *are* part of how this host is dialled, and read as the rest
-            // of the command the target starts.
-            let mut target_spans = vec![Span::styled(
+            // status line above stays scannable across many hosts. The options
+            // ride that same line rather than earning one of their own: they
+            // *are* the rest of the ssh command the target ends, and a port
+            // forward among them is otherwise completely invisible — nothing
+            // else in the dashboard says a local port is answered by another
+            // machine.
+            lines.push(Line::from(Span::styled(
                 format!(
-                    "      {} {}",
+                    "      {} {} {}",
                     if r.is_socket { "socket" } else { "ssh" },
-                    r.target
-                ),
+                    r.target,
+                    r.options.trim()
+                )
+                .trim_end()
+                .to_string(),
                 Style::default().add_modifier(Modifier::DIM),
-            )];
-            target_spans.extend(ssh_arg_spans(&r.ssh_args));
-            lines.push(Line::from(target_spans));
-            // A port forward is otherwise completely invisible — nothing else in
-            // the dashboard says a local port is being answered by another
-            // machine — so a host that has one spends a third line saying so.
-            if !r.forwards.trim().is_empty() {
-                lines.push(Line::from(forward_spans(&r.forwards, r.is_socket)));
-            }
+            )));
         }
         let add_on = state.cursor == state.rows.len() && !state.editing;
         lines.push(Line::from(Span::styled(
@@ -636,8 +633,10 @@ impl App {
                 };
                 let mut spans = vec![
                     mark,
+                    // 8, not 7: `Options` is exactly seven cells, and a label
+                    // that fills its own column runs into the value.
                     Span::styled(
-                        format!("{label:<7}"),
+                        format!("{label:<8}"),
                         Style::default().add_modifier(Modifier::DIM),
                     ),
                 ];
@@ -667,13 +666,9 @@ impl App {
                 Span::raw(r.target.clone()),
                 cursor(state.focus == super::HostField::Target),
             ]);
-            let ports_line = Line::from(vec![
-                Span::raw(r.forwards.clone()),
-                cursor(state.focus == super::HostField::Ports),
-            ]);
-            let args_line = Line::from(vec![
-                Span::raw(r.ssh_args.clone()),
-                cursor(state.focus == super::HostField::Args),
+            let options_line = Line::from(vec![
+                Span::raw(r.options.clone()),
+                cursor(state.focus == super::HostField::Options),
             ]);
             let icon_line = Line::from(vec![
                 Span::raw(if r.icon.trim().is_empty() {
@@ -690,8 +685,11 @@ impl App {
                     "Target",
                     target_line,
                 ),
-                field_row(state.focus == super::HostField::Ports, "Ports", ports_line),
-                field_row(state.focus == super::HostField::Args, "Args", args_line),
+                field_row(
+                    state.focus == super::HostField::Options,
+                    "Options",
+                    options_line,
+                ),
                 field_row(state.focus == super::HostField::Icon, "Icon", icon_line),
             ];
             // Per-field hints for the non-obvious affordances. The Ports one is
@@ -702,14 +700,11 @@ impl App {
                     "  ^t toggle ssh / socket",
                     Style::default().add_modifier(Modifier::DIM),
                 ))),
-                super::HostField::Ports => form_lines.push(Line::from(Span::styled(
-                    "  3000  8080:3000  R:9000  D:1080   (ssh hosts only)",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-                // Names where the *other* host settings go, because that is the
-                // question this field raises rather than answers.
-                super::HostField::Args => form_lines.push(Line::from(Span::styled(
-                    "  -C  -o ServerAliveInterval=30   port/jump: ~/.ssh/config",
+                // An example of the one thing this field is really for, and a
+                // pointer to where the rest belongs — which is the question the
+                // field raises rather than answers.
+                super::HostField::Options => form_lines.push(Line::from(Span::styled(
+                    "  ssh args, e.g. -L 8080:localhost:3000   host setup: ~/.ssh/config",
                     Style::default().add_modifier(Modifier::DIM),
                 ))),
                 super::HostField::Icon => form_lines.push(Line::from(Span::styled(
@@ -1804,65 +1799,6 @@ const OVERRIDE_COL_WIDTH: u16 = 4;
 pub(super) fn one_line(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_str(&flat, max)
-}
-
-/// A host row's port-forward line, rendered from the raw field text.
-///
-/// Each spec is drawn **canonicalised** (`8080:3000` → `L 8080:localhost:3000`),
-/// because the shorthands exist to be quick to type, not to be the record of
-/// what is happening — and what is happening is the whole question this line
-/// answers. One that doesn't parse is drawn as typed, in the attention colour
-/// behind a `!`: it is silently ignored when the host connects (see
-/// [`crate::port_forward`]), and a row that showed it identically to a working
-/// one would make a typo undiagnosable from the only screen that shows it.
-///
-/// The `socket` transport has no ssh hop to hang a forward on, so specs on such
-/// a host say so rather than appearing to be in force. Pure.
-pub(super) fn forward_spans(raw: &str, is_socket: bool) -> Vec<Span<'static>> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut spans = vec![Span::styled("      ", dim)];
-    for (i, spec) in crate::port_forward::parse_list(raw).into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ", dim));
-        }
-        match crate::port_forward::parse(&spec) {
-            Ok(f) => spans.push(Span::styled(f.to_string(), dim)),
-            Err(_) => spans.push(Span::styled(
-                format!("!{spec}"),
-                Style::default().fg(config::get().colors.ui.attention_fg),
-            )),
-        }
-    }
-    if is_socket {
-        spans.push(Span::styled("  (ssh hosts only)", dim));
-    }
-    spans
-}
-
-/// A host row's extra ssh args, appended to its target line.
-///
-/// A token the connection will refuse — a port forward, which belongs in
-/// `Ports` where something cancels it (see [`super::hosts::classify_ssh_args`])
-/// — is drawn in the attention colour behind a `!`, the same shape the forward
-/// line uses for a spec that doesn't parse, and for the same reason: it is
-/// dropped on connect, and a row that drew it like a live argument would make
-/// that undiagnosable. Pure.
-pub(super) fn ssh_arg_spans(raw: &str) -> Vec<Span<'static>> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let args = super::hosts::split_ssh_args(raw);
-    super::hosts::classify_ssh_args(&args)
-        .into_iter()
-        .map(|(tok, keep)| {
-            if keep {
-                Span::styled(format!("  {tok}"), dim)
-            } else {
-                Span::styled(
-                    format!("  !{tok}"),
-                    Style::default().fg(config::get().colors.ui.attention_fg),
-                )
-            }
-        })
-        .collect()
 }
 
 /// The header's ☁️ host tally: one colored number per bucket, good → error →

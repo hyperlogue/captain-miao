@@ -1051,9 +1051,8 @@ impl App {
                 KeyCode::Tab => {
                     state.focus = match state.focus {
                         HostField::Label => HostField::Target,
-                        HostField::Target => HostField::Ports,
-                        HostField::Ports => HostField::Args,
-                        HostField::Args => HostField::Icon,
+                        HostField::Target => HostField::Options,
+                        HostField::Options => HostField::Icon,
                         HostField::Icon => HostField::Label,
                     }
                 }
@@ -1071,11 +1070,8 @@ impl App {
                             HostField::Target => {
                                 r.target.pop();
                             }
-                            HostField::Ports => {
-                                r.forwards.pop();
-                            }
-                            HostField::Args => {
-                                r.ssh_args.pop();
+                            HostField::Options => {
+                                r.options.pop();
                             }
                             HostField::Icon => {
                                 r.icon.pop();
@@ -1090,8 +1086,7 @@ impl App {
                         match state.focus {
                             HostField::Label => r.label.push(c),
                             HostField::Target => r.target.push(c),
-                            HostField::Ports => r.forwards.push(c),
-                            HostField::Args => r.ssh_args.push(c),
+                            HostField::Options => r.options.push(c),
                             // Capped like the directory-mark icon, and for the
                             // same reason now that the two share one table
                             // column: past ~4 cells an "icon" stops reading as a
