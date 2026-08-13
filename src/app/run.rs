@@ -1076,6 +1076,23 @@ fn arm_settle_reload(settle_reload_at: &mut Option<Instant>) {
     *settle_reload_at = Some(Instant::now() + ACTION_SETTLE);
 }
 
+/// How long after the last resize event the logo's kitty images are rebuilt.
+/// Rebuilding costs a full re-upload (~1 MB of base64 for the three animated
+/// paws), and a drag-resize fires a resize event per frame — so the rebuild
+/// waits out a lull and the whole drag collapses into one upload.
+const LOGO_RECOMPOSE_SETTLE: Duration = Duration::from_millis(200);
+
+/// Arm the post-resize logo rebuild the main loop drains: on expiry it calls
+/// `App::invalidate_logo_graphics`, so the next frame re-uploads the paws and
+/// re-places the shown one (see there for why a resize destroys them).
+///
+/// Deliberately a deadline, not an inline rebuild: re-arming it on every resize
+/// event is what turns a drag's worth of events into a single upload, at the
+/// cost of a blank paw until the drag settles.
+fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
+    *logo_recompose_at = Some(Instant::now() + LOGO_RECOMPOSE_SETTLE);
+}
+
 /// Replace one running session with a fresh launcher resumed at the same
 /// transcript, spawned into the current [`SessionsLayout`] (the shared
 /// `miao:sessions` tab in Stacked, its own tab in Per-tab) — this is how a layout
@@ -1349,6 +1366,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     // (`arm_settle_reload`); drained at the top of the loop so the action itself
     // never blocks a frame on it.
     let mut settle_reload_at: Option<Instant> = None;
+    // Deadline armed by a resize (`arm_logo_recompose`), on which the logo's
+    // kitty images are rebuilt — a resize clears the screen, and that frees
+    // them terminal-side.
+    let mut logo_recompose_at: Option<Instant> = None;
     loop {
         // A settle deadline that has come due forces the next reload: re-arm
         // `fs_dirty` and clear `last_reload` so the debounce doesn't defer it.
@@ -1356,6 +1377,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             settle_reload_at = None;
             fs_dirty = true;
             last_reload = None;
+        }
+        // A resize that has settled: rebuild the logo's kitty images. Drained
+        // above the draw so the re-upload and the re-place land in one frame.
+        if logo_recompose_at.is_some_and(|t| Instant::now() >= t) {
+            logo_recompose_at = None;
+            app.invalidate_logo_graphics();
+            needs_redraw = true;
         }
         // An attach window reporting that its session ended — the event that
         // makes detachment prompt without polling the window tree (§5). Handled
@@ -1755,6 +1783,12 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         if let Some(t) = app.next_session_close_due() {
             poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
         }
+        // Nor past the post-resize logo rebuild: nothing else wakes a dashboard
+        // that was only resized, so the paw would stay blank until some
+        // unrelated event happened along.
+        if let Some(t) = logo_recompose_at {
+            poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
+        }
         if event::poll(poll_timeout)? {
             let evt = event::read()?;
             // Any input event can mutate state (selection, status, input mode,
@@ -1801,17 +1835,19 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 }
                 Event::Resize(_, _) => {
                     // Refresh the cell size (a kitty font-zoom, Ctrl+Shift+=, alters
-                    // it — it feeds the cat's sub-cell offset) and force one cheap
-                    // re-place in case the resize cleared the placement. The uploaded
-                    // images are a fixed-size mask, independent of terminal geometry,
-                    // so a resize *never* needs a recompose: kitty rescales the
-                    // source into the cell box on its own. Skipping it avoids both the
-                    // ~1.4 MB re-upload storm during a drag-resize and the one-frame
-                    // paw blink each recompose caused, and lets a running pulse/walk
-                    // ride through the resize. (Graphics capability is fixed for the
-                    // process on kitty, so this never needs to compose/tear down.)
+                    // it — it feeds the cat's sub-cell offset) and arm the logo
+                    // rebuild. The images themselves are geometry-independent — a
+                    // fixed-size mask kitty rescales into the cell box on its own —
+                    // but they don't *survive* a resize: ratatui clears the screen on
+                    // one, and kitty frees every image the clear leaves without a
+                    // placement (`App::invalidate_logo_graphics`). Re-placing alone
+                    // draws nothing and the failure is silent, so the rebuild is not
+                    // optional; debouncing it (`arm_logo_recompose`) is what keeps a
+                    // drag-resize from re-uploading per event. (Graphics capability
+                    // is fixed for the process on kitty, so this never needs to tear
+                    // down.)
                     app.logo_caps = terminal::graphics::capability();
-                    app.logo_placed_color = None;
+                    arm_logo_recompose(&mut logo_recompose_at);
                     None
                 }
                 _ => None,

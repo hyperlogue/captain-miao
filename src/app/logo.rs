@@ -327,6 +327,29 @@ impl App {
         }
     }
 
+    /// Drop everything we believe kitty is still holding for the logo, so the
+    /// next `render_logo_graphics` re-uploads the three paws and re-places the
+    /// shown one. Armed by a resize (`arm_logo_recompose`).
+    ///
+    /// A resize is not just a lost *placement*: ratatui clears the whole screen
+    /// on one (`Terminal::resize` → `clear_viewport`), and kitty's `ESC[2J`
+    /// handler deletes every placement on the screen and then frees the image
+    /// data of anything left without one (`grman_clear` → `filter_refs` with
+    /// `free_images`). That takes all three paws — the two colours that were
+    /// never placed as surely as the one that was — plus any cat sheet. Placing
+    /// a freed id answers `ENOENT`, which our `q=2` suppresses, so a re-place
+    /// alone leaves the paw silently blank for the rest of the run.
+    ///
+    /// A cat mid-walk is only marked for re-upload, not retired: it re-transmits
+    /// its sheet on the next frame and finishes its walk visibly.
+    pub(super) fn invalidate_logo_graphics(&mut self) {
+        self.logo_composed = false;
+        self.logo_placed_color = None;
+        for cat in &mut self.cats {
+            cat.transmitted = false;
+        }
+    }
+
     /// Aggregate status tint for the paw: yellow if any session wants attention,
     /// else green if any is busy, else gray. Matches the Sessions column's
     /// attention/active/idle split (`is_attention_row` / `is_busy`).

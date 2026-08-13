@@ -5992,3 +5992,33 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
         "the dropped binding is still on disk: {on_disk:?}"
     );
 }
+
+// -- Logo graphics --
+
+/// A resize costs the logo its kitty *images*, not just its placement: ratatui
+/// clears the screen on every resize, and kitty's clear frees every image the
+/// deleted placements leave unreferenced — all three paws, since only the shown
+/// colour is ever placed. So the invalidation must force a re-upload; marking
+/// only the placement stale would re-place a freed id, which fails silently
+/// under `q=2` and leaves the paw blank for the rest of the run.
+#[test]
+fn resize_invalidation_forces_a_logo_re_upload() {
+    let mut d = TestDashboard::new(80, 24);
+    d.app.logo_caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    d.app.logo_composed = true;
+    d.app.logo_placed_color = Some(super::logo::PawState::Idle);
+    // A cat mid-walk, its sheet already uploaded.
+    d.app.start_logo_anim();
+    assert!(d.app.cat_walking(), "precondition: a cat should be walking");
+
+    d.app.invalidate_logo_graphics();
+
+    assert!(
+        !d.app.logo_composed,
+        "the paws must be re-uploaded, not merely re-placed"
+    );
+    assert!(d.app.logo_placed_color.is_none());
+    // The walk isn't retired — the cat re-transmits its sheet on the next frame
+    // rather than finishing its trip invisibly.
+    assert!(d.app.cat_walking());
+}
