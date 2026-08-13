@@ -10,7 +10,7 @@ use ratatui::{
     },
 };
 
-use crate::backend::ConnState;
+use crate::backend::{ConnState, VitalsView};
 use crate::config;
 use crate::state::{HostId, LauncherState, SessionStatus};
 
@@ -404,6 +404,10 @@ impl App {
                 ),
                 Style::default().add_modifier(Modifier::DIM),
             ));
+            // The trailer is one dim run of annotations, accumulated as a string
+            // and pushed as a span — except where a failed probe has to carry
+            // its own colour, which closes the run early and opens another.
+            let dim = Style::default().add_modifier(Modifier::DIM);
             let mut trailer = String::new();
             if let Some(v) = backend.daemon_version() {
                 trailer.push_str(&format!("  v{v}"));
@@ -431,15 +435,37 @@ impl App {
             // session?", which is the other half of the question the latency
             // starts. Percentages rather than absolutes because the row is a
             // scannable line, not a monitor — `l` is where detail goes. Absent
-            // until the daemon's first push (and on a daemon too old to send
-            // any), which shows as the numbers simply not being there.
-            if let Some(v) = backend.vitals() {
-                if let Some(cpu) = v.cpu_percent {
-                    trailer.push_str(&format!("  cpu {cpu:.0}%"));
+            // until the first poll comes back, which shows as the numbers
+            // simply not being there.
+            //
+            // The figures are the *last* reading, held across polls, so a
+            // reopened panel is populated on its first frame rather than a round
+            // trip later — which is only honest because the arm below replaces
+            // them the moment a probe stops answering (see [`VitalsView`]).
+            match backend.vitals() {
+                Some(VitalsView::Reading(v)) => {
+                    if let Some(cpu) = v.cpu_percent {
+                        trailer.push_str(&format!("  cpu {cpu:.0}%"));
+                    }
+                    if let Some(mem) = v.mem_percent() {
+                        trailer.push_str(&format!("  mem {mem:.0}%"));
+                    }
                 }
-                if let Some(mem) = v.mem_percent() {
-                    trailer.push_str(&format!("  mem {mem:.0}%"));
+                // Said rather than left blank, and in the attention colour: the
+                // host is connected and everything else about it is on the row,
+                // so two numbers quietly missing reads as "nothing worth
+                // mentioning" rather than "we asked and got nothing back". The
+                // one span here that isn't dim, which is why the run is closed.
+                Some(VitalsView::Unavailable) => {
+                    if !trailer.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut trailer), dim));
+                    }
+                    spans.push(Span::styled(
+                        "  cpu/mem unavailable".to_string(),
+                        Style::default().fg(ui.attention_fg),
+                    ));
                 }
+                None => {}
             }
             // Sampled from ordinary request traffic — no `Ping` frame exists,
             // deliberately (§9). `None` just means nothing has been asked yet.
@@ -447,10 +473,7 @@ impl App {
                 trailer.push_str(&format!("  {}ms", rtt.as_millis()));
             }
             if !trailer.is_empty() {
-                spans.push(Span::styled(
-                    trailer,
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
+                spans.push(Span::styled(trailer, dim));
             }
         }
         spans

@@ -943,10 +943,18 @@ decides what they mean**.
     reachable, and with room; and because the poll refreshes the latency sample
     too, the whole line goes live while it is being read. Rendered as two
     percentages, no absolutes and no colour threshold: the row is a scannable
-    line, and a pegged CPU on a build box is normal rather than an alert. A host
-    that reports nothing (an older daemon, an OS we can't read, a link that just
-    dropped) shows nothing rather than zeros, which on a utilisation display
-    would read as a definitely-idle host. Editing a
+    line, and a pegged CPU on a build box is normal rather than an alert. The
+    figures shown are the **last reading**, held until another reading replaces
+    them, so a reopened panel is populated on its first frame rather than a
+    round trip later. What makes that honest is the failure arm: a probe that
+    comes back with nothing — a daemon too old to know the frame, a host that
+    missed the deadline — is reported as `cpu/mem unavailable` in the attention
+    colour *in place of* the figures, because numbers left standing over a host
+    that has stopped answering are indistinguishable from live ones. A host that
+    answers with nothing to say (an OS we can't read) shows no figures rather
+    than zeros, which on a utilisation display would read as a definitely-idle
+    host; a dropped link drops the reading outright, the row having already said
+    `disconnected`. Editing a
   row exposes label / target (`^t` toggles ssh↔socket) / **options** (below) /
   **icon** (`^e` opens the same searchable emoji picker as `Space i`). There is
   **no Save
