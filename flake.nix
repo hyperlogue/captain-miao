@@ -48,9 +48,9 @@
         ];
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # The targets a bundled dashboard cross-compiles the server to
-        # (docs/crate-split.md). Only `rust-std` comes from here — the C half of
-        # the cross (bundled SQLite's amalgamation, and the link itself) is
+        # The targets `captain-miao-servers` can cross-compile a `miao-server`
+        # to (docs/crate-split.md). Only `rust-std` comes from here — the C half
+        # of the cross (bundled SQLite's amalgamation, and the link itself) is
         # `cargo-zigbuild`'s job, which ships its own libc headers and linker
         # per target.
         #
@@ -60,11 +60,10 @@
         # targets are installed.
         # The musl pair is here because a static build is the only server that
         # runs on a host with no generic loader (NixOS, Alpine, distroless),
-        # where the gnu build cannot start at all. The default download does not
-        # carry them — a release publishes them as assets and a dashboard fetches
-        # one when it meets such a host — but `prepare-servers` builds all four
-        # and the `bundle-linux-all` artifact embeds them, so the toolchain has to
-        # be able to.
+        # where the gnu build cannot start at all — and musl x86-64 is what
+        # `captain-miao-servers` builds *by default*, so this is not a
+        # contingency but the common path here. All four are listed because that
+        # package's `targets` is overridable to any of them.
         crossTargets = [
           "x86_64-unknown-linux-gnu"
           "aarch64-unknown-linux-gnu"
@@ -82,11 +81,11 @@
         # them. A source filter can't see a compile-time file dependency, so
         # keep `assets/` explicitly alongside the Rust sources.
         #
-        # Nothing extra is needed for the embedded server payloads: these
-        # packages build with CM_SERVER_PAYLOAD_MANIFEST unset, so `build.rs`
-        # embeds nothing. The bundled variants below cross-build servers and pass
-        # a manifest naming them, which works offline — every cargo invocation
-        # resolves from the vendored registry crane sets up for the outer build.
+        # Nothing here embeds a server payload: every package builds with
+        # CM_SERVER_PAYLOAD_MANIFEST unset, so `build.rs` embeds nothing. Nix
+        # reaches remote hosts through `captain-miao-with-servers` instead, which
+        # points the dashboard at a directory of servers rather than compiling
+        # them in — see `nix/servers.nix` for why that is the better trade here.
         src = let
           root = ./.;
           isAsset = path: lib.hasPrefix "${toString root}/assets/" path;
@@ -115,19 +114,28 @@
             meta.mainProgram = "miao";
           });
 
-        # The per-host daemon + pty pool, deployed to remote hosts. A separate
-        # workspace member (libshpool lives only here), so scope the build/test
-        # to it with `-p`; reuses the shared dependency artifacts.
+        # The per-host daemon + pty pool, **for this machine only**. A separate
+        # workspace member (libshpool lives only here), so scope the build to it
+        # with `-p`; reuses the shared dependency artifacts.
         #
-        # Deliberately left on plain `release`, not the size-tuned
-        # `server-release` that `xtask` builds published payloads with. That
-        # profile exists to shrink a *download* — every npm install and GitHub
-        # tarball carries a server — and a Nix user builds from source, so it
-        # would be trading throughput for bytes nobody transfers. The two
-        # binaries are otherwise identical; nothing about the wire protocol or
-        # behaviour depends on the profile. (`captain-miao-servers` below goes
-        # through `prepare-servers`, so those *are* `server-release` — they are
-        # payloads a dashboard deploys, which is the case the profile is for.)
+        # This and `captain-miao-servers` are the same program built two ways,
+        # and confusing them is the mistake worth naming. This one is an ordinary
+        # nixpkgs build: `rustToolchain`, plain `cargo build --release`, linked
+        # against the store's own glibc with an absolute `/nix/store/…/ld-linux`
+        # interpreter. That is exactly right for its job — the Home Manager
+        # module putting `miao-server` on *this* machine's PATH, where a
+        # dashboard finds it locally and no deploy happens at all — and exactly
+        # wrong anywhere else, because that loader exists on no other host.
+        #
+        # Anything a dashboard *deploys* must come from `captain-miao-servers`
+        # instead, which cross-builds through zigbuild against a pinned glibc
+        # floor and asserts it did (`nix/servers.nix`). Filed under a generic
+        # triple, this binary would look correct and fail on every non-Nix host —
+        # the inverse of the failure the whole deploy design started from.
+        #
+        # It also stays on plain `release`, not the size-tuned `server-release`
+        # that `xtask` builds published payloads with: that profile exists to
+        # shrink a *download*, and there is no download here.
         captain-miao-server = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
@@ -135,64 +143,13 @@
             cargoExtraArgs = "--locked -p captain-miao-server";
             meta.mainProgram = "miao-server";
           });
-        # The dashboard variants that carry a `miao-server` to deploy to
-        # a remote host — one package per variant `cargo xtask dist` knows about
-        # (docs/crate-split.md).
-        #
-        # These delegate to `xtask` rather than reimplementing it in nix: it
-        # cross-builds the servers, writes the manifest naming them, and builds a
-        # dashboard that embeds it. A nix expression would be a second copy of
-        # that, free to drift. The whole sequence runs offline — every cargo
-        # invocation resolves from the vendored registry crane already set up,
-        # which is also why these pin `--from build` (the default) rather than
-        # offering the `release` source: a nix build has no network to fetch one
-        # over.
-        #
-        # Two things they need that a plain build doesn't. `devToolchain`, for
-        # the cross `rust-std`s — hence a second craneLib, leaving the plain
-        # packages on `rustToolchain` so their output is untouched. And a
-        # writable `HOME`: cargo-zigbuild keeps a cache under it and nix points it
-        # at the non-existent `/homeless-shelter`, so the cross fails on a
-        # permission error before zig is ever invoked.
-        craneLibBundled = (crane.mkLib pkgs).overrideToolchain devToolchain;
-        mkBundled = variant:
-          craneLibBundled.buildPackage (commonArgs
-            // {
-              pname = "captain-miao-${variant}";
-              nativeBuildInputs = [pkgs.cargo-zigbuild pkgs.zig];
-              preBuild = ''
-                export HOME="$TMPDIR"
-                export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-              '';
-              buildPhaseCargoCommand = ''
-                cargo run --release --locked -p xtask -- dist --variant ${variant}
-              '';
-              # `dist` names its artifacts, and the binary inside is `miao`.
-              installPhaseCommand = ''
-                install -Dm755 dist/miao-${variant} "$out/bin/miao"
-              '';
-              # crane's default install reads a cargo build log to decide which
-              # binaries to install. There isn't one here — the artifact comes
-              # out of `dist/`, already patched — and installing straight from
-              # `target/release` would give an *unbundled* `miao`, so this has to
-              # be off rather than merely redundant.
-              doNotPostBuildInstallCargoBinaries = true;
-              # `xtask dist` already runs the artifact and checks it reports the
-              # servers it was built to carry — the check that catches a manifest
-              # that silently didn't reach the compile.
-              doCheck = false;
-              meta.mainProgram = "miao";
-            });
-        # `bundle-linux-x86_64` is what a release ships for every host target;
-        # `bundle-linux-all` is the separate all-server download. The other two
-        # are not published but stay buildable — a Nix user driving a fleet of one
-        # architecture has no reason to carry the other.
-        bundled = lib.genAttrs [
-          "bundle-linux"
-          "bundle-linux-x86_64"
-          "bundle-linux-aarch64"
-          "bundle-linux-all"
-        ] (variant: mkBundled variant);
+        # `devToolchain`, for the cross `rust-std`s a deployable server needs — a
+        # second craneLib, leaving the plain packages on `rustToolchain` so their
+        # output stays byte-identical. Those builds also need a writable `HOME`:
+        # cargo-zigbuild keeps a cache under it and nix points it at the
+        # non-existent `/homeless-shelter`, so the cross fails on a permission
+        # error before zig is ever invoked.
+        craneLibCross = (crane.mkLib pkgs).overrideToolchain devToolchain;
 
         # A link farm of servers, and (below) a dashboard pointed at it — the
         # recommended way to drive remote hosts from Nix.
@@ -204,7 +161,7 @@
         #       targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
         #     }
         captain-miao-servers = pkgs.callPackage ./nix/servers.nix {
-          inherit craneLibBundled commonArgs;
+          inherit craneLibCross commonArgs;
         };
 
         # The dashboard with the remote-hosts gate on. Required by the wrapper
@@ -224,15 +181,10 @@
           inherit captain-miao-remote captain-miao-servers;
         };
       in {
-        packages =
-          {
-            default = captain-miao;
-            inherit captain-miao captain-miao-server captain-miao-remote captain-miao-servers captain-miao-with-servers;
-          }
-          # `captain-miao-bundle-linux`, and the single-arch + all-server variants.
-          // lib.mapAttrs' (feature: pkg:
-            lib.nameValuePair "captain-miao-${feature}" pkg)
-          bundled;
+        packages = {
+          default = captain-miao;
+          inherit captain-miao captain-miao-server captain-miao-remote captain-miao-servers captain-miao-with-servers;
+        };
 
         devShells.default = import ./nix/shell.nix {
           inherit pkgs;

@@ -69,10 +69,14 @@ in {
         ```
 
         The servers are separate store paths there, so widening that list costs
-        a server build rather than a rebuild of the dashboard. The
-        `captain-miao-bundle-*` variants compile the servers *into* `miao`
-        instead — the shape a release publishes, and rarely what you want on
-        Nix, where nothing is downloaded.
+        a server build rather than a rebuild of the dashboard, and they are
+        cross-built against a pinned glibc floor so they run on hosts that are
+        not NixOS.
+
+        Note this is a different build from `captain-miao-server`, which is an
+        ordinary store-linked binary for *this* machine's PATH — see
+        `services.captain-miao.server.enable` below. That one cannot be deployed
+        anywhere else.
       '';
     };
 

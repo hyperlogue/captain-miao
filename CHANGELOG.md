@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.override { targets = [ … ]; }` widens that fleet without rebuilding the
   dashboard.
 
+### Removed
+
+- **Nix: the `captain-miao-bundle-*` packages.** They compiled servers into the
+  `miao` binary for parity with the published artifacts, which buys nothing when
+  nothing is downloaded — and every change to the fleet relinked the dashboard.
+  Use `captain-miao-with-servers` instead.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added

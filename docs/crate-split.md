@@ -350,34 +350,39 @@ reason embedding exists elsewhere: a download wants one self-contained file,
 whereas in the store the servers are paths shared between generations, and adding
 an architecture costs a server build rather than relinking `miao`.
 
-**The bundled variants also exist on Nix**: `packages.captain-miao-bundle-linux`
-and the single-arch + all-server ones, matching what a release publishes. They
-delegate to `cargo xtask dist` rather than reimplementing
-it, because obtaining the servers, writing each variant's manifest and building
-against it is exactly what `dist` already does — a nix expression would be a
-second copy of it, free to drift. The whole sequence runs offline: every cargo
-invocation resolves from the vendored registry crane already set up, which is
-also why these stay on `--from build` (the default) rather than offering the
-`release` source — a nix build has no network to fetch one over. Two things they
-need that the
-plain packages don't, both found by trying it: `devToolchain` for the cross
-`rust-std`s (a second `craneLib`, so `nix build .#captain-miao` stays
-byte-identical), and a **writable `HOME`** — cargo-zigbuild keeps a cache under it
-and nix points `HOME` at the non-existent `/homeless-shelter`, so the cross dies
-on a permission error before zig is even invoked.
+**Nix does not embed at all — the flake carries no bundled variants.** They
+existed for parity with what a release publishes and nobody wanted them: a Nix
+build downloads nothing, so the one property embedding buys — a single
+self-contained file — is worth nothing there, while every widening of the fleet
+cost a full relink of `miao`.
 
-**Nix also has a better option than embedding**, and it is the one to reach for
-there: `packages.captain-miao-servers` builds a link farm via `prepare-servers`,
-and `packages.captain-miao-with-servers` wraps the dashboard with
-`CAPTAIN_MIAO_SERVER_DIR` pointed at it. The servers become store paths shared
-between dashboard generations rather than megabytes recompiled into one binary,
-and adding an architecture no longer relinks `miao`. The farm must hold
-`prepare-servers` **cross** builds and never `packages.captain-miao-server` — that
-one is crane-built against the store's own glibc with an absolute
-`/nix/store/…/ld-linux` interpreter, so under a generic triple it would look
-correct and fail on every non-Nix host. Delegating to `prepare-servers` makes that
-impossible by construction; the deploy's interpreter check is the belt. The
-wrapper uses `--set-default`, so a user's own `CAPTAIN_MIAO_SERVER_DIR` still wins.
+**Two builds of the same server, and confusing them is the mistake.**
+`packages.captain-miao-server` is an ordinary nixpkgs build: `rustToolchain`,
+plain `cargo build --release`, linked against the store's own glibc with an
+absolute `/nix/store/…/ld-linux` interpreter. That is right for its only job —
+the Home Manager module putting `miao-server` on *this* machine's PATH, where a
+dashboard finds it locally and no deploy happens — and wrong anywhere else,
+because that loader exists on no other host. Anything a dashboard *deploys* comes
+from `packages.captain-miao-servers`, which cross-builds through cargo-zigbuild
+against the pinned glibc floor.
+
+That distinction is **asserted, not assumed**. `choose_strategy` prefers zigbuild
+but falls back to a native build when zig is not on `PATH`, and for a
+`-linux-gnu` target on an x86-64 builder that fallback *succeeds* — producing
+precisely the store-linked binary above, which would pass every other check and
+fail at exec on the first host it reached. So `nix/servers.nix` refuses any
+output whose ELF interpreter is a store path. A musl build is static and has none,
+which is the expected case rather than a skipped one.
+
+Both need `devToolchain` for the cross `rust-std`s (a second `craneLib`, so
+`nix build .#captain-miao` stays byte-identical) and a **writable `HOME`** —
+cargo-zigbuild keeps a cache under it and nix points `HOME` at the non-existent
+`/homeless-shelter`, so the cross dies on a permission error before zig is even
+invoked. The whole sequence runs offline, which is also why it stays on
+`--from build`: a nix build has no network to fetch a published server over.
+
+The wrapper uses `--set-default`, so a user's own `CAPTAIN_MIAO_SERVER_DIR` still
+wins.
 
 **Deploying: `backend.rs`.** The connect probe gained a fifth line (the digest
 marker beside the deployed binary) and `Provision` gained an `Upload` arm. The
