@@ -1717,8 +1717,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cm-sock-health-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("probe.sock");
+        let successor = dir.join("successor.sock");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&successor);
         std::fs::write(&path, b"").unwrap();
+        // Mint the replacement now, while the original still holds its inode, so
+        // the filesystem cannot issue the same number twice. Creating it after
+        // the unlink instead leaves the case at the mercy of the allocator: ext4
+        // hands the just-freed inode straight back to the next create in that
+        // directory, so the replacement read as intact and this test failed on
+        // CI while passing on a btrfs checkout, where numbers only ever climb.
+        std::fs::write(&successor, b"").unwrap();
 
         let bound = file_identity(&path);
         assert!(bound.is_some());
@@ -1732,8 +1741,15 @@ mod tests {
         assert!(hook_socket_lost(&path, bound));
 
         // Replaced: present again, different inode, our listener orphaned.
-        std::fs::write(&path, b"").unwrap();
+        // `rename` carries the successor's own inode across, so this stays a
+        // real replacement however the allocator recycles numbers.
+        std::fs::rename(&successor, &path).unwrap();
         assert!(std::fs::metadata(&path).is_ok());
+        assert_ne!(
+            file_identity(&path),
+            bound,
+            "fixture must replace the inode"
+        );
         assert!(hook_socket_lost(&path, bound));
 
         // No identity recorded at bind time leaves nothing to compare, so
