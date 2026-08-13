@@ -51,16 +51,18 @@ const ARM: &str = "aarch64-unknown-linux-gnu";
 const X86_MUSL: &str = "x86_64-unknown-linux-musl";
 const ARM_MUSL: &str = "aarch64-unknown-linux-musl";
 
-/// What a **shipping bundled variant embeds**: glibc only.
+/// The glibc pair. Not a shipping set on its own any more — [`SHIPPING_VARIANT`]
+/// carries [`X86`] alone — but kept as the set a `bundle-linux` build embeds and
+/// as the floor [`PUBLISHED_TARGETS`] must stay a superset of.
 ///
 /// Deliberately *not* the same set as [`PUBLISHED_TARGETS`], and the two must
-/// not be re-merged. A released dashboard embeds no musl: musl's audience is
+/// not be re-merged. The default download embeds no musl: musl's audience is
 /// hosts with no generic loader (NixOS, Alpine, distroless), and those have a
 /// better answer already — a server built against their own libc, on their own
 /// PATH, with no deploy at all. Making every downloader carry ~6 MiB aimed at
-/// the one platform that doesn't need it is the wrong default. A released
-/// dashboard reaches such a host by *downloading* the published musl asset
-/// instead, which is what [`PUBLISHED_TARGETS`] exists for.
+/// the one platform that doesn't need it is the wrong default. Such a host is
+/// reached by *downloading* the published musl asset instead — what
+/// [`PUBLISHED_TARGETS`] exists for — or by taking [`ALL_SERVER_VARIANT`].
 const LINUX_TARGETS: &[&str] = &[X86, ARM];
 
 /// What a release **publishes** as assets, and what `prepare-servers` builds by
@@ -288,21 +290,36 @@ const VARIANTS: &[Variant] = &[
         servers: LINUX_TARGETS,
         what: "remote hosts, deploying its own server to either Linux arch",
     },
-    // A dev variant, deliberately outside DEFAULT_VARIANTS so it is never a
-    // release artifact: it exists so the candidate loop and the musl path are
-    // exercised by a build we can actually run, rather than only on a host we
-    // don't have. Released dashboards stay gnu-only — see LINUX_TARGETS.
     Variant {
         name: "bundle-linux-all",
         features: &[],
         servers: PUBLISHED_TARGETS,
-        what: "dev: every Linux server (gnu + musl), for exercising the musl fallback",
+        what: "every published Linux server (gnu + musl) — reaches any host without a download",
     },
 ];
 
-/// What `dist` builds when asked for nothing in particular: the two ends of the
-/// range, which is what a release would carry.
-const DEFAULT_VARIANTS: &[&str] = &["", "bundle-linux"];
+/// The variant **every published dashboard download is built from** — GitHub
+/// tarballs and all four npm platform packages alike.
+///
+/// One server, x86-64 glibc, on every host platform including the macOS ones:
+/// the payload's target is the *remote host's*, not the laptop's, and x86-64
+/// glibc is overwhelmingly what a remote host runs. Anything else is a download
+/// away at deploy time, which is the trade — ~2.8 MiB on every install against a
+/// one-time fetch for the minority host.
+const SHIPPING_VARIANT: &str = "bundle-linux-x86_64";
+
+/// The extra GitHub-only artifact, carrying every server a release publishes.
+///
+/// For the air-gapped case and for anyone driving a mixed fleet: it deploys to
+/// arm64 and to musl hosts with no network fetch at all. Roughly 2.5× the
+/// shipping download, which is exactly why it is a separate asset rather than
+/// the default — and why it never goes to npm.
+const ALL_SERVER_VARIANT: &str = "bundle-linux-all";
+
+/// What `dist` builds when asked for nothing in particular: precisely what a
+/// release publishes. The plain build is deliberately absent — it is what a bare
+/// `cargo build` already produces, and nothing has shipped it since 0.4.0.
+const DEFAULT_VARIANTS: &[&str] = &[SHIPPING_VARIANT, ALL_SERVER_VARIANT];
 
 impl Variant {
     /// How the variant is named on the command line and in output. The plain
@@ -391,8 +408,8 @@ fn workspace_root() -> Result<PathBuf> {
 
 #[derive(Args)]
 struct DistArgs {
-    /// Variant to build (repeatable). Defaults to the plain dashboard plus
-    /// `bundle-linux`. Use `--list` to see them all.
+    /// Variant to build (repeatable). Defaults to what a release publishes.
+    /// Use `--list` to see them all.
     #[arg(long = "variant", value_name = "NAME")]
     variants: Vec<String>,
     /// Build every variant.
@@ -401,6 +418,14 @@ struct DistArgs {
     /// Print the variants and exit.
     #[arg(long)]
     list: bool,
+    /// Compile the dashboard for this target instead of the host.
+    ///
+    /// Only the *dashboard* — the servers a variant carries are named by the
+    /// variant and obtained through `--from`, and are unrelated to the machine
+    /// the dashboard runs on. Release CI needs this for x86-64 macOS, which is
+    /// cross-built on an arm64 runner.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
     #[command(flatten)]
     servers: ServerArgs,
 }
@@ -438,21 +463,28 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
     std::fs::create_dir_all(&dist_dir)
         .with_context(|| format!("creating {}", dist_dir.display()))?;
 
+    // Whether the artifact will run here. A cross-built dashboard cannot be
+    // executed, so `verify` falls back to reading its bytes — see there.
+    let runnable = match &args.target {
+        None => true,
+        Some(t) => server::host_triple().map(|h| &h == t).unwrap_or(false),
+    };
+
     let mut built = Vec::new();
     for v in &wanted {
         println!("\n▶ {}", v.label());
         let payloads = pick_payloads(&servers, v.servers)?;
 
-        build_dashboard(ws, v, &payloads)?;
+        build_dashboard(ws, v, &payloads, args.target.as_deref())?;
 
         let to = dist_dir.join(v.artifact());
         // Copy rather than rename: every variant's build reuses the same
         // `target/release/cm`, so leaving it in place would be a lie the moment
         // the next one overwrote it.
-        let from = ws.target_dir.join("release").join(DASHBOARD_BIN);
+        let from = built_dashboard(&ws.target_dir, args.target.as_deref());
         install(&from, &to)?;
 
-        verify(&to, v.servers)?;
+        verify(&to, &payloads, runnable)?;
         built.push((v.artifact(), std::fs::metadata(&to).map(|m| m.len())?));
     }
 
@@ -479,7 +511,12 @@ fn pick_payloads<'a>(
         .collect()
 }
 
-fn build_dashboard(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) -> Result<()> {
+fn build_dashboard(
+    ws: &Workspace,
+    v: &Variant,
+    payloads: &[&server::Payload],
+    target: Option<&str>,
+) -> Result<()> {
     let features = v.cargo_features();
     let mut argv = vec![
         "build".to_string(),
@@ -488,6 +525,10 @@ fn build_dashboard(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) -
         "-p".to_string(),
         DASHBOARD_PKG.to_string(),
     ];
+    if let Some(t) = target {
+        argv.push("--target".to_string());
+        argv.push(t.to_string());
+    }
     if !features.is_empty() {
         argv.push("--features".to_string());
         argv.push(features.join(","));
@@ -581,15 +622,65 @@ fn find_variant(name: &str) -> Result<&'static Variant> {
     })
 }
 
-/// Run the artifact and check it reports what it was built to carry.
+/// Where cargo leaves the dashboard it just built.
+///
+/// Passing `--target` moves the output under a triple-named directory — even
+/// when that triple *is* the host, which is the case worth stating: there is no
+/// "same as host, so same path" shortcut, and reading `target/release/miao` after
+/// a `--target` build silently picks up whatever an earlier plain build left
+/// there. Pure, so the layout is pinned by a test rather than by a CI run that
+/// packaged a stale binary.
+fn built_dashboard(target_dir: &Path, target: Option<&str>) -> PathBuf {
+    let mut p = target_dir.to_path_buf();
+    if let Some(t) = target {
+        p.push(t);
+    }
+    p.join("release").join(DASHBOARD_BIN)
+}
+
+/// Check the artifact really carries what it was built to carry.
 ///
 /// A manifest reaches the dashboard through an environment variable and a
 /// generated file, which is exactly the kind of seam that fails silently: a
 /// variable that didn't survive, a manifest naming an archive that moved, and the
-/// build succeeds carrying nothing. Running the thing is the only check that
-/// catches it. The artifact is always built for this host, so failing to start is
-/// a failure rather than something to note and move past.
-fn verify(artifact: &Path, servers: &[&str]) -> Result<()> {
+/// build succeeds carrying nothing. Something has to look, or a hollow bundle
+/// ships.
+///
+/// Running the artifact is the better check and is used whenever it *can* run —
+/// it exercises the real accessor, not just the presence of some bytes. A
+/// cross-built dashboard can't be executed here, so the fallback searches the
+/// image for each payload's SHA-256, which survives `strip = true` because it is
+/// a `&'static str` in `.rodata` rather than a symbol. That is weaker (it proves
+/// the table was populated, not that the binary starts) but it is the difference
+/// between checking the cross build and not checking it, and CI still runs the
+/// native artifacts.
+fn verify(artifact: &Path, payloads: &[&server::Payload], runnable: bool) -> Result<()> {
+    if !runnable {
+        if payloads.is_empty() {
+            println!("  cross-built and carries nothing — nothing to verify");
+            return Ok(());
+        }
+        let image =
+            std::fs::read(artifact).with_context(|| format!("reading {}", artifact.display()))?;
+        for p in payloads {
+            let needle = p.sha256.as_bytes();
+            if !image.windows(needle.len()).any(|w| w == needle) {
+                bail!(
+                    "{} was built to carry {} but its image does not contain that payload's \
+                     digest ({}…) — the manifest did not reach the build",
+                    artifact.display(),
+                    p.target,
+                    &p.sha256[..12],
+                );
+            }
+        }
+        println!(
+            "  cross-built: {} payload digest(s) present",
+            payloads.len()
+        );
+        return Ok(());
+    }
+
     let out = Command::new(artifact)
         .arg("--version")
         .output()
@@ -598,16 +689,17 @@ fn verify(artifact: &Path, servers: &[&str]) -> Result<()> {
         bail!("{} does not run ({})", artifact.display(), out.status);
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    for target in servers {
-        if !text.contains(target) {
+    for p in payloads {
+        if !text.contains(&p.target) {
             bail!(
-                "{} was built to carry {target} but does not report it:\n{}",
+                "{} was built to carry {} but does not report it:\n{}",
                 artifact.display(),
+                p.target,
                 text.trim()
             );
         }
     }
-    if servers.is_empty() && !text.contains("none") {
+    if payloads.is_empty() && !text.contains("none") {
         bail!(
             "{} should carry nothing but reports:\n{}",
             artifact.display(),
@@ -915,24 +1007,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The variant that ships and the `bundle` default have to agree: they are
-    /// two spellings of "what a release carries".
+    /// The default download carries **exactly one** server, x86-64 glibc.
+    ///
+    /// Every published artifact is built from this variant — four GitHub
+    /// tarballs and four npm packages — so a second payload here is ~2.8 MiB
+    /// added to every install captain-miao has, including the macOS ones that
+    /// would be carrying a Linux binary purely on the chance a host needs it.
+    /// Widening the fleet is [`ALL_SERVER_VARIANT`]'s job, not this one's.
     #[test]
-    fn bundle_defaults_to_what_the_shipping_variant_carries() {
-        assert_eq!(find_variant("bundle-linux").unwrap().servers, LINUX_TARGETS);
+    fn the_shipping_variant_carries_exactly_one_glibc_server() {
+        assert_eq!(find_variant(SHIPPING_VARIANT).unwrap().servers, &[X86]);
     }
 
-    /// No **release** artifact may embed a musl server.
+    /// Only the explicitly-named all-server artifact may embed a musl server.
     ///
     /// The two target sets were one const until musl arrived, and re-merging
     /// them is the easy mistake: it silently adds ~6 MiB to every download for
     /// a payload aimed at the one platform that is better served without a
     /// deploy at all. The reverse mistake — dropping musl from what we publish —
-    /// is caught by the test below, since nothing embeds those builds and the
-    /// runtime downloader is the only thing that can reach them.
+    /// is caught by the test below, since the shipping variant embeds none of
+    /// them and the runtime downloader is the only other thing that can reach
+    /// them.
     #[test]
-    fn no_release_variant_embeds_a_musl_server() {
+    fn only_the_all_server_variant_embeds_a_musl_server() {
         for name in DEFAULT_VARIANTS {
+            if *name == ALL_SERVER_VARIANT {
+                continue;
+            }
             let v = find_variant(name).unwrap();
             assert!(
                 !v.servers.iter().any(|t| t.contains("-musl")),
@@ -941,11 +1042,87 @@ mod tests {
                 v.servers
             );
         }
-        // The dev variant is where musl *is* carried, and it is deliberately not
-        // a default — that is what keeps the loop exercisable without shipping it.
-        let all = find_variant("bundle-linux-all").unwrap();
+        // The all-server artifact is the one place musl *is* carried, and it is
+        // a separate download precisely so nobody pays for it by default.
+        let all = find_variant(ALL_SERVER_VARIANT).unwrap();
         assert!(all.servers.iter().any(|t| t.contains("-musl")));
-        assert!(!DEFAULT_VARIANTS.contains(&"bundle-linux-all"));
+        assert_eq!(all.servers, PUBLISHED_TARGETS);
+    }
+
+    /// `--target` relocates cargo's output, and the packaged binary comes from
+    /// wherever this says. Getting it wrong does not fail the build — it ships
+    /// whatever an earlier plain build left in `target/release/`, which on a CI
+    /// runner is nothing and locally is a stale unbundled dashboard.
+    #[test]
+    fn the_built_dashboard_moves_under_the_target_triple() {
+        let td = Path::new("/w/target");
+        assert_eq!(
+            built_dashboard(td, None),
+            Path::new("/w/target/release/miao")
+        );
+        // Including when the requested target *is* the host: cargo relocates on
+        // the presence of the flag, not on whether it changes anything.
+        assert_eq!(
+            built_dashboard(td, Some(X86)),
+            Path::new("/w/target/x86_64-unknown-linux-gnu/release/miao")
+        );
+    }
+
+    /// The cross-build half of [`verify`], which nothing but release CI's
+    /// x86-64 macOS leg exercises — and which fails *open* if it is wrong, since
+    /// a scan that never matches and a scan that always matches both look like a
+    /// green build until someone downloads the artifact.
+    #[test]
+    fn the_cross_check_finds_a_payload_digest_and_notices_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("xtask-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("miao");
+
+        let payload = |sha: &str| server::Payload {
+            target: X86.to_string(),
+            sha256: sha.to_string(),
+            bin_path: artifact.clone(),
+            gz_path: artifact.clone(),
+            raw_len: 0,
+            gz_len: 0,
+            provenance: server::Provenance::Local,
+            repacked: false,
+        };
+        let present = payload(&"a1".repeat(32));
+        let absent = payload(&"b2".repeat(32));
+
+        // The digest lives in `.rodata` surrounded by unrelated bytes, so the
+        // scan has to find it mid-image rather than at a known offset.
+        let mut image = vec![0u8; 4096];
+        image.extend_from_slice(present.sha256.as_bytes());
+        image.extend(std::iter::repeat_n(0u8, 4096));
+        std::fs::write(&artifact, &image).unwrap();
+
+        verify(&artifact, &[&present], false).expect("digest is present");
+        let err = verify(&artifact, &[&present, &absent], false)
+            .expect_err("a payload whose digest never made it in must fail");
+        assert!(format!("{err}").contains(&absent.sha256[..12]), "{err}");
+
+        // Carrying nothing is the one case with nothing to look for; it must not
+        // be reported as a failure.
+        verify(&artifact, &[], false).expect("no payloads, nothing to verify");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The plain build must never come back as a published artifact: since 0.4.0
+    /// every download is bundled, and a plain tarball under the same name would
+    /// silently strip the deploy path from whoever grabbed it.
+    #[test]
+    fn no_default_variant_is_the_plain_build() {
+        for name in DEFAULT_VARIANTS {
+            let v = find_variant(name).unwrap();
+            assert!(
+                v.bundles(),
+                "release variant {:?} carries no server",
+                v.label()
+            );
+        }
     }
 
     /// Publishing is how a payload becomes reachable without being embedded, so

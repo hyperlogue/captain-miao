@@ -6,16 +6,31 @@ name: build
 # Unix-domain sockets, $XDG_RUNTIME_DIR, and caffeinate/systemd-inhibit — and
 # Kitty itself has no native Windows build, so there is no Windows target.
 #
-# The `build` matrix ships ONLY the `captain-miao` dashboard package
+# The `dashboard` matrix ships ONLY the `captain-miao` dashboard package
 # (`-p captain-miao`, whose binary is `miao`), not the whole workspace: the
 # dashboard carries the `claude`/`codex`/`hook`/`focus` entrypoints a local
 # install needs, and building it alone keeps libshpool (the `miao-server`
-# pty pool) off these runners' cross-builds.
+# pty pool) off these runners' cross-builds. It embeds a *prebuilt* server rather
+# than compiling one, so that stays true even though every artifact is now
+# bundled.
+#
+# **Every published dashboard is bundled** — there is no plain build in a release
+# any more. Each of the four targets produces two tarballs:
+#
+#   miao-v<version>-<target>.tar.gz                    carries x86-64 glibc only
+#   miao-bundled-all-server-v<version>-<target>.tar.gz carries all four servers
+#
+# The first is what npm packages and what most people download; the second is for
+# a mixed fleet or an air-gapped one. Which servers each carries is decided in
+# xtask (`SHIPPING_VARIANT` / `ALL_SERVER_VARIANT`), not here.
 #
 # `miao-server` is published by the separate `server` job below, on one
 # x86_64 runner, cross-compiled to both Linux arches by cargo-zigbuild — which is
 # what makes the server a *fetchable* artifact rather than something every
 # bundled build has to compile for itself (`cargo xtask dist --from release`).
+# The dashboard matrix `needs:` that job and embeds the exact binaries it just
+# produced, so a bundled dashboard and the standalone server assets beside it are
+# bit-identical rather than merely same-versioned.
 #
 # Linux builds run on **ubuntu-22.04**, not ubuntu-latest, purely to set the glibc
 # floor: a binary linked against 24.04's glibc 2.39 dies with a cryptic loader
@@ -52,10 +67,11 @@ env:
 # release.yml also pins the tag to plain SemVer before calling this workflow;
 # the indirection here is what keeps that true for any other caller.
 jobs:
-  build:
+  dashboard:
     name: ${{ matrix.target }}
+    needs: server
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +83,12 @@ jobs:
           # the aarch64 binary testable instead of shipping unexecuted. Only
           # x86_64 macOS is still cross-built — macos-latest is arm64, and Apple
           # ships both SDKs, so that cross is native-toolchain and reliable.
+          #
+          # `native` is not passed to xtask: `dist` compares the requested target
+          # against `rustc -vV`'s host itself and picks exec-verification or the
+          # digest scan accordingly. The flag survives only for the extra smoke
+          # test below, which is a separate assertion (the binary starts) from
+          # what `dist` guarantees (it carries what it was told to).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             native: true
@@ -120,40 +142,98 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --locked --target "$TARGET" -p captain-miao
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: captain-miao-server-payloads
+          path: servers
 
-      # `--version` is handled by clap at parse time (exit 0) before the
-      # terminal gate, so it's a safe exit-0 probe that the binary at least
-      # links and runs. Only on natively-runnable targets.
-      - name: Smoke-test the binary
+      # Flat tarballs holding a single `miao-server`, so each unpacks into its
+      # own directory named for its target. All four are unpacked even though the
+      # shipping variant embeds one: the all-server variant wants the rest, and
+      # `dist` resolves the union across the variants it is asked for.
+      - name: Unpack the servers
+        run: |
+          set -euo pipefail
+          for tgz in servers/miao-server-*.tar.gz; do
+            base=${tgz##*/}
+            target=${base#"miao-server-$VERSION-"}
+            target=${target%.tar.gz}
+            mkdir -p "servers/$target"
+            tar -C "servers/$target" -xzf "$tgz" miao-server
+          done
+          ls -R servers
+
+      # `--server <target>=<path>`, not `--from release`: these servers are the
+      # ones *this* run just built and are not published yet — the release job
+      # publishes them afterwards. Handing xtask the exact binaries is the
+      # documented escape hatch for precisely this case.
+      #
+      # Both variants in one invocation so the payloads are obtained once. `dist`
+      # still relinks per variant (the manifest changes, so `build.rs` re-runs),
+      # which is why this job's timeout is 60 minutes rather than 45.
+      - name: Build the bundled dashboards
+        run: |
+          set -euo pipefail
+          cargo xtask dist --target "$TARGET" \
+            --variant bundle-linux-x86_64 \
+            --variant bundle-linux-all \
+            --server "x86_64-unknown-linux-gnu=$PWD/servers/x86_64-unknown-linux-gnu/miao-server" \
+            --server "aarch64-unknown-linux-gnu=$PWD/servers/aarch64-unknown-linux-gnu/miao-server" \
+            --server "x86_64-unknown-linux-musl=$PWD/servers/x86_64-unknown-linux-musl/miao-server" \
+            --server "aarch64-unknown-linux-musl=$PWD/servers/aarch64-unknown-linux-musl/miao-server"
+
+      # `dist` already verified each artifact carries what it was built to carry —
+      # by execution where it can, by scanning the image for the payload digests
+      # where it cannot. This repeats it in the log so a hollow bundle is visible
+      # in the run rather than only in an exit code, and it is the one assertion
+      # `dist` does not make on a cross build: that the binary actually starts.
+      # `--version` is handled by clap at parse time (exit 0) before the terminal
+      # gate, so it is a safe exit-0 probe.
+      - name: Smoke-test the binaries
         if: matrix.native
-        run: ./target/"$TARGET"/release/miao --version
+        run: |
+          set -euo pipefail
+          ./dist/miao-bundle-linux-x86_64 --version
+          ./dist/miao-bundle-linux-all --version
 
       - name: Package
         run: |
           set -euo pipefail
-          # The tarball is named for the project; the binary inside it is `miao`
-          # (see the [[bin]] target in Cargo.toml). stage-npm-packages.sh reads
-          # both halves of that split — keep them in sync with its PROJECT/BIN.
-          name="captain-miao-$VERSION-$TARGET"
-          stage="dist/$name"
-          mkdir -p "$stage"
-          cp "target/$TARGET/release/miao" "$stage/"
-          # README + LICENSE only. CLAUDE.md is `@AGENTS.md` plus agent tooling
-          # tips — an import that would dangle here, and not user-facing docs.
-          cp README.md LICENSE "$stage/"
-          tar -C dist -czf "$name.tar.gz" "$name"
+          # `miao-`, NOT `captain-miao-`: the project names the npm packages, the
+          # binary names the tarballs. stage-npm-packages.sh resolves dashboard
+          # tarballs by the exact string `miao-v$VERSION-$target` — keep this in
+          # sync with its TARBALL/BIN, and note that the all-server and
+          # miao-server names below cannot collide with it.
+          pack() {
+            local name="$1" built="$2"
+            local stage="dist/$name"
+            mkdir -p "$stage"
+            cp "dist/$built" "$stage/miao"
+            # README + LICENSE only. CLAUDE.md is `@AGENTS.md` plus agent tooling
+            # tips — an import that would dangle here, and not user-facing docs.
+            cp README.md LICENSE "$stage/"
+            tar -C dist -czf "$name.tar.gz" "$name"
+            echo "  packaged $name.tar.gz"
+          }
+          pack "miao-$VERSION-$TARGET"                    miao-bundle-linux-x86_64
+          pack "miao-bundled-all-server-$VERSION-$TARGET" miao-bundle-linux-all
 
       # No .sha256 sidecar: GitHub already hashes this twice over. upload-artifact
       # records a SHA-256 digest that download-artifact verifies on the way back
       # out, and a release asset carries a `digest: "sha256:…"` field in the REST
       # API — so a sidecar would be a third copy of the same number, trusted no
       # more than the tarball beside it.
+      #
+      # The *artifact* keeps the `captain-miao-` prefix because the release job
+      # selects artifacts with `pattern: captain-miao-*`; rename it and these
+      # stop being published. The *files* inside are `miao-…`, which is what
+      # stage-npm-packages.sh matches on. Both tarballs for this target ride in
+      # one artifact — the glob is root-relative, so the unpacked servers under
+      # `servers/` cannot be swept in.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: captain-miao-${{ matrix.target }}
-          path: captain-miao-*.tar.gz
+          path: miao-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -234,126 +314,14 @@ jobs:
       # published. The *files* inside are `miao-server-v<version>-<target>.tar.gz`,
       # which `release_url` reconstructs (pinned by a unit test) and which
       # `stage-npm-packages.sh` cannot pick up — it looks for the exact name
-      # `captain-miao-v<version>-<target>`, so a server tarball can never be
-      # mistaken for a dashboard one and staged into an npm package.
+      # `miao-v<version>-<target>`, so a server tarball can never be mistaken for
+      # a dashboard one and staged into an npm package. That margin got narrower
+      # when dashboards moved from `captain-miao-` to `miao-`: the two now differ
+      # only by the `server-` infix, and the match is exact-string for that
+      # reason. Do not loosen either side to a glob.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: captain-miao-server-payloads
           path: miao-server-*.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
-  # The *bundled* Linux dashboard: the same `miao`, carrying `miao-server` for
-  # both Linux arches so it can deploy one to a host that has none. Published
-  # beside the plain build rather than replacing it — most users run captain-miao
-  # locally and shouldn't pay ~7 MB for a code path they never reach — so a
-  # release offers both and you pick.
-  #
-  # `needs: server` and `--server <target>=<path>`, not `--from release`: the
-  # servers this bundles are the ones *this* run just built, which are not
-  # published yet (the release job publishes them afterwards). Handing xtask the
-  # exact binaries is the documented escape hatch for precisely this case, and it
-  # keeps the bundle and the standalone server assets bit-identical rather than
-  # merely same-versioned.
-  #
-  # Only Linux: LINUX_TARGETS is what a bundle can carry, and a macOS dashboard
-  # deploying to Linux hosts is a real case but not one this job covers yet —
-  # `cargo xtask dist --variant bundle-linux --from release` builds it locally.
-  bundle:
-    name: bundled dashboard (${{ matrix.target }})
-    needs: server
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-    env:
-      VERSION: ${{ inputs.version }}
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
-      # Same toolchain source as the build matrix above, and for the same reason:
-      # these runners can't use the flake (no aarch64-linux system in it), so the
-      # pin in rust-toolchain.toml is what keeps them on the tested compiler.
-      - name: Read the pinned toolchain
-        id: toolchain
-        run: |
-          channel=$(awk -F'"' '/^channel/ { print $2 }' rust-toolchain.toml)
-          if [ -z "$channel" ]; then
-            echo "::error::no channel found in rust-toolchain.toml" >&2
-            exit 1
-          fi
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: bundle-${{ matrix.target }}
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: captain-miao-server-payloads
-          path: servers
-
-      # Flat tarballs holding a single `miao-server`, so each unpacks into its
-      # own directory named for its target.
-      - name: Unpack the servers
-        run: |
-          set -euo pipefail
-          for tgz in servers/miao-server-*.tar.gz; do
-            base=${tgz##*/}
-            target=${base#"miao-server-$VERSION-"}
-            target=${target%.tar.gz}
-            mkdir -p "servers/$target"
-            tar -C "servers/$target" -xzf "$tgz" miao-server
-          done
-          ls -R servers
-
-      - name: Build the bundle
-        run: |
-          set -euo pipefail
-          cargo xtask dist --variant bundle-linux \
-            --server "x86_64-unknown-linux-gnu=$PWD/servers/x86_64-unknown-linux-gnu/miao-server" \
-            --server "aarch64-unknown-linux-gnu=$PWD/servers/aarch64-unknown-linux-gnu/miao-server"
-
-      # `dist` already verifies the artifact reports the servers it was built to
-      # carry; this repeats it in the log so a bundle that silently carried
-      # nothing is visible in the run rather than only in an exit code.
-      - name: Show what it carries
-        run: ./dist/miao-bundle-linux --version
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          # `miao-bundle-`, NOT `captain-miao-`: stage-npm-packages.sh resolves
-          # dashboard tarballs by the exact name `captain-miao-v$VERSION-$target`,
-          # and an npm package must carry the plain build. Same split the server
-          # tarballs use, for the same reason.
-          name="miao-bundle-$VERSION-$TARGET"
-          stage="dist/$name"
-          mkdir -p "$stage"
-          cp dist/miao-bundle-linux "$stage/miao"
-          cp README.md LICENSE "$stage/"
-          tar -C dist -czf "$name.tar.gz" "$name"
-
-      # Artifact name keeps the `captain-miao-` prefix so the release job's
-      # `pattern: captain-miao-*` collects it; the files inside cannot be
-      # mistaken for the npm-staged ones (see Package above).
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: captain-miao-bundle-${{ matrix.target }}
-          path: miao-bundle-*.tar.gz
           if-no-files-found: error
           retention-days: 7

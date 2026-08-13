@@ -161,7 +161,18 @@ Anything local to one module is in that module's doc instead.
   else** — Cargo/npm packages, nix attrs, `~/.config` + `~/.local/state` +
   `~/.cache` dirs. `xtask/src/server.rs` carries both `SERVER_PKG` and
   `SERVER_BIN` because conflating them builds fine and then can't find the
-  binary.
+  binary. Release *tarballs* follow the binary, not the project, and three of
+  them now differ only by an infix — `miao-v…`, `miao-bundled-all-server-v…`,
+  `miao-server-v…`. `stage-npm-packages.sh` picks the first by **exact string**
+  for that reason; loosen it to a glob and a publish stages the daemon as the
+  dashboard. Upload-*artifact* names keep the `captain-miao-` prefix regardless,
+  because the release job collects them with `pattern: captain-miao-*`.
+- **Publish only bundled dashboards.** Every release artifact and all four npm
+  packages are built from `SHIPPING_VARIANT` (one x86-64 glibc server);
+  `ALL_SERVER_VARIANT` is the extra GitHub-only download carrying all four. A
+  plain build is still what `cargo build` gives you, but shipping one under the
+  `miao-v…` name silently removes the deploy path from whoever grabbed it — which
+  is why `no_default_variant_is_the_plain_build` exists.
 - **Bump `[workspace.package] version` before you tag** (CI's `verify` fails
   otherwise) and refresh `Cargo.lock` with it. Tags are plain SemVer. **No
   `run:` body may interpolate a `${{ }}` expression** — values reach the shell
@@ -224,12 +235,16 @@ cargo run -p captain-miao-server -- daemon ensure|status|stop
 cargo run -p captain-miao-client -- list | attach <name> [--force]
 
 # Embedded server payloads. A plain `cargo build` bundles nothing.
-cargo xtask dist [--list|--from release|--server <target>=<path>]
+cargo xtask dist [--list|--target <triple>|--from release|--server <target>=<path>]
+                             # no --variant: builds exactly what a release ships
 cargo xtask prepare-servers --out dist/servers   # what release CI runs
 miao --version                                   # what a built binary embeds
 
-# Ignored tests that need a live host / server:
-CM_TEST_SSH_TARGET=box cargo test -p captain-miao --features bundle-linux-x86_64 -- \
-  --ignored provisions_a_real_host
+# Ignored tests that need a live host / server. The payload reaches the test
+# binary through the manifest env var, never a cargo feature — there is no
+# `bundle-*` feature, and without a manifest there is nothing to deploy:
+CM_SERVER_PAYLOAD_MANIFEST=/tmp/payloads.tsv CM_TEST_SSH_TARGET=box \
+  cargo test -p captain-miao -- --ignored provisions_a_real_host
+#   (src/backend.rs's test doc has the full recipe for building that manifest)
 cargo test -p captain-miao -- --ignored drives_a_real_tmux_server
 ```

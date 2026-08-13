@@ -5,6 +5,25 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Every prebuilt binary now carries a server.** `npx @hyperlogue/captain-miao`
+  and the GitHub tarballs all ship with an x86-64 glibc `miao-server` embedded,
+  so setting up a remote host that has nothing installed no longer waits on a
+  download. Hosts on another architecture, or with no glibc, still fetch theirs
+  at deploy time.
+- **Release tarballs are named `miao-v<version>-<target>.tar.gz`**, matching the
+  binary rather than the project. The old `captain-miao-v…` name is gone; npm
+  installs are unaffected.
+
+### Added
+
+- **`miao-bundled-all-server-v<version>-<target>.tar.gz`** — a larger download
+  carrying every published server (both arches, glibc and musl), for a mixed
+  fleet or a machine that can't reach the network at deploy time.
+
 ## [0.3.0] - 2026-08-12
 
 ### Added

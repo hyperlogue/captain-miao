@@ -27,12 +27,22 @@ cd "$(dirname "$0")/.."
 SRC="${1:-artifacts}"
 OUT="dist/npm"
 SCOPE="@hyperlogue"
-# The project's name and the executable's are deliberately different: PROJECT
-# names the npm packages and the release tarballs (the published identity, which
-# a rename would break for every existing install), BIN is the file inside them.
-# Keep BIN in sync with the [[bin]] target in Cargo.toml and the require.resolve
-# path in npm/launch.mjs (the consumer).
+# Three names, and they are deliberately not one. PROJECT is the published npm
+# identity (a rename breaks every existing install), TARBALL is what the release
+# tarballs are called, BIN is the file inside them. PROJECT and TARBALL were the
+# same string until dashboards moved to `miao-v<version>-<target>.tar.gz`;
+# conflating them again would make this script look for tarballs no build
+# produces. Keep BIN in sync with the [[bin]] target in Cargo.toml and the
+# require.resolve path in npm/launch.mjs (the consumer), and TARBALL in sync with
+# the Package step in .github/workflows/build.yml (the producer).
+#
+# The binaries staged here are **bundled**: each carries an x86-64 glibc
+# `miao-server`, so a fresh `npx @hyperlogue/captain-miao` can deploy to a remote
+# host with nothing installed on it. That is a property of the tarball this picks
+# up, not of anything this script does — but it is why the packages are ~11 MB
+# rather than ~6 MB, which is otherwise a surprising jump to find here.
 PROJECT="captain-miao"
+TARBALL="miao"
 BIN="miao"
 
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 1; }
@@ -83,7 +93,10 @@ while IFS='|' read -r slug target os cpu libc; do
 
     name="$SCOPE/$PROJECT-$slug"
     pkgdir="$OUT/$PROJECT-$slug"
-    tarball="$SRC/$PROJECT-v$VERSION-$target.tar.gz"
+    # Exact name, never a glob: `$SRC` also holds `miao-server-v…` and
+    # `miao-bundled-all-server-v…` tarballs, which differ from this one only by an
+    # infix. A glob here would happily stage a server daemon as the dashboard.
+    tarball="$SRC/$TARBALL-v$VERSION-$target.tar.gz"
 
     [ -f "$tarball" ] || { echo "error: missing $tarball" >&2; exit 1; }
 
@@ -94,14 +107,15 @@ while IFS='|' read -r slug target os cpu libc; do
     # both). tar itself is the remaining integrity check: gzip carries a CRC and
     # a truncated archive fails extraction below.
     mkdir -p "$pkgdir/bin"
-    # The tarball holds <project-v-target>/cm; --strip-components lands the binary
-    # directly in bin/. Extract only the binary — never the README/LICENSE copies
-    # the release tarball also carries, which would shadow the ones staged above.
-    # --no-same-owner/--no-same-permissions are the non-root defaults, stated
-    # explicitly so a run as root can't restore an archived uid or setuid bit.
+    # The tarball holds <tarball-v-target>/miao; --strip-components lands the
+    # binary directly in bin/. Extract only the binary — never the README/LICENSE
+    # copies the release tarball also carries, which would shadow the ones staged
+    # above. --no-same-owner/--no-same-permissions are the non-root defaults,
+    # stated explicitly so a run as root can't restore an archived uid or setuid
+    # bit.
     tar -xzf "$tarball" -C "$pkgdir/bin" --strip-components=1 \
         --no-same-owner --no-same-permissions \
-        "$PROJECT-v$VERSION-$target/$BIN"
+        "$TARBALL-v$VERSION-$target/$BIN"
 
     # tar extracts whatever kind of entry the archive names. A member recorded as
     # a symlink extracts as one (verified: exit 0, no warning), and the chmod
@@ -132,7 +146,7 @@ while IFS='|' read -r slug target os cpu libc; do
         '{
             name: $name,
             version: $version,
-            description: "Prebuilt captain-miao binary for \($os)-\($cpu).",
+            description: "Prebuilt captain-miao binary for \($os)-\($cpu), bundling an x86-64 glibc miao-server.",
             license: "MIT",
             os: [$os],
             cpu: [$cpu]

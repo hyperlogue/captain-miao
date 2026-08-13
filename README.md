@@ -59,8 +59,16 @@ that execs a prebuilt native binary shipped as a per-platform optional
 dependency, so your package manager downloads only the one binary matching your
 machine; nothing is fetched at runtime. Prebuilt binaries cover **macOS** (Apple
 silicon + Intel) and **Linux** (x86-64 + arm64), and are also attached to every
-[GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as a
-`.tar.gz` if you'd rather download one directly.
+[GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as
+`miao-v<version>-<target>.tar.gz` if you'd rather download one directly.
+
+Every prebuilt binary carries an x86-64 glibc `miao-server`, so it can set up a
+remote host that has nothing installed on it — see [Running sessions on remote
+servers](#running-sessions-on-remote-servers). A host on another architecture, or
+one with no glibc, gets its server downloaded at deploy time instead. If you'd
+rather not depend on that, each release also has a
+`miao-bundled-all-server-v<version>-<target>.tar.gz` carrying every server
+captain-miao publishes — larger, and never needs the network.
 
 ### With Nix
 

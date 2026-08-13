@@ -85,10 +85,19 @@ that. Provisioning is zero-touch again: connect to a bare host and it gets a
 server, with no manual deploy step.
 
 **The dashboard is no longer one artifact.** A build carries whatever servers it
-was pointed at; most users want none. `cargo xtask dist` produces the named
-variants side by side — a plain `miao` carrying nothing, a `miao-bundle-linux`
-carrying both Linux arches, single-arch ones in between — and a plain `cargo
-build` is byte-for-byte what it would be if none of this existed.
+was pointed at. `cargo xtask dist` produces the named variants side by side — a
+plain `miao` carrying nothing, single-arch bundles, a `miao-bundle-linux-all`
+carrying every published server — and a plain `cargo build` is byte-for-byte what
+it would be if none of this existed.
+
+Since 0.4.0 **every published artifact is bundled**: what ships is
+`bundle-linux-x86_64` (one server, x86-64 glibc) for all four host targets, plus
+`bundle-linux-all` as a separate GitHub-only download. The plain build stays a
+variant — it is what a bare `cargo build` gives you — but nothing publishes it.
+The reasoning is that "most users want none" turned out to be the wrong read: the
+payload's target is the *remote host's* architecture, not the laptop's, so a Mac
+user carrying a Linux server is the common case rather than the odd one, and the
+cost of being wrong is a first-run deploy that has to stop and fetch.
 
 **Obtaining a server and building a dashboard are separate steps**, with the seam
 between them at *where servers come from* rather than at *how they get in*.
@@ -201,13 +210,21 @@ hosting the pty pool, so unwinding drops one task where aborting would kill ever
 session on the host.
 
 **Building the variants: `cargo xtask dist`** builds the named release artifacts
-into `dist/`: `miao` (plain), `miao-remote`, `miao-bundle-linux`, plus the single-arch
-bundles. Each run obtains every server once even when several variants want it,
-then verifies each artifact by running it and checking it reports what it was
-built to carry. That check earns its keep: a manifest reaches the compile through
-an environment variable and a generated file, and that seam fails *silently* — a
-variable that did not survive, an archive that moved, and the build succeeds
-carrying nothing.
+into `dist/`; with no `--variant` it builds exactly what a release publishes
+(`bundle-linux-x86_64` and `bundle-linux-all`). Each run obtains every server
+once even when several variants want it, then verifies each artifact carries what
+it was built to carry. That check earns its keep: a manifest reaches the compile
+through an environment variable and a generated file, and that seam fails
+*silently* — a variable that did not survive, an archive that moved, and the build
+succeeds carrying nothing.
+
+Verification is by **execution** wherever the artifact can run, which exercises
+the real accessor rather than the mere presence of bytes. `--target` (release CI
+needs it for x86-64 macOS, cross-built on an arm64 runner) can produce an artifact
+this machine cannot exec; there the check falls back to scanning the image for
+each payload's SHA-256, which survives `strip = true` because it is a
+`&'static str` in `.rodata`. Weaker — it proves the table was populated, not that
+the binary starts — but the alternative was not checking the cross build at all.
 
 **Release CI publishes the servers** (`build.yml`'s `server` job), which is what
 gives `--from release` something to fetch. One x86_64 runner cross-compiles

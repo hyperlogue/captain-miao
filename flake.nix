@@ -60,10 +60,11 @@
         # targets are installed.
         # The musl pair is here because a static build is the only server that
         # runs on a host with no generic loader (NixOS, Alpine, distroless),
-        # where the gnu build cannot start at all. Nothing *ships* carrying
-        # them — a release publishes them as assets and a dashboard fetches one
-        # when it meets such a host — but `prepare-servers` builds all four, so
-        # the toolchain has to be able to.
+        # where the gnu build cannot start at all. The default download does not
+        # carry them — a release publishes them as assets and a dashboard fetches
+        # one when it meets such a host — but `prepare-servers` builds all four
+        # and the `bundle-linux-all` artifact embeds them, so the toolchain has to
+        # be able to.
         crossTargets = [
           "x86_64-unknown-linux-gnu"
           "aarch64-unknown-linux-gnu"
@@ -172,10 +173,15 @@
               doCheck = false;
               meta.mainProgram = "miao";
             });
+        # `bundle-linux-x86_64` is what a release ships for every host target;
+        # `bundle-linux-all` is the separate all-server download. The other two
+        # are not published but stay buildable — a Nix user driving a fleet of one
+        # architecture has no reason to carry the other.
         bundled = lib.genAttrs [
           "bundle-linux"
           "bundle-linux-x86_64"
           "bundle-linux-aarch64"
+          "bundle-linux-all"
         ] (variant: mkBundled variant);
 
         # A link farm of servers, and a dashboard pointed at it.
