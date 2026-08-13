@@ -351,12 +351,35 @@ GetVitals{req_id}                      Vitals{req_id, vitals}
   unknown fields are skipped, new fields must be additive with `#[serde(default)]`,
   and refusal happens only *below* `PROTOCOL_MIN` (`protocol_compatible`, pinned
   by test). A newer peer is fine in either direction, so later protocol changes
-  stop stranding deployed daemons. The sharper half of the problem remains: the
-  daemon hosts the pool and pool children die with it (session leaders on its
-  pty masters), so "restart the daemon to upgrade" still means killing every
-  pooled session on the host. Splitting the pool into a separately-stable
-  process (the `pty-daemon` entrypoint already exists) is evaluated with the
-  engine ruling (§10.2) — with per-session zellij/tmux servers it disappears.
+  stop stranding deployed daemons. The sharper half of the problem is
+  mechanically unchanged: the daemon hosts the pool and pool children die with
+  it (session leaders on its pty masters), so restarting it to upgrade still
+  ends every pooled session on the host.
+
+  What changed is that this is no longer the *user's* problem — `u` in the
+  hosts panel (§9) upgrades a host and resumes what the restart ended, so the
+  cost is a reconnect rather than lost work. Three properties are worth keeping
+  straight, because they are what make that safe rather than merely convenient:
+  * **Verification precedes the stop.** `upgrade_script` is the deploy script
+    split at its `mv`, with `daemon stop --force` inserted between the halves
+    under one `set -e` — so the host has run the new binary (`self-check`) and
+    agreed its version before anything is ended. A payload it refuses costs a
+    transfer and nothing else.
+  * **Publishing follows the stop**, not merely accompanies it. `mv`-ing onto a
+    live daemon's own path leaves its `/proc/<pid>/exe` reading `(deleted)`,
+    and the launcher argv it bakes into reservations comes from `current_exe()`
+    — so a session opened in that window would carry an unexecutable path.
+  * **The host is held off the air across it** (an in-memory suspended set, not
+    the persisted `disabled` flag). The reconnect backoff floors at 500ms, and
+    a redial landing between the stop and the `mv` would run `daemon ensure`
+    against the old binary still at the cache path and resurrect it — having
+    killed every session for nothing.
+
+  Splitting the pool into a separately-stable process (the `pty-daemon`
+  entrypoint already exists) is still the fix for the mechanism itself, and is
+  evaluated with the engine ruling (§10.2) — with per-session zellij/tmux
+  servers it disappears. `u` makes the restart survivable; it does not make it
+  unnecessary.
 - **`$HOME` has left the wire.** The **host-canonical `~` form is the wire
   format itself** (`cm_core::paths`). The server collapses every path it
   returns (`~`-prefixed when under the host home, absolute otherwise) and
@@ -904,6 +927,34 @@ decides what they mean**.
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.
+  - **`u` — upgrade this host's server** (§3 for the mechanism). Offered only
+    on a row that has somewhere to go: the connection task re-asks
+    `decide_provision` with the running daemon out of the picture, and only an
+    `Upload` becomes an offer, so a host on a user's own PATH install (never
+    overwritten) or already on our exact digest advertises nothing. The row
+    wears `↑<version>` where an offer exists and the footer hint appears with
+    it — a key that would silently do nothing is worse than no key, and every
+    other key here works on every row. A stale-but-unfixable host keeps the
+    plain `(older than ours)` annotation instead.
+  - **Two refusals, and they are one rule seen twice.** The upgrade ends every
+    session on the host and brings each one back as a window *here*, so it
+    declines a host with any **non-idle** session and any session **another
+    client is attached to** — the first would lose work, the second would take
+    a session from whoever is using it rather than hand it back. "Idle" is the
+    restart-all whitelist (`Idle | Compacted`), deliberately not
+    `SessionStatus::is_busy`: `Starting`, `WaitingForApproval` and
+    `ReviewPending` all read as at-rest by that narrower test and are exactly
+    what you would hate to have restarted. An *unreadable* attached bit is not
+    evidence of a second client, matching the detached glyph's rule.
+  - **The refusal renders in the panel**, on the same line the confirm uses.
+    This mode's footer is key hints, so there is no status line to put it on,
+    and a message set elsewhere would surface stale after the panel closed.
+  - **A failure drops the restore list.** `set -e` puts everything destructive
+    downstream of the host's own verdict, so the common failures stopped
+    nothing — and resuming a session that never died would fork it into a live
+    duplicate. The residual case (stop succeeded, `mv` did not) loses the
+    automatic restore, says so, and leaves those sessions in the resume picker,
+    since a killed pool session's transcript on the host is untouched.
 - **`Options` — per-host ssh arguments** (`hosts::split_options`,
   `backend::split_connection_options`). Passed through verbatim to every ssh
   captain-miao runs for that host, with no grammar of our own on top.
@@ -1183,6 +1234,17 @@ restart stops killing them, which retires the upgrade edge in §3 as a side
 effect. Days, not weeks; no state migration. **Running sessions can't move**
 (same pty truth as ever) — the transition is kill + resume per session, or
 letting both engines coexist on separate sockets while old sessions drain.
+
+The hosts panel's `u` (§3, §9) changes what that side effect is worth without
+changing whether it is worth having. `u` already turns an upgrade into a
+reconnect: it verifies on the host before stopping anything, and resumes what
+the stop ended. What it cannot do is make the restart free — a resumed session
+is a new pid on the same transcript, so scrollback, in-flight work and anything
+the agent held in memory are still lost, and the gate has to refuse a host that
+is busy or that another client is attached to. A split pool (or per-session
+servers) removes the restart from the picture entirely, and `u` would then be
+deploy-and-reload with nothing to resume. Read the keystroke as evidence that
+the edge is *survivable*, not as a reason the ruling matters less.
 
 The cost of *staying* on shpool is a known, bounded list: the single-client
 model and everything it forces (the busy-exit-0 wrapper, the attached-bit
