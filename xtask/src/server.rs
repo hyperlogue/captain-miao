@@ -166,6 +166,48 @@ fn choose_strategy(target: &str, host: &str, tools: &Tools) -> Result<Strategy, 
 }
 
 /// Where a strategy's glibc floor actually comes from, when it isn't the pinned
+/// The cargo profile every server build uses, defined in the workspace root
+/// `Cargo.toml`. Size-tuned, and deliberately not `release` — see the comment on
+/// the profile itself.
+///
+/// This constant is load-bearing **twice**: it is the `--profile` argument, and
+/// it is also the directory cargo writes into (`<build-dir>/<target>/<profile>/`).
+/// Spelling the two separately is how a build succeeds and then packs a stale
+/// binary from the previous profile's directory, so both read this.
+pub const SERVER_PROFILE: &str = "server-release";
+
+/// Extra flags for SQLite's bundled C amalgamation, read natively by
+/// `libsqlite3-sys` (which declares `rerun-if-env-changed`, so there is no
+/// stale-object hazard).
+///
+/// Everything switched off here is a feature the server cannot reach: its only
+/// SQLite use is reading Codex thread titles — one read-only `SELECT` through
+/// `LocalBackend::overlay_codex_titles` — and the amalgamation otherwise compiles
+/// in full-text search twice over, JSON1, R*Tree and the loadable-extension
+/// machinery. Measured at ~326 KiB gzipped, which is real money on a payload
+/// carried by every published dashboard.
+///
+/// Scoped to the nested build rather than exported, so a developer's own
+/// `cargo build` is untouched and cannot end up with a differently-featured
+/// SQLite than the one CI ships.
+///
+/// Conservative on purpose: `-U` of `ENABLE` flags is always safe (they are
+/// additive), whereas arbitrary `SQLITE_OMIT_*` defines are *not* supported by
+/// the prebuilt amalgamation and can miscompile. The three `OMIT`s here are the
+/// well-trodden ones. Do not extend this list without checking upstream.
+///
+/// `-USQLITE_ENABLE_JSON1` is knowingly a **no-op** on the bundled version —
+/// JSON has been core since 3.38, so `json_each` is still in the binary and
+/// removing it would take `-DSQLITE_OMIT_JSON`. Kept because it costs nothing
+/// and still says what we want; listed here so nobody re-discovers it by
+/// grepping the output and concluding the trim silently failed.
+const SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
+     -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_JSON1 -USQLITE_ENABLE_RTREE \
+     -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB \
+     -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_LOAD_EXTENSION \
+     -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED \
+     -DSQLITE_OMIT_SHARED_CACHE";
+
 /// [`GLIBC_FLOOR`] — phrased for the warning `dist` prints beside the payload.
 /// `None` means the floor is pinned (or the target has no glibc to pin).
 ///
@@ -195,7 +237,8 @@ fn build_argv(strategy: Strategy, target: &str, build_dir: &Path) -> (String, Ve
     let argv = |verb: &str, tgt: &str| {
         vec![
             verb.to_string(),
-            "--release".to_string(),
+            "--profile".to_string(),
+            SERVER_PROFILE.to_string(),
             "--locked".to_string(),
             "-p".to_string(),
             SERVER_PKG.to_string(),
@@ -210,6 +253,14 @@ fn build_argv(strategy: Strategy, target: &str, build_dir: &Path) -> (String, Ve
         Strategy::Zigbuild => (cargo(), argv("zigbuild", &zig_target(target))),
         Strategy::Cross => ("cross".to_string(), argv("build", target)),
     }
+}
+
+/// Where the nested build leaves the server. Pure, and paired with the
+/// `--profile` in [`build_argv`] — cargo names the output directory after the
+/// profile, so the two are one decision spelled in two places, and a test holds
+/// them together.
+fn built_server(build_dir: &Path, target: &str) -> PathBuf {
+    build_dir.join(target).join(SERVER_PROFILE).join(SERVER_BIN)
 }
 
 /// The cargo that invoked us, so a nested build stays on one toolchain.
@@ -249,6 +300,15 @@ fn cargo() -> String {
 /// stays a forward declaration and bindgen dies with "field has incomplete
 /// type". Defining it restores the full header. (Faces one and two were the
 /// missing per-target variable and the dashed-vs-underscored spelling of it.)
+/// Everything the nested server build needs in its environment: the SQLite trim,
+/// which always applies, plus whatever [`cross_build_env`] adds for this
+/// host/target pair. Pure.
+fn nested_build_env(target: &str, host: &str) -> Vec<(String, String)> {
+    let mut env = vec![("LIBSQLITE3_FLAGS".to_string(), SQLITE_TRIM.to_string())];
+    env.extend(cross_build_env(target, host));
+    env
+}
+
 fn cross_build_env(target: &str, host: &str) -> Vec<(String, String)> {
     if !host.contains("apple-darwin") || target.contains("apple-darwin") {
         return Vec::new();
@@ -345,9 +405,9 @@ pub fn build(
     let (program, args) = build_argv(strategy, target, build_dir);
 
     println!("  {} {}", program, args.join(" "));
-    run(root, &program, &args, &cross_build_env(target, host))?;
+    run(root, &program, &args, &nested_build_env(target, host))?;
 
-    let artifact = build_dir.join(target).join("release").join(SERVER_BIN);
+    let artifact = built_server(build_dir, target);
     let raw = std::fs::read(&artifact).map_err(|e| {
         format!(
             "reading {} after a successful build: {e}",
@@ -842,6 +902,56 @@ mod tests {
             let (_, args) = build_argv(s, OTHER, dir);
             let at = args.iter().position(|a| a == "--target-dir").unwrap();
             assert_eq!(args[at + 1], dir.display().to_string());
+        }
+    }
+
+    /// The `--profile` the build runs under and the directory the artifact is
+    /// read back from are the same string, and cargo is what couples them.
+    ///
+    /// Getting this wrong does not fail the build. Cargo writes to
+    /// `<dir>/<target>/<profile>/`, so a mismatched pair reads whichever binary
+    /// happened to be at the old path — nothing on a clean CI runner (a clear
+    /// error), but locally a stale artifact from a previous profile, silently
+    /// packed and shipped. `--release` is also still spelled `release` on disk,
+    /// which is exactly why swapping to a custom profile is easy to half-do.
+    #[test]
+    fn the_build_profile_and_the_artifact_directory_agree() {
+        let dir = Path::new("/w/target/cm-server-build");
+        for s in [Strategy::Native, Strategy::Zigbuild, Strategy::Cross] {
+            let (_, args) = build_argv(s, OTHER, dir);
+            let at = args
+                .iter()
+                .position(|a| a == "--profile")
+                .expect("every strategy names a profile");
+            assert_eq!(args[at + 1], SERVER_PROFILE);
+            // And no `--release`, which would silently win or conflict.
+            assert!(!args.contains(&"--release".to_string()), "{args:?}");
+        }
+        assert_eq!(
+            built_server(dir, OTHER),
+            dir.join(OTHER).join(SERVER_PROFILE).join(SERVER_BIN),
+        );
+    }
+
+    /// The SQLite trim reaches the nested build on every host/target pair, not
+    /// just the cross ones — it rides in the same env vector as a macOS-only
+    /// bindgen workaround, which is an easy place for it to end up conditional.
+    #[test]
+    fn the_sqlite_trim_is_set_for_every_host_and_target() {
+        for (target, host) in [(OTHER, HOST), (HOST, HOST), (OTHER, "aarch64-apple-darwin")] {
+            let env = nested_build_env(target, host);
+            let flags = env
+                .iter()
+                .find(|(k, _)| k == "LIBSQLITE3_FLAGS")
+                .unwrap_or_else(|| panic!("no LIBSQLITE3_FLAGS for {target} on {host}"));
+            // The two shapes that matter: `-U` of an additive ENABLE flag, and
+            // the load-extension pair that must be switched off on both sides.
+            assert!(flags.1.contains("-USQLITE_ENABLE_FTS5"), "{}", flags.1);
+            assert!(
+                flags.1.contains("-DSQLITE_OMIT_LOAD_EXTENSION"),
+                "{}",
+                flags.1
+            );
         }
     }
 

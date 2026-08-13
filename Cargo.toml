@@ -105,3 +105,51 @@ strip = true
 # every session on the host. Not worth a few percent.
 lto = "fat"
 codegen-units = 1
+
+# What `miao-server` is built with — `xtask`'s `server::build`, never a bare
+# `cargo build`. Separate from `[profile.release]` on purpose: the dashboard is
+# an interactive TUI on the machine you are sitting at, and has no reason to
+# trade throughput for bytes. The server is a payload, and since 0.4.0 every
+# published dashboard carries one, so its size is paid by every npm install and
+# every GitHub download.
+#
+# All figures below are measured on a native x86-64 build, gzipped as the
+# payload ships, against a 3,075,415-byte baseline of this same profile at
+# `opt-level = 3`.
+#
+# This profile, with the overrides and the SQLite trim `xtask` sets alongside it:
+# 2,154,035 (-30.0%). On the real zigbuild cross-build CI publishes from, the
+# x86-64 glibc payload goes 2,975,483 -> 2,137,645 (-28.2%).
+#
+# `opt-level = "s"` rather than `"z"`: `"s"` here is -23.0% before the SQLite
+# trim, where a separate `"z"` run measured about -29%. The extra ~6 points is
+# not worth an unmeasured throughput risk on a daemon — `"z"` disables loop
+# vectorization outright, `"s"` keeps it. Nobody has benchmarked either against
+# `3`, so the conservative one wins by default; revisit only with numbers.
+#
+# The overrides hold the pty byte path at full speed: shpool-vterm's vte state
+# machine sees *every byte* of terminal output from *every* session on the host,
+# and tokio drives the sockets around it. They cost ~34 KiB gzipped, against a
+# slowdown nobody has quantified. Both `vte` majors in the graph are covered — an
+# unversioned key applies to every version of a name.
+#
+# Considered and not taken: leaving Rust at `3` and dropping only
+# `libsqlite3-sys` to `"s"` is -9.6% on its own, or -16.6% with the trim — 55% of
+# the full win for zero effect on any Rust code. Worth remembering as the
+# fallback if `"s"` ever proves to cost real throughput.
+#
+# Note this level reaches C, not just Rust: `cc` scrapes cargo's `OPT_LEVEL` and
+# passes it through as `-O<level>` (cc-1.2.65 `src/lib.rs:2123`), so SQLite's
+# bundled amalgamation compiles `-Os` here.
+[profile.server-release]
+inherits = "release"
+opt-level = "s"
+
+[profile.server-release.package.shpool-vterm]
+opt-level = 3
+[profile.server-release.package.shpool_vt100]
+opt-level = 3
+[profile.server-release.package.vte]
+opt-level = 3
+[profile.server-release.package.tokio]
+opt-level = 3

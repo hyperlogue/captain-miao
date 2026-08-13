@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release tarballs are named `miao-v<version>-<target>.tar.gz`**, matching the
   binary rather than the project. The old `captain-miao-v…` name is gone; npm
   installs are unaffected.
+- **`miao-server` is 30% smaller**, which claws back most of what bundling one
+  costs: the server now builds size-tuned and without the SQLite features it
+  never uses, keeping the pty path at full optimization. Around 890 KiB off every
+  download.
 
 ### Added
 

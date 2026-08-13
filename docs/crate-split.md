@@ -207,7 +207,35 @@ this: 16% off `miao-server` (8.61 → 7.21 MB) and the same order off `miao`,
 which every npm and GitHub download pays for and a bundled build pays for twice.
 Deliberately not `panic = "abort"`, the usual companion — the server is a daemon
 hosting the pty pool, so unwinding drops one task where aborting would kill every
-session on the host.
+session on the host. That ruling was re-measured at −9.8% gzipped and re-affirmed:
+tokio's task harness catches unwinds, so a panicking task becomes a `JoinError`
+and the host's other sessions survive, where an abort would take the daemon and
+every session on it.
+
+**The server then got its own profile.** Once every published dashboard carried a
+server, the payload's size started being paid by every npm install and every
+GitHub download, so `[profile.server-release]` splits the server off from the
+dashboard's `release`: `opt-level = "s"`, with `shpool-vterm` / `shpool_vt100` /
+`vte` / `tokio` held at `3` so the pty byte path keeps full speed. `xtask` sets
+`LIBSQLITE3_FLAGS` alongside it, dropping FTS3/FTS5/JSON1/R*Tree/STAT4 and the
+loadable-extension machinery from the bundled amalgamation — the server's only
+SQLite use is one read-only `SELECT` for Codex thread titles.
+
+Measured on the real cross-build — `prepare-servers` through zigbuild, the same
+path CI publishes from — for `x86_64-unknown-linux-gnu`, gzipped as the payload
+ships: **2,975,483 → 2,137,645, −28.2%** (raw 6,633,456 → 4,711,104, −29.0%).
+Roughly 840 KiB off every npm platform package and every dashboard tarball, and
+~3.2 MB off the all-server artifact. A native non-zigbuild build measures −30.0%;
+the shipped figure is the one to quote.
+
+Two findings worth not re-deriving. `opt-level` reaches **C**, not just Rust —
+`cc` scrapes cargo's `OPT_LEVEL` and passes `-O<level>` straight through — so
+SQLite's amalgamation compiles `-Os` here, and a per-package override does
+propagate into a build script. And that is where most of the win is: leaving all
+Rust at `3` and dropping only `libsqlite3-sys` to `"s"` is −9.6% by itself, or
+−16.6% with the trim, which is 55% of the total for zero effect on any Rust code.
+That is the fallback if `"s"` ever turns out to cost real throughput — nobody has
+benchmarked `s` against `3`, which is the honest gap in all of this.
 
 **Building the variants: `cargo xtask dist`** builds the named release artifacts
 into `dist/`; with no `--variant` it builds exactly what a release publishes

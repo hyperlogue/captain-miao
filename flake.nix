@@ -118,6 +118,16 @@
         # The per-host daemon + pty pool, deployed to remote hosts. A separate
         # workspace member (libshpool lives only here), so scope the build/test
         # to it with `-p`; reuses the shared dependency artifacts.
+        #
+        # Deliberately left on plain `release`, not the size-tuned
+        # `server-release` that `xtask` builds published payloads with. That
+        # profile exists to shrink a *download* — every npm install and GitHub
+        # tarball carries a server — and a Nix user builds from source, so it
+        # would be trading throughput for bytes nobody transfers. The two
+        # binaries are otherwise identical; nothing about the wire protocol or
+        # behaviour depends on the profile. (`captain-miao-servers` below goes
+        # through `prepare-servers`, so those *are* `server-release` — they are
+        # payloads a dashboard deploys, which is the case the profile is for.)
         captain-miao-server = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
