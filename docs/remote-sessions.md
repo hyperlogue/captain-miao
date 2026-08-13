@@ -194,6 +194,18 @@ library**.
 - **Restore mode is `simple`** (`pty_pool.rs`): reattach = reconnect +
   SIGWINCH, **no scrollback replay**. Fine for full-screen agent TUIs, which
   repaint on resize anyway.
+- **The pool has no keybindings** (`keybinding = []`, `pty_pool.rs`). libshpool
+  scans every byte on the client→pty path for a chord and detaches on one,
+  defaulting to `Ctrl-Space Ctrl-q`. captain-miao never chose that binding, it
+  duplicates an escape hatch the dashboard already owns (`D`, `DetachRemote`),
+  and it sits on a prefix an agent TUI may want. The empty list is the
+  disabling form rather than `action = "noop"`, because the pump snips a
+  matched sequence *before* dispatching the action — `noop` would still eat the
+  keys — and because a partial match is buffered until the next byte
+  disambiguates it, which delays a lone `Ctrl-Space` either way. Note the
+  config file is passed with `--config-file`, which makes it the *only* one
+  libshpool loads: a user's own `~/.config/shpool/config.toml` never reaches the
+  pool, so it can't put the binding back (nor change anything else here).
 - **One client at a time — with an explicit steal.** A pool session that
   already has a terminal attached declines a second attach; `--force` steals
   it instead (§10.2 — implemented). libshpool's attach client implements the

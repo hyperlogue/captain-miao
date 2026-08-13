@@ -42,7 +42,19 @@ pub(crate) fn pool_socket_path() -> PathBuf {
 /// live redraw, and the spool costs memory per session for no benefit.
 /// libshpool's default is `screen` (restore a screenful), so `simple` has to be
 /// set explicitly. Pinned by `pool_config_is_simple_restore`.
-const POOL_CONFIG: &str = "session_restore_mode = \"simple\"\n";
+///
+/// We also take libshpool's **detach keybinding away entirely**. Its daemon
+/// scans every byte on the client→pty path for a chord, defaulting to
+/// `Ctrl-Space Ctrl-q` (`daemon/shell.rs`) — a binding captain-miao never chose,
+/// pointed at an escape hatch the dashboard already owns (`D`), sitting on a
+/// prefix an agent TUI may want. An **empty list** is the disabling form, not
+/// `action = "noop"`: the pump snips a matched sequence from the stream before
+/// it dispatches, so `noop` would still swallow the keys, and a *partial* match
+/// is held back until the next byte disambiguates it, so a lone `Ctrl-Space`
+/// would still arrive late. With no bindings compiled, every byte misses on the
+/// first transition and flows through untouched. Pinned by
+/// `pool_config_has_no_keybindings`.
+const POOL_CONFIG: &str = "session_restore_mode = \"simple\"\nkeybinding = []\n";
 
 /// Path to the libshpool config captain-miao writes for its pool daemon. Lives
 /// next to the pool socket in the per-user runtime dir; regenerated on every
@@ -446,7 +458,28 @@ mod tests {
     fn pool_config_is_simple_restore() {
         // The pool must not manage/restore scrollback. libshpool's default is
         // `screen`, so the authored config has to opt into `simple` explicitly.
-        assert_eq!(POOL_CONFIG.trim(), r#"session_restore_mode = "simple""#);
+        assert!(
+            POOL_CONFIG
+                .lines()
+                .any(|l| l == r#"session_restore_mode = "simple""#),
+            "authored config: {POOL_CONFIG:?}"
+        );
+    }
+
+    #[test]
+    fn pool_config_has_no_keybindings() {
+        // An empty list, not a `noop` action: the input pump snips a matched
+        // sequence before dispatching it, so `noop` still eats the keys.
+        // Nothing else may appear under the key — a `[[keybinding]]` table
+        // anywhere in this file would re-arm the scanner.
+        assert!(
+            POOL_CONFIG.lines().any(|l| l == "keybinding = []"),
+            "authored config: {POOL_CONFIG:?}"
+        );
+        assert!(
+            !POOL_CONFIG.contains("[[keybinding]]"),
+            "authored config: {POOL_CONFIG:?}"
+        );
     }
 
     #[test]
