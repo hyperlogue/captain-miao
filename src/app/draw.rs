@@ -1912,13 +1912,18 @@ const OVERRIDE_COL_WIDTH: u16 = 4;
 /// Squeeze arbitrary text — up to and including a host's multi-line refusal —
 /// onto one row of `max` cells.
 ///
-/// Both halves matter. **Flattening** is a correctness fix, not cosmetics: a
+/// All three parts matter. **Flattening** is a correctness fix, not cosmetics: a
 /// `\n` inside a `Span` doesn't wrap, it corrupts the row, and a `ConnState`
-/// reason quotes host output verbatim. **Truncating** with `truncate_str`'s `…`
+/// reason quotes host output verbatim. **Sanitizing** is the same argument
+/// carried to its end: `split_whitespace` drops the whitespace controls but not
+/// `ESC`, which a terminal executes rather than prints, so a host's stderr could
+/// otherwise repaint the dashboard around its own error message (see
+/// [`crate::backend::host_text_safe`]). **Truncating** with `truncate_str`'s `…`
 /// then says the text was cut, where letting it run to the popup edge looks
 /// like the whole message. Pure.
 pub(super) fn one_line(text: &str, max: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe = crate::backend::host_text_safe(text);
+    let flat = safe.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_str(&flat, max)
 }
 

@@ -137,6 +137,38 @@ pub(crate) struct ConnLog {
 /// narrative is ~15 lines, so this holds a long flap without growing.
 const CONN_LOG_CAP: usize = 200;
 
+/// Make text safe to paint into a terminal cell.
+///
+/// **Most of what this log carries is the host's own words** — a loader's
+/// refusal, a `tic` complaint, `uname` output, a version string — captured from
+/// stderr and quoted verbatim, which is the whole point of the log. But a
+/// terminal is not a text box: an `ESC` in that text is not a character, it is
+/// the start of a command to the emulator the dashboard is running in. ratatui
+/// writes a `Span`'s graphemes into cells and the cells go to the terminal, so
+/// an escape sequence in remote output is *executed* — it can clear the screen,
+/// move the cursor over the rest of the UI, recolour it, or (with the right
+/// sequence) get text echoed back onto the dashboard's own stdin. Nothing about
+/// a remote host's stderr deserves that much trust: the host may be
+/// compromised, and it need not even be malicious — a stray `\r` from a progress
+/// bar is enough to make the log unreadable.
+///
+/// `\n` survives because the log is line-structured and splits on it; `\t`
+/// becomes a space (ratatui doesn't expand tabs, so it would paint as one
+/// cell); everything else in the control classes — C0, `DEL`, and the C1 range
+/// where a bare `\u{9b}` *is* CSI — becomes a visible replacement character, so
+/// the diagnosis shows that something was stripped rather than quietly losing
+/// it.
+pub(crate) fn host_text_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' => '\n',
+            '\t' => ' ',
+            c if c.is_control() => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
+}
+
 impl ConnLog {
     fn push(&self, error: bool, text: String) {
         let mut entries = self.entries.lock().unwrap();
@@ -146,7 +178,12 @@ impl ConnLog {
         entries.push_back(ConnLogEntry {
             at: Instant::now(),
             error,
-            text,
+            // Sanitized at the sink rather than at each capture site: the log
+            // has four or five separate remote-text sources (every stderr we
+            // quote, plus `uname` and the version strings parsed out of the
+            // probe), and one of them being added later without the treatment
+            // is exactly how this comes back.
+            text: host_text_safe(&text),
         });
     }
 
@@ -1520,7 +1557,7 @@ fn provision_label(action: &Provision) -> &'static str {
 /// account's login shell: [`login_shell_safe`] wraps the whole thing in
 /// `/bin/sh -c '…'`, so the inner dialect is always POSIX sh. The rule that
 /// still binds is the wrapper's — no single quote and no backslash anywhere.
-fn probe_script(terminfo: Option<&str>) -> String {
+fn probe_script(terminfo: Option<&TerminfoName>) -> String {
     // Whether the host can describe *our* terminal. Asked here rather than
     // anywhere else because this is the one round trip that already exists, and
     // because the answer is only actionable during provisioning — a pooled
@@ -1557,30 +1594,62 @@ fn probe_script(terminfo: Option<&str>) -> String {
     )
 }
 
-/// This dashboard's `TERM`, when it is a name worth asking a host about *and*
-/// safe to splice into a shell script.
+/// A terminfo name that has passed the allowlist below, and is therefore safe
+/// to splice into a script and to hand to `infocmp` as a positional argument.
 ///
-/// The allowlist is the security half: the value is interpolated into a script
-/// that [`login_shell_safe`] wraps in single quotes, so a `TERM` carrying a
-/// quote would both break that wrapping and be a command-injection seam from an
-/// environment variable. Terminfo names are `[A-Za-z0-9._+-]` in practice
-/// (`xterm-kitty`, `screen.xterm-256color`), so anything else is refused rather
-/// than escaped — there is nothing to gain by accepting it.
-///
-/// `dumb` and the universally-present `xterm-256color` are dropped as well:
-/// every host has the latter, and the pool wrapper substitutes it for the
-/// former anyway, so asking would only ever produce a `yes`. Pure apart from the
-/// env read.
-fn terminfo_to_provision() -> Option<String> {
-    let term = std::env::var("TERM").ok()?;
-    let term = term.trim();
-    let safe = !term.is_empty()
-        && term.len() <= 64
-        && term
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
-    let worth_asking = !matches!(term, "dumb" | "xterm-256color" | "xterm" | "linux");
-    (safe && worth_asking).then(|| term.to_string())
+/// A newtype rather than a validated `String` because the invariant has to
+/// outlive the call site that established it: every script this module sends is
+/// wrapped by [`login_shell_safe`] in `/bin/sh -c '…'`, so a name carrying a
+/// single quote does not merely break the wrapping — it *closes* it, and the
+/// rest of the value runs as commands on every host the dashboard touches. The
+/// value comes from `TERM`, an environment variable, which is exactly the class
+/// of input that shouldn't be trusted on the strength of a comment. Making the
+/// only constructor the validator means a future caller cannot forget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminfoName(String);
+
+impl TerminfoName {
+    /// `Some` for a name that is safe to send and worth asking about.
+    ///
+    /// **Allowlist, not escaping.** Real terminfo names are
+    /// `[A-Za-z0-9._+-]` (`xterm-kitty`, `screen.xterm-256color`), so anything
+    /// else is refused outright — there is no legitimate name we'd lose, and an
+    /// escaping scheme is a thing to get subtly wrong forever after.
+    ///
+    /// **The first character must be alphanumeric.** `-` is otherwise a
+    /// perfectly good terminfo character, but a *leading* one makes the name an
+    /// option to both `infocmp` and `tic`, which is a second injection grammar
+    /// hiding behind the first: `TERM=-V` would have `infocmp -V` exit 0 and be
+    /// read as "the host has this terminal".
+    ///
+    /// Universally-present names are dropped as not worth a question — every
+    /// host has them, and the pool wrapper substitutes `xterm-256color` for
+    /// `dumb` anyway, so the answer could only ever be `yes`.
+    fn new(raw: &str) -> Option<Self> {
+        let name = raw.trim();
+        let safe = name.len() <= 64
+            && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+        let worth_asking = !matches!(name, "dumb" | "xterm-256color" | "xterm" | "linux");
+        (safe && worth_asking).then(|| Self(name.to_string()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TerminfoName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// This dashboard's own `TERM`, if it is a name we can safely ask a host about.
+fn terminfo_to_provision() -> Option<TerminfoName> {
+    TerminfoName::new(&std::env::var("TERM").ok()?)
 }
 
 /// The fragment of `miao-server daemon status`'s first line that means a daemon
@@ -2114,7 +2183,7 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
         .args(opts)
         .arg(target)
         .arg(login_shell_safe(&probe_script(
-            terminfo_to_provision().as_deref(),
+            terminfo_to_provision().as_ref(),
         )))
         .output()
         .await
@@ -2147,14 +2216,21 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
 /// host to resolve the name afterwards, which is the thing we actually want to
 /// be true. A failure is returned, never fatal — a host that can't take the
 /// entry still runs sessions, just in `xterm-256color`.
-async fn install_terminfo(target: &str, opts: &[String], term: &str) -> Result<(), String> {
+async fn install_terminfo(
+    target: &str,
+    opts: &[String],
+    term: &TerminfoName,
+) -> Result<(), String> {
+    // No shell on this side — an argv, so the name needs no quoting here. It is
+    // still a [`TerminfoName`], because a leading `-` would make it an *option*
+    // to infocmp rather than the terminal to describe.
     let local = Command::new("infocmp")
         .arg("-x")
-        .arg(term)
+        .arg(term.as_str())
         .output()
         .await
         .map_err(|e| format!("running local infocmp: {e}"))?;
-    if !local.status.success() {
+    if !local.status.success() || local.stdout.is_empty() {
         return Err(format!("this machine has no terminfo source for {term}"));
     }
 
@@ -2181,7 +2257,10 @@ async fn install_terminfo(target: &str, opts: &[String], term: &str) -> Result<(
         .map_err(|e| format!("ssh failed: {e}"))?;
     let _ = writer.await;
 
-    if !String::from_utf8_lossy(&out.stdout).contains("ok") {
+    // Both halves: the script's own exit status *and* its marker. Either alone
+    // can lie — ssh reports the remote status faithfully but a login shell's rc
+    // can exit 0 on its own, and stdout is shared with whatever that rc printed.
+    if !out.status.success() || !terminfo_took(&String::from_utf8_lossy(&out.stdout)) {
         let stderr: String = String::from_utf8_lossy(&out.stderr)
             .trim()
             .chars()
@@ -2201,15 +2280,32 @@ async fn install_terminfo(target: &str, opts: &[String], term: &str) -> Result<(
 const TERMINFO_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The remote half of [`install_terminfo`]: compile the entry arriving on stdin
-/// into `~/.terminfo`, then prove the name resolves. `echo ok` is the contract —
-/// tic's own exit status says the file compiled, not that ncurses will find it.
-/// Quote- and backslash-free for [`login_shell_safe`]; pure. Pinned by
-/// `every_script_we_send_survives_the_wrapping_that_defeats_a_login_shell`.
-fn terminfo_install_script(term: &str) -> String {
+/// into `~/.terminfo`, then prove the name resolves. The final `echo` is the
+/// contract — tic's own exit status says the file compiled, not that ncurses
+/// will find it. Quote- and backslash-free for [`login_shell_safe`]; pure.
+/// Pinned by `every_script_we_send_survives_the_wrapping_that_defeats_a_login_shell`.
+fn terminfo_install_script(term: &TerminfoName) -> String {
     format!(
         "d=\"$HOME/.terminfo\"; mkdir -p \"$d\"; \
-         tic -x -o \"$d\" - && infocmp {term} >/dev/null 2>&1 && echo ok"
+         tic -x -o \"$d\" - && infocmp {term} >/dev/null 2>&1 && echo {TIC_OK_MARK}"
     )
+}
+
+/// What the install script prints when the entry both compiled *and* resolves.
+///
+/// Distinctive, and matched as a whole line, because the host's stdout is not
+/// ours alone: `ssh` runs the command through the account's **login shell**, so
+/// a `fish_greeting` or an `echo` in `.bashrc` lands on the same stream — the
+/// same hazard [`reported_version`] exists for. A plain `ok` would let a chatty
+/// rc file report a success that never happened, and the failure would then
+/// surface much later as a session mysteriously running in `xterm-256color`.
+const TIC_OK_MARK: &str = "cm-terminfo-installed";
+
+/// Whether the host's output actually claims the install landed. Whole-line
+/// match on [`TIC_OK_MARK`], so neither a greeting mentioning it in passing nor
+/// a prompt fragment counts. Pure.
+fn terminfo_took(stdout: &str) -> bool {
+    stdout.lines().any(|l| l.trim() == TIC_OK_MARK)
 }
 
 /// Stream an embedded server payload to the host's cache path over the ssh
@@ -3753,10 +3849,10 @@ mod tests {
             unsafe { std::env::set_var("TERM", t) };
             terminfo_to_provision()
         };
-        assert_eq!(name("xterm-kitty").as_deref(), Some("xterm-kitty"));
+        assert_eq!(name("xterm-kitty"), TerminfoName::new("xterm-kitty"));
         assert_eq!(
-            name("screen.xterm-256color").as_deref(),
-            Some("screen.xterm-256color")
+            name("screen.xterm-256color"),
+            TerminfoName::new("screen.xterm-256color")
         );
         // Nothing to ask about: every host has these, and the pool wrapper
         // substitutes for the rest anyway.
@@ -3764,11 +3860,89 @@ mod tests {
         assert_eq!(name("dumb"), None);
         assert_eq!(name(""), None);
         // Injection attempts, in the forms an environment variable can take.
-        assert_eq!(name("x; rm -rf ~"), None);
-        assert_eq!(name("x' ; id ; '"), None);
-        assert_eq!(name("$(id)"), None);
-        assert_eq!(name("a\\b"), None);
-        assert_eq!(name(&"x".repeat(65)), None);
+        // The `'` case is the one that matters most: `login_shell_safe` wraps
+        // the script in single quotes, so that value doesn't escape a quote —
+        // it *closes* one, and `id` runs on the host.
+        for hostile in [
+            "x; rm -rf ~",
+            "x' ; id ; '",
+            "$(id)",
+            "`id`",
+            "a\\b",
+            "a b",
+            "a\nb",
+            "a|b",
+            "a&b",
+            "a>b",
+            "a$b",
+            "../../etc/passwd",
+            "*",
+            &"x".repeat(65),
+        ] {
+            assert_eq!(name(hostile), None, "accepted {hostile:?}");
+        }
+        // A leading `-` is the second grammar: legal *inside* a terminfo name,
+        // but at the front it makes the value an option to infocmp/tic rather
+        // than a terminal. `-V` exits 0, which would read as "the host has it".
+        assert_eq!(name("-V"), None);
+        assert_eq!(name("-o/tmp/x"), None);
+        // …while the same character mid-name is ordinary and must survive.
+        assert!(name("rxvt-unicode-256color").is_some());
+
+        // Belt and braces: whatever survives the allowlist must still be inert
+        // in the two scripts it reaches, which is what the wrapper depends on.
+        for ok in ["xterm-kitty", "screen.xterm-256color", "rxvt-unicode"] {
+            let n = TerminfoName::new(ok).expect("a real name");
+            for script in [probe_script(Some(&n)), terminfo_install_script(&n)] {
+                assert!(!script.contains('\''), "{script}");
+                assert!(!script.contains('\\'), "{script}");
+            }
+        }
+    }
+
+    /// The log quotes a remote host's stderr verbatim into a terminal, so an
+    /// `ESC` in it would be *executed* by the emulator rather than printed —
+    /// enough to repaint the dashboard around the host's own error message, or
+    /// with the right sequence to get text echoed back onto its stdin. Line
+    /// structure survives; nothing else in the control classes does.
+    #[test]
+    fn quoted_host_output_cannot_drive_the_terminal() {
+        // A clear-screen and a cursor move, as a hostile (or just broken) host
+        // could emit them: 7-bit ESC-introduced, and the 8-bit C1 CSI that a
+        // filter thinking only in ESC would sail straight past.
+        let hostile = "tic: \u{1b}[2Jbad\u{9b}31mred\u{1b}]0;retitle\u{7}";
+        let safe = host_text_safe(hostile);
+        assert!(!safe.contains('\u{1b}'), "{safe:?}");
+        assert!(!safe.contains('\u{9b}'), "{safe:?}");
+        assert!(!safe.contains('\u{7}'), "{safe:?}");
+        // The words survive — the log is still a diagnosis.
+        assert!(safe.contains("bad") && safe.contains("red"), "{safe:?}");
+        // Line structure is load-bearing (`host_log_lines` splits on it) and a
+        // tab would paint as one cell, so it becomes a space.
+        assert_eq!(host_text_safe("a\nb\tc"), "a\nb c");
+        // A `\r` alone would return the cursor and overwrite the line.
+        assert_eq!(host_text_safe("done\r"), "done\u{FFFD}");
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(host_text_safe("no such file: café"), "no such file: café");
+    }
+
+    /// The install's success signal shares stdout with the account's **login
+    /// shell**, so it is matched as a whole distinctive line. A bare `ok` would
+    /// let a `.bashrc` greeting report a success that never happened — and the
+    /// symptom would surface much later, as a session mysteriously running in
+    /// `xterm-256color`.
+    #[test]
+    fn a_chatty_login_shell_cannot_fake_a_terminfo_install() {
+        assert!(terminfo_took(TIC_OK_MARK));
+        // The real shape: an rc greeting, then our marker.
+        assert!(terminfo_took(&format!(
+            "Welcome to box!\nHave a nice day\n{TIC_OK_MARK}\n"
+        )));
+        assert!(!terminfo_took(""));
+        assert!(!terminfo_took("ok"));
+        assert!(!terminfo_took("everything looks ok\n"));
+        assert!(!terminfo_took(&format!("almost-{TIC_OK_MARK}\n")));
+        assert!(!terminfo_took(&format!("{TIC_OK_MARK}-not-really\n")));
     }
 
     #[test]
@@ -4410,12 +4584,13 @@ mod tests {
         // The constraint that makes `/bin/sh -c '<script>'` parse identically in
         // sh, bash, zsh, fish and csh. `login_shell_safe` debug-asserts it too,
         // but only for the scripts a given run happens to build.
+        let safe_name = TerminfoName::new("xterm-kitty").expect("a plain name is accepted");
         for script in [
             probe_script(None),
             // A terminfo name is spliced into the probe, so the sanitized form
             // has to survive the same wrapping.
-            probe_script(Some("xterm-kitty")),
-            terminfo_install_script("xterm-kitty"),
+            probe_script(Some(&safe_name)),
+            terminfo_install_script(&safe_name),
             upload_script(&"a".repeat(64), "aarch64-unknown-linux-musl"),
         ] {
             let script = script.as_str();
