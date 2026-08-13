@@ -2384,6 +2384,11 @@ async fn capped_output(
 /// host misbehaving, and the parse only ever reads the first few lines anyway.
 const REMOTE_OUTPUT_CAP: u64 = 256 * 1024;
 
+/// How long `daemon ensure` may take. Longer than the probe: on a host whose
+/// daemon isn't up yet this *starts* one, which is a spawn plus a socket bind,
+/// and a cold NFS home has been known to make that unhurried.
+const ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How long a probe may take. It is five `--version` calls and a `cat` over an
 /// already-primed ControlMaster; the generous end of that is still seconds.
 /// Needed because `ConnectTimeout` covers only the handshake and `ServerAlive*`
@@ -2590,10 +2595,13 @@ async fn upload_server(
         stdin.shutdown().await
     });
 
-    let out = tokio::time::timeout(UPLOAD_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| format!("timed out after {}s", UPLOAD_TIMEOUT.as_secs()))?
-        .map_err(|e| format!("ssh failed: {e}"))?;
+    // Capped like the probe: the host is on the far end and the deploy script's
+    // whole reply is one `--version` line (see [`capped_output`]).
+    let (status, stdout, stderr) =
+        tokio::time::timeout(UPLOAD_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .map_err(|_| format!("timed out after {}s", UPLOAD_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("ssh failed: {e}"))?;
     // A write error here is usually the *consequence* of the remote script
     // failing (it exited, closing the pipe), so the script's own stderr below is
     // the better message; only report this one if the script looked fine.
@@ -2603,14 +2611,10 @@ async fn upload_server(
         Err(e) => Some(format!("upload task: {e}")),
     };
 
-    if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(200)
-            .collect();
+    if !status.success() {
+        let stderr: String = stderr.trim().chars().take(200).collect();
         return Err(if stderr.is_empty() {
-            write_err.unwrap_or_else(|| format!("host rejected it (rc={:?})", out.status.code()))
+            write_err.unwrap_or_else(|| format!("host rejected it (rc={:?})", status.code()))
         } else {
             stderr
         });
@@ -2621,7 +2625,6 @@ async fn upload_server(
     // The script echoed what the *host* got from `<binary> --version`, which is
     // the real proof it both landed intact and can run there.
     let expected = env!("CARGO_PKG_VERSION");
-    let stdout = String::from_utf8_lossy(&out.stdout);
     if reported_version(&stdout).as_deref() != Some(expected) {
         return Err(format!(
             "deployed binary reported {:?}, expected {SERVER_BIN} {expected}",
@@ -3362,27 +3365,37 @@ async fn setup_ssh(
     // `daemon ensure` self-daemonizes if needed (idempotent — a no-op against a
     // live one) and prints the socket path on its first stdout line. This starts
     // the persistent daemon; the separate `-N -L` child below only forwards.
-    let out = Command::new("ssh")
+    let child = Command::new("ssh")
         .args(&opts)
         .arg(target)
         .arg(&exe)
         .args(["daemon", "ensure"])
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    // Bounded on both axes, exactly like the probe that ran a moment ago
+    // against this same host: `ensure` answers with one socket path, and
+    // nothing about a remote host obliges it to stop talking.
+    let (status, stdout, stderr) =
+        tokio::time::timeout(ENSURE_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .ok()?
+            .ok()?;
+    if !status.success() {
         tracing::warn!(
             target: "captain_miao::ssh",
             "{target}: `{exe} daemon ensure` failed (rc={:?}): {}",
-            out.status.code(),
+            status.code(),
             stderr.trim()
         );
         // The log gets it whole and unelided — this is the sentence the panel
         // row has to cut, and reading all of it is the entire reason `l` exists.
         log.error(format!(
             "`{exe} daemon ensure` failed (rc={:?}):\n{}",
-            out.status.code(),
+            status.code(),
             stderr.trim()
         ));
         // Keep a provisioning diagnosis if we have one (it's the root cause);
@@ -3392,7 +3405,7 @@ async fn setup_ssh(
             *failure = Some(if detail.is_empty() {
                 format!(
                     "`daemon ensure` failed on the host (rc={:?})",
-                    out.status.code()
+                    status.code()
                 )
             } else {
                 format!("`daemon ensure` failed on the host: {detail}")
@@ -3402,12 +3415,7 @@ async fn setup_ssh(
     }
     // The daemon answered, so nothing is wrong with the install after all.
     *failure = None;
-    let remote_sock = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let remote_sock = stdout.lines().next().unwrap_or_default().trim().to_string();
     if remote_sock.is_empty() {
         tracing::warn!(target: "captain_miao::ssh", "{target}: daemon ensure returned no socket path");
         log.error("`daemon ensure` succeeded but printed no socket path");
