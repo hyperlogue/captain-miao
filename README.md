@@ -21,33 +21,16 @@ tool and the rest of your workflow is yours to compose.
 
 - **The whole fleet at a glance:** every session in one table, with status, working directory, model, context usage, git branch, and a live transcript preview.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
-- **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard, with a filterable picker for recent working directories.
+- **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
+- **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
 - **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents.
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
-- **Pin and mark:** pin important sessions to the top, and flag the ones to follow up on.
-- **Sessions that outlive their window** (opt-in): run them in a local pty pool so closing the terminal — or logging out — doesn't end them, and a dashboard on another machine can attach to the same ones.
-- **Sessions on other machines:** federate several hosts into one dashboard, each running its sessions in its own pty pool, so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- 🧪 **Isolated worktrees:** start a session in a fresh git worktree so it can't touch your main checkout — see [Experimental](#experimental).
-
-## Experimental
-
-Two parts of captain-miao are usable but not yet load-bearing. They're marked 🧪
-throughout this README, and each is listed here with what specifically is
-unproven — so you can judge the risk rather than guess at it.
-
-| Feature | State | What's unverified |
-| --- | --- | --- |
-| **tmux backend** | On by default when you run inside tmux | Probe-verified against **tmux 3.7b only**. The documented ≥ 3.2 floor is a claim, not a tested one, and the backend's live test doesn't yet run in CI. |
-| **Worktrees** (`Ctrl-g`) | On, Claude Code only | Newly added and lightly exercised. captain-miao only passes `--worktree`; the worktree itself is the agent's, so the blast radius is small — but the flag has not been through a real multi-week workflow. |
-
-Everything else — the dashboard, Kitty and zellij, both agent backends, pooled
-local sessions, and remote hosts — is the supported path.
 
 ## Requirements
 
-- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or 🧪 **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
+- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
 - **Claude Code** and/or **Codex** on your `PATH`.
 
 ## Installation
@@ -125,8 +108,6 @@ Run the dashboard inside a supported terminal (Kitty, zellij or tmux):
 miao
 ```
 
-> `miao` must be launched from within Kitty or a zellij/tmux session; it exits with an error otherwise. Inside a multiplexer it auto-selects that backend — zellij first, then tmux, else Kitty (override with `[terminal] backend` in the config). Both multiplexers deliberately beat an ambient Kitty: nested inside Kitty, every pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty backend would drive the wrong window.
-
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
 | Command                       | What it does                                                                                                                               |
@@ -141,18 +122,23 @@ Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process tha
 
 ### Key bindings
 
-Press `?` in the dashboard for the complete list. Highlights:
+Press `?` in the dashboard for the complete list. The six you'll reach for most:
 
 | Key                            | Action                                                                 |
 | ------------------------------ | ---------------------------------------------------------------------- |
 | `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                      |
-| `gg` / `G`                     | Jump to top / bottom                                                   |
-| `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                       |
-| `Enter`                        | Focus the selected session's window                                    |
-| `o` / `O`                      | New session (same tab / prompt for cwd)                                |
+| `Enter`                        | Focus the selected session's window, or attach one to a detached session (asking first if another client holds it) |
+| `o` / `O`                      | New session (same cwd / prompt for cwd)                                |
 | `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session |
 | `x` / `D`                      | Kill the selected session / detach from it, leaving it running         |
 | `s`                            | Jump to the next session needing attention                             |
+
+#### Remaining key bindings
+
+| Key                            | Action                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `gg` / `G`                     | Jump to top / bottom                                                   |
+| `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                       |
 | `p` / `i`                      | Pin / toggle needs-input on the selected session                       |
 | `y`                            | Copy the selected session id to the clipboard                          |
 | `t` / `w`                      | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab |
@@ -173,27 +159,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
-In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, `Ctrl-d` drops the highlighted recent directory, and 🧪 `Ctrl-g` starts the session in a fresh **git worktree**.
-
-> 🧪 **Worktrees are experimental** — newly added and lightly exercised. See
-> [Experimental](#experimental).
-
-`Ctrl-g` also asks for a name: type one and press Enter for
-`.claude/worktrees/<name>` on a `worktree-<name>` branch (a `#1234` PR reference
-works too), or just press Enter to let the agent name it. `Esc` there means "no
-worktree after all".
-
-Worktrees are created by the agent, not by captain-miao: `Ctrl-g` adds
-`--worktree` to the launch, and Claude Code does the rest — the branch,
-`.worktreeinclude` files copied in, edits to your main checkout blocked, and a
-keep-or-remove prompt when the session exits. Resuming or restarting a worktree
-session returns it to the same worktree without asking again. Codex has no
-equivalent, so the key is hidden when it's the selected backend.
-
-Worktree rows keep their project's identity: the directory icon and colour you
-set with `Space i` are shared with the repo (set it once, every worktree of it
-follows), while `w` opens a work tab per worktree — they're different branches —
-titled `<repo>@<worktree>` so the tab bar stays readable.
+In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, and `Ctrl-d` drops the highlighted recent directory.
 
 **Custom keybindings.** Every Normal-mode command above is remappable via a `[keybinds]` table in `~/.config/captain-miao/config.toml`. Map a command id to a key (or list of keys); an empty list unbinds it:
 
@@ -228,7 +194,8 @@ max_recent_cwds = 50         # entries kept in the workdir picker's recent list
 resume_list_limit = 50       # max sessions listed in the resume picker (most recent first)
 new_tab_title = "{agent}: {basename}"     # new-session tab title; placeholders: {agent} {basename} {cwd}
 resume_tab_title = "{agent}: {basename}"  # resumed-session tab title
-pooled = false               # run this machine's sessions in the local pty pool (see below)
+pooled = false               # run this machine's sessions in a local pty pool, so they
+                             # survive closing the window; needs miao-server on PATH
 
 [remote]
 on_window_close = "close"    # "close" | "detach": what closing a pooled session's window
@@ -282,125 +249,35 @@ keybind_log_file = "keybinds.log"
 
 Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`kill`, `jump_attention`, `restart`, `toggle_preview`, …).
 
-### Pooled sessions (`[launcher] pooled`)
+### Running sessions on remote servers
 
-By default a session *is* its terminal window: closing the window ends it. With
-`pooled = true` captain-miao instead runs each session in a local pty pool (an
-embedded [libshpool](https://github.com/shell-pool/shpool)), and the window
-merely *attaches* to it — so the session survives closing the window, a crashed
-multiplexer, and logging out.
-
-This is meant for **dev servers, not laptops**. On a machine you only ever sit
-at, the pool buys no persistence and costs an extra process hop, no scrollback
-replay when you reattach, and one client at a time. On a machine you also reach
-from elsewhere it's the point: a dashboard on your laptop and a captain-miao you
-ssh into from a phone become two clients of the *same* sessions.
-
-Needs `miao-server` on `PATH` (it hosts the pool); without it the
-dashboard says so and falls back to the default behaviour. On Linux, also run
-`loginctl enable-linger` — see below.
-
-### Running sessions on other machines
-
-Add hosts with `Space h`.
-Each host runs a `miao-server` daemon holding its sessions in a pty
-pool, and the dashboard attaches local windows to them over ssh, so a dropped
-connection or a slept laptop detaches windows without touching the sessions —
-and reconnecting brings them all back. Full design notes:
+Add hosts with `Space h`. Each runs a `miao-server` daemon holding its sessions
+in a pty pool, and the dashboard attaches local windows to them over ssh — so a
+dropped connection or a slept laptop detaches windows without touching the
+sessions, and reconnecting brings them back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
 
-The panel itself is where each host reports in: connection state (with the
-reason when it failed), how many sessions it holds and how many you're attached
-to, its daemon version, its **CPU and memory utilisation**, and the round-trip
-latency — so "which box has room for this?" is answered before you launch, not
-after. The utilisation is measured by the host's own daemon and asked for only
-while the panel is open, so nothing is sampled or sent while you aren't
-looking; a host running an older `miao-server` simply shows no numbers.
+The panel is where each host reports in: connection state and the reason when it
+failed, session counts, daemon version, latency, and CPU + memory. `l` opens its
+full connection log, `c` suspends it, `u` upgrades its server.
 
-**Closing a session's window ends that session**, the same as `x` — closing it
-by hand reads as "I'm done with this", and the alternative is a pooled session
-running with nothing on screen to show it. Set `on_window_close = "detach"`
-under `[remote]` for the opposite (every close behaves like `D`). This applies
-only to a window *you* close: an attach that ends because its link died always
-detaches, so a dropped ssh, a slept laptop, or a whole host going away never
-costs you a session. Nor does quitting the terminal, which closes every window
-at once — the session ends a second after its window does, and quitting takes
-the dashboard down well inside that. Note that closing a *tab* closes the
-windows in it — under `stacked`, that is every session sharing the
-`miao:sessions` tab.
-
-**Per-host ssh options.** The `Options` field in the same panel takes ssh
-arguments, passed through verbatim to every ssh captain-miao runs for that host.
-It exists mainly for **port forwards** — an agent on a remote box starts a dev
-server, and `-L 8080:localhost:3000` is how you open it in the browser here. The
-forward comes up with the connection, comes back with it after a reconnect, and
-goes away when you remove it or suspend the host, which is the part a hand-run
-`ssh -L` in a spare terminal doesn't give you.
-
-Most other host settings belong in `~/.ssh/config` instead — a non-default port,
-a jump host, an identity file are properties of the machine, and a `Host` block
-there also covers the attach windows and the `w` shell. Use this field for what
-ssh_config can't single out, since it can't tell captain-miao's connection from
-any other ssh to the same machine: a forward, `-C`, a keepalive. Your arguments
-go first, so an `-o` here overrides captain-miao's own default for it.
-
-**Getting the daemon onto each host.** Either install `miao-server`
-there yourself (any copy on `PATH` matching your dashboard's version is used as
-is, and never touched), or let the dashboard carry one and deploy it for you:
-
-```sh
-# Download this version's published servers and bundle them in — needs only
-# curl and tar, no cross toolchain:
-cargo xtask dist --variant bundle-linux --from release
-
-# …or cross-compile them from the sources beside you, which is what you want
-# while changing the server itself:
-nix develop                                # provides zig + the cross toolchains
-cargo xtask dist --variant bundle-linux
-
-# …or straight from the flake, no dev shell needed:
-nix build .#captain-miao-bundle-linux
-```
-
-Either way it ends with the servers embedded in the finished dashboard, and
-there is no separate step to run or keep up to date.
-
-The resulting binary pushes the right server to any host that's missing one,
-verifies it runs there before putting it in place, and skips the work on later
-connects. The embedded binaries target glibc 2.28 (Debian 10, RHEL 8, and newer)
-and cost about 7 MB (7.6 → 14.2 MB).
-
-What a dashboard carries is fixed when it is built, and `miao --version` reports
-it — including each server's digest, which is what tells two builds of the same
-version apart. `cargo xtask dist` builds the named release variants side by
-side — a plain `miao` carrying nothing and a `miao-bundle-linux` carrying both — and
-`--list` shows the rest, including single-arch bundles if your fleet is only one.
-The flake exposes the same set as packages (`captain-miao-bundle-linux`,
-`-x86_64`, `-aarch64`). Binaries from npm and GitHub Releases are the plain
-build; each release also publishes the servers on their own, which is what
-`--from release` downloads.
-
-`miao --version` says what any given binary is carrying:
-
-```
-miao 0.3.0
-embedded miao-server:
-  aarch64-unknown-linux-gnu     3.2 MiB  36fd6ac00444
-  x86_64-unknown-linux-gnu      3.4 MiB  c1a3cd563639
-```
-
-**On any Linux host that runs the daemon — including your own machine under
-`pooled = true` — run `loginctl enable-linger`:**
-
-```sh
-loginctl enable-linger "$USER"
-```
-
-Without it, systemd-logind removes `/run/user/<uid>` when you log out, taking
-the daemon's sockets with it (and on distros with `KillUserProcesses=yes`,
-killing the daemon outright). captain-miao recovers on the next login — the
-daemon notices its socket is gone and rebinds — but linger avoids the outage
-entirely, which matters precisely when you're away and expecting persistence.
+- **Detached rows** — running there, no window here — are dimmed and marked 🙈
+  when free or 👀 when another client is holding one. `Enter` attaches, `Space A`
+  attaches every free one, `Space s` steals a held one.
+- **Closing a session's window ends it**, the same as `x`; set `on_window_close =
+  "detach"` under `[remote]` for the opposite. A window lost to a dropped link
+  detaches instead, so a flaky network never costs you a session.
+- **`Options`** takes verbatim ssh arguments, mainly port forwards
+  (`-L 8080:localhost:3000`), which come up and go away with the connection.
+  Everything else belongs in `~/.ssh/config`.
+- **Terminfo** — a host with no entry for your `TERM` is offered yours, so
+  sessions there stop falling back to `xterm-256color`. It asks first.
+- **The daemon** is either your own on `PATH` or one the dashboard deploys.
+  `cargo xtask dist` bundles servers into the binary (`--list` shows the
+  variants); carrying none for a host, it offers to download the published one.
+  `miao --version` reports what a binary carries.
+- **Run `loginctl enable-linger "$USER"`** on any Linux host running the daemon,
+  or systemd-logind takes its sockets away at your last logout.
 
 ## How it works
 
@@ -414,11 +291,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 ## Roadmap
 
-Graduating the two 🧪 [experimental](#experimental) features is the near-term
-work:
-
-- [ ] 🧪 **tmux**: probe-verified on 3.7b only, and its live-server test doesn't run in CI yet. tmux is the one backend that *can* be tested headlessly — a server on a socket is the whole dependency — so putting that test in CI, and pinning the claimed ≥ 3.2 floor with it, is what graduates it.
-- [ ] 🧪 **Worktrees**: shipped for Claude Code, which owns the worktree itself. Codex has [no equivalent flag yet](https://github.com/openai/codex/issues/12862); when it lands, captain-miao needs one match arm.
+- [ ] **tmux**: probe-verified on 3.7b only, and its live-server test doesn't run in CI yet. tmux is the one backend that *can* be tested headlessly — a server on a socket is the whole dependency — so putting that test in CI, and pinning the claimed ≥ 3.2 floor with it, is what graduates it.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 

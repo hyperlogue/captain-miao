@@ -5,292 +5,84 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-12
 
 ### Added
 
-- **Host CPU and memory in the hosts panel.** Each host row now carries its
-  utilisation beside the connection latency, so "which box has room for this
-  session?" is answered before you launch rather than after. The numbers are
-  measured by the host's own `miao-server`, and asked for only while the panel
-  is open, so nothing is sampled or sent while you aren't looking. A host
-  running an older server, or one whose OS we can't read, simply shows none —
-  never a misleading `0%`.
+- **Remote dev is out of the experimental stage.** Federate several machines into
+  one dashboard: each host runs its sessions in its own pty pool, so a dropped
+  connection or a slept laptop detaches windows without touching the sessions,
+  and reconnecting brings them back.
 
-- **Per-host ssh options.** Hosts (`Space h`) gained an `Options` field: ssh
-  arguments, passed through verbatim to every ssh captain-miao runs for that
-  host.
+  - `Space h` opens a hosts panel showing each host's connection state, session
+    counts, daemon version, latency, and CPU + memory, with `l` for its full
+    connection log and `c` to suspend a host in place instead of deleting it.
+  - The dashboard deploys `miao-server` to a host that hasn't got one, offering a
+    build and letting the host prove it can run it; `cargo xtask dist` is what
+    bundles the servers into a dashboard.
+  - A host with no terminfo entry for your `TERM` is offered this terminal's,
+    which stops sessions there silently falling back to `xterm-256color`.
+  - `u` upgrades a host's server in place, and the panel says which hosts a
+    restart would move.
+  - Each host takes verbatim ssh `Options`, mostly for port forwards — they come
+    up with the connection, come back after a reconnect, and go away with it.
+  - `Space A` attaches a window to every detached session that is free to take.
+  - `[launcher] pooled = true` runs *this* machine's sessions in a pool too, so
+    they survive closing the window, a crashed multiplexer, and logging out.
+  - `programs.captain-miao.server.enable = true` — a Home Manager module, and the
+    whole setup a Nix host needs to be reachable from another machine's dashboard.
 
-  It's mostly for **port forwards**. An agent working on a remote box starts a
-  dev server, a preview, a debugger — `-L 8080:localhost:3000` here is how you
-  reach them, and unlike a hand-run `ssh -L` in a spare terminal, the forward
-  comes up with the connection, comes back after a reconnect, and goes away when
-  you delete it or suspend the host. A port that's already taken costs you that
-  one forward and nothing else.
-
-  Most other host settings belong in `~/.ssh/config`, which also covers the
-  attach windows and the `w` shell; this field is for what ssh_config can't
-  single out, since it can't tell captain-miao's connection from any other ssh
-  to the same machine. Your arguments go first, so an `-o` here wins over
-  captain-miao's default for it.
-
-## [0.3.0] - 2026-08-11
-
-### Added
-
-- 🧪 **captain-miao runs in tmux.** The third terminal backend, alongside Kitty
-  and zellij: start the dashboard inside a tmux pane and it drives that server —
-  spawning sessions, focusing them, previewing them, and moving them between
-  windows. There is nothing to configure, because tmux's CLI is already trusted
-  by the socket that owns your session (contrast Kitty's remote-control setup).
-  Two things work here that don't on zellij: `t` (move a session to another tab)
-  is real, since `break-pane`/`join-pane` are actual commands, and the `miao
-  focus` bell keybinding has a direct analog via `run-shell -b`. One thing
-  doesn't: tmux has no arrangement that keeps several sessions in one window
-  without a pty resize on every switch, so every session gets its own tmux
-  window and the layout toggle isn't offered.
-
-  **Experimental**: probe-verified against tmux 3.7b only. The documented ≥ 3.2
+- 🧪 Add experimental support for **tmux**, as a third terminal backend alongside
+  Kitty and zellij. Probe-verified against tmux 3.7b only; the documented ≥ 3.2
   floor is a claim, not a tested one.
 
-- 🧪 **Start a session in its own git worktree.** `Ctrl-g` in the new-session
-  picker launches into a fresh worktree, so an agent working on one thing can't
-  touch the checkout you're working in. It asks for a name as it arms — type
-  `feature-auth` for `.claude/worktrees/feature-auth` on a
-  `worktree-feature-auth` branch (a `#1234` PR reference works too), or just
-  press Enter and let the agent name it.
+- 🧪 Add experimental support for **git worktrees**: `Ctrl-g` in the new-session
+  picker starts the session in a fresh one, which the agent creates and owns.
 
-  captain-miao doesn't create, name or clean up worktrees — it passes
-  `--worktree` and Claude Code does the rest, including blocking edits that would
-  reach your main checkout. Resuming or restarting a worktree session returns it
-  to the same worktree without asking again. Worktree rows share their project's
-  directory icon and colour, and `w` opens a per-worktree shell tab titled
-  `<repo>@<worktree>`. Codex has no equivalent flag yet, so the key is hidden
-  when it's the selected backend.
+- **Misc**
 
-  **Experimental**: newly added and lightly exercised.
-
-- **Choose how sessions are arranged.** `Space l` switches between **stacked** —
-  every session consolidated into one shared `miao:sessions` tab, one visible at
-  a time, the dashboard doing the switching — and **per-tab**, one tab per
-  session, switchable natively in the tab bar. Stacked is the default and matches
-  the previous behaviour; per-tab trades a busier tab bar for being able to reach
-  sessions without the dashboard. The choice is remembered, and applies to *new*
-  sessions: restart with `Space e` / `Space E` to migrate the ones already
-  running. On tmux, where both would mean the same thing, the key isn't offered.
-
-- **The dashboard's own tab says how many sessions want you.** It labels itself
-  `miao (2)`, or a plain `miao` at zero, so the tab bar answers "does anything
-  need me?" without switching to the dashboard at all. The count is over every
-  session, not just the ones a search filter is showing.
-
-- **Suspend a host instead of deleting it.** `c` in the hosts panel parks a host:
-  its row, target and icon stay, but nothing dials it, it contributes no
-  sessions, and it drops out of the header's host tally rather than counting as
-  down. Press `c` again to bring it back. Useful for a machine that's off for the
-  week and was otherwise a permanent red number.
-
-- **The dashboard can deploy its own server to a remote host.** Connecting to a
-  host with no `miao-server` — or one built from a different version —
-  used to be a dead end that told you to go install it yourself. A dashboard
-  built to carry a server now pushes the right binary over the ssh connection it
-  just opened, checks it actually runs there before putting it in place, and
-  remembers what it deployed so the next connect doesn't repeat the work. When
-  it *can't* help (no payload for that architecture, or the host refused the
-  write) it says exactly that instead of a generic failure.
-
-  This is opt-in, and it is one command: `cargo xtask dist` obtains the servers
-  and writes them into the finished dashboard. It produces a plain `miao` alongside
-  a `miao-bundle-linux` carrying servers for both Linux architectures (single-arch
-  variants too, if your fleet is only one). A regular build is unchanged and
-  costs nothing extra; bundling both arches costs about 7 MB. Releases now
-  publish the bundled Linux build alongside the plain one, so you can pick which
-  you want without building it yourself.
-
-  **Where the servers come from is up to you.** `--from build` (the default)
-  cross-compiles them from the sources beside you, against an old glibc (2.28 —
-  Debian 10, RHEL 8) so they run on machines far older than the one that built
-  them. `--from release` downloads the ones a release published, so a bundled
-  dashboard needs only `curl` and `tar` — no cross toolchain at all. Each release
-  now publishes the servers as their own assets to make that possible, and
-  `miao --version` prints the digest of everything a binary carries, which is what
-  tells two builds of the same version apart.
-
-  **The host decides which build it can run.** `uname` reports an architecture
-  but never a libc, so rather than guess, the deploy offers a candidate and lets
-  the host rule on it: the binary is staged, run there via a new `miao-server
-  self-check`, and only moved into place if it passes. That check resolves a
-  user account — the thing a static build silently cannot do on an LDAP/SSSD
-  host, where a plain `--version` would pass and the first attach would then
-  fail. A host that can't run the glibc build falls back to a static musl one,
-  and what it accepted is remembered, so this runs once per host rather than
-  once per connect. A `miao-server` already on the host's PATH is now kept when
-  its *protocol* is compatible rather than only when its version matches
-  exactly, and a daemon already running is left alone.
-
-  **A dashboard that carries nothing for a host can still reach it.** Payloads
-  resolve through a chain — `$CAPTAIN_MIAO_SERVER_<TARGET>`, then
-  `$CAPTAIN_MIAO_SERVER_DIR`, then whatever the binary embeds, then a local
-  cache — and, when all of those are exhausted, by downloading the published
-  server for that target. The download asks first and a refusal is the default,
-  so an ordinary release build can serve a NixOS or Alpine host it carries
-  nothing for, and never leaves the machine without being asked.
-
-- **Sessions that outlive their window** (`[launcher] pooled = true`, opt-in).
-  By default a session *is* its terminal window and closing it ends the session.
-  Pooled mode runs each of this machine's sessions in a local pty pool instead,
-  with the window merely attached — so a session survives closing the window, a
-  crashed multiplexer, and logging out, and a dashboard on another machine can
-  attach to the very same ones. Meant for dev servers, not laptops: where nobody
-  connects from elsewhere the pool buys no persistence and costs an extra hop,
-  no scrollback replay on reattach, and one client at a time. Needs
-  `miao-server` on `PATH`; without it the dashboard says so and keeps
-  the default behaviour.
-
-- **A Home Manager module.** `programs.captain-miao.enable = true` puts `miao`
-  on your PATH, and `programs.captain-miao.server.enable = true` puts
-  `miao-server` there — which is the entire setup a Nix host needs to be
-  reachable from another machine's dashboard, since a server that host builds
-  for itself runs where a deployed generic-glibc binary cannot even start. No
-  systemd unit: the daemon starts on demand and exits when idle. (Set
-  `users.users.<name>.linger = true` on NixOS if you want pooled sessions to
-  survive your last logout.)
-
-- **`Space H` — a default host** for new-session operations, the exact analog of
-  `Space a`'s default backend, persisted and shown in the header once you have
-  more than one host.
-
-- **`Space s` — steal a session** from whatever client is attached to it, behind
-  a confirm (skipped when nobody is actually there). The pool is one client at a
-  time, so this is how you take a session back from a terminal you can't reach.
-  Also available as `--force` on `miao-server attach` and
-  `miao-client attach`.
+  - `Space l` switches between one shared session tab and one tab per session.
+  - The dashboard's own tab says how many sessions want you — `miao (2)`.
 
 ### Changed
 
-- **Keep-awake counts only sessions on this machine.** A busy session on a
-  *remote* host no longer keeps your laptop awake.
-
-- **The resume picker is scoped to one host, and no longer freezes the UI.** It
-  loads off the UI thread, so opening it (or switching hosts with `Ctrl-h`) is
-  immediate rather than blocking every frame on an ssh round trip, and it shows
-  the 50 most recent sessions on the *default* host instead of a merged list
-  across all of them. Your typed filter survives the list arriving.
-
-- **The hosts panel is easier to read at a glance.** The per-host colour is gone
-  — the emoji icon already said it — and the host now shares the workdir-icon
-  column (`🖥│📁`) instead of holding a column of its own. `l` opens a host's
-  full connection log (every step of probe → deploy → handshake, with the host's
-  own replies quoted), which is the answer to "the row says the deploy failed but
-  won't tell me why". Editing a host only reconnects when the connection actually
-  changed, so renaming one or picking a new emoji no longer re-dials your whole
-  fleet.
-
-- **A picker's live settings sit on the picker.** Which agent and host a launch
-  will use now render on the popup's own bottom line rather than in the footer
-  ribbon, so `Ctrl-t` shows its effect where you're already looking.
-
-- **Attach windows report their own end instead of being polled for.** Closing an
-  attach window used to be noticed by periodically listing the whole window tree
-  — which on zellij costs about 20 ms per pane. Each attach now reports when it
-  ends, so a detached row updates immediately and covers every way an attach can
-  finish (a closed window, an in-session detach, a dropped ssh), not just the one
-  a snapshot could see. It also cleans up the dead window it leaves behind —
-  unless that window is holding an error message, which is the only copy you get.
-
-- **Pooled sessions are created by their first attach.** A remote session used to
-  be created detached and then attached to, which meant the agent's TUI ran its
-  terminal capability probes into a pty nobody was reading, got no answer, and
-  fell back to legacy key encoding for the session's whole life — Shift+Enter
-  arrived as a bare Enter. The session is now born with a real terminal on the
-  far end, and inherits your terminal's `TERM` (validated on the host) and
-  truecolor support.
-
-- **Release binaries are about 20% smaller.** Link-time optimisation is now on
-  for release builds, taking `miao` from 7.6 MB to 6.6 MB and the same
-  proportion off `miao-server`; dropping 11 crates from the dashboard's
-  dependency tree (a regex engine pulled in by a log-filter syntax nothing used,
-  and a terminal-colour chain for `--help`) takes it to 6.1 MB. LTO costs about
-  90 seconds of build time; debug builds are untouched. Two visible
-  consequences: `--help` is no longer coloured, and third-party crates no longer
-  log at ERROR by default — set `RUST_LOG` if you want theirs.
-
-- **Remote hosts are on by default.** The feature was gated behind a `remote`
-  cargo feature while it was unverified; it has now been used against real hosts,
-  so it is part of the standard build and `Space h` just works. Restart and fork
-  work on any host; windows you had open come back by
-  themselves when a slept laptop or a dropped connection reconnects, while a
-  session you detached with `D` stays detached; pins and mutes on a pooled host
-  are stored by that host, so every dashboard watching it agrees and they
-  survive a restart; and opening an attach or `w` window reuses the existing ssh
-  connection, so it costs no second authentication. Design notes:
-  [docs/remote-sessions.md](docs/remote-sessions.md).
-
-- **`Space h` is a hosts panel, not a form.** Each host shows its live
-  connection state, running/attached session counts, daemon version and latency,
-  and gets a configurable emoji shown in the session table's Host column. There
-  is no Save step to forget: adding a host connects it immediately, edits apply
-  when you leave the row, and removal asks first. When something is wrong the
-  panel now says *what* — "miao-server not found", "version mismatch
-  (found 0.3.1, need 0.4.0)" — where the header used to show only a warning
-  triangle, and **`l` opens that host's whole connection log**: every step of
-  probe, deploy, daemon start and handshake, with the host's own replies quoted
-  in full, for when a one-line reason isn't enough to explain the failure. The
-  header carries a `☁` tally rather than a raw count — one number per bucket
-  (healthy, failing, dialing), with empty buckets left out — so an all-green
-  fleet reads as a single number and a problem announces itself by a number
-  appearing.
-
-- **`r` lists one host at a time** (named in the picker title, `Ctrl-h` to
-  switch) instead of merging every host's resumable sessions into one list whose
-  scope you had to infer. With that, **`b` (the cross-host browser) is gone** —
-  the table covers running sessions and `r` covers resumable ones.
-
-- **Remote rows you can't act on are hidden**, and a session still running on
-  its host with no window here sorts to the bottom of the list with its own
-  icon — though an approval prompt still floats to the top wherever it is.
-
-- **A daemon no longer dies with your login session.** It rebinds its socket
-  when systemd-logind takes the runtime directory away at logout, which used to
-  wedge it permanently, and one transient error accepting a connection no longer
-  tears down every session on the host. **Run `loginctl enable-linger` on any
-  Linux machine hosting sessions** to avoid the outage entirely.
-
 - **The commands are now `miao`, `miao-server` and `miao-client`** (were
-  `captain-miao`, `captain-miao-server`, `captain-miao-client`) — you reach for
-  the dashboard dozens of times a day, so it should be short enough to type
-  without thinking. Only the executables were renamed: the project, the crates,
-  the npm package (`@hyperlogue/captain-miao`), the release tarballs, and the
-  `~/.config` + `~/.local/state` directories all keep the captain-miao name, so
-  an upgrade moves no state and no config. Every subcommand follows the binary —
-  `miao claude`, `miao codex`, `miao focus`, `miao hook`.
-
-  The shared tab holding your sessions in the Stacked layout is renamed to match,
-  from `cm:sessions` to `miao:sessions`. It is found by title, so a dashboard
-  running against a terminal that still has the old tab simply creates the new
-  one beside it; sessions in the old tab keep running and stay reachable with
-  `Enter`. Close it once it empties.
-
-  **Upgrading:** the old `captain-miao` command is gone rather than aliased.
-  Re-run your installer (`cargo install --git …`, `npm i -g
-  @hyperlogue/captain-miao`, or `nix run`) to pick up the new name, and update
-  any Kitty keybind that calls it — `launch --type=background miao focus
-  --window-id @active-kitty-window-id`. A `cargo install` upgrade leaves the old
-  `captain-miao` binary behind in `~/.cargo/bin`; delete it so a stale build
-  can't shadow the new one. Sessions already running keep hooks pointing at the
-  absolute path of the binary that launched them, so restart them once the old
-  path is gone (npm removes it; `cargo install` leaves it in place).
+  `captain-miao`, …) — re-run your installer, and delete the old `captain-miao`
+  binary if `cargo install` left one in `~/.cargo/bin`.
+- **The shared tab holding your sessions is `miao:sessions`**, renamed from
+  `cm:sessions`; sessions in an old tab keep running and stay reachable.
+- **`r` lists one host at a time** (named in the picker, `Ctrl-h` switches), so
+  the cross-host browser `b` is gone.
+- **The resume picker loads off the UI thread** and shows the 50 most recent
+  sessions on the default host, keeping your typed filter when the list lands.
+- **Killing a remote session answers the keystroke** instead of freezing the
+  dashboard for the ssh round trip.
+- **Pooled sessions are created by their first attach**, so the agent's TUI probes
+  a real terminal and Shift+Enter no longer arrives as a bare Enter.
+- **Attach windows report their own end** rather than being found by polling the
+  whole window tree, which on zellij cost about 20 ms per pane.
+- **A host that is still dialing says so** instead of counting with the ones that
+  are down.
+- **The status glyphs are ordinary emoji**, so they no longer need a Nerd Font.
+- **Keep-awake counts only sessions on this machine**, so a busy session on a
+  remote host no longer keeps your laptop awake.
+- **Release binaries are about 20% smaller** (LTO, and 11 crates dropped from the
+  dependency tree) — `--help` is no longer coloured and third-party crates no
+  longer log at ERROR.
 
 ### Fixed
 
-- **The cursor stays on the session you selected.** Anything that re-sorted the
-  table — a session changing status, a bell clearing, a window attaching or
-  detaching — used to leave the highlight on whichever row slid into that slot,
-  so the next `x` or `Enter` could act on a session you never picked.
-- **`w` works on a remote host whose login shell is fish.** The shell command was
-  POSIX-only, so on a fish account the work tab flashed open and shut.
-- **A failed window-tree snapshot no longer drops every window binding.** A
-  single transient terminal error could detach every row at once.
+- **The cursor stays on the session you selected** when something re-sorts the
+  table underneath it.
+- **A long-running session no longer freezes on macOS** when the periodic
+  `$TMPDIR` sweep deletes its hook socket out from under it.
+- **`w` works on a remote host whose login shell is fish.**
+- **A failed window-tree snapshot no longer drops every window binding.**
+
+### Removed
+
+- **The mute flag (`m`).** A session you don't want to look at is one you scroll
+  past; a `muted` left in your state files is ignored.
 
 ## [0.2.1] - 2026-08-02
 
@@ -413,7 +205,6 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hyperlogue/captain-miao/releases/tag/v0.2.0
