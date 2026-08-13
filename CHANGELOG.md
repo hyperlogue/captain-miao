@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`miao-bundled-all-server-v<version>-<target>.tar.gz`** — a larger download
   carrying every published server (both arches, glibc and musl), for a mixed
   fleet or a machine that can't reach the network at deploy time.
+- **Nix: the servers a dashboard can deploy are now an override.**
+  `captain-miao-with-servers` carries a static musl x86-64 server by default —
+  which runs on any x86-64 Linux host regardless of its libc — and
+  `.override { targets = [ … ]; }` widens that fleet without rebuilding the
+  dashboard.
 
 ## [0.3.0] - 2026-08-12
 

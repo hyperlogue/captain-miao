@@ -331,8 +331,28 @@ body out unless that macro is defined, leaving `struct if_data` a forward
 declaration and killing bindgen with "field has incomplete type". Faces one and
 two were the missing per-target variable and its dashed-vs-underscored spelling.
 
-**Nix has the same variants**: `packages.captain-miao-bundle-linux` and the two
-single-arch ones. They delegate to `cargo xtask dist` rather than reimplementing
+**On Nix, prefer the link farm to embedding.** `captain-miao-with-servers` wraps
+the dashboard with `CAPTAIN_MIAO_SERVER_DIR` pointing at
+`captain-miao-servers`, a directory of `<triple>/miao-server` built by
+`prepare-servers`. Both are `callPackage`d, so the fleet is one override away:
+
+```nix
+packages.captain-miao-with-servers.override {
+  targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
+}
+```
+
+The default is a single target, `x86_64-unknown-linux-musl` — a static build
+runs on any x86-64 Linux host whatever its libc, including the
+NixOS/Alpine/distroless boxes a glibc build cannot start on, so it is the one
+binary covering the most fleet. This beats embedding *on this path* for the
+reason embedding exists elsewhere: a download wants one self-contained file,
+whereas in the store the servers are paths shared between generations, and adding
+an architecture costs a server build rather than relinking `miao`.
+
+**The bundled variants also exist on Nix**: `packages.captain-miao-bundle-linux`
+and the single-arch + all-server ones, matching what a release publishes. They
+delegate to `cargo xtask dist` rather than reimplementing
 it, because obtaining the servers, writing each variant's manifest and building
 against it is exactly what `dist` already does — a nix expression would be a
 second copy of it, free to drift. The whole sequence runs offline: every cargo

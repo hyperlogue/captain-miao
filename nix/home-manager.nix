@@ -58,9 +58,21 @@ in {
       default = pick "captain-miao";
       defaultText = lib.literalExpression "captain-miao.packages.\${system}.captain-miao";
       description = ''
-        The dashboard package. Override to use one of the bundled variants
-        (`captain-miao-bundle-linux`, …) if you want a dashboard that carries
-        servers to deploy to non-Nix hosts.
+        The dashboard package. To drive remote hosts that have no
+        `miao-server`, set this to `captain-miao-with-servers`, which carries
+        a static musl x86-64 server it can deploy. Its fleet is overridable:
+
+        ```nix
+        package = captain-miao.packages.''${system}.captain-miao-with-servers.override {
+          targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
+        };
+        ```
+
+        The servers are separate store paths there, so widening that list costs
+        a server build rather than a rebuild of the dashboard. The
+        `captain-miao-bundle-*` variants compile the servers *into* `miao`
+        instead — the shape a release publishes, and rarely what you want on
+        Nix, where nothing is downloaded.
       '';
     };
 

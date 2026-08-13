@@ -194,46 +194,18 @@
           "bundle-linux-all"
         ] (variant: mkBundled variant);
 
-        # A link farm of servers, and a dashboard pointed at it.
+        # A link farm of servers, and (below) a dashboard pointed at it — the
+        # recommended way to drive remote hosts from Nix.
         #
-        # With the source chain's directory variable, a Nix-built dashboard needs
-        # no embedded payloads at all — which is strictly better on this path than
-        # embedding: the servers become store paths shared between dashboard
-        # generations rather than megabytes recompiled into one binary, and adding
-        # an architecture doesn't relink `miao`.
+        # Both are `callPackage`d rather than defined here so their server list is
+        # overridable; the reasoning and the default live in `nix/servers.nix`.
         #
-        # CRITICAL: this must hold `prepare-servers` **cross** builds, never
-        # `packages.captain-miao-server`. That one is crane-built against the
-        # store's own glibc with an absolute /nix/store/.../ld-linux interpreter —
-        # filed under a generic triple it would look correct and fail on every
-        # non-Nix host, the inverse of the failure this whole design started from.
-        # It is the right binary for exactly one machine: the one that built it,
-        # where the Home Manager module puts it on PATH and no deploy happens at
-        # all. Delegating to `prepare-servers` makes the mistake impossible by
-        # construction; the dashboard's PT_INTERP check is the belt.
-        #
-        # Same delegation argument as mkBundled: xtask owns the cross-compile
-        # strategy, the glibc floor and the arch check, so a nix expression
-        # restating them would be a second copy free to drift. Hence the same two
-        # needs — devToolchain for the cross rust-stds, and a writable HOME for
-        # cargo-zigbuild's cache.
-        captain-miao-servers = craneLibBundled.buildPackage (commonArgs
-          // {
-            pname = "captain-miao-servers";
-            nativeBuildInputs = [pkgs.cargo-zigbuild pkgs.zig];
-            preBuild = ''
-              export HOME="$TMPDIR"
-              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-            '';
-            # `prepare-servers --out` already writes <target>/miao-server, which
-            # is exactly the layout the directory variable expects.
-            buildPhaseCargoCommand = ''
-              cargo run --release --locked -p xtask -- prepare-servers --out "$out"
-            '';
-            installPhaseCommand = "true";
-            doNotPostBuildInstallCargoBinaries = true;
-            doCheck = false;
-          });
+        #     packages.captain-miao-with-servers.override {
+        #       targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
+        #     }
+        captain-miao-servers = pkgs.callPackage ./nix/servers.nix {
+          inherit craneLibBundled commonArgs;
+        };
 
         # The dashboard with the remote-hosts gate on. Required by the wrapper
         # below and not merely nice to have: `REMOTE_ENABLED` is
@@ -248,19 +220,8 @@
             meta.mainProgram = "miao";
           });
 
-        captain-miao-with-servers = pkgs.symlinkJoin {
-          name = "captain-miao-with-servers";
-          paths = [captain-miao-remote];
-          nativeBuildInputs = [pkgs.makeWrapper];
-          # `--set-default`, not `--set`: the chain's whole premise is that
-          # explicit configuration beats a build-time default, so a user who
-          # exports their own CAPTAIN_MIAO_SERVER_DIR must still win. The
-          # per-target variable overrides either way.
-          postBuild = ''
-            wrapProgram $out/bin/miao \
-              --set-default CAPTAIN_MIAO_SERVER_DIR ${captain-miao-servers}
-          '';
-          meta.mainProgram = "miao";
+        captain-miao-with-servers = pkgs.callPackage ./nix/with-servers.nix {
+          inherit captain-miao-remote captain-miao-servers;
         };
       in {
         packages =
@@ -268,7 +229,7 @@
             default = captain-miao;
             inherit captain-miao captain-miao-server captain-miao-remote captain-miao-servers captain-miao-with-servers;
           }
-          # `captain-miao-bundle-linux`, and the two single-arch variants.
+          # `captain-miao-bundle-linux`, and the single-arch + all-server variants.
           // lib.mapAttrs' (feature: pkg:
             lib.nameValuePair "captain-miao-${feature}" pkg)
           bundled;
