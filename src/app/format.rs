@@ -458,6 +458,20 @@ pub(super) fn dir_icon_width(icon: &str) -> usize {
     icon.width().clamp(1, DIR_ICON_MAX_CHARS)
 }
 
+/// Whether `icon` is an emoji, which is what decides whether a directory mark's
+/// **colour is inert**: a colour emoji font paints its own hues and ignores the
+/// fg we set (the same fact [`override_indicator_cell`] records). The palette
+/// only ever reaches a *text* icon — including the default case, since the
+/// derived mark is always an emoji — so the editor says so rather than leaving
+/// the user to conclude the colour keys are broken.
+///
+/// An exact table lookup, not a codepoint-range guess: the emoji reaching this
+/// field come from the same `emojis` crate the picker is built from, and a
+/// heuristic would have to decide what a CJK text icon is. Pure.
+pub(super) fn icon_is_emoji(icon: &str) -> bool {
+    emojis::get(icon.trim()).is_some()
+}
+
 /// Why a row has no window on this screen — the two cases read differently, so
 /// the override column draws them differently (§9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

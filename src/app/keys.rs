@@ -10,7 +10,7 @@ use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS};
 use super::keymap::{Chord, Command};
 use super::picker::{PickerEvent, TextInputEvent};
 use super::{
-    Action, App, DirEditFocus, DragTarget, HostField, HostLogView, HostRow, InputMode, PickerKind,
+    Action, App, DirEditFocus, DragTarget, HostField, HostLogView, InputMode, PickerKind,
     SessionFlag,
 };
 
@@ -1012,7 +1012,7 @@ impl App {
     fn handle_host_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let editing = self.host_edit.as_ref()?.editing;
+        let editing = self.host_edit.as_ref()?.edit.is_some();
 
         // The log view owns the keyboard while it's open — it replaces the list,
         // so none of the list's keys are reachable behind it.
@@ -1025,7 +1025,7 @@ impl App {
         // refusal rather than a question, until acknowledged.
         if let Some(prompt) = self.host_edit.as_mut()?.pending_upgrade.take() {
             if prompt.actionable && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                let host = HostId(self.host_edit.as_ref()?.rows.get(prompt.row)?.label.clone());
+                let host = self.host_edit.as_ref()?.rows.get(prompt.row)?.host();
                 return Some(Action::UpgradeHost { host });
             }
             return None;
@@ -1051,100 +1051,136 @@ impl App {
             return None;
         }
 
-        // Ctrl-E from the Icon field opens the same searchable emoji picker the
-        // directory marks use — one affordance, learned once.
-        if editing
-            && ctrl
-            && matches!(key.code, KeyCode::Char('e'))
-            && self.host_edit.as_ref()?.focus == HostField::Icon
-        {
-            self.open_emoji_picker_for_host();
-            return None;
+        // Ctrl-E opens the same searchable emoji picker the directory marks use
+        // — one affordance, learned once. From the Icon field, and from the list
+        // as the shortcut that opens the editor *on* that field: the picker was
+        // otherwise five keys away from a row whose emoji you wanted to change.
+        if ctrl && matches!(key.code, KeyCode::Char('e')) {
+            let state = self.host_edit.as_mut()?;
+            let opens_picker = match state.focus() {
+                // In the Icon field the picker *is* the editor, so it shadows
+                // readline's end-of-line — a field of at most four cells has
+                // nowhere to jump to anyway.
+                Some(HostField::Icon) => true,
+                // In a text field ^e keeps that readline meaning and falls
+                // through to the input below.
+                Some(_) => false,
+                // From the list, on a row: open the editor on Icon and go
+                // straight where the key would have gone from there.
+                None => {
+                    let on_row = state.cursor < state.rows.len();
+                    if on_row {
+                        state.begin_edit(HostField::Icon);
+                    }
+                    on_row
+                }
+            };
+            if opens_picker {
+                self.open_emoji_picker_for_host();
+                return None;
+            }
         }
 
         let state = self.host_edit.as_mut()?;
-        if state.editing {
+        if let Some(focus) = state.focus() {
+            // Field focus, by all three idioms the dashboard already uses: Tab
+            // walks the form, ↑↓ walk it as the vertical list it looks like, and
+            // ^n/^p are what the pickers bind. Backwards matters as much as
+            // forwards — a form you can only cycle one way makes overshooting
+            // Options cost three more presses.
+            let step = match key.code {
+                KeyCode::Tab | KeyCode::Down => Some(true),
+                KeyCode::BackTab | KeyCode::Up => Some(false),
+                KeyCode::Char('n') if ctrl => Some(true),
+                KeyCode::Char('p') if ctrl => Some(false),
+                _ => None,
+            };
+            if let Some(forward) = step {
+                if let Some(edit) = state.edit.as_mut() {
+                    edit.focus = focus.step(forward);
+                }
+                return None;
+            }
             match key.code {
                 // Committing a row applies it: persist + reconnect right away.
-                KeyCode::Esc | KeyCode::Enter => {
-                    state.editing = false;
+                KeyCode::Enter => {
+                    state.edit = None;
                     self.apply_host_edits();
                     return None;
                 }
-                KeyCode::Tab => {
-                    state.focus = match state.focus {
-                        HostField::Label => HostField::Target,
-                        HostField::Target => HostField::Options,
-                        HostField::Options => HostField::Icon,
-                        HostField::Icon => HostField::Label,
-                    }
+                // And Esc abandons it — the snapshot the edit carries is what
+                // makes that a real cancel rather than a second commit.
+                KeyCode::Esc => {
+                    state.cancel_edit();
+                    return None;
                 }
-                KeyCode::Char('t') if ctrl && state.focus == HostField::Target => {
+                KeyCode::Char('t') if ctrl && focus == HostField::Target => {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
                         r.is_socket = !r.is_socket;
                     }
-                }
-                KeyCode::Backspace => {
-                    if let Some(r) = state.rows.get_mut(state.cursor) {
-                        match state.focus {
-                            HostField::Label => {
-                                r.label.pop();
-                            }
-                            HostField::Target => {
-                                r.target.pop();
-                            }
-                            HostField::Options => {
-                                r.options.pop();
-                            }
-                            HostField::Icon => {
-                                r.icon.pop();
-                            }
-                        }
-                    }
-                }
-                // Guard Alt too, not just Ctrl: an Alt-modified char (e.g. a
-                // stray readline reflex) must not insert its literal letter.
-                KeyCode::Char(c) if !ctrl && !alt => {
-                    if let Some(r) = state.rows.get_mut(state.cursor) {
-                        match state.focus {
-                            HostField::Label => r.label.push(c),
-                            HostField::Target => r.target.push(c),
-                            HostField::Options => r.options.push(c),
-                            // Capped like the directory-mark icon, and for the
-                            // same reason now that the two share one table
-                            // column: past ~4 cells an "icon" stops reading as a
-                            // mark and just widens the column for every row.
-                            HostField::Icon => {
-                                use unicode_width::UnicodeWidthStr;
-                                let mut next = r.icon.clone();
-                                next.push(c);
-                                if next.width() <= DIR_ICON_MAX_CHARS {
-                                    r.icon = next;
-                                }
-                            }
-                        }
-                    }
+                    return None;
                 }
                 _ => {}
             }
+            // Everything else is text. The fields are `TextInput`s, so the
+            // readline keys, the arrows and Home/End all come for free — and a
+            // key none of them claim is simply dropped.
+            let r = state.rows.get_mut(state.cursor)?;
+            match focus {
+                HostField::Label => {
+                    r.label.handle_key(key);
+                }
+                HostField::Target => {
+                    r.target.handle_key(key);
+                }
+                HostField::Options => {
+                    r.options.handle_key(key);
+                }
+                // Capped like the directory-mark icon, and for the same reason
+                // now that the two share one table column: past ~4 cells an
+                // "icon" stops reading as a mark and just widens the column for
+                // every row. Post-hoc revert rather than a pre-check, so paste
+                // and multi-byte input still go through `TextInput` first.
+                HostField::Icon => {
+                    use unicode_width::UnicodeWidthStr;
+                    let prev = r.icon.text().to_string();
+                    if matches!(r.icon.handle_key(key), TextInputEvent::Changed)
+                        && r.icon.text().width() > DIR_ICON_MAX_CHARS
+                    {
+                        r.icon.set_text(prev);
+                    }
+                }
+            }
         } else {
             let n = state.rows.len();
+            // A modified key never falls through to the plain-letter commands
+            // below: a stray `^d` in the list must not reach the removal
+            // confirm. What Ctrl *does* mean here is "open the editor on this
+            // key's field" — `^e` above, `^t` here — plus the pickers' own
+            // ^n/^p, which are the list's ↑↓ under another name.
+            if ctrl || alt {
+                if ctrl {
+                    match key.code {
+                        KeyCode::Char('n') => state.cursor = (state.cursor + 1).min(n),
+                        KeyCode::Char('p') => state.cursor = state.cursor.saturating_sub(1),
+                        KeyCode::Char('t') if state.cursor < n => {
+                            state.begin_edit(HostField::Target)
+                        }
+                        _ => {}
+                    }
+                }
+                return None;
+            }
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => state.cursor = state.cursor.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => state.cursor = (state.cursor + 1).min(n),
-                KeyCode::Char('a') => {
-                    state.rows.push(HostRow::default());
-                    state.cursor = state.rows.len() - 1;
-                    state.editing = true;
-                    state.focus = HostField::Label;
-                }
+                KeyCode::Char('a') => state.begin_new_row(),
                 KeyCode::Char('e') | KeyCode::Enter => {
                     if state.cursor == n {
-                        state.rows.push(HostRow::default());
-                        state.cursor = state.rows.len() - 1;
+                        state.begin_new_row();
+                    } else {
+                        state.begin_edit(HostField::Label);
                     }
-                    state.editing = true;
-                    state.focus = HostField::Label;
                 }
                 // Suspend / resume the host. No confirm: unlike `d` it destroys
                 // nothing — the row, its target and its icon all stay — and the
@@ -1171,7 +1207,7 @@ impl App {
                 // report, either the cost or the reason there isn't one.
                 KeyCode::Char('u') if state.cursor < n => {
                     let row = state.cursor;
-                    let host = HostId(state.rows[row].label.clone());
+                    let host = state.rows[row].host();
                     let offer = self.selected_host_upgrade()?;
                     let prompt = match self.upgrade_blocker(&host) {
                         Some(why) => super::UpgradePrompt {
@@ -1204,7 +1240,7 @@ impl App {
                 // The row shows one truncated line of a failure; `l` is where
                 // the whole thing — and the steps before it — is readable.
                 KeyCode::Char('l') if state.cursor < n => {
-                    let host = HostId(state.rows[state.cursor].label.clone());
+                    let host = state.rows[state.cursor].host();
                     state.log_view = Some(HostLogView {
                         host,
                         scroll: 0,
@@ -1282,18 +1318,22 @@ impl App {
             return None;
         }
 
+        // Tab/↑/↓/^n/^p toggle focus. j/k are reserved for text input — binding
+        // them here would let the user *enter* Custom but never *leave* it;
+        // ^n/^p carry no such cost, since `TextInput` leaves them alone
+        // precisely so a list around it can have them.
+        let switches_row = matches!(
+            key.code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+        ) || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('n' | 'p')));
         let s = self.dir_edit.as_mut()?;
-        // Tab/↑/↓ toggle focus. j/k are reserved for text input — binding
-        // them here would let the user *enter* Custom but never *leave* it.
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                s.focus = match s.focus {
-                    DirEditFocus::Custom => DirEditFocus::Color,
-                    DirEditFocus::Color => DirEditFocus::Custom,
-                };
-                return None;
-            }
-            _ => {}
+        if switches_row {
+            s.focus = match s.focus {
+                DirEditFocus::Custom => DirEditFocus::Color,
+                DirEditFocus::Color => DirEditFocus::Custom,
+            };
+            return None;
         }
 
         match s.focus {

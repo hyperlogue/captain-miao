@@ -112,6 +112,11 @@ impl TestDashboard {
         self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn press_ctrl(&mut self, code: KeyCode) -> Option<Action> {
+        self.app
+            .handle_key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
     /// Dispatch a left-button-down at a screen cell. Two calls at the same cell
     /// in quick succession (well under the 500ms threshold in a test) register
     /// as a double-click.
@@ -3557,6 +3562,54 @@ fn dir_edit_custom_text_capped_at_max_chars() {
     assert_eq!(custom, "abcd");
 }
 
+/// ^n/^p switch rows alongside Tab and the arrows. They are what the pickers
+/// bind for the same motion, and `TextInput` deliberately leaves them alone so
+/// the list around it can have them — including from *inside* the text field,
+/// which is the case that would otherwise trap the user in it.
+#[test]
+fn dir_edit_ctrl_n_p_switch_rows() {
+    let mut d = TestDashboard::new(120, 22);
+    d.set_sessions(vec![session(1, "/home/test/proj", SessionStatus::Active)]);
+    d.app.open_dir_edit();
+    assert_eq!(
+        d.app.dir_edit.as_ref().unwrap().focus,
+        super::DirEditFocus::Custom
+    );
+    d.press_ctrl(KeyCode::Char('n'));
+    assert_eq!(
+        d.app.dir_edit.as_ref().unwrap().focus,
+        super::DirEditFocus::Color
+    );
+    d.press_ctrl(KeyCode::Char('p'));
+    assert_eq!(
+        d.app.dir_edit.as_ref().unwrap().focus,
+        super::DirEditFocus::Custom
+    );
+    // The text field never sees them, so nothing was typed on the way.
+    assert!(d.app.dir_edit.as_ref().unwrap().custom.is_empty());
+}
+
+/// The colour palette is inert while the mark is an emoji — a colour emoji font
+/// paints its own hues — so the editor says so instead of leaving the user to
+/// conclude the colour keys are broken. It has to say it in the **default**
+/// case too: the derived mark is always an emoji, so an untouched directory
+/// opens straight into it.
+#[test]
+fn dir_edit_says_the_color_is_inert_for_an_emoji_icon() {
+    let mut d = TestDashboard::new(120, 22);
+    d.set_sessions(vec![session(1, "/home/test/proj", SessionStatus::Active)]);
+    d.app.open_dir_edit();
+    let out = d.render();
+    assert!(out.contains("no effect on emoji"), "{out}");
+
+    // A text icon is what the palette actually reaches, so the caveat goes away
+    // as soon as one is typed — it tracks the icon, it isn't a fixture.
+    d.press(KeyCode::Char('a'));
+    d.press(KeyCode::Char('b'));
+    let out = d.render();
+    assert!(!out.contains("no effect on emoji"), "{out}");
+}
+
 #[test]
 fn t_returns_fetch_tabs_action() {
     let mut d = TestDashboard::new(120, 15);
@@ -4491,8 +4544,8 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     // view says so rather than showing a blank box.)
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(super::HostRow {
-        label: "polaris".to_string(),
-        target: "polaris".to_string(),
+        label: super::picker::TextInput::with_text("polaris"),
+        target: super::picker::TextInput::with_text("polaris"),
         ..Default::default()
     });
     state.cursor = 0;
@@ -4536,15 +4589,15 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
     }
     d.press(KeyCode::Tab);
     assert_eq!(
-        d.app.host_edit.as_ref().unwrap().focus,
-        super::HostField::Options
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::Options)
     );
     for c in "-C -L 8080:localhost:3000".chars() {
         d.press(KeyCode::Char(c));
     }
     let row = &d.app.host_edit.as_ref().unwrap().rows[0];
-    assert_eq!(row.target, "user@box");
-    assert_eq!(row.options, "-C -L 8080:localhost:3000");
+    assert_eq!(row.target.text(), "user@box");
+    assert_eq!(row.options.text(), "-C -L 8080:localhost:3000");
 
     // Shown as typed: this field has no grammar of its own to canonicalise to.
     let out = d.render();
@@ -4556,9 +4609,214 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
     // One more Tab reaches Icon, so the cycle still closes.
     d.press(KeyCode::Tab);
     assert_eq!(
-        d.app.host_edit.as_ref().unwrap().focus,
-        super::HostField::Icon
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::Icon)
     );
+}
+
+/// The row editor's four fields walk by every idiom the dashboard binds
+/// elsewhere, and — the point — they walk **backwards** too. `Tab`-only meant
+/// overshooting Options cost three more presses.
+#[test]
+fn the_hosts_panel_walks_its_fields_in_both_directions() {
+    use super::HostField::*;
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let focus = |d: &TestDashboard| d.app.host_edit.as_ref().unwrap().focus();
+
+    d.press(KeyCode::Char('a'));
+    assert_eq!(focus(&d), Some(Label));
+    d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(Target));
+    d.press(KeyCode::Down);
+    assert_eq!(focus(&d), Some(Options));
+    d.press_ctrl(KeyCode::Char('n'));
+    assert_eq!(focus(&d), Some(Icon));
+    // The form is a ring, so the last field steps to the first.
+    d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(Label));
+
+    d.press(KeyCode::BackTab);
+    assert_eq!(focus(&d), Some(Icon));
+    d.press(KeyCode::Up);
+    assert_eq!(focus(&d), Some(Options));
+    d.press_ctrl(KeyCode::Char('p'));
+    assert_eq!(focus(&d), Some(Target));
+
+    // None of it typed anything: the field keys are intercepted ahead of the
+    // text input, which would otherwise have eaten `n` and `p`.
+    assert_eq!(d.app.host_edit.as_ref().unwrap().rows[0].label.text(), "");
+}
+
+/// `Esc` abandons a row edit where `Enter` keeps it. The two used to be the same
+/// key, so there was no way to back out of a mistyped target — and the footer
+/// said "back", which is what `Esc` means everywhere else in the app.
+#[test]
+fn esc_abandons_a_hosts_row_edit_and_enter_keeps_it() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let rows = |d: &TestDashboard| {
+        d.app
+            .host_edit
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.label.text().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // A row with no target never reaches `hosts.json` (nothing to dial), so
+    // committing it here exercises the commit without standing up a backend.
+    d.press(KeyCode::Char('a'));
+    for c in "box".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert!(d.app.host_edit.as_ref().unwrap().edit.is_none());
+    assert_eq!(rows(&d), ["box"]);
+
+    // Editing it and pressing Esc puts back what was there before the edit…
+    d.press(KeyCode::Char('e'));
+    for c in "-typo".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(rows(&d), ["box-typo"]);
+    d.press(KeyCode::Esc);
+    assert_eq!(rows(&d), ["box"]);
+    // …and leaves the panel open: it cancelled the row, not the view.
+    assert!(d.app.host_edit.as_ref().unwrap().edit.is_none());
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+
+    // A row the edit *created* has nothing to restore, so cancelling removes it
+    // again — an empty row was never a host on disk, and leaving it in the list
+    // would be a lie about what is configured.
+    d.press(KeyCode::Char('a'));
+    for c in "half".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(rows(&d), ["box", "half"]);
+    d.press(KeyCode::Esc);
+    assert_eq!(rows(&d), ["box"]);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 1, "on '+ add'");
+
+    // Esc from the list still closes the panel — the cancel is scoped to an
+    // edit in progress, and there is none now.
+    d.press(KeyCode::Esc);
+    assert!(d.app.host_edit.is_none());
+}
+
+/// The fields are `TextInput`s, so a typo in the middle of a target is fixable
+/// in place. They used to be push/pop `String`s: the only edit was at the end,
+/// and the cursor drawn after the text was decorative.
+#[test]
+fn a_hosts_panel_field_edits_at_the_cursor() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    d.press(KeyCode::Char('a'));
+    for c in "usr@box".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    // Back over "r@box" and repair the front of the string.
+    for _ in 0..5 {
+        d.press(KeyCode::Left);
+    }
+    d.press(KeyCode::Char('e'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[0].label.text(),
+        "user@box"
+    );
+    // Readline keys ride along with the arrows, and they are cursor-relative
+    // too: ^u kills to the start *from where the cursor is*, not the whole line.
+    d.press_ctrl(KeyCode::Char('u'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[0].label.text(),
+        "r@box"
+    );
+}
+
+/// From the list, `^e`/`^t` open the editor *on* the field they name — `e`
+/// always lands on Label, which put the emoji picker five keys away from a row
+/// whose icon you wanted to change.
+#[test]
+fn ctrl_keys_open_the_hosts_editor_on_a_named_field() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: super::picker::TextInput::with_text("box"),
+        target: super::picker::TextInput::with_text("user@box"),
+        ..Default::default()
+    });
+    state.cursor = 0;
+
+    d.press_ctrl(KeyCode::Char('t'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::Target)
+    );
+    d.press(KeyCode::Esc);
+
+    // `^e` goes one step further and opens the picker, since picking is what
+    // the icon field is for. The panel stays alive underneath to receive it.
+    d.press_ctrl(KeyCode::Char('e'));
+    assert_eq!(d.app.input_mode, InputMode::Picker);
+    assert!(matches!(
+        d.app.picker.as_ref().unwrap().kind,
+        super::PickerKind::HostEmoji
+    ));
+    d.app.apply_host_emoji_pick("\u{1F680}");
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+    let state = d.app.host_edit.as_ref().unwrap();
+    assert_eq!(state.focus(), Some(super::HostField::Icon));
+    assert_eq!(state.rows[0].icon.text(), "\u{1F680}");
+
+    // And it is an *edit*, so Esc undoes the pick like any other field change.
+    d.press(KeyCode::Esc);
+    let state = d.app.host_edit.as_ref().unwrap();
+    assert_eq!(state.rows[0].icon.text(), "");
+    assert!(state.edit.is_none());
+
+    // Inside a *text* field the same key keeps its readline meaning: the picker
+    // belongs to the Icon field, not to the form.
+    d.press(KeyCode::Char('e'));
+    d.press(KeyCode::Left);
+    d.press_ctrl(KeyCode::Char('e'));
+    d.press(KeyCode::Char('y'));
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[0].label.text(),
+        "boxy"
+    );
+}
+
+/// A Ctrl-modified key never falls through to the list's plain-letter commands.
+/// `^d` reaching `d` would put a removal confirm on screen for a keystroke the
+/// user meant as "page down" or as nothing at all.
+#[test]
+fn a_ctrl_key_does_not_trigger_the_hosts_lists_plain_commands() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: super::picker::TextInput::with_text("box"),
+        target: super::picker::TextInput::with_text("user@box"),
+        ..Default::default()
+    });
+    state.cursor = 0;
+
+    d.press_ctrl(KeyCode::Char('d'));
+    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    d.press_ctrl(KeyCode::Char('a'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().rows.len(), 1);
+    d.press_ctrl(KeyCode::Char('l'));
+    assert!(d.app.host_edit.as_ref().unwrap().log_view.is_none());
+
+    // ^n/^p are the list's ↑↓ under the pickers' names, and are the exception.
+    d.press_ctrl(KeyCode::Char('n'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 1, "on '+ add'");
+    d.press_ctrl(KeyCode::Char('p'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
 }
 
 #[test]

@@ -21,7 +21,8 @@ use super::format::{
     override_indicator_cell, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
-use super::{App, DirEditFocus, HostTally, InputMode, PickerKind};
+use super::picker::TextInput;
+use super::{App, DirEditFocus, HostField, HostTally, InputMode, PickerKind};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) {
@@ -276,6 +277,9 @@ impl App {
         } else {
             custom.to_string()
         };
+        // Taken before the preview moves into the title: it is a property of the
+        // icon the mark will actually wear, default included.
+        let color_is_inert = super::format::icon_is_emoji(&preview_icon);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Line::from(vec![
@@ -355,6 +359,18 @@ impl App {
 
         let color_focus = state.focus == DirEditFocus::Color;
         let mut color_spans: Vec<Span<'static>> = vec![row_label(color_focus, "Color")];
+        // Said on the row it applies to, and only while it is true — switching
+        // to a text icon is answered by the caveat going away. It rides the
+        // label rather than taking a line of its own because this popup's
+        // layout is already tight on a short terminal. The *default* mark is an
+        // emoji too, so an untouched directory opens straight into this, which
+        // is exactly when the colour keys would otherwise look broken.
+        if color_is_inert {
+            color_spans.push(Span::styled(
+                "(no effect on emoji) ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
         for (i, (name, color)) in DIR_COLORS.iter().enumerate() {
             let mut style = Style::default().fg(*color);
             if i == state.color_idx {
@@ -583,7 +599,7 @@ impl App {
         frame.render_widget(block, popup);
 
         // Four field rows + at most one per-field hint, plus a little slack.
-        let form_h: u16 = if state.editing { 7 } else { 0 };
+        let form_h: u16 = if state.edit.is_some() { 7 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
@@ -596,21 +612,21 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (i, r) in state.rows.iter().enumerate() {
             let on = i == state.cursor;
-            let marker = if on && !state.editing {
+            let marker = if on && state.edit.is_none() {
                 "\u{276F} "
             } else {
                 "  "
             };
-            let label = if r.label.trim().is_empty() {
+            let label = if r.label.text().trim().is_empty() {
                 "(unnamed)".to_string()
             } else {
-                r.label.clone()
+                r.label.text().to_string()
             };
-            let host = HostId(r.label.clone());
-            let icon = if r.icon.trim().is_empty() {
+            let host = r.host();
+            let icon = if r.icon.text().trim().is_empty() {
                 self.host_icon(&host)
             } else {
-                r.icon.clone()
+                r.icon.text().to_string()
             };
             // A suspended host is dimmed whole: it has no backend, so every live
             // number the row would otherwise carry is simply absent, and the row
@@ -652,15 +668,15 @@ impl App {
                 format!(
                     "      {} {} {}",
                     if r.is_socket { "socket" } else { "ssh" },
-                    r.target,
-                    r.options.trim()
+                    r.target.text(),
+                    r.options.text().trim()
                 )
                 .trim_end()
                 .to_string(),
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }
-        let add_on = state.cursor == state.rows.len() && !state.editing;
+        let add_on = state.cursor == state.rows.len() && state.edit.is_none();
         lines.push(Line::from(Span::styled(
             format!("{}+ add host", if add_on { "\u{276F} " } else { "  " }),
             Style::default().add_modifier(Modifier::DIM),
@@ -670,7 +686,7 @@ impl App {
             let label = state
                 .rows
                 .get(idx)
-                .map(|r| r.label.clone())
+                .map(|r| r.label.text().to_string())
                 .unwrap_or_default();
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -695,7 +711,7 @@ impl App {
         frame.render_widget(Paragraph::new(lines), list_area);
 
         // The field form for the row being edited.
-        if state.editing
+        if let Some(focus) = state.focus()
             && let Some(r) = state.rows.get(state.cursor)
         {
             let field_row = |focused: bool, label: &str, value: Line<'static>| {
@@ -716,59 +732,37 @@ impl App {
                 spans.extend(value.spans);
                 Line::from(spans)
             };
-            let cursor = |focused: bool| {
-                if focused {
-                    Span::styled(
-                        "\u{2588}",
-                        Style::default().add_modifier(Modifier::SLOW_BLINK),
-                    )
-                } else {
-                    Span::raw("")
-                }
-            };
-            let label_line = Line::from(vec![
-                Span::raw(r.label.clone()),
-                cursor(state.focus == super::HostField::Label),
-            ]);
+            let label_line = Line::from(text_field_spans(&r.label, focus == HostField::Label));
             let kind = if r.is_socket { "socket" } else { "ssh" };
-            let target_line = Line::from(vec![
-                Span::styled(
-                    format!("[{kind}] "),
+            let mut target_spans = vec![Span::styled(
+                format!("[{kind}] "),
+                Style::default().add_modifier(Modifier::DIM),
+            )];
+            target_spans.extend(text_field_spans(&r.target, focus == HostField::Target));
+            let target_line = Line::from(target_spans);
+            let options_line =
+                Line::from(text_field_spans(&r.options, focus == HostField::Options));
+            // The derived emoji stands where the field's text would be, dim, so
+            // an empty field says what it will *do* rather than reading as one
+            // the user forgot. It follows the cursor rather than replacing it.
+            let mut icon_spans = text_field_spans(&r.icon, focus == HostField::Icon);
+            if r.icon.text().trim().is_empty() {
+                icon_spans.push(Span::styled(
+                    format!("{} (auto)", self.host_icon(&r.host())),
                     Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::raw(r.target.clone()),
-                cursor(state.focus == super::HostField::Target),
-            ]);
-            let options_line = Line::from(vec![
-                Span::raw(r.options.clone()),
-                cursor(state.focus == super::HostField::Options),
-            ]);
-            let icon_line = Line::from(vec![
-                Span::raw(if r.icon.trim().is_empty() {
-                    format!("{} (auto)", self.host_icon(&HostId(r.label.clone())))
-                } else {
-                    r.icon.clone()
-                }),
-                cursor(state.focus == super::HostField::Icon),
-            ]);
+                ));
+            }
+            let icon_line = Line::from(icon_spans);
             let mut form_lines = vec![
-                field_row(state.focus == super::HostField::Label, "Label", label_line),
-                field_row(
-                    state.focus == super::HostField::Target,
-                    "Target",
-                    target_line,
-                ),
-                field_row(
-                    state.focus == super::HostField::Options,
-                    "Options",
-                    options_line,
-                ),
-                field_row(state.focus == super::HostField::Icon, "Icon", icon_line),
+                field_row(focus == HostField::Label, "Label", label_line),
+                field_row(focus == HostField::Target, "Target", target_line),
+                field_row(focus == HostField::Options, "Options", options_line),
+                field_row(focus == HostField::Icon, "Icon", icon_line),
             ];
             // Per-field hints for the non-obvious affordances. The Ports one is
             // the syntax itself: the field accepts more forms than a label can
             // carry, and examples teach it in less room than a grammar would.
-            match state.focus {
+            match focus {
                 super::HostField::Target => form_lines.push(Line::from(Span::styled(
                     "  ^t toggle ssh / socket",
                     Style::default().add_modifier(Modifier::DIM),
@@ -1942,7 +1936,7 @@ impl App {
                 spans
             }
             InputMode::DirEdit => {
-                let mut spans = hint_pair("Tab", "row");
+                let mut spans = hint_pair("Tab/↑↓", "row");
                 spans.extend(hint_pair("←→", "change"));
                 spans.extend(hint_pair("^E", "emoji"));
                 spans.extend(hint_pair("Enter", "save"));
@@ -1957,12 +1951,15 @@ impl App {
                     spans.extend(hint_pair("g/G", "top/bottom"));
                     spans.extend(hint_pair("Esc", "back"));
                     spans
-                } else if host_edit.is_some_and(|h| h.editing) {
-                    let mut spans = hint_pair("Tab", "field");
+                } else if host_edit.is_some_and(|h| h.edit.is_some()) {
+                    // `Esc cancel`, not the old `back`: it puts the row as it was
+                    // and Enter is what keeps the change, so the two keys have to
+                    // read as the opposites they now are.
+                    let mut spans = hint_pair("Tab/↑↓", "field");
                     spans.extend(hint_pair("^t", "ssh/socket"));
                     spans.extend(hint_pair("^e", "emoji"));
-                    spans.extend(hint_pair("Enter", "done"));
-                    spans.extend(hint_pair("Esc", "back"));
+                    spans.extend(hint_pair("Enter", "save"));
+                    spans.extend(hint_pair("Esc", "cancel"));
                     spans
                 } else {
                     // No `s save`: the panel has no Save step — every mutation
@@ -1971,6 +1968,11 @@ impl App {
                     // not exist.
                     let mut spans = hint_pair("a", "add");
                     spans.extend(hint_pair("e", "edit"));
+                    // The two shortcuts into a *named* field, where `e` always
+                    // lands on Label. Only worth a hint for the fields you'd open
+                    // the editor specifically to change.
+                    spans.extend(hint_pair("^e", "icon"));
+                    spans.extend(hint_pair("^t", "target"));
                     spans.extend(hint_pair("c", "connect/disconnect"));
                     spans.extend(hint_pair("d", "delete"));
                     // Shown only on a row that has somewhere to go, which is the
@@ -2005,6 +2007,31 @@ const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
 /// lists have to agree with what `override_indicator_cell` builds — a column
 /// narrower than the line right-aligned into it silently clips the bell.
 const OVERRIDE_COL_WIDTH: u16 = 4;
+
+/// One form field's spans, with the cursor drawn where it actually is.
+///
+/// A block parked after the text was honest while a field could only be appended
+/// to. Now that the hosts panel's fields are [`TextInput`]s, the cursor is the
+/// only thing on screen saying where the next character lands — so the cell
+/// under it is reversed, with a reversed space standing in at end-of-text. An
+/// unfocused field renders as plain text: two cursors in one form would be a
+/// lie about which one the keyboard is in. Pure.
+fn text_field_spans(input: &TextInput, focused: bool) -> Vec<Span<'static>> {
+    let text = input.text();
+    if !focused {
+        return vec![Span::raw(text.to_string())];
+    }
+    // `TextInput` keeps the cursor on a char boundary, so this can't split a
+    // multi-byte glyph.
+    let (head, rest) = text.split_at(input.cursor().min(text.len()));
+    let mut chars = rest.chars();
+    let under = chars.next().map(String::from).unwrap_or_else(|| " ".into());
+    vec![
+        Span::raw(head.to_string()),
+        Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(chars.as_str().to_string()),
+    ]
+}
 
 /// Squeeze arbitrary text — up to and including a host's multi-line refusal —
 /// onto one row of `max` cells.

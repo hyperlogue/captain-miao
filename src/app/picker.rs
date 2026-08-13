@@ -38,6 +38,14 @@ impl TextInput {
         Self::default()
     }
 
+    /// A field pre-filled with `text`, cursor at the end — what a popup wants
+    /// when it seeds a form from stored config.
+    pub fn with_text(text: impl Into<String>) -> Self {
+        let mut input = Self::new();
+        input.set_text(text);
+        input
+    }
+
     pub fn text(&self) -> &str {
         &self.buf
     }

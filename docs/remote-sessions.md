@@ -969,6 +969,21 @@ decides what they mean**.
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.
+  - **The row editor is a form, and moves like one.** `Tab`/`S-Tab`, `↑`/`↓` and
+    `^n`/`^p` all walk the four fields, forwards and back — a ring you can only
+    cycle one way makes overshooting a field cost three more presses. The fields
+    are `TextInput`s, the same widget behind every picker's query, so the
+    readline keys, the arrows and Home/End work inside them and the cursor
+    renders where it actually is. **`Enter` commits and `Esc` cancels**: the
+    editor snapshots the row on the way in, so `Esc` restores what was there —
+    and drops the row outright if the edit is what created it, since an empty
+    row never became a host on disk and leaving it in the list would misstate
+    what is configured. (The panel's no-Save-step rule is about the *panel*; a
+    per-row cancel is what makes the commit meaningful.) From the list, `^e` and
+    `^t` open the editor **on** the field they name — `e` always lands on Label,
+    which put the emoji picker five keys from a row whose icon you wanted to
+    change. Every other Ctrl-key in the list is inert rather than falling
+    through to its plain letter: a stray `^d` must not reach the `d` confirm.
   - **`u` — upgrade this host's server** (§3 for the mechanism). Offered only
     on a row that has somewhere to go: the connection task re-asks
     `decide_provision` with the running daemon out of the picture, and only an

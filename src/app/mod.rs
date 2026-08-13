@@ -526,9 +526,9 @@ pub(super) struct HostEditState {
     pub(in crate::app) rows: Vec<HostRow>,
     /// Selected row (`0..rows.len()`), or `rows.len()` for the "+ add" line.
     pub(in crate::app) cursor: usize,
-    /// `true` while editing the selected row's fields; `false` in the list.
-    pub(in crate::app) editing: bool,
-    pub(in crate::app) focus: HostField,
+    /// `Some` while the selected row's fields have the keyboard — see
+    /// [`RowEdit`]. `None` in the list.
+    pub(in crate::app) edit: Option<RowEdit>,
     /// The row a `d` press is asking about — the removal confirm (§9). `None`
     /// when nothing is pending.
     pub(in crate::app) pending_remove: Option<usize>,
@@ -541,6 +541,87 @@ pub(super) struct HostEditState {
     /// view entirely — it wants the whole popup, since the text it exists to
     /// show is what didn't fit on a row.
     pub(in crate::app) log_view: Option<HostLogView>,
+}
+
+/// The hosts panel's row editor: which field has the keyboard, and what `Esc`
+/// puts back.
+///
+/// One `Option` rather than an `editing` flag beside a focus and a snapshot: an
+/// entry point that set two of the three and forgot the third would compile,
+/// and the one it would forget is the snapshot — which is the difference
+/// between `Esc` restoring a mistyped target and losing the old one. There are
+/// three entry points (`a`, `e`/`Enter`, and the `^`-key that opens the editor
+/// on a named field), so that is a live risk rather than a hypothetical one.
+#[derive(Debug)]
+pub(in crate::app) struct RowEdit {
+    pub(in crate::app) focus: HostField,
+    pub(in crate::app) origin: EditOrigin,
+}
+
+/// What `Esc` undoes in the hosts panel's row editor.
+///
+/// The panel has no Save step — a commit persists immediately (§9) — so its
+/// counterpart has to be a real cancel, and a cancel needs the pre-edit
+/// contents from somewhere. A row the edit *created* has none: abandoning it
+/// removes it again, which is also what stops a half-typed `(unnamed)` row from
+/// lingering in the list until the panel is reopened.
+#[derive(Debug)]
+pub(in crate::app) enum EditOrigin {
+    Existing(HostRow),
+    Added,
+}
+
+impl HostEditState {
+    /// Start editing the selected row on `focus`, recording what `Esc` restores.
+    pub(in crate::app) fn begin_edit(&mut self, focus: HostField) {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        self.edit = Some(RowEdit {
+            focus,
+            origin: EditOrigin::Existing(row.clone()),
+        });
+    }
+
+    /// Append a blank row and edit it from the Label field. `Esc` removes it
+    /// again — an empty row is not a host, and never became one on disk
+    /// ([`App::apply_host_edits`] filters it), so leaving it in the list would
+    /// only be a lie about what is configured.
+    pub(in crate::app) fn begin_new_row(&mut self) {
+        self.rows.push(HostRow::default());
+        self.cursor = self.rows.len() - 1;
+        self.edit = Some(RowEdit {
+            focus: HostField::Label,
+            origin: EditOrigin::Added,
+        });
+    }
+
+    /// Abandon the edit in progress, restoring what was there before it.
+    /// Persists nothing: no mutation reaches disk between `begin_edit` and the
+    /// commit, so putting the row back is the whole of the undo.
+    pub(in crate::app) fn cancel_edit(&mut self) {
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        match edit.origin {
+            EditOrigin::Existing(row) => {
+                if let Some(slot) = self.rows.get_mut(self.cursor) {
+                    *slot = row;
+                }
+            }
+            EditOrigin::Added => {
+                if self.cursor < self.rows.len() {
+                    self.rows.remove(self.cursor);
+                }
+                self.cursor = self.cursor.min(self.rows.len());
+            }
+        }
+    }
+
+    /// The field with the keyboard, or `None` in the list.
+    pub(in crate::app) fn focus(&self) -> Option<HostField> {
+        self.edit.as_ref().map(|e| e.focus)
+    }
 }
 
 /// One session an upgrade will kill, recorded so it can be brought back on the
@@ -610,22 +691,37 @@ pub(super) struct HostLogView {
 }
 
 /// One editable host row in the popup.
+///
+/// The four text fields are [`TextInput`](picker::TextInput)s rather than bare
+/// `String`s. They hold ssh targets and argument lines long enough that fixing a
+/// typo in the middle has to be possible, which needs a cursor — and the widget
+/// that has one already backs every picker's query and the directory-mark
+/// editor's icon field, so the readline keys are the same ones here.
 #[derive(Debug, Clone, Default)]
 pub(super) struct HostRow {
-    pub(in crate::app) label: String,
+    pub(in crate::app) label: picker::TextInput,
     /// ssh target (`user@host`) or, when `is_socket`, a socket path.
-    pub(in crate::app) target: String,
+    pub(in crate::app) target: picker::TextInput,
     pub(in crate::app) is_socket: bool,
     /// Per-host emoji shown beside the workdir icon, picked with the same
     /// searchable picker as the workdir marks. Empty = derive one from the label.
-    pub(in crate::app) icon: String,
+    pub(in crate::app) icon: picker::TextInput,
     /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
     pub(in crate::app) disabled: bool,
     /// ssh arguments as one line of text — see [`hosts::HostConfig::options`].
     /// Edited as text rather than as a list of rows because the whole set is
     /// nearly always one or two arguments, and a sub-list inside a popup row
     /// would need its own cursor, its own add/remove keys and its own footer.
-    pub(in crate::app) options: String,
+    pub(in crate::app) options: picker::TextInput,
+}
+
+impl HostRow {
+    /// The `HostId` this row configures — its label, trimmed exactly as
+    /// [`App::apply_host_edits`] trims it on the way to disk, so a lookup
+    /// against the live backends matches a row still being typed.
+    pub(in crate::app) fn host(&self) -> HostId {
+        HostId(self.label.text().trim().to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -634,6 +730,26 @@ pub(super) enum HostField {
     Target,
     Options,
     Icon,
+}
+
+impl HostField {
+    /// Form order — the order the fields are drawn in, which is the order the
+    /// focus keys walk.
+    const ORDER: [HostField; 4] = [
+        HostField::Label,
+        HostField::Target,
+        HostField::Options,
+        HostField::Icon,
+    ];
+
+    /// The next field, forwards or back. Wraps: the form is a ring, so
+    /// overshooting the last field costs one more press either way.
+    pub(in crate::app) fn step(self, forward: bool) -> Self {
+        let n = Self::ORDER.len();
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        let next = if forward { i + 1 } else { i + n - 1 };
+        Self::ORDER[next % n]
+    }
 }
 
 /// What one configured host's backend is built *from* — see
@@ -2099,9 +2215,14 @@ impl App {
         if let Some(state) = self.host_edit.as_mut() {
             let cursor = state.cursor;
             if let Some(r) = state.rows.get_mut(cursor) {
-                r.icon = emoji.to_string();
+                r.icon.set_text(emoji);
             }
-            state.focus = HostField::Icon;
+            // The picker is only reachable from inside the row editor (from the
+            // Icon field, or from the list via the key that opens the editor
+            // *on* it), so there is always an edit to hand the glyph back to.
+            if let Some(edit) = state.edit.as_mut() {
+                edit.focus = HostField::Icon;
+            }
         }
         self.input_mode = InputMode::HostEdit;
     }
@@ -2345,19 +2466,18 @@ impl App {
             .into_iter()
             .map(|h| HostRow {
                 is_socket: h.socket.is_some(),
-                target: h.socket.or(h.ssh).unwrap_or_default(),
-                icon: h.icon.unwrap_or_default(),
+                target: picker::TextInput::with_text(h.socket.or(h.ssh).unwrap_or_default()),
+                icon: picker::TextInput::with_text(h.icon.unwrap_or_default()),
                 disabled: h.disabled,
                 // Round-trips exactly: a spec can hold neither a comma nor a
                 // space, so this join is the inverse of `parse_list`'s split.
-                options: h.options.join(" "),
-                label: h.label,
+                options: picker::TextInput::with_text(h.options.join(" ")),
+                label: picker::TextInput::with_text(h.label),
             })
             .collect::<Vec<_>>();
         self.host_edit = Some(HostEditState {
             cursor: 0,
-            editing: false,
-            focus: HostField::Label,
+            edit: None,
             pending_remove: None,
             pending_upgrade: None,
             log_view: None,
@@ -2418,20 +2538,20 @@ impl App {
             // Drop blank rows (a half-typed one being added) and any that alias
             // the reserved `local` host.
             .filter(|r| {
-                !r.label.trim().is_empty()
-                    && !r.target.trim().is_empty()
-                    && !r.label.trim().eq_ignore_ascii_case("local")
+                !r.label.text().trim().is_empty()
+                    && !r.target.text().trim().is_empty()
+                    && !r.label.text().trim().eq_ignore_ascii_case("local")
             })
             .map(|r| {
-                let target = r.target.trim().to_string();
-                let icon = r.icon.trim().to_string();
+                let target = r.target.text().trim().to_string();
+                let icon = r.icon.text().trim().to_string();
                 hosts::HostConfig {
                     icon: (!icon.is_empty()).then_some(icon),
-                    label: r.label.trim().to_string(),
+                    label: r.label.text().trim().to_string(),
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
                     disabled: r.disabled,
-                    options: hosts::split_options(&r.options),
+                    options: hosts::split_options(r.options.text()),
                 }
             })
             .collect();
@@ -3921,7 +4041,7 @@ impl App {
     /// cursor is turned into a host.
     pub(super) fn selected_host_upgrade(&self) -> Option<crate::backend::UpgradeOffer> {
         let state = self.host_edit.as_ref()?;
-        let host = HostId(state.rows.get(state.cursor)?.label.clone());
+        let host = state.rows.get(state.cursor)?.host();
         self.backend_for(&host)
             .and_then(crate::backend::Backend::upgrade_offer)
     }
