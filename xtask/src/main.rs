@@ -46,6 +46,11 @@ const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 /// server carried without it would be dead weight by construction.
 const REMOTE_FEATURE: &str = "remote";
 
+/// The size-tuned dashboard profile, defined in the workspace root `Cargo.toml`.
+/// Load-bearing twice, exactly like `server::SERVER_PROFILE`: it is the
+/// `--profile` argument *and* the directory cargo writes the artifact into.
+const DASHBOARD_SMALL_PROFILE: &str = "dashboard-small";
+
 const X86: &str = "x86_64-unknown-linux-gnu";
 const ARM: &str = "aarch64-unknown-linux-gnu";
 const X86_MUSL: &str = "x86_64-unknown-linux-musl";
@@ -258,6 +263,14 @@ struct Variant {
     features: &'static [&'static str],
     /// Server targets to obtain and inject.
     servers: &'static [&'static str],
+    /// Build the *dashboard* for size as well as the servers it carries: the
+    /// `dashboard-small` profile, plus the SQLite feature trim `cm-core` also
+    /// benefits from.
+    ///
+    /// Off for everything a release publishes. The servers are size-tuned
+    /// regardless — that happens in `server::build`, below this flag — so this
+    /// is only ever a statement about the `miao` binary itself.
+    size_tuned: bool,
     what: &'static str,
 }
 
@@ -266,6 +279,7 @@ const VARIANTS: &[Variant] = &[
         name: "",
         features: &[],
         servers: &[],
+        size_tuned: false,
         what: "the default: local sessions, plus remote hosts that already have miao-server",
     },
     // No `remote` variant: the feature is on by default since 0.3.0, so such a
@@ -276,25 +290,41 @@ const VARIANTS: &[Variant] = &[
         name: "bundle-linux-x86_64",
         features: &[],
         servers: &[X86],
+        size_tuned: false,
         what: "remote hosts, deploying its own server to x86-64 Linux",
     },
     Variant {
         name: "bundle-linux-aarch64",
         features: &[],
         servers: &[ARM],
+        size_tuned: false,
         what: "remote hosts, deploying its own server to arm64 Linux",
     },
     Variant {
         name: "bundle-linux",
         features: &[],
         servers: LINUX_TARGETS,
+        size_tuned: false,
         what: "remote hosts, deploying its own server to either Linux arch",
     },
     Variant {
         name: "bundle-linux-all",
         features: &[],
         servers: PUBLISHED_TARGETS,
+        size_tuned: false,
         what: "every published Linux server (gnu + musl) — reaches any host without a download",
+    },
+    // Not published, and not a default: `"s"` on the dashboard's own render and
+    // session-parsing paths has never been benchmarked, so it is opt-in. It
+    // exists for builds where the artifact's size *is* the point — the Nix
+    // `captain-miao-bundle-small` package, where there is no download to amortise
+    // a bigger binary against.
+    Variant {
+        name: "bundle-small",
+        features: &[],
+        servers: &[X86],
+        size_tuned: true,
+        what: "smallest bundled build: the dashboard is size-tuned too, not just its server",
     },
 ];
 
@@ -334,6 +364,17 @@ impl Variant {
 
     fn bundles(&self) -> bool {
         !self.servers.is_empty()
+    }
+
+    /// The cargo profile this variant's **dashboard** compiles under. Also names
+    /// the directory cargo writes it to, which is why [`built_dashboard`] takes
+    /// it rather than assuming `release`.
+    fn dashboard_profile(&self) -> &'static str {
+        if self.size_tuned {
+            DASHBOARD_SMALL_PROFILE
+        } else {
+            "release"
+        }
     }
 
     /// The features this variant compiles with.
@@ -481,7 +522,11 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         // Copy rather than rename: every variant's build reuses the same
         // `target/release/cm`, so leaving it in place would be a lie the moment
         // the next one overwrote it.
-        let from = built_dashboard(&ws.target_dir, args.target.as_deref());
+        let from = built_dashboard(
+            &ws.target_dir,
+            args.target.as_deref(),
+            v.dashboard_profile(),
+        );
         install(&from, &to)?;
 
         verify(&to, &payloads, runnable)?;
@@ -518,9 +563,12 @@ fn build_dashboard(
     target: Option<&str>,
 ) -> Result<()> {
     let features = v.cargo_features();
+    // `--profile <name>` rather than `--release`, which is only its alias and
+    // cannot be passed alongside it.
     let mut argv = vec![
         "build".to_string(),
-        "--release".to_string(),
+        "--profile".to_string(),
+        v.dashboard_profile().to_string(),
         "--locked".to_string(),
         "-p".to_string(),
         DASHBOARD_PKG.to_string(),
@@ -536,15 +584,21 @@ fn build_dashboard(
 
     let manifest = write_manifest(ws, v, payloads)?;
     println!("  {} {}", cargo(), argv.join(" "));
-    let status = Command::new(cargo())
-        .args(&argv)
+    let mut cmd = Command::new(cargo());
+    cmd.args(&argv)
         .current_dir(&ws.root)
         // Always set, even to the empty-manifest path: a stale value inherited
         // from the caller's environment would otherwise decide what a variant
         // carries, and a plain `miao` would quietly stop being plain.
-        .env(MANIFEST_ENV, &manifest)
-        .status()
-        .context("spawning cargo")?;
+        .env(MANIFEST_ENV, &manifest);
+    // The dashboard links the same bundled SQLite as the server, through
+    // `cm-core`, and reaches no more of it — one read-only SELECT for Codex
+    // thread titles. Only for a size-tuned variant, so every other artifact
+    // stays byte-for-byte what it was.
+    if v.size_tuned {
+        cmd.env("LIBSQLITE3_FLAGS", server::SQLITE_TRIM);
+    }
+    let status = cmd.status().context("spawning cargo")?;
     if !status.success() {
         bail!("building {} failed ({status})", v.label());
     }
@@ -630,12 +684,12 @@ fn find_variant(name: &str) -> Result<&'static Variant> {
 /// a `--target` build silently picks up whatever an earlier plain build left
 /// there. Pure, so the layout is pinned by a test rather than by a CI run that
 /// packaged a stale binary.
-fn built_dashboard(target_dir: &Path, target: Option<&str>) -> PathBuf {
+fn built_dashboard(target_dir: &Path, target: Option<&str>, profile: &str) -> PathBuf {
     let mut p = target_dir.to_path_buf();
     if let Some(t) = target {
         p.push(t);
     }
-    p.join("release").join(DASHBOARD_BIN)
+    p.join(profile).join(DASHBOARD_BIN)
 }
 
 /// Check the artifact really carries what it was built to carry.
@@ -1057,15 +1111,45 @@ mod tests {
     fn the_built_dashboard_moves_under_the_target_triple() {
         let td = Path::new("/w/target");
         assert_eq!(
-            built_dashboard(td, None),
+            built_dashboard(td, None, "release"),
             Path::new("/w/target/release/miao")
         );
         // Including when the requested target *is* the host: cargo relocates on
         // the presence of the flag, not on whether it changes anything.
         assert_eq!(
-            built_dashboard(td, Some(X86)),
+            built_dashboard(td, Some(X86), "release"),
             Path::new("/w/target/x86_64-unknown-linux-gnu/release/miao")
         );
+        // And the profile names the directory too, so a size-tuned variant is
+        // read back from its own — never from a `release/` an earlier build left.
+        assert_eq!(
+            built_dashboard(td, Some(X86), DASHBOARD_SMALL_PROFILE),
+            Path::new("/w/target/x86_64-unknown-linux-gnu/dashboard-small/miao")
+        );
+    }
+
+    /// The size-tuned variant must differ from every shipping one in both ways
+    /// that matter, and nothing a release publishes may pick either up.
+    ///
+    /// `"s"` on the dashboard is unbenchmarked, so it stays opt-in: a variant
+    /// that quietly acquired it would ship a slower TUI to every npm install.
+    #[test]
+    fn only_the_opt_in_variant_is_size_tuned() {
+        let small = find_variant("bundle-small").unwrap();
+        assert!(small.size_tuned);
+        assert_eq!(small.dashboard_profile(), DASHBOARD_SMALL_PROFILE);
+        assert!(small.bundles(), "a size-tuned build is still a bundle");
+
+        for name in DEFAULT_VARIANTS {
+            let v = find_variant(name).unwrap();
+            assert!(
+                !v.size_tuned,
+                "published variant {:?} is size-tuned",
+                v.label()
+            );
+            assert_eq!(v.dashboard_profile(), "release");
+        }
+        assert!(!DEFAULT_VARIANTS.contains(&"bundle-small"));
     }
 
     /// The cross-build half of [`verify`], which nothing but release CI's

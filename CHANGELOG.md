@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`miao-bundled-all-server-v<version>-<target>.tar.gz`** — a larger download
   carrying every published server (both arches, glibc and musl), for a mixed
   fleet or a machine that can't reach the network at deploy time.
+- **`packages.captain-miao-bundle-small`** (Nix) — a bundled dashboard built for
+  size throughout, 22.6% smaller than the equivalent regular bundle. Nix-only and
+  opt-in: it trades optimization on the dashboard's own paths for bytes, which is
+  a good deal when you build locally and never download anything.
 
 ## [0.3.0] - 2026-08-12
 

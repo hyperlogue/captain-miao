@@ -165,7 +165,6 @@ fn choose_strategy(target: &str, host: &str, tools: &Tools) -> Result<Strategy, 
     ))
 }
 
-/// Where a strategy's glibc floor actually comes from, when it isn't the pinned
 /// The cargo profile every server build uses, defined in the workspace root
 /// `Cargo.toml`. Size-tuned, and deliberately not `release` — see the comment on
 /// the profile itself.
@@ -201,13 +200,14 @@ pub const SERVER_PROFILE: &str = "server-release";
 /// removing it would take `-DSQLITE_OMIT_JSON`. Kept because it costs nothing
 /// and still says what we want; listed here so nobody re-discovers it by
 /// grepping the output and concluding the trim silently failed.
-const SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
+pub const SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
      -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_JSON1 -USQLITE_ENABLE_RTREE \
      -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB \
      -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_LOAD_EXTENSION \
      -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED \
      -DSQLITE_OMIT_SHARED_CACHE";
 
+/// Where a strategy's glibc floor actually comes from, when it isn't the pinned
 /// [`GLIBC_FLOOR`] — phrased for the warning `dist` prints beside the payload.
 /// `None` means the floor is pinned (or the target has no glibc to pin).
 ///

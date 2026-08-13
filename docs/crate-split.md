@@ -228,6 +228,17 @@ Roughly 840 KiB off every npm platform package and every dashboard tarball, and
 ~3.2 MB off the all-server artifact. A native non-zigbuild build measures −30.0%;
 the shipped figure is the one to quote.
 
+**The dashboard can take the same treatment, and one variant does.** `Variant`'s
+`size_tuned` selects the `dashboard-small` profile plus the SQLite trim for the
+`miao` binary itself — measured at **8,973,680 → 6,949,072, −22.6%**, both
+carrying the identical payload, so the dashboard's own code fell ~29%. Nothing
+published uses it: `"s"` on render and session-parsing paths is unbenchmarked,
+and a slower TUI is a worse trade than a bigger download for someone who is
+downloading anyway. It exists for `packages.captain-miao-bundle-small`, where the
+build is local and there is no download to amortise. Its graph has no
+`libshpool`/`shpool_vt100`/`vte`, so it needs none of `server-release`'s
+carve-outs — but it does link `libsqlite3-sys`, which is why the trim applies.
+
 Two findings worth not re-deriving. `opt-level` reaches **C**, not just Rust —
 `cc` scrapes cargo's `OPT_LEVEL` and passes `-O<level>` straight through — so
 SQLite's amalgamation compiles `-Os` here, and a per-package override does
