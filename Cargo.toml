@@ -153,22 +153,3 @@ opt-level = 3
 opt-level = 3
 [profile.server-release.package.tokio]
 opt-level = 3
-
-# The same treatment for the *dashboard*, used only by variants that ask for it
-# (`xtask`'s `Variant::size_tuned`) — never by a plain `cargo build`, and never by
-# what a release publishes.
-#
-# Separate from `server-release` rather than shared, because the two carry
-# different risk. A server is a payload nobody interacts with; the dashboard is
-# the TUI under your hands, and `"s"` on its render and session-parsing paths is
-# unbenchmarked. It is offered for the case where the artifact's size is the
-# whole point — a Nix bundled build — and is deliberately not the default.
-#
-# No per-package carve-outs, unlike `server-release`: the dashboard's graph has
-# no `libshpool`, no `shpool_vt100` and no `vte` (verified with `cargo tree -p
-# captain-miao`), so the pty state machine that carve-out exists to protect is
-# not in this binary at all. It does link `libsqlite3-sys`, which is why the
-# SQLite trim applies here too.
-[profile.dashboard-small]
-inherits = "release"
-opt-level = "s"

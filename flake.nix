@@ -187,20 +187,11 @@
         # `bundle-linux-all` is the separate all-server download. The other two
         # are not published but stay buildable — a Nix user driving a fleet of one
         # architecture has no reason to carry the other.
-        #
-        # `bundle-small` is the odd one out: the only variant whose *dashboard* is
-        # also built for size (`dashboard-small` + the SQLite trim), not just the
-        # server it carries. Nix is exactly where that trade makes sense — the
-        # build is local, so there is no download to amortise a bigger binary
-        # against, and `"s"` on the TUI's own paths is a cost nobody has measured.
-        # It is not published and not a `dist` default for that reason; here it is
-        # simply one more name, since everything about it lives in xtask.
         bundled = lib.genAttrs [
           "bundle-linux"
           "bundle-linux-x86_64"
           "bundle-linux-aarch64"
           "bundle-linux-all"
-          "bundle-small"
         ] (variant: mkBundled variant);
 
         # A link farm of servers, and a dashboard pointed at it.

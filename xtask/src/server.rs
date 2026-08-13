@@ -200,7 +200,7 @@ pub const SERVER_PROFILE: &str = "server-release";
 /// removing it would take `-DSQLITE_OMIT_JSON`. Kept because it costs nothing
 /// and still says what we want; listed here so nobody re-discovers it by
 /// grepping the output and concluding the trim silently failed.
-pub const SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
+const SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
      -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_JSON1 -USQLITE_ENABLE_RTREE \
      -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_DBSTAT_VTAB \
      -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_LOAD_EXTENSION \
