@@ -19,9 +19,25 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 # crate of their own because nothing else links them: the dashboard reads the
 # archives through `include_bytes!`, so it needs no code from this side at all.
 #
-# gzip. The dashboard inflates with the same crate, so there is one codec in the
-# tree and no C dependency on either side.
-flate2 = "1"
+# xz, for packing payloads. `static` vendors liblzma and builds it with `cc`
+# rather than looking for a system one, so a CI runner with no nix and no
+# `liblzma-dev` still builds this — which is every runner in build.yml's
+# dashboard matrix.
+#
+# The C implementation is here and *not* in the dashboard, which decodes with
+# pure-Rust `lzma-rs`. That split is measured, not stylistic: `lzma-rs`'s encoder
+# does not compress (a 4,711,104-byte server came out at 4,711,376), while
+# liblzma at preset 6 makes it 1,675,744. xtask runs on a build machine where a C
+# toolchain is a given; the dashboard cross-compiles to four targets where it is
+# not.
+liblzma = { version = "0.4", features = ["static"] }
 # The digest that rides to the remote host as the deployed-build marker. Same
 # major as cm-core's, so the workspace carries one copy.
 sha2 = "0.11"
+
+# The decoder the *dashboard* ships, so `pack`'s output can be round-tripped
+# against it here. This is the only place both codecs exist, and the only place
+# a preset or filter change that liblzma accepts and `lzma-rs` cannot read would
+# be caught before it shipped as an unpackable payload.
+[dev-dependencies]
+lzma-rs = "0.3"

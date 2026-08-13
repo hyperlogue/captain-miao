@@ -25,8 +25,6 @@
 //! `include_bytes!` data is allocated and referenced, so — like the slot it
 //! replaced — it survives `strip`.
 
-use std::io::Read;
-
 /// One embedded server build.
 pub(crate) struct ServerPayload {
     /// The Rust target triple it was built for.
@@ -37,21 +35,28 @@ pub(crate) struct ServerPayload {
     /// one, which is what makes the dev loop (rebuild, reconnect, get the new
     /// server) work without a version bump.
     pub(crate) sha256: &'static str,
-    /// The gzip'd binary.
-    pub(crate) gz: &'static [u8],
+    /// The xz-compressed binary. `xtask` packs it at preset 6, whose 8 MiB
+    /// dictionary is what bounds the allocation below.
+    pub(crate) packed: &'static [u8],
 }
 
 impl ServerPayload {
     /// Inflate to the bytes to upload.
+    ///
+    /// Pure-Rust xz, so a cross-compiled dashboard needs no system liblzma. Peak
+    /// cost is the dictionary the stream header asks for — 9 MiB at the preset
+    /// `xtask` uses, which is why that preset is pinned there rather than left
+    /// to whatever compresses best.
     pub(crate) fn decompress(&self) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(self.gz).read_to_end(&mut out)?;
+        lzma_rs::xz_decompress(&mut &self.packed[..], &mut out)
+            .map_err(|e| std::io::Error::other(format!("unpacking {}: {e}", self.target)))?;
         Ok(out)
     }
 }
 
 // The table `build.rs` generates: one `ServerPayload` per line of the manifest,
-// each `gz` an `include_bytes!` of the archive. Empty — a `&[]` costing nothing —
+// each `packed` an `include_bytes!` of the archive. Empty — a `&[]` costing nothing —
 // whenever `CM_SERVER_PAYLOAD_MANIFEST` was unset, which is every ordinary build.
 include!(concat!(env!("OUT_DIR"), "/payloads.rs"));
 
@@ -362,7 +367,7 @@ fn describe_table(table: &[ServerPayload]) -> String {
         out.push_str(&format!(
             "\n  {:<28} {:>8}  {}",
             p.target,
-            format!("{:.1} MiB", p.gz.len() as f64 / (1u64 << 20) as f64),
+            format!("{:.1} MiB", p.packed.len() as f64 / (1u64 << 20) as f64),
             &p.sha256[..12.min(p.sha256.len())],
         ));
     }
@@ -491,12 +496,12 @@ mod tests {
             ServerPayload {
                 target: "x86_64-unknown-linux-musl",
                 sha256: "m",
-                gz: b"",
+                packed: b"",
             },
             ServerPayload {
                 target: "x86_64-unknown-linux-gnu",
                 sha256: "g",
-                gz: b"",
+                packed: b"",
             },
         ]
     }
@@ -642,19 +647,35 @@ mod tests {
         assert!(s.contains(env!("CARGO_PKG_VERSION")), "{s}");
     }
 
+    /// `xz -6` of `b"\x7fELF not really, but it compresses".repeat(64)`,
+    /// produced by liblzma — the encoder `xtask` packs with.
+    ///
+    /// A literal rather than something the test compresses itself, because the
+    /// dashboard has no encoder: `lzma-rs` ships decode-only (its `xz_compress`
+    /// does not compress), and pulling liblzma in as a dev-dependency would put a
+    /// C build in the way of `cargo test` on all four cross targets. The
+    /// end-to-end guard against a preset or filter change that this decoder
+    /// cannot read lives in `xtask`, where both codecs are available.
+    const XZ6_FIXTURE: &[u8] = b"\xfd\x37\x7a\x58\x5a\x00\x00\x04\xe6\xd6\xb4\x46\x04\xc0\x3b\x80\
+\x11\x21\x01\x16\x00\x00\x00\x00\x00\x00\x00\x00\x1b\x77\xc5\x18\
+\xe0\x08\x7f\x00\x33\x5d\x00\x3f\x91\x45\x84\x69\x4d\x9b\xc1\xaa\
+\x27\x31\xba\xc1\x4c\x13\x09\x59\x13\x78\xac\x90\xa7\xef\x8b\xe1\
+\xba\x5d\x0c\x43\xd2\x99\x4b\xd2\x9f\xbf\xcd\x4b\x8b\x98\xb5\x0e\
+\x9f\xb1\xc0\xc3\xb1\x9a\xef\x71\x19\x40\x00\x00\x36\x56\x1c\x14\
+\x5e\x76\x8d\x0b\x00\x01\x57\x80\x11\x00\x00\x00\xfa\x6c\x9d\x8b\
+\xb1\xc4\x67\xfb\x02\x00\x00\x00\x00\x04\x59\x5a";
+
     #[test]
-    fn a_payload_round_trips_through_gzip() {
-        use std::io::Write;
+    fn a_payload_round_trips_through_xz() {
+        // Fixture bytes compressed by `lzma-rs` would prove nothing: its encoder
+        // does not actually compress, and the streams this has to read are
+        // liblzma's. So this is a real `xz -6` stream, produced by liblzma and
+        // committed as bytes, decoded by the pure-Rust decoder that ships.
         let raw = b"\x7fELF not really, but it compresses".repeat(64);
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        enc.write_all(&raw).unwrap();
-        let gz = enc.finish().unwrap();
-        // `gz` has to outlive the borrow in `ServerPayload`, hence the leak; this
-        // is the one place a payload isn't `'static` from the embedded table.
         let payload = ServerPayload {
             target: "t",
             sha256: "s",
-            gz: Box::leak(gz.into_boxed_slice()),
+            packed: XZ6_FIXTURE,
         };
         assert_eq!(payload.decompress().unwrap(), raw);
     }
@@ -683,8 +704,30 @@ mod tests {
         // one this pins that the manifest produced usable entries.
         for p in payloads() {
             assert_eq!(p.sha256.len(), 64, "{}: bad digest", p.target);
-            assert!(!p.gz.is_empty(), "{}: empty payload", p.target);
-            assert_eq!(&p.gz[..2], b"\x1f\x8b", "{}: not gzip", p.target);
+            assert!(!p.packed.is_empty(), "{}: empty payload", p.target);
+            // xz magic: FD 37 7A 58 5A 00.
+            assert_eq!(
+                &p.packed[..6],
+                b"\xfd7zXZ\x00",
+                "{}: not an xz stream",
+                p.target
+            );
+            // Actually unpack it, and check the bytes are the ones the digest
+            // names. Magic alone would still pass for a stream this decoder
+            // cannot read — a filter it lacks, or a truncated embed — and the
+            // first place that would otherwise surface is a failed deploy on
+            // someone else's machine. The digest is of the *decompressed* binary
+            // (it becomes the marker on the host), so this checks the whole
+            // chain: manifest, `include_bytes!`, codec, and identity.
+            let raw = p
+                .decompress()
+                .unwrap_or_else(|e| panic!("{}: does not unpack: {e}", p.target));
+            use sha2::Digest as _;
+            let got: String = sha2::Sha256::digest(&raw)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, p.sha256, "{}: unpacks to the wrong bytes", p.target);
         }
         let mut targets = embedded_targets();
         let before = targets.len();

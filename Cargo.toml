@@ -59,10 +59,19 @@ emojis = "0.6"
 # header paw + cat. Already in the tree transitively; pinned here as a direct dep.
 base64 = "0.22"
 # Inflates the embedded `miao-server` payloads before uploading them to a
-# remote host (src/server_payload.rs). Pure Rust (miniz_oxide) by default, and
-# the same crate `xtask` compresses with, so there is one codec in the tree and
-# no C dependency on either side.
-flate2 = "1"
+# remote host (src/server_payload.rs), and the ones downloaded from a release.
+#
+# **Decode only, and pure Rust on purpose.** The dashboard cross-compiles to four
+# targets and must not grow a C dependency for this; `lzma-rs` needs no system
+# liblzma and no build script. `xtask` compresses with the C liblzma instead
+# (see its Cargo.toml) — the asymmetry is deliberate, because this crate's
+# *encoder* does not actually compress: measured, `xz_compress` turned a
+# 4,711,104-byte server into 4,711,376 bytes. Its decoder is fine, and verified
+# against liblzma's output by a round-trip test.
+#
+# Measured against `flate2`, which this replaced: +25 KiB of decoder in exchange
+# for 462 KiB less payload per embedded server.
+lzma-rs = "0.3"
 # Digests a server payload that came from a file rather than the embedded table
 # (the env-var and cache sources), so every candidate carries the same identity
 # the deploy marker records. Already in the tree via `cm-core` and `xtask`, and

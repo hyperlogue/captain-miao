@@ -19,15 +19,14 @@
 //! Cargo is left in charge of *whether* a rebuild is needed: [`build`] always
 //! invokes it, and cargo does nothing when nothing changed. Only the packing
 //! step is memoised here, keyed on the digest of the binary that arrived,
-//! because gzipping ~9 MB at maximum compression is the one part that would
+//! because compressing ~9 MB at maximum effort is the one part that would
 //! otherwise cost real time on a no-op run.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use flate2::Compression;
-use flate2::write::GzEncoder;
+use liblzma::write::XzEncoder;
 use sha2::{Digest, Sha256};
 
 /// The cargo package we build. Distinct from [`SERVER_BIN`] since the rename:
@@ -368,10 +367,10 @@ pub struct Payload {
     /// server is a step in its own right: `cargo xtask prepare-servers` publishes these,
     /// while only the dashboard's build wants the archive.
     pub bin_path: PathBuf,
-    /// The gzip the dashboard `include_bytes!`es.
-    pub gz_path: PathBuf,
+    /// The xz archive the dashboard `include_bytes!`es.
+    pub packed_path: PathBuf,
     pub raw_len: u64,
-    pub gz_len: u64,
+    pub packed_len: u64,
     pub provenance: Provenance,
     /// False when the binary was byte-identical to the last one packed and the
     /// existing archive was reused.
@@ -575,14 +574,14 @@ pub fn pack_binary(
     provenance: Provenance,
 ) -> Result<Payload, String> {
     let sha256 = hex(&Sha256::digest(raw));
-    let (gz_path, gz_len, repacked) = pack(build_dir, target, raw, &sha256)?;
+    let (packed_path, packed_len, repacked) = pack(build_dir, target, raw, &sha256)?;
     Ok(Payload {
         target: target.to_string(),
         sha256,
         bin_path: bin_path.to_path_buf(),
-        gz_path,
+        packed_path,
         raw_len: raw.len() as u64,
-        gz_len,
+        packed_len,
         provenance,
         repacked,
     })
@@ -609,8 +608,25 @@ fn verify_arch(raw: &[u8], target: &str, whence: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Gzip `raw` into the build directory, reusing the previous archive when the
-/// binary hasn't changed. Returns the archive, its size, and whether it was
+/// The xz preset payloads are compressed at.
+///
+/// **6, not 9, and that is not a compromise** — on a ~4.7 MB server the two emit
+/// byte-identical output, because an LZMA dictionary larger than the input buys
+/// nothing and 6's is already 8 MiB. What 9 *would* change is the decoder: xz
+/// records the dictionary size in the stream header, so `xz -9` obliges every
+/// dashboard to allocate 64 MiB to unpack, against 9 MiB here. Measured on the
+/// x86-64 glibc payload: both 1,675,744 bytes, 65 MiB vs 9 MiB to decode.
+///
+/// Raise it only if a payload ever exceeds 8 MiB *and* the ratio measurably
+/// improves — never on the assumption that a bigger number compresses better.
+///
+/// No BCJ/x86 filter, which would otherwise be the obvious win on executables:
+/// `lzma-rs`, the pure-Rust decoder on the dashboard side, implements LZMA2 only.
+/// A filtered stream would pack smaller here and fail to unpack there.
+const XZ_PRESET: u32 = 6;
+
+/// Compress `raw` into the build directory, reusing the previous archive when
+/// the binary hasn't changed. Returns the archive, its size, and whether it was
 /// (re)written.
 fn pack(
     build_dir: &Path,
@@ -620,32 +636,32 @@ fn pack(
 ) -> Result<(PathBuf, u64, bool), String> {
     let dir = build_dir.join("packed");
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let gz_path = dir.join(format!("{target}.gz"));
+    let packed_path = dir.join(format!("{target}.xz"));
     let stamp = dir.join(format!("{target}.sha256"));
 
     // The stamp records the digest of the *binary* the archive was made from, so
     // a cache hit means the bytes we are about to embed are the bytes cargo just
     // produced — not merely that some archive exists.
     if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == sha256)
-        && let Ok(meta) = std::fs::metadata(&gz_path)
+        && let Ok(meta) = std::fs::metadata(&packed_path)
     {
-        return Ok((gz_path, meta.len(), false));
+        return Ok((packed_path, meta.len(), false));
     }
 
-    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-    enc.write_all(raw).map_err(|e| format!("gzip: {e}"))?;
-    let gz = enc.finish().map_err(|e| format!("gzip: {e}"))?;
+    let mut enc = XzEncoder::new(Vec::new(), XZ_PRESET);
+    enc.write_all(raw).map_err(|e| format!("xz: {e}"))?;
+    let packed = enc.finish().map_err(|e| format!("xz: {e}"))?;
 
     // Write the archive first and the stamp only once it has landed, so an
     // interrupted run leaves a stale-looking cache rather than a stamp promising
     // an archive that isn't there.
-    let tmp = dir.join(format!(".{target}.gz.tmp"));
-    std::fs::write(&tmp, &gz).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &gz_path).map_err(|e| format!("renaming {}: {e}", tmp.display()))?;
+    let tmp = dir.join(format!(".{target}.xz.tmp"));
+    std::fs::write(&tmp, &packed).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &packed_path).map_err(|e| format!("renaming {}: {e}", tmp.display()))?;
     std::fs::write(&stamp, format!("{sha256}\n"))
         .map_err(|e| format!("writing {}: {e}", stamp.display()))?;
 
-    Ok((gz_path, gz.len() as u64, true))
+    Ok((packed_path, packed.len() as u64, true))
 }
 
 /// Run the nested cargo, with its output going straight to the terminal.
@@ -1171,6 +1187,45 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let (_, _, refilled) = pack(&dir, "t", &other, &other_sha).unwrap();
         assert!(refilled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What [`pack`] writes must be readable by the decoder the **dashboard**
+    /// ships, which is a different implementation by a different author.
+    ///
+    /// This is the only place in the tree where both codecs exist, so it is the
+    /// only place the pairing can be checked at all. The realistic way to break
+    /// it is not a bug but an improvement: adding the BCJ/x86 filter, which
+    /// liblzma applies happily and would cut an executable by several percent,
+    /// and which `lzma-rs` — LZMA2 only — cannot read. That ships a dashboard
+    /// whose payload fails to unpack on first deploy, having passed every other
+    /// test, so this asserts on the bytes rather than on the settings.
+    #[test]
+    fn what_pack_writes_is_readable_by_the_decoder_the_dashboard_ships() {
+        let dir = std::env::temp_dir().join(format!("cm-server-xz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Repetitive enough to compress, so a silently-stored stream would show
+        // up as a size failure rather than passing the round-trip regardless.
+        let raw = b"\x7fELF and then some payload bytes".repeat(4096);
+        let sha = hex(&Sha256::digest(&raw));
+        let (path, len, _) = pack(&dir, "t", &raw, &sha).unwrap();
+
+        let packed = std::fs::read(&path).unwrap();
+        assert_eq!(packed.len() as u64, len);
+        assert_eq!(&packed[..6], b"\xfd7zXZ\x00", "not an xz stream");
+        assert!(
+            packed.len() < raw.len() / 4,
+            "{} bytes from {} — the stream is not actually compressed",
+            packed.len(),
+            raw.len()
+        );
+
+        let mut out = Vec::new();
+        lzma_rs::xz_decompress(&mut &packed[..], &mut out)
+            .expect("the shipped pure-Rust decoder must read what liblzma wrote");
+        assert_eq!(out, raw);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -223,7 +223,7 @@ fn report(p: &server::Payload) {
     println!(
         "  {} → {} via {}{}",
         server::human(p.raw_len),
-        server::human(p.gz_len),
+        server::human(p.packed_len),
         p.provenance.label(),
         if p.repacked { "" } else { " (cached)" },
     );
@@ -575,9 +575,9 @@ fn write_manifest(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) ->
             "{}\t{}\t{}\n",
             p.target,
             p.sha256,
-            p.gz_path.display()
+            p.packed_path.display()
         ));
-        println!("  embedding {} ({})", p.target, server::human(p.gz_len));
+        println!("  embedding {} ({})", p.target, server::human(p.packed_len));
     }
 
     // Written only when the contents actually change. `build.rs` watches this
@@ -978,9 +978,9 @@ mod tests {
             target: target.to_string(),
             sha256: "a".repeat(64),
             bin_path: gz.clone(),
-            gz_path: gz.clone(),
+            packed_path: gz.clone(),
             raw_len: 17,
-            gz_len: 17,
+            packed_len: 17,
             provenance: server::Provenance::Local,
             repacked: false,
         };
@@ -1082,9 +1082,9 @@ mod tests {
             target: X86.to_string(),
             sha256: sha.to_string(),
             bin_path: artifact.clone(),
-            gz_path: artifact.clone(),
+            packed_path: artifact.clone(),
             raw_len: 0,
-            gz_len: 0,
+            packed_len: 0,
             provenance: server::Provenance::Local,
             repacked: false,
         };
