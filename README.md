@@ -315,8 +315,9 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 ## Roadmap
 
-- [ ] **tmux**: probe-verified on 3.7b only, and its live-server test doesn't run in CI yet. tmux is the one backend that *can* be tested headlessly — a server on a socket is the whole dependency — so putting that test in CI, and pinning the claimed ≥ 3.2 floor with it, is what graduates it.
+- [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that *can* be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
+- [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
 ## License

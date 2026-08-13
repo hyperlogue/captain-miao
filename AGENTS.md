@@ -255,9 +255,6 @@ CM_SERVER_PAYLOAD_MANIFEST=target/cm-server-payloads/bundle-linux-x86_64.tsv \
   cargo test -p captain-miao -- --ignored provisions_a_real_host
 #   (`cargo xtask dist` writes that manifest as a side effect — one TSV per
 #    variant; src/backend.rs's test doc has the full recipe)
+# Also run by CI on both matrix legs — tmux is in the dev shell for it.
 cargo test -p captain-miao -- --ignored drives_a_real_tmux_server
-# Ghostty's own live test. macOS, Ghostty >= 1.3 running, and captain-miao
-# granted Automation permission for it — the backend is otherwise written and
-# tested entirely against pure script-building/parsing functions.
-cargo test -p captain-miao -- --ignored drives_a_real_ghostty
 ```

@@ -115,3 +115,19 @@ jobs:
 
       - name: Test
         run: nix develop --command cargo test --workspace --locked
+
+      # The one `#[ignore]`d test that CI can actually satisfy. It starts a real
+      # tmux server on a pid-unique socket with `-f /dev/null`, so it needs
+      # nothing but the binary the dev shell now pins — no window system, no
+      # display, no consent dialog. That is what separates it from the other
+      # backends' live tests, which is why they don't exist.
+      #
+      # It runs as its own step rather than folded into `--include-ignored`
+      # above: `provisions_a_real_host` is also ignored and needs an ssh target
+      # and a built server payload, so sweeping them all in would fail here for
+      # reasons that have nothing to do with tmux.
+      #
+      # This pins tmux against whatever version flake.lock resolves, which is
+      # *not* the ≥ 3.2 floor the README claims — that floor is still untested.
+      - name: Test (live tmux server)
+        run: nix develop --command cargo test -p captain-miao --locked -- --ignored drives_a_real_tmux_server

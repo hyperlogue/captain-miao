@@ -36,6 +36,15 @@ in
 
       # for kitty remote control during development
       kitty
+
+      # `drives_a_real_tmux_server`, the one backend test that drives a real
+      # server rather than a fixture — and the only one that *can*, since a
+      # server on a private socket is its whole dependency (kitty and Ghostty
+      # both need a window system, Ghostty additionally a hand-clicked macOS
+      # Automation grant). It is in the shell rather than left to the machine
+      # because CI runs every check through `nix develop`, so an ambient tmux
+      # would make the test pass or vanish depending on the runner image.
+      tmux
     ];
 
     env = {};

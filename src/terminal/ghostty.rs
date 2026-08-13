@@ -16,9 +16,12 @@
 //! addresses the thing an agent runs in, and the OS window it happens to sit in
 //! is presentation.
 //!
-//! Backend properties this module encodes (read off the shipped `Ghostty.sdef`
-//! and the Swift behind it, **not** measured against a live Ghostty — this
-//! backend is written on Linux and its live test is `#[ignore]`d):
+//! Backend properties this module encodes, read off the shipped `Ghostty.sdef`
+//! and the Swift behind it — **not** measured against a live Ghostty. Everything
+//! covered by a test here is pure (script building, snapshot parsing, id
+//! validation, shell quoting, the startup diagnosis); the rest would need a Mac
+//! with a GUI session and a hand-clicked Automation grant, which no CI can
+//! supply, so it is unverified rather than verified-elsewhere:
 //! - **Ids are opaque strings of three different shapes.** A terminal id is a
 //!   UUID (`SurfaceView.id.uuidString`); a tab id is `tab-<hex>`; a window id is
 //!   `window-<hex>` / `tab-group-<hex>` / `controller-<hex>`. So the digit-only
@@ -146,8 +149,7 @@ impl GhosttyTerminal {
         cm_core::terminal::is_ghostty(term_program.as_deref().map(str::trim)).then(Self::new)
     }
 
-    /// A backend not built from the env — the live-Ghostty test's constructor,
-    /// and what `from_env` defers to once the env has been vouched for.
+    /// The bare backend, once `from_env` has vouched for the environment.
     fn new() -> Self {
         Self {
             own_surface: OnceLock::new(),
@@ -930,52 +932,5 @@ mod tests {
             // -circuits before any env read, so no `TERM_PROGRAM` value matters.
             assert!(GhosttyTerminal::from_env().is_none());
         }
-    }
-
-    /// Drive a real Ghostty. Needs macOS, Ghostty ≥ 1.3 running, and captain-miao
-    /// granted Automation permission for it — so it is `#[ignore]`d, like the
-    /// live tmux and ssh tests.
-    ///
-    /// ```sh
-    /// cargo test -p captain-miao -- --ignored drives_a_real_ghostty
-    /// ```
-    #[tokio::test]
-    #[ignore = "needs a live Ghostty >= 1.3 on macOS with Automation permission granted"]
-    async fn drives_a_real_ghostty() {
-        let term = GhosttyTerminal::new();
-        term.verify_control().await.expect("control channel");
-
-        let before = term.snapshot().await.expect("snapshot");
-        let spawned = term
-            .spawn(SpawnSpec {
-                cwd: std::env::var("HOME").expect("HOME"),
-                target: SpawnTarget::NewTab,
-                command: SpawnCommand::Exec(vec!["sleep".into(), "30".into()]),
-                title: Some("miao test".into()),
-                hold: false,
-                take_focus: false,
-                stack: true,
-            })
-            .await
-            .expect("spawn");
-        let window = spawned.window.expect("a spawn always reports its surface");
-        let tab = spawned.tab.expect("a spawn always reports its tab");
-
-        // The reported tab must be the one actually holding the reported
-        // surface: the dashboard trusts it and skips the resolving snapshot.
-        let after = term.snapshot().await.expect("snapshot");
-        assert_eq!(after.len(), before.len() + 1);
-        let holder = after
-            .iter()
-            .find(|t| t.windows.contains(&window))
-            .expect("the new surface is in the snapshot");
-        assert_eq!(holder.id, tab);
-        assert_eq!(holder.title, "miao test", "the title action took effect");
-
-        term.focus_window(&window).await.expect("focus");
-        term.close_window(&window).await.expect("close");
-        // Closing an id that is already gone must be harmless, not a panic —
-        // the restart/kill paths close speculatively.
-        let _ = term.close_window(&window).await;
     }
 }
