@@ -1677,7 +1677,16 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             && dirty_at.elapsed() >= preview_debounce
         {
             app.preview_dirty_since = None;
-            if let Some(wid) = selected_wid {
+            // A backend that can't capture is never asked to
+            // (`Capabilities::capture` carries why). The window id is still
+            // stamped below, because that is what keeps the selection-mismatch
+            // check above from re-arming the debounce on the very next
+            // iteration; `preview_fetched_at` deliberately is not, so the
+            // auto-refresh timer has nothing to fire on either.
+            if let Some(wid) = selected_wid.as_ref().filter(|_| !app.capabilities.capture) {
+                app.preview_window_id = Some(wid.clone());
+                app.set_preview_text(None);
+            } else if let Some(wid) = selected_wid {
                 app.preview_fetched_at = Some(Instant::now());
                 match terminal::get()
                     .capture_text(&wid, PREVIEW_CAPTURE_LINES)

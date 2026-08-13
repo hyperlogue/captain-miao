@@ -723,7 +723,8 @@ pub(super) struct App {
     /// constant) — every consumer reads this cache, never
     /// `terminal::get().capabilities()` again. `move_to_tab` gates the `t`
     /// command and hides its help/footer hint; `window_stacking` decides
-    /// whether a session spawn anchors next to a window or gets its own tab.
+    /// whether a session spawn anchors next to a window or gets its own tab;
+    /// `capture` gates the preview fetch and its auto-refresh timer.
     pub(super) capabilities: Capabilities,
     /// Backend used when starting a new session (`o` / `O`). Seeded from
     /// `launcher.default_agent`, cycled with `Space a`.
@@ -4027,6 +4028,11 @@ impl App {
         if self.window_id_for_session(s).is_none() {
             return "(no window to preview)".to_string();
         }
+        // Last, so the more specific reasons above still win: the row *has* a
+        // live local window, this backend simply cannot read one.
+        if !self.capabilities.capture {
+            return "(this terminal exposes no way to read a window — no preview)".to_string();
+        }
         "(loading…)".to_string()
     }
 
@@ -4726,8 +4732,9 @@ impl App {
         }
     }
 
-    /// Whether the periodic preview auto-refresh should fire: the dashboard
-    /// has terminal focus (no `kitten @ get-text` churn while the user is
+    /// Whether the periodic preview auto-refresh should fire: the backend can
+    /// capture at all, the dashboard has terminal focus (no `kitten @ get-text`
+    /// churn while the user is
     /// away), the panel is visible and showing a live window, the selected
     /// session is busy (an at-rest session produces no new output to fetch;
     /// once a reload shows it busy again the timer resumes, and the fetch
@@ -4738,6 +4745,7 @@ impl App {
     /// disables the timer.
     pub(super) fn wants_preview_auto_refresh(&self, interval: Duration) -> bool {
         !interval.is_zero()
+            && self.capabilities.capture
             && self.focused
             && self.preview_visible
             && self.preview_window_id.is_some()

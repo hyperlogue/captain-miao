@@ -390,6 +390,7 @@ pub(crate) const CAPABILITIES: super::Capabilities = super::Capabilities {
     move_to_tab: false,
     window_stacking: false,
     floating_sessions: true,
+    capture: true,
 };
 
 #[async_trait]

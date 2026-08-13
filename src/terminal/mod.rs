@@ -194,6 +194,21 @@ pub struct Capabilities {
     /// non-active sessions tab moves nothing at all. zellij only; Kitty has
     /// no floating panes.
     pub floating_sessions: bool,
+    /// [`capture_text`](Terminal::capture_text) can actually read a window's
+    /// output, so the preview panel has something to show. Ghostty's
+    /// AppleScript dictionary exposes no screen or scrollback read at all, so it
+    /// is the one backend that answers `false`.
+    ///
+    /// This has to be a capability rather than "the call just errors", because
+    /// the preview loop reads a failed capture as *evidence about the binding*:
+    /// it clears the text, stamps `preview_window_id` and arms the
+    /// snapshot-verified detach prune, on the reasonable theory that a window
+    /// which won't answer a `get-text` is a window that no longer exists. A
+    /// backend that can never answer would feed that inference a false signal on
+    /// every debounce tick *and* on the auto-refresh timer, for every live
+    /// session. Gating it up front keeps the unsupported case a rendered
+    /// sentence instead of an inference.
+    pub capture: bool,
 }
 
 impl Default for Capabilities {
@@ -203,6 +218,7 @@ impl Default for Capabilities {
             move_to_tab: true,
             window_stacking: true,
             floating_sessions: false,
+            capture: true,
         }
     }
 }

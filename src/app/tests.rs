@@ -3590,6 +3590,54 @@ fn t_disabled_when_move_to_tab_unsupported() {
     );
 }
 
+/// A backend that can't read a window (Ghostty) must say so in the preview
+/// panel and must not arm the auto-refresh timer. Both matter: the fetch loop
+/// treats a *failed* capture as evidence the binding is stale, so leaving the
+/// call to fail would feed that inference on every tick for every live session.
+#[test]
+fn preview_reports_a_backend_that_cannot_capture() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
+
+    // Capable backend (kitty, the test default): the row is simply waiting.
+    assert_eq!(d.app.preview_placeholder(), "(loading…)");
+    d.app.preview_window_id = d.app.selected_window_id();
+    d.app.preview_fetched_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    assert!(
+        d.app
+            .wants_preview_auto_refresh(std::time::Duration::from_secs(3))
+    );
+
+    d.app.capabilities.capture = false;
+    assert!(
+        d.app.preview_placeholder().contains("no preview"),
+        "expected the placeholder to name the limitation, got {:?}",
+        d.app.preview_placeholder()
+    );
+    assert!(
+        !d.app
+            .wants_preview_auto_refresh(std::time::Duration::from_secs(3)),
+        "auto-refresh must not fire on a backend that cannot capture"
+    );
+}
+
+/// The capture gate is the *last* resort: a foreign, detached or unbound row
+/// has a more specific thing to say, and those must keep saying it.
+#[test]
+fn more_specific_preview_placeholders_beat_the_capture_gate() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.capabilities.capture = false;
+
+    let mut s = session(1, "/home/test/a", SessionStatus::Active);
+    s.window_id = None;
+    s.launch_id = None;
+    d.set_sessions(vec![s]);
+    assert_eq!(d.app.preview_placeholder(), "(no window to preview)");
+
+    d.set_sessions(vec![]);
+    assert_eq!(d.app.preview_placeholder(), "(no session selected)");
+}
+
 #[test]
 fn help_overlay_hides_move_tab_when_unsupported() {
     // Supported (kitty, the test default): the move-tab row is present.
