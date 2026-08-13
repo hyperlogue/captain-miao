@@ -3872,6 +3872,56 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     assert!(!out.contains("xterm"), "no terminfo invented: {out}");
 }
 
+/// `Enter` on a row another client holds is a *steal*, so it asks. Left to the
+/// attach wrapper this was a window that opened, printed libshpool's refusal and
+/// closed — the answer arriving where the user isn't looking. The confirm keys
+/// on the same bit as the held-elsewhere glyph, so what the row shows and what
+/// `Enter` does cannot disagree.
+#[test]
+fn enter_on_a_row_another_client_holds_offers_the_steal() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let mut held = session(1, "/srv/held", SessionStatus::Idle);
+    held.host = HostId("box".into());
+    held.pool_session = Some("cm-held".into());
+    held.attached = Some(true);
+    d.set_sessions(vec![held.clone()]);
+
+    assert!(
+        d.app.focus_or_attach(&held).is_none(),
+        "the action waits behind the confirm rather than firing"
+    );
+    let confirm = d.app.pending_confirm.as_ref().expect("a confirm is armed");
+    assert!(confirm.prompt.contains("kick it"), "{}", confirm.prompt);
+    assert!(
+        matches!(
+            confirm.action,
+            Action::AttachRemoteRunning { force: true, .. }
+        ),
+        "answering yes must steal, not re-attempt a plain attach"
+    );
+    assert_eq!(d.app.input_mode, super::InputMode::Confirm);
+
+    // Free, and unknown, both attach as before — the second matters most: a
+    // pool we couldn't read must not put a confirm in front of every row.
+    for bit in [Some(false), None] {
+        let mut free = session(2, "/srv/free", SessionStatus::Idle);
+        free.host = HostId("box".into());
+        free.pool_session = Some("cm-free".into());
+        free.attached = bit;
+        let mut d = TestDashboard::new(120, 12);
+        d.set_sessions(vec![free.clone()]);
+        assert!(
+            matches!(
+                d.app.focus_or_attach(&free),
+                Some(Action::AttachRemoteRunning { force: false, .. })
+            ),
+            "attached={bit:?} must attach directly"
+        );
+        assert!(d.app.pending_confirm.is_none(), "attached={bit:?}");
+    }
+}
+
 /// A terminfo that isn't this terminal's earns a warning under the value naming
 /// what this terminal is — the name to install on the host, which is the remedy
 /// however the difference arose. It must not fire when they agree, or on a row

@@ -3621,13 +3621,34 @@ impl App {
         // those out entirely (see `is_actionable_row`).
         // A local, unpooled session with no window yields `None` — nothing to
         // focus and nothing to attach to.
-        s.pool_session
-            .as_ref()
-            .map(|pool| Action::AttachRemoteRunning {
-                host: s.host.clone(),
-                pool_session: pool.clone(),
-                force: false,
-            })
+        let pool = s.pool_session.as_ref()?;
+        // …unless another client holds the pty, in which case attaching is a
+        // *steal* and has to be asked rather than done. Left to the attach
+        // wrapper, this was a window that opened, printed libshpool's refusal,
+        // and closed — the answer arriving in the one place the user isn't
+        // looking. Asking here also makes `Enter` agree with what the row
+        // already says: the confirm appears on exactly the rows drawn with the
+        // held-elsewhere glyph, since both key on the same bit. An *unknown*
+        // bit attaches as before and lets the wrapper refuse if it must —
+        // guessing "held" from a pool we couldn't read would put a confirm in
+        // front of every row.
+        if s.attached == Some(true) {
+            self.pending_confirm = Some(PendingConfirm {
+                prompt: "Another terminal is attached — kick it? [y/N]".to_string(),
+                action: Action::AttachRemoteRunning {
+                    host: s.host.clone(),
+                    pool_session: pool.clone(),
+                    force: true,
+                },
+            });
+            self.input_mode = InputMode::Confirm;
+            return None;
+        }
+        Some(Action::AttachRemoteRunning {
+            host: s.host.clone(),
+            pool_session: pool.clone(),
+            force: false,
+        })
     }
 
     /// Whether a row is one this dashboard can act on, and therefore worth a
