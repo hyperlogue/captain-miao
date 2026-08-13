@@ -48,7 +48,7 @@
         ];
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # The targets `captain-miao-servers` can cross-compile a `miao-server`
+        # The targets `captain-miao-server-payloads` can cross-compile a `miao-server`
         # to (docs/crate-split.md). Only `rust-std` comes from here — the C half
         # of the cross (bundled SQLite's amalgamation, and the link itself) is
         # `cargo-zigbuild`'s job, which ships its own libc headers and linker
@@ -61,7 +61,7 @@
         # The musl pair is here because a static build is the only server that
         # runs on a host with no generic loader (NixOS, Alpine, distroless),
         # where the gnu build cannot start at all — and musl x86-64 is what
-        # `captain-miao-servers` builds *by default*, so this is not a
+        # `captain-miao-server-payloads` builds *by default*, so this is not a
         # contingency but the common path here. All four are listed because that
         # package's `targets` is overridable to any of them.
         crossTargets = [
@@ -85,7 +85,7 @@
         # CM_SERVER_PAYLOAD_MANIFEST unset, so `build.rs` embeds nothing. Nix
         # reaches remote hosts through `captain-miao-with-servers` instead, which
         # points the dashboard at a directory of servers rather than compiling
-        # them in — see `nix/servers.nix` for why that is the better trade here.
+        # them in — see `nix/server-payloads.nix` for why that is the better trade here.
         src = let
           root = ./.;
           isAsset = path: lib.hasPrefix "${toString root}/assets/" path;
@@ -118,7 +118,7 @@
         # workspace member (libshpool lives only here), so scope the build to it
         # with `-p`; reuses the shared dependency artifacts.
         #
-        # This and `captain-miao-servers` are the same program built two ways,
+        # This and `captain-miao-server-payloads` are the same program built two ways,
         # and confusing them is the mistake worth naming. This one is an ordinary
         # nixpkgs build: `rustToolchain`, plain `cargo build --release`, linked
         # against the store's own glibc with an absolute `/nix/store/…/ld-linux`
@@ -127,9 +127,9 @@
         # dashboard finds it locally and no deploy happens at all — and exactly
         # wrong anywhere else, because that loader exists on no other host.
         #
-        # Anything a dashboard *deploys* must come from `captain-miao-servers`
+        # Anything a dashboard *deploys* must come from `captain-miao-server-payloads`
         # instead, which cross-builds through zigbuild against a pinned glibc
-        # floor and asserts it did (`nix/servers.nix`). Filed under a generic
+        # floor and asserts it did (`nix/server-payloads.nix`). Filed under a generic
         # triple, this binary would look correct and fail on every non-Nix host —
         # the inverse of the failure the whole deploy design started from.
         #
@@ -155,12 +155,12 @@
         # recommended way to drive remote hosts from Nix.
         #
         # Both are `callPackage`d rather than defined here so their server list is
-        # overridable; the reasoning and the default live in `nix/servers.nix`.
+        # overridable; the reasoning and the default live in `nix/server-payloads.nix`.
         #
         #     packages.captain-miao-with-servers.override {
         #       targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
         #     }
-        captain-miao-servers = pkgs.callPackage ./nix/servers.nix {
+        captain-miao-server-payloads = pkgs.callPackage ./nix/server-payloads.nix {
           inherit craneLibCross commonArgs;
         };
 
@@ -178,12 +178,12 @@
           });
 
         captain-miao-with-servers = pkgs.callPackage ./nix/with-servers.nix {
-          inherit captain-miao-remote captain-miao-servers;
+          inherit captain-miao-remote captain-miao-server-payloads;
         };
       in {
         packages = {
           default = captain-miao;
-          inherit captain-miao captain-miao-server captain-miao-remote captain-miao-servers captain-miao-with-servers;
+          inherit captain-miao captain-miao-server captain-miao-remote captain-miao-server-payloads captain-miao-with-servers;
         };
 
         devShells.default = import ./nix/shell.nix {

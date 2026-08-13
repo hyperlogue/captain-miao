@@ -11,16 +11,16 @@
   symlinkJoin,
   makeWrapper,
   captain-miao-remote,
-  captain-miao-servers,
-  # Passed straight through to `captain-miao-servers`. `null` means "whatever
+  captain-miao-server-payloads,
+  # Passed straight through to `captain-miao-server-payloads`. `null` means "whatever
   # that package defaults to" — the default lives there and only there, so the
   # two cannot drift into disagreeing about what a plain build carries.
   targets ? null,
 }: let
   servers =
     if targets == null
-    then captain-miao-servers
-    else captain-miao-servers.override {inherit targets;};
+    then captain-miao-server-payloads
+    else captain-miao-server-payloads.override {inherit targets;};
 in
   symlinkJoin {
     name = "captain-miao-with-servers";

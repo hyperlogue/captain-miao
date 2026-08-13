@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `miao` binary for parity with the published artifacts, which buys nothing when
   nothing is downloaded — and every change to the fleet relinked the dashboard.
   Use `captain-miao-with-servers` instead.
+- **Nix: `captain-miao-servers` is renamed `captain-miao-server-payloads`.** One
+  letter apart from `captain-miao-server`, they meant opposite things — the
+  former is cross-built to run on other machines, the latter is a store-linked
+  binary for this one — and mixing them up produces a server that looks right
+  and fails to start on every host it reaches. Most people want
+  `captain-miao-with-servers` and never name either.
 
 ## [0.3.0] - 2026-08-12
 

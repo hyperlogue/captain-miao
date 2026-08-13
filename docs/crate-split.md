@@ -333,7 +333,7 @@ two were the missing per-target variable and its dashed-vs-underscored spelling.
 
 **On Nix, prefer the link farm to embedding.** `captain-miao-with-servers` wraps
 the dashboard with `CAPTAIN_MIAO_SERVER_DIR` pointing at
-`captain-miao-servers`, a directory of `<triple>/miao-server` built by
+`captain-miao-server-payloads`, a directory of `<triple>/miao-server` built by
 `prepare-servers`. Both are `callPackage`d, so the fleet is one override away:
 
 ```nix
@@ -363,14 +363,14 @@ absolute `/nix/store/…/ld-linux` interpreter. That is right for its only job �
 the Home Manager module putting `miao-server` on *this* machine's PATH, where a
 dashboard finds it locally and no deploy happens — and wrong anywhere else,
 because that loader exists on no other host. Anything a dashboard *deploys* comes
-from `packages.captain-miao-servers`, which cross-builds through cargo-zigbuild
+from `packages.captain-miao-server-payloads`, which cross-builds through cargo-zigbuild
 against the pinned glibc floor.
 
 That distinction is **asserted, not assumed**. `choose_strategy` prefers zigbuild
 but falls back to a native build when zig is not on `PATH`, and for a
 `-linux-gnu` target on an x86-64 builder that fallback *succeeds* — producing
 precisely the store-linked binary above, which would pass every other check and
-fail at exec on the first host it reached. So `nix/servers.nix` refuses any
+fail at exec on the first host it reached. So `nix/server-payloads.nix` refuses any
 output whose ELF interpreter is a store path. A musl build is static and has none,
 which is the expected case rather than a skipped one.
 

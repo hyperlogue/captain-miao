@@ -10,7 +10,7 @@
 #
 # `callPackage`d rather than defined inline so `targets` is overridable:
 #
-#     packages.captain-miao-servers.override {
+#     packages.captain-miao-server-payloads.override {
 #       targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-gnu" ];
 #     }
 #
@@ -47,10 +47,10 @@
   # deploy time.
   targets ? ["x86_64-unknown-linux-musl"],
 }:
-assert lib.assertMsg (targets != []) "captain-miao-servers: `targets` must name at least one triple";
+assert lib.assertMsg (targets != []) "captain-miao-server-payloads: `targets` must name at least one triple";
   craneLibCross.buildPackage (commonArgs
     // {
-      pname = "captain-miao-servers";
+      pname = "captain-miao-server-payloads";
       nativeBuildInputs = [cargo-zigbuild zig patchelf];
       preBuild = ''
         export HOME="$TMPDIR"
