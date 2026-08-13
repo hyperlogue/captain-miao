@@ -19,11 +19,17 @@
 #   * **No lingering.** For the daemon (and so every pooled session) to survive
 #     your last logout, the *system* needs `users.users.<name>.linger = true`
 #     — systemd-logind otherwise tears down `/run/user/<uid>` behind it. That is
-#     a NixOS option, not a Home-Manager one, so it stays your call to set.
+#     a NixOS option, not a Home-Manager one, so it stays your call to set. We
+#     cannot set it; when we can *see* it we warn instead (see `warnings` below).
 self: {
   config,
   lib,
   pkgs,
+  # Home Manager's own `submodule-support.nix` defaults this to `null` and the
+  # NixOS/nix-darwin wrappers override it with the system `config`, so it is
+  # always in scope: non-null means we are running as a NixOS module and can
+  # read system options. The `? null` is belt-and-braces for an older HM.
+  osConfig ? null,
   ...
 }: let
   cfg = config.programs.captain-miao;
@@ -83,5 +89,53 @@ in {
     home.packages =
       lib.optional cfg.enable cfg.package
       ++ lib.optional cfg.server.enable cfg.server.package;
+
+    # We can't *set* lingering from here, but when Home Manager runs as a NixOS
+    # module we can read what the system decided and say something. A warning,
+    # not an assertion: a host that is only ever reached while someone is logged
+    # in works fine without linger, and failing a rebuild over a preference
+    # would be picking the user's tradeoff for them.
+    #
+    # Only for `server.enable` — the dashboard half owns no daemon, so linger is
+    # nothing to it. And only when `osConfig` is non-null: standalone there is no
+    # system config to consult, and a warning that can't be checked is noise.
+    #
+    # `linger` is `nullOr bool` defaulting to **null**, which is a third state,
+    # not a synonym for false: null means NixOS leaves lingering alone, so an
+    # imperative `loginctl enable-linger` from earlier still stands and this
+    # warning is a false positive for that host. It is still worth saying —
+    # unmanaged means nothing guarantees it, and a rebuild elsewhere won't
+    # restore it — so the two cases get different wording rather than one vague
+    # line.
+    warnings = let
+      linger = osConfig.users.users.${config.home.username}.linger or null;
+      remedy = ''
+        Set `users.users.${config.home.username}.linger = true;` in your NixOS
+        configuration, or the daemon and every pooled session on this host die
+        at your last logout: systemd-logind removes /run/user/<uid> and takes
+        the daemon's sockets with it (and on a system with
+        `KillUserProcesses=yes`, kills the daemon outright). captain-miao
+        recovers on the next login by rebinding, but the outage lands precisely
+        when you are away and expecting persistence.
+      '';
+    in
+      lib.optional (cfg.server.enable && osConfig != null && linger != true) (
+        if linger == false
+        then ''
+          programs.captain-miao.server is enabled but lingering is explicitly
+          disabled for ${config.home.username}.
+
+          ${remedy}
+        ''
+        else ''
+          programs.captain-miao.server is enabled but lingering is unmanaged for
+          ${config.home.username} (`users.users.${config.home.username}.linger`
+          is null, so NixOS neither enables nor disables it). If you have run
+          `loginctl enable-linger` by hand this is already fine and you can
+          ignore it — but nothing in your configuration guarantees it.
+
+          ${remedy}
+        ''
+      );
   };
 }
