@@ -50,10 +50,32 @@
 //!   a capability rather than a failing call.
 //! - **There is no way to move a surface between tabs**, so `move_to_tab: false`
 //!   and the `t` affordance hides itself, exactly as on zellij.
-//! - **Neither Stacked arrangement exists.** Splits tile with no stack layout,
-//!   and the quick terminal is a single app-wide dropdown, not a per-session
-//!   floating pane. Both flags are false, which makes `layout_is_a_choice()`
-//!   false and every spawn a `NewTab` — tmux's shape.
+//! - **Neither Stacked arrangement is worth having.** `floating_sessions` is
+//!   clear-cut: the quick terminal is one app-wide dropdown bound to a hotkey,
+//!   not a per-session floating pane, and nothing else floats.
+//!
+//!   `window_stacking` is the closer call, because Ghostty *does* have
+//!   `toggle_split_zoom` ("take up the entire space in the current tab, hiding
+//!   other splits"), reachable through `perform action`. So sessions-as-splits
+//!   with one zoomed is constructible. It is rejected for the reason
+//!   `design/tmux-backend.md` §6 rejects the same emulation there, plus two
+//!   Ghostty-specific costs:
+//!   - **Switching costs two pty resizes per session, not zero.** There is no
+//!     "zoom *this* one" — only a toggle — so moving from A to B is unzoom A
+//!     (every split in the tab re-tiles), focus B, zoom B (they all resize
+//!     back). Kitty's `stack` layout switches by showing a different full-size
+//!     window and resizes nothing.
+//!   - **Splits are a binary tree, so spawning resizes the whole tab.** Each
+//!     `split` halves a sibling, so the Nth session in a shared tab resizes the
+//!     N-1 already there — a repaint storm across every running agent. Joining a
+//!     kitty stack tab costs the existing windows nothing.
+//!
+//!   A toggle with no idempotent "set" form also can't be driven by a pure
+//!   viewer: captain-miao would have to track which surface it believes is
+//!   zoomed and would desync the moment the user hit the keybind themselves.
+//!
+//!   Both flags false makes `layout_is_a_choice()` false, which hides `Space l`
+//!   and resolves every spawn to `NewTab` — tmux's shape.
 
 use std::sync::OnceLock;
 use std::time::Duration;

@@ -1639,11 +1639,21 @@ impl App {
             cmd(Command::JumpBottom),
             row("1..9".to_string(), "select Nth visible session"),
             row("C-1..C-9".to_string(), "select Nth and focus its window"),
-            cmd(Command::ScrollPreviewUp),
-            cmd(Command::ScrollPreviewDown),
-            cmd(Command::ScrollPreviewLeft),
-            cmd(Command::ScrollPreviewRight),
-            cmd(Command::RefreshPreview),
+        ];
+        // Scrolling and refreshing a preview presuppose a preview to scroll. On
+        // a backend that can't read a window at all (Ghostty) the panel only
+        // ever holds the one-line explanation, so drop the keys rather than list
+        // five that do nothing — the same treatment the unsupported `t` gets.
+        if self.capabilities.capture {
+            lines.extend([
+                cmd(Command::ScrollPreviewUp),
+                cmd(Command::ScrollPreviewDown),
+                cmd(Command::ScrollPreviewLeft),
+                cmd(Command::ScrollPreviewRight),
+                cmd(Command::RefreshPreview),
+            ]);
+        }
+        lines.extend([
             Line::from(""),
             section("Actions"),
             cmd(Command::FocusSelected),
@@ -1655,7 +1665,7 @@ impl App {
             cmd(Command::KillSelected),
             cmd(Command::RestartSelected),
             cmd(Command::RestartAll),
-        ];
+        ]);
         // Detach and steal only mean anything once some host pools its sessions
         // (a remote, or pooled-localhost) — otherwise a session *is* its window.
         // Hide them rather than list keys that only report they don't apply,

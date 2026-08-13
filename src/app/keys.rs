@@ -396,6 +396,18 @@ impl App {
                 None
             }
             Command::RefreshPreview => {
+                // Nothing to re-fetch on a backend that can't read a window at
+                // all (Ghostty); say why rather than claim a refresh that the
+                // fetch loop will decline anyway.
+                if !self.capabilities.capture {
+                    self.set_status(
+                        "This terminal backend exposes no way to read a window, so there is \
+                         nothing to preview"
+                            .to_string(),
+                        true,
+                    );
+                    return None;
+                }
                 self.request_preview_refresh();
                 self.set_status("Refreshing preview…".to_string(), false);
                 None

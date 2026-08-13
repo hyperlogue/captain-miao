@@ -3621,6 +3621,51 @@ fn preview_reports_a_backend_that_cannot_capture() {
     );
 }
 
+/// Every preview affordance has to disappear together with the capture it
+/// depends on — otherwise `R` claims a refresh the fetch loop then declines, and
+/// `?` advertises four scroll keys for a panel that never holds a scrollable
+/// line.
+#[test]
+fn preview_keys_are_hidden_when_the_backend_cannot_capture() {
+    // Supported (kitty, the test default): `R` refreshes and `?` lists the keys.
+    let mut d = TestDashboard::new(120, 44);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
+    d.press(KeyCode::Char('R'));
+    assert!(!d.app.status_is_error, "{:?}", d.app.status_msg);
+    d.press(KeyCode::Char('?'));
+    let help = d.render();
+    assert!(help.contains("refresh preview now"), "{help}");
+    assert!(help.contains("scroll preview up"), "{help}");
+
+    // Ghostty: the row still exists and still focuses, but nothing about the
+    // preview is offered.
+    let mut d = TestDashboard::new(120, 44);
+    d.app.capabilities.capture = false;
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
+    let action = d.press(KeyCode::Char('R'));
+    assert!(
+        action.is_none(),
+        "R should produce no action when unsupported"
+    );
+    assert!(d.app.status_is_error);
+    assert!(
+        d.app
+            .status_msg
+            .as_deref()
+            .unwrap_or("")
+            .contains("no way to read a window"),
+        "expected an unsupported-backend status, got {:?}",
+        d.app.status_msg
+    );
+    d.press(KeyCode::Char('?'));
+    let help = d.render();
+    assert!(!help.contains("refresh preview now"), "{help}");
+    assert!(!help.contains("scroll preview up"), "{help}");
+    // The panel toggle stays: the placeholder is worth reading once, and worth
+    // reclaiming the rows from afterwards.
+    assert!(help.contains("toggle preview panel"), "{help}");
+}
+
 /// The capture gate is the *last* resort: a foreign, detached or unbound row
 /// has a more specific thing to say, and those must keep saying it.
 #[test]
