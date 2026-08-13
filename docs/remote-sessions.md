@@ -790,6 +790,11 @@ through the identical path.
   dashboard. `Enter` on an already-bound row just focuses.
 - **STEAL** (`Space s`): the same attach with `force`, behind a y/N confirm —
   skipped entirely when the host's attached-bit overlay says nobody is there.
+- **ATTACH ALL** (`Space A`): the same attach, run over every detached row the
+  attached-bit overlay reports free — the manual form of the auto-reattach
+  below, and focus-less for the same reason. Held rows are skipped, never
+  stolen: a steal takes someone else's terminal away, so it stays a per-session
+  decision behind its own confirm.
 - **AUTO-REATTACH**: on a host's `Disconnected → Connected` edge (tracked by
   the backend's reconnect epoch), every remembered `(host, pool_session)`
   without a live window gets its attach window respawned into the current
@@ -1063,6 +1068,11 @@ decides what they mean**.
 - **`Space s` steal** — attach, kicking whatever client holds the session,
   behind a y/N confirm. Skipped when the host's attached-bit overlay says the
   session is free. Hidden from `?` when no host pools its sessions.
+- **`Space A` attach-all** — one window per free detached row, no confirm: it
+  only opens windows onto sessions already running, `D` puts any of them back,
+  and it is what the reconnect sweep does unprompted. Held rows are skipped and
+  counted in the status, so a partial batch doesn't read as a whole one. Hidden
+  from `?` alongside the steal.
 - **`w` work tab** — `shell_plan` decides: an in-process shell for this
   machine, an `ssh -t <host>` tab that cds into the session's cwd for a remote.
 - **Fork and restart** work on any host.

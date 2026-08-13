@@ -1642,6 +1642,7 @@ impl App {
         if self.backends.iter().any(|b| b.capabilities().pooled) {
             lines.push(cmd(Command::DetachRemote));
             lines.push(cmd(Command::StealAttach));
+            lines.push(cmd(Command::AttachAll));
         }
         // zellij can't reparent a pane across tabs; drop the hint rather than
         // list a key that only errors.

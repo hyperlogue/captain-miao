@@ -161,6 +161,12 @@ pub(super) enum Action {
         /// time, so attaching otherwise declines rather than kicking someone.
         force: bool,
     },
+    /// Attach a local window to each `(host, pool_session)` in turn — the
+    /// dashboard pre-filters the list to detached sessions nobody else holds,
+    /// so every one of these is a plain, non-stealing attach.
+    AttachAll {
+        targets: Vec<(HostId, String)>,
+    },
     /// Allow a host's connection task to download a published `miao-server`.
     ///
     /// The only action that carries a reply channel, because it answers a
@@ -225,6 +231,7 @@ impl Action {
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
+            Action::AttachAll { .. } => "AttachAll",
             Action::GrantConsent(_) => "GrantConsent",
         }
     }
@@ -3706,6 +3713,58 @@ impl App {
         } else {
             format::Detached::Free
         })
+    }
+
+    /// Every detached pooled session that is free to take, as the
+    /// `(host, pool_session)` pairs an attach needs. The manual half of the
+    /// reconnect sweep's work list, and deliberately built from the same
+    /// `detached_kind` the rows are drawn from: what the list attaches is
+    /// exactly what the table marks as detached-and-free.
+    ///
+    /// Filtered on the whole session set rather than the visible one — a search
+    /// filter narrows what you're *looking at*, not what "all" means (`Space E`
+    /// restart-all reads the same way).
+    pub(super) fn attach_all_targets(&self) -> Vec<(HostId, String)> {
+        self.sessions
+            .iter()
+            .filter(|s| self.detached_kind(s) == Some(format::Detached::Free))
+            .filter_map(|s| Some((s.host.clone(), s.pool_session.clone()?)))
+            .collect()
+    }
+
+    /// `Space A`: attach a window to every free detached session at once.
+    ///
+    /// Held-elsewhere rows are skipped rather than stolen — a steal takes
+    /// someone else's terminal away, which stays a per-session decision behind
+    /// its own confirm (§10.2). Saying how many were skipped keeps that from
+    /// reading as a silent partial job.
+    ///
+    /// No confirm of its own: this only opens windows for sessions already
+    /// running, `D` puts any of them back, and it is the same thing the
+    /// reconnect sweep does unprompted.
+    pub(super) fn request_attach_all(&mut self) -> Option<Action> {
+        let targets = self.attach_all_targets();
+        if targets.is_empty() {
+            let held = self
+                .sessions
+                .iter()
+                .filter(|s| self.detached_kind(s) == Some(format::Detached::HeldElsewhere))
+                .count();
+            let msg = match (held, self.keymap.primary_key(keymap::Command::StealAttach)) {
+                (0, _) => "Nothing to attach — every session already has a window here".to_string(),
+                (n, Some(key)) => format!(
+                    "{n} detached {} attached in another terminal — {key} steals one",
+                    plural_sessions(n),
+                ),
+                (n, None) => format!(
+                    "{n} detached {} attached in another terminal",
+                    plural_sessions(n),
+                ),
+            };
+            self.set_status(msg, false);
+            return None;
+        }
+        Some(Action::AttachAll { targets })
     }
 
     /// What the preview panel says when it has no captured text.

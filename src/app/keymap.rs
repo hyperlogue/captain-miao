@@ -260,6 +260,11 @@ pub(super) enum Command {
     /// holds it. Behind a y/N confirm: the pool is one client at a time, so this
     /// takes someone else's terminal away (§10.2).
     StealAttach,
+    /// Attach a window to every detached pooled session that is free to take —
+    /// the manual form of the reconnect sweep. Rows another client holds are
+    /// skipped rather than stolen: a steal is a per-session decision (§10.2),
+    /// and one keypress must not kick a roomful of terminals.
+    AttachAll,
 }
 
 impl Command {
@@ -300,6 +305,7 @@ impl Command {
             Command::DefaultAgent => "default_agent",
             Command::DefaultHost => "default_host",
             Command::StealAttach => "steal_attach",
+            Command::AttachAll => "attach_all",
             Command::SessionsLayout => "sessions_layout",
             Command::ManageHosts => "manage_hosts",
         }
@@ -346,6 +352,7 @@ impl Command {
             Command::DefaultAgent => "set default new-session backend (Claude/Codex)",
             Command::DefaultHost => "set default host for new sessions",
             Command::StealAttach => "attach, kicking the client already attached",
+            Command::AttachAll => "attach every free detached session",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
         }
@@ -388,6 +395,7 @@ impl Command {
             Command::DefaultAgent => "agent",
             Command::DefaultHost => "host",
             Command::StealAttach => "steal",
+            Command::AttachAll => "attach all",
             Command::SessionsLayout => "layout",
             Command::ManageHosts => "hosts",
         }
@@ -433,6 +441,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::DefaultAgent,       &["space a"]),
     (Command::DefaultHost,        &["space H"]),
     (Command::StealAttach,        &["space s"]),
+    (Command::AttachAll,          &["space A"]),
     (Command::SessionsLayout,     &["space l"]),
     (Command::ManageHosts,        &["space h"]),
 ];

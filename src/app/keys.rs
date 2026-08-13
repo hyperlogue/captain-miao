@@ -520,6 +520,7 @@ impl App {
                 self.input_mode = InputMode::Confirm;
                 None
             }
+            Command::AttachAll => self.request_attach_all(),
             Command::SessionsLayout => {
                 // On a backend with no shared-tab arrangement (tmux) both layouts
                 // spawn a tab per session, so the toggle would only flip a label.

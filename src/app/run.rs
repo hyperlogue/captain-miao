@@ -778,13 +778,17 @@ async fn launch_agent(
 /// spawn is `take_focus: false` on both backends (the spawn itself must not yank
 /// the client mid-creation), so the raise is an explicit `focus_window` after the
 /// binding is recorded — the same call `Enter` on an already-attached row makes.
+///
+/// Returns whether a window was actually attached and bound, so a caller
+/// attaching a whole batch (`Space A`) can report how much of it landed. The
+/// single-attach callers ignore it: the status line already said what happened.
 async fn attach_pool_session(
     app: &mut App,
     host: HostId,
     pool_session: String,
     force: bool,
     focus: bool,
-) {
+) -> bool {
     // Resolve the plan before the match so the backend borrow ends before `app`
     // is touched again.
     let plan = app
@@ -795,7 +799,7 @@ async fn attach_pool_session(
         Ok(crate::backend::AttachPlan { argv }) => argv,
         Err(e) => {
             app.set_status(format!("Cannot attach: {e}"), true);
-            return;
+            return false;
         }
     };
     // Wrap the attach so the window reports its own end (§5) and holds itself
@@ -847,10 +851,17 @@ async fn attach_pool_session(
                 }
                 // Selects the row once it comes back carrying this window.
                 app.pending_focus_window = Some((id, Instant::now()));
+                true
             }
-            None => app.set_status("Attach failed: no window id".to_string(), true),
+            None => {
+                app.set_status("Attach failed: no window id".to_string(), true);
+                false
+            }
         },
-        Err(e) => app.set_status(format!("Attach failed: {e}"), true),
+        Err(e) => {
+            app.set_status(format!("Attach failed: {e}"), true);
+            false
+        }
     }
 }
 
@@ -907,6 +918,37 @@ async fn reattach_session(app: &mut App, host: HostId, pool_session: String) {
     let previously_focused = app.pending_focus_window.clone();
     attach_pool_session(app, host, pool_session, false, false).await;
     app.pending_focus_window = previously_focused;
+}
+
+/// Attach a window to every session in `targets` — the `Space A` batch. Each is
+/// a plain attach: the dashboard filtered the list to sessions nobody else
+/// holds, so nothing here can kick another client.
+///
+/// Focus is deliberately not taken. Restoring a dozen sessions must not fight
+/// the user for the cursor a dozen times, and the selection stays where the
+/// keypress left it (each attach would otherwise queue its own
+/// `pending_focus_window` and the last window to come up would win the cursor).
+/// Returns `(attached, total)`.
+async fn attach_all(
+    app: &mut App,
+    targets: Vec<(HostId, String)>,
+    terminal: &mut DefaultTerminal,
+) -> Result<(usize, usize)> {
+    let previously_focused = app.pending_focus_window.clone();
+    let total = targets.len();
+    let mut ok = 0usize;
+    for (host, pool_session) in targets {
+        // Name the session being attached in the overlay, so a long batch shows
+        // progress rather than one frozen frame for the whole run.
+        app.attaching = Some(pool_session.clone());
+        terminal.draw(|frame| app.draw(frame))?;
+        if attach_pool_session(app, host, pool_session, false, false).await {
+            ok += 1;
+        }
+    }
+    app.attaching = None;
+    app.pending_focus_window = previously_focused;
+    Ok((ok, total))
 }
 
 /// How long an action that races a launcher's own state-file write (kill,
@@ -1948,6 +1990,15 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     } => {
                         attach_pool_session(&mut app, host, pool_session, force, true).await;
                         app.attaching = None;
+                    }
+                    Action::AttachAll { targets } => {
+                        let (ok, total) = attach_all(&mut app, targets, terminal).await?;
+                        let msg = if ok == total {
+                            format!("Attached to {ok} {}", super::plural_sessions(ok))
+                        } else {
+                            format!("Attached to {ok}/{total} sessions")
+                        };
+                        app.set_status(msg, ok != total);
                     }
                     Action::RestartAll { sessions } => {
                         let total = sessions.len();

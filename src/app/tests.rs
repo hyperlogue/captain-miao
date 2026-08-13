@@ -3922,6 +3922,67 @@ fn enter_on_a_row_another_client_holds_offers_the_steal() {
     }
 }
 
+/// `Space A` takes every detached session it *can* take: the free ones. A row
+/// another client holds is skipped rather than stolen — one keypress must not
+/// kick a roomful of terminals — and a row that already has a window here has
+/// nothing to attach. The unknown-bit row rides with the free ones, matching how
+/// `Enter` treats it: attach, and let the pool refuse if it must.
+#[test]
+fn attach_all_takes_the_free_detached_rows_and_leaves_the_held_ones() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+
+    let mut free = session(1, "/srv/free", SessionStatus::Idle);
+    free.host = HostId("box".into());
+    free.pool_session = Some("cm-free".into());
+    free.attached = Some(false);
+    let mut unknown = session(2, "/srv/unknown", SessionStatus::Idle);
+    unknown.host = HostId("box".into());
+    unknown.pool_session = Some("cm-unknown".into());
+    unknown.attached = None;
+    let mut held = session(3, "/srv/held", SessionStatus::Idle);
+    held.host = HostId("box".into());
+    held.pool_session = Some("cm-held".into());
+    held.attached = Some(true);
+    // A local row with a window: nothing detached about it.
+    let here = session(4, "/home/miao/here", SessionStatus::Idle);
+    d.set_sessions(vec![free, unknown, held.clone(), here]);
+
+    // Reached through the real binding, so the default key is under test too.
+    assert!(d.press(KeyCode::Char(' ')).is_none(), "leader is pending");
+    let action = d
+        .press(KeyCode::Char('A'))
+        .expect("Space A produces a batch");
+    let Action::AttachAll { targets } = action else {
+        panic!("expected AttachAll, got {action:?}");
+    };
+    let names: Vec<&str> = targets.iter().map(|(_, s)| s.as_str()).collect();
+    assert_eq!(names, vec!["cm-free", "cm-unknown"]);
+    assert!(
+        targets.iter().all(|(h, _)| h.0 == "box"),
+        "each target carries its own host"
+    );
+
+    // Only held rows left: nothing to do, and the status points at the steal
+    // instead of silently reporting success.
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![held]);
+    assert!(d.app.request_attach_all().is_none());
+    let status = d.app.status_msg.clone().expect("a status is set");
+    assert!(status.contains("another terminal"), "{status}");
+    assert!(
+        status.contains("Space s"),
+        "names the live steal key: {status}"
+    );
+
+    // Nothing detached at all reads differently again.
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![session(5, "/home/miao/here", SessionStatus::Idle)]);
+    assert!(d.app.request_attach_all().is_none());
+    let status = d.app.status_msg.clone().expect("a status is set");
+    assert!(status.contains("Nothing to attach"), "{status}");
+}
+
 /// A terminfo that isn't this terminal's earns a warning under the value naming
 /// what this terminal is — the name to install on the host, which is the remedy
 /// however the difference arose. It must not fire when they agree, or on a row

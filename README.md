@@ -166,6 +166,7 @@ Press `?` in the dashboard for the complete list. Highlights:
 | `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
 | `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, which has only the one) |
 | `Space h` / `Space s`          | Hosts panel (add, edit, port forwards, suspend with `c`, connection log with `l`) / attach to a session, kicking the client holding it |
+| `Space A`                      | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen) |
 | `?`                            | Show the full key list (help overlay)                                  |
 | `/`                            | Search                                                                 |
 | `q` / `Ctrl-c`                 | Quit                                                                   |
