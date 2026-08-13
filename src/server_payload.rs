@@ -247,15 +247,17 @@ fn digest_of(path: &std::path::Path) -> std::io::Result<String> {
 pub(crate) fn resolve_candidates(uname_sm: &str) -> Vec<Candidate> {
     let mut out = Vec::new();
     for target in target_candidates(uname_sm) {
-        if let Some(c) = resolve_one(target) {
+        if let Some(c) = resolve_target(target) {
             out.push(c);
         }
     }
     out
 }
 
-/// The chain for a single target. Separated so the ordering is readable.
-fn resolve_one(target: &str) -> Option<Candidate> {
+/// The chain for a single target. Separated so the ordering is readable, and
+/// reachable on its own because the hosts-panel upgrade already knows which
+/// target it is deploying — it has no `uname` to re-derive one from.
+pub(crate) fn resolve_target(target: &str) -> Option<Candidate> {
     let from_file = |path: std::path::PathBuf, source: PayloadSource| -> Option<Candidate> {
         if !path.is_file() {
             // Say so for a variable the user *set*: silently falling through to

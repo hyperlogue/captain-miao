@@ -1644,7 +1644,7 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// until it exits. Knowing *which* binary answered is what lets `UseRunning`
 /// name an exe: the running daemon's own path is not otherwise observable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunningDaemon {
+pub(crate) enum RunningDaemon {
     /// A daemon is up, and `miao-server` on PATH reported it.
     OnPath,
     /// A daemon is up, and the deployed cache-path binary reported it.
@@ -2101,6 +2101,10 @@ pub(crate) struct UpgradeOffer {
     pub(crate) sha256: String,
     /// The version we carry, to name beside the one the host is running.
     pub(crate) version: String,
+    /// Which binary is serving the daemon we would have to stop. Carried here
+    /// because the upgrade runs with the backend already torn down, and it is
+    /// what decides how the script spells `daemon stop`.
+    pub(crate) running: RunningDaemon,
 }
 
 /// The [`UpgradeOffer`] for a host whose daemon is already up: what
@@ -2128,6 +2132,7 @@ fn upgrade_offer_for(
             target,
             sha256,
             version: local_version.to_string(),
+            running: probe.running?,
         }),
         _ => None,
     }
@@ -2348,19 +2353,74 @@ impl UploadGate {
 /// behind, which costs some cache-directory space until the next attempt and
 /// buys a script that runs everywhere. Pure, so all of this is unit-tested.
 fn upload_script(sha256: &str, target: &str) -> String {
+    format!(
+        "set -e; {}; {}",
+        stage_steps(),
+        publish_steps(sha256, target)
+    )
+}
+
+/// Everything up to and including the host's verdict: stream the binary into a
+/// temp file, make it executable, run it, and refuse a version that isn't ours.
+/// Leaves `$t` naming the verified file and **nothing** at the published path.
+///
+/// Split out from [`publish_steps`] so the two halves can be separated by
+/// something else — see [`upgrade_script`], where what goes between them is
+/// stopping the host's daemon. On its own this half is inert: it can be run
+/// against a host in any state without disturbing it.
+fn stage_steps() -> String {
     let version = env!("CARGO_PKG_VERSION");
     format!(
-        "set -e; \
-         t=\"$HOME/{REMOTE_INCOMING_REL}\"; \
+        "t=\"$HOME/{REMOTE_INCOMING_REL}\"; \
          mkdir -p \"$HOME/{REMOTE_BIN_DIR_REL}\"; \
          rm -f \"$t\"; \
          cat > \"$t\"; \
          chmod 0755 \"$t\"; \
          out=$(\"$t\" self-check); \
          echo \"$out\"; \
-         echo \"$out\" | grep -q \"{SERVER_BIN} {version} \"; \
-         mv -f \"$t\" \"$HOME/{REMOTE_CACHE_REL}\"; \
+         echo \"$out\" | grep -q \"{SERVER_BIN} {version} \""
+    )
+}
+
+/// Publish what [`stage_steps`] verified, and record which build it was.
+/// Assumes `$t` is set and the marker is written *after* the `mv`, so a crash
+/// between them leaves a good binary described by a stale marker (the next probe
+/// re-deploys) rather than a stale binary described by a good one.
+fn publish_steps(sha256: &str, target: &str) -> String {
+    format!(
+        "mv -f \"$t\" \"$HOME/{REMOTE_CACHE_REL}\"; \
          echo {sha256} {target} > \"$HOME/{REMOTE_MARKER_REL}\""
+    )
+}
+
+/// The hosts-panel upgrade, as one `set -e` script: stage, verify, **stop the
+/// daemon**, publish.
+///
+/// The ordering is the whole feature. Everything destructive sits downstream of
+/// the host's own `self-check`, so a wrong-ABI payload, a truncated transfer or
+/// a stale build costs a transfer and nothing else — the daemon is still
+/// serving and its pooled sessions are untouched. `set -e` is what enforces
+/// that; there is no arm here that reaches the stop on a failed verify.
+///
+/// The publish is downstream of the *stop* for a second, less obvious reason:
+/// `mv`-ing onto a live daemon's own path leaves its `/proc/<pid>/exe` reading
+/// `(deleted)`, and the launcher argv it bakes into new reservations comes from
+/// `current_exe()` — so a session opened in that window would carry a path that
+/// cannot be executed. Stopping first makes that unreachable rather than
+/// unlikely.
+///
+/// `stop_exe` is spelled `$HOME`-relative rather than passed as a resolved path:
+/// this string is wrapped by [`login_shell_safe`], which forbids a single quote
+/// anywhere in it, and a home directory is not ours to make promises about.
+fn upgrade_script(sha256: &str, target: &str, running: RunningDaemon) -> String {
+    let stop_exe = match running {
+        RunningDaemon::OnPath => SERVER_BIN.to_string(),
+        RunningDaemon::InCache => format!("\"$HOME/{REMOTE_CACHE_REL}\""),
+    };
+    format!(
+        "set -e; {}; {stop_exe} daemon stop --force; {}",
+        stage_steps(),
+        publish_steps(sha256, target)
     )
 }
 
@@ -2641,6 +2701,43 @@ fn terminfo_took(stdout: &str) -> bool {
     stdout.lines().any(|l| l.trim() == TIC_OK_MARK)
 }
 
+/// Upgrade a host that is already running a daemon: stage our server there,
+/// let the host verify it, then stop the daemon and publish — [`upgrade_script`]
+/// with the payload on its stdin.
+///
+/// **The caller must have taken this host's backend down first.** The reconnect
+/// backoff floors at 500ms, so a redial landing between the stop and the `mv`
+/// would run `daemon ensure` against the *old* binary still at the cache path
+/// and resurrect it — after which the probe reports `UseRunning` on the old
+/// version and every session was killed for nothing. Suspending the host is what
+/// makes that window not exist; it is also what lets the fresh dial afterwards
+/// find exactly our digest and resolve straight to `UseCache`.
+///
+/// The digest sent is the one resolved *now*, not the one the offer was minted
+/// with: a rebuild between the two is the dev loop, and the marker has to
+/// describe what actually landed.
+pub(crate) async fn upgrade_host_server(
+    target: &str,
+    options: &[String],
+    offer: &UpgradeOffer,
+) -> Result<(), String> {
+    let payload = crate::server_payload::resolve_target(&offer.target).ok_or_else(|| {
+        format!(
+            "no {} server to deploy any more — the payload this offer named is gone",
+            offer.target
+        )
+    })?;
+    let (extra, _forwards) = split_connection_options(options);
+    let opts = ssh_common_opts(&crate::state::ssh_control_path(target), &extra);
+    upload_server(
+        target,
+        &opts,
+        &payload,
+        &upgrade_script(&payload.sha256, &payload.target, offer.running),
+    )
+    .await
+}
+
 /// Stream an embedded server payload to the host's cache path over the ssh
 /// connection the probe already opened (so it costs no extra authentication —
 /// the ControlMaster is up by now).
@@ -2656,6 +2753,7 @@ async fn upload_server(
     target: &str,
     opts: &[String],
     payload: &crate::server_payload::Candidate,
+    script: &str,
 ) -> Result<(), String> {
     let bytes = payload
         .bytes()
@@ -2678,10 +2776,7 @@ async fn upload_server(
     let mut child = Command::new("ssh")
         .args(opts)
         .arg(target)
-        .arg(login_shell_safe(&upload_script(
-            &payload.sha256,
-            &payload.target,
-        )))
+        .arg(login_shell_safe(script))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3118,7 +3213,14 @@ async fn resolve_remote_exe(
             }
             None => {
                 log.info(format!("deploying {t} from {}", payload.source.label()));
-                match upload_server(target, opts, payload).await {
+                match upload_server(
+                    target,
+                    opts,
+                    payload,
+                    &upload_script(sha256, &payload.target),
+                )
+                .await
+                {
                     Ok(()) => None,
                     Err(e) => {
                         tracing::warn!(target: "captain_miao::provision", "{target}: deploy of {t} failed: {e}");
@@ -4609,6 +4711,7 @@ mod tests {
                 target: PAYLOAD.0.to_string(),
                 sha256: PAYLOAD.1.to_string(),
                 version: "0.1.0".to_string(),
+                running: RunningDaemon::InCache,
             })
         );
 
@@ -5224,6 +5327,47 @@ mod tests {
         // `CONSENT` is a process-wide OnceLock the TUI sets at startup; this
         // test binary never does.
         assert!(!ask_consent("may I?".to_string()).await);
+    }
+
+    /// The upgrade's whole safety argument, as an ordering: nothing that ends a
+    /// session happens before the host has run the binary and agreed it is ours.
+    #[test]
+    fn the_upgrade_script_verifies_before_it_stops_anything() {
+        let script = upgrade_script("d1g3st", "x86_64-unknown-linux-gnu", RunningDaemon::InCache);
+        let stage = script.find("cat > ").unwrap();
+        let verify = script.find("self-check").unwrap();
+        let version_check = script.find("grep -q").unwrap();
+        let stop = script.find("daemon stop --force").unwrap();
+        let publish = script.find("mv -f").unwrap();
+        let marker = script.find("miao-server.sha256").unwrap();
+        assert!(stage < verify, "{script}");
+        // The two that matter: a payload the host refuses must cost a transfer
+        // and nothing else, so both the run and the version check precede the
+        // stop — and `set -e` is what turns "precede" into "gate".
+        assert!(verify < stop, "{script}");
+        assert!(version_check < stop, "{script}");
+        // And the publish follows the stop, so no live daemon ever has its own
+        // executable replaced under it.
+        assert!(stop < publish, "{script}");
+        assert!(publish < marker, "{script}");
+        assert!(script.starts_with("set -e;"), "{script}");
+
+        // Which binary stops depends on which one answered the probe; a cache
+        // deploy is named `$HOME`-relative because the script is single-quoted
+        // whole and a home directory is not ours to make promises about.
+        assert!(script.contains("\"$HOME/.cache/captain-miao/bin/miao-server\" daemon stop"));
+        let on_path = upgrade_script("d1g3st", "x86_64-unknown-linux-gnu", RunningDaemon::OnPath);
+        assert!(
+            on_path.contains("miao-server daemon stop --force"),
+            "{on_path}"
+        );
+        assert!(!on_path.contains("$HOME/.cache/captain-miao/bin/miao-server\" daemon stop"));
+
+        // Same `login_shell_safe` constraints as the deploy it shares steps with.
+        for s in [&script, &on_path] {
+            assert!(!s.contains('\''), "no single quote: {s}");
+            assert!(!s.contains('\\'), "no backslash: {s}");
+        }
     }
 
     #[test]

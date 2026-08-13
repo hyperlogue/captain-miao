@@ -167,6 +167,12 @@ pub(super) enum Action {
     AttachAll {
         targets: Vec<(HostId, String)>,
     },
+    /// Deploy this dashboard's server to `host` and restart its daemon, then
+    /// resume everything the restart killed. Raised by `u` in the hosts panel,
+    /// past both its gate and its confirm.
+    UpgradeHost {
+        host: HostId,
+    },
     /// Allow a host's connection task to download a published `miao-server`.
     ///
     /// The only action that carries a reply channel, because it answers a
@@ -232,6 +238,7 @@ impl Action {
             Action::CopySessionId(_) => "CopySessionId",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
             Action::AttachAll { .. } => "AttachAll",
+            Action::UpgradeHost { .. } => "UpgradeHost",
             Action::GrantConsent(_) => "GrantConsent",
         }
     }
@@ -524,10 +531,56 @@ pub(super) struct HostEditState {
     /// The row a `d` press is asking about — the removal confirm (§9). `None`
     /// when nothing is pending.
     pub(in crate::app) pending_remove: Option<usize>,
+    /// What a `u` press put on screen — a question to answer, or a refusal to
+    /// acknowledge. Kept beside `pending_remove` rather than folded into the
+    /// global [`PendingConfirm`] because that one switches `InputMode`, which
+    /// would tear this panel down mid-question.
+    pub(in crate::app) pending_upgrade: Option<UpgradePrompt>,
     /// The connection log open over the list (`l`). `Some` replaces the list
     /// view entirely — it wants the whole popup, since the text it exists to
     /// show is what didn't fit on a row.
     pub(in crate::app) log_view: Option<HostLogView>,
+}
+
+/// One session an upgrade will kill, recorded so it can be brought back on the
+/// other side of the restart.
+///
+/// A resume, not a re-launch: the agent's transcript on the host outlives the
+/// pool session dying, so the restored row continues the same conversation. The
+/// `SessionKey`, the pid and the pool name are all newly minted — only
+/// `session_id` crosses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RestoreSpec {
+    pub(super) agent: AgentControl,
+    /// Host-canonical (`~`-collapsed), exactly as it arrived and exactly as
+    /// [`OpenSpec`](cm_core::backend::OpenSpec) wants it back.
+    pub(super) cwd: String,
+    pub(super) session_id: String,
+}
+
+/// The outcome of one host's upgrade, delivered back to the run loop from the
+/// background ssh that performed it.
+#[derive(Debug)]
+pub(super) struct UpgradeReport {
+    pub(super) host: HostId,
+    /// `None` on success. On failure this is what the host said, and the host
+    /// comes back up on whatever it was already running.
+    pub(super) error: Option<String>,
+}
+
+/// The line a `u` press leaves in the hosts panel.
+///
+/// One type for both outcomes because they render identically and are dismissed
+/// identically; only `actionable` decides whether `y` does anything. Keeping the
+/// refusal on screen matters — this panel has no status line (its footer is key
+/// hints), so a message set anywhere else would surface stale, after the panel
+/// closed, or not at all.
+#[derive(Debug)]
+pub(super) struct UpgradePrompt {
+    pub(in crate::app) row: usize,
+    pub(in crate::app) text: String,
+    /// `false` for a refusal: any key dismisses it and nothing happens.
+    pub(in crate::app) actionable: bool,
 }
 
 /// One rendered line of a host's connection log — see [`App::host_log_lines`].
@@ -735,6 +788,17 @@ pub(super) struct App {
     pub(super) resume_loads: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
     pub(super) resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
     pub(super) resume_seq: u64,
+    /// Hosts held down for the duration of a server upgrade: no backend, no
+    /// connection task, no redial. Deliberately **not** the persisted `disabled`
+    /// flag — a dashboard that dies mid-upgrade must not leave a host suspended
+    /// in the user's config file.
+    pub(super) upgrading: HashSet<HostId>,
+    /// What each upgrading host owed its user: the sessions it killed, waiting
+    /// for that host to come back so they can be resumed. Held until the
+    /// reconnect edge fires, or until the upgrade reports a failure.
+    pub(super) upgrade_restores: HashMap<HostId, Vec<RestoreSpec>>,
+    pub(super) upgrade_reports: tokio::sync::mpsc::UnboundedReceiver<UpgradeReport>,
+    pub(super) upgrade_tx: tokio::sync::mpsc::UnboundedSender<UpgradeReport>,
     /// Kills coming back from the round trip that carried them, for the same
     /// reason the resume list does: a remote `KillSession` is an ssh round trip,
     /// and running it on the UI thread meant `x` froze the dashboard until the
@@ -1351,6 +1415,7 @@ impl App {
         let (consent_tx, consent_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::backend::set_consent_channel(consent_tx);
         let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
@@ -1366,7 +1431,7 @@ impl App {
         let HostSetup {
             mut backends,
             host_icons,
-        } = Self::build_backends_from_config();
+        } = Self::build_backends_from_config(&HashSet::new());
         // Every backend reports its own changes now (§5), so the run loop needs
         // no filesystem watcher of its own; subscribe once, here.
         let backend_events = backends.iter_mut().map(Backend::subscribe).collect();
@@ -1406,6 +1471,10 @@ impl App {
             consent_prompts: consent_rx,
             resume_loads: resume_rx,
             resume_tx,
+            upgrading: HashSet::new(),
+            upgrade_restores: HashMap::new(),
+            upgrade_reports: upgrade_rx,
+            upgrade_tx,
             kill_results: kill_rx,
             kill_tx,
             resume_seq: 0,
@@ -2165,7 +2234,7 @@ impl App {
     /// backend: `hosts.json` is never read, so no remote connection task is ever
     /// spawned and every row is local. Pooled-localhost is deliberately *not*
     /// gated by it — it uses no ssh and is opt-in by its own config flag.
-    fn build_backends_from_config() -> HostSetup {
+    fn build_backends_from_config(suspended: &HashSet<HostId>) -> HostSetup {
         let mut host_icons: HashMap<HostId, String> = HashMap::new();
         let mut backends = vec![Self::this_machine_backend()];
         if !REMOTE_ENABLED {
@@ -2190,6 +2259,13 @@ impl App {
             // nothing in the header tally to explain. `c` in the panel brings it
             // back — which is the whole point of not making the user delete it.
             if h.disabled {
+                continue;
+            }
+            // Held down for an upgrade. Same treatment as `disabled` — the row
+            // stays, reads "not connected", and gets no connection task — but
+            // from memory rather than from the config file, so a dashboard that
+            // dies here leaves nothing behind to un-suspend.
+            if suspended.contains(&host) {
                 continue;
             }
             if let Some(sock) = h.socket {
@@ -2251,7 +2327,7 @@ impl App {
         let HostSetup {
             mut backends,
             host_icons,
-        } = Self::build_backends_from_config();
+        } = Self::build_backends_from_config(&self.upgrading);
         self.backend_events = backends.iter_mut().map(Backend::subscribe).collect();
         self.backends = backends;
         self.host_icons = host_icons;
@@ -2281,6 +2357,7 @@ impl App {
             editing: false,
             focus: HostField::Label,
             pending_remove: None,
+            pending_upgrade: None,
             log_view: None,
             rows,
         });
@@ -3730,6 +3807,108 @@ impl App {
             .filter(|s| self.detached_kind(s) == Some(format::Detached::Free))
             .filter_map(|s| Some((s.host.clone(), s.pool_session.clone()?)))
             .collect()
+    }
+
+    /// Why this host's server cannot be upgraded right now, phrased for the
+    /// panel — `None` when it can.
+    ///
+    /// Two refusals, and they are the same rule seen from two sides: an upgrade
+    /// ends every session on the host and brings each one back as a window
+    /// *here*. A session that isn't resting would lose work to that, and a
+    /// session another terminal is attached to would be taken from whoever is
+    /// using it rather than restored to them.
+    ///
+    /// "Resting" is the restart-all whitelist (`Idle | Compacted`), deliberately
+    /// not [`SessionStatus::is_busy`] — `Starting`, `WaitingForApproval` and
+    /// `ReviewPending` all read as at-rest by that narrower test, and all three
+    /// are states you would hate to have silently restarted.
+    pub(super) fn upgrade_blocker(&self, host: &HostId) -> Option<String> {
+        let mine: Vec<&LauncherState> = self.sessions.iter().filter(|s| &s.host == host).collect();
+        let busy = mine
+            .iter()
+            .filter(|s| !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted))
+            .count();
+        if busy > 0 {
+            return Some(format!("{busy} {} not idle", plural_sessions(busy)));
+        }
+        let held = mine
+            .iter()
+            .filter(|s| self.detached_kind(s) == Some(format::Detached::HeldElsewhere))
+            .count();
+        if held > 0 {
+            return Some(format!(
+                "{held} {} attached in another terminal",
+                plural_sessions(held)
+            ));
+        }
+        None
+    }
+
+    /// Everything an upgrade of `host` will kill, in the form that brings it
+    /// back. Snapshotted **before** the host is suspended — taking the backend
+    /// down clears its mirror, and these rows are the only record of what was
+    /// there.
+    ///
+    /// A session with no `session_id` yet is dropped rather than restored: there
+    /// is nothing to resume it *to*. The gate already refuses such a host (a
+    /// session that young is `Starting`, which is not idle), so this is a belt.
+    pub(super) fn upgrade_restore_list(&self, host: &HostId) -> Vec<RestoreSpec> {
+        self.sessions
+            .iter()
+            .filter(|s| &s.host == host)
+            .filter_map(|s| {
+                Some(RestoreSpec {
+                    agent: s.agent,
+                    cwd: s.cwd.clone(),
+                    session_id: s.session_id.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The upgrade offer for the row the hosts panel is sitting on, if any —
+    /// what decides whether `u` is advertised, and the one place the panel's
+    /// cursor is turned into a host.
+    pub(super) fn selected_host_upgrade(&self) -> Option<crate::backend::UpgradeOffer> {
+        let state = self.host_edit.as_ref()?;
+        let host = HostId(state.rows.get(state.cursor)?.label.clone());
+        self.backend_for(&host)
+            .and_then(crate::backend::Backend::upgrade_offer)
+    }
+
+    /// Hosts whose post-upgrade restore can run now: they owe sessions and they
+    /// are connected again.
+    ///
+    /// Connected is a sufficient test here, with no need to inspect the mirror
+    /// first. A restore list only survives a *successful* upgrade, and success
+    /// means the daemon was stopped — so every pooled session this host had is
+    /// gone, and nothing that could be resumed twice is left to race.
+    pub(super) fn hosts_ready_to_restore(&self) -> Vec<HostId> {
+        self.upgrade_restores
+            .keys()
+            .filter(|h| {
+                self.backends
+                    .iter()
+                    .any(|b| &&b.host_id() == h && b.conn_state().is_connected())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Take `host` off the air for the duration of its upgrade: no backend, no
+    /// connection task, no redial into the window where the daemon is stopped
+    /// but the new binary is not yet published.
+    pub(super) fn suspend_for_upgrade(&mut self, host: &HostId) {
+        self.upgrading.insert(host.clone());
+        self.rebuild_remote_backends();
+    }
+
+    /// Put `host` back on the air, whichever way its upgrade went. The fresh
+    /// dial re-probes: on success it finds our digest at the cache path and no
+    /// daemon, so it resolves to `UseCache` and starts one.
+    pub(super) fn resume_after_upgrade(&mut self, host: &HostId) {
+        self.upgrading.remove(host);
+        self.rebuild_remote_backends();
     }
 
     /// `Space A`: attach a window to every free detached session at once.

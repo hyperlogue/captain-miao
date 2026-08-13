@@ -190,6 +190,112 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
     }
 }
 
+/// Begin a host's server upgrade: snapshot what it will cost, take the host off
+/// the air, and hand the ssh to a background task.
+///
+/// The order is the safety property, and it is the same one the remote script
+/// keeps. Here it is about *this* side: the restore list has to be taken before
+/// the suspend, because dropping the backend clears the mirror those rows live
+/// in, and once they are gone there is no record of what the restart ended.
+///
+/// The gate is re-checked rather than trusted from the keystroke — a session can
+/// go from idle to working while the confirm sits on screen, and that is exactly
+/// the session this must not take down.
+fn start_host_upgrade(app: &mut App, host: HostId) {
+    let Some(offer) = app
+        .backend_for(&host)
+        .and_then(crate::backend::Backend::upgrade_offer)
+    else {
+        app.set_status(format!("{} has nothing to upgrade to", host.0), true);
+        return;
+    };
+    if let Some(why) = app.upgrade_blocker(&host) {
+        app.set_status(format!("Cannot upgrade {}: {why}", host.0), true);
+        return;
+    }
+    // Only an ssh host can be upgraded: the probe that minted this offer runs
+    // over ssh, so a socket-transport host never has one — but read the config
+    // rather than assume it, since that is where the target actually lives.
+    let Some(config) = super::hosts::load_hosts()
+        .into_iter()
+        .find(|h| h.label == host.0)
+    else {
+        app.set_status(format!("{} is no longer configured", host.0), true);
+        return;
+    };
+    let Some(target) = config.ssh else {
+        app.set_status(
+            format!(
+                "{} is reached over a socket — upgrade its server there",
+                host.0
+            ),
+            true,
+        );
+        return;
+    };
+
+    let restores = app.upgrade_restore_list(&host);
+    let n = restores.len();
+    app.upgrade_restores.insert(host.clone(), restores);
+    app.suspend_for_upgrade(&host);
+
+    let tx = app.upgrade_tx.clone();
+    let options = config.options.clone();
+    let reported = host.clone();
+    let version = offer.version.clone();
+    tokio::spawn(async move {
+        let error = crate::backend::upgrade_host_server(&target, &options, &offer)
+            .await
+            .err();
+        let _ = tx.send(super::UpgradeReport {
+            host: reported,
+            error,
+        });
+    });
+    app.set_status(
+        match n {
+            0 => format!("Upgrading {} to {version}\u{2026}", host.0),
+            n => format!(
+                "Upgrading {} to {version} — {n} {} will be resumed",
+                host.0,
+                super::plural_sessions(n)
+            ),
+        },
+        false,
+    );
+}
+
+/// Put a host back on the air after its upgrade attempt, and decide what became
+/// of the sessions it owed.
+///
+/// **A failure drops the restore list**, and that is a deliberate trade rather
+/// than an oversight. The remote script runs under `set -e` with everything
+/// destructive downstream of the host's own `self-check`, so the overwhelmingly
+/// common failure — a payload the host refuses, a transfer that broke — stopped
+/// nothing and killed nothing, and resuming those sessions would fork every one
+/// of them into a live duplicate. The residual case, a stop that succeeded
+/// followed by a `mv` that didn't, does lose the automatic restore; it is named
+/// in the message, and the sessions are still in the resume picker, because a
+/// killed pool session leaves its transcript on the host untouched.
+fn finish_host_upgrade(app: &mut App, report: super::UpgradeReport) {
+    let host = report.host;
+    match report.error {
+        None => app.set_status(format!("{} upgraded — reconnecting…", host.0), false),
+        Some(e) => {
+            let owed = app.upgrade_restores.remove(&host).unwrap_or_default();
+            let tail = match owed.len() {
+                0 => String::new(),
+                n => format!(
+                    " ({n} {} left as-is; `r` resumes any the restart did end)",
+                    super::plural_sessions(n)
+                ),
+            };
+            app.set_status(format!("Could not upgrade {}: {e}{tail}", host.0), true);
+        }
+    }
+    app.resume_after_upgrade(&host);
+}
+
 /// Fill the open resume picker in from a completed fetch, or say why it's empty.
 ///
 /// A stale reply (the user has since switched hosts) is dropped, as is one that
@@ -1324,6 +1430,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             apply_resume_load(&mut app, load);
             needs_redraw = true;
         }
+        // Upgrades finishing. Whichever way one went the host goes back on the
+        // air — on the new binary if it landed, on the one it was already
+        // running if it didn't.
+        while let Ok(report) = app.upgrade_reports.try_recv() {
+            finish_host_upgrade(&mut app, report);
+            needs_redraw = true;
+        }
         // A host asking whether it may download a server. Only taken while
         // nothing else owns the screen: a question left in the channel simply
         // waits, where popping it here would clobber an open picker or a
@@ -1396,6 +1509,40 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // in `reload_sessions` because it spawns windows.
             for (host, pool_session) in std::mem::take(&mut app.pending_reattach) {
                 reattach_session(&mut app, host, pool_session).await;
+            }
+            // A host back from an upgrade owes its user everything the restart
+            // ended. Resumed, not reattached: the pool session died with the
+            // daemon, so what comes back is a new launcher — new pid, new key,
+            // new pool name — continuing the same transcript. Every one of them
+            // gets a window, including sessions that were detached before, which
+            // is why the gate refuses a host another terminal is attached to.
+            for host in app.hosts_ready_to_restore() {
+                let specs = app.upgrade_restores.remove(&host).unwrap_or_default();
+                let n = specs.len();
+                for spec in specs {
+                    launch_agent(
+                        &mut app,
+                        spec.agent,
+                        &spec.cwd,
+                        Some((spec.session_id.as_str(), false)),
+                        &LAUNCH_COPY_RESUME,
+                        &host,
+                        // As everywhere else on a resume: the agent re-enters
+                        // the session's own worktree.
+                        None,
+                    )
+                    .await;
+                }
+                if n > 0 {
+                    app.set_status(
+                        format!(
+                            "{} upgraded — resumed {n} {}",
+                            host.0,
+                            super::plural_sessions(n)
+                        ),
+                        false,
+                    );
+                }
             }
             // Both consumers below want a terminal snapshot: the tab-cache
             // refresh (a new/moved local window is unresolved) and the remote
@@ -2000,6 +2147,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         };
                         app.set_status(msg, ok != total);
                     }
+                    Action::UpgradeHost { host } => start_host_upgrade(&mut app, host),
                     Action::RestartAll { sessions } => {
                         let total = sessions.len();
                         let mut ok = 0usize;

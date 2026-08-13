@@ -1342,6 +1342,84 @@ fn a_detached_row_draws_dim() {
 }
 
 /// Two rows can both be "no window here" for opposite reasons: free to take, or
+/// The two refusals the server upgrade owes the user, and the one case it lets
+/// through.
+///
+/// Both come from the same fact: the upgrade ends every session on the host and
+/// brings each one back as a window *here*. A session that isn't resting would
+/// lose work to that, and one another terminal holds would be taken from
+/// whoever is using it rather than handed back.
+#[test]
+fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
+    use crate::state::HostId;
+    let host = HostId("box".into());
+    let pooled = |pid: u32, status: SessionStatus, attached: Option<bool>| {
+        let mut s = session(pid, "/srv/work", status);
+        s.host = HostId("box".into());
+        s.pool_session = Some(format!("cm-{pid}"));
+        s.attached = attached;
+        // A pooled row's window binding is keyed on the pool name, not the
+        // launch id a local row carries; leaving that behind is what makes
+        // `detached_kind` see these as detached at all.
+        s.launch_id = None;
+        s.window_id = None;
+        s
+    };
+
+    // Everything idle and nobody else attached: the upgrade may proceed.
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![
+        pooled(1, SessionStatus::Idle, Some(false)),
+        pooled(2, SessionStatus::Compacted, None),
+    ]);
+    assert_eq!(d.app.upgrade_blocker(&host), None);
+    // …and both are on the restore list, detached or not — every session comes
+    // back as a window, which is exactly why a held one is refused below.
+    assert_eq!(d.app.upgrade_restore_list(&host).len(), 2);
+
+    // A session that isn't resting blocks it. Note `WaitingForApproval` is at
+    // rest by `SessionStatus::is_busy`'s narrower test and must still block:
+    // restarting a session sitting on a permission prompt loses the prompt.
+    for status in [
+        SessionStatus::Active,
+        SessionStatus::Starting,
+        SessionStatus::WaitingForApproval,
+        SessionStatus::ReviewPending,
+        SessionStatus::BackgroundServer,
+    ] {
+        let mut d = TestDashboard::new(120, 12);
+        d.set_sessions(vec![
+            pooled(1, SessionStatus::Idle, Some(false)),
+            pooled(2, status.clone(), Some(false)),
+        ]);
+        let why = d
+            .app
+            .upgrade_blocker(&host)
+            .unwrap_or_else(|| panic!("{status:?} must block"));
+        assert!(why.contains("not idle"), "{status:?} said: {why}");
+    }
+
+    // A session another terminal is attached to blocks it too, even idle.
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![
+        pooled(1, SessionStatus::Idle, Some(false)),
+        pooled(2, SessionStatus::Idle, Some(true)),
+    ]);
+    let why = d.app.upgrade_blocker(&host).expect("held row blocks");
+    assert!(why.contains("another terminal"), "{why}");
+
+    // An unreadable attached bit is not evidence of a second client — the same
+    // rule the detached glyph follows.
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![pooled(1, SessionStatus::Idle, None)]);
+    assert_eq!(d.app.upgrade_blocker(&host), None);
+
+    // A host with nothing on it upgrades freely, and owes nothing back.
+    let d = TestDashboard::new(120, 12);
+    assert_eq!(d.app.upgrade_blocker(&host), None);
+    assert!(d.app.upgrade_restore_list(&host).is_empty());
+}
+
 /// held by somebody else's terminal. `Enter` behaves differently on each (the
 /// second needs a steal), so they must not wear the same glyph. The host's
 /// attached-bit overlay is what separates them — and an *unknown* bit (an

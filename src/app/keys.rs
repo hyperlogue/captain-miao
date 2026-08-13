@@ -1009,6 +1009,16 @@ impl App {
             return None;
         }
 
+        // A pending upgrade owns the keyboard until answered — or, when it is a
+        // refusal rather than a question, until acknowledged.
+        if let Some(prompt) = self.host_edit.as_mut()?.pending_upgrade.take() {
+            if prompt.actionable && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                let host = HostId(self.host_edit.as_ref()?.rows.get(prompt.row)?.label.clone());
+                return Some(Action::UpgradeHost { host });
+            }
+            return None;
+        }
+
         // A pending removal owns the keyboard until answered.
         if let Some(idx) = self.host_edit.as_ref()?.pending_remove {
             let state = self.host_edit.as_mut()?;
@@ -1142,6 +1152,42 @@ impl App {
                 // it asks first.
                 KeyCode::Char('d') if state.cursor < n => {
                     state.pending_remove = Some(state.cursor);
+                }
+                // Upgrade the host's server. Offered only where it would land on
+                // something else — the row's `↑` says so, and the footer hint
+                // appears with it — so a press here always has a decision to
+                // report, either the cost or the reason there isn't one.
+                KeyCode::Char('u') if state.cursor < n => {
+                    let row = state.cursor;
+                    let host = HostId(state.rows[row].label.clone());
+                    let offer = self.selected_host_upgrade()?;
+                    let prompt = match self.upgrade_blocker(&host) {
+                        Some(why) => super::UpgradePrompt {
+                            row,
+                            text: format!("  Cannot upgrade \"{}\": {why}", host.0),
+                            actionable: false,
+                        },
+                        None => {
+                            let n = self.host_session_counts(&host).0;
+                            super::UpgradePrompt {
+                                row,
+                                text: format!(
+                                    "  Upgrade \"{}\" to {}? {} [y/N]",
+                                    host.0,
+                                    offer.version,
+                                    match n {
+                                        0 => "The daemon restarts.".to_string(),
+                                        n => format!(
+                                            "{n} idle {} restart with it.",
+                                            super::plural_sessions(n)
+                                        ),
+                                    }
+                                ),
+                                actionable: true,
+                            }
+                        }
+                    };
+                    self.host_edit.as_mut()?.pending_upgrade = Some(prompt);
                 }
                 // The row shows one truncated line of a failure; `l` is where
                 // the whole thing — and the steps before it — is readable.

@@ -648,6 +648,18 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )));
         }
+        // The upgrade's question, or its refusal. Both render here rather than
+        // on a status line the panel doesn't have — a refusal the user never
+        // sees is indistinguishable from a key that does nothing.
+        if let Some(prompt) = &state.pending_upgrade {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                prompt.text.clone(),
+                Style::default()
+                    .fg(config::get().colors.ui.attention_fg)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         frame.render_widget(Paragraph::new(lines), list_area);
 
         // The field form for the row being edited.
@@ -1893,6 +1905,13 @@ impl App {
                     spans.extend(hint_pair("e", "edit"));
                     spans.extend(hint_pair("c", "connect/disconnect"));
                     spans.extend(hint_pair("d", "delete"));
+                    // Shown only on a row that has somewhere to go, which is the
+                    // same condition the row's `↑` marker draws under: a hint
+                    // for a key that would silently do nothing is worse than no
+                    // hint, and every other key here works on every row.
+                    if self.selected_host_upgrade().is_some() {
+                        spans.extend(hint_pair("u", "upgrade server"));
+                    }
                     spans.extend(hint_pair("l", "log"));
                     spans.extend(hint_pair("Esc", "close"));
                     spans
