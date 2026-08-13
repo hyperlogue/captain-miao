@@ -31,7 +31,7 @@ use self::format::{
     contains_ci, format_coarse_age, format_relative_time, random_session_name, workdir_picker_title,
 };
 use self::picker::{Picker, PickerItem};
-use crate::backend::{Backend, BackendEvents, ConnState, RemoteBackend, Transport};
+use crate::backend::{Backend, BackendEvents, ConnState, KillOutcome, RemoteBackend, Transport};
 use crate::config;
 
 /// Whether remote (SSH) host support is compiled in — the `remote` cargo
@@ -331,6 +331,33 @@ pub(super) struct ResumeLoad {
     pub(super) host: HostId,
     pub(super) candidates: Vec<ResumeCandidate>,
     pub(super) errors: Vec<String>,
+}
+
+/// Why a session was killed, which is what decides whether its outcome is worth
+/// saying out loud once it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KillOrigin {
+    /// The user pressed `x`. They are owed an answer, including the one that
+    /// arrives a round trip after the row already left.
+    Asked,
+    /// The window-close policy (`[remote] on_window_close`). Silent by design —
+    /// see `run::close_reported_sessions`, whose doc explains why: the queue is
+    /// filled from a report that can only ever race the session's own end, and
+    /// there is nothing the user could do about a failure anyway. A row coming
+    /// back is its own report.
+    WindowClosed,
+}
+
+/// What became of a kill the dashboard sent, delivered back to the run loop from
+/// the background round trip [`run::start_kill`] kicked off.
+///
+/// [`run::start_kill`]: super::app::run
+#[derive(Debug)]
+pub(super) struct KillResult {
+    pub(super) host: HostId,
+    pub(super) key: state::SessionKey,
+    pub(super) outcome: KillOutcome,
+    pub(super) origin: KillOrigin,
 }
 
 /// Persisted dashboard overrides (pin/needs-input) so they survive restarts.
@@ -702,6 +729,18 @@ pub(super) struct App {
     pub(super) resume_loads: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
     pub(super) resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
     pub(super) resume_seq: u64,
+    /// Kills coming back from the round trip that carried them, for the same
+    /// reason the resume list does: a remote `KillSession` is an ssh round trip,
+    /// and running it on the UI thread meant `x` froze the dashboard until the
+    /// host answered — the whole span in which the row it killed sat there
+    /// looking alive. The row now goes at the keystroke
+    /// (`Backend::presume_killed`) and the answer lands here, where it is either
+    /// nothing to do or grounds to put the row back.
+    ///
+    /// No sequence number, unlike `resume_loads`: each result names the session
+    /// it belongs to, so two kills in flight can't be confused for one another.
+    pub(super) kill_results: tokio::sync::mpsc::UnboundedReceiver<KillResult>,
+    pub(super) kill_tx: tokio::sync::mpsc::UnboundedSender<KillResult>,
     /// Active directory-mark popup. `Some` iff `input_mode == InputMode::DirEdit`.
     pub(super) dir_edit: Option<DirEditState>,
     /// Active hosts popup. `Some` iff `input_mode == InputMode::HostEdit`.
@@ -1306,6 +1345,7 @@ impl App {
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::backend::set_download_consent(download_tx);
         let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
         // Surface config problems the TUI would otherwise hide (it swallows
@@ -1360,6 +1400,8 @@ impl App {
             download_prompts: download_rx,
             resume_loads: resume_rx,
             resume_tx,
+            kill_results: kill_rx,
+            kill_tx,
             resume_seq: 0,
             dir_edit: None,
             host_edit: None,
@@ -3103,9 +3145,16 @@ impl App {
     /// `origin` gates the one destructive thing this does — ending the session
     /// behind a window the user closed (see [`closed_by_the_user`]). A
     /// dashboard-initiated close must therefore **retire the binding before
-    /// closing the window** (`D` does; `x` and restart have already ended the
-    /// session, so their report's kill is a no-op on a corpse). A close-without-
-    /// kill path that skipped the retire would read as the user's.
+    /// closing the window** (`D` does). A close-without-kill path that skipped
+    /// the retire would read as the user's.
+    ///
+    /// `x` and restart don't retire, and don't need to: they close the window
+    /// *because* they are ending that session, so the queued close asks for
+    /// exactly what is already happening. It is not merely harmless but the
+    /// better of the two orderings — since the kill now goes out optimistically
+    /// (`run::start_kill`), the one case where it lands on something still alive
+    /// is a host that never took the first request, and there a second attempt a
+    /// second later is a free retry rather than a duplicate.
     pub(super) fn apply_detach_reports(
         &mut self,
         reports: Vec<state::DetachReport>,

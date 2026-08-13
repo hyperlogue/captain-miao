@@ -503,6 +503,21 @@ different hosts indistinguishable to the app layer: `list_sessions`,
   queue a `PendingRequest` and block on a oneshot (`block_in_place`); against a
   `Disconnected`/`Failed` host they **fail fast** instead of hanging through
   the backoff.
+- **Two round trips don't block the UI thread at all**, because their latency
+  is the thing the user would feel: the resume list (`start_resume_load`, which
+  is why the picker opens empty and fills in) and the kill (`start_kill`). Both
+  run on a pool thread through an `Arc<RemoteBackend>` clone — which is why
+  `Backend::Remote` holds one, a spawned task being unable to borrow the `App`
+  that owns the backend — and deliver their answer back to the run loop over an
+  unbounded channel it drains each tick.
+- **A kill is optimistic**, and `presume_killed`/`unpresume_killed` are the seam
+  for it: `Remote` hides the key from `list_sessions` (a `presumed_dead` set
+  beside the mirror, never a write *to* the mirror — see §7), `Local` no-ops,
+  since its kill is an in-process signal its own watcher reports within the
+  settle. `KillOutcome` is three-valued for the same reason: `AlreadyGone`
+  ("this host has no such live session") and `Unreachable` ("this host never
+  heard you") used to be the same `false`, and only the second is grounds to
+  put the row back.
 - **Open is a plan, not a boolean.** `open_session(OpenSpec{agent, cwd,
   resume?})` returns a `LaunchPlan`: `SpawnLocal{argv}` (the window IS the
   launcher, dashboard mints `--launch-id`) or `AttachRemote{argv,
@@ -782,6 +797,26 @@ through the identical path.
   and SIGTERMs the agent → launcher tears down, removes its state file →
   `Removed` push → row gone. Later the session shows in that host's resumable
   list; resuming is OPEN with `resume: Some(…)`.
+
+  **The row leaves at the keystroke, not at the `Removed`.** That whole chain is
+  an ssh round trip plus a process teardown, and it used to run on the UI thread
+  — so `x` froze the dashboard for its duration with the row it was killing
+  still sitting there. `start_kill` now marks the key *presumed dead* before the
+  request goes out (hidden from `Remote::list_sessions`) and makes the call from
+  a pool thread. The same applies to the window-close policy below, which is the
+  same RPC on a timer.
+
+  Three things unwind a presumption, and the third is what makes it safe:
+  the host's own `Removed` (it happened — drop the guess, and with it any chance
+  of a recycled launcher pid inheriting the hide); a reconnect's `Snapshot` or a
+  dropped link (a full account of the host supersedes every guess about it); and
+  a **10s lapse**, after which the row simply comes back. The lapse is load-
+  bearing because the presumption is *not* a write to the mirror: the server
+  pushes only what changed, so a session that survived a kill it never heard
+  about is one the host has no reason to re-send, and an edit to the mirror
+  would leave nothing to correct against. An `Unreachable` reply — no answer at
+  all, so nothing was signalled — withdraws it immediately rather than waiting
+  the lapse out.
 - **RESTART / FORK**: kill + reopen **on the row's own host** (fork with
   `fork = true`), landing in that host's pool and auto-attaching like any open.
   No longer local-only.

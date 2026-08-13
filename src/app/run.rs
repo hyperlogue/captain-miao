@@ -9,9 +9,9 @@ use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentControl;
-use crate::backend::{Backend, LaunchPlan, OpenSpec, ShellPlan};
+use crate::backend::{Backend, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
-use crate::state::{self, HostId};
+use crate::state::{self, HostId, SessionKey};
 use crate::terminal::{
     self, Capabilities, SessionsLayout, SpawnCommand, SpawnSpec, SpawnTarget, Tab, WindowId,
 };
@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    Action, App, InputMode, PendingConfirm, PickerKind, ReportOrigin, RestartSpec, ResumeLoad,
-    SessionSnapshotEntry,
+    Action, App, InputMode, KillOrigin, KillResult, PendingConfirm, PickerKind, ReportOrigin,
+    RestartSpec, ResumeLoad, SessionSnapshotEntry,
 };
 
 /// Lines of terminal output captured for the preview panel — its vertical
@@ -243,6 +243,92 @@ fn apply_resume_load(app: &mut App, load: ResumeLoad) {
     app.picker = None;
     app.input_mode = InputMode::Normal;
     app.set_status(msg, true);
+}
+
+/// Ask `host` to end `key`, without making the user watch the round trip.
+///
+/// The row goes **now**: `presume_killed` hides it before the request is even
+/// sent, and the blocking `KillSession` runs on a pool thread. That ordering is
+/// the whole point — the kill is an ssh round trip, and it used to be made from
+/// the UI thread, so the dashboard froze for its duration with the row it was
+/// killing still on screen. Nothing is lost by guessing: the key names a session
+/// on a host that is about to say the same thing, and [`apply_kill_result`] puts
+/// the row back for the one answer that means it never heard us.
+///
+/// Returns whether a host was actually asked, so a batch can report an honest
+/// count. Only an unknown `host` (a row whose host has since been removed from
+/// the config — never a guess at `backends[0]`, §9) comes back false.
+fn start_kill(app: &mut App, host: HostId, key: SessionKey, origin: KillOrigin) -> bool {
+    let Some(backend) = app.backend_for(&host) else {
+        app.set_status(format!("Unknown host {}", host.0), true);
+        return false;
+    };
+    // Before anyone has been asked — that ordering *is* the optimism. A no-op on
+    // a plain local backend, which has nothing to be optimistic about.
+    backend.presume_killed(&key);
+    // Hand a host's blocking round trip to a pool thread. The `Arc` clone is why
+    // `Backend::Remote` holds one — a spawned task can't borrow the `App` that
+    // owns the backend.
+    if let Backend::Remote(remote) = backend {
+        let remote = Arc::clone(remote);
+        let tx = app.kill_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = remote.kill_session(&key);
+            let _ = tx.send(KillResult {
+                host,
+                key,
+                outcome,
+                origin,
+            });
+        });
+        return true;
+    }
+    // Local: an in-process `libc::kill`, so it has already happened by the time
+    // this returns and the `sessions/` watcher takes the row within the settle.
+    let outcome = tokio::task::block_in_place(|| backend.kill_session(&key));
+    apply_kill_result(
+        app,
+        KillResult {
+            host,
+            key,
+            outcome,
+            origin,
+        },
+    );
+    true
+}
+
+/// Settle a kill that has come back from its host: put the row back if the
+/// request never landed, and say so if anyone is waiting to hear.
+fn apply_kill_result(app: &mut App, result: KillResult) {
+    let KillResult {
+        host,
+        key,
+        outcome,
+        origin,
+    } = result;
+    if outcome == KillOutcome::Unreachable {
+        // Nothing was signalled, so the session is still running and hiding its
+        // row was wrong. `AlreadyGone` is the opposite case and keeps the hide:
+        // the host is telling us the session had ended before we asked.
+        if let Some(backend) = app.backend_for(&host) {
+            backend.unpresume_killed(&key);
+        }
+    }
+    if origin == KillOrigin::WindowClosed {
+        // Silent by design — `close_reported_sessions` says why. A restored row
+        // is the only feedback that path gives, and it needs no words.
+        tracing::debug!("close-on-window-close: {host:?} {key} → {outcome:?}");
+        return;
+    }
+    match outcome {
+        KillOutcome::Signalled => app.set_status("Session terminated".to_string(), false),
+        // Not an error: the row leaving is what `x` was for, and it has.
+        KillOutcome::AlreadyGone => app.set_status("Session had already ended".to_string(), false),
+        KillOutcome::Unreachable => {
+            app.set_status(format!("Kill failed: {} did not answer", host.0), true)
+        }
+    }
 }
 
 // -- Dashboard singleton --
@@ -788,22 +874,22 @@ async fn attach_pool_session(
 /// count is worth saying: with the default policy a closed tab full of sessions
 /// ends all of them at once, and silence about that would be worse.
 ///
+/// The count is of sessions *asked about*, not of hosts that have answered — a
+/// closed tab full of remote sessions would otherwise report itself one ssh
+/// round trip at a time, long after the windows went. Their rows leave at the
+/// same moment for the same reason (see [`start_kill`]).
+///
 /// Returns whether anything was closed, so the caller can arm the settle reload
 /// that picks up the departed rows (the deadline is the loop's own local).
-async fn close_reported_sessions(app: &mut App) -> bool {
+fn close_reported_sessions(app: &mut App) -> bool {
     let queued = app.take_due_session_closes(Instant::now());
     if queued.is_empty() {
         return false;
     }
     let mut closed = 0usize;
     for (host, key) in queued {
-        let Some(backend) = app.backend_for(&host) else {
-            continue;
-        };
-        if tokio::task::block_in_place(|| backend.kill_session(&key)) {
+        if start_kill(app, host, key, KillOrigin::WindowClosed) {
             closed += 1;
-        } else {
-            tracing::debug!("close-on-window-close: {host:?} {key} was already gone");
         }
     }
     if closed == 0 {
@@ -1144,8 +1230,15 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         // every tick rather than beside the report that queued it: the wait is
         // what makes the queue safe, and it comes due on an iteration that may
         // carry no report and no reload of its own.
-        if close_reported_sessions(&mut app).await {
+        if close_reported_sessions(&mut app) {
             arm_settle_reload(&mut settle_reload_at);
+            needs_redraw = true;
+        }
+        // Kills coming back from the hosts that took them. Drained above the
+        // change-signal sweep just below, so a row restored by an unreachable
+        // host is picked up by this iteration's reload rather than the next.
+        while let Ok(result) = app.kill_results.try_recv() {
+            apply_kill_result(&mut app, result);
             needs_redraw = true;
         }
         // Take each backend's change signal and coalesce (§5). One uniform
@@ -1661,20 +1754,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         // Route to the session's host, naming it by key: the host
                         // re-resolves that to a live pid immediately before
                         // signalling, so a stale row can't kill a recycled pid.
-                        // Local is in process; a remote is an RPC, so it rides
-                        // `block_in_place`.
-                        let killed = match app.backend_for(&host) {
-                            Some(b) => tokio::task::block_in_place(|| b.kill_session(&key)),
-                            None => {
-                                app.set_status(format!("Unknown host {}", host.0), true);
-                                false
-                            }
-                        };
-                        if killed {
-                            app.set_status("Session terminated".to_string(), false);
-                        } else {
-                            app.set_status("Kill failed (session already gone?)".to_string(), true);
-                        }
+                        // The row goes at this keystroke rather than when the
+                        // host gets round to answering; the answer itself lands
+                        // in `apply_kill_result`.
+                        start_kill(&mut app, host, key, KillOrigin::Asked);
                         if let Some(wid) = window_id {
                             let _ = terminal::get().close_window(&wid).await;
                         }

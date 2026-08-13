@@ -348,6 +348,27 @@ pub(crate) struct AttachPlan {
     pub argv: Vec<String>,
 }
 
+/// What came of asking a host to end a session.
+///
+/// Three states rather than the `bool` this used to be, because the dashboard
+/// now hides the row *before* the answer arrives (`Backend::presume_killed`) and
+/// only one of the two failures is grounds for putting it back. "The host says
+/// there is no such live session" and "the host never answered" collapse into
+/// the same `false`, and they are opposites: the first means the row was right
+/// to go, the second that nothing was signalled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// The host resolved the key and signalled the session.
+    Signalled,
+    /// The host had no live session under that key — it had already ended, so
+    /// the row leaving was right even though the signal never went out.
+    AlreadyGone,
+    /// No answer: the host is unreachable, or too old to know the frame (it
+    /// ignores what it can't decode, §3). Nothing was signalled and the session
+    /// is still running — the one outcome an optimistic hide must unwind.
+    Unreachable,
+}
+
 impl Backend {
     pub(crate) fn local() -> Self {
         Backend::Local(Box::new(LocalHost {
@@ -530,10 +551,43 @@ impl Backend {
     /// signalling, so a mirror lagging the session's exit can't make it SIGTERM
     /// a recycled pid (§3). May block on a round-trip for a remote host, so an
     /// async caller should wrap this in `block_in_place`.
-    pub(crate) fn kill_session(&self, key: &SessionKey) -> bool {
+    pub(crate) fn kill_session(&self, key: &SessionKey) -> KillOutcome {
         match self {
-            Backend::Local(h) => h.inner.kill_session(key),
+            // In-process `libc::kill`: the only way to fail is to find no live
+            // session under the key, so there is no unreachable case here.
+            Backend::Local(h) => match h.inner.kill_session(key) {
+                true => KillOutcome::Signalled,
+                false => KillOutcome::AlreadyGone,
+            },
             Backend::Remote(b) => b.kill_session(key),
+        }
+    }
+
+    /// Treat `key` as already gone, before the host has been asked — the
+    /// optimistic half of a kill. The row leaves the table on the next reload
+    /// rather than a round trip later; [`unpresume_killed`] puts it back if the
+    /// host turns out never to have heard the request.
+    ///
+    /// A no-op for a plain local backend, which has nothing to be optimistic
+    /// about: its kill is an in-process signal and its `sessions/` watcher takes
+    /// the row away within the settle. Under pooled-localhost the daemon is
+    /// still on the far side of a socket, and that backend is a `Remote` — which
+    /// is why this branches on the backend, not on locality.
+    ///
+    /// [`unpresume_killed`]: Self::unpresume_killed
+    pub(crate) fn presume_killed(&self, key: &SessionKey) {
+        if let Backend::Remote(b) = self {
+            b.presume_dead(key);
+        }
+    }
+
+    /// Undo a [`presume_killed`]: nothing was signalled after all, so the
+    /// session is still running and its row belongs back in the table.
+    ///
+    /// [`presume_killed`]: Self::presume_killed
+    pub(crate) fn unpresume_killed(&self, key: &SessionKey) {
+        if let Backend::Remote(b) = self {
+            b.unpresume_dead(key);
         }
     }
 
@@ -813,6 +867,21 @@ pub(crate) struct RemoteBackend {
     /// Latest known sessions on the remote host, keyed by their opaque
     /// [`SessionKey`] — the wire's only session identifier (§3).
     mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
+    /// Sessions the dashboard has asked this host to end, hidden from
+    /// [`list_sessions`] from the moment the request goes *out* rather than when
+    /// its answer comes back. Each holds the instant it was hidden, so a
+    /// presumption the host never confirms lapses on its own after
+    /// [`PRESUMED_DEAD_FOR`] and the row comes back.
+    ///
+    /// This is what makes `x` (and the window-close policy behind it) feel
+    /// instant on a remote host: the kill is an ssh round trip, and every
+    /// millisecond of it used to be a row sitting there looking alive.
+    ///
+    /// Deliberately *not* a removal from the mirror. The mirror is the host's
+    /// account of itself, and overwriting it with a guess would leave nothing to
+    /// correct against: the server pushes only what *changed*, so a session that
+    /// survived a kill it never heard about would never be re-sent.
+    presumed_dead: Arc<Mutex<HashMap<SessionKey, Instant>>>,
     /// Requests to the connection task; `None` once the task has exited.
     requests: mpsc::UnboundedSender<PendingRequest>,
     next_req_id: AtomicU64,
@@ -851,6 +920,43 @@ pub(crate) struct RemoteBackend {
     log: Arc<ConnLog>,
 }
 
+/// How long a session stays presumed dead on the strength of the dashboard's own
+/// kill, with the host neither confirming it (a `Removed` push, which drops the
+/// presumption early) nor being found unreachable (which withdraws it at once).
+///
+/// It is a backstop for the one gap the two exact answers leave: a host that
+/// takes the request, answers `Killed{ok:true}`, and then never removes the
+/// session — an agent that ignores SIGTERM, a launcher wedged mid-teardown. The
+/// host has no reason to re-send a session that never changed, so without a
+/// lapse the row would stay hidden until the next reconnect, and a session
+/// nobody can see is worse than one that took a while to die.
+///
+/// Generous on purpose: a window that expires *during* a slow but successful
+/// kill flickers the row back moments before it goes for real, which reads as a
+/// glitch. Erring long only delays the honest reappearance of a session that
+/// refused to die.
+const PRESUMED_DEAD_FOR: Duration = Duration::from_secs(10);
+
+/// The rows to show for a host: everything it has told us about, minus what the
+/// dashboard is presuming it just killed.
+///
+/// Takes `presumed_dead` by `&mut` because reading is when stale presumptions
+/// are noticed: an entry past [`PRESUMED_DEAD_FOR`] is dropped here, which both
+/// bounds the map and is what brings a survivor's row back. Pure apart from
+/// that, with `now` injected, so the lapse is testable without waiting one out.
+fn live_rows(
+    mirror: &HashMap<SessionKey, LauncherState>,
+    presumed_dead: &mut HashMap<SessionKey, Instant>,
+    now: Instant,
+) -> Vec<LauncherState> {
+    presumed_dead.retain(|_, since| now.duration_since(*since) < PRESUMED_DEAD_FOR);
+    mirror
+        .iter()
+        .filter(|(key, _)| !presumed_dead.contains_key(*key))
+        .map(|(_, state)| state.clone())
+        .collect()
+}
+
 impl RemoteBackend {
     /// Start mirroring a server over `transport`. Returns immediately; the
     /// mirror fills once the background task connects and receives the snapshot.
@@ -872,6 +978,7 @@ impl RemoteBackend {
         };
         let transport_is_local = matches!(transport, Transport::LocalSocket(_));
         let mirror = Arc::new(Mutex::new(HashMap::new()));
+        let presumed_dead = Arc::new(Mutex::new(HashMap::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
         let dirty = Arc::new(AtomicBool::new(false));
@@ -886,6 +993,7 @@ impl RemoteBackend {
             ConnectionShared {
                 host: host.clone(),
                 mirror: mirror.clone(),
+                presumed_dead: presumed_dead.clone(),
                 remote_exe: remote_exe.clone(),
                 conn: conn.clone(),
                 dirty: dirty.clone(),
@@ -906,6 +1014,7 @@ impl RemoteBackend {
             ssh_options,
             transport_is_local,
             mirror,
+            presumed_dead,
             requests: tx,
             next_req_id: AtomicU64::new(1),
             remote_exe,
@@ -1000,7 +1109,39 @@ impl RemoteBackend {
     }
 
     fn list_sessions(&self) -> Vec<LauncherState> {
-        self.mirror.lock().unwrap().values().cloned().collect()
+        live_rows(
+            &self.mirror.lock().unwrap(),
+            &mut self.presumed_dead.lock().unwrap(),
+            Instant::now(),
+        )
+    }
+
+    /// Hide `key`'s row now, on the strength of a kill we are only about to
+    /// send. Flips `dirty` so the dashboard re-reads and the row goes on the
+    /// next frame rather than whenever something else happens to wake it.
+    ///
+    /// `pub(crate)` for the same reason [`list_resumable`] is: the dashboard
+    /// pairs this with a [`kill_session`] made *off* the UI thread through an
+    /// `Arc<RemoteBackend>` clone, bypassing the `Backend` seam — see
+    /// `run::start_kill`. [`Backend::presume_killed`] is the seam-level spelling.
+    ///
+    /// [`list_resumable`]: Self::list_resumable
+    /// [`kill_session`]: Self::kill_session
+    pub(crate) fn presume_dead(&self, key: &SessionKey) {
+        self.presumed_dead
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Instant::now());
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Withdraw the presumption — the session is alive after all, so put its row
+    /// back. Idempotent: a presumption already dropped by a confirming `Removed`
+    /// (or lapsed) leaves nothing to undo.
+    fn unpresume_dead(&self, key: &SessionKey) {
+        if self.presumed_dead.lock().unwrap().remove(key).is_some() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The remote Claude name-manifest index isn't served; remote rows get
@@ -1022,12 +1163,23 @@ impl RemoteBackend {
         }
     }
 
-    fn kill_session(&self, key: &SessionKey) -> bool {
+    /// Blocking: an ssh round trip, so the dashboard makes it from a pool thread
+    /// through an `Arc` clone (hence `pub(crate)`, as for [`list_resumable`]).
+    /// Callers hold the row's [`presume_dead`] over this, so nothing about the
+    /// wait is visible in the table.
+    ///
+    /// [`list_resumable`]: Self::list_resumable
+    /// [`presume_dead`]: Self::presume_dead
+    pub(crate) fn kill_session(&self, key: &SessionKey) -> KillOutcome {
         let key = key.clone();
-        matches!(
-            self.request(|req_id| ClientFrame::KillSession { req_id, key }),
-            Some(ServerFrame::Killed { ok: true, .. })
-        )
+        match self.request(|req_id| ClientFrame::KillSession { req_id, key }) {
+            Some(ServerFrame::Killed { ok: true, .. }) => KillOutcome::Signalled,
+            Some(ServerFrame::Killed { ok: false, .. }) => KillOutcome::AlreadyGone,
+            // No reply at all — `request` fails fast on a known-down host and
+            // otherwise waits out the connection, and a daemon too old to decode
+            // the frame simply never answers.
+            _ => KillOutcome::Unreachable,
+        }
     }
 
     fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
@@ -2798,6 +2950,7 @@ struct ConnectionShared {
     /// question worth asking without saying for whom.
     host: HostId,
     mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
+    presumed_dead: Arc<Mutex<HashMap<SessionKey, Instant>>>,
     remote_exe: Arc<Mutex<String>>,
     conn: Arc<Mutex<ConnState>>,
     dirty: Arc<AtomicBool>,
@@ -2822,6 +2975,7 @@ async fn connection_task(
     let ConnectionShared {
         host,
         mirror,
+        presumed_dead,
         remote_exe,
         conn,
         dirty,
@@ -2952,7 +3106,15 @@ async fn connection_task(
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
-        let outcome = serve(stream, &mirror, &dirty, &server_version, &mut requests).await;
+        let outcome = serve(
+            stream,
+            &mirror,
+            &presumed_dead,
+            &dirty,
+            &server_version,
+            &mut requests,
+        )
+        .await;
         // Forget remembered deploy failures and refusals only once the host has
         // *demonstrably* worked — which means the handshake and subscribe both
         // succeeded, not merely that a socket accepted us. Clearing at connect
@@ -2967,6 +3129,11 @@ async fn connection_task(
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
         mirror.lock().unwrap().clear();
+        // And with it every presumption: each one says "this row is on its way
+        // out", which only means anything against rows we still have. Carrying
+        // them across the gap would let one hide a session the reconnect's
+        // snapshot reports as alive.
+        presumed_dead.lock().unwrap().clear();
         *latency.lock().unwrap() = None;
         vitals.clear();
         standing_failure = match &outcome {
@@ -3356,6 +3523,7 @@ async fn cancel_forwards(target: &str, opts: &[String], forwards: &[Forward]) {
 async fn serve(
     stream: UnixStream,
     mirror: &Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
+    presumed_dead: &Arc<Mutex<HashMap<SessionKey, Instant>>>,
     dirty: &Arc<AtomicBool>,
     server_version: &Arc<Mutex<Option<String>>>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
@@ -3421,15 +3589,31 @@ async fn serve(
                         for s in sessions {
                             m.insert(s.key(), s);
                         }
+                        // A full account of the host supersedes every guess we
+                        // were making about it (see `presumed_dead`).
+                        presumed_dead.lock().unwrap().clear();
                         // The mirror changed off-thread; wake the dashboard loop.
                         dirty.store(true, Ordering::Relaxed);
                     }
+                    // Deliberately does *not* withdraw a presumption. A delta
+                    // says only that the state file moved, which a session on
+                    // its way out can still do — a last hook, a status mirrored
+                    // from the agent's own file as it exits. `Removed` is the
+                    // frame that means gone; treating a delta as evidence of
+                    // life would flash the row back for the frame or two before
+                    // one arrives.
                     ServerFrame::Delta { state } => {
                         mirror.lock().unwrap().insert(state.key(), *state);
                         dirty.store(true, Ordering::Relaxed);
                     }
                     ServerFrame::Removed { key } => {
                         mirror.lock().unwrap().remove(&key);
+                        // The host has now said what we were presuming, so the
+                        // presumption has nothing left to do. Dropping it here
+                        // rather than letting it lapse keeps a recycled key (a
+                        // launcher pid the host reuses within the window) from
+                        // inheriting the hide meant for its predecessor.
+                        presumed_dead.lock().unwrap().remove(&key);
                         dirty.store(true, Ordering::Relaxed);
                     }
                     // Every reply routes by `req_id` through one accessor, so a
@@ -3494,6 +3678,57 @@ mod tests {
             attached: None,
             host: crate::state::HostId::local(),
         }
+    }
+
+    /// The optimistic hide behind `x` on a remote host. Its two *answered*
+    /// endings — the host confirming with a `Removed`, and the presumption being
+    /// withdrawn outright — run against the live mock in
+    /// `remote_backend_mirrors_snapshot_and_serves_requests`; this is the third,
+    /// where no answer ever settles it.
+    ///
+    /// The lapse is the safety property. Presuming is a *guess* made before the
+    /// request goes out, and the server pushes only what changed — so a session
+    /// that survived a kill it never heard about is one the host has no reason
+    /// to re-send. Without the lapse its row would stay hidden until the next
+    /// reconnect, and an invisible running session is worse than a slow one.
+    #[test]
+    fn a_presumed_kill_hides_a_row_but_never_indefinitely() {
+        let now = Instant::now();
+        let mirror: HashMap<SessionKey, LauncherState> = [101, 102]
+            .into_iter()
+            .map(|pid| (SessionKey::from_launcher_pid(pid), test_state(pid)))
+            .collect();
+        let pids = |rows: Vec<LauncherState>| {
+            let mut p: Vec<u32> = rows.iter().map(|s| s.launcher_pid).collect();
+            p.sort();
+            p
+        };
+
+        // Nothing presumed: the host's account of itself, verbatim.
+        let mut presumed = HashMap::new();
+        assert_eq!(pids(live_rows(&mirror, &mut presumed, now)), [101, 102]);
+
+        // Presumed a moment ago — the row is gone while the kill is in flight,
+        // with the mirror still holding it (the host hasn't answered yet).
+        presumed.insert(SessionKey::from_launcher_pid(101), now);
+        assert_eq!(pids(live_rows(&mirror, &mut presumed, now)), [102]);
+        assert_eq!(
+            pids(live_rows(
+                &mirror,
+                &mut presumed,
+                now + PRESUMED_DEAD_FOR - Duration::from_millis(1)
+            )),
+            [102]
+        );
+
+        // Still there once the window is up: the session outlived the kill, so
+        // the guess is withdrawn and the entry with it — no unbounded growth
+        // from a host that goes quiet.
+        assert_eq!(
+            pids(live_rows(&mirror, &mut presumed, now + PRESUMED_DEAD_FOR)),
+            [101, 102]
+        );
+        assert!(presumed.is_empty());
     }
 
     /// A host's options are passed through untouched except for its forwards,
@@ -5327,8 +5562,14 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                ClientFrame::KillSession { req_id, .. } => {
+                ClientFrame::KillSession { req_id, key } => {
                     write_frame(&mut wr, &ServerFrame::Killed { req_id, ok: true })
+                        .await
+                        .unwrap();
+                    // What a real host does moments later, once the launcher has
+                    // torn down and its state file gone. The client's optimistic
+                    // hide is waiting for exactly this.
+                    write_frame(&mut wr, &ServerFrame::Removed { key })
                         .await
                         .unwrap()
                 }
@@ -5429,9 +5670,41 @@ mod tests {
         // Blocking request/response must run off the async worker.
         let (cands, errs) = tokio::task::block_in_place(|| backend.list_resumable(5));
         assert!(cands.is_empty() && errs.is_empty());
-        assert!(tokio::task::block_in_place(
-            || backend.kill_session(&SessionKey::from_launcher_pid(999))
-        ));
+        assert_eq!(
+            tokio::task::block_in_place(
+                || backend.kill_session(&SessionKey::from_launcher_pid(999))
+            ),
+            KillOutcome::Signalled
+        );
+
+        // The optimistic half. Presuming a session dead takes its row out of
+        // `list_sessions` at once, with nothing asked of the host at all…
+        let spared = SessionKey::from_launcher_pid(102);
+        backend.presume_dead(&spared);
+        assert_eq!(backend.list_sessions().len(), 1);
+        // …and withdrawing the presumption puts it straight back, which is what
+        // an unreachable host's answer does.
+        backend.unpresume_dead(&spared);
+        assert_eq!(backend.list_sessions().len(), 2);
+
+        // The other ending: the host confirms with a `Removed` of its own, which
+        // retires the row *and* the presumption standing in for it — so a
+        // launcher pid the host later recycles can't inherit a hide meant for
+        // its predecessor.
+        let doomed = SessionKey::from_launcher_pid(101);
+        backend.presume_dead(&doomed);
+        assert_eq!(backend.list_sessions().len(), 1);
+        assert_eq!(
+            tokio::task::block_in_place(|| backend.kill_session(&doomed)),
+            KillOutcome::Signalled
+        );
+        let mut tries = 0;
+        while !backend.presumed_dead.lock().unwrap().is_empty() {
+            tries += 1;
+            assert!(tries < 100, "the host's Removed never retired the guess");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(backend.list_sessions().len(), 1);
 
         let _ = std::fs::remove_file(&sock);
     }
