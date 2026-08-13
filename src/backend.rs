@@ -473,6 +473,19 @@ impl Backend {
         }
     }
 
+    /// What restarting this host's daemon would deploy, when that differs from
+    /// what it is running — the hosts panel's upgrade affordance, and the payload
+    /// the upgrade itself stages.
+    ///
+    /// `None` on a local backend, on a disconnected host, and — importantly — on
+    /// every connected host a restart would bring back on the same bytes.
+    pub(crate) fn upgrade_offer(&self) -> Option<UpgradeOffer> {
+        match self {
+            Backend::Local(_) => None,
+            Backend::Remote(b) => b.upgrade.lock().unwrap().clone(),
+        }
+    }
+
     /// Round-trip time to this host, sampled opportunistically from real
     /// request/response traffic — there is deliberately **no `Ping` frame**
     /// (§9): every reply is already matched by `req_id`, so timing one costs
@@ -915,6 +928,9 @@ pub(crate) struct RemoteBackend {
     conn: Arc<Mutex<ConnState>>,
     /// The daemon version from `Welcome`, for the hosts panel.
     server_version: Arc<Mutex<Option<String>>>,
+    /// What restarting this host's daemon would deploy, when that is newer than
+    /// what it is serving. Re-decided by the connection task on every pass.
+    upgrade: Arc<Mutex<Option<UpgradeOffer>>>,
     /// Most recent request→reply round-trip. Sampled from ordinary traffic —
     /// there is no `Ping` frame, because every reply is already `req_id`-matched
     /// and timing one is free (§9).
@@ -1000,6 +1016,7 @@ impl RemoteBackend {
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
         let dirty = Arc::new(AtomicBool::new(false));
         let server_version = Arc::new(Mutex::new(None));
+        let upgrade = Arc::new(Mutex::new(None));
         let latency = Arc::new(Mutex::new(None));
         let vitals = Arc::new(VitalsCell::default());
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
@@ -1015,6 +1032,7 @@ impl RemoteBackend {
                 conn: conn.clone(),
                 dirty: dirty.clone(),
                 server_version: server_version.clone(),
+                upgrade: upgrade.clone(),
                 latency: latency.clone(),
                 vitals: vitals.clone(),
                 reconnect_epoch: reconnect_epoch.clone(),
@@ -1037,6 +1055,7 @@ impl RemoteBackend {
             remote_exe,
             conn,
             server_version,
+            upgrade,
             latency,
             vitals,
             dirty,
@@ -2067,6 +2086,53 @@ fn decide_provision(
     }
 }
 
+/// What stopping this host's daemon would deploy, when that differs from what
+/// is already running there.
+///
+/// Exists because [`Provision::UseRunning`] short-circuits the whole ladder: a
+/// connected host reports the version it *is* serving and nothing at all about
+/// the one it would pick up next time, so drift is invisible until something
+/// else forces a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpgradeOffer {
+    /// The payload target the host would be sent.
+    pub(crate) target: String,
+    /// Its digest — what the deploy stages, verifies and records in the marker.
+    pub(crate) sha256: String,
+    /// The version we carry, to name beside the one the host is running.
+    pub(crate) version: String,
+}
+
+/// The [`UpgradeOffer`] for a host whose daemon is already up: what
+/// [`decide_provision`] would choose with that daemon out of the picture.
+///
+/// **A re-decision, not a digest comparison.** The ladder's ordering *is* the
+/// answer to "would a restart change anything" — a user's PATH install wins and
+/// is never overwritten, a marker naming a target we can no longer supply is
+/// kept — and a second implementation of that reasoning would drift from the
+/// first. Only an `Upload` is an offer: every other outcome comes back on the
+/// same bytes, and killing a host's sessions to redeploy what it already runs is
+/// the one result this must never produce. Pure, so it is unit-tested.
+fn upgrade_offer_for(
+    local_version: &str,
+    probe: &RemoteProbe,
+    candidates: &[(&str, &str)],
+    suppliable: &[&str],
+) -> Option<UpgradeOffer> {
+    let restarted = RemoteProbe {
+        running: None,
+        ..probe.clone()
+    };
+    match decide_provision(local_version, &restarted, candidates, suppliable) {
+        Provision::Upload { target, sha256 } => Some(UpgradeOffer {
+            target,
+            sha256,
+            version: local_version.to_string(),
+        }),
+        _ => None,
+    }
+}
+
 /// Whether the host's own `miao-server` is one we can talk to, and so should
 /// defer to rather than deploy over.
 ///
@@ -2892,7 +2958,7 @@ async fn resolve_remote_exe(
     opts: &[String],
     prov: &mut Provisioning<'_>,
     log: &ConnLog,
-) -> (String, Option<String>) {
+) -> Provisioned {
     let host = prov.host;
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
@@ -2900,10 +2966,11 @@ async fn resolve_remote_exe(
             "{target}: probe failed (unreachable / no shell) → PATH miao-server"
         );
         log.error("probe failed — the host is unreachable over ssh, or has no shell");
-        return (
-            "miao-server".to_string(),
-            Some("host unreachable over ssh (or no shell)".to_string()),
-        );
+        return Provisioned {
+            exe: "miao-server".to_string(),
+            failure: Some("host unreachable over ssh (or no shell)".to_string()),
+            upgrade: None,
+        };
     };
     let local_version = env!("CARGO_PKG_VERSION");
     // The source chain: env vars, then what this build carries, then anything
@@ -3080,9 +3147,37 @@ async fn resolve_remote_exe(
     let exe = remote_exe_for(&action, &probe.home);
     tracing::debug!(target: "captain_miao::provision", "{target}: remote exe = {exe}");
     log.info(format!("will invoke `{exe}` on the host"));
-    (
+    // Only a host we deployed nothing to can still have something to gain: every
+    // other arm above has already provisioned whatever it was going to.
+    let upgrade = match action {
+        Provision::UseRunning(_) => {
+            // Nothing was refused on this pass — the upload branch is exactly
+            // what `UseRunning` skips — so every candidate is still on offer.
+            let candidates: Vec<(&str, &str)> = available
+                .iter()
+                .map(|p| (p.target.as_str(), p.sha256.as_str()))
+                .collect();
+            let suppliable: Vec<&str> = candidates.iter().map(|(t, _)| *t).collect();
+            let offer = upgrade_offer_for(local_version, &probe, &candidates, &suppliable);
+            if let Some(o) = &offer {
+                log.info(format!(
+                    "a restart here would deploy {} {} (the daemon is running {})",
+                    o.target,
+                    o.version,
+                    probe
+                        .cache_version
+                        .as_deref()
+                        .or(probe.path_version.as_deref())
+                        .unwrap_or("an unknown version")
+                ));
+            }
+            offer
+        }
+        _ => None,
+    };
+    Provisioned {
         exe,
-        provision_failure(
+        failure: provision_failure(
             local_version,
             &probe,
             &action,
@@ -3092,7 +3187,17 @@ async fn resolve_remote_exe(
                 .map(|p| p.target.as_str())
                 .collect::<Vec<_>>(),
         ),
-    )
+        upgrade,
+    }
+}
+
+/// What [`resolve_remote_exe`] settled: the command to invoke on the host, why
+/// that is a fall-back if it is one, and whether restarting the host's daemon
+/// would deploy something newer.
+struct Provisioned {
+    exe: String,
+    failure: Option<String>,
+    upgrade: Option<UpgradeOffer>,
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -3132,6 +3237,7 @@ struct ConnectionShared {
     conn: Arc<Mutex<ConnState>>,
     dirty: Arc<AtomicBool>,
     server_version: Arc<Mutex<Option<String>>>,
+    upgrade: Arc<Mutex<Option<UpgradeOffer>>>,
     latency: Arc<Mutex<Option<Duration>>>,
     vitals: Arc<VitalsCell>,
     reconnect_epoch: Arc<AtomicU64>,
@@ -3157,6 +3263,7 @@ async fn connection_task(
         conn,
         dirty,
         server_version,
+        upgrade,
         latency,
         vitals,
         reconnect_epoch,
@@ -3216,6 +3323,7 @@ async fn connection_task(
                         options,
                     },
                     &remote_exe,
+                    &upgrade,
                     &mut failure,
                     &mut Provisioning {
                         upload: &mut upload_gate,
@@ -3430,6 +3538,7 @@ struct SshLink<'a> {
 async fn setup_ssh(
     link: SshLink<'_>,
     remote_exe: &Arc<Mutex<String>>,
+    upgrade: &Arc<Mutex<Option<UpgradeOffer>>>,
     failure: &mut Option<String>,
     prov: &mut Provisioning<'_>,
     log: &ConnLog,
@@ -3460,12 +3569,17 @@ async fn setup_ssh(
     // build can run there (open-decision #3), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
-    let (exe, diagnosis) = resolve_remote_exe(target, &opts, prov, log).await;
+    let provisioned = resolve_remote_exe(target, &opts, prov, log).await;
+    let exe = provisioned.exe;
     *remote_exe.lock().unwrap() = exe.clone();
+    // Re-published on every pass, `None` included: an offer that has since been
+    // taken (or a host that stopped being upgradable) must stop being advertised,
+    // and a stale `Some` here is a keystroke that kills sessions for nothing.
+    *upgrade.lock().unwrap() = provisioned.upgrade;
     // Carry the diagnosis out even when we go on to try the fallback: if the
     // `daemon ensure` below fails, *this* is the reason the user needs, not
     // "connection failed".
-    *failure = diagnosis;
+    *failure = provisioned.failure;
 
     // Ensure the remote daemon is running AND learn its socket path in one call:
     // `daemon ensure` self-daemonizes if needed (idempotent — a no-op against a
@@ -4474,6 +4588,53 @@ mod tests {
             ),
             format!("/home/u/{REMOTE_CACHE_REL}")
         );
+    }
+
+    /// The upgrade offer is the same ladder asked a different question, and the
+    /// cases that must answer "nothing to gain" are the ones that matter: an
+    /// offer is a keystroke that kills every session on the host.
+    #[test]
+    fn an_upgrade_is_offered_only_when_a_restart_would_land_somewhere_else() {
+        let running = |p: &RemoteProbe| {
+            let mut p = p.clone();
+            p.running = Some(RunningDaemon::InCache);
+            p
+        };
+
+        // Nothing deployed, and we carry something: a restart would deploy it.
+        let p = running(&probe("Linux x86_64", None, None));
+        assert_eq!(
+            upgrade_offer_for("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            Some(UpgradeOffer {
+                target: PAYLOAD.0.to_string(),
+                sha256: PAYLOAD.1.to_string(),
+                version: "0.1.0".to_string(),
+            })
+        );
+
+        // The host already runs our exact build. Re-deploying identical bytes
+        // and killing its sessions to do it is the worst outcome available.
+        let mut p = running(&probe("Linux x86_64", None, Some("0.1.0")));
+        p.cache_sha = Some(PAYLOAD.1.to_string());
+        p.cache_target = Some(PAYLOAD.0.to_string());
+        assert_eq!(
+            upgrade_offer_for("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            None
+        );
+
+        // A *user's* install on PATH wins the ladder and is never overwritten,
+        // so stopping the daemon would bring the very same binary back up. The
+        // stale-version annotation in the panel is all this host can be told.
+        let p = running(&probe("Linux x86_64", Some("0.1.0"), None));
+        assert_eq!(
+            upgrade_offer_for("0.1.0", &p, &[PAYLOAD], &[PAYLOAD.0]),
+            None
+        );
+
+        // A dashboard carrying no payload for this host has nothing to offer,
+        // however stale the host is.
+        let p = running(&probe("Linux riscv64", None, Some("0.0.9")));
+        assert_eq!(upgrade_offer_for("0.1.0", &p, &[], &[]), None);
     }
 
     #[test]
@@ -5719,7 +5880,7 @@ mod tests {
         let log = ConnLog::default();
         let host = HostId("test".into());
         let mut dl = UploadGate::default();
-        let (exe, failure) = resolve_remote_exe(
+        let Provisioned { exe, failure, .. } = resolve_remote_exe(
             &target,
             &opts,
             &mut Provisioning {
@@ -5755,7 +5916,11 @@ mod tests {
             ),
             Provision::UseCache,
         );
-        let (exe2, failure2) = resolve_remote_exe(
+        let Provisioned {
+            exe: exe2,
+            failure: failure2,
+            ..
+        } = resolve_remote_exe(
             &target,
             &opts,
             &mut Provisioning {

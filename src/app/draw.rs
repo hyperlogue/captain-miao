@@ -407,14 +407,23 @@ impl App {
             let mut trailer = String::new();
             if let Some(v) = backend.daemon_version() {
                 trailer.push_str(&format!("  v{v}"));
-                // The cost of preferring a host's own server on protocol
-                // compatibility rather than version equality: a stale one
-                // outlives our upgrades silently, and the digest marker that
-                // refreshes the *cache* path never applies to a PATH install.
-                // Stated here rather than left to be discovered — but as an
-                // annotation, since it usually works fine.
-                if super::format::version_is_older(&v, env!("CARGO_PKG_VERSION")) {
-                    trailer.push_str(" (older than ours)");
+                match backend.upgrade_offer() {
+                    // A restart here would genuinely land on something else, so
+                    // name what — the offer is only worth reading if it says
+                    // where it goes.
+                    Some(o) => trailer.push_str(&format!(" \u{2191}{}", o.version)),
+                    // The cost of preferring a host's own server on protocol
+                    // compatibility rather than version equality: a stale one
+                    // outlives our upgrades silently, and the digest marker that
+                    // refreshes the *cache* path never applies to a PATH install.
+                    // Stated here rather than left to be discovered — but as an
+                    // annotation, since it usually works fine, and *without* an
+                    // upgrade arrow, because there is nothing we could deploy
+                    // that this host would then choose.
+                    None if super::format::version_is_older(&v, env!("CARGO_PKG_VERSION")) => {
+                        trailer.push_str(" (older than ours)");
+                    }
+                    None => {}
                 }
             }
             // What the host says about itself, beside what the link says about
