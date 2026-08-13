@@ -2384,6 +2384,23 @@ async fn capped_output(
 /// host misbehaving, and the parse only ever reads the first few lines anyway.
 const REMOTE_OUTPUT_CAP: u64 = 256 * 1024;
 
+/// Bounds on fetching a published server. The download is the one step that
+/// leaves the machine, so what is on the far end is a web server — which may be
+/// slow, may be enormous, and (a redirect chain later) may not be the one the
+/// URL named.
+///
+/// `DOWNLOAD_TIMEOUT` is generous because this is tens of megabytes over
+/// whatever link the user has; `GRACE` exists so curl's own `--max-time` fires
+/// first and produces the message, leaving the outer timeout as the backstop
+/// for a curl that doesn't honour it. `EXTRACT_TIMEOUT` bounds a gzip bomb's
+/// running time, and `MAX_SERVER_BYTES` bounds what a bomb can leave behind —
+/// the archive cap can't, since the whole point of a bomb is the ratio.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const GRACE: Duration = Duration::from_secs(15);
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SERVER_BYTES: u64 = 512 * 1024 * 1024;
+
 /// How long `daemon ensure` may take. Longer than the probe: on a host whose
 /// daemon isn't up yet this *starts* one, which is a spawn plus a socket bind,
 /// and a cold NFS home has been known to make that unhurried.
@@ -2692,7 +2709,11 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let tgz = dir.join("server.tar.gz");
 
-    let out = Command::new("curl")
+    // Both bounds are curl's own as well as ours: `--max-time` is what actually
+    // stops a server that accepts the connection and then dribbles (a stall no
+    // connect timeout covers), and it gets to produce the error message, so the
+    // outer timeout below is only the backstop for a curl that ignores it.
+    let child = Command::new("curl")
         .args([
             "--fail",
             "--silent",
@@ -2701,39 +2722,57 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
             "--proto",
             "=https",
             "--tlsv1.2",
+            "--max-time",
+            &DOWNLOAD_TIMEOUT.as_secs().to_string(),
+            "--max-filesize",
+            &MAX_ARCHIVE_BYTES.to_string(),
             "--output",
         ])
         .arg(&tgz)
         .arg(url)
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("spawning curl: {e}"))?;
-    if !out.status.success() {
-        let err: String = String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(200)
-            .collect();
+    let (status, _, stderr) = tokio::time::timeout(
+        DOWNLOAD_TIMEOUT + GRACE,
+        capped_output(child, REMOTE_OUTPUT_CAP),
+    )
+    .await
+    .map_err(|_| format!("download timed out after {}s", DOWNLOAD_TIMEOUT.as_secs()))?
+    .map_err(|e| format!("curl failed: {e}"))?;
+    if !status.success() {
+        let err: String = stderr.trim().chars().take(200).collect();
         return Err(if err.is_empty() {
-            format!("download failed (rc={:?})", out.status.code())
+            format!("download failed (rc={:?})", status.code())
         } else {
             err
         });
     }
 
-    let out = Command::new("tar")
+    let child = Command::new("tar")
         .arg("-xzf")
         .arg(&tgz)
         .arg("-C")
         .arg(&dir)
         .args(["--no-same-owner", "--no-same-permissions", SERVER_BIN])
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("spawning tar: {e}"))?;
-    if !out.status.success() {
+    let (status, _, stderr) =
+        tokio::time::timeout(EXTRACT_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .map_err(|_| format!("extract timed out after {}s", EXTRACT_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("tar failed: {e}"))?;
+    if !status.success() {
         return Err(format!(
             "the archive did not contain {SERVER_BIN}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr.trim()
         ));
     }
     let _ = std::fs::remove_file(&tgz);
@@ -2744,6 +2783,18 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
         let _ = std::fs::remove_file(&dest);
         return Err(format!(
             "{url} did not yield a regular file at {SERVER_BIN}"
+        ));
+    }
+    // The archive was capped on the wire, but gzip expands: a small download can
+    // still be a large file on disk. Checked after the fact rather than
+    // prevented, because there is no portable way to bound what `tar` writes —
+    // so the cost of a bomb is bounded by the extract timeout, and this is what
+    // stops the result being *used*.
+    if meta.len() > MAX_SERVER_BYTES {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!(
+            "{url} yielded a {}MB {SERVER_BIN}, which is not a server binary",
+            meta.len() / 1_000_000
         ));
     }
     #[cfg(unix)]
