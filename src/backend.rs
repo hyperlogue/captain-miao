@@ -657,7 +657,7 @@ impl Backend {
     /// attach windows arrive with the 3d browser; see `App::local_backend`.)
     pub(crate) fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         match self {
-            Backend::Local(h) => Ok(h.inner.open_session(spec)),
+            Backend::Local(h) => h.inner.open_session(spec),
             Backend::Remote(b) => b.open_session(spec),
         }
     }

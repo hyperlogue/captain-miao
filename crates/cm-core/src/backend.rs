@@ -371,7 +371,21 @@ impl LocalBackend {
     /// captain-miao exe so the launched launcher is the same build as the
     /// dashboard (falls back to a bare `miao` on PATH if unresolvable — the
     /// dashboard binary's name, since that is what a local install puts there).
-    pub fn open_session(&self, spec: &OpenSpec) -> LaunchPlan {
+    ///
+    /// Fails only on [`AgentControl::Unknown`], and that is the whole reason it
+    /// returns a `Result`: the spec crosses the wire, so a **newer dashboard**
+    /// can hand an older server a backend this build has never heard of. The
+    /// tolerant decode (see [`crate::agent`]) makes that a live `Unknown`
+    /// instead of a refused frame, and `cli_subcommand()` is `""` for it — so
+    /// without the guard the argv would be `miao "" <cwd>`, a window that opens
+    /// and dies on a clap error. Refusing here rather than at each caller keeps
+    /// the check somewhere a future caller cannot forget it, and says the same
+    /// thing [`AgentControl::build_launch_command`] does for the launcher's own
+    /// side of the same problem.
+    pub fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
+        if spec.agent == AgentControl::Unknown {
+            anyhow::bail!(crate::agent::UNKNOWN_AGENT_REFUSAL);
+        }
         let exe = std::env::current_exe()
             .unwrap_or_else(|_| "miao".into())
             .to_string_lossy()
@@ -393,7 +407,7 @@ impl LocalBackend {
         {
             argv.extend(args);
         }
-        LaunchPlan::SpawnLocal { argv }
+        Ok(LaunchPlan::SpawnLocal { argv })
     }
 
     // --- Host filesystem queries (server-core; also answered over the wire) ---
@@ -596,19 +610,49 @@ mod tests {
         resume: Option<(&str, bool)>,
         worktree: Option<&str>,
     ) -> Vec<String> {
-        let plan = LocalBackend::default().open_session(&OpenSpec {
-            agent,
-            cwd: "/work".to_string(),
-            resume: resume.map(|(id, fork)| (id.to_string(), fork)),
-            worktree: worktree.map(str::to_string),
-        });
+        let plan = LocalBackend::default()
+            .open_session(&OpenSpec {
+                agent,
+                cwd: "/work".to_string(),
+                resume: resume.map(|(id, fork)| (id.to_string(), fork)),
+                worktree: worktree.map(str::to_string),
+            })
+            .expect("a known agent always plans");
         plan.argv()[1..].to_vec()
     }
 
+    /// Also the happy-path guard for the `Result` signature: a known agent must
+    /// still plan its exact argv, not merely "not fail".
     #[test]
     fn open_session_new_session_argv() {
         assert_eq!(open_argv(AgentControl::Claude, None), ["claude", "/work"]);
         assert_eq!(open_argv(AgentControl::Codex, None), ["codex", "/work"]);
+    }
+
+    /// A spec crosses the wire, so a **newer dashboard** can name a backend this
+    /// build has never heard of; the tolerant decode makes that a live `Unknown`
+    /// rather than a refused frame (see [`crate::agent`]). `cli_subcommand()` is
+    /// `""` for it, so an unguarded plan would be `miao "" /work` — a window
+    /// that opens and dies on a clap error instead of an honest refusal.
+    #[test]
+    fn open_session_refuses_an_unknown_agent() {
+        let plan = LocalBackend::default().open_session(&OpenSpec {
+            agent: AgentControl::Unknown,
+            cwd: "/work".to_string(),
+            resume: None,
+            worktree: None,
+        });
+        let err = match plan {
+            Ok(p) => panic!(
+                "an unknown backend must never yield an argv: {:?}",
+                p.argv()
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("upgrade"),
+            "the refusal must name the fix: {err}"
+        );
     }
 
     #[test]
@@ -679,12 +723,14 @@ mod tests {
 
         // The launch argv gets the *expanded* path — a process chdir, not a
         // shell word, so a `~` there would be a literal directory name.
-        let plan = backend.open_session(&OpenSpec {
-            agent: AgentControl::Claude,
-            cwd: "~/proj".to_string(),
-            resume: None,
-            worktree: None,
-        });
+        let plan = backend
+            .open_session(&OpenSpec {
+                agent: AgentControl::Claude,
+                cwd: "~/proj".to_string(),
+                resume: None,
+                worktree: None,
+            })
+            .expect("plans");
         assert_eq!(plan.argv()[2], root.join("proj").display().to_string());
 
         let _ = std::fs::remove_dir_all(&root);

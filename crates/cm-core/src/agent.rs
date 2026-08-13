@@ -9,8 +9,36 @@
 //!
 //! Adding a new backend is meant to be: add a variant, add a module under
 //! `agents/`, extend each `match` here. No registry, no dyn dispatch.
+//!
+//! [`AgentControl::Unknown`] is the one variant that isn't a backend. `agent`
+//! rides `LauncherState`, and `LauncherState` rides the `Snapshot` frame as a
+//! `Vec` — so a single element that refuses to decode fails the *whole* frame,
+//! and one session started under a backend this build predates would blank
+//! every row on that host. The protocol's frame-level rule (an unknown frame
+//! decodes to `Unknown` and is ignored) therefore extends one level down to
+//! this field: an unrecognized name decodes here instead of erroring, every
+//! method answers inertly, and the row stays visible, sortable and killable
+//! while nothing can be launched from it.
+//!
+//! What keeps that safe is that **`Unknown` is a read-side-only state**. It
+//! arises solely from decoding a value this build does not know: `from_cli`
+//! never yields it (so `miao --agent nonsense` is still an honest error, not a
+//! dimmed row), it is not in `ALL` (so no picker or `Ctrl-t` cycle can land on
+//! it), and no launcher may ever write it into a state file — a host knows its
+//! own backends, so `"agent":"unknown"` on the wire can only be a decoded value
+//! being echoed back, which the launch path refuses rather than guessing. That
+//! last clause is *enforced*, not merely expected: the two places an argv or a
+//! command gets built — [`crate::backend::LocalBackend::open_session`] and
+//! [`AgentControl::build_launch_command`] — both refuse with
+//! [`UNKNOWN_AGENT_REFUSAL`], so no path can turn an undecodable name into a
+//! process.
+//!
+//! It deliberately does not preserve the original name. `AgentControl` is
+//! `Copy`, is used as a `HashMap` key, and every method takes `self` by value;
+//! carrying a `String` would cost all of that repo-wide to hold a label nothing
+//! is allowed to act on.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -22,15 +50,67 @@ use tokio::process::Command;
 use crate::agents::{claude, codex};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize, Deserialize)]
+/// `Deserialize` is hand-written (see below) so an unrecognized name lands on
+/// [`AgentControl::Unknown`]; `Serialize` stays derived — `rename_all` maps that
+/// variant to `"unknown"`, which decodes back to itself.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentControl {
     #[default]
     Claude,
     Codex,
+    /// A backend name this build doesn't know — a newer host's session seen by
+    /// an older dashboard. Read-side only: produced by `Deserialize` alone,
+    /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
+    /// method answers inertly so the row survives; launching from it errors.
+    /// See the module doc for why it holds no name.
+    Unknown,
+}
+
+/// What both write-side guards say when they refuse an [`AgentControl::Unknown`]
+/// — [`AgentControl::build_launch_command`] and
+/// [`crate::backend::LocalBackend::open_session`]. Shared so the two can't drift
+/// into describing the same situation differently, and so a caller that only
+/// ever sees one of them still learns the fix.
+pub const UNKNOWN_AGENT_REFUSAL: &str = "unknown agent backend: this build doesn't know it (the \
+                                         request comes from a newer captain-miao); upgrade \
+                                         captain-miao to launch it";
+
+impl<'de> Deserialize<'de> for AgentControl {
+    /// Accepts exactly the names [`AgentControl::cli_subcommand`] emits and maps
+    /// everything else to [`AgentControl::Unknown`] — the whole point being that
+    /// a value from a newer host must not fail the frame it arrived in. Matching
+    /// is exact, as on-disk state has always been; the case-insensitive spelling
+    /// belongs to `from_cli`, where a human types the name.
+    ///
+    /// Still string-only: a number or an object is a malformed field, not a
+    /// backend this build predates, and is reported as the decode error it is.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct AgentVisitor;
+        impl serde::de::Visitor<'_> for AgentVisitor {
+            type Value = AgentControl;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an agent backend name")
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<AgentControl, E> {
+                Ok(match v {
+                    "claude" => AgentControl::Claude,
+                    "codex" => AgentControl::Codex,
+                    _ => AgentControl::Unknown,
+                })
+            }
+        }
+        d.deserialize_str(AgentVisitor)
+    }
 }
 
 impl AgentControl {
+    /// Every backend this build can actually drive — `Unknown` is deliberately
+    /// absent, which is what keeps it out of the `Space a` picker and the
+    /// `Ctrl-t` cycle.
     pub const ALL: &'static [AgentControl] = &[AgentControl::Claude, AgentControl::Codex];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -39,10 +119,14 @@ impl AgentControl {
         match self {
             AgentControl::Claude => "claude",
             AgentControl::Codex => "codex",
+            AgentControl::Unknown => "",
         }
     }
 
     /// Parse the `--agent` flag / config value. Mirrors `cli_subcommand`.
+    ///
+    /// Never yields `Unknown`: a name this build can't drive stays `None` so the
+    /// caller reports it, rather than launching into an inert backend.
     pub fn from_cli(s: &str) -> Option<AgentControl> {
         match s.to_ascii_lowercase().as_str() {
             "claude" => Some(AgentControl::Claude),
@@ -56,6 +140,9 @@ impl AgentControl {
         match self {
             AgentControl::Claude => "Claude",
             AgentControl::Codex => "Codex",
+            // Truthful and neutral: the row is an agent session, we just can't
+            // say which backend.
+            AgentControl::Unknown => "Agent",
         }
     }
 
@@ -75,6 +162,7 @@ impl AgentControl {
                 let sub = if fork { "fork" } else { "resume" };
                 vec![sub.to_string(), session_id.to_string()]
             }
+            AgentControl::Unknown => vec![],
         }
     }
 
@@ -106,6 +194,7 @@ impl AgentControl {
                 Some(v)
             }
             AgentControl::Codex => None,
+            AgentControl::Unknown => None,
         }
     }
 
@@ -125,6 +214,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::watch_paths(),
             AgentControl::Codex => codex::watch_paths(),
+            AgentControl::Unknown => vec![],
         }
     }
 
@@ -135,6 +225,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_session_index(cache),
             AgentControl::Codex => codex::read_session_index(cache),
+            AgentControl::Unknown => SessionIndex::default(),
         }
     }
 
@@ -155,6 +246,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_transcript_stats_incremental(transcript, prior),
             AgentControl::Codex => codex::read_transcript_stats(transcript, prior),
+            AgentControl::Unknown => TranscriptStats::default(),
         }
     }
 
@@ -165,6 +257,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::list_resumable(limit),
             AgentControl::Codex => codex::list_resumable(limit),
+            AgentControl::Unknown => Ok(vec![]),
         }
     }
 
@@ -188,6 +281,11 @@ impl AgentControl {
             AgentControl::Codex => {
                 codex::build_launch_command(cwd, sock_path, settings_path, extra_args)
             }
+            // One of the two places `Unknown` must be loud: there is no argv to
+            // guess, and guessing Claude's would run the wrong agent in the
+            // user's cwd. The other is `LocalBackend::open_session`, which
+            // builds an argv without coming through here.
+            AgentControl::Unknown => Err(anyhow!(UNKNOWN_AGENT_REFUSAL)),
         }
     }
 
@@ -198,6 +296,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::build_hooks_settings(sock_path),
             AgentControl::Codex => codex::build_hooks_settings(sock_path),
+            AgentControl::Unknown => String::new(),
         }
     }
 
@@ -208,6 +307,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::dispatch_hook(state, msg).await,
             AgentControl::Codex => codex::dispatch_hook(state, msg).await,
+            AgentControl::Unknown => {}
         }
     }
 
@@ -217,6 +317,10 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::parse_hook_payload(event, stdin),
             AgentControl::Codex => codex::parse_hook_payload(event, stdin),
+            AgentControl::Unknown => Err(anyhow!(
+                "unknown agent backend (this hook came from a newer \
+                 captain-miao); upgrade captain-miao to handle it"
+            )),
         }
     }
 
@@ -227,6 +331,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::scan_transcript_signals(path, offset),
             AgentControl::Codex => codex::scan_transcript_signals(path, offset),
+            AgentControl::Unknown => TranscriptScan::default(),
         }
     }
 
@@ -240,6 +345,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::session_activity(agent_pid),
             AgentControl::Codex => codex::session_activity(agent_pid),
+            AgentControl::Unknown => None,
         }
     }
 
@@ -255,6 +361,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_session_name(agent_pid),
             AgentControl::Codex => None,
+            AgentControl::Unknown => None,
         }
     }
 
@@ -265,6 +372,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::session_file_path(agent_pid),
             AgentControl::Codex => None,
+            AgentControl::Unknown => None,
         }
     }
 
@@ -302,6 +410,7 @@ impl AgentControl {
             AgentControl::Claude => None,
             AgentControl::Codex if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Codex => None,
+            AgentControl::Unknown => None,
         }
     }
 
@@ -320,6 +429,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::bg_shells(agent_pid),
             AgentControl::Codex => None,
+            AgentControl::Unknown => None,
         }
     }
 }
@@ -552,5 +662,126 @@ pub fn read_transcript_delta(path: &Path, offset: u64) -> TranscriptDelta {
     TranscriptDelta {
         new_offset: offset + bytes.len() as u64,
         text: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal state file / snapshot element: only the fields without a serde
+    /// default, so the agent name is the variable under test.
+    fn state_json(agent: &str, pid: u32) -> String {
+        format!(
+            r#"{{"agent":"{agent}","launcher_pid":{pid},"cwd":"/home/miao/p",
+               "status":"idle","updated_at":0}}"#
+        )
+    }
+
+    /// The hand-written `Deserialize` must not have moved the names it replaced.
+    #[test]
+    fn known_agent_names_still_decode() {
+        let claude: AgentControl = serde_json::from_str(r#""claude""#).expect("claude decodes");
+        let codex: AgentControl = serde_json::from_str(r#""codex""#).expect("codex decodes");
+        assert_eq!(claude, AgentControl::Claude);
+        assert_eq!(codex, AgentControl::Codex);
+    }
+
+    /// A backend added after this build was cut decodes to `Unknown` instead of
+    /// erroring, and re-serializes to a value that decodes back to itself (the
+    /// name is gone, but it never silently becomes Claude).
+    #[test]
+    fn an_unrecognized_agent_name_decodes_to_unknown() {
+        let a: AgentControl = serde_json::from_str(r#""reasonix""#).expect("decodes, not errors");
+        assert_eq!(a, AgentControl::Unknown);
+
+        let encoded = serde_json::to_string(&a).expect("encodes");
+        assert_eq!(encoded, r#""unknown""#);
+        let round: AgentControl = serde_json::from_str(&encoded).expect("round-trips");
+        assert_eq!(round, AgentControl::Unknown);
+    }
+
+    /// The regression this variant exists for: `ServerFrame::Snapshot` carries a
+    /// `Vec<LauncherState>`, so one element the build can't decode used to fail
+    /// the *whole* frame — an older dashboard talking to a host running one new
+    /// backend lost **every** row on that host. Every session must survive.
+    #[test]
+    fn one_unknown_agent_does_not_blank_the_whole_snapshot() {
+        let snapshot = format!(
+            "[{},{},{}]",
+            state_json("claude", 1),
+            state_json("reasonix", 2),
+            state_json("codex", 3),
+        );
+        let sessions: Vec<LauncherState> =
+            serde_json::from_str(&snapshot).expect("an unknown agent must not fail the frame");
+        assert_eq!(
+            sessions.len(),
+            3,
+            "every session in the snapshot must survive one undecodable agent name"
+        );
+        assert_eq!(
+            sessions.iter().map(|s| s.agent).collect::<Vec<_>>(),
+            [
+                AgentControl::Claude,
+                AgentControl::Unknown,
+                AgentControl::Codex
+            ]
+        );
+        // The rest of the unknown row is intact, so it still renders and can
+        // still be killed.
+        assert_eq!(sessions[1].launcher_pid, 2);
+        assert_eq!(sessions[1].cwd, "/home/miao/p");
+    }
+
+    /// `Unknown` out of `ALL` is what keeps it out of the `Space a` picker and
+    /// the workdir picker's `Ctrl-t` cycle — both iterate exactly this.
+    #[test]
+    fn all_excludes_unknown() {
+        assert!(!AgentControl::ALL.contains(&AgentControl::Unknown));
+        assert_eq!(
+            AgentControl::ALL,
+            &[AgentControl::Claude, AgentControl::Codex]
+        );
+    }
+
+    /// A typo on the command line is a user error, not a compatibility gap:
+    /// `from_cli` still refuses rather than handing back an inert backend.
+    #[test]
+    fn from_cli_rejects_an_unrecognized_name_instead_of_unknown() {
+        assert_eq!(AgentControl::from_cli("reasonix"), None);
+        assert_eq!(AgentControl::from_cli(""), None);
+        assert_eq!(AgentControl::from_cli("claude"), Some(AgentControl::Claude));
+    }
+
+    /// Nothing may be launched from a backend we can't name — guessing an argv
+    /// would run the wrong agent in the user's cwd.
+    #[test]
+    fn launching_an_unknown_agent_is_an_error() {
+        let err = AgentControl::Unknown
+            .build_launch_command(
+                "/home/miao/p",
+                Path::new("/run/miao.sock"),
+                Path::new("/run/miao-settings.json"),
+                &[],
+            )
+            .expect_err("an unknown backend has no launch command");
+        assert!(
+            err.to_string().contains("upgrade"),
+            "the error must name the fix: {err}"
+        );
+    }
+
+    /// Tolerance is for *names*, not for malformed JSON: a number in the field
+    /// is a broken payload, and reading it as `Unknown` would hide that.
+    #[test]
+    fn a_non_string_agent_is_still_a_decode_error() {
+        assert!(serde_json::from_str::<AgentControl>("7").is_err());
+        assert!(serde_json::from_str::<AgentControl>("null").is_err());
+        assert!(serde_json::from_str::<AgentControl>(r#"{"name":"claude"}"#).is_err());
     }
 }

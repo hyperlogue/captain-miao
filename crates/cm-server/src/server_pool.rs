@@ -110,7 +110,7 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
     // needs the real path — both in the argv (`open_session` expands it) and in
     // libshpool's `--dir`, which is a chdir, not a shell word.
     let cwd = cm_core::paths::expand_home(&spec.cwd, backend.home());
-    let plan = backend.open_session(spec);
+    let plan = backend.open_session(spec)?;
     let mut argv: Vec<String> = plan.argv().to_vec();
     argv.push("--pool-session".to_string());
     argv.push(name.clone());
