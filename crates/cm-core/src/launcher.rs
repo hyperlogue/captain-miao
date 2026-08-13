@@ -96,13 +96,15 @@ pub async fn run(
     {
         std::fs::create_dir_all(&sock_dir)?;
     }
+    // Runtime files no longer live in a dir the OS clears for us (see
+    // `state::runtime_dir`), so a launcher that died without unwinding — a hard
+    // reboot, a SIGKILL — leaves its socket and settings file behind for good.
+    // Reap those here, mirroring `sweep_dead_launcher_logs`.
+    sweep_dead_launcher_runtime_files(&sock_dir);
     let sock_path = sock_dir.join(format!("{launcher_pid}.sock"));
     let _ = std::fs::remove_file(&sock_path);
 
-    let listener = std::os::unix::net::UnixListener::bind(&sock_path)?;
-    let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
-    listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(listener)?;
+    let mut listener = bind_hook_socket(&sock_path)?;
 
     // Per-session hooks settings file. Path is generic; contents are
     // backend-specific JSON the agent will read on launch.
@@ -177,7 +179,7 @@ pub async fn run(
                 return Err(e).context("Failed to wait on agent");
             }
         },
-        _ = process_hooks(&listener, &mut launcher_state) => {
+        _ = process_hooks(&mut listener, &sock_path, &mut launcher_state) => {
             match child.wait().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -234,6 +236,103 @@ async fn wait_for_termination_signal() {
     tokio::select! {
         _ = recv(&mut sigterm) => {}
         _ = recv(&mut sighup) => {}
+    }
+}
+
+/// Bind the launcher's hook socket, owner-only and non-blocking. Factored out
+/// because [`restore_hook_socket`] has to repeat it exactly when the socket is
+/// removed mid-session; the two must not drift on the permission bits.
+fn bind_hook_socket(sock_path: &Path) -> Result<UnixListener> {
+    let listener = std::os::unix::net::UnixListener::bind(sock_path)?;
+    let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600));
+    listener.set_nonblocking(true)?;
+    Ok(UnixListener::from_std(listener)?)
+}
+
+/// `(device, inode)` of `path`, the identity the socket health check compares.
+/// Mere existence isn't enough: a path that was unlinked and re-bound by someone
+/// else exists again while *our* listener is orphaned on the old inode.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// Whether the socket we bound is no longer reachable at its path — either
+/// unlinked, or replaced by a different inode. `bound` is the identity recorded
+/// at bind time; `None` there means the stat failed then, leaving nothing to
+/// compare, so presence alone has to count as intact.
+fn hook_socket_lost(sock_path: &Path, bound: Option<(u64, u64)>) -> bool {
+    match file_identity(sock_path) {
+        None => true,
+        Some(now) => bound.is_some_and(|then| now != then),
+    }
+}
+
+/// Re-bind the hook socket after something removed it, returning the new
+/// identity to track (or `None` if the re-bind failed and we should keep
+/// trying). Recreates the containing dir too, since whatever took the socket
+/// may have taken the whole tree.
+///
+/// This is the half of the `$TMPDIR`-reaping fix that helps a session which is
+/// *already* running: moving `runtime_dir` only protects launchers started
+/// afterwards. The agent resolves the socket path from the `--settings` file it
+/// read at startup, and that path is unchanged, so hooks fired after the re-bind
+/// connect to the fresh listener and the session recovers on its own. The
+/// settings file is deliberately not rewritten — the agent read it once at
+/// startup, so restoring it would recover nothing.
+fn restore_hook_socket(listener: &mut UnixListener, sock_path: &Path) -> Option<(u64, u64)> {
+    if let Some(dir) = sock_path.parent() {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+    }
+    let _ = std::fs::remove_file(sock_path);
+    match bind_hook_socket(sock_path) {
+        Ok(fresh) => {
+            *listener = fresh;
+            tracing::warn!(
+                "hook socket {} had been removed; re-bound it. Hook events fired \
+                 while it was missing were lost, so this row's status may have \
+                 been stale until now.",
+                sock_path.display()
+            );
+            file_identity(sock_path)
+        }
+        Err(e) => {
+            tracing::error!(
+                "hook socket {} was removed and could not be re-bound: {e}. \
+                 This session's status updates are being dropped.",
+                sock_path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Remove `{pid}.sock` / `{pid}-settings.json` left by launchers that have
+/// exited. `$TMPDIR` used to clear these for us; [`state::runtime_dir`]'s
+/// fallback now persists across reboots, so they need reaping on the same terms
+/// as the per-launcher logs — on every launcher startup, leaving live (and
+/// just-crashed) launchers' files alone.
+fn sweep_dead_launcher_runtime_files(sock_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(sock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_suffix(".sock")
+            .or_else(|| name.strip_suffix("-settings.json"))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !state::is_process_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -316,7 +415,7 @@ impl Drop for CleanupGuard {
     }
 }
 
-async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
+async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mut LauncherState) {
     let agent = state.agent;
     // Watch the agent's transcript file instead of polling. For Claude,
     // a transcript modification while we're in WaitingForApproval is a
@@ -398,6 +497,23 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
     let mut bg_first_seen: std::collections::HashMap<String, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut learn_at: Option<tokio::time::Instant> = None;
+
+    // Losing the hook socket fires no event and produces no traffic — a session
+    // whose hooks have stopped looks exactly like one that is simply quiet — so
+    // the only way to notice is to look. One `stat` per tick, and the interval
+    // bounds how long a session can run blind before it recovers itself.
+    const SOCKET_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut bound_identity = file_identity(sock_path);
+    // Start one interval out rather than immediately, so the loop's first pass is
+    // always a real event and the `Starting` → `Idle` settle below isn't skipped
+    // by a tick that `continue`s.
+    let mut socket_health = tokio::time::interval_at(
+        tokio::time::Instant::now() + SOCKET_HEALTH_INTERVAL,
+        SOCKET_HEALTH_INTERVAL,
+    );
+    // After a laptop sleep, don't replay every tick that elapsed while suspended
+    // — one check is as good as fifty.
+    socket_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let was_active = state.status.is_busy();
@@ -590,6 +706,22 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
             // oldest such command crosses the threshold so the classification
             // block below can learn it and flip the row to `BackgroundServer`.
             _ = sleep_until_opt(learn_at) => {}
+            // Socket health. Nothing else can detect a socket removed out from
+            // under us, and a session that has lost its hooks is silent by
+            // definition — so this arm is the only thing standing between a
+            // reaped socket and a row that is stale for the rest of the
+            // session's life.
+            _ = socket_health.tick() => {
+                if hook_socket_lost(sock_path, bound_identity) {
+                    bound_identity = restore_hook_socket(listener, sock_path);
+                }
+                // Deliberately the whole iteration: this wake carries no state
+                // signal, and falling through would run the reconciliation — and
+                // on a background row its process-tree scan, a `ps` exec on
+                // macOS — every 30s for the life of every parked session, purely
+                // as a side effect of watching a socket.
+                continue;
+            }
         }
 
         if state.status == SessionStatus::Starting {
@@ -609,9 +741,16 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
         //     (`"shell"`), which reads as `BackgroundActive` rather than `Idle`.
         // We only ever *demote* toward rest here; hook events own the rest→`Active`
         // direction, so a momentary `"busy"` read can never bounce us into `Active`.
-        // Only the working/idle/shell statuses are consulted; the fine-grained,
-        // hook/transcript-backed states (Approval, Decision, Compacting, Compacted)
-        // are left untouched so the file can't clobber them.
+        // (The one promotion in this loop lives in the classification block below,
+        // and turns on corroborating process-tree evidence rather than on this read
+        // alone.) Only the working/idle/shell statuses are consulted; the
+        // fine-grained, hook/transcript-backed states (Approval, Decision,
+        // Compacting, Compacted) are left untouched so the file can't clobber them.
+        //
+        // Kept for the classification block, which needs the same read: `None`
+        // whenever this didn't run, which is exactly when there is no fresh
+        // evidence and nothing downstream should act.
+        let mut activity = None;
         if session_file_event
             && let Some(cpid) = state.child_pid
             && matches!(
@@ -626,7 +765,7 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
             // Offload the blocking status-file read off the runtime thread. A
             // join error is treated like the read failing (`None`), so the
             // demote-only refinement holds the status unchanged.
-            let activity = tokio::task::spawn_blocking(move || agent.agent_activity(cpid))
+            activity = tokio::task::spawn_blocking(move || agent.agent_activity(cpid))
                 .await
                 .unwrap_or(None);
             let next = match (&state.status, activity) {
@@ -714,17 +853,25 @@ async fn process_hooks(listener: &UnixListener, state: &mut LauncherState) {
             let shells = tokio::task::spawn_blocking(move || agent.bg_shells(cpid))
                 .await
                 .unwrap_or(None);
-            let (class, next_deadline) = classify_and_learn(
-                shells.as_deref(),
-                &mut bg_first_seen,
-                LEARN_LONG_RUNNING_AFTER,
-                tokio::time::Instant::now(),
-                learned::is_long_running,
-                learned::record_long_running,
-            );
-            learn_at = next_deadline;
-            if refine_background_kind(state, class) {
+            if promote_stale_background(state, shells.as_deref(), activity) {
+                // Left the background states entirely; the per-command timers
+                // belong to shells that are gone.
+                bg_first_seen.clear();
+                learn_at = None;
                 state_changed = true;
+            } else {
+                let (class, next_deadline) = classify_and_learn(
+                    shells.as_deref(),
+                    &mut bg_first_seen,
+                    LEARN_LONG_RUNNING_AFTER,
+                    tokio::time::Instant::now(),
+                    learned::is_long_running,
+                    learned::record_long_running,
+                );
+                learn_at = next_deadline;
+                if refine_background_kind(state, class) {
+                    state_changed = true;
+                }
             }
         } else {
             // Not in a background-shell state: drop the per-command timers so a
@@ -1152,6 +1299,57 @@ fn classify_and_learn(
     (Some(class), next_deadline)
 }
 
+/// Retire a background-shell status the process tree has disproved, promoting
+/// the row to `Active`. Returns whether the status changed.
+///
+/// Each of the three background states asserts *"a `run_in_background` shell is
+/// running"*. The live process tree is the authority on that — the same
+/// authority that put the row into the state to begin with — so when it reads
+/// cleanly and holds no background shell, the assertion is false and the row is
+/// stale by its own definition. It must be `Active` or `Idle`, and the session
+/// file says which.
+///
+/// This is the sole exception to the demote-only rule above it, and it does not
+/// weaken it: that rule guards against a *momentary or lagging* `"busy"` read
+/// bouncing a resting row into `Active`, whereas this needs two independent
+/// signals to agree. Both halves are load-bearing:
+///
+/// - `Some(&[])` is "tree read fine, nothing running"; `None` is "couldn't read
+///   the tree" and must never promote — acting on an unreadable tree is exactly
+///   the spurious bounce the demote-only rule exists to prevent.
+/// - `activity` is `None` on any wake that didn't re-read the session file, so a
+///   stale value can never be mistaken for fresh evidence.
+///
+/// Without this, a session whose background shell ends *while the agent goes
+/// back to work* has no path back to `Active`: the demote-only table only exits
+/// these states toward `Idle`, and `refine_background_kind` declines to act on
+/// an empty tree. Hooks normally cover the gap in milliseconds, so the hole is
+/// invisible until hooks are missing — a lost socket, a hook binary that can't
+/// run — at which point the row reads `Review`/`Task`/`Server` for every working
+/// turn until the agent next comes to rest.
+fn promote_stale_background(
+    state: &mut LauncherState,
+    shells: Option<&[BgShell]>,
+    activity: Option<AgentActivity>,
+) -> bool {
+    if !matches!(
+        state.status,
+        SessionStatus::BackgroundActive
+            | SessionStatus::BackgroundServer
+            | SessionStatus::ReviewPending
+    ) {
+        return false;
+    }
+    if activity != Some(AgentActivity::Working) {
+        return false;
+    }
+    if !shells.is_some_and(<[BgShell]>::is_empty) {
+        return false;
+    }
+    state.status = SessionStatus::Active;
+    true
+}
+
 /// Apply an aggregate [`BgClass`] to a background-shell status. The session file
 /// still owns whether a background shell is running *at all* (it produces
 /// `BackgroundActive` first); this only classifies it into the right sub-state.
@@ -1414,6 +1612,177 @@ mod tests {
             assert!(!refine_background_kind(&mut s, Some(BgClass::ReviewWatch)));
             assert_eq!(s.status, st);
         }
+    }
+
+    /// The recovery path: a background shell ended while the agent went back to
+    /// work, so the row's background status is disproved by the tree and the
+    /// session file says which rest-or-work shape replaces it. Every background
+    /// state has to escape, since the bug reproduced from `ReviewPending` but
+    /// the hole is in all three.
+    #[test]
+    fn a_disproved_background_status_promotes_to_active() {
+        for st in [
+            SessionStatus::BackgroundActive,
+            SessionStatus::BackgroundServer,
+            SessionStatus::ReviewPending,
+        ] {
+            let mut s = state_with(st.clone());
+            assert!(
+                promote_stale_background(&mut s, Some(&[]), Some(AgentActivity::Working)),
+                "{st:?} survived a clean tree read with no background shells"
+            );
+            assert_eq!(s.status, SessionStatus::Active);
+        }
+    }
+
+    /// The half that protects the demote-only rule. `bg_shells` returns `None`
+    /// when the process tree could not be read at all — promoting on that would
+    /// be acting on no evidence, which is precisely the spurious bounce into
+    /// `Active` the surrounding reconciliation is written to prevent. This is
+    /// the assertion that is easy to leave out and expensive to lose.
+    #[test]
+    fn an_unreadable_process_tree_never_promotes() {
+        let mut s = state_with(SessionStatus::ReviewPending);
+        assert!(!promote_stale_background(
+            &mut s,
+            None,
+            Some(AgentActivity::Working)
+        ));
+        assert_eq!(s.status, SessionStatus::ReviewPending);
+    }
+
+    #[test]
+    fn promotion_needs_a_working_agent_and_a_background_row() {
+        // A shell is still running → the status is not stale; classification,
+        // not promotion, owns this row.
+        let mut s = state_with(SessionStatus::ReviewPending);
+        let running = [shell("r3 watch review_abc", BgSeedKind::ReviewWatch)];
+        assert!(!promote_stale_background(
+            &mut s,
+            Some(&running),
+            Some(AgentActivity::Working)
+        ));
+        assert_eq!(s.status, SessionStatus::ReviewPending);
+
+        // Tree is empty, but the agent is at rest or the session file wasn't
+        // re-read this wake (`None`) — the demote-only path owns the exit to
+        // `Idle`; promotion must not invent work.
+        for activity in [None, Some(AgentActivity::Idle)] {
+            let mut s = state_with(SessionStatus::ReviewPending);
+            assert!(!promote_stale_background(&mut s, Some(&[]), activity));
+            assert_eq!(s.status, SessionStatus::ReviewPending);
+        }
+
+        // Not a background row at all: `Active`/`Idle` and the fine-grained
+        // hook-backed states are none of this function's business.
+        for st in [
+            SessionStatus::Idle,
+            SessionStatus::WaitingForApproval,
+            SessionStatus::Compacting,
+        ] {
+            let mut s = state_with(st.clone());
+            assert!(!promote_stale_background(
+                &mut s,
+                Some(&[]),
+                Some(AgentActivity::Working)
+            ));
+            assert_eq!(s.status, st);
+        }
+    }
+
+    /// An empty-but-readable tree must keep behaving like "nothing to classify"
+    /// everywhere *else*, or teaching `bg_shells` the distinction would change
+    /// the meaning of a parked row. `None` class → `refine_background_kind`
+    /// leaves the status alone.
+    #[test]
+    fn an_empty_tree_still_classifies_as_nothing() {
+        let mut first_seen = std::collections::HashMap::new();
+        let (class, deadline) = classify_and_learn(
+            Some(&[]),
+            &mut first_seen,
+            std::time::Duration::from_secs(3600),
+            tokio::time::Instant::now(),
+            |_| false,
+            |_| panic!("nothing running must never be learned"),
+        );
+        assert_eq!(class, None);
+        assert_eq!(deadline, None);
+    }
+
+    /// The socket health check keys on inode identity, not mere existence: a
+    /// path unlinked and re-bound by someone else is present again while our
+    /// listener is stranded on the old inode.
+    #[test]
+    fn hook_socket_loss_is_detected_by_identity_not_existence() {
+        let dir = std::env::temp_dir().join(format!("cm-sock-health-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.sock");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").unwrap();
+
+        let bound = file_identity(&path);
+        assert!(bound.is_some());
+        assert!(
+            !hook_socket_lost(&path, bound),
+            "untouched file reads intact"
+        );
+
+        // Unlinked — the observed failure.
+        std::fs::remove_file(&path).unwrap();
+        assert!(hook_socket_lost(&path, bound));
+
+        // Replaced: present again, different inode, our listener orphaned.
+        std::fs::write(&path, b"").unwrap();
+        assert!(std::fs::metadata(&path).is_ok());
+        assert!(hook_socket_lost(&path, bound));
+
+        // No identity recorded at bind time leaves nothing to compare, so
+        // presence alone has to count as intact — otherwise we would re-bind on
+        // every single tick.
+        assert!(!hook_socket_lost(&path, None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recovery itself, end to end: reap a live launcher's socket the way
+    /// macOS's `$TMPDIR` sweep did, then confirm the re-bound listener actually
+    /// serves a client connecting to the *same path* — which is all the agent
+    /// ever knows, since it read that path from `--settings` at startup and
+    /// never re-reads it. A re-bind that didn't accept again would look fine in
+    /// the log and still leave the session mute.
+    #[tokio::test]
+    async fn a_reaped_socket_is_rebound_and_serves_again() {
+        let dir = std::env::temp_dir().join(format!("cm-sock-rebind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rebind.sock");
+        let _ = std::fs::remove_file(&path);
+
+        let mut listener = bind_hook_socket(&path).unwrap();
+        let bound = file_identity(&path);
+        assert!(!hook_socket_lost(&path, bound));
+
+        // The failure: the socket is unlinked while the listener stays bound to
+        // the now-unreachable inode.
+        std::fs::remove_file(&path).unwrap();
+        assert!(hook_socket_lost(&path, bound));
+
+        let restored = restore_hook_socket(&mut listener, &path);
+        assert!(restored.is_some(), "re-bind failed");
+        assert!(!hook_socket_lost(&path, restored));
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("a hook must be able to reach the re-bound socket");
+        drop(client);
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            <UnixListener>::accept(&listener),
+        )
+        .await
+        .expect("re-bound listener never accepted");
+        assert!(accepted.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

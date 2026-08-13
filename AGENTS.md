@@ -52,7 +52,10 @@ protocol; `docs/crate-split.md` on the crate split and server payloads. The
 dirs `0700`, JSON `0600`, because state records the user's prompt text and cwds.
 Write through `create_dir_all_private` / `write_json_atomic`, never `fs::write`.
 All of it is safe to delete; each file regenerates or resets. Runtime sockets
-live under `$XDG_RUNTIME_DIR/captain-miao/`.
+live under `$XDG_RUNTIME_DIR/captain-miao/`, falling back to
+`~/.local/state/captain-miao/run/` where that is unset (macOS) — **never
+`$TMPDIR`**, which macOS reaps out from under a long-lived session. ssh's own
+sockets are the documented exception (`ssh_sock_dir`).
 
 ---
 
@@ -135,7 +138,11 @@ Anything local to one module is in that module's doc instead.
 - **Treat Claude's own session file as authoritative** on the
   working/idle/background-shell axis; mirror it, no edge-tracking. Refinement is
   **demote-only** — hooks own rest→`Active`. An unreadable or unrecognized read
-  maps to `None` (leave unchanged), never a definite state.
+  maps to `None` (leave unchanged), never a definite state. The one promotion
+  (`promote_stale_background`) is not an exception to that rule so much as a
+  different one: it fires only when the **process tree** disproves a background
+  status, never on the session file alone. Anything else that wants to promote
+  needs its own corroborating evidence, not a second opinion from the same file.
 - **Leave worktrees entirely to the agent.** captain-miao creates, names and
   cleans up nothing: `worktree_args` contributes `--worktree [name]` and the
   agent owns the branch, base ref, enforcement and cleanup. Resume and restart

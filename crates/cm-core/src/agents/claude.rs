@@ -409,9 +409,15 @@ impl StatsCursor {
 const SHELL_SNAPSHOT_MARKER: &str = "/shell-snapshots/snapshot-";
 
 /// The agent's currently-running `run_in_background` shells, each reduced to a
-/// normalized command `key` and a static [`BgSeedKind`]. `None` when no
-/// background shell is found or the process tree can't be read (the launcher
-/// leaves the status unrefined). Read from the **live process tree** — the Bash
+/// normalized command `key` and a static [`BgSeedKind`].
+///
+/// `None` means **the process tree could not be read**, and nothing may be
+/// concluded from it. An empty `Some` means the tree read cleanly and the agent
+/// has no background shell running — a positive fact, and the evidence the
+/// launcher needs to retire a background status that has gone stale. Collapsing
+/// the two (as this once did) makes "no shells" indistinguishable from "no
+/// answer", which is why a row whose review-watch had ended could sit in
+/// `ReviewPending` for the rest of its life. Read from the **live process tree** — the Bash
 /// tool runs each background command in a wrapper shell that stays a direct
 /// child of the agent for the task's lifetime — so the answer is present-tense
 /// truth and can't go stale: a task that ends with no transcript marker
@@ -423,15 +429,16 @@ const SHELL_SNAPSHOT_MARKER: &str = "/shell-snapshots/snapshot-";
 /// (`BackgroundActive`/`BackgroundServer`/`ReviewPending`), when no foreground
 /// tool shell can be among the children.
 pub fn bg_shells(agent_pid: u32) -> Option<Vec<BgShell>> {
-    classify_bg_shells(&child_cmdlines(agent_pid)?)
+    Some(classify_bg_shells(&child_cmdlines(agent_pid)?))
 }
 
 /// Reduce the agent's child command lines to its Bash-tool background shells
 /// (the [`SHELL_SNAPSHOT_MARKER`] wrapper), each normalized to its eval'd
 /// command and classified by command text alone. The wrapper embeds the eval'd
-/// command verbatim, so the classifiers match it unchanged. `None` when no
-/// wrapper shell is among the children.
-fn classify_bg_shells(cmdlines: &[String]) -> Option<Vec<BgShell>> {
+/// command verbatim, so the classifiers match it unchanged. Total, since the
+/// caller has already read the tree: no wrapper shell among the children is an
+/// empty vec, never `None` (see [`bg_shells`]).
+fn classify_bg_shells(cmdlines: &[String]) -> Vec<BgShell> {
     let shells: Vec<BgShell> = cmdlines
         .iter()
         .filter(|c| c.contains(SHELL_SNAPSHOT_MARKER))
@@ -451,7 +458,7 @@ fn classify_bg_shells(cmdlines: &[String]) -> Option<Vec<BgShell>> {
             BgShell { key, kind }
         })
         .collect();
-    (!shells.is_empty()).then_some(shells)
+    shells
 }
 
 /// Extract the agent's actual `run_in_background` command from the Bash-tool
@@ -2017,10 +2024,12 @@ mod tests {
         )
     }
 
-    /// The seed kinds of the classified background shells (or None when there's
-    /// no shell to classify), for terse assertions.
-    fn kinds(cmds: &[String]) -> Option<Vec<BgSeedKind>> {
-        classify_bg_shells(cmds).map(|v| v.into_iter().map(|s| s.kind).collect())
+    /// The seed kinds of the classified background shells, for terse assertions.
+    fn kinds(cmds: &[String]) -> Vec<BgSeedKind> {
+        classify_bg_shells(cmds)
+            .into_iter()
+            .map(|s| s.kind)
+            .collect()
     }
 
     /// [`wrapper`] is load-bearing for every test below it, and nothing checked
@@ -2074,7 +2083,7 @@ mod tests {
         ];
         for &(cmd, kind, why) in cases {
             let line = wrapper(cmd);
-            let seeds = classify_bg_shells(&[line]).expect("a wrapped command is a bg shell");
+            let seeds = classify_bg_shells(&[line]);
             assert_eq!(seeds.len(), 1, "{why}");
             // Assert the *pair*: the kind is only meaningful next to the key it
             // was derived from, and the key is what the learning store records.
@@ -2094,11 +2103,11 @@ mod tests {
         ];
         assert_eq!(
             kinds(&cmds),
-            Some(vec![
+            vec![
                 BgSeedKind::ReviewWatch,
                 BgSeedKind::LongRunning,
                 BgSeedKind::Other,
-            ])
+            ]
         );
     }
 
@@ -2108,10 +2117,13 @@ mod tests {
         // background tasks and must not block the refinement…
         let mcp = "node /home/riteye/.local/lib/some-mcp-server/index.js --stdio".to_string();
         let cmds = vec![mcp.clone(), wrapper("r3 watch review_2b40f7")];
-        assert_eq!(kinds(&cmds), Some(vec![BgSeedKind::ReviewWatch]));
-        // …and alone they're not a running set either (nothing to classify).
-        assert_eq!(kinds(&[mcp]), None);
-        assert_eq!(kinds(&[]), None);
+        assert_eq!(kinds(&cmds), vec![BgSeedKind::ReviewWatch]);
+        // …and alone they leave an *empty* set, which is a different fact from
+        // "the tree couldn't be read" (`bg_shells`' `None`). The launcher
+        // promotes a stale background row on the strength of this emptiness, so
+        // collapsing it back into `None` would silently disable that recovery.
+        assert!(kinds(&[mcp]).is_empty());
+        assert!(kinds(&[]).is_empty());
     }
 
     #[test]
@@ -2211,7 +2223,7 @@ mod tests {
         let children = parse_ps_child_cmdlines(ps, 4321);
         assert_eq!(children.len(), 2);
         assert!(children[0].starts_with("/bin/bash -c source"));
-        assert_eq!(kinds(&children), Some(vec![BgSeedKind::ReviewWatch]));
+        assert_eq!(kinds(&children), vec![BgSeedKind::ReviewWatch]);
     }
 
     /// End-to-end on the real `/proc`: a child we spawn ourselves shows up in

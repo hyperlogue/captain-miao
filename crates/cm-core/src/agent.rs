@@ -309,10 +309,13 @@ impl AgentControl {
     /// **live process tree** (see `claude::bg_shells`) and each classified by
     /// *what* it runs — the launcher's basis for refining a `BackgroundActive`
     /// row into `ReviewPending` (all review-watches), `BackgroundServer` (all
-    /// long-running services), or a busy transient task. `None` when nothing is
-    /// running or the tree can't be read (the caller leaves the status
-    /// unrefined). Always `None` for Codex, which has no `run_in_background`
-    /// concept.
+    /// long-running services), or a busy transient task.
+    ///
+    /// `None` means the tree could not be read, so nothing may be concluded; an
+    /// empty `Some` is the positive fact that nothing is running, which is what
+    /// lets the launcher retire a stale background status. Always `None` for
+    /// Codex, which has no `run_in_background` concept — and therefore never
+    /// reaches any of the states that reading would refine.
     pub fn bg_shells(self, agent_pid: u32) -> Option<Vec<BgShell>> {
         match self {
             AgentControl::Claude => claude::bg_shells(agent_pid),

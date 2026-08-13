@@ -56,21 +56,36 @@ pub fn state_dir() -> PathBuf {
         .join("captain-miao")
 }
 
+/// Where sockets and other runtime-lifetime files live.
+///
+/// `$XDG_RUNTIME_DIR` when set (Linux: `/run/user/<uid>`, a per-user tmpfs the
+/// OS clears at logout) — the right home for these, and used unchanged.
+///
+/// The fallback — macOS, where that variable is never set — is **not**
+/// `$TMPDIR`, which is where it used to point. macOS reaps `/var/folders/…/T`
+/// on a periodic sweep, and a launcher's hook socket living there is deleted out
+/// from under a session that outlives the sweep. Nothing notices: the launcher's
+/// listener stays bound to an unlinked inode, every hook silently fails to
+/// connect, and the row freezes at whatever status it last held while the
+/// session keeps running for hours. So the fallback goes under [`state_dir`],
+/// which nothing reaps. That also drops the `captain-miao-<uid>` namespacing the
+/// old path needed: a home directory is already per-user, so there is no shared
+/// world-writable dir left for another user to win a race in.
+///
+/// The trade is that these files now outlive a reboot, where `$TMPDIR` got them
+/// cleared for free — so a launcher killed without unwinding leaves an orphan
+/// behind. `sweep_dead_launcher_runtime_files` reaps those on the next launch.
+/// (ssh's control/forward sockets deliberately stay in [`ssh_sock_dir`]: they
+/// live under a much tighter path-length limit, and ssh re-establishes a
+/// control master whose socket went missing.)
 pub fn runtime_dir() -> PathBuf {
-    // XDG_RUNTIME_DIR is already per-user; when it's unset (or empty, which
-    // the XDG spec treats as unset) we fall back to the shared, world-writable
-    // temp dir, so namespace by uid to keep two users from colliding (and to
-    // avoid binding the launcher's control socket in a path another user could
-    // hijack).
+    // Per the XDG spec an empty env var is treated as unset, not as a relative
+    // path, so filter out the empty string before falling back.
     std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = unsafe { libc::getuid() };
-            std::env::temp_dir().join(format!("captain-miao-{uid}"))
-        })
-        .join("captain-miao")
+        .map(|d| PathBuf::from(d).join("captain-miao"))
+        .unwrap_or_else(|| state_dir().join("run"))
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -139,13 +154,15 @@ pub fn pool_socket_path() -> PathBuf {
 
 /// The base dir for ssh control/forward sockets, kept as short as possible.
 /// These live under the tightest constraint in the codebase: ssh's
-/// `ControlMaster` appends a ~17-char random suffix to `ControlPath`, and macOS
-/// caps a `sockaddr_un` path near 104 bytes while its `$TMPDIR` is already a
-/// ~49-char `/var/folders/...` path. The general [`runtime_dir`] nests
-/// `captain-miao-<uid>/captain-miao` (30 chars) under that, which pushes a
-/// hashed ControlPath + ssh's suffix to ~109 bytes — over the limit. So ssh
-/// sockets get their own flat `cm-<uid>` dir (no doubled app name) instead.
-/// `$XDG_RUNTIME_DIR` (short on Linux: `/run/user/<uid>`) is used when present.
+/// `ControlMaster` appends a ~17-char random suffix to `ControlPath`, on top of
+/// our own hashed name, while macOS caps a `sockaddr_un` path near 104 bytes.
+/// So they get their own flat `cm-<uid>` dir under `$TMPDIR` rather than
+/// nesting under [`runtime_dir`], whose macOS fallback is a `$HOME`-relative
+/// path — longer, and on a networked home directory unable to host a unix
+/// socket at all. Being reaped from `$TMPDIR` is survivable here in a way it is
+/// not for a launcher's hook socket: ssh simply re-establishes a control master
+/// whose socket went missing. `$XDG_RUNTIME_DIR` (short on Linux:
+/// `/run/user/<uid>`) is used when present.
 pub fn ssh_sock_dir() -> PathBuf {
     std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -1381,6 +1398,42 @@ mod tests {
             fwd.len() < 104,
             "forward socket too long ({}): {fwd}",
             fwd.len()
+        );
+    }
+
+    /// Runtime files must never land back in `$TMPDIR`. macOS reaps that tree on
+    /// a periodic sweep, and a launcher's hook socket removed from under a live
+    /// session takes the session's whole status pipeline with it, silently: the
+    /// listener stays bound to an unlinked inode, every hook fails to connect,
+    /// and the dashboard row freezes at whatever it last said for as long as the
+    /// session keeps running.
+    ///
+    /// Asserted on whichever branch this platform actually takes, so the macOS
+    /// fallback — the one that broke — is covered where it is used, and the
+    /// hook-socket path is checked against the same `sockaddr_un` cap as ssh's.
+    #[test]
+    fn runtime_files_never_live_in_the_reaped_temp_tree() {
+        let dir = runtime_dir();
+        match std::env::var("XDG_RUNTIME_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(xdg) => assert_eq!(dir, PathBuf::from(xdg).join("captain-miao")),
+            None => assert_eq!(dir, state_dir().join("run")),
+        }
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "runtime dir is back under the OS temp tree: {}",
+            dir.display()
+        );
+        // A launcher socket is `<runtime>/launchers/<pid>.sock`; it binds like
+        // any other and is subject to the same cap.
+        let sock = dir.join("launchers").join("4294967295.sock");
+        assert!(
+            sock.to_string_lossy().len() < 104,
+            "launcher socket path too long ({}): {}",
+            sock.to_string_lossy().len(),
+            sock.display()
         );
     }
 }
