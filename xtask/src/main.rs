@@ -318,7 +318,7 @@ const ALL_SERVER_VARIANT: &str = "bundle-linux-all";
 
 /// What `dist` builds when asked for nothing in particular: precisely what a
 /// release publishes. The plain build is deliberately absent — it is what a bare
-/// `cargo build` already produces, and nothing has shipped it since 0.4.0.
+/// `cargo build` already produces, and no release ships it.
 const DEFAULT_VARIANTS: &[&str] = &[SHIPPING_VARIANT, ALL_SERVER_VARIANT];
 
 impl Variant {
@@ -972,15 +972,15 @@ mod tests {
         };
         let v = find_variant("bundle-linux").unwrap();
 
-        let gz = root.join("server.gz");
-        std::fs::write(&gz, b"not really a gzip").unwrap();
+        let packed = root.join("server.xz");
+        std::fs::write(&packed, b"not really an xz stream").unwrap();
         let payload = |target: &str| server::Payload {
             target: target.to_string(),
             sha256: "a".repeat(64),
-            bin_path: gz.clone(),
-            packed_path: gz.clone(),
-            raw_len: 17,
-            packed_len: 17,
+            bin_path: packed.clone(),
+            packed_path: packed.clone(),
+            raw_len: 23,
+            packed_len: 23,
             provenance: server::Provenance::Local,
             repacked: false,
         };
@@ -1110,8 +1110,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The plain build must never come back as a published artifact: since 0.4.0
-    /// every download is bundled, and a plain tarball under the same name would
+    /// The plain build must never come back as a published artifact: every
+    /// download is bundled, and a plain tarball under the same name would
     /// silently strip the deploy path from whoever grabbed it.
     #[test]
     fn no_default_variant_is_the_plain_build() {

@@ -90,7 +90,7 @@ plain `miao` carrying nothing, single-arch bundles, a `miao-bundle-linux-all`
 carrying every published server — and a plain `cargo build` is byte-for-byte what
 it would be if none of this existed.
 
-Since 0.4.0 **every published artifact is bundled**: what ships is
+**Every published artifact is bundled**: what ships is
 `bundle-linux-x86_64` (one server, x86-64 glibc) for all four host targets, plus
 `bundle-linux-all` as a separate GitHub-only download. The plain build stays a
 variant — it is what a bare `cargo build` gives you — but nothing publishes it.
@@ -222,11 +222,12 @@ loadable-extension machinery from the bundled amalgamation — the server's only
 SQLite use is one read-only `SELECT` for Codex thread titles.
 
 Measured on the real cross-build — `prepare-servers` through zigbuild, the same
-path CI publishes from — for `x86_64-unknown-linux-gnu`, gzipped as the payload
-ships: **2,975,483 → 2,137,645, −28.2%** (raw 6,633,456 → 4,711,104, −29.0%).
-Roughly 840 KiB off every npm platform package and every dashboard tarball, and
-~3.2 MB off the all-server artifact. A native non-zigbuild build measures −30.0%;
-the shipped figure is the one to quote.
+path CI publishes from — for `x86_64-unknown-linux-gnu`, gzipped (the codec the
+payload used at the time): **2,975,483 → 2,137,645, −28.2%** (raw 6,633,456 →
+4,711,104, −29.0%). Roughly 818 KiB off every npm platform package and every
+dashboard tarball, and ~3.2 MiB off the all-server artifact. A native
+non-zigbuild build measures −30.0%; the zigbuild figure is the one to quote,
+because it is the path a release is actually built on.
 
 Two findings worth not re-deriving. `opt-level` reaches **C**, not just Rust —
 `cc` scrapes cargo's `OPT_LEVEL` and passes `-O<level>` straight through — so
@@ -236,6 +237,32 @@ Rust at `3` and dropping only `libsqlite3-sys` to `"s"` is −9.6% by itself, or
 −16.6% with the trim, which is 55% of the total for zero effect on any Rust code.
 That is the fallback if `"s"` ever turns out to cost real throughput — nobody has
 benchmarked `s` against `3`, which is the honest gap in all of this.
+
+**Then the codec, which compounds with the profile.** The embedded format is
+entirely internal — `xtask` packs it, the dashboard unpacks it before uploading,
+and the remote host only ever receives the plain binary — so both halves ship
+from the same commit and there is no compatibility surface to preserve. That
+freedom is the whole argument for picking on merit: gzip → **xz preset 6** took
+the same x86-64 glibc payload 2,137,645 → 1,675,736 (−21.6%), where zstd measured
+−16.1% and brotli −20.4%. Compounded with the profile, the payload a release
+actually ships went **2,975,483 → 1,675,736, −43.7%** — about 1.24 MiB off every
+npm install and every dashboard tarball.
+
+Three constraints worth not re-deriving. **Preset 6, not 9**, and that is not a
+compromise: on a ~4.7 MB server the two emit byte-identical output, because an
+LZMA dictionary larger than the input buys nothing and 6's is already 8 MiB. What
+9 would change is the *decoder* — the dictionary size rides in the stream header,
+so it would oblige every dashboard to allocate 65 MiB to unpack rather than 9.
+**Encode with C liblzma in `xtask`, decode with pure-Rust `lzma-rs` in the
+dashboard**, an asymmetry that is measured rather than stylistic: `lzma-rs`'s
+encoder does not compress at all (it turned a 4,711,104-byte server into
+4,711,376), while its decoder is fine — and `xtask` runs on a build machine where
+a C toolchain is a given, whereas the dashboard cross-compiles to four targets
+where it is not. **No BCJ/x86 filter**, which would be the obvious next win on
+executables: `lzma-rs` implements LZMA2 only, so a filtered stream would pack
+smaller in `xtask` and fail to unpack in the dashboard. That is the realistic way
+to break the pairing, so `xtask` round-trips `pack`'s real output through the
+decoder the dashboard ships — the one place in the tree where both codecs exist.
 
 **Building the variants: `cargo xtask dist`** builds the named release artifacts
 into `dist/`; with no `--variant` it builds exactly what a release publishes

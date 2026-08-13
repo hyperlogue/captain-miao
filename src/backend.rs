@@ -6087,12 +6087,14 @@ mod tests {
     /// line of it — so run it whenever the deploy path changes:
     ///
     /// ```text
-    /// # Obtain a server and note where its manifest landed:
-    /// cargo xtask prepare-servers --out /tmp/srv
-    /// printf '%s\t%s\t%s\n' x86_64-unknown-linux-gnu "$SHA" /tmp/srv/…/server.gz \
-    ///   > /tmp/payloads.tsv
+    /// # `dist` obtains the server, packs it, and writes the very manifest
+    /// # `build.rs` reads — one TSV per variant under the target dir — so there
+    /// # is nothing to hand-roll here. (`prepare-servers --out` is the wrong
+    /// # tool: it lays out *uncompressed* `<target>/miao-server` for publishing,
+    /// # and the manifest's third column wants the packed `.xz`.)
+    /// cargo xtask dist --variant bundle-linux-x86_64
     ///
-    /// CM_SERVER_PAYLOAD_MANIFEST=/tmp/payloads.tsv \
+    /// CM_SERVER_PAYLOAD_MANIFEST=target/cm-server-payloads/bundle-linux-x86_64.tsv \
     ///   CM_TEST_SSH_TARGET=127.0.0.1 \
     ///   CM_TEST_SSH_OPTS="-p 2299 -i /tmp/id -o StrictHostKeyChecking=no" \
     ///   cargo test -p captain-miao --features remote -- \

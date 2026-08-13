@@ -250,9 +250,11 @@ miao --version                                   # what a built binary embeds
 # Ignored tests that need a live host / server. The payload reaches the test
 # binary through the manifest env var, never a cargo feature — there is no
 # `bundle-*` feature, and without a manifest there is nothing to deploy:
-CM_SERVER_PAYLOAD_MANIFEST=/tmp/payloads.tsv CM_TEST_SSH_TARGET=box \
+CM_SERVER_PAYLOAD_MANIFEST=target/cm-server-payloads/bundle-linux-x86_64.tsv \
+  CM_TEST_SSH_TARGET=box \
   cargo test -p captain-miao -- --ignored provisions_a_real_host
-#   (src/backend.rs's test doc has the full recipe for building that manifest)
+#   (`cargo xtask dist` writes that manifest as a side effect — one TSV per
+#    variant; src/backend.rs's test doc has the full recipe)
 cargo test -p captain-miao -- --ignored drives_a_real_tmux_server
 # Ghostty's own live test. macOS, Ghostty >= 1.3 running, and captain-miao
 # granted Automation permission for it — the backend is otherwise written and

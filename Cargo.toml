@@ -118,13 +118,16 @@ codegen-units = 1
 # What `miao-server` is built with — `xtask`'s `server::build`, never a bare
 # `cargo build`. Separate from `[profile.release]` on purpose: the dashboard is
 # an interactive TUI on the machine you are sitting at, and has no reason to
-# trade throughput for bytes. The server is a payload, and since 0.4.0 every
-# published dashboard carries one, so its size is paid by every npm install and
-# every GitHub download.
+# trade throughput for bytes. The server is a payload, and every published
+# dashboard carries one, so its size is paid by every npm install and every
+# GitHub download.
 #
-# All figures below are measured on a native x86-64 build, gzipped as the
-# payload ships, against a 3,075,415-byte baseline of this same profile at
-# `opt-level = 3`.
+# All figures below are measured on a native x86-64 build and **gzipped**,
+# against a 3,075,415-byte baseline of this same profile at `opt-level = 3`.
+# Gzip because that is what the payload shipped in when these were taken; it
+# ships xz now (see `lzma-rs` above), which compounds with this rather than
+# replacing it — the ratios here still hold, the absolute bytes are no longer
+# what lands in a release.
 #
 # This profile, with the overrides and the SQLite trim `xtask` sets alongside it:
 # 2,154,035 (-30.0%). On the real zigbuild cross-build CI publishes from, the
