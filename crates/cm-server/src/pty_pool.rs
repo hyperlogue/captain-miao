@@ -13,9 +13,11 @@
 //! child (§8), so no double-fork actually happens — but honoring the
 //! pre-threads contract costs nothing and keeps the call sound.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -128,6 +130,17 @@ fn prepare_daemon_socket(socket: &Path) -> Result<DaemonStart> {
 /// scratch dir off the socket string, so the explicit path keeps both private to
 /// us. Must be called before the tokio runtime is built.
 fn run_shpool(global: &[&str], sub: &[&str]) -> Result<()> {
+    run_shpool_with(global, sub, None)
+}
+
+/// [`run_shpool`] with libshpool's hook callbacks. Only the `daemon` subcommand
+/// consults them (the attach path ignores the argument), and only the daemon
+/// runs in the server's process, so this is where [`PoolHooks`] goes in.
+fn run_shpool_with(
+    global: &[&str],
+    sub: &[&str],
+    hooks: Option<Box<dyn libshpool::Hooks + Send + Sync>>,
+) -> Result<()> {
     // libshpool binds the socket but doesn't create our custom socket's parent.
     let socket = pool_socket_path();
     if let Some(parent) = socket.parent() {
@@ -139,7 +152,7 @@ fn run_shpool(global: &[&str], sub: &[&str]) -> Result<()> {
     let args = Args::try_parse_from(&argv).context("building libshpool args")?;
     // Safety: callers run before the tokio runtime (hence any thread) is built;
     // see the module docs.
-    unsafe { libshpool::run(args, None) }
+    unsafe { libshpool::run(args, hooks) }
 }
 
 /// Run the libshpool daemon in the foreground. Blocks until it exits.
@@ -169,7 +182,11 @@ pub(crate) fn run_daemon() -> Result<()> {
         DaemonStart::Proceed => {
             let config = write_pool_config()?;
             let config = config.to_string_lossy().into_owned();
-            run_shpool(&["--no-daemonize", "--config-file", &config], &["daemon"])
+            run_shpool_with(
+                &["--no-daemonize", "--config-file", &config],
+                &["daemon"],
+                Some(Box::new(PoolHooks)),
+            )
         }
     }
 }
@@ -192,7 +209,11 @@ fn shpool_decode<T: DeserializeOwned, R: Read>(r: R) -> Result<T> {
 
 /// The pool daemon's read-only `List`, as `session name → has a client
 /// attached`. One connection, no side effects.
-fn pool_attached_map() -> Result<std::collections::HashMap<String, bool>> {
+///
+/// This is the *attach client's* reading, taken from a separate short-lived
+/// process, and it is only used for the busy pre-check below — where a sample
+/// is all there is. The daemon serves its own rows from [`ATTACHED`] instead.
+fn pool_attached_map() -> Result<HashMap<String, bool>> {
     let stream =
         UnixStream::connect(pool_socket_path()).context("connecting to the pty pool socket")?;
     let _version: VersionHeader =
@@ -206,16 +227,99 @@ fn pool_attached_map() -> Result<std::collections::HashMap<String, bool>> {
         .collect())
 }
 
+/// `pool session name → a client is attached`, maintained from the pool
+/// daemon's own hooks rather than sampled with a `List`.
+///
+/// The distinction is the whole point. libshpool has no attached *flag*: its
+/// `List` reconstructs the bit by `try_lock`ing the session's `SessionInner`,
+/// which the attach path holds for exactly as long as a client is attached. So
+/// any query is a sample, and a sample is stale the moment it is read — a
+/// detach and a re-attach either side of the round trip both answer truthfully
+/// and disagree. The hooks instead fire *in the daemon's own causal order*, so
+/// what lands here is a sequence of transitions, not a series of guesses.
+///
+/// Ordering is safe even for a steal, which is the case that looks racy: the
+/// stealing client cannot take `inner` until the kicked one releases it, and the
+/// kicked one's `on_client_disconnect` fires *before* that release, so the
+/// sequence is always `false` (old client) then `true` (new one).
+///
+/// It needs no seeding: the pool is a thread of *this* process
+/// (`server::start_pool_thread`), so a daemon only now starting hosts no
+/// sessions and the hooks have seen every one that can exist. Where the pool
+/// thread found a socket already bound and stood down, the map simply stays
+/// empty — every row's bit reads `None` ("unknown"), which the UI treats as
+/// "don't offer a steal". The one leak is a session whose shell fails to spawn
+/// after `on_new_session`: inert (no launcher, so no row ever names it) and
+/// bounded by the daemon's own lifetime.
+static ATTACHED: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(Default::default);
+
 /// The attached-bit overlay the daemon's server-core stamps onto the rows it
 /// serves (`docs/remote-sessions.md` §10.2), so a dashboard can show
 /// attached/detached per row and offer a steal only when one actually applies.
-/// A pool that can't be reached yields an empty map — every row's bit stays
-/// `None` ("unknown"), never a false "detached".
-pub(crate) fn attached_by_session() -> std::collections::HashMap<String, bool> {
-    pool_attached_map().unwrap_or_else(|e| {
-        tracing::debug!(target: "captain_miao::pool", "attached-bit probe failed: {e}");
-        Default::default()
-    })
+pub(crate) fn attached_by_session() -> HashMap<String, bool> {
+    ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// libshpool's callbacks into captain-miao, and the only writer of [`ATTACHED`].
+///
+/// Each one also wakes every subscriber, because an attach or a detach touches
+/// nothing under `sessions/` — without this the notify watch never fires and a
+/// dashboard's `attached` bit stays at whatever it was when some *unrelated*
+/// session last wrote state. The rows most affected are the idle ones, which is
+/// exactly what the steal confirm and the reconnect sweep act on.
+///
+/// Hooks run inline on the daemon's control path and must not block. Both
+/// operations here are non-blocking: an uncontended `Mutex` and a `broadcast`
+/// send that discards its own "no receivers" error.
+struct PoolHooks;
+
+impl PoolHooks {
+    fn set(name: &str, attached: bool) {
+        ATTACHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), attached);
+        crate::server::wake_subscribers();
+    }
+}
+
+impl libshpool::Hooks for PoolHooks {
+    fn on_new_session(&self, name: &str) -> anyhow::Result<()> {
+        // A session is created by its first attach, so it is born attached.
+        Self::set(name, true);
+        Ok(())
+    }
+
+    fn on_reattach(&self, name: &str) -> anyhow::Result<()> {
+        Self::set(name, true);
+        Ok(())
+    }
+
+    fn on_busy(&self, name: &str) -> anyhow::Result<()> {
+        // Not a transition — a *corroboration*, and the one signal that arrives
+        // when someone actively cares: a refused attach proves a client holds
+        // the pty, so an entry that somehow says otherwise is wrong right now.
+        Self::set(name, true);
+        Ok(())
+    }
+
+    fn on_client_disconnect(&self, name: &str) -> anyhow::Result<()> {
+        Self::set(name, false);
+        Ok(())
+    }
+
+    fn on_shell_disconnect(&self, name: &str) -> anyhow::Result<()> {
+        ATTACHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        // The launcher's own state file usually goes first and the `sessions/`
+        // watch catches it. This still earns the wake for a launcher killed
+        // hard enough to skip its cleanup: the file is pruned on a re-read, and
+        // nothing else would ever ask for one.
+        crate::server::wake_subscribers();
+        Ok(())
+    }
 }
 
 /// Whether the named pool session currently has a client attached.
@@ -394,7 +498,42 @@ pub(crate) fn run_attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libshpool::Hooks;
     use std::os::unix::net::UnixListener;
+
+    /// The attached bit as a state machine over the daemon's hooks, including
+    /// the sequence a steal produces. The kicked client's `on_client_disconnect`
+    /// always precedes the stealing client's `on_reattach` (it fires before the
+    /// `inner` lock it is waiting on is released), so the pair must settle on
+    /// *attached* — the inverse order would leave a held session looking free
+    /// and put `Space A` on a row it cannot have.
+    #[test]
+    fn the_hooks_drive_the_attached_bit() {
+        // A name of this test's own: `ATTACHED` is process-wide.
+        let s = "cm-claude-hooks-1";
+        let bit = || attached_by_session().get(s).copied();
+        assert_eq!(bit(), None, "unknown until the session exists");
+
+        PoolHooks.on_new_session(s).unwrap();
+        assert_eq!(bit(), Some(true), "created by its first attach");
+
+        PoolHooks.on_client_disconnect(s).unwrap();
+        assert_eq!(bit(), Some(false));
+
+        PoolHooks.on_reattach(s).unwrap();
+        assert_eq!(bit(), Some(true));
+
+        // The steal, in the order the daemon produces it.
+        PoolHooks.on_client_disconnect(s).unwrap();
+        PoolHooks.on_reattach(s).unwrap();
+        assert_eq!(bit(), Some(true), "a steal ends attached, not free");
+
+        PoolHooks.on_busy(s).unwrap();
+        assert_eq!(bit(), Some(true), "a refusal proves someone holds it");
+
+        PoolHooks.on_shell_disconnect(s).unwrap();
+        assert_eq!(bit(), None, "the session is gone, not detached");
+    }
 
     /// Pin this crate's copy of the shpool wire codec (struct-map msgpack,
     /// value-framed) — the busy pre-check's `List` must keep decoding what the

@@ -1213,9 +1213,31 @@ attach subargs, bypassing only the *busy* half of the pre-guard — the
 stale-name/resurrection guard is never forceable, since attaching to a dead name
 would silently mint a bare login shell wearing it) and through
 `miao-client attach`. In the TUI it's `Space s` behind a y/N confirm,
-and the daemon overlays libshpool's live attached bit onto the rows it serves
+and the daemon overlays the pool's attached bit onto the rows it serves
 (`LauncherState.attached`, exactly like the Codex title overlay) so the UI can
 tell whether anyone is actually there and skip the confirm when nobody is.
+
+**The bit is pushed by libshpool's hooks, not sampled** (`pty_pool::PoolHooks`,
+feeding `ATTACHED`). It has to be. libshpool keeps no attached flag: its `List`
+reconstructs one by `try_lock`ing the session's `SessionInner`, the mutex the
+attach path holds for exactly as long as a client is attached. So every query is
+a *sample*, stale the moment it is read — a detach and a re-attach either side of
+the round trip both answer truthfully and disagree — whereas the hooks fire in
+the daemon's own causal order. The hooks also carry the **wake**: an attach or a
+detach touches nothing under `sessions/`, so before this the notify watch never
+fired for one and the bit reached other dashboards only when some unrelated
+session happened to write state. Idle rows were the worst case, and idle rows are
+what the steal confirm and the reconnect sweep act on. No seeding is needed —
+the pool is a thread of the daemon's own process, so a daemon only now starting
+hosts no sessions and the hooks have seen every one that can exist.
+
+The one remaining sample is the attach wrapper's busy pre-check, which runs in a
+separate short-lived process and so can only ask. It stays racy on purpose: a
+wrong "busy" costs a retry, and a wrong "free" falls through to libshpool's own
+refusal. What makes that acceptable is that the attach attempt is the only
+operation that actually takes the lock — it is a transaction, not an
+observation — so its answer is authoritative, and §6 spends it: `ATTACH_EXIT_BUSY`
+names the reason in the dashboard and corrects the row it came from.
 
 **Still open: which pool engine.** The adjudication asked to price **tmux**
 (`tmux -S`, private socket) and **zellij** behind the existing

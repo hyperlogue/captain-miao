@@ -24,8 +24,8 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -424,6 +424,27 @@ fn stop(force: bool) -> Result<()> {
     }
 }
 
+/// The one wake channel every subscribed connection's diff loop listens on.
+///
+/// A `static` rather than a local of [`serve`] because the pool thread starts
+/// *before* the runtime does and its hooks are a writer (`pty_pool::PoolHooks`)
+/// — an attach or a detach is a change no filesystem event announces. Building
+/// the channel needs no runtime, and `send` from a non-async thread is
+/// non-blocking, so a hook can wake the loop directly.
+static CHANGES: LazyLock<broadcast::Sender<()>> = LazyLock::new(|| broadcast::channel::<()>(64).0);
+
+/// Wake every subscribed connection to re-read and diff. Cheap to over-call:
+/// `push_changes` sends only what actually differs from what that connection
+/// last saw, so a wake with nothing behind it costs one read and pushes
+/// nothing. A wake before anyone has subscribed is discarded.
+///
+/// The pool hooks are the only caller, so without them the notify watch is once
+/// again the only writer and this has nothing to do.
+#[cfg(feature = "pty-pool")]
+pub(crate) fn wake_subscribers() {
+    let _ = CHANGES.send(());
+}
+
 /// The async server core: bind the control socket, watch `sessions/`, and serve
 /// connections until SIGTERM or idle-exit. Assumes the singleton check + pid file
 /// + (with pty-pool) the pool thread are already set up by `ensure`.
@@ -431,10 +452,10 @@ async fn serve() -> Result<()> {
     let sock_path = state::server_sock_path();
     let mut listener = bind_control_socket(&sock_path)?;
 
-    // One notify watch on `sessions/`, fanned out to every subscriber via a
-    // broadcast channel — each connection diffs the change against what it last
-    // sent (so late joiners stay correct after their own snapshot).
-    let (changes_tx, _) = broadcast::channel::<()>(64);
+    // One notify watch on `sessions/`, fanned out to every subscriber via the
+    // wake channel — each connection diffs the change against what it last sent
+    // (so late joiners stay correct after their own snapshot).
+    let changes_tx = CHANGES.clone();
     let _watcher = start_sessions_watcher(changes_tx.clone()).context("watch sessions dir")?;
 
     // The daemon is the host's server-core: on top of the reads it owns the
