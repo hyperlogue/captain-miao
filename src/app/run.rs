@@ -1295,15 +1295,13 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             // otherwise be shown, answered, and silently do nothing — and the
             // *fresh* prompt for the same host is queued right behind it, so
             // the user would be asked the same thing twice.
-            && let Some(prompt) = std::iter::from_fn(|| app.download_prompts.try_recv().ok())
+            && let Some(prompt) = std::iter::from_fn(|| app.consent_prompts.try_recv().ok())
                 .find(|p| !p.reply.is_closed())
         {
             app.pending_confirm = Some(PendingConfirm {
-                prompt: format!(
-                    "Download miao-server for {} on host \"{}\"?\n{} [y/N]",
-                    prompt.target, prompt.host.0, prompt.url
-                ),
-                action: Action::AllowServerDownload(prompt.reply),
+                // The asker phrased it; this only adds the answer key.
+                prompt: format!("{} [y/N]", prompt.question),
+                action: Action::GrantConsent(prompt.reply),
             });
             app.input_mode = InputMode::Confirm;
             needs_redraw = true;
@@ -1926,7 +1924,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                     // The only "yes" that is just an answer. A refusal never
                     // reaches here: `handle_confirm_key` drops the action, and
                     // the dropped sender is what the waiting task reads as no.
-                    Action::AllowServerDownload(reply) => {
+                    Action::GrantConsent(reply) => {
                         let _ = reply.send(true);
                     }
                     Action::CopySessionId(sid) => {

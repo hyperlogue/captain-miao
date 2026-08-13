@@ -428,11 +428,23 @@ the full sequence and re-runs it on every reconnect:
    sentence and the `⚠` stays lit.
 
    The probe carries one rider that isn't about the binary: **does this host
-   have a terminfo entry for the dashboard's own `TERM`?** If not, the local
-   entry is piped into the host's `tic` (`infocmp -x` → `tic -x -o ~/.terminfo`,
-   the same stream-it-over-the-open-connection shape as the deploy, at a
-   thousandth of the size) and the host is asked to resolve the name afterwards
-   — tic's exit status says the file compiled, not that ncurses will find it.
+   have a terminfo entry for the dashboard's own `TERM`?** If not, the dashboard
+   **asks** — on the same consent channel as the download, so it inherits the
+   queueing, the 90s lapse, and the rule that every ambiguous outcome (no UI,
+   Esc, quit, a timeout) declines. Deploying a server is what the user asked for
+   by adding the host; writing into their `$HOME` is a side effect they didn't,
+   and that is the line the prompt draws. A **decline is remembered without a
+   deadline in a gate that is never cleared** — unlike the deploy's, which
+   forgets once the host works. That asymmetry is the whole point: a host that
+   connects perfectly well is exactly the host that would otherwise re-ask on
+   every reconnect. A *failure* still uses the ordinary cooldown, since a full
+   disk may not be true next week and the user did say yes.
+
+   On a yes, the local entry is piped into the host's `tic` (`infocmp -x` →
+   `tic -x -o ~/.terminfo`, the same stream-it-over-the-open-connection shape as
+   the deploy, at a thousandth of the size) and the host is asked to resolve the
+   name afterwards — tic's exit status says the file compiled, not that ncurses
+   will find it.
    It belongs *here*, in provisioning, because it cannot help later: the pool
    wrapper rewrites an unresolvable `TERM` to `xterm-256color`, and libshpool
    fixes a session's environment when it **spawns** the command, so that rewrite

@@ -1531,6 +1531,11 @@ const REMOTE_MARKER_REL: &str = ".cache/captain-miao/bin/miao-server.sha256";
 struct Provisioning<'a> {
     upload: &'a mut UploadGate,
     download: &'a mut UploadGate,
+    /// The terminfo offer's memory. A third gate rather than a reused one
+    /// because this is the only one that is **never cleared**: the other two
+    /// forget once the host demonstrably works, which is right for a transient
+    /// deploy failure and exactly wrong for a preference the user stated.
+    terminfo: &'a mut UploadGate,
     host: &'a HostId,
 }
 
@@ -1561,16 +1566,17 @@ fn release_url(base: &str, version: &str, target: &str) -> String {
 /// call from the UI thread parks in `block_in_place` waiting on this host, so an
 /// unanswered popup must not wedge it indefinitely. A lapse is treated exactly
 /// like a decline, and remembered the same way.
-const DOWNLOAD_CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A pending "may I download a server?" question, on its way to the UI.
 ///
 /// The download is the only step in this design that leaves the machine, so it
 /// asks first — through the same y/N machinery `Space e` and host removal use.
-pub(crate) struct DownloadPrompt {
-    pub(crate) host: HostId,
-    pub(crate) target: String,
-    pub(crate) url: String,
+pub(crate) struct ConsentPrompt {
+    /// The question, already phrased by whoever is asking — the backend knows
+    /// what it wants to do and the UI only renders it, so a second thing to ask
+    /// about needs no new channel, no new queueing rule and no new timeout.
+    pub(crate) question: String,
     /// Answered with `true` to allow. **Dropping it means no**, which is what
     /// makes every path that doesn't explicitly allow — pressing `n`, pressing
     /// Esc, closing the dashboard — decline safely. Nothing may add a
@@ -1585,13 +1591,13 @@ pub(crate) struct DownloadPrompt {
 /// in tests, and anywhere there is no TUI to ask — consent is **denied**, which
 /// is the safe direction: a download that nobody could have approved must not
 /// happen silently.
-static DOWNLOAD_CONSENT: std::sync::OnceLock<mpsc::UnboundedSender<DownloadPrompt>> =
+static CONSENT: std::sync::OnceLock<mpsc::UnboundedSender<ConsentPrompt>> =
     std::sync::OnceLock::new();
 
 /// Hand the dashboard's consent channel to the backends. Called once, from
 /// `App::new`.
-pub(crate) fn set_download_consent(tx: mpsc::UnboundedSender<DownloadPrompt>) {
-    let _ = DOWNLOAD_CONSENT.set(tx);
+pub(crate) fn set_consent_channel(tx: mpsc::UnboundedSender<ConsentPrompt>) {
+    let _ = CONSENT.set(tx);
 }
 
 /// How long a failed upload suppresses the next attempt for the same payload.
@@ -2657,26 +2663,18 @@ async fn upload_server(
 /// Returns `false` on a decline, on a lapse, and whenever there is no UI to ask
 /// — every ambiguous outcome refuses, because this is the one step that leaves
 /// the machine.
-async fn ask_download_consent(host: &HostId, target: &str, url: &str) -> bool {
-    let Some(tx) = DOWNLOAD_CONSENT.get() else {
+async fn ask_consent(question: String) -> bool {
+    let Some(tx) = CONSENT.get() else {
         return false;
     };
     let (reply, rx) = oneshot::channel();
-    if tx
-        .send(DownloadPrompt {
-            host: host.clone(),
-            target: target.to_string(),
-            url: url.to_string(),
-            reply,
-        })
-        .is_err()
-    {
+    if tx.send(ConsentPrompt { question, reply }).is_err() {
         return false;
     }
     // A closed channel is a decline: the UI drops the sender on `n`, on Esc, and
     // on quit, so refusal needs no message of its own.
     matches!(
-        tokio::time::timeout(DOWNLOAD_CONSENT_TIMEOUT, rx).await,
+        tokio::time::timeout(CONSENT_TIMEOUT, rx).await,
         Ok(Ok(true))
     )
 }
@@ -2839,7 +2837,12 @@ async fn try_download_candidate(
         return None;
     }
     log.info(format!("nothing local for {wanted}; asking to download it"));
-    if !ask_download_consent(host, wanted, &url).await {
+    if !ask_consent(format!(
+        "Download miao-server for {wanted} on host \"{}\"?\n{url}",
+        host.0
+    ))
+    .await
+    {
         log.info(format!("download of {wanted} declined"));
         gate.record_refusal(&url, "you declined the download".to_string());
         return None;
@@ -2908,26 +2911,59 @@ async fn resolve_remote_exe(
         },
     ));
 
-    // Before anything else: if the host can't describe this terminal, teach it.
-    // Cheap, idempotent (the next probe answers `yes` and this never runs
-    // again), and strictly ahead of the first session — which is the only time
-    // it can help, since a pooled session's terminfo is fixed at create.
+    // Before anything else: if the host can't describe this terminal, offer to
+    // teach it. Strictly ahead of the first session, which is the only time it
+    // can help — a pooled session's terminfo is fixed when its pty is created.
+    //
+    // **Asked, not assumed.** Deploying a server is the thing the user asked
+    // for by adding the host; writing a terminfo entry into their `$HOME` is a
+    // side effect they did not, and "captain-miao put files on my server" is
+    // not a sentence a tool gets to earn quietly. It rides the same consent
+    // channel as the download, so it inherits the queueing, the timeout, and
+    // the rule that every ambiguous outcome — no UI, a lapse, Esc, quit —
+    // declines.
     if probe.terminfo == Some(false)
         && let Some(term) = terminfo_to_provision()
     {
-        match install_terminfo(target, opts, &term).await {
-            Ok(()) => {
-                tracing::info!(target: "captain_miao::provision", "{target}: installed {term} terminfo");
-                log.info(format!(
-                    "installed the {term} terminfo in ~/.terminfo — sessions opened from here keep it"
-                ));
+        let now = Instant::now();
+        // A decline is a standing preference, not a transient failure, so it is
+        // recorded with no deadline and this gate — unlike the deploy's — is
+        // never cleared: a host that connects fine is exactly the host that
+        // would otherwise re-ask on every reconnect, forever.
+        if let Some(previous) = prov.terminfo.suppressed(term.as_str(), now) {
+            log.info(format!("not installing the {term} terminfo: {previous}"));
+        } else if ask_consent(format!(
+            "Host \"{}\" has no terminfo for {term}.\nInstall it in ~/.terminfo there? \
+             Sessions opened from this terminal will keep {term} instead of falling back \
+             to xterm-256color.",
+            host.0
+        ))
+        .await
+        {
+            match install_terminfo(target, opts, &term).await {
+                Ok(()) => {
+                    tracing::info!(target: "captain_miao::provision", "{target}: installed {term} terminfo");
+                    log.info(format!(
+                        "installed the {term} terminfo in ~/.terminfo — sessions opened from here keep it"
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(target: "captain_miao::provision", "{target}: {term} terminfo install failed: {e}");
+                    // A cooldown, not a refusal: a full disk or a missing tic
+                    // may not be true next week, and the user said yes once.
+                    prov.terminfo.record_failure(term.as_str(), now, e.clone());
+                    log.error(format!(
+                        "could not install the {term} terminfo ({e}); sessions here will run as xterm-256color"
+                    ));
+                }
             }
-            Err(e) => {
-                tracing::warn!(target: "captain_miao::provision", "{target}: {term} terminfo install failed: {e}");
-                log.error(format!(
-                    "could not install the {term} terminfo ({e}); sessions here will run as xterm-256color"
-                ));
-            }
+        } else {
+            log.info(format!(
+                "{term} terminfo install declined; sessions here will run as xterm-256color \
+                 (removing and re-adding the host asks again)"
+            ));
+            prov.terminfo
+                .record_refusal(term.as_str(), "you declined it".to_string());
         }
     }
 
@@ -3126,6 +3162,8 @@ async fn connection_task(
     // payload we have not fetched has no digest yet. Same shape and the same
     // reason: a decline or a 404 must not be re-attempted every backoff tick.
     let mut download_gate = UploadGate::default();
+    // Deliberately absent from the `clear()` below — see `Provisioning::terminfo`.
+    let mut terminfo_gate = UploadGate::default();
     // The diagnosis the last attempt reached, held across the wait *and* the
     // next attempt. Retrying doesn't make "no miao-server on the host" any less
     // true, so blinking the sentence off to `connecting` once per backoff tick
@@ -3166,6 +3204,7 @@ async fn connection_task(
                     &mut Provisioning {
                         upload: &mut upload_gate,
                         download: &mut download_gate,
+                        terminfo: &mut terminfo_gate,
                         host: &host,
                     },
                     &log,
@@ -4950,6 +4989,37 @@ mod tests {
         assert!(gate.suppressed("sha-a", t0).is_none());
     }
 
+    /// A *decline* is a decision, not a symptom, and the two are remembered
+    /// differently. This is what the terminfo offer rides on: its gate is the
+    /// one that is never cleared, so a host that connects perfectly well — the
+    /// very host that would otherwise re-ask on every reconnect — stays quiet.
+    #[test]
+    fn a_declined_offer_is_remembered_without_a_deadline() {
+        let mut gate = UploadGate::default();
+        let t0 = Instant::now();
+        gate.record_refusal("xterm-kitty", "you declined it".into());
+        assert_eq!(gate.suppressed("xterm-kitty", t0), Some("you declined it"));
+        // Not a cooldown: still refused long past when a failure would retry.
+        assert_eq!(
+            gate.suppressed("xterm-kitty", t0 + UPLOAD_RETRY_COOLDOWN * 100),
+            Some("you declined it")
+        );
+        // And a decline about one terminal says nothing about another.
+        assert!(gate.suppressed("rxvt-unicode", t0).is_none());
+    }
+
+    /// Every ambiguous outcome declines. With no UI wired up — a test, a
+    /// headless run, a dashboard shutting down — there is nobody to ask, and
+    /// the answer must be no rather than "go ahead": both things this channel
+    /// gates (fetching a binary from the internet, writing into someone's
+    /// remote `$HOME`) are ones a user has to actually say yes to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_with_nobody_to_ask_is_refused() {
+        // `CONSENT` is a process-wide OnceLock the TUI sets at startup; this
+        // test binary never does.
+        assert!(!ask_consent("may I?".to_string()).await);
+    }
+
     #[test]
     fn the_upload_script_stages_verifies_then_moves() {
         let script = upload_script("d1g3st", "x86_64-unknown-linux-gnu");
@@ -5610,6 +5680,7 @@ mod tests {
             &mut Provisioning {
                 upload: &mut gate,
                 download: &mut dl,
+                terminfo: &mut UploadGate::default(),
                 host: &host,
             },
             &log,
@@ -5645,6 +5716,7 @@ mod tests {
             &mut Provisioning {
                 upload: &mut gate,
                 download: &mut dl,
+                terminfo: &mut UploadGate::default(),
                 host: &host,
             },
             &log,

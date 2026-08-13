@@ -169,7 +169,7 @@ pub(super) enum Action {
     /// makes `n`, Esc and quitting all decline without a branch of their own —
     /// `handle_confirm_key` already drops the pending action on anything but
     /// `y`, so the safe answer is the default one.
-    AllowServerDownload(tokio::sync::oneshot::Sender<bool>),
+    GrantConsent(tokio::sync::oneshot::Sender<bool>),
 }
 
 /// Inputs needed to restart a single session: kill the old child, then launch
@@ -225,7 +225,7 @@ impl Action {
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
-            Action::AllowServerDownload(_) => "AllowServerDownload",
+            Action::GrantConsent(_) => "GrantConsent",
         }
     }
 }
@@ -715,8 +715,7 @@ pub(super) struct App {
     /// they ask. Drained by the run loop only while nothing else owns the
     /// screen, so a question can never displace an open picker — an unread one
     /// simply waits in the channel.
-    pub(super) download_prompts:
-        tokio::sync::mpsc::UnboundedReceiver<crate::backend::DownloadPrompt>,
+    pub(super) consent_prompts: tokio::sync::mpsc::UnboundedReceiver<crate::backend::ConsentPrompt>,
     /// Resumable lists arriving from a background fetch, and the sequence number
     /// that tells a live one from a stale one.
     ///
@@ -1342,8 +1341,8 @@ impl App {
         // Give the backends somewhere to ask about downloads before any of them
         // is constructed below — a connection task can start probing
         // immediately, and with no channel set it would (safely) refuse.
-        let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::backend::set_download_consent(download_tx);
+        let (consent_tx, consent_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::backend::set_consent_channel(consent_tx);
         let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::get();
@@ -1397,7 +1396,7 @@ impl App {
             preview_updated_at: None,
             picker: None,
             pending_confirm: None,
-            download_prompts: download_rx,
+            consent_prompts: consent_rx,
             resume_loads: resume_rx,
             resume_tx,
             kill_results: kill_rx,
