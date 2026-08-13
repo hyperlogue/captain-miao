@@ -1,9 +1,7 @@
-use std::num::NonZeroU16;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::{
-    buffer::{Buffer, CellDiffOption},
-    layout::{Alignment, Constraint, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -89,8 +87,6 @@ impl App {
         if self.attaching.is_some() {
             self.draw_attaching(frame, frame.area());
         }
-        // Last of all, on the finished frame: see `pin_wide_cell_widths`.
-        pin_wide_cell_widths(frame.buffer_mut());
     }
 
     /// The "Attaching…" overlay shown while an attach is in flight.
@@ -1973,59 +1969,6 @@ pub(super) fn connecting_row_label(hosts: &[HostId]) -> Option<String> {
             "loading sessions from {} remote hosts…",
             many.len()
         )),
-    }
-}
-
-/// Pin the width of every multi-cell grapheme on the finished frame, so
-/// ratatui's next diff can't emit a write *into* a wide glyph's second column.
-///
-/// ratatui clears the trailing column of an emoji-presentation sequence (one
-/// carrying VS16, `U+FE0F` — the header's ☁️, half the host icons) whenever that
-/// column's symbol changed, as a workaround for terminals that paint such a
-/// glyph one cell wide. Its crossterm backend then prints that cell with **no
-/// `MoveTo`**, because it treats a cell at `x + 1` as contiguous with the one it
-/// just printed at `x` — true only of a *narrow* glyph. On a terminal that
-/// paints the emoji two cells (kitty does, and so does `unicode-width`, which is
-/// what every width in this UI is measured with) the cursor is already at
-/// `x + 2`: the clear lands a column late and eats the character that belongs
-/// there, and every cell the backend then believes is contiguous is drawn one
-/// column right of where it belongs, until the next `MoveTo` re-anchors it.
-///
-/// The header is where this shows, because its right cluster is **right-aligned**
-/// — ☁️ and the host icon slide sideways whenever the tally, the layout label or
-/// the default host changes width, and the column they slide onto held a digit
-/// last frame. The damage then sticks: the diff only ever rewrites cells whose
-/// buffer content changed, so a glyph left in the wrong column stays there.
-///
-/// `ForcedWidth` takes the diff down its plain multi-width path instead — emit
-/// the glyph, skip the columns it covers — which is what a terminal that agrees
-/// about the width needs. The trade is ratatui's workaround itself: a terminal
-/// that paints these emoji one cell wide keeps a stale glyph in the column it
-/// didn't cover. That terminal is already mis-laying-out every wide glyph in the
-/// UI, whereas without this every agreeing terminal corrupts the header.
-///
-/// Applied to the whole frame rather than the header alone: the row icons and
-/// status glyphs are the same two-cell shape, and one pass costs a width lookup
-/// per cell (skipped outright for the ASCII that most of them are).
-pub(super) fn pin_wide_cell_widths(buf: &mut Buffer) {
-    use unicode_width::UnicodeWidthStr;
-
-    let area = buf.area;
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            let Some(cell) = buf.cell_mut(Position { x, y }) else {
-                continue;
-            };
-            // A wide grapheme is never ASCII, and that check is a length
-            // comparison where the width lookup is a table walk.
-            if cell.symbol().is_ascii() {
-                continue;
-            }
-            let width = NonZeroU16::new(cell.symbol().width() as u16);
-            if let Some(width) = width.filter(|w| w.get() > 1) {
-                cell.set_diff_option(CellDiffOption::ForcedWidth(width));
-            }
-        }
     }
 }
 

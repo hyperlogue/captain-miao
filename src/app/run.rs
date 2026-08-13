@@ -5,9 +5,9 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use ratatui::DefaultTerminal;
 use std::time::{Duration, Instant};
 
+use super::render_backend::DashboardTerminal;
 use crate::agent::AgentControl;
 use crate::backend::{Backend, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
@@ -1038,7 +1038,7 @@ async fn reattach_session(app: &mut App, host: HostId, pool_session: String) {
 async fn attach_all(
     app: &mut App,
     targets: Vec<(HostId, String)>,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut DashboardTerminal,
 ) -> Result<(usize, usize)> {
     let previously_focused = app.pending_focus_window.clone();
     let total = targets.len();
@@ -1186,7 +1186,7 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
 // -- Terminal modes --
 
 /// Enable the terminal modes the dashboard relies on, beyond what
-/// `ratatui::init` sets up (raw mode + alt screen): mouse capture, focus
+/// `render_backend::init` sets up (raw mode + alt screen): mouse capture, focus
 /// reporting, and the kitty keyboard protocol. Returns whether the keyboard
 /// enhancement push succeeded, so the caller can pop it symmetrically.
 ///
@@ -1244,23 +1244,24 @@ pub async fn run() -> Result<()> {
     // knowledge at all — and pooled-localhost gets there for free, since that
     // backend simply has no watcher to own.
 
-    let mut terminal = ratatui::init();
+    let mut terminal = super::render_backend::init();
     // No tab label here: the run loop owns it now (it carries the live attention
     // count), and there is nothing to say about a dashboard that hasn't read the
     // sessions yet.
     // Probe the terminal palette for the paw's status tints and the cat's colours
-    // now: raw mode is on (ratatui::init) so the OSC-4 reply isn't line-buffered,
+    // now: raw mode is on (render_backend::init) so the OSC-4 reply isn't line-buffered,
     // but mouse/focus reporting and the event loop haven't started reading stdin
     // yet, so the reply can't be mistaken for input. Cached for `App::new`.
     super::logo::probe_logo_colors();
     let kb_enhanced = enter_terminal_modes();
 
-    // ratatui::init's panic hook only disables raw mode and leaves the alt
-    // screen — it doesn't know about the modes we just enabled above. Chain
+    // The restore hook `render_backend::init` installs only disables raw mode
+    // and leaves the alt screen — it doesn't know about the modes we just
+    // enabled above. Chain
     // a hook that pops them first, then delegates. Without this, a crash
     // leaves focus reporting / mouse capture / kitty keyboard stuck on, and
     // the shell starts receiving focus-out events as ^[[O after exit.
-    // (Each `ratatui::init()` restacks its own panic hook on top; the leaked
+    // (Each `render_backend::init` restacks its own panic hook on top; the leaked
     // extra hooks are harmless — they only run on a panic, which exits anyway.)
     let prior_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1283,7 +1284,7 @@ pub async fn run() -> Result<()> {
     result
 }
 
-async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
+async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let mut app = App::new();
     // Recover window bindings a previous dashboard left behind so live sessions
     // resolve their windows across a restart (§15.7). Before the first reload, so

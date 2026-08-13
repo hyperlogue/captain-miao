@@ -7,6 +7,7 @@ mod keymap;
 mod keys;
 mod logo;
 mod picker;
+mod render_backend;
 mod run;
 
 pub use run::{read_dashboard_window_id, run};
