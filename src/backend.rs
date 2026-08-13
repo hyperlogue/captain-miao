@@ -137,27 +137,37 @@ pub(crate) struct ConnLog {
 /// narrative is ~15 lines, so this holds a long flap without growing.
 const CONN_LOG_CAP: usize = 200;
 
-/// Make text safe to paint into a terminal cell.
+/// Make text safe to paint into a terminal cell, and *legible* while doing it.
 ///
 /// **Most of what this log carries is the host's own words** — a loader's
 /// refusal, a `tic` complaint, `uname` output, a version string — captured from
-/// stderr and quoted verbatim, which is the whole point of the log. But a
-/// terminal is not a text box: an `ESC` in that text is not a character, it is
-/// the start of a command to the emulator the dashboard is running in. ratatui
-/// writes a `Span`'s graphemes into cells and the cells go to the terminal, so
-/// an escape sequence in remote output is *executed* — it can clear the screen,
-/// move the cursor over the rest of the UI, recolour it, or (with the right
-/// sequence) get text echoed back onto the dashboard's own stdin. Nothing about
-/// a remote host's stderr deserves that much trust: the host may be
-/// compromised, and it need not even be malicious — a stray `\r` from a progress
-/// bar is enough to make the log unreadable.
+/// stderr and quoted verbatim, which is the whole point of the log.
 ///
-/// `\n` survives because the log is line-structured and splits on it; `\t`
-/// becomes a space (ratatui doesn't expand tabs, so it would paint as one
-/// cell); everything else in the control classes — C0, `DEL`, and the C1 range
-/// where a bare `\u{9b}` *is* CSI — becomes a visible replacement character, so
-/// the diagnosis shows that something was stripped rather than quietly losing
-/// it.
+/// **This is a second line of defence, not the only one, and the distinction is
+/// worth stating precisely because the obvious reading is wrong.** An `ESC` in
+/// remote output would indeed be a command to the emulator rather than a
+/// character — but it never reaches one: ratatui filters control characters out
+/// of every span before a cell is written, on both paths this log takes
+/// (`ratatui_core::buffer::Buffer::set_stringn` and
+/// `ratatui_core::text::Span::styled_graphemes`, which also drops zero-width
+/// graphemes, covering bidi overrides and friends). Verified against the pinned
+/// 0.30.2. So the *security* claim belongs to the renderer, and it is a version
+/// pin away from being ours instead.
+///
+/// What this function is actually worth, today:
+/// * **Legibility.** ratatui drops a control character silently, leaving
+///   `\u{1b}[2J` on screen as a bare `[2J` and a `\t` as nothing at all. A
+///   visible `\u{FFFD}` says the host emitted something unprintable, which is
+///   part of the diagnosis; `\t` becomes a space so words don't fuse.
+/// * **A backstop that costs nothing.** It holds if the renderer is swapped, if
+///   a sink appears that doesn't go through a `Span`, or if this text is ever
+///   written somewhere rawer than a ratatui buffer.
+///
+/// `\n` survives because the log is line-structured and splits on it. The
+/// control classes here are Unicode `Cc` — C0, `DEL`, and the C1 range where a
+/// bare `\u{9b}` *is* CSI. Deliberately **not** widened to an ASCII-printable
+/// allowlist: that would mangle every non-English error message a host returns,
+/// which is a real cost against a class the renderer already handles.
 pub(crate) fn host_text_safe(text: &str) -> String {
     text.chars()
         .map(|c| match c {
@@ -2329,21 +2339,83 @@ fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
     opts
 }
 
+/// Read a child's stdout and stderr to completion, but **bounded**: at most
+/// `cap` bytes from each, both drained concurrently.
+///
+/// `Command::output()` is what this replaces, and the difference is the point.
+/// `output()` reads until EOF with no ceiling, so a host that connects and then
+/// *streams* is not a hung connection ssh will notice — the peer is answering
+/// keepalives, `ConnectTimeout` is long past, and the only thing that grows is
+/// this process's memory. Trusting a remote host to stop talking is not a
+/// property worth relying on, and it doesn't take malice: an `.bashrc` that
+/// runs something chatty is enough.
+///
+/// A child that exceeds the cap stalls on a full pipe rather than being killed
+/// here — the caller's `timeout` is what ends it, and `kill_on_drop` reaps it.
+/// Both pipes are drained together because reading one to EOF first deadlocks
+/// the moment the other fills.
+async fn capped_output(
+    mut child: tokio::process::Child,
+    cap: u64,
+) -> std::io::Result<(std::process::ExitStatus, String, String)> {
+    async fn read_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, cap: u64) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let Some(pipe) = pipe else {
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        let _ = pipe.take(cap).read_to_end(&mut buf).await;
+        buf
+    }
+    let (out, err) = tokio::join!(
+        read_capped(child.stdout.take(), cap),
+        read_capped(child.stderr.take(), cap),
+    );
+    let status = child.wait().await?;
+    Ok((
+        status,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    ))
+}
+
+/// Ceiling on what we'll buffer from one remote command. The probe answers in
+/// seven short lines and `tic` in a sentence; anything approaching this is a
+/// host misbehaving, and the parse only ever reads the first few lines anyway.
+const REMOTE_OUTPUT_CAP: u64 = 256 * 1024;
+
+/// How long a probe may take. It is five `--version` calls and a `cat` over an
+/// already-primed ControlMaster; the generous end of that is still seconds.
+/// Needed because `ConnectTimeout` covers only the handshake and `ServerAlive*`
+/// only a host that goes *silent* — neither bounds a host that answers slowly
+/// forever.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run [`probe_script`] on the remote (this also primes the ControlMaster).
 async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
-    let out = Command::new("ssh")
+    let child = Command::new("ssh")
         .args(opts)
         .arg(target)
         .arg(login_shell_safe(&probe_script(
             terminfo_to_provision().as_ref(),
         )))
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // The timeout below ends the attempt by dropping the future, which
+        // would otherwise leave an ssh child talking to nobody.
+        .kill_on_drop(true)
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    let (status, stdout, _stderr) =
+        tokio::time::timeout(PROBE_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .ok()?
+            .ok()?;
+    if !status.success() {
         return None;
     }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
+    parse_probe(&stdout)
 }
 
 /// Teach the host this terminal's terminfo, by piping the local entry into the
@@ -2403,23 +2475,22 @@ async fn install_terminfo(
         stdin.write_all(&source).await?;
         stdin.shutdown().await
     });
-    let out = tokio::time::timeout(TERMINFO_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| format!("timed out after {}s", TERMINFO_TIMEOUT.as_secs()))?
-        .map_err(|e| format!("ssh failed: {e}"))?;
+    // Capped, not `wait_with_output`: the host is on the other end of this and
+    // has no obligation to be brief (see [`capped_output`]).
+    let (status, stdout, stderr) =
+        tokio::time::timeout(TERMINFO_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .map_err(|_| format!("timed out after {}s", TERMINFO_TIMEOUT.as_secs()))?
+            .map_err(|e| format!("ssh failed: {e}"))?;
     let _ = writer.await;
 
     // Both halves: the script's own exit status *and* its marker. Either alone
     // can lie — ssh reports the remote status faithfully but a login shell's rc
     // can exit 0 on its own, and stdout is shared with whatever that rc printed.
-    if !out.status.success() || !terminfo_took(&String::from_utf8_lossy(&out.stdout)) {
-        let stderr: String = String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(200)
-            .collect();
+    if !status.success() || !terminfo_took(&stdout) {
+        let stderr: String = stderr.trim().chars().take(200).collect();
         return Err(if stderr.is_empty() {
-            format!("the host did not take it (rc={:?})", out.status.code())
+            format!("the host did not take it (rc={:?})", status.code())
         } else {
             stderr
         });
@@ -4135,10 +4206,64 @@ mod tests {
         }
     }
 
-    /// The log quotes a remote host's stderr verbatim into a terminal, so an
-    /// `ESC` in it would be *executed* by the emulator rather than printed —
-    /// enough to repaint the dashboard around the host's own error message, or
-    /// with the right sequence to get text echoed back onto its stdin. Line
+    /// A remote host is under no obligation to stop talking, and a flood is not
+    /// a hung link ssh will notice: the peer answers keepalives, `ConnectTimeout`
+    /// is long past, and the only thing that grows is the dashboard's memory.
+    /// The cap is what makes that a bounded read rather than an open one — and
+    /// it holds while the child is *still writing*, which is the case an
+    /// after-the-fact truncation misses entirely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flooding_host_cannot_grow_the_buffer_without_bound() {
+        // 64 MiB of `y`, of which we agree to hold 1 KiB.
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("head -c 67108864 /dev/zero | tr \\\\0 y; echo done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning the flood");
+        let (_, stdout, _) =
+            tokio::time::timeout(Duration::from_secs(20), capped_output(child, 1024))
+                .await
+                .expect("the cap must not depend on the child finishing")
+                .expect("reading the flood");
+        assert_eq!(stdout.len(), 1024, "held {} bytes", stdout.len());
+        // Closing our read end is what ends it: the writer takes SIGPIPE rather
+        // than filling a pipe we've stopped draining, so this returns long
+        // before the timeout — the cap, not the clock, is doing the work.
+    }
+
+    /// …and the wall-clock bound is real too: a host that connects and then says
+    /// nothing must not park a connection task forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_host_hits_the_wall_clock_bound() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning the sleeper");
+        let start = Instant::now();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                capped_output(child, REMOTE_OUTPUT_CAP)
+            )
+            .await
+            .is_err(),
+            "a silent child must time out rather than be waited on"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The log quotes a remote host's stderr verbatim. ratatui is what stops an
+    /// `ESC` in it from reaching the emulator; this keeps the same text
+    /// *legible* — and holds the line if that ever stops being true. Line
     /// structure survives; nothing else in the control classes does.
     #[test]
     fn quoted_host_output_cannot_drive_the_terminal() {
