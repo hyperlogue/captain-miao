@@ -21,7 +21,7 @@
 //! *is* the launcher); the remote `AttachRemote` plan lands once the pty pool can
 //! host a launcher. See §14.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -621,6 +621,20 @@ impl Backend {
         }
     }
 
+    /// Treat `key` as held by another terminal — the reading a refused attach
+    /// just came back with. Corrects the row now rather than on the host's own
+    /// account of the same fact, which follows a round trip behind it.
+    ///
+    /// A no-op for a plain local backend, which serves no attached bit at all
+    /// (it has no pool). Under pooled-localhost the daemon *is* on the far side
+    /// of a socket and that backend is a `Remote` — the seam branches on the
+    /// backend, not on locality.
+    pub(crate) fn presume_attached(&self, key: &SessionKey) {
+        if let Backend::Remote(b) = self {
+            b.presume_attached(key);
+        }
+    }
+
     /// Record the host-owned flags for a session, so every dashboard watching
     /// that host agrees (§9). `false` when the host doesn't serve flags — a
     /// plain local backend, whose flags are the dashboard's own
@@ -912,6 +926,28 @@ pub(crate) struct RemoteBackend {
     /// correct against: the server pushes only what *changed*, so a session that
     /// survived a kill it never heard about would never be re-sent.
     presumed_dead: Arc<Mutex<HashMap<SessionKey, Instant>>>,
+    /// Sessions a refused attach has just proved someone else holds, stamped
+    /// `attached = Some(true)` on their way out of [`list_sessions`].
+    ///
+    /// The evidence is `ATTACH_EXIT_BUSY`: the attach is the only operation that
+    /// actually takes the pty's lock, so its refusal is a *transaction's* answer
+    /// rather than an observation, and it is authoritative for the instant it
+    /// happened. This carries that answer back to the row the user is looking
+    /// at, in the frame it arrives, instead of waiting for the host to say the
+    /// same thing (which it will — the refusal fires the pool's `on_busy` hook
+    /// there, which wakes a push of exactly this bit).
+    ///
+    /// Unlike [`presumed_dead`] this needs no lapse, and must not have one. A
+    /// dead presumption has no natural terminator — a session that survived a
+    /// kill never changes, so the host has no reason to re-send it — whereas
+    /// every `Delta` carries the attached bit, so the host's own account ends
+    /// this presumption the moment it disagrees *or* agrees. Lapsing it on a
+    /// timer would instead go back to showing the stale value it corrected,
+    /// since a session stays attached for as long as its user is working.
+    ///
+    /// [`presumed_dead`]: Self::presumed_dead
+    /// [`list_sessions`]: Self::list_sessions
+    presumed_attached: Arc<Mutex<HashSet<SessionKey>>>,
     /// Requests to the connection task; `None` once the task has exited.
     requests: mpsc::UnboundedSender<PendingRequest>,
     next_req_id: AtomicU64,
@@ -971,22 +1007,35 @@ pub(crate) struct RemoteBackend {
 const PRESUMED_DEAD_FOR: Duration = Duration::from_secs(10);
 
 /// The rows to show for a host: everything it has told us about, minus what the
-/// dashboard is presuming it just killed.
+/// dashboard is presuming it just killed, plus what a refused attach has proved
+/// is held elsewhere.
 ///
 /// Takes `presumed_dead` by `&mut` because reading is when stale presumptions
 /// are noticed: an entry past [`PRESUMED_DEAD_FOR`] is dropped here, which both
 /// bounds the map and is what brings a survivor's row back. Pure apart from
 /// that, with `now` injected, so the lapse is testable without waiting one out.
+///
+/// `presumed_attached` needs no such sweep — the host's own frames end those
+/// (see the field). It only ever *raises* the bit: a row the host already calls
+/// attached is unchanged, and one it calls free is corrected, but nothing here
+/// clears a bit the host is asserting.
 fn live_rows(
     mirror: &HashMap<SessionKey, LauncherState>,
     presumed_dead: &mut HashMap<SessionKey, Instant>,
+    presumed_attached: &HashSet<SessionKey>,
     now: Instant,
 ) -> Vec<LauncherState> {
     presumed_dead.retain(|_, since| now.duration_since(*since) < PRESUMED_DEAD_FOR);
     mirror
         .iter()
         .filter(|(key, _)| !presumed_dead.contains_key(*key))
-        .map(|(_, state)| state.clone())
+        .map(|(key, state)| {
+            let mut state = state.clone();
+            if presumed_attached.contains(key) {
+                state.attached = Some(true);
+            }
+            state
+        })
         .collect()
 }
 
@@ -1012,6 +1061,7 @@ impl RemoteBackend {
         let transport_is_local = matches!(transport, Transport::LocalSocket(_));
         let mirror = Arc::new(Mutex::new(HashMap::new()));
         let presumed_dead = Arc::new(Mutex::new(HashMap::new()));
+        let presumed_attached = Arc::new(Mutex::new(HashSet::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
         let dirty = Arc::new(AtomicBool::new(false));
@@ -1028,6 +1078,7 @@ impl RemoteBackend {
                 host: host.clone(),
                 mirror: mirror.clone(),
                 presumed_dead: presumed_dead.clone(),
+                presumed_attached: presumed_attached.clone(),
                 remote_exe: remote_exe.clone(),
                 conn: conn.clone(),
                 dirty: dirty.clone(),
@@ -1050,6 +1101,7 @@ impl RemoteBackend {
             transport_is_local,
             mirror,
             presumed_dead,
+            presumed_attached,
             requests: tx,
             next_req_id: AtomicU64::new(1),
             remote_exe,
@@ -1148,6 +1200,7 @@ impl RemoteBackend {
         live_rows(
             &self.mirror.lock().unwrap(),
             &mut self.presumed_dead.lock().unwrap(),
+            &self.presumed_attached.lock().unwrap(),
             Instant::now(),
         )
     }
@@ -1176,6 +1229,18 @@ impl RemoteBackend {
     /// (or lapsed) leaves nothing to undo.
     fn unpresume_dead(&self, key: &SessionKey) {
         if self.presumed_dead.lock().unwrap().remove(key).is_some() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Show `key`'s row as held by another terminal, on the strength of an
+    /// attach this host refused as busy. See [`presumed_attached`] for why the
+    /// refusal is worth more than a query, and why this presumption never
+    /// lapses.
+    ///
+    /// [`presumed_attached`]: Self::presumed_attached
+    fn presume_attached(&self, key: &SessionKey) {
+        if self.presumed_attached.lock().unwrap().insert(key.clone()) {
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -3335,6 +3400,7 @@ struct ConnectionShared {
     host: HostId,
     mirror: Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
     presumed_dead: Arc<Mutex<HashMap<SessionKey, Instant>>>,
+    presumed_attached: Arc<Mutex<HashSet<SessionKey>>>,
     remote_exe: Arc<Mutex<String>>,
     conn: Arc<Mutex<ConnState>>,
     dirty: Arc<AtomicBool>,
@@ -3361,6 +3427,7 @@ async fn connection_task(
         host,
         mirror,
         presumed_dead,
+        presumed_attached,
         remote_exe,
         conn,
         dirty,
@@ -3500,6 +3567,7 @@ async fn connection_task(
             stream,
             &mirror,
             &presumed_dead,
+            &presumed_attached,
             &dirty,
             &server_version,
             &mut requests,
@@ -3524,6 +3592,7 @@ async fn connection_task(
         // them across the gap would let one hide a session the reconnect's
         // snapshot reports as alive.
         presumed_dead.lock().unwrap().clear();
+        presumed_attached.lock().unwrap().clear();
         *latency.lock().unwrap() = None;
         vitals.clear();
         standing_failure = match &outcome {
@@ -3925,6 +3994,7 @@ async fn serve(
     stream: UnixStream,
     mirror: &Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
     presumed_dead: &Arc<Mutex<HashMap<SessionKey, Instant>>>,
+    presumed_attached: &Arc<Mutex<HashSet<SessionKey>>>,
     dirty: &Arc<AtomicBool>,
     server_version: &Arc<Mutex<Option<String>>>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
@@ -3993,18 +4063,29 @@ async fn serve(
                         // A full account of the host supersedes every guess we
                         // were making about it (see `presumed_dead`).
                         presumed_dead.lock().unwrap().clear();
+                        presumed_attached.lock().unwrap().clear();
                         // The mirror changed off-thread; wake the dashboard loop.
                         dirty.store(true, Ordering::Relaxed);
                     }
-                    // Deliberately does *not* withdraw a presumption. A delta
-                    // says only that the state file moved, which a session on
-                    // its way out can still do — a last hook, a status mirrored
-                    // from the agent's own file as it exits. `Removed` is the
-                    // frame that means gone; treating a delta as evidence of
-                    // life would flash the row back for the frame or two before
-                    // one arrives.
+                    // Deliberately does *not* withdraw a *dead* presumption. A
+                    // delta says only that the state file moved, which a session
+                    // on its way out can still do — a last hook, a status
+                    // mirrored from the agent's own file as it exits. `Removed`
+                    // is the frame that means gone; treating a delta as evidence
+                    // of life would flash the row back for the frame or two
+                    // before one arrives.
+                    //
+                    // It does end an *attached* presumption, and that asymmetry
+                    // is the point: a delta carries the attached bit, so it is
+                    // the host's own account of the very thing being presumed,
+                    // arriving whether it agrees or not. Nothing else ends one —
+                    // a session stays attached for as long as its user is
+                    // working, so a timer would only restore the stale value the
+                    // presumption was correcting.
                     ServerFrame::Delta { state } => {
-                        mirror.lock().unwrap().insert(state.key(), *state);
+                        let key = state.key();
+                        presumed_attached.lock().unwrap().remove(&key);
+                        mirror.lock().unwrap().insert(key, *state);
                         dirty.store(true, Ordering::Relaxed);
                     }
                     ServerFrame::Removed { key } => {
@@ -4015,6 +4096,9 @@ async fn serve(
                         // launcher pid the host reuses within the window) from
                         // inheriting the hide meant for its predecessor.
                         presumed_dead.lock().unwrap().remove(&key);
+                        // Nothing to hold a bit about any more, and a launcher
+                        // pid the host recycles must not inherit it.
+                        presumed_attached.lock().unwrap().remove(&key);
                         dirty.store(true, Ordering::Relaxed);
                     }
                     // Every reply routes by `req_id` through one accessor, so a
@@ -4107,16 +4191,21 @@ mod tests {
 
         // Nothing presumed: the host's account of itself, verbatim.
         let mut presumed = HashMap::new();
-        assert_eq!(pids(live_rows(&mirror, &mut presumed, now)), [101, 102]);
+        let held = HashSet::new();
+        assert_eq!(
+            pids(live_rows(&mirror, &mut presumed, &held, now)),
+            [101, 102]
+        );
 
         // Presumed a moment ago — the row is gone while the kill is in flight,
         // with the mirror still holding it (the host hasn't answered yet).
         presumed.insert(SessionKey::from_launcher_pid(101), now);
-        assert_eq!(pids(live_rows(&mirror, &mut presumed, now)), [102]);
+        assert_eq!(pids(live_rows(&mirror, &mut presumed, &held, now)), [102]);
         assert_eq!(
             pids(live_rows(
                 &mirror,
                 &mut presumed,
+                &held,
                 now + PRESUMED_DEAD_FOR - Duration::from_millis(1)
             )),
             [102]
@@ -4126,10 +4215,58 @@ mod tests {
         // the guess is withdrawn and the entry with it — no unbounded growth
         // from a host that goes quiet.
         assert_eq!(
-            pids(live_rows(&mirror, &mut presumed, now + PRESUMED_DEAD_FOR)),
+            pids(live_rows(
+                &mirror,
+                &mut presumed,
+                &held,
+                now + PRESUMED_DEAD_FOR
+            )),
             [101, 102]
         );
         assert!(presumed.is_empty());
+    }
+
+    /// The other presumption: a refused attach says a row is held elsewhere, and
+    /// says it about the row the host is still calling free.
+    ///
+    /// No lapse, deliberately — see `presumed_attached`. What ends it is the
+    /// host's own account (a `Delta` carries the bit, a `Removed` takes the row),
+    /// and a session stays attached for as long as its user is working, so a
+    /// timer would only put the stale reading back.
+    #[test]
+    fn a_refused_attach_marks_the_row_held_elsewhere() {
+        let now = Instant::now();
+        let key = SessionKey::from_launcher_pid(101);
+        let mut free = test_state(101);
+        free.attached = Some(false);
+        let mirror: HashMap<SessionKey, LauncherState> =
+            [(key.clone(), free)].into_iter().collect();
+        let mut presumed = HashMap::new();
+
+        let bit = |held: &HashSet<SessionKey>, presumed: &mut HashMap<_, _>| {
+            live_rows(&mirror, presumed, held, now)[0].attached
+        };
+        assert_eq!(
+            bit(&HashSet::new(), &mut presumed),
+            Some(false),
+            "the host's own reading, untouched"
+        );
+        assert_eq!(
+            bit(&HashSet::from([key.clone()]), &mut presumed),
+            Some(true),
+            "corrected by the refusal"
+        );
+
+        // It only ever raises the bit: a presumption for a row the host has
+        // already caught up on changes nothing, so the two can't fight.
+        let mut caught_up = test_state(101);
+        caught_up.attached = Some(true);
+        let mirror: HashMap<SessionKey, LauncherState> =
+            [(key.clone(), caught_up)].into_iter().collect();
+        assert_eq!(
+            live_rows(&mirror, &mut presumed, &HashSet::from([key]), now)[0].attached,
+            Some(true)
+        );
     }
 
     /// A host's options are passed through untouched except for its forwards,

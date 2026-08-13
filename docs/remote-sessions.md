@@ -699,6 +699,23 @@ into the signal case would close the window on every failed connection. Equally,
 duration cannot decide alone — it would keep a window for every session detached
 inside the grace.
 
+**The two refusals captain-miao mints are answers, not just failures**
+(`App::refused_attach`). A not-spent report normally means "the window is holding
+a reason we don't have" — but `ATTACH_EXIT_BUSY` (43) and `ATTACH_EXIT_STALE`
+(44) are our own codes and self-describing, so the dashboard names them in the
+status line instead of pointing at a window the user watched open and close.
+
+They are also worth more than a message. An attach is the only operation that
+actually *takes* the pty's lock, so its refusal is a transaction's answer —
+authoritative for the instant it happened — where any query about the same
+session is a sample (§10.2). So each one corrects the row it came from: `43`
+presumes the session attached, `44` presumes it killed, both reusing the
+presumption machinery `x` already has. The host says the same thing a round trip
+later — a refusal fires the pool's `on_busy` hook there, a dead session its
+`Removed` — and that is what ends the presumption. Every other status keeps the
+old text, because for those the window really is the only place the reason
+exists.
+
 **A window the user closed ends its session** — `[remote] on_window_close`,
 default `close`, the same host RPC `x` makes. Closing a window by hand reads as
 "I'm done with this", and the alternative leaves a pooled session running with

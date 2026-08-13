@@ -3246,7 +3246,7 @@ impl App {
     ) -> bool {
         let mut changed = false;
         for report in reports {
-            let host = HostId(report.host);
+            let host = HostId(report.host.clone());
             let Some(retired) = self.window_bindings.prune_token(&host, &report.token) else {
                 continue;
             };
@@ -3285,12 +3285,8 @@ impl App {
                 // every `list-panes`.
                 self.reap_window_queue.push(retired.window);
             } else {
-                // Refused on arrival — the window is holding the reason (busy,
-                // stale name, ssh auth), and that text exists nowhere else.
-                self.set_status(
-                    format!("Attach to {} failed — see its window", report.token),
-                    true,
-                );
+                let msg = self.refused_attach(&host, &report);
+                self.set_status(msg, true);
             }
         }
         if changed {
@@ -3329,6 +3325,58 @@ impl App {
     /// it an idle dashboard would fire the kill up to one `event_poll_ms` late.
     pub(super) fn next_session_close_due(&self) -> Option<Instant> {
         self.pending_session_close.iter().map(|p| p.due).min()
+    }
+
+    /// What to say about an attach that came back refused, and — for the two
+    /// refusals captain-miao mints itself — the correction it is worth applying
+    /// to the row it was about.
+    ///
+    /// An attach is the only operation that actually takes the pty's lock, so
+    /// its answer is a transaction's, not an observation's: authoritative for
+    /// the instant it happened, in a way no query about the same session can
+    /// be. `ATTACH_EXIT_BUSY` therefore settles the attached bit and
+    /// `ATTACH_EXIT_STALE` settles the row's existence, and both are spent here
+    /// rather than left in a window the user is not looking at. The host says
+    /// the same thing a round trip later — a refusal fires the pool's `on_busy`
+    /// hook, a dead session its `Removed` — which is what ends the presumption.
+    ///
+    /// Every other status keeps the old text. The reason for those (ssh auth, a
+    /// missing server, a shell that died on the way) exists only as the output
+    /// held in that window, so pointing at it is the whole of what we know.
+    fn refused_attach(&self, host: &HostId, report: &state::DetachReport) -> String {
+        // The correction, where there is still a row and a backend to apply it
+        // to. A refusal for a row that has since gone needs none — the message
+        // is still worth saying, since it explains a window the user watched
+        // open and close.
+        let correct = |apply: fn(&Backend, &SessionKey)| {
+            if let (Some(key), Some(backend)) = (
+                self.pooled_session_key(host, &report.token),
+                self.backend_for(host),
+            ) {
+                apply(backend, &key);
+            }
+        };
+        match report.status {
+            Some(state::ATTACH_EXIT_BUSY) => {
+                correct(Backend::presume_attached);
+                // Name the steal by its live binding, so a remap shows through.
+                match self.keymap.primary_key(keymap::Command::StealAttach) {
+                    Some(steal) => format!(
+                        "{} is attached in another terminal — {steal} steals it",
+                        report.token
+                    ),
+                    None => format!("{} is attached in another terminal", report.token),
+                }
+            }
+            Some(state::ATTACH_EXIT_STALE) => {
+                // Not a live session any more, so the row is the stale thing —
+                // the same presumption `x` makes, reached by evidence rather
+                // than by intent.
+                correct(Backend::presume_killed);
+                format!("{} is no longer a live session", report.token)
+            }
+            _ => format!("Attach to {} failed — see its window", report.token),
+        }
     }
 
     /// The `SessionKey` of the pooled session `token` names on `host`, for the

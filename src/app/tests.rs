@@ -1821,6 +1821,76 @@ fn a_reported_window_close_queues_only_its_own_session() {
     assert!(d.app.pending_session_close.is_empty());
 }
 
+/// The two refusals captain-miao mints itself say what happened, in the
+/// dashboard, rather than pointing at a window the user is not looking at.
+///
+/// They earn that because an attach is the only operation that actually takes
+/// the pty's lock: its refusal is a transaction's answer, authoritative for the
+/// instant it happened, where any query about the same session is a sample. A
+/// refusal we did *not* mint keeps the old text — its reason exists only as
+/// output held in that window.
+#[test]
+fn a_refused_attach_names_its_reason() {
+    use super::ReportOrigin;
+    use crate::state::{ATTACH_EXIT_BUSY, ATTACH_EXIT_STALE, DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let pooled = |pid: u32, token: &str| {
+        let mut s = session(pid, "/srv/work", SessionStatus::Idle);
+        s.host = host.clone();
+        s.pool_session = Some(token.to_string());
+        s.window_id = None;
+        s
+    };
+    d.set_sessions(vec![pooled(1, "cm-one"), pooled(2, "cm-two")]);
+
+    // A refusal arrives the instant the wrapper exits, so the window it was
+    // holding is not "spent" — that is the branch these statuses land in.
+    let refused = |token: &str, status: i32| DetachReport {
+        host: "box".into(),
+        token: token.into(),
+        status: Some(status),
+        held_secs: Some(0),
+    };
+    let apply = |d: &mut TestDashboard, report: DetachReport, wid: u64| {
+        let token = report.token.clone();
+        d.app
+            .record_window_binding(host.clone(), token, WindowId::from(wid));
+        d.app.apply_detach_reports(vec![report], ReportOrigin::Live);
+        d.app.status_msg.clone().expect("a status was set")
+    };
+
+    let msg = apply(&mut d, refused("cm-one", ATTACH_EXIT_BUSY), 901);
+    assert!(
+        msg.contains("cm-one") && msg.contains("attached in another terminal"),
+        "busy should name the session and the reason, got {msg:?}"
+    );
+    assert!(
+        msg.contains(
+            &d.app
+                .keymap
+                .primary_key(super::keymap::Command::StealAttach)
+                .expect("a steal binding")
+        ),
+        "and offer the steal by its live binding, got {msg:?}"
+    );
+
+    let msg = apply(&mut d, refused("cm-two", ATTACH_EXIT_STALE), 902);
+    assert!(
+        msg.contains("cm-two") && msg.contains("no longer a live session"),
+        "stale should say the session is gone, got {msg:?}"
+    );
+
+    // Anything else — ssh auth, a missing server — reads the same as before.
+    let msg = apply(&mut d, refused("cm-one", 255), 903);
+    assert!(
+        msg.contains("see its window"),
+        "an unminted status keeps pointing at the window, got {msg:?}"
+    );
+}
+
 /// A queued close waits before it goes out, and that wait is the guard against
 /// the one event that looks exactly like a user closing every window at once: a
 /// terminal quitting. The dashboard dies with it in milliseconds, so anything
