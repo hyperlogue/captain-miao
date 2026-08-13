@@ -125,6 +125,10 @@ pub struct TerminalEnv {
     pub kitty_window: Option<String>,
     pub kitty_listen: Option<String>,
     pub kitty_pid: Option<String>,
+    /// `TERM_PROGRAM` — Ghostty's only self-identifying variable. It exports no
+    /// per-surface id at all, which is why the Ghostty arm below yields an
+    /// identity and no window (see [`ghostty_identity`]).
+    pub term_program: Option<String>,
 }
 
 /// The terminal *instance* identity and the window/pane of the current process,
@@ -145,6 +149,7 @@ fn terminal_env() -> (Option<String>, Option<WindowId>) {
         kitty_window: read("KITTY_WINDOW_ID"),
         kitty_listen: read("KITTY_LISTEN_ON"),
         kitty_pid: read("KITTY_PID"),
+        term_program: read("TERM_PROGRAM"),
     })
 }
 
@@ -158,6 +163,11 @@ fn terminal_env() -> (Option<String>, Option<WindowId>) {
 ///   with the same both-halves-or-neither rule.
 /// - else a Kitty window ⇒ (`kitty:<KITTY_LISTEN_ON>`, falling back to
 ///   `kitty:<KITTY_PID>`; `None` when neither is set — window id).
+/// - else `TERM_PROGRAM=ghostty` ⇒ (`ghostty`, **no window**). Ghostty is the
+///   one supported terminal that exports nothing per surface, so this half is
+///   structurally `None`; the dashboard's backend recovers *its own* surface a
+///   different way (`ttyname` → the AppleScript `tty` property) and every
+///   dashboard-spawned session is bound from its `SpawnResult` instead.
 /// - else `(None, None)`.
 ///
 /// Env values are trimmed (most are bare integer strings, so trimming is
@@ -179,7 +189,39 @@ fn resolve_terminal_env(env: TerminalEnv) -> (Option<String>, Option<WindowId>) 
             Some(WindowId(window)),
         );
     }
+    // Last, because it is the weakest signal: `TERM_PROGRAM` is set by many
+    // emulators and carries no window, so anything that *can* name one wins.
+    if is_ghostty(clean(env.term_program).as_deref()) {
+        return (Some(ghostty_identity()), None);
+    }
     (None, None)
+}
+
+/// Whether a `TERM_PROGRAM` value names Ghostty. Compared case-insensitively:
+/// Ghostty writes it lowercase, and this is a display-ish string that costs
+/// nothing to be lenient about.
+pub fn is_ghostty(term_program: Option<&str>) -> bool {
+    term_program.is_some_and(|s| s.eq_ignore_ascii_case("ghostty"))
+}
+
+/// The identity of a Ghostty instance — the single constructor for the form, as
+/// [`zellij_identity`] is for its own.
+///
+/// **Deliberately not instance-granular**, which every other backend here is.
+/// The reason that rule exists is that window ids overlap between instances: two
+/// zellij sessions each number panes 1,2,3…, so a binding from one would resolve
+/// to a live-but-wrong pane in the other. Ghostty's surface ids are UUIDs
+/// (`SurfaceView.id.uuidString`), so they collide with nothing — not another
+/// instance's, and not a restarted Ghostty's. A binding left over from a dead
+/// Ghostty simply fails to resolve and is pruned, which is the failure direction
+/// captain-miao already handles everywhere.
+///
+/// The narrower reason not to reach for a key anyway: there is nothing cheap to
+/// key on. The scripting dictionary exposes no application pid, and `TERM_PROGRAM`
+/// is all a launcher gets — so any instance key would cost a process scan in
+/// `cm-core`, on a path a headless launcher also runs.
+pub fn ghostty_identity() -> String {
+    "ghostty".to_string()
 }
 
 /// The window/pane the current process is running in, from the terminal's env
@@ -453,6 +495,77 @@ mod tests {
         });
         assert_eq!(id, None);
         assert_eq!(win, Some(WindowId("7".into())));
+    }
+
+    #[test]
+    fn ghostty_yields_an_identity_but_never_a_window() {
+        // Ghostty exports no per-surface variable, so the window half is
+        // structurally absent — a launcher inside one can still be *classified*
+        // (the row isn't foreign), it just carries no window to drive.
+        let (id, win) = resolve_terminal_env(TerminalEnv {
+            term_program: Some("ghostty".into()),
+            ..Default::default()
+        });
+        assert_eq!(id.as_deref(), Some("ghostty"));
+        assert_eq!(win, None);
+
+        // Case-insensitive, and any other TERM_PROGRAM is not ours.
+        for other in ["Ghostty", "GHOSTTY"] {
+            let (id, _) = resolve_terminal_env(TerminalEnv {
+                term_program: Some(other.into()),
+                ..Default::default()
+            });
+            assert_eq!(id.as_deref(), Some("ghostty"), "TERM_PROGRAM={other}");
+        }
+        for other in ["Apple_Terminal", "iTerm.app", "WezTerm", "", "  "] {
+            let (id, _) = resolve_terminal_env(TerminalEnv {
+                term_program: Some(other.into()),
+                ..Default::default()
+            });
+            assert_eq!(id, None, "TERM_PROGRAM={other}");
+        }
+    }
+
+    #[test]
+    fn anything_that_names_a_window_beats_ghostty() {
+        // `TERM_PROGRAM` is the weakest signal on offer: it survives into a
+        // multiplexer's panes, and it can't name a window. A backend that *can*
+        // must win, or a zellij session inside Ghostty would report no pane.
+        let cases = [
+            (
+                TerminalEnv {
+                    zellij_pane: Some("3".into()),
+                    zellij_session: Some("work".into()),
+                    term_program: Some("ghostty".into()),
+                    ..Default::default()
+                },
+                "zellij:work",
+                "3",
+            ),
+            (
+                TerminalEnv {
+                    tmux: Some("/tmp/s,4242,0".into()),
+                    tmux_pane: Some("%5".into()),
+                    term_program: Some("ghostty".into()),
+                    ..Default::default()
+                },
+                "tmux:/tmp/s,4242",
+                "%5",
+            ),
+            (
+                TerminalEnv {
+                    term_program: Some("ghostty".into()),
+                    ..kitty_env()
+                },
+                "kitty:unix:/tmp/k",
+                "7",
+            ),
+        ];
+        for (env, want_id, want_win) in cases {
+            let (id, win) = resolve_terminal_env(env);
+            assert_eq!(id.as_deref(), Some(want_id));
+            assert_eq!(win, Some(WindowId(want_win.into())));
+        }
     }
 
     #[test]

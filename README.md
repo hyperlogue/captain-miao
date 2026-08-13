@@ -6,16 +6,16 @@
 
 <img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
 
-A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
+A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
 
 https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
 
 When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
 Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
-Kitty, zellij or tmux you already run (every session is a native window or pane,
-controlled through the terminal's own protocol), so it stays one small, focused
-tool and the rest of your workflow is yours to compose.
+Kitty, Ghostty, zellij or tmux you already run (every session is a native window
+or pane, controlled through the terminal's own protocol), so it stays one small,
+focused tool and the rest of your workflow is yours to compose.
 
 ## Highlights
 
@@ -30,7 +30,7 @@ tool and the rest of your workflow is yours to compose.
 
 ## Requirements
 
-- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
+- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **Ghostty** ≥ 1.3 on macOS (see [Ghostty setup](#ghostty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
 - **Claude Code** and/or **Codex** on your `PATH`.
 
 ## Installation
@@ -108,9 +108,23 @@ Looser alternatives: `allow_remote_control socket-only` (off the escape-code cha
 
 **Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
 
+## Ghostty setup
+
+**macOS only, Ghostty ≥ 1.3.** captain-miao drives Ghostty through its [AppleScript dictionary](https://ghostty.org/docs/features/applescript), which is enabled by default — there is no config file to edit. The one thing you must do is approve the Automation prompt macOS raises the first time captain-miao talks to Ghostty; if you dismissed it, re-enable it under **System Settings → Privacy & Security → Automation**, in the entry for whatever launched captain-miao. It verifies the channel at startup and exits with a diagnostic naming the fix if it can't get through.
+
+The Linux build of Ghostty exposes no equivalent control channel, so captain-miao does not claim it there — run it under zellij or tmux instead.
+
+Three things work differently here, all of them because the dictionary has no way to express them:
+
+- **No preview.** Nothing in Ghostty's automation API reads a window's screen or scrollback, so the preview pane says so instead of showing output. Everything else on the row — status, context usage, working directory — comes from the agent's own files and is unaffected.
+- **No move-to-tab.** `t` is hidden, as it is on zellij.
+- **New sessions bring Ghostty to the front.** Ghostty activates itself whenever a script creates a window or tab ([ghostty#11457](https://github.com/ghostty-org/ghostty/issues/11457)), with no way to opt out, so a spawn takes focus even when captain-miao asks it not to.
+
+Sessions always get their own tab: Ghostty has neither a stack layout nor floating panes, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
+
 ## Usage
 
-Run the dashboard inside a supported terminal (Kitty, zellij or tmux):
+Run the dashboard inside a supported terminal (Kitty, Ghostty, zellij or tmux):
 
 ```sh
 miao
@@ -158,7 +172,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space e` / `Space E`          | Restart the selected / all idle sessions                               |
 | `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
 | `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
-| `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, which has only the one) |
+| `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux or Ghostty, which have only the one) |
 | `Space h` / `Space s`          | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`                      | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen) |
 | `?`                            | Show the full key list (help overlay)                                  |
@@ -189,8 +203,10 @@ captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml`
 
 ```toml
 [terminal]
-backend = "kitty"            # "kitty" | "zellij" | "tmux"; unset auto-detects (zellij, then tmux, else Kitty)
-sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this; tmux is always per-tab)
+backend = "kitty"            # "kitty" | "ghostty" | "zellij" | "tmux"; unset auto-detects
+                             # (zellij, then tmux, then Ghostty, else Kitty)
+sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this;
+                             # tmux and Ghostty are always per-tab)
 
 [kitty]
 rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
@@ -301,7 +317,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 - [ ] **tmux**: probe-verified on 3.7b only, and its live-server test doesn't run in CI yet. tmux is the one backend that *can* be tested headlessly — a server on a socket is the whole dependency — so putting that test in CI, and pinning the claimed ≥ 3.2 floor with it, is what graduates it.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
-- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
+- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
 ## License
 

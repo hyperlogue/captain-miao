@@ -1,7 +1,7 @@
 # captain-miao
 
 TUI dashboard to monitor and manage multiple Claude Code / Codex sessions across
-Kitty, zellij and tmux.
+Kitty, Ghostty, zellij and tmux.
 
 This file is the **map and the house rules**: where things live, and the
 constraints you can't discover by reading the file you're editing. Design
@@ -38,7 +38,8 @@ Four seams carry the whole design; each is documented at its definition.
   (`cm-core/backend.rs`) is also the server-core.
 - **`Terminal`** (`src/terminal/`) — per-emulator control. One `capabilities()`
   query is the whole capability seam: a new backend limitation is a new *field*
-  there, not a new trait method.
+  there, not a new trait method. Ghostty is the worked example: it can't read a
+  window at all, and that became `capture`.
 - **`Keymap`** (`src/app/keymap.rs`) — every Normal-mode command is remappable;
   `run_command` is the one place a `Command` becomes a side effect.
 
@@ -125,8 +126,12 @@ Anything local to one module is in that module's doc instead.
 - **Keep protocol changes additive** (`#[serde(default)]`). v4 is meant to be the
   last refusing bump; unknown frames decode to `Unknown` and are ignored.
 - **Hide an unsupported affordance, don't offer a key that only errors.** `t` on
-  zellij, `Space l` on tmux, `Ctrl-g` on Codex all do this. Render bindings via
-  `keys_for`/`primary_key` so a remap shows through without touching `draw.rs`.
+  zellij and Ghostty, `Space l` on tmux and Ghostty, `Ctrl-g` on Codex all do
+  this. Render bindings via `keys_for`/`primary_key` so a remap shows through
+  without touching `draw.rs`. A capability that gates a *recurring* read needs
+  the gate at the call site too, not just in the UI: the preview loop treats a
+  failed `capture_text` as evidence the binding is stale, so `capture: false`
+  has to stop the fetch rather than let it error.
 - **Wrap anything sent over ssh in `/bin/sh -c '<script>'`** (`login_shell_safe`)
   — the account's login shell is routinely fish. Such a script may contain **no
   single quote and no backslash**.
@@ -134,7 +139,9 @@ Anything local to one module is in that module's doc instead.
   (`zellij:<session>` / `tmux:<socket>,<server-pid>` / `kitty:<socket|pid>`) —
   those id spaces overlap. A row stamped with another instance is *foreign*:
   drawn dimmed, window ops inert, bindings carried verbatim through every
-  rewrite so switching backends loses nothing.
+  rewrite so switching backends loses nothing. Ghostty is the one identity that
+  is **not** instance-granular, and `ghostty_identity` states why: its surface
+  ids are UUIDs, so nothing overlaps and there is nothing to disambiguate.
 - **Treat Claude's own session file as authoritative** on the
   working/idle/background-shell axis; mirror it, no edge-tracking. Refinement is
   **demote-only** — hooks own rest→`Active`. An unreadable or unrecognized read
@@ -247,4 +254,8 @@ CM_SERVER_PAYLOAD_MANIFEST=/tmp/payloads.tsv CM_TEST_SSH_TARGET=box \
   cargo test -p captain-miao -- --ignored provisions_a_real_host
 #   (src/backend.rs's test doc has the full recipe for building that manifest)
 cargo test -p captain-miao -- --ignored drives_a_real_tmux_server
+# Ghostty's own live test. macOS, Ghostty >= 1.3 running, and captain-miao
+# granted Automation permission for it — the backend is otherwise written and
+# tested entirely against pure script-building/parsing functions.
+cargo test -p captain-miao -- --ignored drives_a_real_ghostty
 ```

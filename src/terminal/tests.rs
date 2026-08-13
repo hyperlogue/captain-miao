@@ -80,32 +80,78 @@ fn tail_lines_returns_last_n() {
 fn detect_backend_override_beats_env() {
     // An explicit `[terminal] backend` pins the backend regardless of env —
     // including forcing Kitty while inside a nested multiplexer (and vice versa).
-    for (in_zellij, in_tmux) in [(true, true), (true, false), (false, true), (false, false)] {
-        assert_eq!(
-            detect_backend(Some(ConfiguredBackend::Kitty), in_zellij, in_tmux),
-            ConfiguredBackend::Kitty
-        );
-        assert_eq!(
-            detect_backend(Some(ConfiguredBackend::Tmux), in_zellij, in_tmux),
-            ConfiguredBackend::Tmux
-        );
-        assert_eq!(
-            detect_backend(Some(ConfiguredBackend::Zellij), in_zellij, in_tmux),
-            ConfiguredBackend::Zellij
-        );
+    for in_zellij in [true, false] {
+        for in_tmux in [true, false] {
+            for in_ghostty in [true, false] {
+                for pinned in [
+                    ConfiguredBackend::Kitty,
+                    ConfiguredBackend::Tmux,
+                    ConfiguredBackend::Zellij,
+                    ConfiguredBackend::Ghostty,
+                ] {
+                    assert_eq!(
+                        detect_backend(Some(pinned), in_zellij, in_tmux, in_ghostty),
+                        pinned
+                    );
+                }
+            }
+        }
     }
 }
 
 #[test]
-fn detect_backend_prefers_zellij_then_tmux_then_kitty() {
-    // No override: a live multiplexer wins over the ambient Kitty env (a nested
-    // mux shares the outer KITTY_WINDOW_ID), else Kitty is the status-quo
-    // fallback. Zellij stays ahead of tmux when both are live — the env can't
-    // say which is inner, and this order keeps existing zellij users unchanged.
-    assert_eq!(detect_backend(None, true, true), ConfiguredBackend::Zellij);
-    assert_eq!(detect_backend(None, true, false), ConfiguredBackend::Zellij);
-    assert_eq!(detect_backend(None, false, true), ConfiguredBackend::Tmux);
-    assert_eq!(detect_backend(None, false, false), ConfiguredBackend::Kitty);
+fn detect_backend_prefers_zellij_then_tmux_then_ghostty_then_kitty() {
+    // No override: a live multiplexer wins over the ambient emulator env (a
+    // nested mux shares both the outer KITTY_WINDOW_ID and the outer
+    // TERM_PROGRAM), else Kitty is the status-quo fallback. Zellij stays ahead
+    // of tmux when both are live — the env can't say which is inner, and this
+    // order keeps existing zellij users unchanged.
+    assert_eq!(
+        detect_backend(None, true, true, true),
+        ConfiguredBackend::Zellij
+    );
+    assert_eq!(
+        detect_backend(None, true, false, true),
+        ConfiguredBackend::Zellij
+    );
+    assert_eq!(
+        detect_backend(None, false, true, true),
+        ConfiguredBackend::Tmux
+    );
+    assert_eq!(
+        detect_backend(None, false, false, true),
+        ConfiguredBackend::Ghostty
+    );
+    assert_eq!(
+        detect_backend(None, false, false, false),
+        ConfiguredBackend::Kitty
+    );
+}
+
+/// Ghostty is the one backend with no shared-tab arrangement *and* no capture,
+/// so both of the derived policies that key off `Capabilities` have to land the
+/// same way they do for the backends that share each trait: `Space l` is not a
+/// choice (tmux's shape), and the preview declines up front.
+#[test]
+fn ghostty_capabilities_resolve_the_derived_policies() {
+    let caps = ghostty::CAPABILITIES;
+    assert!(
+        !caps.layout_is_a_choice(),
+        "with neither stacked arrangement, `Space l` would toggle a label that changes nothing"
+    );
+    assert!(!caps.capture);
+    assert!(!caps.move_to_tab);
+    // tmux differs only in being able to reparent a pane, so the two must agree
+    // on everything else — a new capability field that Ghostty can't do either
+    // should be a deliberate edit here, not a silent divergence.
+    assert_eq!(
+        caps,
+        Capabilities {
+            move_to_tab: false,
+            capture: false,
+            ..tmux::CAPABILITIES
+        }
+    );
 }
 
 /// Both multiplexer backends share this: a pane command inherits the *server*'s

@@ -1,8 +1,9 @@
 //! Terminal-emulator abstraction.
 //!
 //! captain-miao controls windows and tabs through a [`Terminal`] backend —
-//! Kitty (`terminal::kitty`) or zellij (`terminal::zellij`), picked by
-//! [`get`]'s zellij-first detection. The trait is the set of *irreducible*
+//! Kitty (`terminal::kitty`), Ghostty (`terminal::ghostty`), zellij
+//! (`terminal::zellij`) or tmux (`terminal::tmux`), picked by
+//! [`get`]'s multiplexer-first detection. The trait is the set of *irreducible*
 //! per-backend primitives. Everything derivable from a window/tab tree — the
 //! window→tab map, the picker's tab summary — lives here as pure functions
 //! over a [`snapshot`](Terminal::snapshot), so the policy is written once and
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ConfiguredBackend};
 
+pub mod ghostty;
 pub mod graphics;
 pub mod kitty;
 pub mod tmux;
@@ -422,9 +424,10 @@ fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
 static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 
 /// Which backend `get()` should build: a config override wins, then a live
-/// zellij session, then a live tmux server, then Kitty as the status-quo
-/// fallback. Pure (env reads stay at the `get()` edge) so the precedence is
-/// unit-tested without touching the process-global env or the `OnceLock`.
+/// zellij session, then a live tmux server, then a Ghostty surface, then Kitty
+/// as the status-quo fallback. Pure (env reads stay at the `get()` edge) so the
+/// precedence is unit-tested without touching the process-global env or the
+/// `OnceLock`.
 ///
 /// **Both multiplexers must beat the ambient Kitty env**: when either runs nested
 /// inside Kitty, every pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty
@@ -436,15 +439,23 @@ static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 /// two nestings, and keeping zellij first means adding tmux changes nothing for
 /// existing zellij users. The wrong guess is corrected the same way the
 /// nested-zellij-in-Kitty case already is: pin `[terminal] backend`.
+///
+/// **Ghostty sits below both multiplexers for the same reason Kitty does** —
+/// `TERM_PROGRAM` survives into every pane — and below Kitty because it is the
+/// strictly weaker signal: `KITTY_WINDOW_ID` names a window, `TERM_PROGRAM` names
+/// only a vendor. The two never co-occur in practice, so the order between them
+/// is a tie-break rather than a policy.
 fn detect_backend(
     over: Option<ConfiguredBackend>,
     in_zellij: bool,
     in_tmux: bool,
+    in_ghostty: bool,
 ) -> ConfiguredBackend {
     match over {
         Some(b) => b,
         None if in_zellij => ConfiguredBackend::Zellij,
         None if in_tmux => ConfiguredBackend::Tmux,
+        None if in_ghostty => ConfiguredBackend::Ghostty,
         None => ConfiguredBackend::Kitty,
     }
 }
@@ -460,15 +471,24 @@ fn detect_backend(
 pub fn supported_terminal_present() -> bool {
     let in_zellij = zellij::ZellijTerminal::from_env().is_some();
     let in_tmux = tmux::TmuxTerminal::from_env().is_some();
-    match detect_backend(config::get().terminal.backend, in_zellij, in_tmux) {
-        // `get()` builds a multiplexer backend only when one is actually live;
-        // when it isn't (config pinned zellij/tmux outside one) `get()` falls
-        // back to Kitty, so the gate then requires Kitty like the Kitty arm.
+    let in_ghostty = ghostty::GhosttyTerminal::from_env().is_some();
+    match detect_backend(
+        config::get().terminal.backend,
+        in_zellij,
+        in_tmux,
+        in_ghostty,
+    ) {
+        // `get()` builds a non-Kitty backend only when one is actually live; when
+        // it isn't (config pinned zellij/tmux/ghostty outside one, or pinned
+        // ghostty off macOS) `get()` falls back to Kitty, so the gate then
+        // requires Kitty like the Kitty arm.
         ConfiguredBackend::Zellij if in_zellij => true,
         ConfiguredBackend::Tmux if in_tmux => true,
-        ConfiguredBackend::Zellij | ConfiguredBackend::Tmux | ConfiguredBackend::Kitty => {
-            std::env::var_os("KITTY_PID").is_some()
-        }
+        ConfiguredBackend::Ghostty if in_ghostty => true,
+        ConfiguredBackend::Zellij
+        | ConfiguredBackend::Tmux
+        | ConfiguredBackend::Ghostty
+        | ConfiguredBackend::Kitty => std::env::var_os("KITTY_PID").is_some(),
     }
 }
 
@@ -499,10 +519,12 @@ pub fn get() -> &'static dyn Terminal {
         // an unparseable `TMUX`).
         let zellij = zellij::ZellijTerminal::from_env();
         let tmux = tmux::TmuxTerminal::from_env();
+        let ghostty = ghostty::GhosttyTerminal::from_env();
         match detect_backend(
             config::get().terminal.backend,
             zellij.is_some(),
             tmux.is_some(),
+            ghostty.is_some(),
         ) {
             ConfiguredBackend::Zellij => match zellij {
                 Some(z) => Box::new(z) as Box<dyn Terminal>,
@@ -524,6 +546,19 @@ pub fn get() -> &'static dyn Terminal {
                     tracing::warn!(
                         "[terminal] backend = \"tmux\" but TMUX is unset or unparseable; \
                          falling back to Kitty"
+                    );
+                    Box::new(kitty::KittyTerminal)
+                }
+            },
+            ConfiguredBackend::Ghostty => match ghostty {
+                Some(g) => Box::new(g) as Box<dyn Terminal>,
+                // Same fallback as the two above, plus one case they don't have:
+                // the config can pin ghostty on Linux, where `from_env` refuses
+                // regardless of `TERM_PROGRAM` because there is nothing to drive.
+                None => {
+                    tracing::warn!(
+                        "[terminal] backend = \"ghostty\" but this is not a macOS Ghostty \
+                         surface; falling back to Kitty"
                     );
                     Box::new(kitty::KittyTerminal)
                 }
