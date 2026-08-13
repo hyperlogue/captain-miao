@@ -25,11 +25,20 @@
 # is the belt.
 #
 # Delegated to xtask rather than restated here: it owns the cross-compile
-# strategy, the glibc floor and the arch check, so a nix expression repeating them
-# would be a second copy free to drift. Hence the two needs — `devToolchain`
-# for the cross `rust-std`s (via `craneLibCross`), and a writable `HOME`, since
-# cargo-zigbuild keeps a cache under it and nix points it at the non-existent
-# `/homeless-shelter`.
+# strategy, the glibc floor, the arch check and the size-tuned `server-release`
+# profile, so a nix expression repeating them would be a second copy free to
+# drift. Hence the two needs — `devToolchain` for the cross `rust-std`s (via
+# `craneLibCross`), and a writable `HOME`, since cargo-zigbuild keeps a cache
+# under it and nix points it at the non-existent `/homeless-shelter`.
+#
+# That the size-tuned profile comes along is **wanted, not a leak**, and the
+# distinction is easy to get backwards. `packages.captain-miao-server` stays on
+# plain `release` because nothing downloads it — it is put on this machine's PATH
+# and run in place. These are the opposite case: they are deployed to other hosts
+# over ssh, so they want the same treatment the GitHub and npm payloads get, and
+# a host served from the store should be running the build that was published and
+# tested rather than a second one that merely resembles it. Do not "fix" this by
+# overriding the profile back to `release`.
 {
   lib,
   cargo-zigbuild,
