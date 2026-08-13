@@ -43,16 +43,17 @@
 //! measured that on a two-column terminal it turns the late write into an
 //! explicit `MoveTo` onto the glyph's second column, destroying the glyph.
 
-use std::io::{Stdout, Write, stdout};
+use std::io::{self, Stdout, Write, stdout};
 
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
 
-/// What `ratatui::DefaultTerminal` would have been.
+/// The dashboard's terminal — `ratatui::DefaultTerminal` with this module's
+/// backend in place of the stock one.
 pub(super) type DashboardTerminal = Terminal<WideGlyphBackend<Stdout>>;
 
 /// Raw mode, alternate screen, restore-on-panic, then the terminal — the same
@@ -74,59 +75,62 @@ pub(super) fn init() -> DashboardTerminal {
 
 /// `CrosstermBackend` with the reordering in the module docs. Every other method
 /// forwards untouched.
+///
+/// `Backend` gains two more required methods under ratatui's
+/// `scrolling-regions` feature, which nothing in this workspace turns on. If
+/// something ever does, this impl stops compiling for want of
+/// `scroll_region_up`/`scroll_region_down` — forward them to `self.0` like the
+/// rest. They can't be written ahead of time: the feature belongs to
+/// `ratatui-core`, so there is no `cfg` we can name from here.
 pub(super) struct WideGlyphBackend<W: Write>(CrosstermBackend<W>);
 
 impl<W: Write> Backend for WideGlyphBackend<W> {
-    type Error = std::io::Error;
+    type Error = io::Error;
 
-    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.0.draw(ReservedColumnFirst {
-            inner: content,
-            peeked: None,
-            deferred: None,
-        })
+        self.0.draw(ReservedColumnFirst::new(content))
     }
 
-    fn hide_cursor(&mut self) -> std::io::Result<()> {
+    fn hide_cursor(&mut self) -> io::Result<()> {
         self.0.hide_cursor()
     }
 
-    fn show_cursor(&mut self) -> std::io::Result<()> {
+    fn show_cursor(&mut self) -> io::Result<()> {
         self.0.show_cursor()
     }
 
-    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
         self.0.get_cursor_position()
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         self.0.set_cursor_position(position)
     }
 
-    fn clear(&mut self) -> std::io::Result<()> {
+    fn clear(&mut self) -> io::Result<()> {
         self.0.clear()
     }
 
-    fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
         self.0.clear_region(clear_type)
     }
 
-    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
         self.0.append_lines(n)
     }
 
-    fn size(&self) -> std::io::Result<Size> {
+    fn size(&self) -> io::Result<Size> {
         self.0.size()
     }
 
-    fn window_size(&mut self) -> std::io::Result<WindowSize> {
+    fn window_size(&mut self) -> io::Result<WindowSize> {
         self.0.window_size()
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         // `CrosstermBackend` is also a `Write`, whose `flush` means something
         // else — this is the one that drains the queued frame.
         Backend::flush(&mut self.0)
@@ -147,6 +151,16 @@ struct ReservedColumnFirst<I: Iterator> {
     deferred: Option<I::Item>,
 }
 
+impl<I: Iterator> ReservedColumnFirst<I> {
+    const fn new(inner: I) -> Self {
+        Self {
+            inner,
+            peeked: None,
+            deferred: None,
+        }
+    }
+}
+
 impl<'a, I> Iterator for ReservedColumnFirst<I>
 where
     I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -154,8 +168,6 @@ where
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        use ratatui::buffer::CellWidth;
-
         if let Some(deferred) = self.deferred.take() {
             return Some(deferred);
         }
@@ -181,6 +193,7 @@ where
 mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Alignment, Rect};
+    use ratatui::style::{Color, Style};
     use ratatui::text::Line;
     use ratatui::widgets::{Paragraph, Widget};
     use unicode_width::UnicodeWidthStr;
@@ -272,9 +285,10 @@ mod tests {
             self.paint(symbol);
         }
 
-        /// A full repaint of `buf` — the reference every incremental update has
-        /// to agree with. Skips the columns a wide cell reserved, since painting
-        /// their blanks would erase the glyph.
+        /// A full repaint of `buf` (one row, which is all these cases need) —
+        /// the reference every incremental update has to agree with. Skips the
+        /// columns a wide cell reserved, since painting their blanks would erase
+        /// the glyph that reserved them.
         fn repaint(buf: &Buffer, emoji_cols: usize) -> Self {
             let mut screen = Self::new(buf.area.width, emoji_cols);
             let mut x = 0;
@@ -288,11 +302,16 @@ mod tests {
         }
     }
 
+    /// A right-aligned bar on a filled background, like the header's. The
+    /// background matters: it is what puts ratatui's diff on the path that
+    /// force-clears a wide glyph's columns when narrower content replaces it,
+    /// so these cases exercise that alongside the reordering.
     fn bar(text: &str, width: u16) -> Buffer {
         let area = Rect::new(0, 0, width, 1);
         let mut buf = Buffer::empty(area);
         Paragraph::new(Line::from(text.to_string()))
             .alignment(Alignment::Right)
+            .style(Style::default().bg(Color::Rgb(49, 50, 68)))
             .render(area, &mut buf);
         buf
     }
@@ -323,12 +342,7 @@ mod tests {
                     screen.cursor = 0;
                     screen.last = None;
                     let updates = prev.diff(&next);
-                    let reordered = super::ReservedColumnFirst {
-                        inner: updates.into_iter(),
-                        peeked: None,
-                        deferred: None,
-                    };
-                    for (x, y, cell) in reordered {
+                    for (x, y, cell) in super::ReservedColumnFirst::new(updates.into_iter()) {
                         screen.feed(x, y, cell.symbol());
                     }
                     let want = Screen::repaint(&next, emoji_cols);
@@ -351,21 +365,19 @@ mod tests {
         let (prev, next) = (bar("a \u{2601}\u{fe0f} b", 12), bar("ab \u{1f4e6} c", 12));
         let updates = prev.diff(&next);
         let before: Vec<u16> = updates.iter().map(|(x, _, _)| *x).collect();
-        let after: Vec<u16> = super::ReservedColumnFirst {
-            inner: updates.clone().into_iter(),
-            peeked: None,
-            deferred: None,
-        }
-        .map(|(x, _, _)| x)
-        .collect();
+        let after: Vec<u16> = super::ReservedColumnFirst::new(updates.clone().into_iter())
+            .map(|(x, _, _)| x)
+            .collect();
         // Same set of writes, every time — reordering must never drop or add one.
         let (mut s_before, mut s_after) = (before.clone(), after.clone());
         s_before.sort_unstable();
         s_after.sort_unstable();
         assert_eq!(s_before, s_after, "{before:?} -> {after:?}");
-        // And a swap only ever puts a column ahead of the glyph covering it.
+        // And the only backwards step is the single column a swap moves: a
+        // glyph landing right after the column it covers.
         for pair in after.windows(2) {
-            assert!(pair[0] <= pair[1] + 1, "{before:?} -> {after:?}");
+            let stepped_back = pair[0].saturating_sub(pair[1]);
+            assert!(stepped_back <= 1, "{before:?} -> {after:?}");
         }
     }
 }
