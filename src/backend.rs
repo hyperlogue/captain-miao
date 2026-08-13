@@ -161,7 +161,14 @@ const CONN_LOG_CAP: usize = 200;
 ///   part of the diagnosis; `\t` becomes a space so words don't fuse.
 /// * **A backstop that costs nothing.** It holds if the renderer is swapped, if
 ///   a sink appears that doesn't go through a `Span`, or if this text is ever
-///   written somewhere rawer than a ratatui buffer.
+///   written somewhere rawer than a ratatui buffer — and one such sink is
+///   already here: `tracing` writes host stderr into log *files*, inert until
+///   somebody `cat`s one, at which point their terminal is the renderer and
+///   ratatui is nowhere in the picture.
+///
+/// Applied at [`capped_output`], where remote bytes arrive, so every consumer
+/// downstream — log, failure reason, tracing, parsers — gets the treated text
+/// without each having to remember.
 ///
 /// `\n` survives because the log is line-structured and splits on it. The
 /// control classes here are Unicode `Cc` — C0, `DEL`, and the C1 range where a
@@ -2378,10 +2385,19 @@ async fn capped_output(
         read_capped(child.stderr.take(), cap),
     );
     let status = child.wait().await?;
+    // Sanitized *here*, where the bytes arrive, rather than at each place they
+    // are shown. This text goes on to at least four destinations — the
+    // connection log, the `ConnState::Failed` reason, `tracing` (which writes
+    // files a user may later `cat` into a terminal), and the parsers — and only
+    // the first two had any treatment. One call at the entry point covers the
+    // ones that exist and the ones added later, which is the same argument
+    // `ConnLog::push` makes one level further down. Nothing parsed here is
+    // affected: line structure is preserved, and every field the probe returns
+    // is printable.
     Ok((
         status,
-        String::from_utf8_lossy(&out).into_owned(),
-        String::from_utf8_lossy(&err).into_owned(),
+        host_text_safe(&String::from_utf8_lossy(&out)),
+        host_text_safe(&String::from_utf8_lossy(&err)),
     ))
 }
 
@@ -4382,6 +4398,35 @@ mod tests {
         assert_eq!(host_text_safe("done\r"), "done\u{FFFD}");
         // Ordinary text, including non-ASCII, is untouched.
         assert_eq!(host_text_safe("no such file: café"), "no such file: café");
+    }
+
+    /// …and it happens where the bytes arrive, so a consumer that never heard
+    /// of it — `tracing`, which writes files a user may later `cat`, or a
+    /// `ConnState::Failed` reason — cannot receive raw ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn escapes_are_stripped_where_remote_output_enters() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            // Printed by the "host": a clear-screen on stdout, a retitle on
+            // stderr. `printf` so the bytes are real control characters.
+            .arg("printf 'a\\033[2Jb\\n'; printf 'e\\033]0;x\\007f\\n' >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning the noisy child");
+        let (_, stdout, stderr) = capped_output(child, REMOTE_OUTPUT_CAP)
+            .await
+            .expect("reading it");
+        assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+        assert!(
+            !stderr.contains('\u{1b}') && !stderr.contains('\u{7}'),
+            "{stderr:?}"
+        );
+        // Still readable as a diagnosis.
+        assert!(stdout.contains('a') && stdout.contains('b'), "{stdout:?}");
+        assert!(stderr.contains('e') && stderr.contains('f'), "{stderr:?}");
     }
 
     /// The install's success signal shares stdout with the account's **login
