@@ -434,14 +434,14 @@ impl App {
             // it: utilisation answers "does this box have room for another
             // session?", which is the other half of the question the latency
             // starts. Percentages rather than absolutes because the row is a
-            // scannable line, not a monitor — `l` is where detail goes. Absent
-            // until the first poll comes back, which shows as the numbers
-            // simply not being there.
+            // scannable line, not a monitor — `l` is where detail goes.
             //
-            // The figures are the *last* reading, held across polls, so a
-            // reopened panel is populated on its first frame rather than a round
-            // trip later — which is only honest because the arm below replaces
-            // them the moment a probe stops answering (see [`VitalsView`]).
+            // All three numbers stand or fall together, and none of them is ever
+            // a held one (see [`VitalsView`]): they arrive with a reading — the
+            // poll refreshes the latency sample on its way through — and until
+            // one does, a spinner sits in their place. A row that has none
+            // coming (a local backend, a host that isn't connected) shows
+            // neither, spinner included.
             match backend.vitals() {
                 Some(VitalsView::Reading(v)) => {
                     if let Some(cpu) = v.cpu_percent {
@@ -450,12 +450,26 @@ impl App {
                     if let Some(mem) = v.mem_percent() {
                         trailer.push_str(&format!("  mem {mem:.0}%"));
                     }
+                    // Labelled, unlike the bare `12ms` it used to be: three
+                    // numbers in a row need saying which is which, and a
+                    // duration on its own beside two percentages reads as
+                    // whatever the eye guesses.
+                    if let Some(rtt) = backend.latency() {
+                        trailer.push_str(&format!("  latency {}ms", rtt.as_millis()));
+                    }
+                }
+                // A frame of the spinner, which the run loop keeps turning. The
+                // wait is a round trip, so what this really says is "asked" —
+                // and on a host that has stopped answering it turns until the
+                // poll's deadline hands it to the arm below.
+                Some(VitalsView::Loading) => {
+                    trailer.push_str(&format!("  {}", vitals_spinner_glyph()));
                 }
                 // Said rather than left blank, and in the attention colour: the
                 // host is connected and everything else about it is on the row,
-                // so two numbers quietly missing reads as "nothing worth
-                // mentioning" rather than "we asked and got nothing back". The
-                // one span here that isn't dim, which is why the run is closed.
+                // so numbers quietly missing reads as "nothing worth mentioning"
+                // rather than "we asked and got nothing back". The one span here
+                // that isn't dim, which is why the run is closed early.
                 Some(VitalsView::Unavailable) => {
                     if !trailer.is_empty() {
                         spans.push(Span::styled(std::mem::take(&mut trailer), dim));
@@ -466,11 +480,6 @@ impl App {
                     ));
                 }
                 None => {}
-            }
-            // Sampled from ordinary request traffic — no `Ping` frame exists,
-            // deliberately (§9). `None` just means nothing has been asked yet.
-            if let Some(rtt) = backend.latency() {
-                trailer.push_str(&format!("  {}ms", rtt.as_millis()));
             }
             if !trailer.is_empty() {
                 spans.push(Span::styled(trailer, dim));
@@ -962,6 +971,32 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         Some(connect_blink_lit(since_epoch))
+    }
+
+    /// The utilisation spinner's frame right now, or `None` when nothing is
+    /// waiting on a reading — the run loop's "nothing to animate" signal, on the
+    /// same terms as [`connect_blink_phase`]. `None` whenever the hosts panel is
+    /// shut or covered by the connection log, since only its rows draw the
+    /// spinner and a dashboard nobody is looking at must still cost no frames.
+    ///
+    /// [`connect_blink_phase`]: App::connect_blink_phase
+    pub(super) fn vitals_spinner_phase(&self) -> Option<usize> {
+        let showing_rows = self
+            .host_edit
+            .as_ref()
+            .is_some_and(|s| s.log_view.is_none());
+        if !showing_rows
+            || !self
+                .backends
+                .iter()
+                .any(|b| matches!(b.vitals(), Some(VitalsView::Loading)))
+        {
+            return None;
+        }
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Some(vitals_spinner_frame(since_epoch))
     }
 
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -2019,6 +2054,36 @@ const CONNECT_BLINK_DARK: Duration = Duration::from_millis(500);
 pub(super) fn connect_blink_lit(since_epoch: Duration) -> bool {
     let period = (CONNECT_BLINK_LIT + CONNECT_BLINK_DARK).as_millis();
     since_epoch.as_millis() % period < CONNECT_BLINK_LIT.as_millis()
+}
+
+/// The frames a host row turns while its utilisation figures are on their way.
+///
+/// Braille rather than the ASCII `|/-\`: it occupies one cell whichever frame is
+/// up, so the numbers that replace it don't shift the rest of the trailer along,
+/// and the dots read as motion at a glance without the aggression of a spinning
+/// slash. Every frame has the same dot count for the same reason — an even
+/// weight is a spin, an uneven one is a flicker.
+pub(super) const VITALS_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long one frame holds. A tenth of a second reads as steady motion, and
+/// matches the run loop's default idle tick so a spin costs one frame per
+/// wake-up rather than forcing extra ones.
+pub(super) const VITALS_SPINNER_STEP: Duration = Duration::from_millis(100);
+
+/// The spinner's frame index at `since_epoch`. Pure, and off the wall clock
+/// rather than a stored anchor for the same reason as [`connect_blink_lit`]:
+/// every draw agrees on the phase without the App carrying animation state.
+pub(super) fn vitals_spinner_frame(since_epoch: Duration) -> usize {
+    let step = VITALS_SPINNER_STEP.as_millis().max(1);
+    (since_epoch.as_millis() / step) as usize % VITALS_SPINNER.len()
+}
+
+/// The frame to draw right now.
+fn vitals_spinner_glyph() -> &'static str {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    VITALS_SPINNER[vitals_spinner_frame(since_epoch)]
 }
 
 /// The header's ☁️ host tally: one colored number per bucket, good → error →

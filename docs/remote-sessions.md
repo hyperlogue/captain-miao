@@ -943,18 +943,23 @@ decides what they mean**.
     reachable, and with room; and because the poll refreshes the latency sample
     too, the whole line goes live while it is being read. Rendered as two
     percentages, no absolutes and no colour threshold: the row is a scannable
-    line, and a pegged CPU on a build box is normal rather than an alert. The
-    figures shown are the **last reading**, held until another reading replaces
-    them, so a reopened panel is populated on its first frame rather than a
-    round trip later. What makes that honest is the failure arm: a probe that
-    comes back with nothing — a daemon too old to know the frame, a host that
-    missed the deadline — is reported as `cpu/mem unavailable` in the attention
-    colour *in place of* the figures, because numbers left standing over a host
-    that has stopped answering are indistinguishable from live ones. A host that
-    answers with nothing to say (an OS we can't read) shows no figures rather
-    than zeros, which on a utilisation display would read as a definitely-idle
-    host; a dropped link drops the reading outright, the row having already said
-    `disconnected`. Editing a
+    line, and a pegged CPU on a build box is normal rather than an alert.
+  - **Nothing on that line is ever a held number.** Utilisation and latency
+    arrive together with a poll's answer and are dropped the moment they stop
+    describing the present — the panel opening (the previous answer is from
+    whenever it was last up, which a dim row has no way to say), or the link
+    coming back. In their place a **braille spinner** turns, so an opening panel
+    reads as *asking* rather than as a hole that fills in a round trip later,
+    and the ask is re-armed with it so that wait is one round trip rather than
+    the rest of the poll interval. A probe that comes back with nothing — a
+    daemon too old to know the frame, a host that missed the deadline — ends the
+    spin on `cpu/mem unavailable` in the attention colour, which is the third
+    state and the one that keeps the other two honest: a row says the figures
+    are current, on their way, or not coming, and never nothing at all. (A host
+    that *answers* with nothing to say — an OS we can't read — shows no figures
+    rather than zeros, which on a utilisation display would read as a
+    definitely-idle host; a disconnected one shows neither figures nor spinner,
+    its row having already said `disconnected`.) Editing a
   row exposes label / target (`^t` toggles ssh↔socket) / **options** (below) /
   **icon** (`^e` opens the same searchable emoji picker as `Space i`). There is
   **no Save

@@ -4671,6 +4671,27 @@ fn a_dialing_host_blinks_the_cloud_and_holds_the_count_at_zero() {
     assert!(!connect_blink_lit(Duration::from_millis(900 + 1400)));
 }
 
+/// The hosts panel's utilisation spinner: one frame per step, wrapping, and off
+/// the wall clock so nothing has to hold an animation cursor. Same shape as the
+/// blink above, and pinned for the same reason — the run loop redraws on the
+/// *change* of this number, so a phase that stuck or jumped would show up as a
+/// frozen or stuttering spinner rather than as a failure anywhere.
+#[test]
+fn the_vitals_spinner_advances_one_frame_a_step_and_wraps() {
+    use super::draw::{VITALS_SPINNER, VITALS_SPINNER_STEP, vitals_spinner_frame};
+    use std::time::Duration;
+    let step = VITALS_SPINNER_STEP;
+    assert_eq!(vitals_spinner_frame(Duration::ZERO), 0);
+    // Held for the whole step, then exactly one frame on.
+    assert_eq!(vitals_spinner_frame(step - Duration::from_millis(1)), 0);
+    assert_eq!(vitals_spinner_frame(step), 1);
+    assert_eq!(vitals_spinner_frame(step * 2), 2);
+    // And around: the clock never accumulates into an out-of-range index.
+    let cycle = step * VITALS_SPINNER.len() as u32;
+    assert_eq!(vitals_spinner_frame(cycle), 0);
+    assert_eq!(vitals_spinner_frame(cycle * 1000 + step * 3), 3);
+}
+
 /// The table's trailing line while a host is still dialing. Its whole job is to
 /// distinguish "no sessions there" from "not asked yet", so it names the host
 /// when there is one to name and counts them when there isn't.

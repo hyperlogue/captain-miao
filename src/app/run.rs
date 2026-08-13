@@ -1360,6 +1360,11 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // The connecting cloud's blink phase as last drawn: `None` while nothing is
     // dialing, so the steady state costs no frames at all.
     let mut last_blink_phase: Option<bool> = None;
+    // Ditto for the hosts panel's utilisation spinner.
+    let mut last_vitals_phase: Option<usize> = None;
+    // Whether the hosts panel was open on the previous pass, so its *opening*
+    // can be acted on (see the utilisation block).
+    let mut hosts_panel_open = false;
     // The tab label last pushed to the terminal, so the count is only re-sent
     // when it actually moves.
     let mut last_tab_title: Option<String> = None;
@@ -1435,11 +1440,25 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         // open, and only every `VITALS_POLL` (each backend throttles itself, so
         // this can run every iteration). Nothing is measured, sent or woken for
         // the hours the panel is closed — which is most of them.
-        if app.host_edit.is_some() {
+        //
+        // Which is also why *opening* it invalidates: the newest reading a host
+        // has is from the last time the panel was up, and on a dim row there is
+        // nothing to say that was an hour ago. The panel therefore always opens
+        // on the spinner and fills in from the ask below. Done on the edge here
+        // rather than in `open_host_edit` so it can't be missed by a second way
+        // in.
+        let panel_open = app.host_edit.is_some();
+        if panel_open {
+            if !hosts_panel_open {
+                for backend in &app.backends {
+                    backend.invalidate_vitals();
+                }
+            }
             for backend in &app.backends {
                 backend.poll_vitals();
             }
         }
+        hosts_panel_open = panel_open;
         // A reply is redraw-only: it changes no row, so it must not reach the
         // reload path. Taken unconditionally (hence not folded into the `if`
         // above) so a reply that lands as the panel closes drains here instead
@@ -1448,7 +1467,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             .backend_events
             .iter()
             .fold(false, |acc, e| acc | e.take_vitals());
-        if vitals_moved && app.host_edit.is_some() {
+        if vitals_moved && panel_open {
             needs_redraw = true;
         }
         // Resumable lists finishing their background fetch. Drained
@@ -1747,6 +1766,16 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         let blink_phase = app.connect_blink_phase();
         if blink_phase != last_blink_phase {
             last_blink_phase = blink_phase;
+            needs_redraw = true;
+        }
+
+        // The hosts panel's utilisation spinner, on exactly those terms: a frame
+        // per phase change while any host is waiting on a reading, and `None`
+        // the rest of the time — including whenever the panel is shut, which is
+        // most of the dashboard's life.
+        let vitals_phase = app.vitals_spinner_phase();
+        if vitals_phase != last_vitals_phase {
+            last_vitals_phase = vitals_phase;
             needs_redraw = true;
         }
 

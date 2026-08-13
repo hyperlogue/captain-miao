@@ -277,18 +277,24 @@ const VITALS_POLL: Duration = Duration::from_secs(15);
 /// link (or a daemon priming its CPU counters) still lands.
 const VITALS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What the panel has to show for a host: the last reading, or the fact that
-/// asking for one stopped working.
+/// Where a host's utilisation figures stand: on their way, here, or not
+/// coming.
 ///
-/// The distinction exists because the two must not look alike. A reading is
-/// held across polls, so reopening the panel shows the figures from last time
-/// while the fresh round trip is out rather than a blank line that fills in a
-/// second later. That is only safe because a probe that *fails* replaces them
-/// — numbers left standing on a host that has stopped answering are
-/// indistinguishable from live ones, and the whole question they answer ("has
-/// this box got room?") is about now.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Three states rather than "numbers or nothing" because the figures answer a
+/// question about *now* ("has this box got room?"), so the two ways of having
+/// none must not look alike — and neither may be filled in with the last
+/// answer. A reading is dropped the moment it stops describing the present
+/// (the panel opens, the link comes back), leaving `Loading` under the
+/// spinner; a poll that comes back empty-handed leaves `Unavailable` in the
+/// figures' place. What is on screen is therefore either current or visibly
+/// not a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) enum VitalsView {
+    /// Waiting on the first answer since the figures were last invalidated —
+    /// which the panel draws as a spinner rather than a hole that fills in a
+    /// round trip later.
+    #[default]
+    Loading,
     /// The most recent reading. May itself be empty — a host whose OS we can't
     /// sample answered, it just had nothing to say (see [`HostVitals::is_empty`]).
     Reading(HostVitals),
@@ -307,7 +313,7 @@ pub(crate) enum VitalsView {
 /// stacked on a slow link's first.
 #[derive(Default)]
 pub(crate) struct VitalsCell {
-    latest: Mutex<Option<VitalsView>>,
+    latest: Mutex<VitalsView>,
     changed: Arc<AtomicBool>,
     /// When the last poll was *sent* (not answered), so a host that never
     /// replies is retried on the same cadence as one that does rather than
@@ -334,32 +340,31 @@ impl VitalsCell {
     }
 
     /// Record a poll's outcome. `None` — nothing came back — becomes
-    /// [`VitalsView::Unavailable`], which *replaces* the previous reading
-    /// rather than letting it stand for a host that has stopped answering. A
-    /// reading is only ever superseded by another reading, so it survives the
-    /// panel being closed and reopened.
+    /// [`VitalsView::Unavailable`] rather than leaving the previous figures to
+    /// stand for a host that has stopped answering.
     fn settle(&self, vitals: Option<HostVitals>) {
-        *self.latest.lock().unwrap() = Some(match vitals {
+        *self.latest.lock().unwrap() = match vitals {
             Some(v) => VitalsView::Reading(v),
             None => VitalsView::Unavailable,
-        });
+        };
         self.inflight.store(false, Ordering::Relaxed);
         self.changed.store(true, Ordering::Relaxed);
     }
 
-    fn get(&self) -> Option<VitalsView> {
+    fn get(&self) -> VitalsView {
         *self.latest.lock().unwrap()
     }
 
-    /// Drop the reading on disconnect: numbers from before the link died are a
-    /// claim about a host we can no longer see, and stale ones next to a red
-    /// `disconnected` read as live. Back to nothing rather than
-    /// [`VitalsView::Unavailable`] — the row already says `disconnected`, and
-    /// annotating that with "and its utilisation is unavailable" is noise.
-    /// Also re-arms the poll, so the panel doesn't wait out an interval that
-    /// started before the reconnect.
-    fn clear(&self) {
-        *self.latest.lock().unwrap() = None;
+    /// Drop the reading and go back to waiting for one. Called when it stops
+    /// describing the present: the link died (numbers from before it did are a
+    /// claim about a host we can no longer see) and the hosts panel opened (the
+    /// last answer can be hours old, and nothing on a dim row would say so).
+    ///
+    /// Also re-arms the poll, so the very next pass asks — without that the
+    /// spinner would sit through however much of the interval the previous ask
+    /// left, which is the whole wait it exists to shorten.
+    fn invalidate(&self) {
+        *self.latest.lock().unwrap() = VitalsView::Loading;
         *self.asked_at.lock().unwrap() = None;
         self.changed.store(true, Ordering::Relaxed);
     }
@@ -525,16 +530,27 @@ impl Backend {
         }
     }
 
-    /// This host's last CPU/memory reading, as its daemon measured it — or
-    /// [`VitalsView::Unavailable`] if the last poll didn't come back. `None`
-    /// for a local backend — there is no daemon on this side of the seam, and
-    /// the dashboard deliberately measures nothing itself: a host reports its
-    /// own utilisation or none is shown. Also `None` while disconnected, and
-    /// until the first poll comes back.
+    /// Where this host's CPU/memory figures stand — see [`VitalsView`].
+    ///
+    /// `None` for a host that has none coming: a local backend (there is no
+    /// daemon on this side of the seam, and the dashboard deliberately measures
+    /// nothing itself — a host reports its own utilisation or none is shown),
+    /// or one that isn't connected, which is waiting on its link rather than on
+    /// a reading and says so on its own row.
     pub(crate) fn vitals(&self) -> Option<VitalsView> {
         match self {
             Backend::Local(_) => None,
-            Backend::Remote(b) => b.vitals.get(),
+            Backend::Remote(b) => b.conn_state().is_connected().then(|| b.vitals.get()),
+        }
+    }
+
+    /// Drop this host's figures and wait for fresh ones (see
+    /// [`VitalsCell::invalidate`]). Called on every hosts-panel open, because a
+    /// reading taken the last time the panel was up describes whenever that
+    /// was.
+    pub(crate) fn invalidate_vitals(&self) {
+        if let Backend::Remote(b) = self {
+            b.vitals.invalidate();
         }
     }
 
@@ -3623,7 +3639,7 @@ async fn connection_task(
         presumed_dead.lock().unwrap().clear();
         presumed_attached.lock().unwrap().clear();
         *latency.lock().unwrap() = None;
-        vitals.clear();
+        vitals.invalidate();
         standing_failure = match &outcome {
             ServeOutcome::HandshakeFailed(Some(reason)) => Some(reason.clone()),
             _ => None,
@@ -6570,31 +6586,41 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// The two rules the panel's figures rest on, in the cell that enforces
-    /// them: a reading is held until another *reading* replaces it — which is
-    /// what a reopened panel draws from — and a probe that comes back
-    /// empty-handed takes its place rather than leaving it to stand.
+    /// The rule the panel's figures rest on, in the cell that enforces it: what
+    /// a row shows is either an answer that has landed or visibly not a number.
+    /// Nothing here ever hands back a reading from before the last
+    /// invalidation.
     #[test]
-    fn a_failed_probe_replaces_the_held_reading_rather_than_outliving_it() {
+    fn vitals_are_a_landed_answer_or_visibly_not_a_number() {
+        let interval = Duration::from_secs(60);
         let cell = VitalsCell::default();
-        assert_eq!(cell.get(), None);
+        // Nothing asked yet, so nothing to show but the spinner.
+        assert_eq!(cell.get(), VitalsView::Loading);
         let reading = HostVitals {
             cpu_percent: Some(12.0),
             mem_used_bytes: Some(4),
             mem_total_bytes: Some(8),
         };
+        // An answer is the only thing that puts figures on the row...
+        assert!(cell.claim_poll(interval));
         cell.settle(Some(reading));
-        assert_eq!(cell.get(), Some(VitalsView::Reading(reading)));
+        assert_eq!(cell.get(), VitalsView::Reading(reading));
+        // ...and a poll that comes back empty-handed takes their place rather
+        // than leaving them to stand for a host that has stopped answering.
         cell.settle(None);
-        assert_eq!(cell.get(), Some(VitalsView::Unavailable));
+        assert_eq!(cell.get(), VitalsView::Unavailable);
         // A host with nothing to say still answered: that's a reading (which
         // renders as no figures), not a failed probe.
         cell.settle(Some(HostVitals::default()));
-        assert_eq!(cell.get(), Some(VitalsView::Reading(HostVitals::default())));
-        // Disconnect drops both — the row itself already says what happened.
-        cell.settle(Some(reading));
-        cell.clear();
-        assert_eq!(cell.get(), None);
+        assert_eq!(cell.get(), VitalsView::Reading(HostVitals::default()));
+        // Invalidation — the panel opening, or a link coming back — drops the
+        // answer rather than letting it describe a moment that has passed, and
+        // re-arms the poll, so the spinner it leaves behind lasts a round trip
+        // and not the rest of the interval.
+        assert!(!cell.claim_poll(interval));
+        cell.invalidate();
+        assert_eq!(cell.get(), VitalsView::Loading);
+        assert!(cell.claim_poll(interval));
     }
 
     /// A poll fetches the host's reading, raises the redraw-only signal, and —
@@ -6612,8 +6638,9 @@ mod tests {
             HostId("mock".into()),
         ));
         let events = backend.subscribe();
-        // Nothing is asked until the panel asks — the point of polling.
-        assert!(backend.vitals().is_none());
+        // Nothing is asked until the panel asks — the point of polling. So
+        // whether or not the link is up yet, there are no figures.
+        assert!(!matches!(backend.vitals(), Some(VitalsView::Reading(_))));
 
         let mut tries = 0;
         let vitals = loop {
@@ -6644,10 +6671,12 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!events.take_vitals());
-        // And the reading stands between polls rather than being blanked, which
-        // is what lets a reopened panel draw figures on its first frame instead
-        // of a hole that fills in a round trip later.
+        // The answer stands *between* polls — the throttle is what bounds how
+        // old a displayed figure gets, not a re-blank on every pass; only
+        // invalidation puts a row back on the spinner.
         assert_eq!(backend.vitals(), Some(VitalsView::Reading(vitals)));
+        backend.invalidate_vitals();
+        assert_eq!(backend.vitals(), Some(VitalsView::Loading));
 
         let _ = std::fs::remove_file(&sock);
     }
@@ -6656,9 +6685,8 @@ mod tests {
     /// the answer is silence — the poll must give up rather than park a task on
     /// a reply that will never come, and must not leave the host looking busy
     /// with a request forever in flight. Giving up is *reported*: a host that
-    /// answers nothing reads as `Unavailable`, never as a blank where numbers
-    /// would be, which on a held reading would be indistinguishable from a
-    /// figure that is merely a poll old.
+    /// answers nothing reads as `Unavailable` rather than spinning forever, so
+    /// the row says the figures aren't coming instead of implying they are.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_poll_an_old_daemon_ignores_gives_up_and_re_arms() {
         let sock =
