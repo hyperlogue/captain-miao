@@ -1441,6 +1441,11 @@ struct RemoteProbe {
     cache_target: Option<String>,
     /// A daemon already serving on this host, and which binary reported it.
     running: Option<RunningDaemon>,
+    /// Whether the host has a terminfo entry for *this dashboard's* `TERM`.
+    /// `None` when we didn't ask or couldn't tell — no usable local `TERM`, or a
+    /// host with no `infocmp`/`tic` to answer with, where a `false` would only
+    /// provoke an install we can't perform.
+    terminfo: Option<bool>,
 }
 
 /// The provisioning action a probe + local facts imply. Pure + unit-tested.
@@ -1515,7 +1520,25 @@ fn provision_label(action: &Provision) -> &'static str {
 /// account's login shell: [`login_shell_safe`] wraps the whole thing in
 /// `/bin/sh -c '…'`, so the inner dialect is always POSIX sh. The rule that
 /// still binds is the wrapper's — no single quote and no backslash anywhere.
-fn probe_script() -> String {
+fn probe_script(terminfo: Option<&str>) -> String {
+    // Whether the host can describe *our* terminal. Asked here rather than
+    // anywhere else because this is the one round trip that already exists, and
+    // because the answer is only actionable during provisioning — a pooled
+    // session's `TERM` is fixed when its pty is created, so the fix has to be in
+    // place before the session, not after it.
+    //
+    // Gated on `tic` as well as `infocmp`: a `no` we can't act on is worth
+    // nothing, and reporting it would make us re-attempt an install on a host
+    // with no ncurses tools on every single connect.
+    let terminfo = match terminfo {
+        Some(term) => format!(
+            "t=-; \
+             if command -v infocmp >/dev/null 2>&1 && command -v tic >/dev/null 2>&1; \
+             then if infocmp {term} >/dev/null 2>&1; then t=yes; else t=no; fi; fi; \
+             echo t=$t"
+        ),
+        None => "echo t=-".to_string(),
+    };
     format!(
         "set -f; \
          echo \"$HOME\"; uname -sm; \
@@ -1529,8 +1552,35 @@ fn probe_script() -> String {
          then d=path; \
          elif \"$HOME/{REMOTE_CACHE_REL}\" daemon status 2>/dev/null | grep -q \"{DAEMON_RUNNING_MARK}\"; \
          then d=cache; fi; \
-         echo $d"
+         echo $d; \
+         {terminfo}"
     )
+}
+
+/// This dashboard's `TERM`, when it is a name worth asking a host about *and*
+/// safe to splice into a shell script.
+///
+/// The allowlist is the security half: the value is interpolated into a script
+/// that [`login_shell_safe`] wraps in single quotes, so a `TERM` carrying a
+/// quote would both break that wrapping and be a command-injection seam from an
+/// environment variable. Terminfo names are `[A-Za-z0-9._+-]` in practice
+/// (`xterm-kitty`, `screen.xterm-256color`), so anything else is refused rather
+/// than escaped — there is nothing to gain by accepting it.
+///
+/// `dumb` and the universally-present `xterm-256color` are dropped as well:
+/// every host has the latter, and the pool wrapper substitutes it for the
+/// former anyway, so asking would only ever produce a `yes`. Pure apart from the
+/// env read.
+fn terminfo_to_provision() -> Option<String> {
+    let term = std::env::var("TERM").ok()?;
+    let term = term.trim();
+    let safe = !term.is_empty()
+        && term.len() <= 64
+        && term
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'));
+    let worth_asking = !matches!(term, "dumb" | "xterm-256color" | "xterm" | "linux");
+    (safe && worth_asking).then(|| term.to_string())
 }
 
 /// The fragment of `miao-server daemon status`'s first line that means a daemon
@@ -1631,6 +1681,17 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
         Some("cache") => Some(RunningDaemon::InCache),
         _ => None,
     };
+    // Prefixed like the marker, and for the same reason: a bare `-` would be
+    // read by `echo` as a flag.
+    let terminfo = match lines
+        .next()
+        .map(str::trim)
+        .and_then(|l| l.strip_prefix("t="))
+    {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => None,
+    };
     Some(RemoteProbe {
         home,
         arch,
@@ -1641,6 +1702,7 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
         cache_sha,
         cache_target,
         running,
+        terminfo,
     })
 }
 
@@ -2051,7 +2113,9 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
     let out = Command::new("ssh")
         .args(opts)
         .arg(target)
-        .arg(login_shell_safe(&probe_script()))
+        .arg(login_shell_safe(&probe_script(
+            terminfo_to_provision().as_deref(),
+        )))
         .output()
         .await
         .ok()?;
@@ -2059,6 +2123,93 @@ async fn probe_remote(target: &str, opts: &[String]) -> Option<RemoteProbe> {
         return None;
     }
     parse_probe(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Teach the host this terminal's terminfo, by piping the local entry into the
+/// remote's `tic` — the same "stream it in over the connection the probe already
+/// opened" shape as [`upload_server`], at a thousandth of the size.
+///
+/// **Why it belongs in provisioning.** Without the entry, everything that runs
+/// on that host falls back: the pool wrapper rewrites `TERM` to
+/// `xterm-256color` when `infocmp` can't resolve it, and — because libshpool
+/// fixes a session's environment when it *spawns* the command — that rewrite is
+/// permanent for the session's whole life. So this has to land before the
+/// session, and provisioning is the only phase that runs before one. Sessions
+/// already created keep the terminfo they were born with; the detail panel's
+/// warning is what still names those.
+///
+/// Installs into `$HOME/.terminfo`, which needs no privilege and which ncurses
+/// searches ahead of the system directories. `-o` names the directory outright
+/// rather than relying on tic's own not-root fallback, so the destination is the
+/// same on every host.
+///
+/// Verified the way the upload is: not by tic's exit status but by asking the
+/// host to resolve the name afterwards, which is the thing we actually want to
+/// be true. A failure is returned, never fatal — a host that can't take the
+/// entry still runs sessions, just in `xterm-256color`.
+async fn install_terminfo(target: &str, opts: &[String], term: &str) -> Result<(), String> {
+    let local = Command::new("infocmp")
+        .arg("-x")
+        .arg(term)
+        .output()
+        .await
+        .map_err(|e| format!("running local infocmp: {e}"))?;
+    if !local.status.success() {
+        return Err(format!("this machine has no terminfo source for {term}"));
+    }
+
+    let mut child = Command::new("ssh")
+        .args(opts)
+        .arg(target)
+        .arg(login_shell_safe(&terminfo_install_script(term)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawning ssh: {e}"))?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let source = local.stdout;
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(&source).await?;
+        stdin.shutdown().await
+    });
+    let out = tokio::time::timeout(TERMINFO_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("timed out after {}s", TERMINFO_TIMEOUT.as_secs()))?
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    let _ = writer.await;
+
+    if !String::from_utf8_lossy(&out.stdout).contains("ok") {
+        let stderr: String = String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(if stderr.is_empty() {
+            format!("the host did not take it (rc={:?})", out.status.code())
+        } else {
+            stderr
+        });
+    }
+    Ok(())
+}
+
+/// A terminfo entry is a couple of kilobytes; anything slower than this is a
+/// sick link, and the connection behind it has its own troubles to report.
+const TERMINFO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The remote half of [`install_terminfo`]: compile the entry arriving on stdin
+/// into `~/.terminfo`, then prove the name resolves. `echo ok` is the contract —
+/// tic's own exit status says the file compiled, not that ncurses will find it.
+/// Quote- and backslash-free for [`login_shell_safe`]; pure. Pinned by
+/// `every_script_we_send_survives_the_wrapping_that_defeats_a_login_shell`.
+fn terminfo_install_script(term: &str) -> String {
+    format!(
+        "d=\"$HOME/.terminfo\"; mkdir -p \"$d\"; \
+         tic -x -o \"$d\" - && infocmp {term} >/dev/null 2>&1 && echo ok"
+    )
 }
 
 /// Stream an embedded server payload to the host's cache path over the ssh
@@ -2383,6 +2534,29 @@ async fn resolve_remote_exe(
                 .join(", ")
         },
     ));
+
+    // Before anything else: if the host can't describe this terminal, teach it.
+    // Cheap, idempotent (the next probe answers `yes` and this never runs
+    // again), and strictly ahead of the first session — which is the only time
+    // it can help, since a pooled session's terminfo is fixed at create.
+    if probe.terminfo == Some(false)
+        && let Some(term) = terminfo_to_provision()
+    {
+        match install_terminfo(target, opts, &term).await {
+            Ok(()) => {
+                tracing::info!(target: "captain_miao::provision", "{target}: installed {term} terminfo");
+                log.info(format!(
+                    "installed the {term} terminfo in ~/.terminfo — sessions opened from here keep it"
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(target: "captain_miao::provision", "{target}: {term} terminfo install failed: {e}");
+                log.error(format!(
+                    "could not install the {term} terminfo ({e}); sessions here will run as xterm-256color"
+                ));
+            }
+        }
+    }
 
     // **The candidate loop.** `uname` cannot report a libc and neither can
     // anything else we can ask cheaply, so selection is verified rather than
@@ -3381,6 +3555,7 @@ mod tests {
             cache_sha: None,
             cache_target: None,
             running: None,
+            terminfo: None,
         }
     }
 
@@ -3455,7 +3630,7 @@ mod tests {
         // would otherwise expand against the *remote's* cwd and hand us a
         // directory listing where a digest belongs.
         let root = scratch_home("marker");
-        let script = probe_script();
+        let script = probe_script(None);
         // The marker+daemon tail, run against a throwaway $HOME. Everything
         // before it needs a real host, so slice from the marker read.
         let tail = &script[script.find("m=$(cat").expect("the marker read")..];
@@ -3485,9 +3660,14 @@ mod tests {
             let text = String::from_utf8_lossy(&out.stdout);
             assert_eq!(
                 text.lines().count(),
-                2,
-                "{name}: marker + daemon must be exactly two lines, got {text:?}"
+                3,
+                "{name}: marker + daemon + terminfo must be exactly three lines, got {text:?}"
             );
+            // The terminfo line is the tail's last, and with no terminal name
+            // sent it must still be *emitted* — the parse is positional, so a
+            // line that sometimes isn't there would shift every field after it
+            // if one is ever added below.
+            assert_eq!(text.lines().last(), Some("t=-"), "{name}: {text:?}");
             // A glob must stay literal rather than listing the host's cwd,
             // and the `m=` prefix must survive so the parse can find it.
             if name == "glob" {
@@ -3535,6 +3715,60 @@ mod tests {
                 .running,
             None
         );
+    }
+
+    /// The terminfo answer rides the probe's last line. Only an explicit `yes`
+    /// or `no` counts: everything else — a host with no ncurses tools, a probe
+    /// we sent no terminal name in, a daemon from before the field existed —
+    /// must read as *unknown*, because a spurious `no` provokes an install and a
+    /// spurious `yes` suppresses one that was needed.
+    #[test]
+    fn parse_probe_reads_whether_the_host_knows_this_terminal() {
+        let mk = |t: &str| {
+            parse_probe(&format!("/home/u\nLinux x86_64\n-\n-\nm=-\n-\n{t}\n"))
+                .unwrap()
+                .terminfo
+        };
+        assert_eq!(mk("t=yes"), Some(true));
+        assert_eq!(mk("t=no"), Some(false));
+        assert_eq!(mk("t=-"), None);
+        assert_eq!(mk("t=surprise"), None);
+        // No seventh line at all — an older probe script, or output cut short.
+        assert_eq!(
+            parse_probe("/home/u\nLinux x86_64\n-\n-\nm=-\n-\n")
+                .unwrap()
+                .terminfo,
+            None
+        );
+    }
+
+    /// The name is spliced into a shell script wrapped in single quotes, so the
+    /// allowlist is load-bearing rather than tidiness: a `TERM` carrying a quote
+    /// or a `;` would break the wrapping and run whatever followed it, on every
+    /// host this dashboard touches.
+    #[test]
+    fn only_a_plausible_terminfo_name_is_ever_sent_to_a_host() {
+        let name = |t: &str| {
+            // SAFETY: single-threaded test, and the value is read back at once.
+            unsafe { std::env::set_var("TERM", t) };
+            terminfo_to_provision()
+        };
+        assert_eq!(name("xterm-kitty").as_deref(), Some("xterm-kitty"));
+        assert_eq!(
+            name("screen.xterm-256color").as_deref(),
+            Some("screen.xterm-256color")
+        );
+        // Nothing to ask about: every host has these, and the pool wrapper
+        // substitutes for the rest anyway.
+        assert_eq!(name("xterm-256color"), None);
+        assert_eq!(name("dumb"), None);
+        assert_eq!(name(""), None);
+        // Injection attempts, in the forms an environment variable can take.
+        assert_eq!(name("x; rm -rf ~"), None);
+        assert_eq!(name("x' ; id ; '"), None);
+        assert_eq!(name("$(id)"), None);
+        assert_eq!(name("a\\b"), None);
+        assert_eq!(name(&"x".repeat(65)), None);
     }
 
     #[test]
@@ -4177,7 +4411,11 @@ mod tests {
         // sh, bash, zsh, fish and csh. `login_shell_safe` debug-asserts it too,
         // but only for the scripts a given run happens to build.
         for script in [
-            probe_script(),
+            probe_script(None),
+            // A terminfo name is spliced into the probe, so the sanitized form
+            // has to survive the same wrapping.
+            probe_script(Some("xterm-kitty")),
+            terminfo_install_script("xterm-kitty"),
             upload_script(&"a".repeat(64), "aarch64-unknown-linux-musl"),
         ] {
             let script = script.as_str();

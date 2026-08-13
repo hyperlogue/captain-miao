@@ -426,6 +426,25 @@ the full sequence and re-runs it on every reconnect:
    transient. A diagnosis now stands until an attempt concludes something else
    (`standing_failure` in `connection_task`), so the panel shows one steady
    sentence and the `⚠` stays lit.
+
+   The probe carries one rider that isn't about the binary: **does this host
+   have a terminfo entry for the dashboard's own `TERM`?** If not, the local
+   entry is piped into the host's `tic` (`infocmp -x` → `tic -x -o ~/.terminfo`,
+   the same stream-it-over-the-open-connection shape as the deploy, at a
+   thousandth of the size) and the host is asked to resolve the name afterwards
+   — tic's exit status says the file compiled, not that ncurses will find it.
+   It belongs *here*, in provisioning, because it cannot help later: the pool
+   wrapper rewrites an unresolvable `TERM` to `xterm-256color`, and libshpool
+   fixes a session's environment when it **spawns** the command, so that rewrite
+   is permanent for the session's life. Sessions already created keep what they
+   were born with — the detail panel's `Terminfo` warning is what names those.
+   Idempotent by construction (the next probe answers `yes`), never fatal (a
+   host that won't take it still runs sessions, in `xterm-256color`), and asked
+   only when there is something to ask: the probe reports `no` only if the host
+   has both `infocmp` and `tic` to act on it with, and the name is sent only if
+   it passes an `[A-Za-z0-9._+-]` allowlist — it is spliced into a script that
+   `login_shell_safe` wraps in single quotes, so a `TERM` carrying a quote would
+   be a command-injection seam out of an environment variable.
 2. **Ensure** — `ssh <target> <exe> daemon ensure` → prints the control-socket
    path; idempotent. Its stderr becomes the `Failed` reason when the probe had
    nothing to say.
