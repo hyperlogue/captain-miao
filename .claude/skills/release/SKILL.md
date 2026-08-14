@@ -46,8 +46,15 @@ alongside.
    - Write from the **user's** vantage point: what they can now do, or no longer
      run into — not the internal mechanics, refactors, or scaffolding that got it
      there. Fold related commits into one bullet. Match the existing voice: a bold
-     lead-in (`**Feature.**`) then a sentence or two on the change and why it
-     matters.
+     lead-in (`**Feature**`) carrying the change itself.
+   - **One sentence per bullet — no exceptions.** A changelog is scanned, not
+     read, so the bullet has to land in one pass; the second sentence is always
+     the mechanism, the caveat, or the history, and none of those belong here.
+     Where a caveat genuinely must ship, fold it in as a parenthetical or after a
+     dash rather than starting a new sentence. Everything that doesn't survive
+     the cut has a home already: the README for behaviour, the module docs for
+     mechanism, the commit body for why — including that a feature is unproven,
+     which the entry says by not claiming otherwise.
    - Add the compare link at the bottom, with the others:
      `[X.Y.Z]: https://github.com/hyperlogue/captain-miao/compare/v<prev>...vX.Y.Z`
 
