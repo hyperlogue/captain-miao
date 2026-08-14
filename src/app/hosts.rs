@@ -67,7 +67,8 @@ pub(super) struct HostConfig {
     #[serde(default)]
     pub options: Vec<String>,
     /// Offer this host the dashboard machine's clipboard, so an agent in a
-    /// pooled session there can paste a screenshot. Toggled with `p`.
+    /// pooled session there can paste a screenshot. The row editor's `Clipboard`
+    /// field.
     ///
     /// Off by default and per-host, which is the whole security posture: while a
     /// host is connected, anything running as you there — including the agent,

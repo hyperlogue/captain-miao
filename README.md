@@ -332,10 +332,11 @@ full connection log, `c` suspends it, `u` upgrades its server.
 
 #### Pasting a screenshot into a remote session
 
-`p` in the hosts panel offers that host **this machine's clipboard**, so `Ctrl+V`
-in an agent running there attaches a screenshot you just took here. It works by
-shadowing `xclip`/`wl-paste` on the agent's `PATH` with a shim that asks back over
-an owner-only unix socket, ssh-forwarded while the host is connected.
+A host's **Clipboard** field (`Space h`, `e`, then `Space` on it) offers that host
+**this machine's clipboard**, so `Ctrl+V` in an agent running there attaches a
+screenshot you just took here. It works by shadowing `xclip`/`wl-paste` on the
+agent's `PATH` with a shim that asks back over an owner-only unix socket,
+ssh-forwarded while the host is connected. A row that has it on shows 📋.
 
 **Only images are ever served.** Text is not filtered out — it is never requested,
 so a remote can't read your password manager through this. It is off by default

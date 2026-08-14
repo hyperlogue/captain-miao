@@ -1151,6 +1151,19 @@ impl App {
                     }
                     return None;
                 }
+                // The one field with no text in it, so the keys that would move a
+                // cursor have nothing to do and flip the value instead. `Enter`
+                // deliberately isn't one of them: it commits the row everywhere
+                // else in this form, and a key that means "save" on four fields
+                // must not mean "change" on the fifth.
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                    if focus == HostField::Clipboard =>
+                {
+                    if let Some(r) = state.rows.get_mut(state.cursor) {
+                        r.clipboard = !r.clipboard;
+                    }
+                    return None;
+                }
                 _ => {}
             }
             // Everything else is text. The fields are `TextInput`s, so the
@@ -1181,6 +1194,10 @@ impl App {
                         r.icon.set_text(prev);
                     }
                 }
+                // Nothing to type into: its own keys are handled above, and a key
+                // none of them claim is dropped rather than falling through to a
+                // `TextInput` this field does not have.
+                HostField::Clipboard => {}
             }
         } else {
             let n = state.rows.len();
@@ -1225,20 +1242,6 @@ impl App {
                     row.disabled = !row.disabled;
                     // Persists and rebuilds: `disabled` is part of what a backend
                     // is built from, so this drops (or dials) the connection now.
-                    self.apply_host_edits();
-                }
-                // Offer / stop offering this machine's clipboard to the host, so
-                // an agent in a pooled session there can paste a screenshot. No
-                // confirm, for the same reasons as `c`: nothing is destroyed and
-                // the same key undoes it.
-                //
-                // Turning it *off* is the security-relevant direction, and it
-                // takes effect immediately: `clipboard` is part of what a backend
-                // is built from, so this re-dials, and the reconnect cancels the
-                // forward the old tunnel child left with the ControlMaster.
-                KeyCode::Char('p') if state.cursor < n => {
-                    let row = &mut state.rows[state.cursor];
-                    row.clipboard = !row.clipboard;
                     self.apply_host_edits();
                 }
                 // Removal is destructive (it drops the host and its mirror), so

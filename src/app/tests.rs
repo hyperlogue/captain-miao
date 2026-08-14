@@ -4614,13 +4614,13 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
     );
 }
 
-/// A host offered the clipboard says so on its row, and `p` is named in the
-/// footer.
+/// A host offered the clipboard says so on its row.
 ///
 /// The marker rides the *target* line rather than the status line because that is
 /// where a host's forwards are shown, and the clipboard is one more of them — the
-/// status line reports live connection state, which this is not. Without both, the
-/// toggle is a key with no visible effect and no way to discover it.
+/// status line reports live connection state, which this is not. Without it the
+/// setting is invisible from the list, which is where you look to see how a host
+/// is configured.
 #[test]
 fn a_host_offered_the_clipboard_shows_it_on_its_row() {
     let mut d = TestDashboard::new(120, 30);
@@ -4633,19 +4633,91 @@ fn a_host_offered_the_clipboard_shows_it_on_its_row() {
     });
     state.cursor = 0;
 
-    // Off: nothing on the row, but the key is still offered.
     let out = d.render();
     assert!(out.contains("ssh user@box"), "{out}");
     assert!(!out.contains('\u{1f4cb}'), "off must show no marker: {out}");
-    assert!(out.contains("clipboard"), "the footer must name `p`: {out}");
 
-    // On: the marker lands beside the target, where the forwards are.
     d.app.host_edit.as_mut().unwrap().rows[0].clipboard = true;
     let out = d.render();
     assert!(
         out.contains("ssh user@box \u{1f4cb}"),
         "the marker belongs beside the target: {out}"
     );
+}
+
+/// The clipboard is a **field**, not a panel key: it shows its own state in the
+/// editor, `Space` flips it, and `Esc` puts it back like any other field.
+///
+/// The old `p` in the list was invisible until you read the footer and had no way
+/// to say what it currently was. Being a field, `[off]` is on screen the moment
+/// the editor opens — and it inherits the row snapshot, so abandoning an edit
+/// abandons this too.
+#[test]
+fn the_clipboard_is_a_field_in_the_row_editor() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    // No target, so committing the row exercises the commit without standing up a
+    // backend — the same trick `esc_abandons_a_hosts_row_edit_and_enter_keeps_it`
+    // uses, and here it also keeps an ssh host out of the shared `hosts.json`.
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: super::picker::TextInput::with_text("box"),
+        ..Default::default()
+    });
+    state.cursor = 0;
+    let row = |d: &TestDashboard| d.app.host_edit.as_ref().unwrap().rows[0].clipboard;
+
+    // The list has no key for it any more — `p` there must be inert.
+    d.press(KeyCode::Char('p'));
+    assert!(!row(&d), "`p` in the list must no longer toggle anything");
+
+    // Opening the editor shows the field and its state, unasked.
+    d.press(KeyCode::Char('e'));
+    let out = d.render();
+    assert!(
+        out.contains("Clipboard"),
+        "the field must be visible: {out}"
+    );
+    assert!(out.contains("[off]"), "and say what it currently is: {out}");
+
+    // Walk to it and flip it. `Space` on a text field would type a space, which
+    // is why the toggle is bound on this field alone.
+    for _ in 0..4 {
+        d.press(KeyCode::Tab);
+    }
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::Clipboard)
+    );
+    d.press(KeyCode::Char(' '));
+    assert!(row(&d), "Space must toggle it on");
+    let out = d.render();
+    assert!(out.contains("[on]"), "{out}");
+    assert!(
+        out.contains("Space toggle"),
+        "the hint names the key: {out}"
+    );
+    // The arrows have no cursor to move here, so they flip it too.
+    d.press(KeyCode::Left);
+    assert!(!row(&d), "← must toggle it back");
+    d.press(KeyCode::Right);
+    assert!(row(&d));
+
+    // `Enter` commits rather than toggling — a key that means "save" on the other
+    // four fields must not mean "change" on this one.
+    d.press(KeyCode::Enter);
+    assert!(row(&d), "Enter must not have flipped it");
+    assert!(d.app.host_edit.as_ref().unwrap().edit.is_none());
+
+    // And `Esc` abandons it with the rest of the row.
+    d.press(KeyCode::Char('e'));
+    for _ in 0..4 {
+        d.press(KeyCode::Tab);
+    }
+    d.press(KeyCode::Char(' '));
+    assert!(!row(&d));
+    d.press(KeyCode::Esc);
+    assert!(row(&d), "Esc must restore the pre-edit value");
 }
 
 /// The row editor's four fields walk by every idiom the dashboard binds
@@ -4666,16 +4738,18 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
     assert_eq!(focus(&d), Some(Options));
     d.press_ctrl(KeyCode::Char('n'));
     assert_eq!(focus(&d), Some(Icon));
+    d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(Clipboard));
     // The form is a ring, so the last field steps to the first.
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(Label));
 
     d.press(KeyCode::BackTab);
-    assert_eq!(focus(&d), Some(Icon));
+    assert_eq!(focus(&d), Some(Clipboard));
     d.press(KeyCode::Up);
-    assert_eq!(focus(&d), Some(Options));
+    assert_eq!(focus(&d), Some(Icon));
     d.press_ctrl(KeyCode::Char('p'));
-    assert_eq!(focus(&d), Some(Target));
+    assert_eq!(focus(&d), Some(Options));
 
     // None of it typed anything: the field keys are intercepted ahead of the
     // text input, which would otherwise have eaten `n` and `p`.

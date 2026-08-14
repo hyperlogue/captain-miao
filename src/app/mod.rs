@@ -714,8 +714,11 @@ pub(super) struct HostRow {
     /// would need its own cursor, its own add/remove keys and its own footer.
     pub(in crate::app) options: picker::TextInput,
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
-    /// Toggled with `p`, not a form field: it is a yes/no with no text to type,
-    /// and one more Tab stop for a boolean is worse than one more list key.
+    /// A form field, toggled with `Space`: the panel's plain letters are for
+    /// things you do *to* a row (connect, delete, upgrade), and this is part of
+    /// what a host **is**, like its options. Being a field also means it shows its
+    /// own state — `[off]` is visible the moment the editor opens, where a list
+    /// key was only discoverable from the footer.
     pub(in crate::app) clipboard: bool,
 }
 
@@ -734,16 +737,23 @@ pub(super) enum HostField {
     Target,
     Options,
     Icon,
+    /// The one field with nothing to type — see [`HostRow::clipboard`].
+    Clipboard,
 }
 
 impl HostField {
     /// Form order — the order the fields are drawn in, which is the order the
     /// focus keys walk.
-    const ORDER: [HostField; 4] = [
+    ///
+    /// `Clipboard` is last rather than beside `Options`, where it belongs by
+    /// meaning: the four text fields keep the Tab positions fingers already know,
+    /// and `^e`'s "open the editor on Icon" stays the fourth stop it names.
+    const ORDER: [HostField; 5] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
         HostField::Icon,
+        HostField::Clipboard,
     ];
 
     /// The next field, forwards or back. Wraps: the form is a ring, so

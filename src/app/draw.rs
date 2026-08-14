@@ -598,8 +598,8 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        // Four field rows + at most one per-field hint, plus a little slack.
-        let form_h: u16 = if state.edit.is_some() { 7 } else { 0 };
+        // Five field rows + at most one per-field hint, plus a little slack.
+        let form_h: u16 = if state.edit.is_some() { 8 } else { 0 };
         let [list_area, form_area] =
             Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
@@ -733,10 +733,10 @@ impl App {
                 };
                 let mut spans = vec![
                     mark,
-                    // 8, not 7: `Options` is exactly seven cells, and a label
+                    // 10, not 9: `Clipboard` is exactly nine cells, and a label
                     // that fills its own column runs into the value.
                     Span::styled(
-                        format!("{label:<8}"),
+                        format!("{label:<10}"),
                         Style::default().add_modifier(Modifier::DIM),
                     ),
                 ];
@@ -764,11 +764,22 @@ impl App {
                 ));
             }
             let icon_line = Line::from(icon_spans);
+            // The one field with no cursor, so it has to say its state in words:
+            // `[off]` on an untouched row is what tells you the setting is here at
+            // all. The marker doubles as the tie to the row's own `📋`.
+            let clipboard_line = Line::from(vec![
+                Span::styled(
+                    if r.clipboard { "[on] " } else { "[off]" },
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::raw(if r.clipboard { "\u{1f4cb}" } else { "" }),
+            ]);
             let mut form_lines = vec![
                 field_row(focus == HostField::Label, "Label", label_line),
                 field_row(focus == HostField::Target, "Target", target_line),
                 field_row(focus == HostField::Options, "Options", options_line),
                 field_row(focus == HostField::Icon, "Icon", icon_line),
+                field_row(focus == HostField::Clipboard, "Clipboard", clipboard_line),
             ];
             // Per-field hints for the non-obvious affordances. The Ports one is
             // the syntax itself: the field accepts more forms than a label can
@@ -787,6 +798,14 @@ impl App {
                 ))),
                 super::HostField::Icon => form_lines.push(Line::from(Span::styled(
                     "  ^e pick emoji   empty = auto",
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                // Names the key, then the direction — "clipboard" on a host row
+                // could as easily mean the host's own, and *whose* it is is the
+                // whole point. Kept to the length of the `Options` hint above, so
+                // it survives the same popup width that one does.
+                super::HostField::Clipboard => form_lines.push(Line::from(Span::styled(
+                    "  Space toggle   offer this machine's clipboard — paste a screenshot there",
                     Style::default().add_modifier(Modifier::DIM),
                 ))),
                 _ => {}
@@ -1985,7 +2004,6 @@ impl App {
                     spans.extend(hint_pair("^e", "icon"));
                     spans.extend(hint_pair("^t", "target"));
                     spans.extend(hint_pair("c", "connect/disconnect"));
-                    spans.extend(hint_pair("p", "clipboard"));
                     spans.extend(hint_pair("d", "delete"));
                     // Shown only on a row that has somewhere to go, which is the
                     // same condition the row's `↑` marker draws under: a hint

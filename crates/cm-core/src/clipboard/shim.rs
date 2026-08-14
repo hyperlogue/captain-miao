@@ -342,7 +342,7 @@ pub async fn paste() -> Result<()> {
     }
     anyhow::bail!(
         "no image on the clipboard — or this host is not offered one \
-         (turn it on with `p` in the dashboard's hosts panel)"
+         (turn it on in the dashboard: `Space h`, `e`, then the Clipboard field)"
     )
 }
 
