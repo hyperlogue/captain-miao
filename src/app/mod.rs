@@ -4686,7 +4686,10 @@ impl App {
             return Err("Cannot restart: session must be idle (not active or waiting)");
         }
         let Some(session_id) = self.index_of(s).live_session_id(s).map(str::to_string) else {
-            return Err("Cannot restart: session has no session id yet");
+            // Not "yet": a backend whose payloads never name a session id
+            // (opencode) never acquires one, so the wait this used to promise
+            // does not end there.
+            return Err("Cannot restart: no session id known for this session");
         };
         Ok(RestartSpec {
             agent: s.agent,

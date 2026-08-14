@@ -328,7 +328,10 @@ impl Command {
             Command::NewSession => "new session (same cwd)",
             Command::NewSessionPrompt => "new session (prompt for cwd; Ctrl-g for a worktree)",
             Command::ResumePicker => "resume picker",
-            Command::ForkSession => "fork / resume selected in place",
+            // Only ever a fork. The "/ resume selected in place" half dates from
+            // before the key refused to plain-resume, which it now does rather
+            // than quietly deliver the one outcome a fork exists to avoid.
+            Command::ForkSession => "fork the selected session",
             Command::CopySessionId => "copy selected session id to clipboard",
             Command::KillSelected => "kill selected session",
             Command::DetachRemote => "detach remote session (keep it running)",

@@ -341,7 +341,20 @@ impl App {
                 // default: forking is about *this* session, and its transcript
                 // lives on that machine. A remote fork lands in that host's pool
                 // and auto-attaches like any open (§9).
-                let session_id = self.index_of(&s).live_session_id(&s)?.to_string();
+                //
+                // Say so when there is no id, rather than returning `None` into
+                // silence — the treatment `CopySessionId` below already gives
+                // the identical condition. For most backends this is the first
+                // second of a session and the message is never seen; for one
+                // whose payloads name no id at all (opencode) it is permanent,
+                // and a key that does nothing forever with no explanation is the
+                // worst version of it. Deliberately not phrased "yet": on that
+                // backend the wait never ends.
+                let Some(session_id) = self.index_of(&s).live_session_id(&s).map(str::to_string)
+                else {
+                    self.set_status("No session id known for this session".to_string(), true);
+                    return None;
+                };
                 // The fork lands per the current layout (`resolve_spawn_target`),
                 // not next to the session's window.
                 Some(Action::ResumeSession {
