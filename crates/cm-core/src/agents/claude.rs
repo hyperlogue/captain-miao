@@ -1252,6 +1252,10 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Claude's payload has no title; a `/rename` reaches `name` through the
         // session-file fold instead.
         session_title: None,
+        // Claude's tokens and model come from the transcript fold, which is
+        // richer here: it is incremental and yields the first prompt too.
+        context_tokens: None,
+        model: None,
         transcript_path: payload.transcript_path,
         raw: Some(stdin.to_string()),
     })
@@ -1265,7 +1269,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 /// the way every backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // Claude mints a new sessionId on `/resume`; always take the freshest.
-    common::adopt_session_identity(state, &mut msg);
+    common::adopt_session_facts(state, &mut msg);
 
     match msg.event {
         // AskUserQuestion fires a PermissionRequest like any gated tool, but
@@ -1825,6 +1829,8 @@ mod tests {
             cwd: None,
             prompt: None,
             session_title: None,
+            context_tokens: None,
+            model: None,
             transcript_path: None,
             raw: None,
         }

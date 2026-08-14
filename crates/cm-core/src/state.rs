@@ -612,9 +612,25 @@ pub struct HookMessage {
     /// Carried on `HookMessage` rather than handled per-event because it is not
     /// an event: it rides *every* payload of the backends that have it, so the
     /// adoption belongs with the session id's, in
-    /// [`crate::agents::common::adopt_session_identity`].
+    /// [`crate::agents::common::adopt_session_facts`].
     #[serde(default)]
     pub session_title: Option<String>,
+    /// Context-window token total, when the agent puts it on the payload.
+    ///
+    /// The alternative to reading a transcript, and for some backends the *only*
+    /// route: an agent whose sessions live in a database or an undocumented
+    /// sidecar has nothing [`crate::agent::AgentControl::read_transcript_stats`]
+    /// could fold, but can still say the number itself. Where both exist the
+    /// transcript is usually richer (it is incremental and carries the first
+    /// prompt too), so a backend should pick one source and say which — see
+    /// [`crate::agents::common::adopt_session_facts`].
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    /// Model id backing the current turn, when the payload carries it. Same
+    /// argument as [`Self::context_tokens`], and they travel together because
+    /// every agent that reports one reports the other.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Path to the current session's transcript on disk, if the agent
     /// exposes one in its hook payload. The launcher watches it to detect
     /// out-of-band signals (approval dismissed, assistant message appended,

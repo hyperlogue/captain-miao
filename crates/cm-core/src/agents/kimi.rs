@@ -22,7 +22,7 @@
 //! backend here.
 //!
 //! **`session_title` rides every payload**, so [`parse_hook_payload`] fills
-//! [`HookMessage::session_title`] and [`common::adopt_session_identity`] stamps
+//! [`HookMessage::session_title`] and [`common::adopt_session_facts`] stamps
 //! it onto `LauncherState.name`. No title store, no sqlite reader, no per-host
 //! overlay, no `out_of_band_watch_paths` entry — the two mechanisms Claude and
 //! Codex each had to grow are simply absent. A rename is just a later payload
@@ -465,6 +465,10 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         prompt: payload.prompt,
         // The field this whole backend is cheap because of.
         session_title: payload.session_title,
+        // Kimi's payload names neither; both wait on `wire.jsonl`'s field
+        // names (module doc).
+        context_tokens: None,
+        model: None,
         transcript_path: None,
         raw: Some(stdin.to_string()),
     })

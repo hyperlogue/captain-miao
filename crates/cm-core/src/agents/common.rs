@@ -11,9 +11,10 @@
 
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
-/// Adopt what the hook says about *which session this is* — its id, and its
-/// title where the backend reports one. Both ride every payload rather than a
-/// particular event, so both are taken here regardless of `msg.event`.
+/// Adopt everything the hook says about *the session* rather than about the
+/// event — its id, its title, its context-token total and its model. All of it
+/// rides every payload of the backends that report it, so all of it is taken
+/// here regardless of `msg.event`.
 ///
 /// Session ids: agents mint a fresh one on resume (Claude's `/resume`), so the
 /// freshest always wins.
@@ -25,15 +26,30 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// to nothing; it means the agent hasn't titled the session yet, and taking it
 /// would clear a name the launcher already folded.
 ///
-/// One function rather than two because a backend that handles an event
-/// *itself* must still do this, and the point of the pairing is that there is
-/// no way to remember the id and forget the title.
-pub(super) fn adopt_session_identity(state: &mut LauncherState, msg: &mut HookMessage) {
+/// Tokens and model: the same argument one field further. An agent that reports
+/// them needs no transcript read at all, which is the only route for a backend
+/// whose sessions live in a database or an undocumented sidecar. **A backend
+/// should report them here or fold them from a transcript, not both** — the two
+/// are separate sources for one fact, and picking one is what keeps them from
+/// disagreeing. Both are last-write-wins (unlike the title, whose empty case is
+/// special): a token count that has genuinely dropped after a compaction is a
+/// real new value, not a missing one.
+///
+/// One function rather than four because a backend that handles an event
+/// *itself* must still do all of this, and the point of the grouping is that
+/// there is no way to remember the id and forget the rest.
+pub(super) fn adopt_session_facts(state: &mut LauncherState, msg: &mut HookMessage) {
     if let Some(sid) = msg.session_id.take() {
         state.session_id = Some(sid);
     }
     if let Some(title) = msg.session_title.take().filter(|t| !t.trim().is_empty()) {
         state.name = Some(title);
+    }
+    if let Some(tokens) = msg.context_tokens.take() {
+        state.context_tokens = Some(tokens);
+    }
+    if let Some(model) = msg.model.take().filter(|m| !m.trim().is_empty()) {
+        state.model = Some(model);
     }
 }
 
@@ -42,7 +58,7 @@ pub(super) fn adopt_session_identity(state: &mut LauncherState, msg: &mut HookMe
 /// `Stop` defers to its own session file) are handled in the backend module
 /// *before* it delegates here.
 pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) {
-    adopt_session_identity(state, &mut msg);
+    adopt_session_facts(state, &mut msg);
 
     match msg.event {
         HookEvent::SessionStart => {
@@ -143,7 +159,7 @@ mod tests {
         }
     }
 
-    fn msg(session_title: Option<&str>) -> HookMessage {
+    fn blank() -> HookMessage {
         HookMessage {
             event: HookEvent::Stop,
             session_id: None,
@@ -151,9 +167,18 @@ mod tests {
             message: None,
             cwd: None,
             prompt: None,
-            session_title: session_title.map(str::to_string),
+            session_title: None,
+            context_tokens: None,
+            model: None,
             transcript_path: None,
             raw: None,
+        }
+    }
+
+    fn msg(session_title: Option<&str>) -> HookMessage {
+        HookMessage {
+            session_title: session_title.map(str::to_string),
+            ..blank()
         }
     }
 
@@ -163,10 +188,10 @@ mod tests {
     #[test]
     fn a_reported_title_becomes_the_name_and_a_later_one_replaces_it() {
         let mut s = state();
-        adopt_session_identity(&mut s, &mut msg(Some("wire up the parser")));
+        adopt_session_facts(&mut s, &mut msg(Some("wire up the parser")));
         assert_eq!(s.name.as_deref(), Some("wire up the parser"));
 
-        adopt_session_identity(&mut s, &mut msg(Some("renamed by the user")));
+        adopt_session_facts(&mut s, &mut msg(Some("renamed by the user")));
         assert_eq!(s.name.as_deref(), Some("renamed by the user"));
     }
 
@@ -179,12 +204,61 @@ mod tests {
         s.name = Some("folded from the session file".to_string());
 
         for blank in ["", "   "] {
-            adopt_session_identity(&mut s, &mut msg(Some(blank)));
+            adopt_session_facts(&mut s, &mut msg(Some(blank)));
             assert_eq!(s.name.as_deref(), Some("folded from the session file"));
         }
         // As does a payload with no title field at all — the shape Claude and
         // Codex send on every hook.
-        adopt_session_identity(&mut s, &mut msg(None));
+        adopt_session_facts(&mut s, &mut msg(None));
         assert_eq!(s.name.as_deref(), Some("folded from the session file"));
+    }
+
+    /// The route for a backend with no readable transcript: the agent reports
+    /// the numbers itself and they land on the row without a fold.
+    #[test]
+    fn tokens_and_model_can_arrive_on_the_payload() {
+        let mut s = state();
+        let mut m = HookMessage {
+            context_tokens: Some(48_100),
+            model: Some("some-model-1".to_string()),
+            ..blank()
+        };
+        adopt_session_facts(&mut s, &mut m);
+        assert_eq!(s.context_tokens, Some(48_100));
+        assert_eq!(s.model.as_deref(), Some("some-model-1"));
+
+        // A **lower** count is a real value, not a missing one — that is what a
+        // compaction looks like — so unlike the title these are last-write-wins
+        // with no emptiness rule beyond a blank model string.
+        let mut m = HookMessage {
+            context_tokens: Some(9_000),
+            ..blank()
+        };
+        adopt_session_facts(&mut s, &mut m);
+        assert_eq!(s.context_tokens, Some(9_000));
+        // The absent model on that payload left the known one alone.
+        assert_eq!(s.model.as_deref(), Some("some-model-1"));
+    }
+
+    /// A payload that says nothing about tokens or model must not blank a row
+    /// that already has them — the shape every hook of a transcript-backed
+    /// backend sends.
+    #[test]
+    fn a_silent_payload_never_clears_tokens_or_model() {
+        let mut s = state();
+        s.context_tokens = Some(120_000);
+        s.model = Some("some-model-1".to_string());
+
+        adopt_session_facts(&mut s, &mut blank());
+        assert_eq!(s.context_tokens, Some(120_000));
+        assert_eq!(s.model.as_deref(), Some("some-model-1"));
+
+        // An empty model string is "not reported", not "no model".
+        let mut m = HookMessage {
+            model: Some("   ".to_string()),
+            ..blank()
+        };
+        adopt_session_facts(&mut s, &mut m);
+        assert_eq!(s.model.as_deref(), Some("some-model-1"));
     }
 }

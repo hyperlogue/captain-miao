@@ -515,7 +515,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Empty is *absent*, not a new identity. The approval hook synthesizes
         // this field from `$GROK_SESSION_ID` in shell, so an unset variable would
         // otherwise arrive as `""` and overwrite the launcher's real session id
-        // with nothing (`adopt_session_identity` takes the freshest id it is
+        // with nothing (`adopt_session_facts` takes the freshest id it is
         // given).
         session_id: payload.session_id.filter(|s| !s.trim().is_empty()),
         tool_name: payload.tool_name,
@@ -532,6 +532,10 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // the field the launcher gates its entire transcript watch on, so `None`
         // is what keeps the empty stats fold and the absent interrupt scan
         // consistent rather than merely unimplemented.
+        // Grok records both per session, but on disk rather than on the
+        // payload; see the module doc's probe list.
+        context_tokens: None,
+        model: None,
         transcript_path: None,
         raw: Some(stdin.to_string()),
     })
@@ -573,7 +577,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     //    shutdown is how a session ends up looking like it has live background
     //    work. Getting it right now costs one branch.
     if msg.event == HookEvent::Stop && is_session_end_stop(msg.raw.as_deref()) {
-        common::adopt_session_identity(state, &mut msg);
+        common::adopt_session_facts(state, &mut msg);
         return;
     }
 

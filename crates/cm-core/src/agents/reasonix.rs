@@ -349,6 +349,10 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // launcher gates its entire transcript watch on — so nothing reads a
         // Reasonix transcript, which is what makes the empty `read_transcript_stats`
         // and `scan_transcript_signals` consistent rather than merely unimplemented.
+        // Reasonix's payload names neither; both wait on the session sidecar
+        // schema (module doc).
+        context_tokens: None,
+        model: None,
         transcript_path: None,
         raw: Some(stdin.to_string()),
     })

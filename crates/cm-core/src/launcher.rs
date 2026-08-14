@@ -1215,11 +1215,19 @@ fn apply_session_name(state: &mut LauncherState, name: Option<String>) -> bool {
 /// agent's session file (`fold_session_name`), not the transcript.
 fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> bool {
     let mut changed = false;
-    if state.context_tokens != data.context_tokens {
+    // `Some`-only, like `first_prompt` below and for the same reason, now that a
+    // hook can carry these too (`common::adopt_session_facts`): a fold that
+    // produced no token count has not learned the count is zero, it has learned
+    // nothing, and overwriting with `None` would blank a column from a fact we
+    // do not have. That is the house rule for an unreadable read — leave it
+    // unchanged, never assert a definite value — and it also means a Codex tail
+    // that has scrolled past its last `token_count` keeps the number instead of
+    // dropping it.
+    if data.context_tokens.is_some() && state.context_tokens != data.context_tokens {
         state.context_tokens = data.context_tokens;
         changed = true;
     }
-    if state.model != data.model {
+    if data.model.is_some() && state.model != data.model {
         state.model = data.model.clone();
         changed = true;
     }
@@ -1925,5 +1933,34 @@ mod tests {
         );
         assert_eq!(class, Some(BgClass::LongRunning));
         assert!(due.is_none());
+    }
+    /// A fold that produced no token count has learned nothing, not that the
+    /// count is zero — so it must leave the row's number alone. This became
+    /// load-bearing once a hook could carry the value too
+    /// (`common::adopt_session_facts`): without it, the next transcript fold of
+    /// a backend that reports tokens on the payload would blank them again.
+    /// It also fixes a pre-existing case — a Codex tail that has scrolled past
+    /// its last `token_count` used to drop the number.
+    #[test]
+    fn a_silent_transcript_fold_never_clears_tokens_or_model() {
+        let mut state = state_with(SessionStatus::Idle);
+        state.context_tokens = Some(64_000);
+        state.model = Some("some-model-1".to_string());
+
+        let changed = apply_transcript_data(&mut state, &TranscriptStats::default());
+        assert!(!changed, "a fold with nothing in it changes nothing");
+        assert_eq!(state.context_tokens, Some(64_000));
+        assert_eq!(state.model.as_deref(), Some("some-model-1"));
+
+        // A fold that *does* have an opinion still wins, including a lower
+        // count — that is what a compaction looks like.
+        let folded = TranscriptStats {
+            context_tokens: Some(12_000),
+            model: Some("some-model-2".to_string()),
+            ..TranscriptStats::default()
+        };
+        assert!(apply_transcript_data(&mut state, &folded));
+        assert_eq!(state.context_tokens, Some(12_000));
+        assert_eq!(state.model.as_deref(), Some("some-model-2"));
     }
 }
