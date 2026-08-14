@@ -1742,7 +1742,20 @@ impl App {
             cmd(Command::NewSession),
             cmd(Command::NewSessionPrompt),
             cmd(Command::ResumePicker),
-            cmd(Command::ForkSession),
+        ]);
+        // `f` is the one action that turns on the *selected row's* backend
+        // rather than on a global capability: a resume with no way to branch
+        // has no fork to offer (`AgentControl::supports_fork`). Hide it there
+        // instead of listing a key that does nothing, as the unsupported `t`
+        // and the pool-only detach keys already do. With no row selected the
+        // list is generic, so the key stays.
+        if self
+            .selected_session_ref()
+            .is_none_or(|s| s.agent.supports_fork())
+        {
+            lines.push(cmd(Command::ForkSession));
+        }
+        lines.extend([
             cmd(Command::CopySessionId),
             cmd(Command::KillSelected),
             cmd(Command::RestartSelected),

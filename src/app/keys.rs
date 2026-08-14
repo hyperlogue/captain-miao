@@ -324,6 +324,15 @@ impl App {
             }),
             Command::ForkSession => {
                 let s = self.selected_session()?;
+                // Not every backend can branch a resume
+                // (`AgentControl::supports_fork`). Drop the key on one that
+                // can't, rather than run a plain resume under the name "fork" —
+                // continuing the session in place is the single outcome someone
+                // pressing `f` is trying to avoid, and it would look like it
+                // had worked.
+                if !s.agent.supports_fork() {
+                    return None;
+                }
                 // A fork follows the **focused session's** host, never the
                 // default: forking is about *this* session, and its transcript
                 // lives on that machine. A remote fork lands in that host's pool

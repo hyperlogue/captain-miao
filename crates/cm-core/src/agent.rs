@@ -256,6 +256,20 @@ impl AgentControl {
         self.worktree_args(None).is_some()
     }
 
+    /// Whether a resume can **branch** rather than continuing the session in
+    /// place — what `f` offers, and the thing `--fork-session` / Codex's `fork`
+    /// subcommand do.
+    ///
+    /// Derived from [`Self::resume_args`] the same way [`Self::supports_worktrees`]
+    /// derives from `worktree_args`, and for the same reason: a backend with no
+    /// fork flag simply ignores the `fork` argument, which makes the two argvs
+    /// equal and this `false` with no second match to keep in sync. A backend
+    /// that later grows the flag flips this by editing one arm.
+    pub fn supports_fork(self) -> bool {
+        // Any id works — both calls use the same one, so only the flag differs.
+        self.resume_args("id", true) != self.resume_args("id", false)
+    }
+
     // -- Dashboard-side: filesystem watching, transcript reading, naming --
 
     /// Filesystem paths whose changes should trigger a dashboard reload —
@@ -946,5 +960,28 @@ mod tests {
         assert!(serde_json::from_str::<AgentControl>("7").is_err());
         assert!(serde_json::from_str::<AgentControl>("null").is_err());
         assert!(serde_json::from_str::<AgentControl>(r#"{"name":"claude"}"#).is_err());
+    }
+
+    /// The gate is inert today — every shipping backend can branch a resume —
+    /// which is the reason to pin it now. The first backend without a fork flag
+    /// flips it by ignoring `fork` in its own arm, and this asserts that is all
+    /// it has to do.
+    #[test]
+    fn a_backend_forks_exactly_when_its_fork_argv_differs() {
+        for &agent in AgentControl::ALL {
+            let plain = agent.resume_args("id", false);
+            let forked = agent.resume_args("id", true);
+            assert_ne!(plain, forked, "{agent:?} should still fork today");
+            assert!(agent.supports_fork(), "{agent:?}");
+        }
+
+        // A backend this build can't drive contributes no argv either way, so
+        // the two are equal and it reports no fork — rather than offering `f`
+        // and resuming in place.
+        assert_eq!(
+            AgentControl::Unknown.resume_args("id", true),
+            AgentControl::Unknown.resume_args("id", false)
+        );
+        assert!(!AgentControl::Unknown.supports_fork());
     }
 }
