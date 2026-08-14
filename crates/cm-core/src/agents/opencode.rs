@@ -152,6 +152,7 @@ use tokio::process::Command;
 
 use super::common;
 use super::synth_home::SynthHome;
+use crate::agent::ResumeCandidate;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -681,6 +682,91 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 }
 
 // =============================================================================
+// Resume picker
+// =============================================================================
+
+/// `opencode session list --format json -n <limit>`, which is the one place
+/// opencode publishes a *stable* shape for this rather than an internal one.
+///
+/// The alternative — reading `~/.local/share/opencode/storage/session/…` — is
+/// faster and needs no subprocess, and is still not what this does: those files
+/// are opencode's own schema, versioned and migrated (`storage.ts` carries the
+/// migrations), so a reader of them is a reader of an internal format that has
+/// already changed shape at least twice. `formatSessionJSON` exists to be
+/// consumed and projects exactly six fields, four of which are the four this
+/// needs. One subprocess on picker-open is the cheaper side of that trade, and
+/// it runs host-side on a remote host like every other read.
+///
+/// `--format json` never paginates (opencode pages only the table form, and
+/// only on a tty), so this cannot hang waiting on a pager.
+pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    let exe = super::find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
+    let out = std::process::Command::new(exe)
+        .args(["session", "list", "--format", "json", "-n"])
+        .arg(limit.to_string())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("running `opencode session list`")?;
+    if !out.status.success() {
+        anyhow::bail!("`opencode session list` failed: {}", out.status);
+    }
+    Ok(parse_session_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// One entry of `formatSessionJSON`'s array. `updated` and `created` are
+/// epoch milliseconds; `directory` is the session's working directory.
+#[derive(Deserialize)]
+struct ListedSession {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    updated: u64,
+    #[serde(default)]
+    created: u64,
+    #[serde(default)]
+    directory: String,
+}
+
+/// Split from the subprocess so the shape is testable without opencode
+/// installed. An empty session list prints **nothing at all** rather than `[]`
+/// (`if (sessions.length === 0) return`), so an empty body is a valid, empty
+/// answer and not a parse failure.
+fn parse_session_list(stdout: &str) -> Vec<ResumeCandidate> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let listed: Vec<ListedSession> = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    listed
+        .into_iter()
+        .filter(|s| !s.directory.trim().is_empty())
+        .map(|s| ResumeCandidate {
+            agent: crate::agent::AgentControl::OpenCode,
+            session_id: s.id,
+            cwd: s.directory,
+            // opencode titles every session itself, so there is no "untitled,
+            // show me the first prompt" case for `first_prompt` to cover — and
+            // no branch on the row either, which is opencode's to record and it
+            // does not.
+            first_prompt: None,
+            custom_title: Some(s.title).filter(|t| !t.trim().is_empty()),
+            git_branch: None,
+            mtime: std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(if s.updated > 0 {
+                    s.updated
+                } else {
+                    s.created
+                }),
+        })
+        .collect()
+}
+
+// =============================================================================
 // Hook event → status mapping
 // =============================================================================
 
@@ -976,6 +1062,51 @@ mod tests {
         assert_eq!(msg.session_id.as_deref(), Some("ses_1"));
         // Not an assistant message, so no token total is invented for it.
         assert_eq!(msg.context_tokens, None);
+    }
+
+    /// The picker's rows, in the shape `formatSessionJSON` prints them.
+    #[test]
+    fn the_session_list_becomes_resume_candidates() {
+        let out = parse_session_list(
+            r#"[
+              {"id":"ses_1","title":"wire up the parser","updated":1700000002000,
+               "created":1700000001000,"projectId":"prj_1","directory":"/home/miao/p"},
+              {"id":"ses_2","title":"","updated":0,
+               "created":1700000000000,"projectId":"prj_1","directory":"/home/miao/q"}
+            ]"#,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].session_id, "ses_1");
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(
+            out[0].mtime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_002_000)
+        );
+        // An untitled session is untitled, not titled the empty string — the
+        // dashboard falls back to its own label for that.
+        assert_eq!(out[1].custom_title, None);
+        // `updated` is 0 on a session that has never been written since it was
+        // created, and a row dated 1970 sorts to the bottom of a picker that
+        // orders by recency.
+        assert_eq!(
+            out[1].mtime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000)
+        );
+    }
+
+    /// opencode prints **nothing** rather than `[]` when there are no sessions,
+    /// so an empty body has to read as an empty list and not as a broken CLI.
+    #[test]
+    fn no_sessions_is_an_empty_list_not_an_error() {
+        assert!(parse_session_list("").is_empty());
+        assert!(parse_session_list("   \n").is_empty());
+        // And a shape we do not recognise yields nothing rather than a panic or
+        // a half-filled row.
+        assert!(parse_session_list("not json at all").is_empty());
+        // A session with no directory cannot be resumed into anywhere, so it is
+        // dropped rather than offered with an empty cwd.
+        assert!(parse_session_list(r#"[{"id":"ses_1","title":"t","directory":""}]"#).is_empty());
     }
 
     /// One plugin serves every session, so it must carry no per-session data.

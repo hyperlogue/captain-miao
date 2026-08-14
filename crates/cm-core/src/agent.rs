@@ -588,33 +588,9 @@ impl AgentControl {
             // the sidecars directly waits on the same schema question as
             // `read_transcript_stats`.
             AgentControl::Reasonix => Ok(vec![]),
-            // Empty on the same missing fact as `read_transcript_stats`. A
-            // candidate needs a cwd, a first prompt and a session id; the id is
-            // the `sessions/` directory name, but reaching those directories at
-            // all means knowing `<workDirKey>` (or globbing for it), and reading
-            // a cwd or first prompt out of `state.json` / `wire.jsonl` means
-            // knowing their schemas. Kimi's `--session` with no id opens its own
-            // session browser, which is the usable answer until then.
-            AgentControl::Kimi => Ok(vec![]),
-            // Empty for now, and the *only* one of these arms that is a schema
-            // question rather than a design one: `$GROK_HOME/sessions/` is a
-            // plain directory of `summary.json` files (no subprocess needed, and
-            // `grok sessions list` as a fallback if the layout moves), each
-            // carrying the title, the git head and a parent-session ref. What is
-            // missing is how to read a candidate's **cwd**, which is the group
-            // directory's own name in a URL encoding nobody has confirmed, and
-            // the JSON spelling of the fields inside. One look at a real session
-            // dir fills this in.
-            AgentControl::Grok => Ok(vec![]),
-            // Empty on one missing flag, and nothing else. The plan is settled
-            // — shell out to `opencode session list` rather than reimplement
-            // the `opencode.db` schema, one subprocess per picker open, running
-            // host-side on a remote host like everything else — but whether it
-            // takes **`--json`** is unprobed (design §9.4 marks the flag
-            // `[PROBE]`), and parsing unstructured CLI output is how a picker
-            // starts showing fiction. One `opencode session list --help` fills
-            // this in.
-            AgentControl::OpenCode => Ok(vec![]),
+            AgentControl::Kimi => kimi::list_resumable(limit),
+            AgentControl::Grok => grok::list_resumable(limit),
+            AgentControl::OpenCode => opencode::list_resumable(limit),
             // Empty for now. Pi's sessions are plain JSONL under
             // `~/.pi/agent/sessions/`, grouped by working directory, so this is
             // reachable — but a candidate needs a cwd, a first prompt and an id,

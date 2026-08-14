@@ -57,15 +57,17 @@
 //!   a transcript path up does not silently inherit an event-driven watch macOS
 //!   cannot deliver.
 //!
-//! **What is deliberately not read.** The token and model columns and the resume
-//! picker are empty for Kimi, and that is a stated gap rather than an oversight:
-//! `wire.jsonl` is documented to carry "message history, request traces, tool
-//! schemas and parameters", but *no field name* for token usage or model is
-//! documented, and `<workDirKey>`'s derivation is undocumented too. A plausible
-//! guess at either would put a wrong number in a column users read as fact. The
-//! arms return `TranscriptStats::default()` / `Ok(vec![])` and say what would
-//! fill them. (If a session directory ever does need resolving, glob
-//! `sessions/*/<sessionId>/` rather than recomputing the key.)
+//! **What is deliberately not read.** The token and model columns are empty for
+//! Kimi. The names are no longer the obstacle — `agent-core-v2` ships a
+//! *generated* manifest of its whole wire protocol
+//! (`docs/wire-manifest.d.ts`, `protocol_version 1.5`) in which `usage.record`
+//! is flagged `persisted` and carries `model` plus
+//! `usage: {inputOther, output, inputCacheRead, inputCacheCreation}` — so this
+//! is now a fold over `sessions/<bucket>/<id>/agents/<agent>/wire.jsonl`
+//! waiting to be written, not a schema question. [`list_resumable`] needed
+//! neither: `<workDirKey>` is never decoded, because `session_index.jsonl`
+//! records each session's working directory outright and the bucket is a
+//! directory to walk.
 //!
 //! What a probe against a real binary must settle, in the order the failures
 //! hurt:
@@ -89,8 +91,9 @@
 //!   the payload being snake_case and the event vocabulary being Claude's. A
 //!   wrong guess costs the Tool column and the prompt preview, never a wrong
 //!   value (see [`HookPayload`]).
-//! - **`<workDirKey>`** — hash or slug — and `wire.jsonl`'s field names for token
-//!   usage and model. Together these are the whole token/model/resume gap.
+//! - **that `session_index.jsonl` is written for every session**, not only for
+//!   ones opened a particular way. It is the sole record of a session's working
+//!   directory, so a session missing from it never reaches the picker.
 //! - **that there is genuinely no fork** (`kimi --help | grep -i fork`). If one
 //!   appears, [`crate::agent::AgentControl::resume_args`] grows a flag under
 //!   `fork` and `supports_fork()` flips itself — nothing else changes.
@@ -120,6 +123,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
+use crate::agent::ResumeCandidate;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -153,6 +157,117 @@ fn kimi_home() -> Option<PathBuf> {
 /// module doc) is satisfied at most once per machine instead of once per launch.
 fn synth_home() -> PathBuf {
     crate::state::state_dir().join("kimi-home")
+}
+
+// =============================================================================
+// Resume picker
+// =============================================================================
+
+/// `<home>/session_index.jsonl` — one JSON object per line mapping a session to
+/// its directory and its working directory. Appended to rather than rewritten,
+/// so a session may appear more than once and the **last** line wins, which is
+/// also how Kimi's own reader folds it.
+///
+/// This file is the whole reason the bucket directory under `sessions/` never
+/// needs decoding: the cwd is recorded here explicitly, so the bucket is a
+/// directory to walk and not a string to parse.
+const SESSION_INDEX: &str = "session_index.jsonl";
+
+/// The session directory Kimi keeps under `<home>/sessions/<bucket>/`.
+const SESSIONS_DIR: &str = "sessions";
+
+/// Kimi's per-session `state.json`. It carries more than this (`agents`,
+/// `custom`, `isCustomTitle`); everything unnamed is ignored so a Kimi that
+/// grows a field still parses.
+#[derive(Deserialize, Default)]
+struct SessionState {
+    #[serde(default)]
+    title: Option<String>,
+    /// The most recent prompt, not the first — Kimi records no first prompt.
+    /// It stands in as the row's label for a session Kimi has not titled, which
+    /// is the same job `first_prompt` does for Claude and Codex even though the
+    /// prompt it names is a different one.
+    #[serde(default, rename = "lastPrompt")]
+    last_prompt: Option<String>,
+}
+
+fn read_session_index(home: &Path) -> std::collections::HashMap<String, String> {
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(default, rename = "workDir")]
+        work_dir: String,
+    }
+    let mut out = std::collections::HashMap::new();
+    let Ok(body) = std::fs::read_to_string(home.join(SESSION_INDEX)) else {
+        return out;
+    };
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(entry) = serde_json::from_str::<Entry>(line) {
+            out.insert(entry.session_id, entry.work_dir);
+        }
+    }
+    out
+}
+
+/// Every session under `<home>/sessions/`, newest first.
+///
+/// A session is a directory holding a `state.json`, two levels down. Its id is
+/// the directory's name, and its **cwd comes from `session_index.jsonl`** —
+/// state.json does not record one, which is why a session missing from the
+/// index is skipped rather than offered with a blank cwd that `r` would then
+/// resume into the wrong place.
+///
+/// No tokens come back with the row even though Kimi does record them: they
+/// live in `agents/<id>/wire.jsonl` as `usage.record` entries, which is a fold
+/// over an append-only log rather than a field, and belongs to
+/// `read_transcript_stats` rather than to a picker that stats one file per
+/// candidate.
+pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    let home = kimi_home().ok_or_else(|| anyhow::anyhow!("no kimi home"))?;
+    Ok(list_resumable_in(&home, limit))
+}
+
+/// The scan itself, split from `$KIMI_CODE_HOME` resolution so a test can point
+/// it at a fixture tree without touching the environment.
+fn list_resumable_in(home: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    let index = read_session_index(home);
+
+    let mut found = Vec::new();
+    for bucket in common::read_subdirs(&home.join(SESSIONS_DIR)) {
+        for session_dir in common::read_subdirs(&bucket) {
+            let state = session_dir.join("state.json");
+            let Ok(mtime) = std::fs::metadata(&state).and_then(|m| m.modified()) else {
+                continue;
+            };
+            found.push((session_dir, mtime));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (dir, mtime) in common::newest_first(found, limit) {
+        let Some(session_id) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(cwd) = index.get(session_id).filter(|c| !c.trim().is_empty()) else {
+            continue;
+        };
+        let state = std::fs::read_to_string(dir.join("state.json"))
+            .ok()
+            .and_then(|b| serde_json::from_str::<SessionState>(&b).ok())
+            .unwrap_or_default();
+        out.push(ResumeCandidate {
+            agent: crate::agent::AgentControl::Kimi,
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            first_prompt: state.last_prompt.filter(|p| !p.trim().is_empty()),
+            custom_title: state.title.filter(|t| !t.trim().is_empty()),
+            git_branch: None,
+            mtime,
+        });
+    }
+    out
 }
 
 // =============================================================================
@@ -504,6 +619,108 @@ mod tests {
     use super::*;
     use crate::agent::AgentControl;
     use crate::state::SessionStatus;
+
+    /// A `$KIMI_CODE_HOME` tree: `sessions/<bucket>/<id>/state.json`, plus the
+    /// home-level `session_index.jsonl` that is the only record of a session's
+    /// working directory.
+    fn home_fixture(tag: &str, sessions: &[(&str, &str, &str)], index: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("cm-kimi-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        for (bucket, id, body) in sessions {
+            let dir = home.join(SESSIONS_DIR).join(bucket).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("state.json"), body).unwrap();
+        }
+        std::fs::write(home.join(SESSION_INDEX), index).unwrap();
+        home
+    }
+
+    #[test]
+    fn sessions_become_resume_candidates() {
+        let home = home_fixture(
+            "ok",
+            &[(
+                "bucket-1",
+                "session_abc",
+                r#"{"createdAt":1,"updatedAt":2,"title":"wire up the parser",
+                    "isCustomTitle":true,"lastPrompt":"add a test","agents":{"main":{"type":"main"}}}"#,
+            )],
+            r#"{"sessionId":"session_abc","sessionDir":"/x","workDir":"/home/miao/p"}
+"#,
+        );
+        let out = list_resumable_in(&home, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "session_abc");
+        // The cwd is the index's, never the bucket name decoded.
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
+        assert_eq!(out[0].agent, AgentControl::Kimi);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The index is appended to rather than rewritten, so a session can appear
+    /// more than once — and the last line is the current one. Kimi's own reader
+    /// folds it the same way.
+    #[test]
+    fn the_last_index_line_wins() {
+        let home = home_fixture(
+            "moved",
+            &[("b", "session_abc", r#"{"title":"t"}"#)],
+            "{\"sessionId\":\"session_abc\",\"sessionDir\":\"/x\",\"workDir\":\"/home/miao/old\"}\n\
+             {\"sessionId\":\"session_abc\",\"sessionDir\":\"/x\",\"workDir\":\"/home/miao/new\"}\n",
+        );
+        let out = list_resumable_in(&home, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].cwd, "/home/miao/new");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session the index has never heard of has no working directory anywhere
+    /// on disk, so it is dropped rather than offered with a blank cwd that `r`
+    /// would then resume into the wrong place.
+    #[test]
+    fn a_session_missing_from_the_index_is_not_offered() {
+        let home = home_fixture(
+            "unindexed",
+            &[
+                ("b", "session_known", r#"{"title":"t"}"#),
+                ("b", "session_unknown", r#"{"title":"t"}"#),
+            ],
+            "{\"sessionId\":\"session_known\",\"sessionDir\":\"/x\",\"workDir\":\"/home/miao/p\"}\n\
+             not json at all\n",
+        );
+        let out = list_resumable_in(&home, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "session_known");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An unreadable `state.json` still yields a row — the id and the cwd, the
+    /// two things a resume actually needs, come from the directory name and the
+    /// index rather than from that file.
+    #[test]
+    fn a_corrupt_state_file_still_yields_a_resumable_row() {
+        let home = home_fixture(
+            "corrupt",
+            &[("b", "session_abc", "{ this is not json")],
+            "{\"sessionId\":\"session_abc\",\"sessionDir\":\"/x\",\"workDir\":\"/home/miao/p\"}\n",
+        );
+        let out = list_resumable_in(&home, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title, None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An empty or absent home is an empty picker, not an error.
+    #[test]
+    fn a_missing_home_is_empty_rather_than_an_error() {
+        let home = std::env::temp_dir().join(format!("cm-kimi-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(list_resumable_in(&home, 10).is_empty());
+    }
 
     /// **Hand-written from the vendor's documented payload shape, not captured
     /// from a running binary** — no `kimi` was installed when these were

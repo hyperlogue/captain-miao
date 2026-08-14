@@ -90,6 +90,39 @@ fn check_direnv_allowed(direnv: &Path, cwd: &str) -> Result<()> {
     );
 }
 
+/// The immediate subdirectories of `dir`, or nothing if it can't be read.
+///
+/// Three backends key their session store on a directory name derived from the
+/// working directory — Grok's `<cwd-key>`, Kimi's bucket, opencode's
+/// `projectID` — and **none of them is decoded here**. Each agent's own resolver
+/// walks every key when it has only a session id, so a scan does the same: one
+/// `read_dir` per level, and the authoritative cwd comes out of the session's
+/// own metadata rather than out of its path.
+pub(super) fn read_subdirs(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Newest first, capped at `limit` — the ordering every resume picker wants and
+/// the cap that keeps a five-year-old session store off a keystroke path.
+/// Applied to the *stat* results, before any file is opened, so the cost of a
+/// picker is one `read_dir` walk plus `limit` reads rather than one read per
+/// session that ever existed.
+pub(super) fn newest_first<T>(
+    mut found: Vec<(T, std::time::SystemTime)>,
+    limit: usize,
+) -> Vec<(T, std::time::SystemTime)> {
+    found.sort_by_key(|f| std::cmp::Reverse(f.1));
+    found.truncate(limit);
+    found
+}
+
 /// Adopt everything the hook says about *the session* rather than about the
 /// event — its id, its title, its context-token total and its model. All of it
 /// rides every payload of the backends that report it, so all of it is taken

@@ -64,17 +64,22 @@
 //!
 //! - **No transcript path, and so no transcript pipeline at all.** The path *is*
 //!   derivable — `$GROK_HOME/sessions/<url-encoded-cwd>/<session-id>/` per
-//!   `17-sessions.md` — but the encoder and reserved set are unverified, and
-//!   every consumer of the path needs a line schema that source reading did not
-//!   settle: `updates.jsonl` is an ACP update stream carrying
+//!   `17-sessions.md` — but every consumer of it needs a line schema that source
+//!   reading did not settle: `updates.jsonl` is an ACP update stream carrying
 //!   `TurnCompleted.usage` and `AutoCompactStarted { tokens_used, context_window
-//!   }` (`extensions/notification.rs`) under an envelope nobody has seen, and
-//!   `summary.json` carries the title, model and git head under JSON spellings
-//!   that were read as *Rust field names* (`summary_write.rs`). Deriving the
-//!   path now would start a watch that folds nothing on every append. So the
-//!   token and model columns are empty, `list_resumable` is empty, and the fold
-//!   lands with the schema, in one commit, once a real session dir has been
-//!   read.
+//!   }` (`extensions/notification.rs`) under an envelope nobody has seen.
+//!   Deriving the path now would start a watch that folds nothing on every
+//!   append. [`list_resumable`] does not need it — it walks the cwd-key
+//!   directories rather than encoding one, which is what Grok's own
+//!   `resolve_local_session_any_cwd_in_root` does when it has only an id.
+//! - **No token column, and this one is Grok's design rather than our gap.**
+//!   `xai-chat-state/src/usage.rs` opens with *"Per-prompt and per-session
+//!   billing ledgers (not serialized)"*, and the persisted `AssistantItem`
+//!   carries `model_id` but no usage — `TokenUsage` hangs off
+//!   `ConversationResponse`, which never reaches disk. So there is no number to
+//!   read, only per-request ones in `chat_history.jsonl` that would have to be
+//!   re-folded into a context total. If a token column is ever wanted here it
+//!   has to come over a hook, not off disk.
 //! - **No interrupt detection.** `10-hooks.md` is explicit that *"Interrupted
 //!   (Esc / Ctrl+C), refused, and max-turns turns skip Stop hooks entirely"*, so
 //!   Grok has Codex's problem — and Codex solves it by matching `turn_aborted`
@@ -151,6 +156,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
+use crate::agent::ResumeCandidate;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -191,6 +197,18 @@ fn grok_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".grok"))
 }
 
+/// Where Grok keeps its sessions: `$GROK_HOME/sessions/<cwd-key>/<id>/`, each
+/// holding `summary.json`, `chat_history.jsonl` and `updates.jsonl`.
+///
+/// `<cwd-key>` is an encoding of the session's working directory, and this
+/// module never decodes it — Grok's own resolver doesn't either when it has only
+/// an id (`resolve_local_session_any_cwd_in_root` walks every key), and the cwd
+/// we want is inside `summary.json` anyway. So the key is a directory to iterate,
+/// never a string to parse.
+fn sessions_root() -> Option<PathBuf> {
+    Some(grok_home()?.join("sessions"))
+}
+
 /// A single shared synthetic `$GROK_HOME` for every Grok session: the real home
 /// mirrored through symlinks, plus the two entries we own. Shared rather than
 /// per-session because it is a symlink farm over the user's home — one stable
@@ -199,6 +217,96 @@ fn grok_home() -> Option<PathBuf> {
 /// carry per-session data (see [`build_hooks_settings`]).
 fn synth_home() -> PathBuf {
     crate::state::state_dir().join("grok-home")
+}
+
+// =============================================================================
+// Resume picker
+// =============================================================================
+
+/// Grok's `summary.json`, of which four fields are wanted here. Grok writes
+/// more (`num_messages`, `parent_session_id`, `forked_at`, cwd-relocation
+/// bookkeeping); everything unnamed is ignored rather than refused, so a Grok
+/// that grows a field still parses.
+#[derive(Deserialize)]
+struct SessionSummary {
+    #[serde(default)]
+    info: SummaryInfo,
+    /// Grok's own label for the session — what its `grok sessions` listing
+    /// shows and what its session search matches on. The dashboard treats it as
+    /// the row's title.
+    #[serde(default)]
+    session_summary: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SummaryInfo {
+    /// The session's authoritative working directory. Grok tracks moves through
+    /// a generation counter beside it; this is always the current one.
+    #[serde(default)]
+    cwd: String,
+}
+
+/// Every session under `$GROK_HOME/sessions/`, newest first.
+///
+/// A directory counts as a session exactly when it holds a `summary.json` —
+/// which is Grok's own test (`is_persisted_session_dir`), and the reason a
+/// half-written or salvaged directory never becomes a picker row. The session
+/// **id is the directory's name**, not a field: that is how Grok resolves one,
+/// so it cannot disagree with the store the way a copied id inside the file
+/// could.
+///
+/// No token count comes back with it, and that is Grok's design rather than a
+/// gap here: its usage ledgers are explicitly not serialized, so the only
+/// numbers on disk are per-request ones in `chat_history.jsonl` that would have
+/// to be re-folded into a context total. The model *is* on disk, and rides
+/// along.
+pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
+    Ok(list_resumable_in(&root, limit))
+}
+
+/// The scan itself, split from `$GROK_HOME` resolution so a test can point it
+/// at a fixture tree without touching the environment.
+fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    let mut found = Vec::new();
+    for cwd_key in common::read_subdirs(root) {
+        for session_dir in common::read_subdirs(&cwd_key) {
+            let summary = session_dir.join("summary.json");
+            let Ok(mtime) = std::fs::metadata(&summary).and_then(|m| m.modified()) else {
+                continue;
+            };
+            found.push((session_dir, mtime));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (dir, mtime) in common::newest_first(found, limit) {
+        let Some(session_id) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(dir.join("summary.json")) else {
+            continue;
+        };
+        let Ok(summary) = serde_json::from_str::<SessionSummary>(&body) else {
+            continue;
+        };
+        if summary.info.cwd.trim().is_empty() {
+            continue;
+        }
+        out.push(ResumeCandidate {
+            agent: crate::agent::AgentControl::Grok,
+            session_id: session_id.to_string(),
+            cwd: summary.info.cwd,
+            first_prompt: None,
+            custom_title: Some(summary.session_summary).filter(|t| !t.trim().is_empty()),
+            // Grok keeps its worktrees in its own registry rather than beside
+            // the repo, and records no branch on the session, so there is
+            // nothing to show here.
+            git_branch: None,
+            mtime,
+        });
+    }
+    out
 }
 
 // =============================================================================
@@ -612,6 +720,97 @@ mod tests {
     use super::*;
     use crate::agent::AgentControl;
     use crate::state::SessionStatus;
+
+    /// A `$GROK_HOME/sessions/` tree: one directory per cwd-key, one per session
+    /// inside it, `summary.json` inside that.
+    fn sessions_fixture(tag: &str, sessions: &[(&str, &str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cm-grok-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (key, id, body) in sessions {
+            let dir = root.join(key).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("summary.json"), body).unwrap();
+        }
+        root
+    }
+
+    /// The picker's rows come off `summary.json`, and the session id is the
+    /// **directory's** name rather than anything inside the file — which is how
+    /// Grok itself resolves one.
+    #[test]
+    fn sessions_become_resume_candidates() {
+        let root = sessions_fixture(
+            "ok",
+            &[(
+                "cwd-key-1",
+                "abc123",
+                r#"{"info":{"cwd":"/home/miao/p"},"session_summary":"wire up the parser",
+                    "num_messages":12,"current_model_id":"grok-build-0.1"}"#,
+            )],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "abc123");
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(out[0].agent, AgentControl::Grok);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory with no `summary.json` is not a session — Grok's own
+    /// `is_persisted_session_dir` says so, and it is what keeps a half-written
+    /// or salvaged directory out of the picker. A summary with no cwd is
+    /// likewise dropped rather than offered: `r` would resume it into nowhere.
+    #[test]
+    fn only_directories_grok_calls_sessions_are_offered() {
+        let root = sessions_fixture(
+            "partial",
+            &[
+                (
+                    "k",
+                    "good",
+                    r#"{"info":{"cwd":"/home/miao/p"},"session_summary":"t"}"#,
+                ),
+                ("k", "no-cwd", r#"{"info":{},"session_summary":"t"}"#),
+            ],
+        );
+        std::fs::create_dir_all(root.join("k").join("not-a-session")).unwrap();
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "good");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cap is applied to the stat results, before any summary is opened, so
+    /// a picker over a long-lived session store reads `limit` files and not one
+    /// per session that ever existed.
+    #[test]
+    fn the_limit_caps_what_is_read() {
+        let bodies: Vec<(String, String)> = (0..5)
+            .map(|i| {
+                (
+                    format!("s{i}"),
+                    format!(r#"{{"info":{{"cwd":"/home/miao/p{i}"}},"session_summary":"t{i}"}}"#),
+                )
+            })
+            .collect();
+        let sessions: Vec<(&str, &str, &str)> = bodies
+            .iter()
+            .map(|(id, body)| ("k", id.as_str(), body.as_str()))
+            .collect();
+        let root = sessions_fixture("limit", &sessions);
+        assert_eq!(list_resumable_in(&root, 2).len(), 2);
+        assert_eq!(list_resumable_in(&root, 99).len(), 5);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An empty or absent store is an empty picker, not an error.
+    #[test]
+    fn a_missing_sessions_root_is_empty_rather_than_an_error() {
+        let root = std::env::temp_dir().join(format!("cm-grok-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(list_resumable_in(&root, 10).is_empty());
+    }
 
     /// **Hand-written from the payload documented in `10-hooks.md`, not captured
     /// from a running binary** — no `grok` was installed when these were written.
