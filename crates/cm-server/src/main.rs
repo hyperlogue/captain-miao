@@ -86,6 +86,14 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch opencode with a tracking plugin injected, inside the pty pool
+    /// (headless). `name` is explicit because clap would derive `open-code`.
+    #[command(name = "opencode")]
+    OpenCode {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts).
     Hook {
         /// Hook event type.
@@ -182,6 +190,7 @@ impl Commands {
             Commands::Reasonix { args } => Some((AgentControl::Reasonix, args)),
             Commands::Kimi { args } => Some((AgentControl::Kimi, args)),
             Commands::Grok { args } => Some((AgentControl::Grok, args)),
+            Commands::OpenCode { args } => Some((AgentControl::OpenCode, args)),
             _ => None,
         }
     }
@@ -347,7 +356,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         | Commands::Codex { .. }
         | Commands::Reasonix { .. }
         | Commands::Kimi { .. }
-        | Commands::Grok { .. }) => {
+        | Commands::Grok { .. }
+        | Commands::OpenCode { .. }) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
             // runs inside the pty pool, so its agent gets the clipboard shims on
@@ -396,5 +406,27 @@ mod tests {
         ));
         // An unknown action is rejected, not silently accepted.
         assert!(parse(&["miao-server", "daemon", "frobnicate"]).is_err());
+    }
+
+    /// The twin of the dashboard's own check: every backend's
+    /// `cli_subcommand()` must name a subcommand *this* binary has too, because
+    /// a pooled launch spawns `miao-server <cli_subcommand()> <cwd>` on the
+    /// host. The two clap enums are separate on purpose, which is exactly why
+    /// each needs its own guard — clap kebab-cases a two-word variant
+    /// (`OpenCode` → `open-code`), and a name that diverges here fails only on
+    /// a *remote* launch, where nobody is watching.
+    #[test]
+    fn every_backend_launches_under_the_name_it_advertises() {
+        for &want in AgentControl::ALL {
+            let name = want.cli_subcommand();
+            let cli = Cli::try_parse_from(["miao-server", name, "/work"])
+                .unwrap_or_else(|e| panic!("`miao-server {name}` must parse: {e}"));
+            let (got, args) = cli
+                .command
+                .launcher()
+                .unwrap_or_else(|| panic!("`miao-server {name}` must map to a backend"));
+            assert_eq!(got, want, "`miao-server {name}` launched the wrong backend");
+            assert_eq!(args, ["/work"]);
+        }
     }
 }

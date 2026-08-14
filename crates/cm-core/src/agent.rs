@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{claude, codex, grok, kimi, reasonix};
+use crate::agents::{claude, codex, grok, kimi, opencode, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -62,6 +62,9 @@ pub enum AgentControl {
     Reasonix,
     Kimi,
     Grok,
+    /// sst's `opencode`. Spelled lowercase everywhere, including
+    /// [`Self::label`] — it is the project's own styling, not a typo.
+    OpenCode,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -105,6 +108,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "reasonix" => AgentControl::Reasonix,
                     "kimi" => AgentControl::Kimi,
                     "grok" => AgentControl::Grok,
+                    "opencode" => AgentControl::OpenCode,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -126,6 +130,7 @@ impl AgentControl {
         AgentControl::Reasonix,
         AgentControl::Kimi,
         AgentControl::Grok,
+        AgentControl::OpenCode,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -137,6 +142,7 @@ impl AgentControl {
             AgentControl::Reasonix => "reasonix",
             AgentControl::Kimi => "kimi",
             AgentControl::Grok => "grok",
+            AgentControl::OpenCode => "opencode",
             AgentControl::Unknown => "",
         }
     }
@@ -152,6 +158,7 @@ impl AgentControl {
             "reasonix" => Some(AgentControl::Reasonix),
             "kimi" => Some(AgentControl::Kimi),
             "grok" => Some(AgentControl::Grok),
+            "opencode" => Some(AgentControl::OpenCode),
             _ => None,
         }
     }
@@ -175,6 +182,7 @@ impl AgentControl {
             AgentControl::Reasonix => agents::binary_available(reasonix::BIN),
             AgentControl::Kimi => agents::binary_available(kimi::BIN),
             AgentControl::Grok => agents::binary_available(grok::BIN),
+            AgentControl::OpenCode => agents::binary_available(opencode::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -189,6 +197,8 @@ impl AgentControl {
             AgentControl::Reasonix => "Reasonix",
             AgentControl::Kimi => "Kimi",
             AgentControl::Grok => "Grok",
+            // Lowercase on purpose: sst styles the project `opencode`.
+            AgentControl::OpenCode => "opencode",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -203,7 +213,7 @@ impl AgentControl {
     /// flag shapes differ per backend: Claude and Grok take `--resume <id>` plus
     /// an optional `--fork-session`; Codex uses the `resume` / `fork`
     /// subcommands; Reasonix takes `-r <id>` plus `--copy` to continue in a
-    /// writable copy.
+    /// writable copy; opencode takes `-s <id>` plus `--fork`.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         match self {
             // Grok's flags are byte-identical to Claude's here (`17-sessions.md`
@@ -242,6 +252,20 @@ impl AgentControl {
             // also why the bare `--session` form (which opens Kimi's session
             // browser) can't be reached from here.
             AgentControl::Kimi => vec!["--session".to_string(), session_id.to_string()],
+            // `-s <id>` plus `--fork`, both documented flags. Correct and, for
+            // now, unreachable from the dashboard: no opencode hook payload
+            // names a session id, so `LauncherState.session_id` is never set
+            // and `r` / `f` have nothing to pass here. See `agents::opencode`.
+            // (`-c` / `--continue` resumes the most recent session in a
+            // directory without an id, but this seam is id-shaped and inventing
+            // an id-less path for one backend is not the trade.)
+            AgentControl::OpenCode => {
+                let mut v = vec!["-s".to_string(), session_id.to_string()];
+                if fork {
+                    v.push("--fork".to_string());
+                }
+                v
+            }
             AgentControl::Unknown => vec![],
         }
     }
@@ -298,6 +322,10 @@ impl AgentControl {
             // No documented worktree flag. `supports_worktrees()` is derived from
             // this, so `Ctrl-g` hides itself with nothing else to change.
             AgentControl::Kimi => None,
+            // opencode's *plugin context* exposes a `worktree` field, so it has
+            // the concept — but no CLI flag launches into one, and there is
+            // nothing to spend a worktree request on. `Ctrl-g` hides itself.
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -347,6 +375,11 @@ impl AgentControl {
             // spellings were only ever read as Rust field names. When that read
             // lands, `sessions/` is what belongs here.
             AgentControl::Grok => vec![],
+            // Nothing: the dashboard derives no opencode fact from disk. Its
+            // sessions live in `~/.local/share/opencode/`'s sqlite db and
+            // `storage/` blobs, and nothing here reads either — see
+            // `read_transcript_stats`.
+            AgentControl::OpenCode => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -391,6 +424,12 @@ impl AgentControl {
             // written to the state file, which the host already watches. A wake
             // here could only re-diff rows that hadn't changed.
             AgentControl::Grok => vec![],
+            // Nothing to wake on: opencode's title never reaches us at all (no
+            // documented payload field, so `session.updated` isn't even
+            // subscribed), and its sqlite db is not read. Codex needs an entry
+            // here only because its rename lands in sqlite with no hook; for
+            // opencode there is no reader on the other end to wake.
+            AgentControl::OpenCode => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -412,6 +451,11 @@ impl AgentControl {
             // id arrives on every hook payload — which is what this index is a
             // fallback for.
             AgentControl::Grok => SessionIndex::default(),
+            // No per-pid manifest — and unlike the other three, no session id
+            // arrives on the hook either, so this index has nothing to fall
+            // back *to*. That is the gap that makes an opencode row
+            // unresumable; see `agents::opencode`.
+            AgentControl::OpenCode => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -463,6 +507,18 @@ impl AgentControl {
             // watch that folds nothing on every append. The path and the fold
             // land together, once a real session dir has been read.
             AgentControl::Grok => TranscriptStats::default(),
+            // Unreachable rather than unimplemented, as for Reasonix: this runs
+            // only on a path a hook payload supplied, and opencode's carries
+            // none. It would not be a *transcript* if it did — its sessions are
+            // `opencode.db` (sqlite) plus `storage/` blobs, not an appended
+            // file this fold's byte cursor could follow. cm-core already links
+            // bundled SQLite for Codex's titles, so reading it costs no new
+            // dependency and is deliberately still not done: the schema is
+            // unprobed, and phase 1 ships without it (design §9.4). The route
+            // that fits this backend better is the hook itself — `HookMessage`
+            // carries `context_tokens` / `model` now — the moment a usage field
+            // in an event payload is named.
+            AgentControl::OpenCode => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -502,6 +558,15 @@ impl AgentControl {
             // the JSON spelling of the fields inside. One look at a real session
             // dir fills this in.
             AgentControl::Grok => Ok(vec![]),
+            // Empty on one missing flag, and nothing else. The plan is settled
+            // — shell out to `opencode session list` rather than reimplement
+            // the `opencode.db` schema, one subprocess per picker open, running
+            // host-side on a remote host like everything else — but whether it
+            // takes **`--json`** is unprobed (design §9.4 marks the flag
+            // `[PROBE]`), and parsing unstructured CLI output is how a picker
+            // starts showing fiction. One `opencode session list --help` fills
+            // this in.
+            AgentControl::OpenCode => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -542,6 +607,9 @@ impl AgentControl {
             AgentControl::Grok => {
                 grok::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::OpenCode => {
+                opencode::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -565,6 +633,14 @@ impl AgentControl {
             // through it.
             AgentControl::Kimi => kimi::build_hooks_settings(sock_path),
             AgentControl::Grok => grok::build_hooks_settings(sock_path),
+            // **JavaScript**, not JSON — the furthest this method's name has
+            // been stretched, and the seam holds: opencode has no shell-command
+            // hooks at all, so its event surface is a plugin *module*, which
+            // `build_launch_command` drops into a synthetic `plugins/` dir. The
+            // path is generic transport and the contents are opaque to the
+            // launcher, which is what lets each backend put its own format
+            // through it.
+            AgentControl::OpenCode => opencode::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -579,6 +655,7 @@ impl AgentControl {
             AgentControl::Reasonix => reasonix::dispatch_hook(state, msg).await,
             AgentControl::Kimi => kimi::dispatch_hook(state, msg).await,
             AgentControl::Grok => grok::dispatch_hook(state, msg).await,
+            AgentControl::OpenCode => opencode::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -592,6 +669,7 @@ impl AgentControl {
             AgentControl::Reasonix => reasonix::parse_hook_payload(event, stdin),
             AgentControl::Kimi => kimi::parse_hook_payload(event, stdin),
             AgentControl::Grok => grok::parse_hook_payload(event, stdin),
+            AgentControl::OpenCode => opencode::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -627,6 +705,15 @@ impl AgentControl {
             // prompt. Moot until then anyway, since no Grok payload names a
             // transcript for the launcher to watch.
             AgentControl::Grok => TranscriptScan::default(),
+            // Empty because there is no transcript to scan: opencode's sessions
+            // are sqlite plus JSON blobs, and no hook payload names a path
+            // regardless. Whether a sentinel is even *wanted* is unsettled —
+            // design §9.3 calls `session.idle` "the turn-ended signal" without
+            // saying whether an Esc-interrupted turn still reaches it. If it
+            // doesn't, this backend inherits Grok's stranded-`Active` row with
+            // nothing of the agent's to read instead; that is on the probe list
+            // in `agents::opencode`.
+            AgentControl::OpenCode => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -651,6 +738,11 @@ impl AgentControl {
             // No status file, so no second opinion on the working/idle axis. It
             // is the interrupt case above that would have wanted one.
             AgentControl::Grok => None,
+            // No status file. `session.status` may be exactly this second
+            // opinion — design §9.3 flags it `[PROBE]` — and if it carries a
+            // busy/idle string it should drive the row *directly*, the way
+            // Claude's session file does, rather than arriving here.
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -684,6 +776,12 @@ impl AgentControl {
             // surfacing one waits on the same schema question as
             // `read_transcript_stats`.
             AgentControl::Grok => None,
+            // opencode titles its own sessions and puts the title on
+            // `session.updated` — but under no documented field name, so that
+            // event is not subscribed at all and there is no per-pid file to
+            // read instead. An opencode row therefore shows no agent-supplied
+            // name; see `agents::opencode`.
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -699,6 +797,7 @@ impl AgentControl {
             // No status file to watch — see `agent_activity`.
             AgentControl::Kimi => None,
             AgentControl::Grok => None,
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -757,6 +856,11 @@ impl AgentControl {
             // shape that defeats macOS FSEvents, so whoever wires the fold should
             // arrive back here before assuming an event-driven watch works.
             AgentControl::Grok => None,
+            // Moot, and structurally so rather than merely for now: opencode
+            // keeps its sessions in sqlite and JSON blobs, so there is no
+            // appended transcript for either kind of watch to follow, whatever
+            // a payload might one day name.
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -803,6 +907,11 @@ impl AgentControl {
             // arm, which is seam work and belongs in its own commit — so a `Stop`
             // while a background task runs currently reads as `Idle`.
             AgentControl::Grok => None,
+            // No background-shell concept in anything design §9 names, so a
+            // `session.idle` while something else is still running means "the
+            // foreground turn ended" and the row reads `Idle` — never
+            // `BackgroundServer` or `ReviewPending`.
+            AgentControl::OpenCode => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1079,6 +1188,15 @@ mod tests {
         assert_eq!(codex, AgentControl::Codex);
         assert_eq!(reasonix, AgentControl::Reasonix);
         assert_eq!(grok, AgentControl::Grok);
+        // One word, all lowercase — the derived `rename_all` spelling of
+        // `OpenCode` and the project's own styling agree, which is the only
+        // reason no `#[serde(rename)]` is needed here.
+        let opencode: AgentControl = serde_json::from_str(r#""opencode""#).expect("decodes");
+        assert_eq!(opencode, AgentControl::OpenCode);
+        assert_eq!(
+            serde_json::to_string(&AgentControl::OpenCode).expect("encodes"),
+            r#""opencode""#
+        );
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
@@ -1143,7 +1261,8 @@ mod tests {
                 AgentControl::Codex,
                 AgentControl::Reasonix,
                 AgentControl::Kimi,
-                AgentControl::Grok
+                AgentControl::Grok,
+                AgentControl::OpenCode
             ]
         );
     }
@@ -1213,6 +1332,10 @@ mod tests {
         assert!(
             !AgentControl::Kimi.supports_fork(),
             "Kimi has no fork flag, so `f` must hide rather than resume in place"
+        );
+        assert!(
+            AgentControl::OpenCode.supports_fork(),
+            "opencode has --fork"
         );
 
         // A backend this build can't drive contributes no argv either way, so

@@ -642,6 +642,14 @@ mod tests {
         // sets the process cwd and passes nothing positional, because a bare
         // `--worktree` would otherwise swallow it.
         assert_eq!(open_argv(AgentControl::Grok, None), ["grok", "/work"]);
+        // opencode's cwd is *our* positional here and becomes `--dir <path>`
+        // inside `build_launch_command`, the same split Reasonix has: what
+        // `opencode`'s own positional means is undocumented, so translating it
+        // is the backend module's job and never this argv's.
+        assert_eq!(
+            open_argv(AgentControl::OpenCode, None),
+            ["opencode", "/work"]
+        );
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -714,6 +722,12 @@ mod tests {
             open_argv_worktree(AgentControl::Grok, None, Some("")),
             ["grok", "/work", "--worktree"]
         );
+        // opencode's plugin context has a `worktree` field, but no flag
+        // launches into one, so the request is dropped like Codex's.
+        assert_eq!(
+            open_argv_worktree(AgentControl::OpenCode, None, Some("feature-auth")),
+            ["opencode", "/work"]
+        );
     }
 
     #[test]
@@ -752,6 +766,18 @@ mod tests {
         assert_eq!(
             open_argv(AgentControl::Kimi, Some(("s4", false))),
             ["kimi", "/work", "--session", "s4"]
+        );
+        // opencode resumes with `-s <id>` and branches with `--fork`. Both are
+        // pinned even though the dashboard cannot reach them yet — no opencode
+        // hook payload names a session id, so nothing ever fills `s5` — because
+        // the day one does, this is what has to already be right.
+        assert_eq!(
+            open_argv(AgentControl::OpenCode, Some(("s5", false))),
+            ["opencode", "/work", "-s", "s5"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::OpenCode, Some(("s5", true))),
+            ["opencode", "/work", "-s", "s5", "--fork"]
         );
     }
 

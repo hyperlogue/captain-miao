@@ -23,7 +23,7 @@ focused tool and the rest of your workflow is yours to compose.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code) and [Grok Build](https://github.com/xai-org/grok-build) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support)).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build) and [opencode](https://github.com/sst/opencode) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -50,6 +50,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns, resume-picker entries and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork, no token/model columns, no resume-picker entries and no worktrees ([known limits](#kimi-code-support)).                                                  |
 | **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. Token/model columns and resume-picker entries don't work, and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                               |
+| **[opencode](https://github.com/sst/opencode)**               | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. Status is coarser than the others' and sessions can't be resumed from the dashboard ([known limits](#opencode-support)).                             |
 
 ## Installation
 
@@ -158,10 +159,11 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao reasonix [dir] [args…]`   | Launch Reasonix in `dir` with tracking hooks; extra args are forwarded to `reasonix`. See [known limits](#reasonix-support).                |
 | `miao kimi [dir] [args…]`       | Launch Kimi Code in `dir` with tracking hooks; extra args are forwarded to `kimi`. See [known limits](#kimi-code-support).                  |
 | `miao grok [dir] [args…]`       | Launch Grok Build in `dir` with tracking hooks; extra args are forwarded to `grok`. See [known limits](#grok-build-support).                |
+| `miao opencode [dir] [args…]`   | Launch opencode in `dir` with a tracking plugin; extra args are forwarded to `opencode`. See [known limits](#opencode-support).             |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
 #### Reasonix support
 
@@ -194,6 +196,18 @@ Grok rows track status — working, idle, waiting for approval, compacting — a
 - **A session runs under a synthetic `GROK_HOME`** that symlinks your real one, with two exceptions: our own file in `hooks/` (your global hooks still run), and a writable copy of `config.toml`, which is where the approval-notification hook is registered. Authenticate with `grok` outside captain-miao once first — a first-time setup performed _inside_ a session lands in that copy, and the copy is refreshed from your real config whenever you edit it.
 
 None of this has been exercised against a released `grok` build end to end — in particular, if every row sticks at "starting", the hook file's format is the first thing to suspect. Please report anything that looks wrong rather than assuming it's expected.
+
+#### opencode support
+
+opencode rows track a **coarser** status than every other backend here, and that is the honest headline. opencode has no shell-command hooks at all — its only extension point is a JavaScript plugin — so captain-miao generates one and drops it into a synthetic config dir. That gets the events; what it doesn't get is anything *inside* them, because no field of any opencode event payload is documented. Concretely:
+
+- **A session reads as working from its first tool call, not from your prompt.** There is no "prompt submitted" event to subscribe to, and the nearest one (`message.updated`) fires for every message — including the model's own, potentially once per streamed chunk — with no documented way to tell a user message from an assistant one. Subscribing to it unfiltered would spawn a process per chunk inside your session, so it isn't subscribed. A turn that answers you without running a tool therefore never shows as working at all.
+- **Sessions can't be resumed or forked from the dashboard.** `r` and `f` do nothing on an opencode row: no event payload names a session id, so captain-miao never learns one to resume. `opencode -c` in the session's directory continues it in the meantime.
+- **No session name, no tool name, no token or model columns.** Same cause each time — opencode reports all of it, under field names nobody has captured yet. A guess would put a wrong value in a column you'd read as fact, so the column stays empty instead.
+- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a settled turn reads as `Idle` whatever else is still running.
+- **A session runs under a synthetic `OPENCODE_CONFIG_DIR`** that symlinks your real one, with `plugins/` the single exception: that directory is ours, and it is rebuilt to symlink each of your own plugins beside our generated `captain-miao.js`, so your plugins keep loading. Nothing of yours is written to. If you've moved your config with `$XDG_CONFIG_HOME`, captain-miao follows it; if your agents and commands go missing inside a session, that's the thing to check.
+
+It is **the least verified backend here** — written from a design note that was never checked against opencode's source or a running binary, unlike every other backend. If every row sits at "Starting", the generated plugin is the first thing to suspect: it's a plain file at `~/.local/state/captain-miao/opencode-config/plugins/captain-miao.js`, and whether opencode loads a plugin from that directory, under that name, and subscribes handlers keyed the way that file keys them, are all unconfirmed. Please report anything that looks wrong rather than assuming it's expected.
 
 ### Key bindings
 
@@ -399,7 +413,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 ## Roadmap
 
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code and Grok Build have slotted in and are all still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support)); Pi and opencode are mapped but unwritten.
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code, Grok Build and opencode have slotted in and are all still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support)); Pi is mapped but unwritten.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 

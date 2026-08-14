@@ -103,6 +103,20 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch opencode with a tracking plugin injected. Argument handling
+    /// matches the `claude` subcommand.
+    ///
+    /// `name` is spelled explicitly: clap would derive `open-code` from the
+    /// variant, and `cli_subcommand()` — which is what the dashboard puts on
+    /// an argv — says `opencode`.
+    #[command(name = "opencode")]
+    OpenCode {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to opencode.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts)
     Hook {
         /// Hook event type
@@ -182,6 +196,7 @@ impl Commands {
             Commands::Reasonix { args } => Some((agent::AgentControl::Reasonix, args)),
             Commands::Kimi { args } => Some((agent::AgentControl::Kimi, args)),
             Commands::Grok { args } => Some((agent::AgentControl::Grok, args)),
+            Commands::OpenCode { args } => Some((agent::AgentControl::OpenCode, args)),
             _ => None,
         }
     }
@@ -371,7 +386,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Commands::Codex { .. }
             | Commands::Reasonix { .. }
             | Commands::Kimi { .. }
-            | Commands::Grok { .. }),
+            | Commands::Grok { .. }
+            | Commands::OpenCode { .. }),
         ) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             cm_core::cli::run_launch(agent, args.to_vec()).await
@@ -423,6 +439,34 @@ mod tests {
         // An unknown action is rejected rather than quietly accepted.
         assert!(parse(&["miao", "clipboard", "frobnicate"]).is_err());
         assert!(parse(&["miao", "clipboard"]).is_err());
+    }
+
+    /// Every backend's `cli_subcommand()` must be a subcommand this binary
+    /// actually has, and must parse back to the same backend — the dashboard
+    /// spawns `miao <cli_subcommand()> <cwd>`, so a name that doesn't resolve
+    /// opens a window that dies on a clap error.
+    ///
+    /// It is a *derive* trap rather than a typo one: clap kebab-cases a variant
+    /// name, so a two-word backend (`OpenCode` → `open-code`) silently gets a
+    /// subcommand nobody names anywhere else. Hence the explicit
+    /// `#[command(name = …)]` on that variant, and hence this test — which
+    /// covers every backend added later for free.
+    #[test]
+    fn every_backend_launches_under_the_name_it_advertises() {
+        for &want in agent::AgentControl::ALL {
+            let name = want.cli_subcommand();
+            let cli = Cli::try_parse_from(["miao", name, "/work"])
+                .unwrap_or_else(|e| panic!("`miao {name}` must parse: {e}"));
+            let cmd = cli.command.expect("a subcommand");
+            let (got, args) = cmd
+                .launcher()
+                .unwrap_or_else(|| panic!("`miao {name}` must map to a backend"));
+            assert_eq!(got, want, "`miao {name}` launched the wrong backend");
+            assert_eq!(args, ["/work"]);
+            // …and it drives a terminal, which is the gate a new variant is
+            // most easily left out of.
+            assert!(requires_terminal(&Some(cmd)));
+        }
     }
 
     #[test]
