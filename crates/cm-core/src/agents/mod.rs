@@ -5,6 +5,7 @@ use tokio::process::Command;
 
 pub mod claude;
 pub mod codex;
+pub mod kimi;
 pub mod reasonix;
 
 // Shared machinery the backend modules build on: the hook mapping they all

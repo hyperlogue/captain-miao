@@ -74,6 +74,12 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Kimi Code with hooks injected, inside the pty pool (headless).
+    Kimi {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts).
     Hook {
         /// Hook event type.
@@ -168,6 +174,7 @@ impl Commands {
             Commands::Claude { args } => Some((AgentControl::Claude, args)),
             Commands::Codex { args } => Some((AgentControl::Codex, args)),
             Commands::Reasonix { args } => Some((AgentControl::Reasonix, args)),
+            Commands::Kimi { args } => Some((AgentControl::Kimi, args)),
             _ => None,
         }
     }
@@ -329,7 +336,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Clipboard {
             action: ClipboardAction::Paste,
         } => cm_core::clipboard::shim::paste().await,
-        cmd @ (Commands::Claude { .. } | Commands::Codex { .. } | Commands::Reasonix { .. }) => {
+        cmd @ (Commands::Claude { .. }
+        | Commands::Codex { .. }
+        | Commands::Reasonix { .. }
+        | Commands::Kimi { .. }) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
             // runs inside the pty pool, so its agent gets the clipboard shims on

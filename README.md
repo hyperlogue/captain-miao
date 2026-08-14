@@ -23,7 +23,7 @@ focused tool and the rest of your workflow is yours to compose.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) ships too, with [known limits](#reasonix-support).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) and [Kimi Code](https://github.com/MoonshotAI/kimi-code) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -48,6 +48,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[Claude Code](https://claude.com/claude-code)**             |                                                                                                                                                                                                                                                                 |
 | **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns, resume-picker entries and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
+| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork, no token/model columns, no resume-picker entries and no worktrees ([known limits](#kimi-code-support)).                                                  |
 
 ## Installation
 
@@ -154,10 +155,11 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
 | `miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
 | `miao reasonix [dir] [args…]`   | Launch Reasonix in `dir` with tracking hooks; extra args are forwarded to `reasonix`. See [known limits](#reasonix-support).                |
+| `miao kimi [dir] [args…]`       | Launch Kimi Code in `dir` with tracking hooks; extra args are forwarded to `kimi`. See [known limits](#kimi-code-support).                  |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
 #### Reasonix support
 
@@ -168,6 +170,17 @@ Reasonix rows track status — working, idle, waiting for approval, compacting �
 - **Run `reasonix setup` outside captain-miao once first.** A session runs under a synthetic config home that mirrors your real one; a first-time setup performed _inside_ a session lands in that mirror and is cleared on a later launch.
 
 It also hasn't yet been exercised against a released `reasonix` build end to end, so please report anything that looks wrong rather than assuming it's expected.
+
+#### Kimi Code support
+
+Kimi rows track status — working, idle, waiting for approval, compacting — and launch and resume both work. Kimi reports an **interrupt** as a real hook, so pressing Esc mid-turn settles the row immediately, which is something no other backend here manages. What it doesn't do:
+
+- **No fork** (`f` hides itself on a Kimi row). Kimi documents no flag to branch a resume, and offering the key would silently resume in place — the one outcome someone pressing fork is trying to avoid.
+- **No token or model columns, and no resume picker entries.** Both need the field names inside Kimi's `wire.jsonl`, which aren't documented; guessing would put a wrong number in a column you'd read as fact. `kimi --session` with no id opens Kimi's own session browser in the meantime.
+- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a subagent or task runs reads as `Idle`.
+- **A session runs under a synthetic `KIMI_CODE_HOME`** that symlinks your real `~/.kimi-code/`, with `config.toml` a writable **copy** carrying our `[[hooks]]` entries. Your real config is never written to. Your own `[[hooks]]` in it are preserved; anything else in that copy (comments, key order) is rewritten, and refreshed from the real file whenever you change it.
+
+It is also the **least verified backend here**: it was written from Kimi's published documentation alone, against no running binary. Please report anything that looks wrong rather than assuming it's expected — especially a session where every row sits at "Starting", which is what a hook block Kimi rejects would look like.
 
 ### Key bindings
 
@@ -372,7 +385,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 ## Roadmap
 
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix is the first to do so and is still unproven against a released build ([known limits](#reasonix-support)); Grok, Kimi Code, Pi and opencode are mapped but unwritten.
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix and Kimi Code have slotted in and are both still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support)); Grok, Pi and opencode are mapped but unwritten.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 

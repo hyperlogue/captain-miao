@@ -635,6 +635,9 @@ mod tests {
             open_argv(AgentControl::Reasonix, None),
             ["reasonix", "/work"]
         );
+        // Kimi takes no directory argument at all (`build_launch_command` sets
+        // the process cwd instead), so ours is the only positional here too.
+        assert_eq!(open_argv(AgentControl::Kimi, None), ["kimi", "/work"]);
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -689,6 +692,10 @@ mod tests {
             open_argv_worktree(AgentControl::Reasonix, None, Some("feature-auth")),
             ["reasonix", "/work"]
         );
+        assert_eq!(
+            open_argv_worktree(AgentControl::Kimi, None, Some("feature-auth")),
+            ["kimi", "/work"]
+        );
     }
 
     #[test]
@@ -721,6 +728,40 @@ mod tests {
             open_argv(AgentControl::Reasonix, Some(("s3", true))),
             ["reasonix", "/work", "-r", "s3", "--copy"]
         );
+        // Kimi names the session it resumes. `--session <id>` and `--continue`
+        // are mutually exclusive, so only ever one of them is emitted — and
+        // never the bare `--session`, which opens its session browser.
+        assert_eq!(
+            open_argv(AgentControl::Kimi, Some(("s4", false))),
+            ["kimi", "/work", "--session", "s4"]
+        );
+    }
+
+    /// Kimi has no fork flag, so the two argvs are **identical** — which is the
+    /// whole mechanism behind `supports_fork()` and therefore behind `f` hiding
+    /// itself on a Kimi row. Asserted end to end (through `open_session`, where
+    /// the argv is actually built) rather than left implied by the equality in
+    /// `resume_args`, because a stray `if fork` anywhere on this path would
+    /// silently turn a hidden key back into one that resumes in place.
+    #[test]
+    fn kimi_forks_and_resumes_identically() {
+        let plain = open_argv(AgentControl::Kimi, Some(("s4", false)));
+        let forked = open_argv(AgentControl::Kimi, Some(("s4", true)));
+        assert_eq!(plain, forked, "a fork request must add nothing for Kimi");
+        assert!(!AgentControl::Kimi.supports_fork());
+        // The other three still differ, so this test can't pass by the argv
+        // having stopped carrying the flag for everyone.
+        for agent in [
+            AgentControl::Claude,
+            AgentControl::Codex,
+            AgentControl::Reasonix,
+        ] {
+            assert_ne!(
+                open_argv(agent, Some(("s4", false))),
+                open_argv(agent, Some(("s4", true))),
+                "{agent:?}"
+            );
+        }
     }
 
     /// The seam's canonical-path contract (§3), on the *local* arm — which is

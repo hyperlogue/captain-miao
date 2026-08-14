@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{claude, codex, reasonix};
+use crate::agents::{claude, codex, kimi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -60,6 +60,7 @@ pub enum AgentControl {
     Claude,
     Codex,
     Reasonix,
+    Kimi,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -101,6 +102,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "claude" => AgentControl::Claude,
                     "codex" => AgentControl::Codex,
                     "reasonix" => AgentControl::Reasonix,
+                    "kimi" => AgentControl::Kimi,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -120,6 +122,7 @@ impl AgentControl {
         AgentControl::Claude,
         AgentControl::Codex,
         AgentControl::Reasonix,
+        AgentControl::Kimi,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -129,6 +132,7 @@ impl AgentControl {
             AgentControl::Claude => "claude",
             AgentControl::Codex => "codex",
             AgentControl::Reasonix => "reasonix",
+            AgentControl::Kimi => "kimi",
             AgentControl::Unknown => "",
         }
     }
@@ -142,6 +146,7 @@ impl AgentControl {
             "claude" => Some(AgentControl::Claude),
             "codex" => Some(AgentControl::Codex),
             "reasonix" => Some(AgentControl::Reasonix),
+            "kimi" => Some(AgentControl::Kimi),
             _ => None,
         }
     }
@@ -163,6 +168,7 @@ impl AgentControl {
             AgentControl::Claude => agents::binary_available(claude::BIN),
             AgentControl::Codex => agents::binary_available(codex::BIN),
             AgentControl::Reasonix => agents::binary_available(reasonix::BIN),
+            AgentControl::Kimi => agents::binary_available(kimi::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -175,6 +181,7 @@ impl AgentControl {
             AgentControl::Claude => "Claude",
             AgentControl::Codex => "Codex",
             AgentControl::Reasonix => "Reasonix",
+            AgentControl::Kimi => "Kimi",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -184,7 +191,8 @@ impl AgentControl {
     /// Extra args appended after the cwd to resume (or fork) `session_id`. The
     /// flag shapes differ per backend: Claude takes `--resume <id>` plus an
     /// optional `--fork-session`; Codex uses the `resume` / `fork` subcommands;
-    /// Reasonix takes `-r <id>` plus `--copy` to continue in a writable copy.
+    /// Reasonix takes `-r <id>` plus `--copy` to continue in a writable copy;
+    /// Kimi takes `--session <id>` and has no fork at all.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         match self {
             AgentControl::Claude => {
@@ -209,6 +217,17 @@ impl AgentControl {
                 }
                 v
             }
+            // **`fork` is ignored, deliberately.** Kimi documents no fork flag,
+            // and ignoring the argument is how a backend says so: the two argvs
+            // come out equal, [`Self::supports_fork`] is then false, and the
+            // dashboard hides `f` — no second match to keep in sync, and no
+            // chance of offering a key that silently resumes in place instead.
+            //
+            // `--session <id>` and `--continue` are mutually exclusive, so only
+            // ever one of them goes on an argv. We always name the id, which is
+            // also why the bare `--session` form (which opens Kimi's session
+            // browser) can't be reached from here.
+            AgentControl::Kimi => vec!["--session".to_string(), session_id.to_string()],
             AgentControl::Unknown => vec![],
         }
     }
@@ -245,6 +264,9 @@ impl AgentControl {
             // have a state dir), but no CLI flag launches into one, so there is
             // nothing to spend a worktree request on.
             AgentControl::Reasonix => None,
+            // No documented worktree flag. `supports_worktrees()` is derived from
+            // this, so `Ctrl-g` hides itself with nothing else to change.
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -283,6 +305,10 @@ impl AgentControl {
             // session-name manifest, no title store, no transcript read — so
             // there is no file whose change could make a row stale.
             AgentControl::Reasonix => vec![],
+            // Nothing, and for the same reason as Reasonix: no manifest, no
+            // title store (the title rides the hook payload), no transcript
+            // read. There is no file whose change could make a Kimi row stale.
+            AgentControl::Kimi => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -317,6 +343,12 @@ impl AgentControl {
             // hadn't changed. If a rename or a token count is ever read from the
             // session sidecars, that sidecar dir belongs here.
             AgentControl::Reasonix => vec![],
+            // Nothing, and this is the arm `session_title` was added for: Kimi's
+            // rename arrives on the *next hook payload*, which the launcher
+            // folds onto the state file — a `sessions/` write the host already
+            // watches. Codex needs an entry here only because its rename lands
+            // in sqlite with no hook at all.
+            AgentControl::Kimi => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -331,6 +363,9 @@ impl AgentControl {
             // No per-pid manifest to scan: a Reasonix session's id arrives on
             // every hook payload, which is what this index is a fallback for.
             AgentControl::Reasonix => SessionIndex::default(),
+            // No per-pid manifest: a Kimi session's id (and name) arrive on
+            // every hook payload, which is what this index is a fallback for.
+            AgentControl::Kimi => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -361,6 +396,17 @@ impl AgentControl {
             // them are documented as a rebuildable projection, so they are the
             // wrong thing to parse however convenient they look.
             AgentControl::Reasonix => TranscriptStats::default(),
+            // Unreachable rather than unimplemented, as for Reasonix: this runs
+            // only on a path a hook payload supplied, and no documented Kimi
+            // payload field names one. The transcript itself is known —
+            // `sessions/<workDirKey>/<sessionId>/agents/*/wire.jsonl`, carrying
+            // message history and request traces — but neither the field names
+            // for token usage and model nor `<workDirKey>`'s derivation is
+            // documented, and a guessed field would put a wrong number in a
+            // column read as fact. What fills this: one real session dir, read.
+            // (Resolve it by globbing `sessions/*/<sessionId>/` rather than
+            // recomputing the key.)
+            AgentControl::Kimi => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -382,6 +428,14 @@ impl AgentControl {
             // the sidecars directly waits on the same schema question as
             // `read_transcript_stats`.
             AgentControl::Reasonix => Ok(vec![]),
+            // Empty on the same missing fact as `read_transcript_stats`. A
+            // candidate needs a cwd, a first prompt and a session id; the id is
+            // the `sessions/` directory name, but reaching those directories at
+            // all means knowing `<workDirKey>` (or globbing for it), and reading
+            // a cwd or first prompt out of `state.json` / `wire.jsonl` means
+            // knowing their schemas. Kimi's `--session` with no id opens its own
+            // session browser, which is the usable answer until then.
+            AgentControl::Kimi => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -416,6 +470,9 @@ impl AgentControl {
             AgentControl::Reasonix => {
                 reasonix::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Kimi => {
+                kimi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -432,6 +489,12 @@ impl AgentControl {
             AgentControl::Claude => claude::build_hooks_settings(sock_path),
             AgentControl::Codex => codex::build_hooks_settings(sock_path),
             AgentControl::Reasonix => reasonix::build_hooks_settings(sock_path),
+            // TOML, not JSON, despite the method name and the `-settings.json`
+            // file the launcher writes it to: Kimi's hooks live in its
+            // `config.toml`. The path is generic transport and the contents are
+            // opaque to the launcher, so each backend puts its own format
+            // through it.
+            AgentControl::Kimi => kimi::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -444,6 +507,7 @@ impl AgentControl {
             AgentControl::Claude => claude::dispatch_hook(state, msg).await,
             AgentControl::Codex => codex::dispatch_hook(state, msg).await,
             AgentControl::Reasonix => reasonix::dispatch_hook(state, msg).await,
+            AgentControl::Kimi => kimi::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -455,6 +519,7 @@ impl AgentControl {
             AgentControl::Claude => claude::parse_hook_payload(event, stdin),
             AgentControl::Codex => codex::parse_hook_payload(event, stdin),
             AgentControl::Reasonix => reasonix::parse_hook_payload(event, stdin),
+            AgentControl::Kimi => kimi::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -474,6 +539,11 @@ impl AgentControl {
             // hook, so the case that forced Codex to read its rollout — Esc
             // firing nothing — cannot arise here.
             AgentControl::Reasonix => TranscriptScan::default(),
+            // Empty for the strongest reason of any backend: `Interrupt` is a
+            // first-class Kimi hook, so the exact case that forced Codex to read
+            // its rollout — Esc firing nothing — cannot arise. Nothing is
+            // missing here, and nothing would be gained by adding it.
+            AgentControl::Kimi => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -491,6 +561,10 @@ impl AgentControl {
             // No status file, so no second opinion on the working/idle axis —
             // Reasonix's transitions ride hooks alone, interrupts included.
             AgentControl::Reasonix => None,
+            // No status file, and none needed: the interrupt that this exists to
+            // catch for Claude arrives as a hook. Kimi's transitions ride hooks
+            // alone, with no second opinion to reconcile against.
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -512,6 +586,12 @@ impl AgentControl {
             // there is no per-pid file to read, and surfacing one waits on the
             // same schema question as `read_transcript_stats`.
             AgentControl::Reasonix => None,
+            // `None` because there is nothing left to read, not because Kimi has
+            // no name: `session_title` rides every hook payload and is already
+            // on `LauncherState.name` by the time this would be asked. That is
+            // what makes this the one backend needing neither a session-file
+            // fold (Claude) nor a sqlite overlay (Codex).
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -524,6 +604,8 @@ impl AgentControl {
             AgentControl::Claude => claude::session_file_path(agent_pid),
             AgentControl::Codex => None,
             AgentControl::Reasonix => None,
+            // No status file to watch — see `agent_activity`.
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -565,6 +647,17 @@ impl AgentControl {
             // Moot: no hook payload names a transcript, so no watch of either
             // kind is ever started for a Reasonix session.
             AgentControl::Reasonix => None,
+            // **Unverified, and set anyway.** Kimi appends
+            // `agents/*/wire.jsonl` for the life of a session, which is the
+            // long-held-fd shape that defeats macOS FSEvents entirely — so this
+            // matches Codex. It is *moot* today: no hook payload names a
+            // transcript, so the launcher starts no watch of either kind for a
+            // Kimi session. It is set now so that wiring a transcript path up
+            // later doesn't silently inherit an event-driven watch macOS can't
+            // deliver. This machine is Linux and could not test it; no macOS
+            // behaviour is being claimed, only the same defence Codex needed.
+            AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -591,6 +684,13 @@ impl AgentControl {
             // spawn per refresh, a `Stop` while a background task runs means "the
             // foreground turn ended" and the row reads Idle.
             AgentControl::Reasonix => None,
+            // Kimi has subagents (`SubagentStart` / `SubagentStop`) and tasks
+            // (`TaskStarted`), but neither is a `run_in_background` shell in a
+            // process tree we can walk, and no documented payload enumerates
+            // them the way Grok's `Stop` does. So a `Stop` while something else
+            // is still running means "the foreground turn ended" and the row
+            // reads Idle — never `BackgroundServer` or `ReviewPending`.
+            AgentControl::Kimi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -844,6 +944,12 @@ mod tests {
         )
     }
 
+    /// A name no build will ever know, standing in for the backend a *newer*
+    /// captain-miao writes into a state file. Deliberately not a name off the
+    /// roadmap: `"kimi"` was this fixture until Kimi shipped, and the tests then
+    /// asserted the opposite of what they meant.
+    const FUTURE_AGENT: &str = "a-later-backend";
+
     /// The hand-written `Deserialize` must not have moved the names it replaced.
     #[test]
     fn known_agent_names_still_decode() {
@@ -851,9 +957,11 @@ mod tests {
         let codex: AgentControl = serde_json::from_str(r#""codex""#).expect("codex decodes");
         let reasonix: AgentControl =
             serde_json::from_str(r#""reasonix""#).expect("reasonix decodes");
+        let kimi: AgentControl = serde_json::from_str(r#""kimi""#).expect("kimi decodes");
         assert_eq!(claude, AgentControl::Claude);
         assert_eq!(codex, AgentControl::Codex);
         assert_eq!(reasonix, AgentControl::Reasonix);
+        assert_eq!(kimi, AgentControl::Kimi);
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
@@ -861,7 +969,8 @@ mod tests {
     /// name is gone, but it never silently becomes Claude).
     #[test]
     fn an_unrecognized_agent_name_decodes_to_unknown() {
-        let a: AgentControl = serde_json::from_str(r#""kimi""#).expect("decodes, not errors");
+        let a: AgentControl =
+            serde_json::from_str(&format!("\"{FUTURE_AGENT}\"")).expect("decodes, not errors");
         assert_eq!(a, AgentControl::Unknown);
 
         let encoded = serde_json::to_string(&a).expect("encodes");
@@ -879,7 +988,7 @@ mod tests {
         let snapshot = format!(
             "[{},{},{}]",
             state_json("claude", 1),
-            state_json("kimi", 2),
+            state_json(FUTURE_AGENT, 2),
             state_json("codex", 3),
         );
         let sessions: Vec<LauncherState> =
@@ -915,7 +1024,8 @@ mod tests {
             &[
                 AgentControl::Claude,
                 AgentControl::Codex,
-                AgentControl::Reasonix
+                AgentControl::Reasonix,
+                AgentControl::Kimi
             ]
         );
     }
@@ -924,7 +1034,7 @@ mod tests {
     /// `from_cli` still refuses rather than handing back an inert backend.
     #[test]
     fn from_cli_rejects_an_unrecognized_name_instead_of_unknown() {
-        assert_eq!(AgentControl::from_cli("kimi"), None);
+        assert_eq!(AgentControl::from_cli(FUTURE_AGENT), None);
         assert_eq!(AgentControl::from_cli(""), None);
         assert_eq!(AgentControl::from_cli("claude"), Some(AgentControl::Claude));
         assert_eq!(
@@ -962,18 +1072,30 @@ mod tests {
         assert!(serde_json::from_str::<AgentControl>(r#"{"name":"claude"}"#).is_err());
     }
 
-    /// The gate is inert today — every shipping backend can branch a resume —
-    /// which is the reason to pin it now. The first backend without a fork flag
-    /// flips it by ignoring `fork` in its own arm, and this asserts that is all
-    /// it has to do.
+    /// The gate is nothing but "the two argvs differ", in both directions.
+    /// Kimi is the first backend on the false side and the reason the gate
+    /// exists: its arm ignores `fork`, and that alone is what has to be true —
+    /// no separate match, no flag invented to fill the gap.
     #[test]
     fn a_backend_forks_exactly_when_its_fork_argv_differs() {
         for &agent in AgentControl::ALL {
             let plain = agent.resume_args("id", false);
             let forked = agent.resume_args("id", true);
-            assert_ne!(plain, forked, "{agent:?} should still fork today");
-            assert!(agent.supports_fork(), "{agent:?}");
+            assert_eq!(
+                agent.supports_fork(),
+                plain != forked,
+                "{agent:?}'s gate must be its argv, nothing else"
+            );
         }
+        // Named rather than only derived, so a backend quietly losing (or
+        // growing) its fork flag fails here instead of just hiding a key.
+        assert!(AgentControl::Claude.supports_fork());
+        assert!(AgentControl::Codex.supports_fork());
+        assert!(AgentControl::Reasonix.supports_fork());
+        assert!(
+            !AgentControl::Kimi.supports_fork(),
+            "Kimi has no fork flag, so `f` must hide rather than resume in place"
+        );
 
         // A backend this build can't drive contributes no argv either way, so
         // the two are equal and it reports no fork — rather than offering `f`
