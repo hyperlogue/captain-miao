@@ -821,12 +821,13 @@ async fn push_changes(
 }
 
 /// Watch the `sessions/` dir; signal the broadcast on any non-Access change.
-/// Also watches Codex's title-store WAL (`AgentControl::Codex.watch_paths()`) —
-/// a rename touches only that sqlite, so without this wake a remote rename
-/// wouldn't reach subscribers until some other session event fired. The wake
-/// just triggers the normal re-read + diff; the actual sqlite read is heavily
-/// throttled inside `LocalBackend`'s title overlay, and an unchanged diff
-/// pushes nothing. Best-effort: a missing wal simply isn't watched.
+/// Also watches every backend's out-of-band store
+/// ([`AgentControl::out_of_band_watch_paths`]) — today that is Codex's title
+/// sqlite alone: a rename touches only that file, so without this wake a remote
+/// rename wouldn't reach subscribers until some other session event fired. The
+/// wake just triggers the normal re-read + diff; the actual sqlite read is
+/// heavily throttled inside `LocalBackend`'s title overlay, and an unchanged
+/// diff pushes nothing. Best-effort: a missing store simply isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
     let dir = state::sessions_dir();
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -838,8 +839,10 @@ fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::R
         let _ = tx.send(());
     })?;
     w.watch(&dir, notify::RecursiveMode::NonRecursive)?;
-    for path in AgentControl::Codex.watch_paths() {
-        let _ = w.watch(&path, notify::RecursiveMode::NonRecursive);
+    for &agent in AgentControl::ALL {
+        for path in agent.out_of_band_watch_paths() {
+            let _ = w.watch(&path, notify::RecursiveMode::NonRecursive);
+        }
     }
     Ok(w)
 }

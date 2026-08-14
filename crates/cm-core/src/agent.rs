@@ -218,6 +218,33 @@ impl AgentControl {
         }
     }
 
+    /// Paths outside the launcher's own `sessions/` dir whose changes must still
+    /// wake a host's subscribers — an agent's out-of-band store that no session
+    /// event touches, so a change there reaches a remote dashboard only if the
+    /// server wakes and re-diffs on it.
+    ///
+    /// Deliberately *not* [`Self::watch_paths`], which answers a different
+    /// question: what a **dashboard** must watch to keep its own derived reads
+    /// fresh. The two agree for Codex today and disagree for Claude, and the
+    /// disagreement is the point — Claude's `~/.claude/sessions` feeds the local
+    /// session-name index, but every fact in it that a *remote* dashboard needs
+    /// is folded onto the state file by the launcher first, so watching it
+    /// server-side would only wake subscribers with nothing new to push.
+    pub fn out_of_band_watch_paths(self) -> Vec<PathBuf> {
+        match self {
+            // Nothing: names arrive via `session_name`/`session_watch_path` and
+            // stats via the transcript, both folded onto the state file by the
+            // launcher — which is a `sessions/` write the host already watches.
+            AgentControl::Claude => vec![],
+            // `state_5.sqlite`'s WAL. A `/rename` (or Codex's own auto-title)
+            // lands there alone — no hook, no rollout line, no state-file write —
+            // and is read back by the per-host title overlay, so this wake is the
+            // only thing that gets a rename onto the wire.
+            AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
+            AgentControl::Unknown => vec![],
+        }
+    }
+
     /// Refresh per-pid name and session-id maps from the agent's on-disk
     /// session-name store. The cache lets repeated reloads skip files whose
     /// mtime is unchanged.
