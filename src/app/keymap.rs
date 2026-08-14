@@ -349,7 +349,11 @@ impl Command {
             Command::RestartAll => "restart all (idle only, confirm)",
             Command::EditDir => "edit directory icon + color (^E emoji picker)",
             Command::ToggleKeepAwake => "toggle keep-awake (prevent OS sleep)",
-            Command::DefaultAgent => "set default new-session backend (Claude/Codex)",
+            // No parenthetical list of backends. It read as a closed set and so
+            // went stale the moment a third arrived — but deriving one from
+            // `ALL` only trades a wrong list for an unwieldy one, since this
+            // grows to seven names. The picker it opens shows them all anyway.
+            Command::DefaultAgent => "set default new-session backend",
             Command::DefaultHost => "set default host for new sessions",
             Command::StealAttach => "attach, kicking the client already attached",
             Command::AttachAll => "attach every free detached session",
