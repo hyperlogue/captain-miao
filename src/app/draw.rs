@@ -22,7 +22,7 @@ use super::format::{
 };
 use super::keymap::Command;
 use super::picker::TextInput;
-use super::{App, DirEditFocus, HostField, HostTally, InputMode, PickerKind};
+use super::{App, DirEditFocus, EditOrigin, HostField, HostTally, InputMode, PickerKind};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) {
@@ -504,8 +504,14 @@ impl App {
         spans
     }
 
+    /// The hosts popup's geometry, as a percentage of the frame. Shared by the
+    /// list and by the row-editor card that floats inside it — the card insets
+    /// from *this*, so neither can drift off the other's edge.
+    const HOSTS_POPUP: (u16, u16) = (72, 60);
+
     /// The hosts popup: the host list, or — while `l` is open — one host's
-    /// connection log in its place.
+    /// connection log in its place. The row editor is a card over the list
+    /// ([`Self::draw_host_form`]), so both are drawn.
     fn draw_host_edit(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(state) = self.host_edit.as_ref() else {
             return;
@@ -514,6 +520,7 @@ impl App {
             self.draw_host_log(frame, area);
         } else {
             self.draw_host_list(frame, area);
+            self.draw_host_form(frame, area);
         }
     }
 
@@ -588,20 +595,15 @@ impl App {
         let Some(state) = self.host_edit.as_ref() else {
             return;
         };
-        let popup = centered_rect(72, 60, area);
+        let popup = centered_rect(Self::HOSTS_POPUP.0, Self::HOSTS_POPUP.1, area);
         frame.render_widget(Clear, popup);
         // No key hints on the border: the footer bar already renders this
         // mode's bindings, and two copies of the same list disagree eventually.
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" Hosts ", Style::default().bold()));
-        let inner = block.inner(popup);
+        let list_area = block.inner(popup);
         frame.render_widget(block, popup);
-
-        // Five field rows + at most one per-field hint, plus a little slack.
-        let form_h: u16 = if state.edit.is_some() { 8 } else { 0 };
-        let [list_area, form_area] =
-            Layout::vertical([Constraint::Min(2), Constraint::Length(form_h)]).areas(inner);
 
         // The panel proper: one line per host, showing what you'd actually go
         // here to find out — live connection state (with a `Failed` reason
@@ -611,12 +613,10 @@ impl App {
         // lives (§9).
         let mut lines: Vec<Line> = Vec::new();
         for (i, r) in state.rows.iter().enumerate() {
-            let on = i == state.cursor;
-            let marker = if on && state.edit.is_none() {
-                "\u{276F} "
-            } else {
-                "  "
-            };
+            // Kept while the row editor is open, unlike the "+ add" line's: the
+            // card covers the middle of the list, and this is what says which
+            // row it belongs to once the label field is no longer the only clue.
+            let marker = if i == state.cursor { "\u{276F} " } else { "  " };
             let label = if r.label.text().trim().is_empty() {
                 "(unnamed)".to_string()
             } else {
@@ -668,7 +668,7 @@ impl App {
             // The clipboard marker lands here for exactly that reason: it *is*
             // one more forward on the same child, so it belongs beside the ones
             // the user typed rather than on the status line, which reports live
-            // connection state. `p` in the footer is what names the key.
+            // connection state. The editor's `Clipboard` field is what sets it.
             let mut detail = format!(
                 "      {} {} {}",
                 if r.is_socket { "socket" } else { "ssh" },
@@ -720,11 +720,82 @@ impl App {
             )));
         }
         frame.render_widget(Paragraph::new(lines), list_area);
+    }
 
-        // The field form for the row being edited.
+    /// The selected row's fields, as a card floating over the list.
+    ///
+    /// Its own popup rather than the form pinned under the list that this was.
+    /// Two things were wrong with that: the list lost eight of its rows the
+    /// moment you pressed `e` — on a short terminal most of it — and a form
+    /// sharing a box with a list it does *not* share a cursor with reads as one
+    /// more part of the same view, when in fact every key means something
+    /// different while it is up. A card that covers the list, dims it and names
+    /// itself says that in the shape of the thing.
+    fn draw_host_form(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
+        };
         if let Some(focus) = state.focus()
             && let Some(r) = state.rows.get(state.cursor)
         {
+            let host_popup = centered_rect(Self::HOSTS_POPUP.0, Self::HOSTS_POPUP.1, area);
+            // Sized to the *widest* hint over every field, not to the focused
+            // field's: the hints differ by tens of cells, so a card measured
+            // from the current one would resize under the cursor as Tab walks
+            // the form. Plus six — two borders, their padding, and a cell of
+            // margin so the longest hint doesn't sit against the frame.
+            let hint_w = {
+                use unicode_width::UnicodeWidthStr;
+                HostField::ORDER
+                    .iter()
+                    .filter_map(|f| host_field_hint(*f))
+                    .map(|h| h.width() as u16)
+                    .max()
+                    .unwrap_or(0)
+            };
+            // Never wider than the popup behind it less two cells a side, so it
+            // stays inside that frame and reads as floating over the list: a card
+            // exactly as wide lands its own border on the same columns, and the
+            // two then look like one panel with a divider drawn across it.
+            let width = (hint_w + 6).min(host_popup.width.saturating_sub(4));
+            // One row per field, a blank, the hint line — held whether this field
+            // has a hint or not, for the same reason the width is — and the two
+            // borders.
+            let height = (HostField::ORDER.len() as u16 + 4).min(host_popup.height);
+            // A terminal too small to draw a frame around anything. The dashboard
+            // as a whole is unusable well before this, so it is a guard against a
+            // degenerate `Rect`, not a layout for a narrow screen.
+            if width < 8 || height < 3 {
+                return;
+            }
+            let popup = Rect {
+                x: host_popup.x + (host_popup.width - width) / 2,
+                y: host_popup.y + (host_popup.height - height) / 2,
+                width,
+                height,
+            };
+            // The list goes quiet under the card. It is modal — every key belongs
+            // to the form while it is up, including the `j`/`k`/`d` that move and
+            // delete rows out there — and dimming what stopped listening is the
+            // same cue the preview pane uses when it is no longer live.
+            frame
+                .buffer_mut()
+                .set_style(host_popup, Style::default().add_modifier(Modifier::DIM));
+            frame.render_widget(Clear, popup);
+            // Which of the two things Esc will do: put a row back, or drop one
+            // that was never on disk. The old inline form couldn't say.
+            let title = match state.edit.as_ref().map(|e| &e.origin) {
+                Some(EditOrigin::Added) => " Add Host ",
+                _ => " Edit Host ",
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(title, Style::default().bold()));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+
             let field_row = |focused: bool, label: &str, value: Line<'static>| {
                 let mark = if focused {
                     Span::styled("\u{276F} ", Style::default().bold())
@@ -781,36 +852,16 @@ impl App {
                 field_row(focus == HostField::Icon, "Icon", icon_line),
                 field_row(focus == HostField::Clipboard, "Clipboard", clipboard_line),
             ];
-            // Per-field hints for the non-obvious affordances. The Ports one is
-            // the syntax itself: the field accepts more forms than a label can
-            // carry, and examples teach it in less room than a grammar would.
-            match focus {
-                super::HostField::Target => form_lines.push(Line::from(Span::styled(
-                    "  ^t toggle ssh / socket",
+            // The blank goes in whether or not this field has a hint, so the one
+            // line the card reserves for it doesn't shunt the fields up and down.
+            form_lines.push(Line::from(""));
+            if let Some(hint) = host_field_hint(focus) {
+                form_lines.push(Line::from(Span::styled(
+                    hint,
                     Style::default().add_modifier(Modifier::DIM),
-                ))),
-                // An example of the one thing this field is really for, and a
-                // pointer to where the rest belongs — which is the question the
-                // field raises rather than answers.
-                super::HostField::Options => form_lines.push(Line::from(Span::styled(
-                    "  ssh args, e.g. -L 8080:localhost:3000   host setup: ~/.ssh/config",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-                super::HostField::Icon => form_lines.push(Line::from(Span::styled(
-                    "  ^e pick emoji   empty = auto",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-                // Names the key, then the direction — "clipboard" on a host row
-                // could as easily mean the host's own, and *whose* it is is the
-                // whole point. Kept to the length of the `Options` hint above, so
-                // it survives the same popup width that one does.
-                super::HostField::Clipboard => form_lines.push(Line::from(Span::styled(
-                    "  Space toggle   offer this machine's clipboard — paste a screenshot there",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
-                _ => {}
+                )));
             }
-            frame.render_widget(Paragraph::new(form_lines), form_area);
+            frame.render_widget(Paragraph::new(form_lines), inner);
         }
     }
 
@@ -2059,6 +2110,35 @@ const OVERRIDE_COL_WIDTH: u16 = 4;
 /// under it is reversed, with a reversed space standing in at end-of-text. An
 /// unfocused field renders as plain text: two cursors in one form would be a
 /// lie about which one the keyboard is in. Pure.
+/// The hosts row-editor hint for one field, or `None` for a field that speaks for
+/// itself. Indented to the label column, so it reads as belonging to the form
+/// rather than to the card's frame.
+///
+/// A function over the field rather than a `match` inside the draw, because the
+/// card is sized to the widest of these and that needs them enumerable — a hint
+/// that only exists inside the arm that renders it can't be measured before it is
+/// the focused one, which is how a form ends up resizing under the cursor.
+fn host_field_hint(field: HostField) -> Option<&'static str> {
+    match field {
+        // The label is a name. Nothing to explain.
+        HostField::Label => None,
+        HostField::Target => Some("  ^t toggle ssh / socket"),
+        // An example of the one thing this field is really for, and a pointer to
+        // where the rest belongs — which is the question the field raises rather
+        // than answers.
+        HostField::Options => {
+            Some("  ssh args, e.g. -L 8080:localhost:3000   host setup: ~/.ssh/config")
+        }
+        HostField::Icon => Some("  ^e pick emoji   empty = auto"),
+        // Names the key, then the direction — "clipboard" on a host row could as
+        // easily mean the host's own, and *whose* it is is the whole point. It is
+        // the longest of these, so it is what the card's width is set by.
+        HostField::Clipboard => {
+            Some("  Space toggle   offer this machine's clipboard — paste a screenshot there")
+        }
+    }
+}
+
 fn text_field_spans(input: &TextInput, focused: bool) -> Vec<Span<'static>> {
     let text = input.text();
     if !focused {

@@ -4720,6 +4720,86 @@ fn the_clipboard_is_a_field_in_the_row_editor() {
     assert!(row(&d), "Esc must restore the pre-edit value");
 }
 
+/// The row editor is a **card over the list**, not a form pinned under it.
+///
+/// The form used to take eight of the popup's rows the moment you pressed `e`,
+/// and this panel has no scrolling — so on a full list the hosts at the bottom
+/// simply left the screen while you were editing one of them. As a card it costs
+/// the list nothing, it insets inside the panel's frame so it reads as floating
+/// over it, it dims what stopped listening, and it can say which of the two
+/// things `Esc` will do.
+#[test]
+fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
+    use ratatui::style::Modifier;
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let state = d.app.host_edit.as_mut().unwrap();
+    // Two lines each, so seven hosts fill the popup exactly — which is more than
+    // the old layout had room for once the form took the bottom eight rows.
+    for i in 1..=7 {
+        state.rows.push(super::HostRow {
+            label: super::picker::TextInput::with_text(format!("h{i}")),
+            ..Default::default()
+        });
+    }
+    state.cursor = 0;
+    let out = d.render();
+    assert!(out.contains("h7"), "the list starts full: {out}");
+
+    d.press(KeyCode::Char('e'));
+    let out = d.render();
+    assert!(out.contains("Edit Host"), "the card names itself: {out}");
+    assert!(
+        out.contains("h7"),
+        "and costs the list none of its rows: {out}"
+    );
+    let card = out
+        .lines()
+        .find(|l| l.contains("Edit Host"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        card.trim_start().starts_with('\u{2502}'),
+        "the panel's own border survives beside the card: {card}"
+    );
+
+    // The list goes dim under it: every key belongs to the form while it is up,
+    // including the `j`/`k`/`d` that move and delete rows out there.
+    let buf = d.terminal.backend().buffer();
+    let dim_at = |needle: &str| {
+        let (x, y) = find_cell(buf, needle).unwrap_or_else(|| panic!("{needle} not drawn"));
+        buf[(x, y)].style().add_modifier.contains(Modifier::DIM)
+    };
+    assert!(dim_at("h7"), "the list must read as no longer listening");
+    assert!(!dim_at("Edit Host"), "the card itself must not");
+
+    // The line the card holds for a per-field hint is held whether the focused
+    // field has one or not — otherwise `Tab` shunts the fields up and down under
+    // the cursor as it walks past the ones that do.
+    let row_of = |out: &str, needle: &str| out.lines().position(|l| l.contains(needle));
+    let quiet = d.render();
+    assert!(
+        !quiet.contains("Space toggle"),
+        "Label has no hint: {quiet}"
+    );
+    for _ in 0..4 {
+        d.press(KeyCode::Tab);
+    }
+    let hinted = d.render();
+    assert!(hinted.contains("Space toggle"), "{hinted}");
+    assert_eq!(
+        row_of(&quiet, "Clipboard"),
+        row_of(&hinted, "Clipboard"),
+        "the fields must not move when a hint appears"
+    );
+
+    // A row the edit *created* says so, because there `Esc` drops it rather than
+    // putting it back — the inline form had nowhere to tell you that.
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char('a'));
+    let out = d.render();
+    assert!(out.contains("Add Host"), "{out}");
+}
+
 /// The row editor's four fields walk by every idiom the dashboard binds
 /// elsewhere, and — the point — they walk **backwards** too. `Tab`-only meant
 /// overshooting Options cost three more presses.

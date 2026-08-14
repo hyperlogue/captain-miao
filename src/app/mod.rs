@@ -527,7 +527,8 @@ pub(super) struct HostEditState {
     /// Selected row (`0..rows.len()`), or `rows.len()` for the "+ add" line.
     pub(in crate::app) cursor: usize,
     /// `Some` while the selected row's fields have the keyboard — see
-    /// [`RowEdit`]. `None` in the list.
+    /// [`RowEdit`]. `None` in the list. Drawn as a card over the list rather
+    /// than inside it, so this is what dims the panel behind it too.
     pub(in crate::app) edit: Option<RowEdit>,
     /// The row a `d` press is asking about — the removal confirm (§9). `None`
     /// when nothing is pending.
@@ -743,7 +744,9 @@ pub(super) enum HostField {
 
 impl HostField {
     /// Form order — the order the fields are drawn in, which is the order the
-    /// focus keys walk.
+    /// focus keys walk, and what the editor's card measures itself from: the
+    /// widest hint over these fields sets its width and the count sets its
+    /// height, so a sixth field changes the box without anyone resizing it.
     ///
     /// `Clipboard` is last rather than beside `Options`, where it belongs by
     /// meaning: the four text fields keep the Tab positions fingers already know,

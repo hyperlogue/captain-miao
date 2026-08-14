@@ -983,9 +983,17 @@ decides what they mean**.
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.
-  - **The row editor is a form, and moves like one.** `Tab`/`S-Tab`, `↑`/`↓` and
-    `^n`/`^p` all walk the four fields, forwards and back — a ring you can only
-    cycle one way makes overshooting a field cost three more presses. The fields
+  - **The row editor is a form, and moves like one.** It opens as its own card
+    over the list — which goes dim under it, since every key belongs to the form
+    while it is up, including the `j`/`k`/`d` that move and delete rows out
+    there. Titled `Edit Host`, or `Add Host` on a row the edit created, because
+    those are the two different things `Esc` does. It used to be a pane pinned
+    under the list, which took eight of the panel's rows the moment you pressed
+    `e` — and the panel has no scrolling, so on a full list the hosts at the
+    bottom (including, often, the one being edited) simply left the screen.
+    `Tab`/`S-Tab`, `↑`/`↓` and `^n`/`^p` all walk the five fields, forwards and
+    back — a ring you can only cycle one way makes overshooting a field cost
+    three more presses. The fields
     are `TextInput`s, the same widget behind every picker's query, so the
     readline keys, the arrows and Home/End work inside them and the cursor
     renders where it actually is. **`Enter` commits and `Esc` cancels**: the
