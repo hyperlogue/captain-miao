@@ -405,7 +405,10 @@ impl StatsCursor {
 /// snapshot of the user's shell environment
 /// (`…/.claude/shell-snapshots/snapshot-<shell>-<ts>-<rand>.sh`). Distinguishes
 /// background-task shells from the agent's other children (MCP stdio servers,
-/// helper processes), which never source one.
+/// helper processes), which never source one. Present in the *spawned* shell,
+/// not necessarily in the surviving process image: a command that `exec`s
+/// overwrites the wrapper's command line, which is why
+/// [`classify_bg_shells`] can't treat it as the only way in.
 const SHELL_SNAPSHOT_MARKER: &str = "/shell-snapshots/snapshot-";
 
 /// The agent's currently-running `run_in_background` shells, each reduced to a
@@ -419,8 +422,10 @@ const SHELL_SNAPSHOT_MARKER: &str = "/shell-snapshots/snapshot-";
 /// answer", which is why a row whose review-watch had ended could sit in
 /// `ReviewPending` for the rest of its life. Read from the **live process tree** — the Bash
 /// tool runs each background command in a wrapper shell that stays a direct
-/// child of the agent for the task's lifetime — so the answer is present-tense
-/// truth and can't go stale: a task that ends with no transcript marker
+/// child of the agent for the task's lifetime (or that the command `exec`s over,
+/// leaving itself as that same child — see [`classify_bg_shells`]) — so the
+/// answer is present-tense truth and can't go stale: a task that ends with no
+/// transcript marker
 /// (stopped from the UI, a Monitor timeout, agent teardown, or a `--resume`
 /// orphan from a previous process incarnation) simply isn't in the tree
 /// anymore. (An earlier version folded launch/`<task-notification>` pairs from
@@ -432,33 +437,59 @@ pub fn bg_shells(agent_pid: u32) -> Option<Vec<BgShell>> {
     Some(classify_bg_shells(&child_cmdlines(agent_pid)?))
 }
 
-/// Reduce the agent's child command lines to its Bash-tool background shells
-/// (the [`SHELL_SNAPSHOT_MARKER`] wrapper), each normalized to its eval'd
-/// command and classified by command text alone. The wrapper embeds the eval'd
-/// command verbatim, so the classifiers match it unchanged. Total, since the
-/// caller has already read the tree: no wrapper shell among the children is an
-/// empty vec, never `None` (see [`bg_shells`]).
+/// Reduce the agent's child command lines to its `run_in_background` shells,
+/// each normalized to its eval'd command and classified by command text alone.
+/// The wrapper embeds the eval'd command verbatim, so the classifiers match it
+/// unchanged.
+///
+/// A child qualifies two ways. Normally it carries the
+/// [`SHELL_SNAPSHOT_MARKER`] wrapper — the evidence separating a background task
+/// from the agent's other children. But a command that `exec`s (`…; exec r3
+/// watch review_…`, or a launcher script ending in `exec bun "$cli" "$@"`)
+/// replaces that wrapper with itself, and the marker goes with it; the surviving
+/// line is the command verbatim. So a review-watch is admitted **unwrapped**
+/// too: `watch review_<hex>` / an r3 entrypoint is a distinctive enough form to
+/// stand on its own, and it is the one classification whose loss is silent — the
+/// row sits on `BackgroundActive` while a person is actually waiting.
+///
+/// Nothing else is admitted unwrapped, because nothing else can be told apart
+/// from an MCP stdio server or helper by its text. An exec'd dev server is
+/// therefore missed and its row stays busy, which is this module's standing bias
+/// (see [`is_long_running_command`]) — and, more importantly, a child that isn't
+/// a background task at all keeps leaving the **empty** set that
+/// `promote_stale_background` needs to retire a stale row.
+///
+/// Total, since the caller has already read the tree: no background shell among
+/// the children is an empty vec, never `None` (see [`bg_shells`]).
 fn classify_bg_shells(cmdlines: &[String]) -> Vec<BgShell> {
-    let shells: Vec<BgShell> = cmdlines
+    cmdlines
         .iter()
-        .filter(|c| c.contains(SHELL_SNAPSHOT_MARKER))
-        .map(|c| {
+        .filter_map(|c| {
             // Classify the *normalized* command (the eval'd body), not the raw
             // wrapper: the wrapper's leading `bash -c source <snapshot> && …`
             // would shift a `npm run dev` off position 0 and hide it from the
-            // token checks. The same normalized string is the learning key.
+            // token checks. The same normalized string is the learning key —
+            // and for an exec'd child it is just the trimmed line itself.
             let key = normalize_bg_command(c);
-            let kind = if is_r3_watch_command(&key) {
-                BgSeedKind::ReviewWatch
-            } else if is_long_running_command(&key) {
+            if is_r3_watch_command(&key) {
+                return Some(BgShell {
+                    key,
+                    kind: BgSeedKind::ReviewWatch,
+                });
+            }
+            // Past that form, the wrapper is the only evidence this child is a
+            // background task rather than one of the agent's own helpers.
+            if !c.contains(SHELL_SNAPSHOT_MARKER) {
+                return None;
+            }
+            let kind = if is_long_running_command(&key) {
                 BgSeedKind::LongRunning
             } else {
                 BgSeedKind::Other
             };
-            BgShell { key, kind }
+            Some(BgShell { key, kind })
         })
-        .collect();
-    shells
+        .collect()
 }
 
 /// Extract the agent's actual `run_in_background` command from the Bash-tool
@@ -2111,6 +2142,30 @@ mod tests {
         );
     }
 
+    /// A command that `exec`s leaves no wrapper behind, so the snapshot marker
+    /// — the usual evidence that a child is a background task — is gone from
+    /// the process image. From a live session whose row sat on
+    /// `BackgroundActive` while its review really was waiting: the agent ran
+    /// `export PATH=…; exec <dir>/r3 watch review_…`, and that launcher script's
+    /// own `exec bun "$cli" "$@"` left the `bun` line below as the agent's
+    /// direct child. The recognizer would have matched it all along; the filter
+    /// in front of it never let it through.
+    #[test]
+    fn classify_bg_shells_admits_an_execd_review_watch_without_the_wrapper() {
+        let execd = format!("{R3_WATCH_SRC} --auto-fetch-timeout 900");
+        let seeds = classify_bg_shells(std::slice::from_ref(&execd));
+        assert_eq!(seeds.len(), 1, "exec'd review-watch dropped: {execd}");
+        assert_eq!(seeds[0].kind, BgSeedKind::ReviewWatch);
+        assert_eq!(seeds[0].key, execd, "an unwrapped line is its own key");
+
+        // The admission stays narrow. Past the review-watch form an unwrapped
+        // child is still no shell at all: an exec'd dev server leaves the row
+        // busy rather than parking it, which is the safe direction, and the
+        // non-task children keep leaving the empty set that
+        // `promote_stale_background` recovers on.
+        assert!(kinds(&["npm run dev".to_string()]).is_empty());
+    }
+
     #[test]
     fn classify_bg_shells_ignores_non_shell_children() {
         // MCP stdio servers / helpers never source a shell snapshot: they're not
@@ -2214,16 +2269,23 @@ mod tests {
 
     #[test]
     fn parse_ps_children_filters_by_ppid() {
+        // Both shapes a background shell reaches us in, side by side: a parked
+        // dev server still wearing its wrapper, and a review-watch that `exec`'d
+        // out of one. The `999` line is the point of the test — a cmdline that
+        // merely mentions the pid must not be mistaken for a child of it.
         let ps = "\
     1 /sbin/launchd
- 4321 /bin/bash -c source /Users/riteye/.claude/shell-snapshots/snapshot-zsh-17.sh && eval 'r3 watch review_1'
+ 4321 /bin/bash -c source /Users/riteye/.claude/shell-snapshots/snapshot-zsh-17.sh && eval 'npm run dev'
  4321 bun /Users/riteye/projects/r3/cli/index.ts watch review_1
   999 unrelated --ppid 4321
 ";
         let children = parse_ps_child_cmdlines(ps, 4321);
         assert_eq!(children.len(), 2);
         assert!(children[0].starts_with("/bin/bash -c source"));
-        assert_eq!(kinds(&children), vec![BgSeedKind::ReviewWatch]);
+        assert_eq!(
+            kinds(&children),
+            vec![BgSeedKind::LongRunning, BgSeedKind::ReviewWatch]
+        );
     }
 
     /// End-to-end on the real `/proc`: a child we spawn ourselves shows up in
