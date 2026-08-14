@@ -149,7 +149,6 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
-use super::find_in_path;
 use super::synth_home::atomic_write;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
@@ -387,8 +386,6 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let pi_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our extension source to `settings_path`;
     // relocate it to a `.ts` path Pi's loader will accept (see
     // [`extension_path`]). Note the file the launcher wrote is named
@@ -397,18 +394,7 @@ pub fn build_launch_command(
     let source = std::fs::read_to_string(settings_path).context("reading pi hook extension")?;
     let extension = ensure_extension(&source)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&pi_bin);
-            c
-        }
-        None => Command::new(&pi_bin),
-    };
-
-    cmd.current_dir(cwd);
-    super::with_shim_path(&mut cmd, shim_dir);
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     // Read by `miao hook` (spawned from the extension, which inherits this
     // process's environment). The extension file is shared by every session and
     // so cannot carry the path itself.

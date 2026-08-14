@@ -23,7 +23,7 @@ use tokio::process::Command;
 
 use super::common;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
-use super::{collapse_whitespace, find_in_path, shell_quote};
+use super::{collapse_whitespace, shell_quote};
 use crate::agent::{
     AgentActivity, ResumeCandidate, SessionIndex, SessionIndexCache, TranscriptScan,
     TranscriptStats,
@@ -453,30 +453,17 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let codex_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our hooks.json contents to `settings_path`;
     // relocate them into the synthetic home where Codex will discover them.
     let hooks_json =
         std::fs::read_to_string(settings_path).context("reading codex hooks settings")?;
     let home = ensure_synth_home(&hooks_json)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&codex_bin);
-            c
-        }
-        None => Command::new(&codex_bin),
-    };
-
-    cmd.current_dir(cwd);
+    // `agent_command` puts the shim farm on `PATH`, which for Codex buys only
+    // `clipboard-paste`: it reads the clipboard in-process, so no shim can serve
+    // its `Ctrl+V`.
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("CODEX_HOME", &home);
-    // Codex reads the clipboard in-process, so no shim can serve its `Ctrl+V` —
-    // the farm is still on its `PATH` for `clipboard-paste`, which is what it has
-    // instead.
-    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from
     // an argv flag — that keeps hooks.json byte-identical across sessions so
     // its trust hash never changes.

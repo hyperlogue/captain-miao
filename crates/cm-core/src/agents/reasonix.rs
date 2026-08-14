@@ -95,8 +95,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
+use super::shell_quote;
 use super::synth_home::SynthHome;
-use super::{find_in_path, shell_quote};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -178,8 +178,6 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let reasonix_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our settings.json contents to `settings_path`;
     // relocate them into the synthetic home, which is the only place Reasonix
     // looks for global hooks (`hook.Load` reads the project file, the installed
@@ -189,17 +187,7 @@ pub fn build_launch_command(
         std::fs::read_to_string(settings_path).context("reading reasonix hook settings")?;
     let home = ensure_synth_home(&settings_json)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&reasonix_bin);
-            c
-        }
-        None => Command::new(&reasonix_bin),
-    };
-
-    cmd.current_dir(cwd);
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("REASONIX_HOME", &home);
     // Only the *config* root is ours. Without these two the state and cache
     // roots would follow `REASONIX_HOME` into the synthetic dir, putting the
@@ -211,7 +199,6 @@ pub fn build_launch_command(
     if let Some(cache) = cache_home() {
         cmd.env("REASONIX_CACHE_HOME", cache);
     }
-    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from
     // an argv flag: the synthetic home is shared by every session, so its
     // settings.json cannot carry a per-session path. It survives the trip —

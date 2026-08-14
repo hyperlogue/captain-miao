@@ -149,8 +149,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
+use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
-use super::{find_in_path, shell_quote};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -212,8 +212,6 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let grok_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our hook-file contents to `settings_path`;
     // relocate them into the synthetic home, which is where Grok discovers
     // global hooks (there is no per-invocation `--settings` equivalent — that is
@@ -222,19 +220,8 @@ pub fn build_launch_command(
         std::fs::read_to_string(settings_path).context("reading grok hook settings")?;
     let home = ensure_synth_home(&hooks_json)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&grok_bin);
-            c
-        }
-        None => Command::new(&grok_bin),
-    };
-
-    cmd.current_dir(cwd);
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("GROK_HOME", &home);
-    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from an
     // argv flag: the synthetic home is shared by every session, so neither the
     // hooks file nor `config.toml` can carry a per-session path. The notification

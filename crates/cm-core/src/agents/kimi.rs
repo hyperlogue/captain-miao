@@ -118,8 +118,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
+use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
-use super::{find_in_path, shell_quote};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -166,8 +166,6 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let kimi_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our hook block to `settings_path`; merge it
     // into the synthetic home's config.toml, which is the only place Kimi looks
     // for hooks (there is no override flag and no per-invocation injection).
@@ -178,19 +176,8 @@ pub fn build_launch_command(
         std::fs::read_to_string(settings_path).context("reading kimi hook settings")?;
     let home = ensure_synth_home(&hooks_toml)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&kimi_bin);
-            c
-        }
-        None => Command::new(&kimi_bin),
-    };
-
-    cmd.current_dir(cwd);
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("KIMI_CODE_HOME", &home);
-    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from
     // an argv flag: the synthetic home is shared by every session, so its
     // config.toml cannot carry a per-session path — and must not, if Kimi hashes

@@ -151,7 +151,6 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
-use super::find_in_path;
 use super::synth_home::SynthHome;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
@@ -285,8 +284,6 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let opencode_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
-
     // The launcher already wrote our plugin source to `settings_path`;
     // relocate it into the synthetic config dir, which is the only place
     // opencode discovers global plugins (there is no per-invocation
@@ -298,19 +295,8 @@ pub fn build_launch_command(
     let plugin_js = std::fs::read_to_string(settings_path).context("reading opencode plugin")?;
     let config = ensure_synth_config(&plugin_js)?;
 
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&opencode_bin);
-            c
-        }
-        None => Command::new(&opencode_bin),
-    };
-
-    cmd.current_dir(cwd);
+    let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("OPENCODE_CONFIG_DIR", &config);
-    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from
     // an argv flag: the synthetic config dir is shared by every session, so the
     // plugin cannot carry a per-session path. It reaches the forwarder by being
