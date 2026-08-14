@@ -22,7 +22,9 @@ use super::format::{
 };
 use super::keymap::Command;
 use super::picker::TextInput;
-use super::{App, DirEditFocus, EditOrigin, HostField, HostTally, InputMode, PickerKind};
+use super::{
+    App, DirEditFocus, EditOrigin, HostField, HostTally, InputMode, PickerKind, split_worktree,
+};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) {
@@ -1142,7 +1144,22 @@ impl App {
         let sid_short = live_sid
             .map(|sid| sid.split('-').next().unwrap_or(sid).to_string())
             .unwrap_or_else(|| "—".to_string());
+        // A worktree row's cwd ends in `.claude/worktrees/<name>`, so the name is
+        // already here — as the tail of a path that wraps over three lines in the
+        // default 36-column panel, which is where the eye goes last. Lift it onto
+        // a field of its own so "which checkout" is read rather than parsed.
+        //
+        // `Dir` keeps the whole cwd regardless: it is the field you copy into a
+        // `cd`, and a path with its tail lopped off is not a path. The repetition
+        // is the point — a derived field that contradicted the path above it
+        // would be the bug.
+        //
+        // Outside a worktree there is no line at all rather than an empty one, so
+        // its presence is itself the answer to "is this session in a worktree".
         let cwd = self.shorten_path(&s.cwd).into_owned();
+        let worktree = split_worktree(&s.cwd)
+            .1
+            .map(|name| Line::from(vec![label("Worktree"), Span::raw(name.to_string())]));
         let child = s
             .child_pid
             .map(|p| p.to_string())
@@ -1241,6 +1258,7 @@ impl App {
             Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
             Line::from(vec![label("Dir"), Span::raw(cwd)]),
         ]);
+        lines.extend(worktree);
 
         if let Some(err) = &s.last_error {
             lines.push(Line::from(""));

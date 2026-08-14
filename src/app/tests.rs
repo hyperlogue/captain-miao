@@ -4165,6 +4165,54 @@ fn wide_layout_keeps_full_columns_and_detail() {
 /// against a terminfo that has nothing to do with the window you are looking at
 /// it through, and nothing said so. The detail panel says so. A value matching
 /// this dashboard's own terminfo has nothing to report and draws dim.
+/// A worktree row's cwd ends in `.claude/worktrees/<name>`, the one thing
+/// telling it apart from its repo and the last thing the eye reaches in a
+/// wrapped path. It gets a field of its own — beside the *whole* cwd, not
+/// instead of it — and an ordinary row grows no empty `Worktree` field.
+#[test]
+fn the_detail_panel_names_the_worktree_a_session_sits_in() {
+    // Tall enough that the preview doesn't clip the panel above `Dir`, and wide
+    // enough that the cwd lands on one line — the assertions below read it whole.
+    let mut d = TestDashboard::new(160, 40);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.detail_width = 80;
+
+    let plain = session(1, "/home/miao/code/proj", SessionStatus::Idle);
+    // The agent allows a `/` in the name, so the whole remainder is the name.
+    let tree = session(
+        2,
+        "/home/miao/code/proj/.claude/worktrees/feature/auth",
+        SessionStatus::Idle,
+    );
+    d.set_sessions(vec![plain, tree]);
+
+    let select = |d: &mut TestDashboard, pid: u32| {
+        let at = d
+            .app
+            .visible_sessions()
+            .iter()
+            .position(|s| s.launcher_pid == pid)
+            .expect("row is visible");
+        d.app.table_state.select(Some(at));
+    };
+
+    select(&mut d, 1);
+    let out = d.render();
+    assert!(out.contains("/home/miao/code/proj"), "{out}");
+    assert!(!out.contains("Worktree"), "no worktree, no field: {out}");
+
+    select(&mut d, 2);
+    let out = d.render();
+    assert!(out.contains("Worktree feature/auth"), "{out}");
+    // The new field is *additive*. `Dir` is what you copy into a `cd`, so it
+    // stays the whole cwd — tail included — rather than the repo it splits to.
+    assert!(
+        out.contains("Dir      /home/miao/code/proj/.claude/worktrees/feature/auth"),
+        "{out}"
+    );
+}
+
 #[test]
 fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     use crate::state::HostId;
