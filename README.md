@@ -30,8 +30,28 @@ focused tool and the rest of your workflow is yours to compose.
 
 ## Requirements
 
-- A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **Ghostty** ≥ 1.3 on macOS (see [Ghostty setup](#ghostty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
-- **Claude Code**, **Codex** and/or **Reasonix** on your `PATH`.
+One supported terminal to drive, and at least one agent CLI on your `PATH`.
+
+### Terminals
+
+| Terminal | Notes |
+| --- | --- |
+| **Kitty** | Needs remote control enabled — a password and a `listen_on` socket ([Kitty setup](#kitty-setup)). The most capable backend, and the only one with all of: live preview, move-to-tab (`t`), several sessions stacked in one tab, and a header logo drawn as a real image over the TUI via the kitty graphics protocol. |
+| **Ghostty** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary — no config to edit, but macOS asks you to approve Automation once ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**; no move-to-tab, one tab per session, and every spawn brings Ghostty to the front. The Linux build exposes no control channel at all — run it under zellij or tmux there. |
+| **zellij** ≥ 0.44 | Run captain-miao inside the session it should drive; no setup. Sessions live as full-size floating panes in one `miao:sessions` tab, so switching between them is a pure z-order raise — no pty resize, no flicker. No move-to-tab: zellij has no CLI to reparent a pane, so `t` is hidden. |
+| **tmux** ≥ 3.2 | Run captain-miao inside the session it should drive; no setup. One window per session — there is no shared-tab arrangement, so `Space l` is hidden — but move-to-tab works. The one backend a machine with no GUI can drive, so its live-server test runs in CI on Linux and macOS. |
+
+### Agents
+
+| Agent | Notes |
+| --- | --- |
+| **[Claude Code](https://claude.com/claude-code)** | The most complete backend: worktrees (`Ctrl-g`), background-task tiers (dev server vs. finite task vs. [r3](https://github.com/hyperlogue/r3) review-watch), `/rename` titles, and an incremental transcript fold behind the token and model columns. Hooks are injected per-session with `--settings`; nothing is written to your `~/.claude/settings.json`. |
+| **[Codex](https://github.com/openai/codex)** | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. Its rollout JSONL is richer than a transcript, so tokens and lifecycle come from typed events; titles come from Codex's own sqlite store. No worktrees and no background tasks. On macOS the rollout is stat-polled rather than watched, because FSEvents stays silent for Codex's long-held fd. It also can't take a shimmed clipboard paste — it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
+| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Newest, and written against the source rather than a running binary. Status, launch, resume and fork work; token/model columns, resume-picker entries, worktrees and background tiers don't ([known limits](#reasonix-support)). Its hook vocabulary is a 1:1 fit — approvals and Esc-interrupts arrive as real events — so nothing about a row is inferred from disk. |
+
+A session started under a backend your build doesn't know (a newer host seen by
+an older dashboard) still shows up: the row stays visible, sortable and
+killable, and only launching from it is refused.
 
 ## Installation
 
