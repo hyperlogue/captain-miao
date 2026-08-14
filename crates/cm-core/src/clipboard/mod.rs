@@ -54,6 +54,7 @@
 //! match would read `-s primary` as the clipboard selection.
 
 pub mod paths;
+pub mod read;
 
 use std::ffi::OsStr;
 use std::io;

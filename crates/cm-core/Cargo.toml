@@ -36,3 +36,13 @@ toml = "1.1"
 # SQLite, which wants its own test pass rather than riding along with a
 # toolchain bump.
 rusqlite = { version = "0.39", features = ["bundled"] }
+
+# macOS only, and only for the clipboard bridge: `NSPasteboard` is the sole way
+# to get a screenshot's image bytes off the pasteboard (`pbpaste` serves text
+# flavours, `osascript` returns hex — see `clipboard/read/macos.rs`). Feature-
+# gated down to the four classes we touch so a Linux build pulls none of it and a
+# macOS build compiles no AppKit we don't use.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSBitmapImageRep", "NSImageRep", "NSGraphics"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSDictionary", "NSString"] }
