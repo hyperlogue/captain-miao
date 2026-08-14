@@ -102,7 +102,13 @@
 //!   directly and from config-file hooks being spelled `[[hooks.<Event>]]`. If
 //!   that inference is wrong **no hook fires and every row sits at `Starting`**,
 //!   which is also what a typo looks like — check this before believing any
-//!   other symptom;
+//!   other symptom. **A second implementation exists to compare against**:
+//!   `manaflow-ai/cmux` ships a Grok adapter that writes
+//!   `~/.grok/hooks/cmux-session.json` and relocates the tree with `GROK_HOME`,
+//!   which independently corroborates the *location* and the one-JSON-file-per-
+//!   integration form — not the shape inside it, which is the part still
+//!   inferred. Read that adapter before running a probe; it is cheaper than a
+//!   capture and settles most of this item;
 //! - **which lifecycle events exist.** `PreToolUse`, `PostToolUse`, `Stop` and
 //!   `StopFailure` are named in the sources; `SessionStart`, `UserPromptSubmit`,
 //!   `PreCompact` and `PostCompact` are registered on the strength of
@@ -124,7 +130,11 @@
 //!   titles and the resume picker together;
 //! - **cheap confirmations**: that `--worktree=<name>` launches into a worktree
 //!   from a non-TTY spawn, and that a `Stop` hook exiting 0 with empty stdout
-//!   never blocks the turn.
+//!   never blocks the turn. Also that **`--resume <id>` is right for an
+//!   interactive spawn** — `10-hooks.md` gives `-r` as the *headless* spelling
+//!   and cmux's adapter uses `-r` even for a terminal pane, so the two forms may
+//!   simply be synonyms. If they are not, this arm is the one that has to move,
+//!   and it is shared with Claude.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
