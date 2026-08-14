@@ -5,6 +5,46 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Four more agent backends**: `miao kimi`, `miao grok`, `miao opencode` and
+  `miao pi`. Each tracks status and launches, resumes and (where the agent can)
+  forks; each carries its own known limits in the README.
+- **The resume picker (`r`) works on Reasonix, Kimi, Grok and opencode.** Pi's
+  is still empty — its sessions are a tree, so listing them correctly means
+  walking back from the active branch.
+- **Token and model columns for Kimi, opencode and Pi.** Grok and Reasonix stay
+  empty and now say why: neither persists a per-session context number, by
+  design, so it could only come over a hook.
+- **`Space m` opens a log of the footer's status messages** (last 200, in
+  memory), so a message that scrolled past is still readable.
+- **The detail panel names a session's worktree** when it has one.
+
+### Changed
+
+- **The agent cycle key offers only backends that are installed**, instead of
+  cycling through seven and failing at launch.
+- **`f` hides itself on a backend whose resume cannot branch**, rather than
+  offering a key that silently resumes in place.
+- **The hosts row editor draws as a card over the list**, and offering a host
+  the clipboard is a field in it rather than a separate key.
+
+### Fixed
+
+- **opencode sessions stuck reading as "working" forever.** The generated plugin
+  registered six handler keys that opencode never looks for — including the
+  turn-end signal — because they are event names on its bus rather than keys on
+  its hook interface. Fixing that also turned on the session id (so `r` and `f`
+  work), the title, the tool name, and the token and model columns.
+- **`direnv`'s allow-status is now checked on every backend**, not only Claude.
+  Everywhere else a blocked `.envrc` produced no agent, no state file and no
+  visible reason.
+- **opencode is no longer launched with a flag its root command rejects**, which
+  killed the window before any hook could fire.
+- **`f` on a session with no known id says so** instead of doing nothing.
+
 ## [0.4.0] - 2026-08-14
 
 ### Added
