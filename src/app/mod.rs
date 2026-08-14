@@ -713,6 +713,10 @@ pub(super) struct HostRow {
     /// nearly always one or two arguments, and a sub-list inside a popup row
     /// would need its own cursor, its own add/remove keys and its own footer.
     pub(in crate::app) options: picker::TextInput,
+    /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
+    /// Toggled with `p`, not a form field: it is a yes/no with no text to type,
+    /// and one more Tab stop for a boolean is worse than one more list key.
+    pub(in crate::app) clipboard: bool,
 }
 
 impl HostRow {
@@ -768,6 +772,130 @@ pub(in crate::app) struct ConnIdentity {
     /// because a rebuild is what re-runs the split — gating on its *output*
     /// would miss an edit that only moves a token between the two.
     options: Vec<String>,
+    /// Part of the identity because the clipboard is one more `-R` on the tunnel
+    /// child: toggling it has to re-dial, or the forward would not appear (or
+    /// disappear) until the next reconnect for some other reason.
+    clipboard: bool,
+}
+
+/// Supervision for the clipboard bridge's server child (`miao clipboard serve`).
+///
+/// The same shape as the ssh tunnel child: a `kill_on_drop` process the dashboard
+/// holds for as long as it wants the resource. It runs only while some host is
+/// actually offered the clipboard, so a user who never enables it never has a
+/// second process — and toggling the last host off stops it, which is the
+/// direction that matters.
+///
+/// Two mechanisms tie the child's life to ours, and the split is deliberate:
+/// `kill_on_drop` covers an orderly drop, and the **stdin pipe** covers everything
+/// else. The child reads that pipe and exits when the kernel closes our end, so a
+/// SIGKILL'd dashboard — which never gets to run any cleanup — still takes the
+/// server with it. Which is why `child.stdin` is deliberately left in place and
+/// `Child::wait` is never called on it: `wait` closes stdin, so it would tell a
+/// perfectly healthy child that we had died. Only `try_wait` is used.
+#[derive(Default)]
+pub(super) struct ClipboardSupervisor {
+    child: Option<tokio::process::Child>,
+    /// Whether any host wants it, remembered so the per-tick [`Self::poll`] needs
+    /// no re-read of `hosts.json`.
+    wanted: bool,
+    /// Earliest next spawn attempt after a failure.
+    retry_at: Option<Instant>,
+    backoff: Duration,
+}
+
+/// Retry bounds for a clipboard server that won't start or won't stay up,
+/// mirroring the connection task's. It retries indefinitely at the cap for the
+/// same reason that one does: the cause is usually transient, and the alternative
+/// is a feature that silently stays dead until the dashboard is restarted.
+const CLIPBOARD_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const CLIPBOARD_RETRY_MAX: Duration = Duration::from_secs(30);
+
+impl ClipboardSupervisor {
+    /// Called when the host list changes.
+    pub(super) fn set_wanted(&mut self, wanted: bool) {
+        self.wanted = wanted;
+        self.poll();
+    }
+
+    /// Called every run-loop iteration: notices a child that died and respawns
+    /// it. One non-blocking `waitpid` when the server is wanted, nothing at all
+    /// when it isn't.
+    pub(super) fn poll(&mut self) {
+        if !self.wanted {
+            if self.child.take().is_some() {
+                tracing::info!("no host is offered the clipboard; stopping the server");
+            }
+            self.retry_at = None;
+            self.backoff = Duration::ZERO;
+            return;
+        }
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return,
+                Ok(Some(status)) => {
+                    // Exit 0 is the child finding a live server already on the
+                    // socket and standing down. Either way we respawn on the
+                    // backoff, and either way that spawn will stand down too — so
+                    // the loop is bounded by the cap, not by us being clever.
+                    tracing::warn!(%status, "clipboard server exited; respawning");
+                    self.child = None;
+                    self.back_off();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not check on the clipboard server");
+                    return;
+                }
+            }
+        }
+        if self.retry_at.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        match spawn_clipboard_server() {
+            Ok(child) => {
+                tracing::info!(pid = child.id(), "clipboard server started");
+                self.child = Some(child);
+                self.retry_at = None;
+                self.backoff = Duration::ZERO;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start the clipboard server");
+                self.back_off();
+            }
+        }
+    }
+
+    fn back_off(&mut self) {
+        self.backoff = if self.backoff.is_zero() {
+            CLIPBOARD_RETRY_INITIAL
+        } else {
+            (self.backoff * 2).min(CLIPBOARD_RETRY_MAX)
+        };
+        self.retry_at = Some(Instant::now() + self.backoff);
+    }
+}
+
+/// Spawn `miao clipboard serve` — this same binary, so there is nothing to
+/// install or find.
+fn spawn_clipboard_server() -> std::io::Result<tokio::process::Child> {
+    let exe = std::env::current_exe()?;
+    // Truncated on every spawn, exactly like the ssh-forward log: this file is
+    // the child's only channel out, and one that only grew would accumulate a
+    // year of pastes for the sake of the last one.
+    let log_dir = state::state_dir().join("logs");
+    let _ = state::create_dir_all_private(&log_dir);
+    let stderr = std::fs::File::create(log_dir.join("clipboard-serve.log"))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    tokio::process::Command::new(exe)
+        .args(["clipboard", "serve"])
+        // The pipe *is* the parent-death signal — see [`ClipboardSupervisor`].
+        .stdin(std::process::Stdio::piped())
+        // Must never touch the TUI's terminal; the alt-screen owns it.
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .kill_on_drop(true)
+        .spawn()
 }
 
 /// The remote hosts, counted by how usable each one is — see
@@ -1028,6 +1156,8 @@ pub(super) struct App {
     /// reports its own changes (§5), so the run loop has no filesystem
     /// knowledge of its own.
     pub(super) backend_events: Vec<BackendEvents>,
+    /// The clipboard bridge's server child — see [`ClipboardSupervisor`].
+    pub(super) clipboard_server: ClipboardSupervisor,
     /// Last-seen reconnect counter per remote host. A bump means the host went
     /// Disconnected → Connected, which fires the auto-reattach sweep (§7).
     pub(super) reconnect_epochs: HashMap<HostId, u64>,
@@ -1612,6 +1742,7 @@ impl App {
             session_indexes: HashMap::new(),
             backends,
             backend_events,
+            clipboard_server: ClipboardSupervisor::default(),
             reconnect_epochs: HashMap::new(),
             pending_reattach: Vec::new(),
             window_bindings: bindings::WindowBindings::default(),
@@ -2407,6 +2538,7 @@ impl App {
                     target,
                     local_sock,
                     options: h.options,
+                    clipboard: h.clipboard,
                 };
                 backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
             }
@@ -2415,6 +2547,23 @@ impl App {
             backends,
             host_icons,
         }
+    }
+
+    /// Whether any host that will actually be dialled wants the clipboard.
+    ///
+    /// A `socket` host counts: pooled-localhost needs no forward (the socket is
+    /// already on that machine), but it does need the server *running* for the
+    /// shim to find. A suspended host does not — nothing is connected to it, so
+    /// nothing can ask.
+    fn any_host_wants_clipboard(hosts: &[hosts::HostConfig]) -> bool {
+        REMOTE_ENABLED && hosts.iter().any(|h| h.clipboard && !h.disabled)
+    }
+
+    /// Re-read the host list and bring the clipboard server in line with it.
+    /// Called at startup and on every host-list change.
+    pub(super) fn refresh_clipboard_server(&mut self) {
+        self.clipboard_server
+            .set_wanted(Self::any_host_wants_clipboard(&hosts::load_hosts()));
     }
 
     /// The backend for the machine the dashboard runs on: in-process by default,
@@ -2447,6 +2596,12 @@ impl App {
     /// (dropping a `Backend::Remote` ends its connection task), then re-subscribe
     /// to each one's change signal. Called after the hosts panel mutates.
     fn rebuild_remote_backends(&mut self) {
+        // Before the rebuild, so the server is already listening when the first
+        // reconnect asks ssh to forward onto its socket. Order is not actually
+        // load-bearing — ssh binds the remote end whether or not the local socket
+        // exists yet, and a request arriving in a gap costs one delegated paste —
+        // but there is no reason to leave the gap open.
+        self.refresh_clipboard_server();
         let HostSetup {
             mut backends,
             host_icons,
@@ -2469,6 +2624,7 @@ impl App {
                 target: picker::TextInput::with_text(h.socket.or(h.ssh).unwrap_or_default()),
                 icon: picker::TextInput::with_text(h.icon.unwrap_or_default()),
                 disabled: h.disabled,
+                clipboard: h.clipboard,
                 // Round-trips exactly: a spec can hold neither a comma nor a
                 // space, so this join is the inverse of `parse_list`'s split.
                 options: picker::TextInput::with_text(h.options.join(" ")),
@@ -2551,6 +2707,7 @@ impl App {
                     socket: r.is_socket.then(|| target.clone()),
                     ssh: (!r.is_socket).then_some(target),
                     disabled: r.disabled,
+                    clipboard: r.clipboard,
                     options: hosts::split_options(r.options.text()),
                 }
             })
@@ -2599,6 +2756,7 @@ impl App {
                 socket: h.socket.clone(),
                 disabled: h.disabled,
                 options: h.options.clone(),
+                clipboard: h.clipboard,
             })
             .collect()
     }

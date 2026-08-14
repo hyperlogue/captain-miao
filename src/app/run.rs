@@ -1290,6 +1290,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // resolve their windows across a restart (§15.7). Before the first reload, so
     // that reload's resolves (preview select, tab fill, snapshot) see them.
     app.seed_window_bindings_from_disk();
+    // The clipboard bridge's server, if any host is offered it. Before the first
+    // connect, so the socket is already there when ssh forwards onto it.
+    app.refresh_clipboard_server();
     app.reload_sessions();
     app.load_overrides();
     app.load_recent_cwds();
@@ -1416,6 +1419,11 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             arm_settle_reload(&mut settle_reload_at);
             needs_redraw = true;
         }
+        // Notice a clipboard server that died and bring it back. One non-blocking
+        // `waitpid` when it's wanted and nothing at all when it isn't — cheap
+        // enough for every tick, and a tick is the only place it can be seen: a
+        // child exiting is not an event any of the channels below carry.
+        app.clipboard_server.poll();
         // Kills coming back from the hosts that took them. Drained above the
         // change-signal sweep just below, so a row restored by an unreachable
         // host is picked up by this iteration's reload rather than the next.

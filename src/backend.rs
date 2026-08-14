@@ -852,6 +852,10 @@ pub(crate) enum Transport {
         /// options every ssh call for this host carries and the port forwards,
         /// which exactly one call may.
         options: Vec<String>,
+        /// Offer this host the dashboard machine's clipboard — one synthesized
+        /// `-R` alongside the user's own forwards. See
+        /// [`clipboard_forward_for_home`].
+        clipboard: bool,
     },
 }
 
@@ -3175,6 +3179,7 @@ async fn resolve_remote_exe(
             exe: "miao-server".to_string(),
             failure: Some("host unreachable over ssh (or no shell)".to_string()),
             upgrade: None,
+            home: None,
         };
     };
     let local_version = env!("CARGO_PKG_VERSION");
@@ -3389,6 +3394,7 @@ async fn resolve_remote_exe(
     };
     Provisioned {
         exe,
+        home: Some(probe.home.clone()),
         failure: provision_failure(
             local_version,
             &probe,
@@ -3410,6 +3416,11 @@ struct Provisioned {
     exe: String,
     failure: Option<String>,
     upgrade: Option<UpgradeOffer>,
+    /// The host's `$HOME`, as the probe reported it — `None` when the probe never
+    /// answered. Carried out because the clipboard forward's remote path has to be
+    /// absolute (ssh expands nothing in a forward spec) and this is the one round
+    /// trip that already asks.
+    home: Option<String>,
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -3528,6 +3539,7 @@ async fn connection_task(
                 target,
                 local_sock,
                 options,
+                clipboard,
             } => {
                 log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
@@ -3535,6 +3547,7 @@ async fn connection_task(
                         target,
                         local_sock,
                         options,
+                        clipboard: *clipboard,
                     },
                     &remote_exe,
                     &upgrade,
@@ -3736,6 +3749,8 @@ struct SshLink<'a> {
     /// The host's connection options as typed, split on arrival — see
     /// [`split_connection_options`].
     options: &'a [String],
+    /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
+    clipboard: bool,
 }
 
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
@@ -3763,9 +3778,13 @@ async fn setup_ssh(
         target,
         local_sock,
         options,
+        clipboard,
     } = link;
-    let (extra, forwards) = split_connection_options(options);
-    let forwards = forwards.as_slice();
+    // `forwards` stays owned until the probe reports the host's `$HOME`: the
+    // clipboard forward joins the user's own set, which is what gets it the
+    // cancel-then-request on reconnect, the retirement when the host leaves the
+    // ssh set, and the `port forwards:` log line for free.
+    let (extra, mut forwards) = split_connection_options(options);
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
     // ssh below (the probe) already needs it — so ensure the short ssh-socket
@@ -3796,6 +3815,23 @@ async fn setup_ssh(
     // `daemon ensure` below fails, *this* is the reason the user needs, not
     // "connection failed".
     *failure = provisioned.failure;
+
+    // The clipboard bridge: one more `-R`, joining the user's forwards above.
+    // Needs the host's `$HOME`, because ssh does no `~`/`$HOME` expansion in a
+    // forward spec — so a host whose probe failed gets no offer, which costs
+    // nothing since it is about to fail to connect anyway.
+    let clipboard_home = clipboard.then_some(provisioned.home.as_deref()).flatten();
+    if let Some(home) = clipboard_home {
+        let clip_sock = cm_core::clipboard::paths::local_socket_path();
+        log.info(format!(
+            "offering this machine's clipboard at {} on the host",
+            cm_core::clipboard::paths::remote_socket_for_home(home)
+        ));
+        forwards.push(clipboard_forward(home, &clip_sock));
+    } else if clipboard {
+        log.error("cannot offer the clipboard: the probe never reported the host's home");
+    }
+    let forwards = forwards.as_slice();
 
     // Ensure the remote daemon is running AND learn its socket path in one call:
     // `daemon ensure` self-daemonizes if needed (idempotent — a no-op against a
@@ -3886,6 +3922,30 @@ async fn setup_ssh(
     }
     let _ = std::fs::remove_file(local_sock);
 
+    // The same hazard at the far end, and there we cannot run code in the
+    // binding process — so it takes a round trip of its own, after the cancel
+    // above released the path and before the tunnel asks for it.
+    if clipboard_home.is_some() {
+        let script = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
+        let prepared = detached("ssh")
+            .args(&opts)
+            .arg(target)
+            .arg(&script)
+            .status()
+            .await
+            .is_ok_and(|s| s.success());
+        if !prepared {
+            // Not fatal: ssh may still bind (nothing was holding the path), and
+            // if it doesn't, its own stderr file names the listen path. Logged
+            // because this is the step that explains a bridge that never comes
+            // up on an otherwise healthy host.
+            log.error(
+                "could not prepare the host's clipboard socket path; \
+                 the clipboard forward may fail to bind",
+            );
+        }
+    }
+
     // A forward-ONLY child: `-N` runs no remote command, it just holds the `-L`
     // tunnel open (the daemon is already running and persistent — the tunnel and
     // the daemon are now independent). Killed when the backend drops / on
@@ -3930,6 +3990,60 @@ async fn setup_ssh(
         .kill_on_drop(true)
         .spawn()
         .ok()
+}
+
+/// Make the host's clipboard socket path bindable: create its parent dir and
+/// remove anything already there.
+///
+/// **Both halves are load-bearing and neither is optional.** ssh creates no
+/// parent for a forward's listen path — `ControlPath` taught us that — and sshd
+/// will not rebind a path that already exists. `StreamLocalBindUnlink` defaults
+/// to `no`, and setting it on *our* side is inert for `-R`: the
+/// `streamlocal-forward@openssh.com` request carries only a path, so the decision
+/// belongs to a remote sshd_config we don't control. Measured against a live
+/// sshd: without this, a reconnect fails with `remote port forwarding failed for
+/// listen path`, the mux client degrades with `disabling multiplexing`, and the
+/// bridge is dead — and *with* it, the same sequence binds.
+///
+/// Run from the **dashboard** rather than from `daemon ensure`, so it works
+/// against whatever server version is already deployed: a host still running an
+/// older binary would otherwise never get the dir, the forward would never bind,
+/// and every diagnosis would point at the wrong thing.
+///
+/// `"$HOME"` rather than the probed home, even though the forward spec below has
+/// to splice that home in: this script is evaluated by a shell, so it can expand
+/// the variable itself and survive a home with a space in it, while a forward
+/// spec gets no expansion at all. They cannot disagree — the probe's first line
+/// *is* `echo "$HOME"` from inside the same `/bin/sh -c`.
+///
+/// No single quote and no backslash, so it is [`login_shell_safe`]-clean.
+const CLIPBOARD_PREP_SCRIPT: &str = concat!(
+    "mkdir -p \"$HOME\"/.cache/captain-miao && ",
+    "rm -f \"$HOME\"/.cache/captain-miao/clipboard.sock"
+);
+
+/// The clipboard bridge as a [`Forward`]: `-R <remote socket>:<local socket>`.
+///
+/// A synthesized forward rather than a mechanism of its own, because everything a
+/// forward needs is already written — it rides the tunnel child, so it is up for
+/// exactly as long as the host is connected; it gets cancel-then-request on
+/// reconnect from [`cancel_user_forwards`]; it is retired by
+/// [`retire_unlisted_forwards`] when the host is suspended, renamed, deleted or
+/// switched to a socket transport; and it shows up in the `port forwards:` log
+/// line the panel's `l` view already renders.
+///
+/// The remote path is absolute because ssh expands nothing in a forward spec, and
+/// `$HOME`-based because the pool must outlive a login: `/run/user/<uid>` is
+/// reaped when a non-lingering user's last session ends. Pure.
+fn clipboard_forward(remote_home: &str, local_sock: &Path) -> Forward {
+    Forward {
+        flag: "-R".to_string(),
+        spec: format!(
+            "{}:{}",
+            cm_core::clipboard::paths::remote_socket_for_home(remote_home),
+            local_sock.display()
+        ),
+    }
 }
 
 /// Every port-forward spec this process has asked a given ssh target's
@@ -4347,6 +4461,64 @@ mod tests {
         let (opts, fwd) = split("-C -L");
         assert_eq!(opts, ["-C"]);
         assert!(fwd.is_empty());
+    }
+
+    /// The clipboard bridge is a synthesized forward, so it has to be one the
+    /// rest of the forward machinery can name again: `-O cancel` takes the flag
+    /// and the spec back verbatim, and `Forward`'s `Display` is what the log line
+    /// shows.
+    #[test]
+    fn the_clipboard_forward_names_a_home_relative_remote_path() {
+        let f = clipboard_forward("/home/miao", Path::new("/run/user/1000/x/clipboard.sock"));
+        assert_eq!(f.flag, "-R");
+        assert_eq!(
+            f.spec,
+            "/home/miao/.cache/captain-miao/clipboard.sock:/run/user/1000/x/clipboard.sock"
+        );
+        assert_eq!(
+            f.to_string(),
+            "-R /home/miao/.cache/captain-miao/clipboard.sock:/run/user/1000/x/clipboard.sock"
+        );
+        // Absolute on the remote side, because ssh expands nothing in a forward
+        // spec — a `~` or a `$HOME` here would be taken literally as a path.
+        let (remote, _) = f.spec.split_once(':').unwrap();
+        assert!(remote.starts_with('/'), "{remote} is not absolute");
+        assert!(!remote.contains('~') && !remote.contains('$'));
+        // And it round-trips through the splitter that lifts a *user's* forwards
+        // onto the same child, so nothing about it is a special case downstream.
+        let (opts, forwards) = split_connection_options(&[f.flag.clone(), f.spec.clone()]);
+        assert!(opts.is_empty());
+        assert_eq!(forwards, vec![f]);
+    }
+
+    /// The remote path has to be *removed* before ssh can rebind it, and its
+    /// parent has to exist. Both were established against a live sshd; see
+    /// [`CLIPBOARD_PREP_SCRIPT`].
+    #[test]
+    fn the_clipboard_prep_script_survives_a_login_shell() {
+        // The wrapper's rule, which is what makes this work on a fish account:
+        // a single-quoted string is literal in every dialect, but only fish
+        // honours escapes inside one — so no quote and no backslash.
+        assert!(!CLIPBOARD_PREP_SCRIPT.contains('\''));
+        assert!(!CLIPBOARD_PREP_SCRIPT.contains('\\'));
+        // `"$HOME"` rather than a spliced path, so a home with a space in it
+        // still works — the script is evaluated by a shell, unlike the spec.
+        assert!(CLIPBOARD_PREP_SCRIPT.contains("\"$HOME\""));
+        assert!(CLIPBOARD_PREP_SCRIPT.contains("mkdir -p"));
+        assert!(CLIPBOARD_PREP_SCRIPT.contains("rm -f"));
+        // It prepares exactly the path the forward asks for.
+        let home = "/home/miao";
+        let spec = clipboard_forward(home, Path::new("/tmp/x.sock")).spec;
+        let (remote, _) = spec.split_once(':').unwrap();
+        let expanded = CLIPBOARD_PREP_SCRIPT.replace("\"$HOME\"", home);
+        assert!(
+            expanded.contains(remote),
+            "prep script does not cover {remote}: {expanded}"
+        );
+        // And the wrapper accepts it (the `debug_assert` inside would fire
+        // otherwise).
+        let wrapped = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
+        assert!(wrapped.starts_with("/bin/sh -c '") && wrapped.ends_with('\''));
     }
 
     /// The tail of an ssh argv after the `-o` option block, so the assertions

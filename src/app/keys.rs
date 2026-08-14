@@ -1196,6 +1196,20 @@ impl App {
                     // is built from, so this drops (or dials) the connection now.
                     self.apply_host_edits();
                 }
+                // Offer / stop offering this machine's clipboard to the host, so
+                // an agent in a pooled session there can paste a screenshot. No
+                // confirm, for the same reasons as `c`: nothing is destroyed and
+                // the same key undoes it.
+                //
+                // Turning it *off* is the security-relevant direction, and it
+                // takes effect immediately: `clipboard` is part of what a backend
+                // is built from, so this re-dials, and the reconnect cancels the
+                // forward the old tunnel child left with the ControlMaster.
+                KeyCode::Char('p') if state.cursor < n => {
+                    let row = &mut state.rows[state.cursor];
+                    row.clipboard = !row.clipboard;
+                    self.apply_host_edits();
+                }
                 // Removal is destructive (it drops the host and its mirror), so
                 // it asks first.
                 KeyCode::Char('d') if state.cursor < n => {

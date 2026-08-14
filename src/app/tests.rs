@@ -6330,6 +6330,7 @@ fn only_a_changed_connection_string_reconnects() {
         icon: Some(icon.into()),
         disabled: false,
         options: Vec::new(),
+        clipboard: false,
     };
     let before = vec![host("box", "user@box", "🖥")];
 
@@ -6356,6 +6357,7 @@ fn only_a_changed_connection_string_reconnects() {
             icon: Some("🖥".into()),
             disabled: false,
             options: Vec::new(),
+            clipboard: false,
         }])
     );
     // A port forward is part of the ssh child's argv, so changing the set has to
@@ -6381,6 +6383,51 @@ fn only_a_changed_connection_string_reconnects() {
     );
     // …as does adding or dropping a host.
     assert_ne!(App::conn_identities(&before), App::conn_identities(&[]));
+    // And so does the clipboard toggle: it is one more `-R` on the tunnel child,
+    // so it only takes effect on a reconnect. Turning it *off* is the direction
+    // that matters — a forward that lingered until the next unrelated reconnect
+    // would leave the host reading a clipboard the user had just revoked.
+    assert_ne!(
+        App::conn_identities(&before),
+        App::conn_identities(&[HostConfig {
+            clipboard: true,
+            ..host("box", "user@box", "🖥")
+        }])
+    );
+}
+
+/// The clipboard server runs only while some host is actually offered the
+/// clipboard, so a user who never enables it never pays for a second process.
+#[test]
+fn the_clipboard_server_runs_only_when_a_host_wants_it() {
+    use super::hosts::HostConfig;
+    let host = |clipboard: bool, disabled: bool, socket: Option<&str>| HostConfig {
+        label: "box".into(),
+        ssh: socket.is_none().then(|| "user@box".to_string()),
+        socket: socket.map(str::to_string),
+        icon: None,
+        disabled,
+        options: Vec::new(),
+        clipboard,
+    };
+    assert!(!App::any_host_wants_clipboard(&[]));
+    assert!(!App::any_host_wants_clipboard(&[host(false, false, None)]));
+    assert!(App::any_host_wants_clipboard(&[host(true, false, None)]));
+    // A suspended host is not connected, so nothing there can ask.
+    assert!(!App::any_host_wants_clipboard(&[host(true, true, None)]));
+    // A socket host counts: pooled-localhost needs no forward, because the
+    // socket is already on that machine — but it does need the server running
+    // for the shim to find.
+    assert!(App::any_host_wants_clipboard(&[host(
+        true,
+        false,
+        Some("/run/x.sock")
+    )]));
+    // One host asking is enough.
+    assert!(App::any_host_wants_clipboard(&[
+        host(false, false, None),
+        host(true, false, None)
+    ]));
 }
 
 /// A prune must reach `window-bindings.json`, not just the in-memory map.

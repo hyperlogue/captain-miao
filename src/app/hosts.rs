@@ -66,6 +66,21 @@ pub(super) struct HostConfig {
     /// it.
     #[serde(default)]
     pub options: Vec<String>,
+    /// Offer this host the dashboard machine's clipboard, so an agent in a
+    /// pooled session there can paste a screenshot. Toggled with `p`.
+    ///
+    /// Off by default and per-host, which is the whole security posture: while a
+    /// host is connected, anything running as you there — including the agent,
+    /// which runs arbitrary code by design — can read your clipboard when it
+    /// holds an image. Only images are ever served
+    /// ([`cm_core::clipboard`]), so text can't leak; the toggle is what bounds
+    /// *where* even that applies. `#[serde(default)]` gives `false`, so an older
+    /// `hosts.json` offers nothing until asked.
+    ///
+    /// Implemented as one synthesized `-R` on the tunnel child, so it lives and
+    /// dies with the connection exactly like a user-typed forward.
+    #[serde(default)]
+    pub clipboard: bool,
 }
 
 /// Split the panel's `Options` field into tokens.
