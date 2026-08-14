@@ -67,6 +67,20 @@ const FARM_REL: &str = ".cache/captain-miao/shims";
 /// Where `clipboard paste` writes, relative to `$HOME`.
 const PASTE_REL: &str = ".cache/captain-miao/paste";
 
+/// Set on the process a delegate `exec`s, so a shim reached *through* another
+/// shim refuses instead of exec'ing on.
+///
+/// Belt-and-braces for the `(dev, ino)` guard, which covers the case it was
+/// written for and one it cannot: [`super::resolve_delegate`] turns the guard
+/// **off** when we have no identity to compare against, and a binary an upgrade
+/// replaced is exactly that — Linux reports `current_exe` as `… (deleted)`, which
+/// won't `stat`, so [`super::self_id`] is `None`. With the guard off the farm's
+/// own entry is the first candidate on the agent's `PATH`, i.e. the tight exec
+/// loop the guard exists to prevent. One marker in the environment bounds it at
+/// one hop, and "we are our own delegate" degrades to the same exit 1 as "not
+/// installed here".
+const DELEGATED_MARKER: &str = "CM_CLIPBOARD_DELEGATED";
+
 /// A shimmed invocation: which tool we were called as, and its arguments.
 pub struct Shim {
     tool: ShimTool,
@@ -174,13 +188,22 @@ impl Shim {
 
     /// `exec` the real tool, so its stdio and exit status are its own.
     fn delegate(self) -> i32 {
+        if std::env::var_os(DELEGATED_MARKER).is_some() {
+            // We are already some shim's delegate, so whatever `PATH` hands back
+            // is us again — see [`DELEGATED_MARKER`]. Same answer as "not
+            // installed here".
+            return 1;
+        }
         let Some(real) = resolve_delegate_from_env(self.tool.binary()) else {
             // Not installed here at all — which is the common case on a remote,
             // and is why the agent has a fallback chain. Non-zero, so it takes
             // it.
             return 1;
         };
-        let e = std::process::Command::new(&real).args(&self.args).exec();
+        let e = std::process::Command::new(&real)
+            .env(DELEGATED_MARKER, "1")
+            .args(&self.args)
+            .exec();
         // `exec` returns only on failure. Nothing reads this (the agent sends
         // stderr to /dev/null); it is for a human running the shim by hand.
         eprintln!("miao: could not exec {}: {e}", real.display());
@@ -299,11 +322,23 @@ pub fn ensure_farm() -> Result<PathBuf> {
 pub async fn paste() -> Result<()> {
     // No `targets` round trip: asking for png and falling back to bmp is the same
     // two requests in the worst case and one in the common one.
+    let mut failure: Option<anyhow::Error> = None;
     for fmt in Format::ALL {
-        if let Some(path) = fetch_to_file(fmt).await? {
-            println!("{}", path.display());
-            return Ok(());
+        match fetch_to_file(fmt).await {
+            Ok(Some(path)) => {
+                println!("{}", path.display());
+                return Ok(());
+            }
+            Ok(None) => {}
+            // A format that *failed* must not end the chain — falling back to bmp
+            // is the whole reason there is one, and a png cut off mid-stream is
+            // exactly when the next link matters. The first error is kept for the
+            // message, since "the image was cut off" says more than "no image".
+            Err(e) => failure = failure.or(Some(e)),
         }
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     anyhow::bail!(
         "no image on the clipboard — or this host is not offered one \
@@ -331,7 +366,17 @@ async fn fetch_to_file(fmt: Format) -> Result<Option<PathBuf>> {
     crate::state::create_dir_all_private(&dir)
         .with_context(|| format!("could not create {}", dir.display()))?;
     let final_path = dir.join(format!("clipboard.{}", fmt.token()));
-    let part = dir.join(format!("clipboard.{}.part", fmt.token()));
+    // Per-pid, because two `clipboard-paste` runs on the same host otherwise
+    // stage into the same file: the second `truncate`s the inode the first is
+    // still writing, and both then publish a corrupt image. The *published* name
+    // stays shared on purpose (one file per format, no history on disk); only the
+    // staging path has to be private, which is the same rule `synth_home`'s
+    // `atomic_write` follows.
+    let part = dir.join(format!(
+        "clipboard.{}.{}.part",
+        fmt.token(),
+        std::process::id()
+    ));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -340,14 +385,24 @@ async fn fetch_to_file(fmt: Format) -> Result<Option<PathBuf>> {
         .open(&part)
         .with_context(|| format!("could not write {}", part.display()))?;
     let mut file = tokio::fs::File::from_std(file);
-    // A body that ends without its terminator is an error, and the `.part` is
-    // left behind rather than published — the caller must not be handed a path
-    // to a truncated image.
-    read_body(&mut r, &mut file).await.context(
-        "the clipboard image was cut off before it finished (the dashboard may have gone away)",
-    )?;
-    file.flush().await?;
+    let written: Result<()> = async {
+        read_body(&mut r, &mut file).await.context(
+            "the clipboard image was cut off before it finished (the dashboard may have gone away)",
+        )?;
+        file.flush()
+            .await
+            .context("could not finish writing the clipboard image")
+    }
+    .await;
     drop(file);
+    if let Err(e) = written {
+        // Never published: the caller must not be handed a path to a truncated
+        // image. The staging file goes with it, because now that the name carries
+        // a pid it is no longer reused — leaving it would accumulate one per
+        // failed paste in a dir whose whole point is holding no history.
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
     std::fs::rename(&part, &final_path)
         .with_context(|| format!("could not publish {}", final_path.display()))?;
     Ok(Some(final_path))
