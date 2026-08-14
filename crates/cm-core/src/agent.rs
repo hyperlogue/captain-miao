@@ -267,19 +267,26 @@ impl AgentControl {
     /// callbacks pointing at `sock_path`. The launcher writes any per-session
     /// config files (Claude's `--settings` payload, Codex's synth `$CODEX_HOME`,
     /// etc.) before spawning.
+    ///
+    /// `shim_dir` is the clipboard shim farm to prepend to the agent's `PATH`, and
+    /// it is `Some` only for a pooled session — see
+    /// [`crate::cli::ClipboardShims`]. An explicit parameter rather than something
+    /// each backend decides for itself, so the two cannot disagree about when a
+    /// session is shimmed.
     pub fn build_launch_command(
         self,
         cwd: &str,
         sock_path: &Path,
         settings_path: &Path,
         extra_args: &[String],
+        shim_dir: Option<&Path>,
     ) -> Result<Command> {
         match self {
             AgentControl::Claude => {
-                claude::build_launch_command(cwd, sock_path, settings_path, extra_args)
+                claude::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
             AgentControl::Codex => {
-                codex::build_launch_command(cwd, sock_path, settings_path, extra_args)
+                codex::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
@@ -768,6 +775,7 @@ mod tests {
                 Path::new("/run/miao.sock"),
                 Path::new("/run/miao-settings.json"),
                 &[],
+                None,
             )
             .expect_err("an unknown backend has no launch command");
         assert!(

@@ -9,6 +9,7 @@ use tokio::net::UnixListener;
 use crate::agent::{
     AgentActivity, AgentControl, BgSeedKind, BgShell, TranscriptScan, TranscriptStats,
 };
+use crate::cli::ClipboardShims;
 use crate::learned;
 use crate::state::{self, HookMessage, HostId, LauncherState, SessionStatus};
 
@@ -22,6 +23,7 @@ pub async fn run(
     agent_args: &[String],
     pool_session: Option<String>,
     launch_id: Option<String>,
+    shims: ClipboardShims,
 ) -> Result<()> {
     state::ensure_sessions_dir()?;
 
@@ -112,7 +114,28 @@ pub async fn run(
     let settings_path = sock_dir.join(format!("{launcher_pid}-settings.json"));
     std::fs::write(&settings_path, &hooks_settings_json)?;
 
-    let mut cmd = match agent.build_launch_command(cwd, &sock_path, &settings_path, agent_args) {
+    // The clipboard shims, for a pooled session only. Minted here rather than by
+    // the dashboard because the farm has to exist on the machine the *agent* runs
+    // on, and this is the one process that is already there. A failure to mint
+    // costs the paste and nothing else — hence `.ok()` rather than `?`.
+    let shim_dir = match shims {
+        ClipboardShims::Install => match crate::clipboard::shim::ensure_farm() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                tracing::warn!("could not install the clipboard shims: {e:#}");
+                None
+            }
+        },
+        ClipboardShims::Skip => None,
+    };
+
+    let mut cmd = match agent.build_launch_command(
+        cwd,
+        &sock_path,
+        &settings_path,
+        agent_args,
+        shim_dir.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             // The agent never started (direnv blocked, binary missing). Hold the

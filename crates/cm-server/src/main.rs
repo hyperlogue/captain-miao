@@ -126,6 +126,12 @@ enum Commands {
         log_file: Option<String>,
     },
 
+    /// Clipboard-bridge helpers for the machine an agent runs on.
+    Clipboard {
+        #[command(subcommand)]
+        action: ClipboardAction,
+    },
+
     /// Prove this binary can actually host a session on this machine, then print
     /// the same `miao-server <ver> protocol <n>` line `--version` does.
     ///
@@ -140,6 +146,20 @@ enum Commands {
     ///
     /// A loud refusal at deploy time is fine. A silent trap is not.
     SelfCheck,
+}
+
+/// Clipboard-bridge actions on the machine an agent runs on. The *server* half
+/// (`clipboard serve`) belongs to the dashboard's binary, since that is the
+/// machine that owns a clipboard.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+enum ClipboardAction {
+    /// Write the dashboard machine's clipboard image to a file here and print its
+    /// path.
+    ///
+    /// For an agent that reads the clipboard in-process and so cannot be shimmed
+    /// (Codex). Reachable as `clipboard-paste` too — the shim farm carries a
+    /// symlink for it, so the agent needs no binary name.
+    Paste,
 }
 
 /// Lifecycle actions for the per-host daemon (tmux/zellij-style). `ensure` is
@@ -211,6 +231,17 @@ fn self_check() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // **Before clap.** We may have been invoked through the clipboard shim farm,
+    // under another tool's name and with an argv clap has never heard of — and
+    // clap exits 2 on one of those, so asking it first would turn every shimmed
+    // `xclip -selection clipboard -t TARGETS -o` into a usage error instead of a
+    // paste. This is the only `argv[0]` dispatch in the tree; the daemon and
+    // pty-pool dispatches below are ordinary clap subcommands that merely have to
+    // precede the runtime.
+    if let Some(invocation) = cm_core::clipboard::shim::from_argv0() {
+        invocation.run();
+    }
+
     let cli = Cli::parse();
 
     // The daemon self-daemonizes (a double-fork that must precede any thread) and,
@@ -253,8 +284,18 @@ fn main() -> Result<()> {
 
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Claude { args } => cm_core::cli::run_launch(AgentControl::Claude, args).await,
-        Commands::Codex { args } => cm_core::cli::run_launch(AgentControl::Codex, args).await,
+        Commands::Clipboard {
+            action: ClipboardAction::Paste,
+        } => cm_core::clipboard::shim::paste().await,
+        // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher runs
+        // inside the pty pool, so its agent gets the clipboard shims on its PATH.
+        // The dashboard's own launcher arms call the other one.
+        Commands::Claude { args } => {
+            cm_core::cli::run_launch_pooled(AgentControl::Claude, args).await
+        }
+        Commands::Codex { args } => {
+            cm_core::cli::run_launch_pooled(AgentControl::Codex, args).await
+        }
         Commands::Hook { event, sock, agent } => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
         }

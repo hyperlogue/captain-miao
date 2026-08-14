@@ -13,7 +13,9 @@ description = "captain-miao shared core: state, wire protocol, agent backends, l
 # layer. It does carry bundled SQLite (for Codex titles) — portable C, unlike the
 # platform-linking libshpool, so it cross-compiles without trouble.
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
+# `fs` is for `clipboard paste` alone: it streams the image to disk rather than
+# buffering up to the 128 MB cap in memory first.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

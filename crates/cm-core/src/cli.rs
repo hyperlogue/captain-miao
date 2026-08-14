@@ -56,10 +56,48 @@ fn take_flag_value(args: Vec<String>, flag: &str) -> (Option<String>, Vec<String
     (found, rest)
 }
 
-/// Run the launcher for `agent` from a raw positional arg list (as both binaries'
-/// `claude`/`codex` arms receive it): strip the captain-miao-owned flags, split
-/// off the cwd, canonicalize it, and hand the rest to the agent.
+/// Whether this launcher's agent gets the clipboard shims on its `PATH`.
+///
+/// Decided by **which binary is running**, not sniffed from the environment, and
+/// the split is exact: `miao-server` runs every pooled session (a remote host's
+/// pool, or the local one under pooled-localhost — `open_session` names the exe
+/// with `current_exe`, so the daemon's own path is what a pool session runs),
+/// while `miao` runs local windowed sessions. Those already sit in a terminal
+/// that inherited the user's `DISPLAY`, so `xclip` works there natively and
+/// shimming it would be pure indirection with a new failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardShims {
+    /// A pooled session: shadow `xclip`/`wl-paste` so `Ctrl+V` reaches the
+    /// dashboard machine's clipboard.
+    Install,
+    /// A local windowed session: leave the real tools alone.
+    Skip,
+}
+
+/// Run the launcher for `agent` from a raw positional arg list, **without** the
+/// clipboard shims — the dashboard's own `claude`/`codex` arms, which open a local
+/// window.
 pub async fn run_launch(agent: AgentControl, args: Vec<String>) -> Result<()> {
+    run_launch_with(agent, args, ClipboardShims::Skip).await
+}
+
+/// Run the launcher for `agent` **with** the clipboard shims — `miao-server`'s
+/// `claude`/`codex` arms, which only ever run inside the pty pool.
+pub async fn run_launch_pooled(agent: AgentControl, args: Vec<String>) -> Result<()> {
+    run_launch_with(agent, args, ClipboardShims::Install).await
+}
+
+/// Strip the captain-miao-owned flags, split off the cwd, canonicalize it, and
+/// hand the rest to the agent.
+///
+/// Two public wrappers rather than one function with a parameter, so a call site
+/// cannot pass the wrong one by accident and `miao`'s path yields `Skip` by
+/// construction rather than by argument.
+async fn run_launch_with(
+    agent: AgentControl,
+    args: Vec<String>,
+    shims: ClipboardShims,
+) -> Result<()> {
     init_tracing("launcher");
     // The server injects `--pool-session <name>` when it starts a launcher inside
     // a remote pty pool, and the dashboard injects `--launch-id <token>` for a
@@ -71,7 +109,7 @@ pub async fn run_launch(agent: AgentControl, args: Vec<String>) -> Result<()> {
     let cwd = std::fs::canonicalize(&cwd)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or(cwd);
-    crate::launcher::run(agent, &cwd, &args, pool_session, launch_id).await
+    crate::launcher::run(agent, &cwd, &args, pool_session, launch_id, shims).await
 }
 
 /// Handle an agent hook event: parse the backend from the `--agent` value, then

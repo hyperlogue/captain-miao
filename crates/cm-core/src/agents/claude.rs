@@ -1120,6 +1120,7 @@ pub fn build_launch_command(
     _sock_path: &Path,
     settings_path: &Path,
     extra_args: &[String],
+    shim_dir: Option<&Path>,
 ) -> Result<Command> {
     let claude_bin = find_in_path("claude").context("claude not found in PATH")?;
     let has_envrc = Path::new(cwd).join(".envrc").is_file();
@@ -1135,6 +1136,7 @@ pub fn build_launch_command(
 
     cmd.current_dir(cwd);
     cmd.env("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
+    super::with_shim_path(&mut cmd, shim_dir);
     cmd.arg("--settings").arg(settings_path);
     cmd.args(extra_args);
     Ok(cmd)

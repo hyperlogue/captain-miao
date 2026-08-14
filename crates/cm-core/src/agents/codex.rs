@@ -447,6 +447,7 @@ pub fn build_launch_command(
     sock_path: &Path,
     settings_path: &Path,
     extra_args: &[String],
+    shim_dir: Option<&Path>,
 ) -> Result<Command> {
     let codex_bin = find_in_path("codex").context("codex not found in PATH")?;
 
@@ -468,6 +469,10 @@ pub fn build_launch_command(
 
     cmd.current_dir(cwd);
     cmd.env("CODEX_HOME", &home);
+    // Codex reads the clipboard in-process, so no shim can serve its `Ctrl+V` —
+    // the farm is still on its `PATH` for `clipboard-paste`, which is what it has
+    // instead.
+    super::with_shim_path(&mut cmd, shim_dir);
     // The hook subprocess reads the launcher socket from here rather than from
     // an argv flag — that keeps hooks.json byte-identical across sessions so
     // its trust hash never changes.

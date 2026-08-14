@@ -56,6 +56,7 @@
 pub mod paths;
 pub mod read;
 pub mod serve;
+pub mod shim;
 
 use std::ffi::OsStr;
 use std::io;
