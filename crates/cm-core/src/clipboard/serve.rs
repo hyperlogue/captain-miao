@@ -17,13 +17,28 @@
 //! # Three invariants, each carrying its own reason
 //!
 //! **Connections are served one at a time, and nothing here calls
-//! `tokio::spawn`.** On macOS the pasteboard read is a synchronous AppKit call
-//! that expects the process's main thread; [`run`]'s caller gives it a
-//! current-thread runtime, and handling connections inline is what keeps every
-//! read on that thread. Getting a fresh main thread is most of why this is a
-//! separate process at all, so spawning would throw it away. The cost is that two
-//! hosts pasting at the same instant serialize, which is invisible at the scale of
-//! one keystroke.
+//! `tokio::spawn`.** Two reasons, and it is worth being precise about which is
+//! which, because they pull in different directions.
+//!
+//! The macOS pasteboard read is a synchronous AppKit call that expects the
+//! process's main thread, and what guarantees that is [`run`]'s caller handing us
+//! a **current-thread** runtime — getting a fresh main thread is most of why this
+//! is a separate process at all. Note that serving inline is *not* what upholds
+//! it: tasks on a current-thread runtime are all polled on the thread that drives
+//! it, so a `tokio::spawn` here would stay on the main thread too. The thread rule
+//! constrains the runtime, not the shape of this loop.
+//!
+//! What serving inline actually buys is a **bound on materialized images**. A
+//! pasteboard read has no incremental form (see [`read`]), so each concurrent
+//! paste would hold its own copy — up to `MAX_IMAGE_BYTES` each, plus the decode
+//! peak — and nothing above would cap the count. One at a time makes the
+//! high-water one image, whoever is asking.
+//!
+//! The cost is head-of-line blocking, which is why the *request line* has a
+//! deadline of its own ([`REQUEST_TIMEOUT`]) well below [`CONNECTION_DEADLINE`]:
+//! a peer that connects and never speaks is the one case that would hold the
+//! single handler for no reason at all. Two hosts genuinely pasting at the same
+//! instant still serialize, which is invisible at the scale of one keystroke.
 //!
 //! **The socket path is unlinked before binding, and never on the way out.** A
 //! graceful-cleanup path would be dead code: the dashboard's `kill_on_drop` sends
@@ -63,6 +78,17 @@ use super::{MAX_REQUEST_BYTES, Request, Response, paths, read, read_ascii_line, 
 /// (or is stopped). Far beyond any legitimate paste: 128 MB over a slow link is
 /// minutes, and this is five.
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How long a peer gets to send its request *line*, which is the one part of a
+/// connection that can't legitimately be slow: the shim writes 13 bytes and
+/// flushes before it waits for anything.
+///
+/// It needs a bound of its own precisely because connections are served inline
+/// (see the module doc): under [`CONNECTION_DEADLINE`] alone, one shim whose ssh
+/// link froze after `connect` would hold the only handler for five minutes, and
+/// every other host's paste would meanwhile trip the shim's 30s header timeout
+/// and silently degrade to "no image".
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pause after a failed `accept`, so a persistent error (EMFILE) costs a slow
 /// loop rather than a spin.
@@ -153,7 +179,17 @@ where
 async fn handle(stream: UnixStream) -> io::Result<()> {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
-    let Some(line) = read_ascii_line(&mut r, MAX_REQUEST_BYTES).await? else {
+    let read = tokio::time::timeout(REQUEST_TIMEOUT, read_ascii_line(&mut r, MAX_REQUEST_BYTES));
+    let line = match read.await {
+        Ok(line) => line?,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "clipboard: a peer connected without sending a request",
+            ));
+        }
+    };
+    let Some(line) = line else {
         // Connected and hung up without asking anything.
         return Ok(());
     };

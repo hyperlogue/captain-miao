@@ -10,7 +10,7 @@ use crate::{config, state};
 ///
 /// This inverts the rule in the module doc, and only one role qualifies: the
 /// clipboard server, a child the dashboard spawns with `stderr` pointed at
-/// `logs/clipboard-<role>.log`. Every other role shares stderr with something
+/// `logs/clipboard-serve.log`. Every other role shares stderr with something
 /// that would be corrupted by it — the launcher with the agent's TUI, the
 /// dashboard with its own alt-screen — which is why they get files of their own
 /// and this one does not need to.
