@@ -129,10 +129,49 @@ enum Commands {
         #[arg(long)]
         held_secs: Option<u64>,
     },
+
+    /// The clipboard bridge: let an agent in a pooled session read this
+    /// machine's clipboard. Spawned and supervised by the dashboard, not
+    /// something to run by hand.
+    Clipboard {
+        #[command(subcommand)]
+        action: ClipboardAction,
+    },
+}
+
+/// Actions for the clipboard bridge. `serve` is the only one the dashboard's own
+/// binary needs; the shim and `clipboard paste` live in `miao-server`, which is
+/// what runs on the machine the *agent* is on.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+enum ClipboardAction {
+    /// Serve this machine's clipboard on an owner-only unix socket, until the
+    /// parent process goes away.
+    ///
+    /// Exits when its **stdin closes** — that is how it learns the dashboard
+    /// died, even to a SIGKILL. Run by hand from a terminal it therefore lives
+    /// until Ctrl-D; run with stdin on `/dev/null` it exits at once.
+    Serve,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // The clipboard server wants a **current-thread** runtime, so it is
+    // dispatched here rather than in `async_main`. On macOS its pasteboard read
+    // is a synchronous AppKit call that expects the process's main thread; with
+    // one thread every task is polled there, which is the whole reason the server
+    // is a separate process. A multi-thread runtime would silently throw that
+    // away. (Its accept loop also never spawns — see `clipboard::serve`.)
+    if let Some(Commands::Clipboard {
+        action: ClipboardAction::Serve,
+    }) = &cli.command
+    {
+        cm_core::logging::init_stderr_tracing("clipboard");
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(cm_core::clipboard::serve::run());
+    }
 
     // The dashboard is entirely async (the TUI, or a launcher/hook/focus). Build
     // the runtime and run it. (The pre-runtime daemon/pool dispatch that used to
@@ -273,6 +312,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Some(Commands::Clipboard { .. }) => {
+            unreachable!("clipboard is dispatched in main() before the runtime")
+        }
         None => app::run().await,
     }
 }
@@ -304,6 +346,22 @@ mod tests {
             args: vec!["/work".into(), "--resume".into(), "sid".into()],
         });
         assert!(requires_terminal(&cmd));
+    }
+
+    #[test]
+    fn clipboard_serve_parses() {
+        // Nothing gates it on a terminal: `main` dispatches it ahead of the
+        // runtime, so `requires_terminal` never sees it.
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.command);
+        assert!(matches!(
+            parse(&["miao", "clipboard", "serve"]).unwrap(),
+            Some(Commands::Clipboard {
+                action: ClipboardAction::Serve
+            })
+        ));
+        // An unknown action is rejected rather than quietly accepted.
+        assert!(parse(&["miao", "clipboard", "frobnicate"]).is_err());
+        assert!(parse(&["miao", "clipboard"]).is_err());
     }
 
     #[test]

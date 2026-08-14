@@ -1,8 +1,44 @@
 //! Tracing setup shared by both binaries. Routes logs to files under the state
 //! dir (never stderr, which the launcher shares with the agent's TUI and the
-//! dashboard takes over via the alt-screen).
+//! dashboard takes over via the alt-screen) — with one documented exception,
+//! [`init_stderr_tracing`].
 
 use crate::{config, state};
+
+/// Initialize tracing straight to **stderr**, for a role whose stderr is already
+/// a dedicated file its parent opened for it.
+///
+/// This inverts the rule in the module doc, and only one role qualifies: the
+/// clipboard server, a child the dashboard spawns with `stderr` pointed at
+/// `logs/clipboard-<role>.log`. Every other role shares stderr with something
+/// that would be corrupted by it — the launcher with the agent's TUI, the
+/// dashboard with its own alt-screen — which is why they get files of their own
+/// and this one does not need to.
+///
+/// The parent truncates that file on each spawn, so `DEBUG` is affordable: a
+/// paste is a couple of lines, and the log resets with the dashboard.
+pub fn init_stderr_tracing(role: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let initialized = tracing_subscriber::registry()
+        .with(log_filter(std::env::var("RUST_LOG").ok()))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
+        .try_init()
+        .is_ok();
+    if initialized {
+        tracing::info!(
+            target: "captain_miao::launch",
+            "===== {} START pid={} =====",
+            role.to_uppercase(),
+            std::process::id()
+        );
+    }
+}
 
 /// Initialize tracing for one of: "launcher", "dashboard", "hook", "daemon". The
 /// launcher always gets its own per-pid file (so its routine logs don't drown
