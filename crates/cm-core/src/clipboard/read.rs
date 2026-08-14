@@ -116,6 +116,14 @@ pub async fn open(fmt: Format) -> Option<Image> {
     #[cfg(target_os = "macos")]
     {
         let bytes = macos::read(fmt)?;
+        // `open` promises `Some` only once there *is* a byte to serve, and the
+        // streaming path gets that from `peek_first`. Here it has to be checked:
+        // an empty body frames as a **complete** one (header, no chunk, then the
+        // terminator), so the shim would exit 0 and hand the agent a zero-byte
+        // image its `||` chain never falls back from.
+        if bytes.is_empty() {
+            return None;
+        }
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
             tracing::warn!(
                 bytes = bytes.len(),

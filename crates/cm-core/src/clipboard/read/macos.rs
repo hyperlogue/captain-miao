@@ -33,19 +33,27 @@
 //! Finder-copy case ever matters it should come back as "ask AppKit to load that
 //! URL as an image and re-encode it", never as a byte passthrough.
 //!
-//! # Why this materializes
+//! # Why this materializes, and why the pool is explicit
 //!
 //! `dataForType:` is `NSData`-based, there is no incremental pasteboard reader,
 //! and lazy providers exist only on the writing side — so the bytes exist in full
 //! in this process, and the transient peak is the conversion (decoded RGBA for a
-//! 6K screenshot is ~80 MB). That is a large part of why the server is a separate
-//! process: the high-water is reclaimed when it exits instead of accumulating
-//! across a day of pasting in the TUI.
+//! 6K screenshot is ~80 MB). Keeping that out of the dashboard's own address
+//! space is a large part of why the server is a separate process.
+//!
+//! It is **not** a short-lived one, though, which is why every entry point below
+//! opens an `autoreleasepool` of its own. Each call here returns `+0`
+//! autoreleased objects; objc2's `objc_retainAutoreleasedReturnValue` fast path
+//! usually elides the autorelease, but "usually" is the whole problem — this
+//! process runs no run loop and pushes no pool, so an *un*-elided return is
+//! added to a pool that does not exist and is simply leaked. The server lives as
+//! long as the dashboard, so that would accumulate a screenshot's worth of bytes
+//! per paste across a day's work rather than being reclaimed at exit.
 //!
 //! These calls are **synchronous and expect the process's main thread** — see
 //! [`super`] on the current-thread runtime that guarantees it.
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardType, NSPasteboardTypePNG,
     NSPasteboardTypeTIFF,
@@ -70,28 +78,34 @@ fn available_source(pb: &NSPasteboard) -> Option<Retained<NSPasteboardType>> {
 }
 
 pub(super) fn available() -> Vec<Format> {
-    let pb = NSPasteboard::generalPasteboard();
-    match available_source(&pb) {
-        // Either flavour re-encodes to either format, so what we advertise is
-        // what we can *produce*, not what is on the pasteboard.
-        Some(_) => Format::ALL.to_vec(),
-        None => Vec::new(),
-    }
+    autoreleasepool(|_| {
+        let pb = NSPasteboard::generalPasteboard();
+        match available_source(&pb) {
+            // Either flavour re-encodes to either format, so what we advertise is
+            // what we can *produce*, not what is on the pasteboard.
+            Some(_) => Format::ALL.to_vec(),
+            None => Vec::new(),
+        }
+    })
 }
 
 /// The encoded image, or `None` for any reason at all (nothing there, or a
 /// flavour `NSBitmapImageRep` won't decode).
 pub(super) fn read(fmt: Format) -> Option<Vec<u8>> {
-    let pb = NSPasteboard::generalPasteboard();
-    let source = available_source(&pb)?;
-    let data = pb.dataForType(&source)?;
-    // SAFETY: AppKit's own constant.
-    let already_png = unsafe { &*source == NSPasteboardTypePNG };
-    if fmt == Format::Png && already_png {
-        // Nothing to convert: hand over the pasteboard's own bytes.
-        return Some(data.to_vec());
-    }
-    reencode(&data, fmt)
+    // The pool wraps the whole read, not each call: the decoded intermediate is
+    // the largest thing here and it is only reachable from inside.
+    autoreleasepool(|_| {
+        let pb = NSPasteboard::generalPasteboard();
+        let source = available_source(&pb)?;
+        let data = pb.dataForType(&source)?;
+        // SAFETY: AppKit's own constant.
+        let already_png = unsafe { &*source == NSPasteboardTypePNG };
+        if fmt == Format::Png && already_png {
+            // Nothing to convert: hand over the pasteboard's own bytes.
+            return Some(data.to_vec());
+        }
+        reencode(&data, fmt)
+    })
 }
 
 fn reencode(data: &NSData, fmt: Format) -> Option<Vec<u8>> {
