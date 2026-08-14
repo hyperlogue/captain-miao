@@ -94,6 +94,15 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Grok Build with hooks injected for session tracking. Argument
+    /// handling matches the `claude` subcommand.
+    Grok {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to grok.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts)
     Hook {
         /// Hook event type
@@ -172,6 +181,7 @@ impl Commands {
             Commands::Codex { args } => Some((agent::AgentControl::Codex, args)),
             Commands::Reasonix { args } => Some((agent::AgentControl::Reasonix, args)),
             Commands::Kimi { args } => Some((agent::AgentControl::Kimi, args)),
+            Commands::Grok { args } => Some((agent::AgentControl::Grok, args)),
             _ => None,
         }
     }
@@ -360,7 +370,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             cmd @ (Commands::Claude { .. }
             | Commands::Codex { .. }
             | Commands::Reasonix { .. }
-            | Commands::Kimi { .. }),
+            | Commands::Kimi { .. }
+            | Commands::Grok { .. }),
         ) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             cm_core::cli::run_launch(agent, args.to_vec()).await

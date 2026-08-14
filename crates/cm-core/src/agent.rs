@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{claude, codex, kimi, reasonix};
+use crate::agents::{claude, codex, grok, kimi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -61,6 +61,7 @@ pub enum AgentControl {
     Codex,
     Reasonix,
     Kimi,
+    Grok,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -103,6 +104,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "codex" => AgentControl::Codex,
                     "reasonix" => AgentControl::Reasonix,
                     "kimi" => AgentControl::Kimi,
+                    "grok" => AgentControl::Grok,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -123,6 +125,7 @@ impl AgentControl {
         AgentControl::Codex,
         AgentControl::Reasonix,
         AgentControl::Kimi,
+        AgentControl::Grok,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -133,6 +136,7 @@ impl AgentControl {
             AgentControl::Codex => "codex",
             AgentControl::Reasonix => "reasonix",
             AgentControl::Kimi => "kimi",
+            AgentControl::Grok => "grok",
             AgentControl::Unknown => "",
         }
     }
@@ -147,6 +151,7 @@ impl AgentControl {
             "codex" => Some(AgentControl::Codex),
             "reasonix" => Some(AgentControl::Reasonix),
             "kimi" => Some(AgentControl::Kimi),
+            "grok" => Some(AgentControl::Grok),
             _ => None,
         }
     }
@@ -169,6 +174,7 @@ impl AgentControl {
             AgentControl::Codex => agents::binary_available(codex::BIN),
             AgentControl::Reasonix => agents::binary_available(reasonix::BIN),
             AgentControl::Kimi => agents::binary_available(kimi::BIN),
+            AgentControl::Grok => agents::binary_available(grok::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -182,6 +188,7 @@ impl AgentControl {
             AgentControl::Codex => "Codex",
             AgentControl::Reasonix => "Reasonix",
             AgentControl::Kimi => "Kimi",
+            AgentControl::Grok => "Grok",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -193,9 +200,16 @@ impl AgentControl {
     /// optional `--fork-session`; Codex uses the `resume` / `fork` subcommands;
     /// Reasonix takes `-r <id>` plus `--copy` to continue in a writable copy;
     /// Kimi takes `--session <id>` and has no fork at all.
+    /// flag shapes differ per backend: Claude and Grok take `--resume <id>` plus
+    /// an optional `--fork-session`; Codex uses the `resume` / `fork`
+    /// subcommands; Reasonix takes `-r <id>` plus `--copy` to continue in a
+    /// writable copy.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         match self {
-            AgentControl::Claude => {
+            // Grok's flags are byte-identical to Claude's here (`17-sessions.md`
+            // documents `--resume <id>` and `--fork-session`), which is why the
+            // two share an arm rather than repeating one.
+            AgentControl::Claude | AgentControl::Grok => {
                 let mut v = vec!["--resume".to_string(), session_id.to_string()];
                 if fork {
                     v.push("--fork-session".to_string());
@@ -246,8 +260,7 @@ impl AgentControl {
     /// `name` is the worktree name; `None` lets the agent generate one (Claude
     /// mints e.g. `bright-running-fox`). Codex 0.147 has no equivalent flag, so
     /// it answers `None` and the dashboard hides the affordance — the same shape
-    /// as [`Self::session_watch_path`] and [`Self::bg_shells`], which are
-    /// likewise Claude-only.
+    /// as [`Self::session_watch_path`] and [`Self::bg_shells`].
     pub fn worktree_args(self, name: Option<&str>) -> Option<Vec<String>> {
         match self {
             AgentControl::Claude => {
@@ -259,6 +272,24 @@ impl AgentControl {
                 }
                 Some(v)
             }
+            // Grok has `--worktree [NAME]` too (`tutorial/06-worktrees.md`), with
+            // the same ownership story: it creates the worktree, names it, tracks
+            // its age and collects it (`grok worktree gc`), and a resume re-enters
+            // it without the flag.
+            //
+            // **The `=` form, one argv element**, which the tutorial is explicit
+            // about: the value is *optional*, so a bare `--worktree` followed by
+            // any positional swallows it as the name. Nothing captain-miao spawns
+            // passes a trailing positional today — `split_cwd` consumes the cwd
+            // before the agent sees it — so the separated form would work right
+            // up until something appended one, and then fail silently by opening
+            // a worktree named after the argument.
+            AgentControl::Grok => Some(match name.filter(|n| !n.is_empty()) {
+                Some(name) => vec![format!("--worktree={name}")],
+                // Nothing follows it in our argv, so the bare flag is safe here —
+                // and it is the only way to ask Grok to mint the name.
+                None => vec!["--worktree".to_string()],
+            }),
             AgentControl::Codex => None,
             // Reasonix has isolated "Delivery" workspaces of its own (they even
             // have a state dir), but no CLI flag launches into one, so there is
@@ -309,6 +340,13 @@ impl AgentControl {
             // title store (the title rides the hook payload), no transcript
             // read. There is no file whose change could make a Kimi row stale.
             AgentControl::Kimi => vec![],
+            // Nothing *yet*, and for a reason worth keeping next to the code that
+            // would change: Grok's per-session `summary.json` holds the title,
+            // model and git head, but its directory is keyed by a URL-encoded cwd
+            // whose encoder source reading could not pin down, and its JSON key
+            // spellings were only ever read as Rust field names. When that read
+            // lands, `sessions/` is what belongs here.
+            AgentControl::Grok => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -349,6 +387,10 @@ impl AgentControl {
             // watches. Codex needs an entry here only because its rename lands
             // in sqlite with no hook at all.
             AgentControl::Kimi => vec![],
+            // Nothing: every fact a Grok row carries arrives over a hook and is
+            // written to the state file, which the host already watches. A wake
+            // here could only re-diff rows that hadn't changed.
+            AgentControl::Grok => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -366,6 +408,10 @@ impl AgentControl {
             // No per-pid manifest: a Kimi session's id (and name) arrive on
             // every hook payload, which is what this index is a fallback for.
             AgentControl::Kimi => SessionIndex::default(),
+            // Same as Reasonix: no per-pid manifest exists, and a Grok session's
+            // id arrives on every hook payload — which is what this index is a
+            // fallback for.
+            AgentControl::Grok => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -407,6 +453,16 @@ impl AgentControl {
             // (Resolve it by globbing `sessions/*/<sessionId>/` rather than
             // recomputing the key.)
             AgentControl::Kimi => TranscriptStats::default(),
+            // Unreachable rather than unimplemented, the same shape as Reasonix
+            // but for a different reason: Grok's transcript path *is* derivable
+            // (cwd + session id), and `agents::grok` deliberately does not derive
+            // it. Every fact this would fold — the token total from
+            // `updates.jsonl`'s `TurnCompleted.usage`, the model from
+            // `summary.json` — sits under a line envelope and a key spelling that
+            // source reading never settled, so a derived path would only start a
+            // watch that folds nothing on every append. The path and the fold
+            // land together, once a real session dir has been read.
+            AgentControl::Grok => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -436,6 +492,16 @@ impl AgentControl {
             // knowing their schemas. Kimi's `--session` with no id opens its own
             // session browser, which is the usable answer until then.
             AgentControl::Kimi => Ok(vec![]),
+            // Empty for now, and the *only* one of these arms that is a schema
+            // question rather than a design one: `$GROK_HOME/sessions/` is a
+            // plain directory of `summary.json` files (no subprocess needed, and
+            // `grok sessions list` as a fallback if the layout moves), each
+            // carrying the title, the git head and a parent-session ref. What is
+            // missing is how to read a candidate's **cwd**, which is the group
+            // directory's own name in a URL encoding nobody has confirmed, and
+            // the JSON spelling of the fields inside. One look at a real session
+            // dir fills this in.
+            AgentControl::Grok => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -473,6 +539,9 @@ impl AgentControl {
             AgentControl::Kimi => {
                 kimi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Grok => {
+                grok::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -495,6 +564,7 @@ impl AgentControl {
             // opaque to the launcher, so each backend puts its own format
             // through it.
             AgentControl::Kimi => kimi::build_hooks_settings(sock_path),
+            AgentControl::Grok => grok::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -508,6 +578,7 @@ impl AgentControl {
             AgentControl::Codex => codex::dispatch_hook(state, msg).await,
             AgentControl::Reasonix => reasonix::dispatch_hook(state, msg).await,
             AgentControl::Kimi => kimi::dispatch_hook(state, msg).await,
+            AgentControl::Grok => grok::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -520,6 +591,7 @@ impl AgentControl {
             AgentControl::Codex => codex::parse_hook_payload(event, stdin),
             AgentControl::Reasonix => reasonix::parse_hook_payload(event, stdin),
             AgentControl::Kimi => kimi::parse_hook_payload(event, stdin),
+            AgentControl::Grok => grok::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -544,6 +616,17 @@ impl AgentControl {
             // its rollout — Esc firing nothing — cannot arise. Nothing is
             // missing here, and nothing would be gained by adding it.
             AgentControl::Kimi => TranscriptScan::default(),
+            // Empty for the opposite reason to Reasonix's, and the honest gap in
+            // this backend: Grok *does* need a sentinel — `10-hooks.md` states
+            // that an interrupted (Esc / Ctrl-C) turn skips the Stop hooks
+            // entirely, exactly Codex's problem — but no source read named the
+            // line `updates.jsonl` gets on an abort. A guessed sentinel that
+            // never matches is indistinguishable from this, while looking like it
+            // works. The consequence is stated on the row's behalf in
+            // `agents::grok`: an interrupted turn stays `Active` until the next
+            // prompt. Moot until then anyway, since no Grok payload names a
+            // transcript for the launcher to watch.
+            AgentControl::Grok => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -565,6 +648,9 @@ impl AgentControl {
             // catch for Claude arrives as a hook. Kimi's transitions ride hooks
             // alone, with no second opinion to reconcile against.
             AgentControl::Kimi => None,
+            // No status file, so no second opinion on the working/idle axis. It
+            // is the interrupt case above that would have wanted one.
+            AgentControl::Grok => None,
             AgentControl::Unknown => None,
         }
     }
@@ -592,6 +678,12 @@ impl AgentControl {
             // what makes this the one backend needing neither a session-file
             // fold (Claude) nor a sqlite overlay (Codex).
             AgentControl::Kimi => None,
+            // Grok titles its own sessions (`summary.json`'s `generated_title`),
+            // but keyed by session id and under a JSON spelling read only as a
+            // Rust field name — so there is no per-pid file to read, and
+            // surfacing one waits on the same schema question as
+            // `read_transcript_stats`.
+            AgentControl::Grok => None,
             AgentControl::Unknown => None,
         }
     }
@@ -606,6 +698,7 @@ impl AgentControl {
             AgentControl::Reasonix => None,
             // No status file to watch — see `agent_activity`.
             AgentControl::Kimi => None,
+            AgentControl::Grok => None,
             AgentControl::Unknown => None,
         }
     }
@@ -658,6 +751,12 @@ impl AgentControl {
             // behaviour is being claimed, only the same defence Codex needed.
             AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Kimi => None,
+            // Moot for the same reason today — `agents::grok` supplies no
+            // transcript path. It will stop being moot the day it does: Grok's
+            // `updates.jsonl` is a long-lived append stream, which is exactly the
+            // shape that defeats macOS FSEvents, so whoever wires the fold should
+            // arrive back here before assuming an event-driven watch works.
+            AgentControl::Grok => None,
             AgentControl::Unknown => None,
         }
     }
@@ -691,6 +790,19 @@ impl AgentControl {
             // is still running means "the foreground turn ended" and the row
             // reads Idle — never `BackgroundServer` or `ReviewPending`.
             AgentControl::Kimi => None,
+            // `None` **for now, and the data is already in hand** — the one arm
+            // here that is deferred rather than absent. Grok reports its live
+            // background work on the `Stop` payload itself (`backgroundTasks`,
+            // each with an `id`, a `type` of `shell` / `monitor` / `subagent`, a
+            // status and its command text, plus `sessionCrons`), which is
+            // strictly better than Claude's process-tree walk: it comes from the
+            // agent that owns the tasks, at the moment it decides the turn is
+            // over, and a `monitor` is at-rest by construction rather than by
+            // command-text heuristic. Routing it here needs a new
+            // `LauncherState` field to carry the list from the launcher's hook
+            // arm, which is seam work and belongs in its own commit — so a `Stop`
+            // while a background task runs currently reads as `Idle`.
+            AgentControl::Grok => None,
             AgentControl::Unknown => None,
         }
     }
@@ -962,6 +1074,11 @@ mod tests {
         assert_eq!(codex, AgentControl::Codex);
         assert_eq!(reasonix, AgentControl::Reasonix);
         assert_eq!(kimi, AgentControl::Kimi);
+        let grok: AgentControl = serde_json::from_str(r#""grok""#).expect("grok decodes");
+        assert_eq!(claude, AgentControl::Claude);
+        assert_eq!(codex, AgentControl::Codex);
+        assert_eq!(reasonix, AgentControl::Reasonix);
+        assert_eq!(grok, AgentControl::Grok);
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
@@ -1025,7 +1142,8 @@ mod tests {
                 AgentControl::Claude,
                 AgentControl::Codex,
                 AgentControl::Reasonix,
-                AgentControl::Kimi
+                AgentControl::Kimi,
+                AgentControl::Grok
             ]
         );
     }

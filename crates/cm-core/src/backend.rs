@@ -638,6 +638,10 @@ mod tests {
         // Kimi takes no directory argument at all (`build_launch_command` sets
         // the process cwd instead), so ours is the only positional here too.
         assert_eq!(open_argv(AgentControl::Kimi, None), ["kimi", "/work"]);
+        // Grok takes no directory argument of its own either — `build_launch_command`
+        // sets the process cwd and passes nothing positional, because a bare
+        // `--worktree` would otherwise swallow it.
+        assert_eq!(open_argv(AgentControl::Grok, None), ["grok", "/work"]);
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -695,6 +699,20 @@ mod tests {
         assert_eq!(
             open_argv_worktree(AgentControl::Kimi, None, Some("feature-auth")),
             ["kimi", "/work"]
+        );
+        // Grok's flag takes its value with `=`, in **one** argv element: its
+        // worktree name is optional, so the separated form would let any later
+        // positional be read as the name.
+        assert_eq!(
+            open_argv_worktree(AgentControl::Grok, None, Some("feature-auth")),
+            ["grok", "/work", "--worktree=feature-auth"]
+        );
+        // With no name to pass there is no value to attach, and nothing follows
+        // the flag in our argv, so the bare form is both safe and the only way to
+        // ask Grok to mint the name.
+        assert_eq!(
+            open_argv_worktree(AgentControl::Grok, None, Some("")),
+            ["grok", "/work", "--worktree"]
         );
     }
 
@@ -762,6 +780,16 @@ mod tests {
                 "{agent:?}"
             );
         }
+        // Grok's resume flags are Claude's exactly, which is why the two share an
+        // arm — this pins that they may only share it while that stays true.
+        assert_eq!(
+            open_argv(AgentControl::Grok, Some(("s4", false))),
+            ["grok", "/work", "--resume", "s4"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Grok, Some(("s4", true))),
+            ["grok", "/work", "--resume", "s4", "--fork-session"]
+        );
     }
 
     /// The seam's canonical-path contract (§3), on the *local* arm — which is

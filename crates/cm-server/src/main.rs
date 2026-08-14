@@ -80,6 +80,12 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Grok Build with hooks injected, inside the pty pool (headless).
+    Grok {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts).
     Hook {
         /// Hook event type.
@@ -175,6 +181,7 @@ impl Commands {
             Commands::Codex { args } => Some((AgentControl::Codex, args)),
             Commands::Reasonix { args } => Some((AgentControl::Reasonix, args)),
             Commands::Kimi { args } => Some((AgentControl::Kimi, args)),
+            Commands::Grok { args } => Some((AgentControl::Grok, args)),
             _ => None,
         }
     }
@@ -339,7 +346,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         cmd @ (Commands::Claude { .. }
         | Commands::Codex { .. }
         | Commands::Reasonix { .. }
-        | Commands::Kimi { .. }) => {
+        | Commands::Kimi { .. }
+        | Commands::Grok { .. }) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
             // runs inside the pty pool, so its agent gets the clipboard shims on

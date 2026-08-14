@@ -23,7 +23,7 @@ focused tool and the rest of your workflow is yours to compose.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) and [Kimi Code](https://github.com/MoonshotAI/kimi-code) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support)).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code) and [Grok Build](https://github.com/xai-org/grok-build) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -49,6 +49,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns, resume-picker entries and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork, no token/model columns, no resume-picker entries and no worktrees ([known limits](#kimi-code-support)).                                                  |
+| **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. Token/model columns and resume-picker entries don't work, and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                               |
 
 ## Installation
 
@@ -156,10 +157,11 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
 | `miao reasonix [dir] [args…]`   | Launch Reasonix in `dir` with tracking hooks; extra args are forwarded to `reasonix`. See [known limits](#reasonix-support).                |
 | `miao kimi [dir] [args…]`       | Launch Kimi Code in `dir` with tracking hooks; extra args are forwarded to `kimi`. See [known limits](#kimi-code-support).                  |
+| `miao grok [dir] [args…]`       | Launch Grok Build in `dir` with tracking hooks; extra args are forwarded to `grok`. See [known limits](#grok-build-support).                |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` / `kimi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
 #### Reasonix support
 
@@ -181,6 +183,17 @@ Kimi rows track status — working, idle, waiting for approval, compacting — a
 - **A session runs under a synthetic `KIMI_CODE_HOME`** that symlinks your real `~/.kimi-code/`, with `config.toml` a writable **copy** carrying our `[[hooks]]` entries. Your real config is never written to. Your own `[[hooks]]` in it are preserved; anything else in that copy (comments, key order) is rewritten, and refreshed from the real file whenever you change it.
 
 It is also the **least verified backend here**: it was written from Kimi's published documentation alone, against no running binary. Please report anything that looks wrong rather than assuming it's expected — especially a session where every row sits at "Starting", which is what a hook block Kimi rejects would look like.
+#### Grok Build support
+
+Grok rows track status — working, idle, waiting for approval, compacting — and launch, resume, fork and worktrees (`Ctrl-g`) all work. What it does less of, and why:
+
+- **An interrupted turn (Esc / Ctrl-C) keeps reading as working** until you send the next prompt. Grok fires no hook at all for one, and the marker it writes to its session log instead hasn't been identified yet. This is the limit most likely to bite day to day.
+- **No token or model columns, and no resume picker entries.** Grok records all of it per session, but the on-disk layout — the directory name it derives from your working directory, and the field names inside — hasn't been read against a real session yet.
+- **No background-task tiers** — a `Stop` while a background task runs reads as `Idle`. Grok reports its background tasks better than any other backend here (they ride the `Stop` payload), so this one is wiring, not a gap.
+- **The worktree name isn't shown** on a row that has one. Grok keeps its worktrees in its own registry rather than beside the repo, which is where the dashboard looks.
+- **A session runs under a synthetic `GROK_HOME`** that symlinks your real one, with two exceptions: our own file in `hooks/` (your global hooks still run), and a writable copy of `config.toml`, which is where the approval-notification hook is registered. Authenticate with `grok` outside captain-miao once first — a first-time setup performed _inside_ a session lands in that copy, and the copy is refreshed from your real config whenever you edit it.
+
+None of this has been exercised against a released `grok` build end to end — in particular, if every row sticks at "starting", the hook file's format is the first thing to suspect. Please report anything that looks wrong rather than assuming it's expected.
 
 ### Key bindings
 
@@ -385,7 +398,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 ## Roadmap
 
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix and Kimi Code have slotted in and are both still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support)); Grok, Pi and opencode are mapped but unwritten.
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code and Grok Build have slotted in and are all still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support)); Pi and opencode are mapped but unwritten.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
