@@ -265,6 +265,8 @@ pub(super) enum Command {
     /// skipped rather than stolen: a steal is a per-session decision (§10.2),
     /// and one keypress must not kick a roomful of terminals.
     AttachAll,
+    /// Open the scrollback of footer status messages.
+    MessageLog,
 }
 
 impl Command {
@@ -308,6 +310,7 @@ impl Command {
             Command::AttachAll => "attach_all",
             Command::SessionsLayout => "sessions_layout",
             Command::ManageHosts => "manage_hosts",
+            Command::MessageLog => "messages",
         }
     }
 
@@ -359,6 +362,7 @@ impl Command {
             Command::AttachAll => "attach every free detached session",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
+            Command::MessageLog => "message log (status messages the footer showed)",
         }
     }
 
@@ -402,6 +406,7 @@ impl Command {
             Command::AttachAll => "attach all",
             Command::SessionsLayout => "layout",
             Command::ManageHosts => "hosts",
+            Command::MessageLog => "messages",
         }
     }
 }
@@ -448,6 +453,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::AttachAll,          &["space A"]),
     (Command::SessionsLayout,     &["space l"]),
     (Command::ManageHosts,        &["space h"]),
+    (Command::MessageLog,         &["space m"]),
 ];
 
 /// Resolved binding table: sequence → command, plus the set of prefix chords

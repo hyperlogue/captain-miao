@@ -459,6 +459,71 @@ fn status_msg_shown_in_footer() {
     assert!(out.contains("Launched window 42"));
 }
 
+/// The footer shows one status at a time; `Space m` is where the ones it
+/// replaced are still readable. What makes that work is that every status goes
+/// through `set_status` — so the log is fed there, not at each call site.
+#[test]
+fn space_m_opens_the_message_log_and_esc_closes_it() {
+    let mut d = TestDashboard::new(120, 20);
+    d.app.set_status("Launched window 42".to_string(), false);
+    d.app
+        .set_status("Kill failed: host is unreachable".to_string(), true);
+
+    // The footer only carries the newest of the two.
+    let footer = d.render();
+    assert!(footer.contains("Kill failed"), "{footer}");
+    assert!(!footer.contains("Launched window 42"), "{footer}");
+
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('m'));
+    assert_eq!(d.app.input_mode, InputMode::Messages);
+    let out = d.render();
+    assert!(out.contains("Messages"), "{out}");
+    assert!(out.contains("Launched window 42"), "{out}");
+    assert!(out.contains("Kill failed"), "{out}");
+
+    // A stray key is swallowed by the pager rather than reaching the list
+    // underneath — `x` here must not kill the selected session.
+    d.press(KeyCode::Char('x'));
+    assert_eq!(d.app.input_mode, InputMode::Messages);
+
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(d.app.message_view.is_none());
+}
+
+/// The popup opens parked on the newest message: that's what the user pressed
+/// the key to read. `usize::MAX` is only a request — the draw is what knows the
+/// line count, so the clamp has to survive the first frame.
+#[test]
+fn the_message_log_opens_at_the_newest_entry() {
+    let mut d = TestDashboard::new(80, 14);
+    for i in 0..40 {
+        d.app.set_status(format!("message {i}"), false);
+    }
+    d.app.open_message_log();
+    let out = d.render();
+    assert!(out.contains("message 39"), "{out}");
+    assert!(!out.contains("message 0 "), "{out}");
+
+    // `g` goes to the top, and the oldest kept entry is there.
+    d.press(KeyCode::Char('g'));
+    let out = d.render();
+    assert!(out.contains("message 0"), "{out}");
+    assert_eq!(d.app.message_view.as_ref().map(|v| v.scroll), Some(0));
+
+    // `G` parks at the bottom again, clamped to a real offset by the draw.
+    d.press(KeyCode::Char('G'));
+    let out = d.render();
+    assert!(out.contains("message 39"), "{out}");
+    let view = d.app.message_view.as_ref().expect("still open");
+    assert!(
+        view.scroll < 40,
+        "scroll clamped to the last page: {}",
+        view.scroll
+    );
+}
+
 #[test]
 fn space_a_picker_sets_default_new_session_backend() {
     use crate::agent::AgentControl;

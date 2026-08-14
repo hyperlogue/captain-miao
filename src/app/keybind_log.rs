@@ -122,6 +122,7 @@ fn mode_repr(mode: InputMode) -> &'static str {
         InputMode::Confirm => "Confirm",
         InputMode::DirEdit => "DirEdit",
         InputMode::HostEdit => "HostEdit",
+        InputMode::Messages => "Messages",
     }
 }
 

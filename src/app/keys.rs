@@ -56,6 +56,10 @@ impl App {
             InputMode::Confirm => self.handle_confirm_key(key),
             InputMode::DirEdit => self.handle_dir_edit_key(key),
             InputMode::HostEdit => self.handle_host_edit_key(key),
+            InputMode::Messages => {
+                self.handle_message_log_key(key);
+                None
+            }
         }
     }
 
@@ -495,6 +499,10 @@ impl App {
             }
             Command::Help => {
                 self.input_mode = InputMode::Help;
+                None
+            }
+            Command::MessageLog => {
+                self.open_message_log();
                 None
             }
             Command::Quit => {
@@ -1425,6 +1433,31 @@ impl App {
             }
         }
         None
+    }
+
+    /// Scroll keys for the message log. Reading, not editing, so the bindings
+    /// are the pager ones the hosts panel's connection log already uses —
+    /// `j`/`k`, the arrows, the page keys, `g`/`G` — and everything else is
+    /// swallowed rather than reaching the list underneath.
+    fn handle_message_log_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.message_view.as_mut() else {
+            return;
+        };
+        // The draw clamps against the live line count; a page keeps one line of
+        // overlap, so paging never steps over a line unread.
+        let page = view.rows.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_message_log(),
+            KeyCode::Down | KeyCode::Char('j') => view.scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char('f') => view.scroll += page,
+            KeyCode::PageUp | KeyCode::Char('b') => view.scroll = view.scroll.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+            // Clamped down to the real last page by the draw, which knows the
+            // line count and has to re-clamp every frame anyway.
+            KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX,
+            _ => {}
+        }
     }
 
     fn handle_help_key(&mut self, _key: KeyEvent) -> Option<Action> {

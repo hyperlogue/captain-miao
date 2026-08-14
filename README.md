@@ -228,6 +228,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux or Ghostty, which have only the one)                                                  |
 | `Space h` / `Space s` | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
+| `Space m`             | Message log — the footer's status messages, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
 | `?`                   | Show the full key list (help overlay)                                                                                                                                      |
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |

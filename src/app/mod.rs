@@ -6,6 +6,7 @@ mod keybind_log;
 mod keymap;
 mod keys;
 mod logo;
+mod messages;
 mod picker;
 mod render_backend;
 mod run;
@@ -67,6 +68,8 @@ pub(super) enum InputMode {
     DirEdit,
     /// Modal popup for managing remote hosts. See `HostEditState`.
     HostEdit,
+    /// Scrollback of the footer's status messages. See `messages`.
+    Messages,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -962,6 +965,11 @@ pub(super) struct App {
     pub(super) home_dir: String,
     pub(super) status_msg: Option<String>,
     pub(super) status_is_error: bool,
+    /// Everything `set_status` has ever shown, capped and memory-only. The
+    /// footer keeps one line; this is where the ones it replaced went.
+    pub(super) messages: messages::MessageLog,
+    /// Active message-log popup. `Some` iff `input_mode == InputMode::Messages`.
+    pub(super) message_view: Option<messages::MessageLogView>,
     pub(super) input_mode: InputMode,
     /// The Search-mode (`/`) text buffer: a cursor-aware input with readline
     /// editing, shared with the pickers. Only meaningful while `input_mode ==
@@ -1688,6 +1696,13 @@ impl App {
         warnings.extend(keybind_warnings);
         let status_msg = (!warnings.is_empty()).then(|| warnings.join("; "));
         let status_is_error = status_msg.is_some();
+        // Seed the log with them too. Startup warnings are the messages most
+        // likely to be overwritten before they're read — they land before the
+        // user has looked at the screen at all.
+        let mut messages = messages::MessageLog::default();
+        if let Some(msg) = &status_msg {
+            messages.push(msg, status_is_error);
+        }
 
         let HostSetup {
             mut backends,
@@ -1704,6 +1719,8 @@ impl App {
             home_dir,
             status_msg,
             status_is_error,
+            messages,
+            message_view: None,
             input_mode: InputMode::Normal,
             search_input: self::picker::TextInput::new(),
             search_filter: None,
@@ -3955,9 +3972,24 @@ impl App {
             .select(if len == 0 { None } else { Some(0) });
     }
 
+    /// Show `msg` in the footer, and keep it. Every status the dashboard shows
+    /// goes through here, which is what makes this the one place the message log
+    /// has to be fed from — see [`messages`].
     pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
+        self.messages.push(&msg, is_error);
         self.status_msg = Some(msg);
         self.status_is_error = is_error;
+    }
+
+    /// Open the message-log popup, parked on the newest entry.
+    pub(super) fn open_message_log(&mut self) {
+        self.message_view = Some(messages::MessageLogView::at_bottom());
+        self.input_mode = InputMode::Messages;
+    }
+
+    pub(super) fn close_message_log(&mut self) {
+        self.message_view = None;
+        self.input_mode = InputMode::Normal;
     }
 
     /// Borrow the selected session without cloning. Preferred for read-only

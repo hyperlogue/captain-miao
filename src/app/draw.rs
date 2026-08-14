@@ -82,6 +82,9 @@ impl App {
         if self.input_mode == InputMode::HostEdit {
             self.draw_host_edit(frame, frame.area());
         }
+        if self.input_mode == InputMode::Messages {
+            self.draw_message_log(frame, frame.area());
+        }
         // Last, and independent of `input_mode`: an attach freezes the loop for
         // its whole round trip, so this is the only feedback the keypress gets
         // until the window comes up.
@@ -1861,6 +1864,7 @@ impl App {
             section("Modes"),
             cmd(Command::Search),
             cmd(Command::ClearSearch),
+            cmd(Command::MessageLog),
             cmd(Command::Help),
             row(
                 self.keymap
@@ -1878,6 +1882,71 @@ impl App {
 
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
+    }
+
+    /// The footer's status messages, oldest first — the ones it showed and then
+    /// replaced, which is every one the user didn't happen to be looking at.
+    ///
+    /// Takes `&mut self` only to record the viewport height and re-clamp the
+    /// scroll, both of which only a render knows — the same bookkeeping
+    /// [`draw_host_log`](Self::draw_host_log) does, for the same reason.
+    fn draw_message_log(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(view) = self.message_view.as_ref() else {
+            return;
+        };
+        let scroll = view.scroll;
+        // Wide, like the connection log: these are sentences, and wrapping a
+        // path-carrying failure at 60 cells helps nobody.
+        let popup = centered_rect(80, 70, area);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(Span::styled(" Messages ", Style::default().bold()));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        // The age column is fixed-width so every message starts on one margin,
+        // and a wrapped line pays the same indent and so reads as part of the
+        // entry above it.
+        const AGE_WIDTH: usize = 6;
+        let text_width = (inner.width as usize).saturating_sub(AGE_WIDTH);
+        let lines = self.message_log_lines(text_width);
+        let rows = inner.height as usize;
+        let ui = &config::get().colors.ui;
+        let rendered: Vec<Line> = if self.messages.is_empty() {
+            vec![Line::from(Span::styled(
+                "(nothing said yet)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))]
+        } else {
+            lines
+                .iter()
+                .skip(scroll.min(lines.len().saturating_sub(rows)))
+                .take(rows)
+                .map(|l| {
+                    let age = Span::styled(
+                        format!("{:>5} ", l.age.as_deref().unwrap_or("")),
+                        Style::default().add_modifier(Modifier::DIM),
+                    );
+                    let style = if l.error {
+                        Style::default().fg(ui.error_fg)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(vec![age, Span::styled(l.text.clone(), style)])
+                })
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(rendered), inner);
+
+        // Record what the keys need, and re-clamp: the log grows underneath a
+        // parked offset (`G` parks it at `usize::MAX` on purpose), and the popup
+        // resizes with the terminal.
+        if let Some(view) = self.message_view.as_mut() {
+            view.rows = rows;
+            view.scroll = view.scroll.min(lines.len().saturating_sub(rows));
+        }
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -2036,6 +2105,12 @@ impl App {
                 spans.extend(hint_pair("Enter", "save"));
                 spans.extend(hint_pair("r", "reset"));
                 spans.extend(hint_pair("Esc", "cancel"));
+                spans
+            }
+            InputMode::Messages => {
+                let mut spans = hint_pair("j/k", "scroll");
+                spans.extend(hint_pair("g/G", "top/bottom"));
+                spans.extend(hint_pair("Esc", "close"));
                 spans
             }
             InputMode::HostEdit => {
