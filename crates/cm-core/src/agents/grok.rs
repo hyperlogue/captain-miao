@@ -135,6 +135,13 @@
 //!   and cmux's adapter uses `-r` even for a terminal pane, so the two forms may
 //!   simply be synonyms. If they are not, this arm is the one that has to move,
 //!   and it is shared with Claude.
+//! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
+//!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
+//!   this works if the agent reads the clipboard by shelling out to
+//!   `xclip`/`wl-paste`, and silently does nothing if it reads it in-process the
+//!   way Codex does — the one case no shim can serve. Untested either way, and
+//!   the only unknown here a *user* meets rather than a probe runner.
+//!   `clipboard-paste` in the session is the fallback that works regardless.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;

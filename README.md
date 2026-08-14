@@ -402,6 +402,12 @@ Sharp edges worth knowing:
 - **Codex has no `Ctrl+V`** here: it reads the clipboard in-process, so no shim
   can serve it. Run `clipboard-paste` in the session instead — it writes the image
   beside the agent and prints the path to hand it.
+- **Only Claude Code is confirmed to work through the shim**, and only Codex is
+  confirmed not to. Reasonix, Kimi Code, Grok Build, opencode and Pi are all
+  shimmed identically but none has been tested: each works if it shells out to
+  `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
+  in-process the way Codex does. `clipboard-paste` works on all of them
+  regardless, so treat it as the reliable route until one is confirmed.
 - **A macOS host** gets nothing: the agent's clipboard path there is `osascript`,
   which never reaches a shim. `clipboard-paste` is the whole story on such a host.
 - **On a Linux dashboard** only what the clipboard actually offers can be served,

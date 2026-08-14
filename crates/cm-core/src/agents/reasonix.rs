@@ -81,6 +81,13 @@
 //!   **symlinked `.env` honoured** — under `REASONIX_HOME` every fallback path
 //!   is skipped, so a synthetic home that fails to expose the credentials file
 //!   doesn't degrade, it fails to start.
+//! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
+//!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
+//!   this works if the agent reads the clipboard by shelling out to
+//!   `xclip`/`wl-paste`, and silently does nothing if it reads it in-process the
+//!   way Codex does — the one case no shim can serve. Untested either way, and
+//!   the only unknown here a *user* meets rather than a probe runner.
+//!   `clipboard-paste` in the session is the fallback that works regardless.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
