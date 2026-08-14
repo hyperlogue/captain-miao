@@ -724,32 +724,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState {
-            agent: AgentControl::OpenCode,
-            launcher_pid: 0,
-            session_id: None,
-            window_id: None,
-            tab_id: None,
-            cwd: String::new(),
-            status,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
-            child_pid: None,
-            last_error: None,
-            context_tokens: None,
-            model: None,
-            name: None,
-            first_prompt: None,
-            pool_session: None,
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            flags: None,
-            attached: None,
-            host: crate::state::HostId::local(),
-        }
+        LauncherState::for_test(AgentControl::OpenCode, status)
     }
 
     /// Drive one hook end to end — parse the plugin's stdin JSON, then dispatch

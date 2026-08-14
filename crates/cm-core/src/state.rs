@@ -754,6 +754,47 @@ pub struct LauncherState {
     pub host: HostId,
 }
 
+#[cfg(test)]
+impl LauncherState {
+    /// A blank row for one backend, for tests that care about two or three
+    /// fields and had to spell all two dozen to get them.
+    ///
+    /// It lives here rather than in a test module because the point is the
+    /// *compiler error*: this struct has no `Default` on purpose — every field
+    /// is a decision a real launcher makes — so a new field would otherwise
+    /// break eight identical literals across seven backend test modules and the
+    /// launcher's own, which is exactly the tax that keeps people from adding
+    /// the field. One literal, one fix.
+    pub(crate) fn for_test(agent: AgentControl, status: SessionStatus) -> Self {
+        Self {
+            agent,
+            launcher_pid: 0,
+            session_id: None,
+            window_id: None,
+            tab_id: None,
+            cwd: String::new(),
+            status,
+            last_tool: None,
+            updated_at: 0,
+            active_since: None,
+            last_prompt: None,
+            child_pid: None,
+            last_error: None,
+            context_tokens: None,
+            model: None,
+            name: None,
+            first_prompt: None,
+            pool_session: None,
+            launch_id: None,
+            terminal: None,
+            terminfo: None,
+            flags: None,
+            attached: None,
+            host: HostId::local(),
+        }
+    }
+}
+
 /// Per-session flags a host owns on behalf of every dashboard watching it
 /// (`docs/remote-sessions.md` §9). Persisted in the daemon's sidecar
 /// ([`session_flags_path`]), overlaid onto served rows, and updated by

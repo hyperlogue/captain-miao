@@ -1061,32 +1061,7 @@ mod tests {
     }
 
     fn active_state() -> LauncherState {
-        LauncherState {
-            agent: crate::agent::AgentControl::Codex,
-            launcher_pid: 0,
-            session_id: None,
-            window_id: None,
-            tab_id: None,
-            cwd: String::new(),
-            status: SessionStatus::Active,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
-            child_pid: None,
-            last_error: None,
-            context_tokens: None,
-            model: None,
-            name: None,
-            first_prompt: None,
-            pool_session: None,
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            flags: None,
-            attached: None,
-            host: crate::state::HostId::local(),
-        }
+        LauncherState::for_test(crate::agent::AgentControl::Codex, SessionStatus::Active)
     }
 
     fn pre_tool_use(tool: &str) -> HookMessage {
