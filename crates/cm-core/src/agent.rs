@@ -578,16 +578,12 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::list_resumable(limit),
             AgentControl::Codex => codex::list_resumable(limit),
-            // Empty on purpose. Reasonix does ship an introspection command
-            // (`reasonix session list --json`), but it is documented as
-            // *redacted*: it deliberately exposes no transcript, label, path or
-            // host content — i.e. none of the cwd, title or first prompt a
-            // candidate is made of, and machine session ids are opaque hashes
-            // keyed to an installation. Shelling out per picker open to get rows
-            // we couldn't render is worse than an honest empty list, and reading
-            // the sidecars directly waits on the same schema question as
-            // `read_transcript_stats`.
-            AgentControl::Reasonix => Ok(vec![]),
+            // Read off disk rather than through Reasonix's own
+            // `reasonix session list --json`, which is documented as *redacted*:
+            // it deliberately exposes no transcript, label, path or host
+            // content — none of the cwd, title or first prompt a candidate is
+            // made of. The `.jsonl.meta` sidecars carry all three.
+            AgentControl::Reasonix => reasonix::list_resumable(limit),
             AgentControl::Kimi => kimi::list_resumable(limit),
             AgentControl::Grok => grok::list_resumable(limit),
             AgentControl::OpenCode => opencode::list_resumable(limit),

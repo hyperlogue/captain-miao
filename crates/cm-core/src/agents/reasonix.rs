@@ -63,8 +63,21 @@
 //! **The payload carries no transcript path**, so the launcher's whole
 //! transcript pipeline (stats fold, signal scan, stat-poll) is inert for
 //! Reasonix by construction — it only ever runs on a path a hook supplied.
-//! That is why the token/model columns are empty, not an oversight; the session
-//! sidecar schema that would fill them is the open item below.
+//! [`list_resumable`] needs none of it: sessions are discovered by scanning
+//! `<state>/sessions/`, which is how Reasonix's own catalog finds them.
+//!
+//! **The token column is empty, and the reason is more interesting than a
+//! missing schema.** Reasonix's per-session number is
+//! `Agent.ContextUsedTokens()` — an in-memory estimate of the *next* request's
+//! prompt, memoised against the transcript, projection, calibration and tool
+//! schemas, and never serialized. Its own doc comment rejects the obvious
+//! substitute: *"A gauge fed from the last turn's usage instead lags a turn,
+//! counts completion tokens the trigger ignores, and reads zero on a rebound
+//! session — which is how a session displays 8% while it is compacting."*
+//! There is an authoritative usage store on disk (`internal/usagecatalog`, over
+//! "daily statistics JSONL files") but it aggregates by **day**, not by session:
+//! it is a billing view. So the honest options here are a hook that reports the
+//! number or nothing, and nothing is what ships.
 //!
 //! What a probe against a real binary must confirm:
 //! - that `reasonix hook list --json --home-dir <synth>` reports our nine hooks
@@ -75,8 +88,10 @@
 //!   `Runner.SetSessionID`, documented as "the Claude-compatible session
 //!   identifier", while `docs/CLI.md` also describes an opaque *machine* session
 //!   id — if they differ, resume is aimed at the wrong namespace);
-//! - the session sidecar schema under `<state root>/sessions/`, which is what
-//!   [`crate::agent::AgentControl::read_transcript_stats`] would need;
+//! - that a session's `.jsonl.meta` sidecar is written for **every** session and
+//!   not only for ones the desktop has listed. Its `workspace_root` is the only
+//!   record of a session's working directory that [`list_resumable`] can read,
+//!   so a session without one never reaches the picker;
 //! - that the three roots resolve as `paths.go` reads under one launch, with a
 //!   **symlinked `.env` honoured** — under `REASONIX_HOME` every fallback path
 //!   is skipped, so a synthetic home that fails to expose the credentials file
@@ -97,6 +112,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::SynthHome;
+use crate::agent::ResumeCandidate;
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -155,6 +171,14 @@ fn cache_home() -> Option<PathBuf> {
         }
     }
     dirs::cache_dir().map(|c| c.join("reasonix"))
+}
+
+/// Where Reasonix keeps its transcripts: `<state>/sessions/<id>.jsonl`, each
+/// with a family of sidecars beside it (`.jsonl.meta`, `.events.jsonl`,
+/// `.context.json`, `.display-index.json`, …). `internal/store` is Reasonix's
+/// own single authority for that layout.
+fn sessions_root() -> Option<PathBuf> {
+    Some(state_home()?.join("sessions"))
 }
 
 /// A single shared synthetic `$REASONIX_HOME` for every Reasonix session: the
@@ -296,6 +320,117 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
 }
 
 // =============================================================================
+// Resume picker
+// =============================================================================
+
+/// Reasonix's `<session>.jsonl.meta` — its branch-metadata sidecar
+/// (`BranchMeta`, `internal/agent/branch.go`), snake_case on the wire.
+///
+/// `turns` and `preview` are described there as *"listing-only fields the
+/// desktop sidebar and CLI pickers show … without decoding the whole .jsonl"*,
+/// which is precisely this job: one small read per candidate instead of one
+/// transcript parse.
+#[derive(Deserialize, Default)]
+struct BranchMeta {
+    #[serde(default)]
+    id: String,
+    /// The session's working directory.
+    #[serde(default)]
+    workspace_root: String,
+    /// A name the user chose, which overrides the preview.
+    #[serde(default)]
+    custom_title: String,
+    /// The first user message.
+    #[serde(default)]
+    preview: String,
+}
+
+/// Every session under `<state>/sessions/`, newest first.
+///
+/// A file counts as a transcript only if it is a `.jsonl` that is **not** one of
+/// Reasonix's sibling logs — `.events.jsonl`, `.conflicts.jsonl`,
+/// `.guardian.jsonl` — which is `store.IsSessionTranscriptName`'s rule and
+/// carries a warning worth repeating: a naive `*.jsonl` glob resurrects the
+/// salvage files as phantom sessions. (`.events.jsonl.damaged` is deliberately
+/// *not* `.jsonl`-suffixed for that same reason, on Reasonix's side.)
+///
+/// Only the default sessions root is scanned. Reasonix can index further
+/// directories (`reasonix sessions reindex --dir`), and a session outside the
+/// default root will not appear here.
+pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no reasonix state home"))?;
+    Ok(list_resumable_in(&root, limit))
+}
+
+/// Reasonix's own rule for telling a session transcript from the append-only
+/// logs and salvage files that sit beside it.
+fn is_session_transcript_name(name: &str) -> bool {
+    name.ends_with(".jsonl")
+        && !name.ends_with(".events.jsonl")
+        && !name.ends_with(".conflicts.jsonl")
+        && !name.ends_with(".guardian.jsonl")
+}
+
+/// The scan itself, split from `$REASONIX_STATE_HOME` resolution so a test can
+/// point it at a fixture tree without touching the environment.
+fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !is_session_transcript_name(name) {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        found.push((path, mtime));
+    }
+
+    let mut out = Vec::new();
+    for (path, mtime) in common::newest_first(found, limit) {
+        // The sidecar appends to the *whole* path (`session.jsonl.meta`), unlike
+        // the others which replace the extension — a historical layout Reasonix
+        // documents rather than a slip.
+        let meta_path = {
+            let mut p = path.clone().into_os_string();
+            p.push(".meta");
+            PathBuf::from(p)
+        };
+        let meta = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|b| serde_json::from_str::<BranchMeta>(&b).ok())
+            .unwrap_or_default();
+        let session_id = if meta.id.trim().is_empty() {
+            // No sidecar, or one without an id: the transcript's own stem is
+            // what `--resume` takes, so a session is still resumable without it.
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            meta.id.clone()
+        };
+        if session_id.is_empty() || meta.workspace_root.trim().is_empty() {
+            continue;
+        }
+        out.push(ResumeCandidate {
+            agent: crate::agent::AgentControl::Reasonix,
+            session_id,
+            cwd: meta.workspace_root,
+            first_prompt: Some(meta.preview).filter(|p| !p.trim().is_empty()),
+            custom_title: Some(meta.custom_title).filter(|t| !t.trim().is_empty()),
+            git_branch: None,
+            mtime,
+        });
+    }
+    out
+}
+
+// =============================================================================
 // Hook payload (stdin from Reasonix → normalized HookMessage)
 // =============================================================================
 
@@ -391,6 +526,103 @@ mod tests {
     use super::*;
     use crate::agent::AgentControl;
     use crate::state::SessionStatus;
+
+    /// A `<state>/sessions/` directory: transcripts and whichever sidecars the
+    /// case needs.
+    fn sessions_fixture(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cm-reasonix-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, body) in files {
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn sessions_become_resume_candidates() {
+        let root = sessions_fixture(
+            "ok",
+            &[
+                ("abc123.jsonl", "{}\n"),
+                (
+                    "abc123.jsonl.meta",
+                    r#"{"id":"abc123","workspace_root":"/home/miao/p",
+                        "custom_title":"wire up the parser","preview":"add a test",
+                        "turns":5,"schema_version":2}"#,
+                ),
+            ],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "abc123");
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
+        assert_eq!(out[0].agent, AgentControl::Reasonix);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The trap this scan exists to avoid.** Reasonix writes three other
+    /// `.jsonl` files beside a transcript, and a naive `*.jsonl` glob turns each
+    /// into a phantom session — which is why Reasonix's own
+    /// `IsSessionTranscriptName` excludes them by name rather than by extension.
+    #[test]
+    fn the_sibling_logs_are_not_sessions() {
+        let meta = r#"{"id":"x","workspace_root":"/home/miao/p"}"#;
+        let root = sessions_fixture(
+            "siblings",
+            &[
+                ("abc.jsonl", "{}\n"),
+                ("abc.jsonl.meta", meta),
+                ("abc.events.jsonl", "{}\n"),
+                ("abc.events.jsonl.meta", meta),
+                ("abc.conflicts.jsonl", "{}\n"),
+                ("abc.conflicts.jsonl.meta", meta),
+                ("abc.guardian.jsonl", "{}\n"),
+                ("abc.guardian.jsonl.meta", meta),
+                ("abc.context.json", "{}"),
+            ],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the transcript is a session: {:?}",
+            out.iter().map(|c| &c.session_id).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A transcript whose sidecar is missing or unreadable still names a session
+    /// — `--resume` takes the file's own stem — but without a `workspace_root`
+    /// there is nowhere to resume *into*, so it is dropped rather than offered
+    /// with a blank cwd.
+    #[test]
+    fn a_session_with_no_workspace_root_is_not_offered() {
+        let root = sessions_fixture(
+            "nocwd",
+            &[
+                ("no-meta.jsonl", "{}\n"),
+                ("empty-meta.jsonl", "{}\n"),
+                ("empty-meta.jsonl.meta", r#"{"id":"empty-meta"}"#),
+                ("good.jsonl", "{}\n"),
+                ("good.jsonl.meta", r#"{"workspace_root":"/home/miao/p"}"#),
+            ],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        // No `id` in that sidecar, so the transcript's stem stands in for it.
+        assert_eq!(out[0].session_id, "good");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_sessions_root_is_empty_rather_than_an_error() {
+        let root = std::env::temp_dir().join(format!("cm-reasonix-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(list_resumable_in(&root, 10).is_empty());
+    }
 
     /// **Hand-written from `internal/hook/hook.go`, not captured from a running
     /// binary** — no `reasonix` was installed when these were written. A probe
