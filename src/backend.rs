@@ -3847,6 +3847,19 @@ async fn setup_ssh(
         forwards.push(clipboard_forward(home, &clip_sock));
     } else if clipboard {
         log.error("cannot offer the clipboard: the probe never reported the host's home");
+    } else if let Some(home) = provisioned.home.as_deref() {
+        // Revoking must not wait for a *clean* connect. `cancel_user_forwards`
+        // below would take this down, but it sits under `daemon ensure`'s early
+        // return — so a host whose server is broken while its ControlMaster is
+        // still up (any open attach window keeps one) would go on reading this
+        // machine's clipboard until some later reconnect got further, while the
+        // panel says the toggle took effect. Gated on having asked for it, so the
+        // ordinary host that never wanted the clipboard pays nothing.
+        let stale = clipboard_forward(home, &cm_core::clipboard::paths::local_socket_path());
+        if forward_was_requested(prov.host, target, &stale) {
+            log.info("no longer offering this machine's clipboard");
+            cancel_forwards(target, &opts, &[stale]).await;
+        }
     }
     let forwards = forwards.as_slice();
 
@@ -4083,6 +4096,21 @@ static REQUESTED_FORWARDS: LazyLock<Mutex<HashMap<ForwardKey, Vec<Forward>>>> =
 /// `(host label, ssh target)` — which panel row's forwards these are, and where
 /// they were asked for. See [`REQUESTED_FORWARDS`].
 type ForwardKey = (String, String);
+
+/// Whether this process has asked *this* host's master for exactly this forward.
+///
+/// For cancelling one remembered forward on its own, ahead of the wholesale
+/// cancel-then-request in [`cancel_user_forwards`] — which is too late for
+/// anything that must come down even when the connect goes on to fail. The memo
+/// is left alone: the next successful connect replaces it, and until then a cancel
+/// that didn't take is worth retrying.
+fn forward_was_requested(host: &HostId, target: &str, f: &Forward) -> bool {
+    REQUESTED_FORWARDS
+        .lock()
+        .unwrap()
+        .get(&(host.0.clone(), target.to_string()))
+        .is_some_and(|seen| seen.contains(f))
+}
 
 /// Cancel every forward this process has requested for this host, including the
 /// ones about to be re-requested.
@@ -4536,6 +4564,44 @@ mod tests {
         // otherwise).
         let wrapped = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
         assert!(wrapped.starts_with("/bin/sh -c '") && wrapped.ends_with('\''));
+    }
+
+    /// Turning the clipboard off has to be cancellable on its own, ahead of the
+    /// wholesale pass in `cancel_user_forwards` — that one sits under `daemon
+    /// ensure`'s early return, so a host whose server is broken would keep the
+    /// `-R` while the panel says the toggle applied.
+    #[test]
+    fn a_revoked_clipboard_forward_is_nameable_on_its_own() {
+        let host = HostId("revoke-probe".to_string());
+        let target = "user@box";
+        let home = "/home/miao";
+        let f = clipboard_forward(home, Path::new("/run/user/1000/x/clipboard.sock"));
+        // Nothing asked for yet: an ordinary host that never wanted the clipboard
+        // must pay no `-O cancel` on any of its connects.
+        assert!(!forward_was_requested(&host, target, &f));
+
+        REQUESTED_FORWARDS
+            .lock()
+            .unwrap()
+            .insert((host.0.clone(), target.to_string()), vec![f.clone()]);
+        assert!(forward_was_requested(&host, target, &f));
+        // Keyed by (label, target), so one row's forwards are never another's —
+        // two panel rows may well name the same machine.
+        assert!(!forward_was_requested(
+            &HostId("other".to_string()),
+            target,
+            &f
+        ));
+        assert!(!forward_was_requested(&host, "user@elsewhere", &f));
+        // And the spec has to match exactly, since that is what `-O cancel` names:
+        // a different local socket is a different forward.
+        let elsewhere = clipboard_forward(home, Path::new("/run/user/1000/y/clipboard.sock"));
+        assert!(!forward_was_requested(&host, target, &elsewhere));
+
+        REQUESTED_FORWARDS
+            .lock()
+            .unwrap()
+            .remove(&(host.0.clone(), target.to_string()));
     }
 
     /// The tail of an ssh argv after the `-o` option block, so the assertions
