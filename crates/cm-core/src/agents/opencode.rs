@@ -296,24 +296,32 @@ pub fn build_launch_command(
     // environment is unverified; if it does, every hook silently fails to find
     // its launcher (module doc).
     cmd.env("CAPTAIN_MIAO_SOCK", sock_path);
-    cmd.args(launch_args(cwd, extra_args));
+    cmd.args(launch_args(extra_args));
     Ok(cmd)
 }
 
-/// The agent-facing argv: the working directory as `--dir`, then whatever the
-/// launcher forwarded (`-s <id>`, `--fork`).
+/// The agent-facing argv: **nothing for the working directory**, then whatever
+/// the launcher forwarded (`-s <id>`, `--fork`).
 ///
-/// **`--dir <path>` rather than a positional** — it is the flag §9's facts table
-/// gives for the working directory, and what `opencode`'s own positional means
-/// is not documented. Reasonix is the standing reminder of what guessing costs
-/// there: its positional is a *prompt*, so a bare `reasonix /work` opens a
-/// session whose first user message is a path. Pure and separately pinned,
-/// because the process cwd is set too and would mask the mistake in every case
-/// except the one that matters.
-fn launch_args(cwd: &str, extra: &[String]) -> Vec<String> {
-    let mut v = vec!["--dir".to_string(), cwd.to_string()];
-    v.extend(extra.iter().cloned());
-    v
+/// This carried `--dir <path>` on the strength of the design note's facts table,
+/// and that was wrong: the vendor documents the root command as
+/// `opencode [project]` with no `--dir` among its flags — `--dir` belongs to the
+/// `run` and `attach` *subcommands*. A flag the root command rejects fails at
+/// startup, before any hook, so the window would have died with a flag error and
+/// no row would ever have appeared.
+///
+/// So the cwd travels the way it does for Kimi, Grok and Pi: on the process
+/// (`current_dir`), with nothing positional. The documented `[project]`
+/// positional would also work and is the fallback if a probe ever shows opencode
+/// ignoring its own working directory — but adding a positional we have not
+/// watched a real binary accept is how this went wrong the first time, and
+/// Reasonix is the standing reminder of the cost (its positional is a *prompt*,
+/// so a bare `reasonix /work` opens a session whose first message is a path).
+///
+/// Pure and separately pinned because `current_dir` masks a mistake here in
+/// every case except the one that matters.
+fn launch_args(extra: &[String]) -> Vec<String> {
+    extra.to_vec()
 }
 
 /// Create / refresh the synthetic config dir and return it. One owned entry,
@@ -854,14 +862,21 @@ export default CaptainMiao;
         );
     }
 
-    /// The working directory goes in as `--dir`, because what `opencode`'s own
-    /// positional means is undocumented — and resume flags follow it.
+    /// **Nothing** is passed for the working directory — it rides `current_dir`.
+    /// The root command is documented as `opencode [project]` with no `--dir`
+    /// among its flags (that belongs to the `run` and `attach` subcommands), and
+    /// a flag the root command rejects kills the window at startup before any
+    /// hook fires. Pinned as an emptiness because `current_dir` would hide the
+    /// mistake everywhere except the launch that matters.
     #[test]
-    fn the_working_directory_is_passed_as_dir() {
-        assert_eq!(launch_args("/work", &[]), ["--dir", "/work"]);
+    fn nothing_positional_carries_the_working_directory() {
+        assert!(launch_args(&[]).is_empty());
         assert_eq!(
-            launch_args("/work", &["-s".to_string(), "s1".to_string()]),
-            ["--dir", "/work", "-s", "s1"]
+            launch_args(&["-s".to_string(), "s1".to_string()]),
+            ["-s", "s1"]
         );
+        // Whatever the launcher forwarded is passed through untouched, and no
+        // path is ever spliced in beside it.
+        assert!(!launch_args(&["-s".to_string(), "s1".to_string()]).contains(&"--dir".to_string()));
     }
 }
