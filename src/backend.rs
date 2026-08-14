@@ -3180,6 +3180,7 @@ async fn resolve_remote_exe(
             failure: Some("host unreachable over ssh (or no shell)".to_string()),
             upgrade: None,
             home: None,
+            darwin: false,
         };
     };
     let local_version = env!("CARGO_PKG_VERSION");
@@ -3395,6 +3396,8 @@ async fn resolve_remote_exe(
     Provisioned {
         exe,
         home: Some(probe.home.clone()),
+        // `uname -sm`, so the sysname is the first word.
+        darwin: probe.arch.split_whitespace().next() == Some("Darwin"),
         failure: provision_failure(
             local_version,
             &probe,
@@ -3421,6 +3424,10 @@ struct Provisioned {
     /// absolute (ssh expands nothing in a forward spec) and this is the one round
     /// trip that already asks.
     home: Option<String>,
+    /// Whether the host is a Mac, from the probe's `uname -sm`. Carried for one
+    /// reason: an agent's macOS clipboard path is `osascript`, which never reaches
+    /// a shim, so `Ctrl+V` there can never work and the offer needs to say so.
+    darwin: bool,
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -3827,6 +3834,16 @@ async fn setup_ssh(
             "offering this machine's clipboard at {} on the host",
             cm_core::clipboard::paths::remote_socket_for_home(home)
         ));
+        // The one host where the offer cannot become a `Ctrl+V`: an agent reads a
+        // macOS clipboard through `osascript`, which no shim intercepts. Said here
+        // because the alternative is a key that silently does nothing, with the
+        // panel reporting a forward that is genuinely up.
+        if provisioned.darwin {
+            log.info(
+                "this host is a Mac, so Ctrl+V there cannot reach it — \
+                 run `clipboard-paste` in the session instead",
+            );
+        }
         forwards.push(clipboard_forward(home, &clip_sock));
     } else if clipboard {
         log.error("cannot offer the clipboard: the probe never reported the host's home");

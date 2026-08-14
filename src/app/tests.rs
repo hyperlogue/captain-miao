@@ -4614,6 +4614,40 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
     );
 }
 
+/// A host offered the clipboard says so on its row, and `p` is named in the
+/// footer.
+///
+/// The marker rides the *target* line rather than the status line because that is
+/// where a host's forwards are shown, and the clipboard is one more of them — the
+/// status line reports live connection state, which this is not. Without both, the
+/// toggle is a key with no visible effect and no way to discover it.
+#[test]
+fn a_host_offered_the_clipboard_shows_it_on_its_row() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: super::picker::TextInput::with_text("box"),
+        target: super::picker::TextInput::with_text("user@box"),
+        ..Default::default()
+    });
+    state.cursor = 0;
+
+    // Off: nothing on the row, but the key is still offered.
+    let out = d.render();
+    assert!(out.contains("ssh user@box"), "{out}");
+    assert!(!out.contains('\u{1f4cb}'), "off must show no marker: {out}");
+    assert!(out.contains("clipboard"), "the footer must name `p`: {out}");
+
+    // On: the marker lands beside the target, where the forwards are.
+    d.app.host_edit.as_mut().unwrap().rows[0].clipboard = true;
+    let out = d.render();
+    assert!(
+        out.contains("ssh user@box \u{1f4cb}"),
+        "the marker belongs beside the target: {out}"
+    );
+}
+
 /// The row editor's four fields walk by every idiom the dashboard binds
 /// elsewhere, and — the point — they walk **backwards** too. `Tab`-only meant
 /// overshooting Options cost three more presses.

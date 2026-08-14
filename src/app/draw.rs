@@ -664,15 +664,26 @@ impl App {
             // forward among them is otherwise completely invisible — nothing
             // else in the dashboard says a local port is answered by another
             // machine.
+            //
+            // The clipboard marker lands here for exactly that reason: it *is*
+            // one more forward on the same child, so it belongs beside the ones
+            // the user typed rather than on the status line, which reports live
+            // connection state. `p` in the footer is what names the key.
+            let mut detail = format!(
+                "      {} {} {}",
+                if r.is_socket { "socket" } else { "ssh" },
+                r.target.text(),
+                r.options.text().trim()
+            )
+            .trim_end()
+            .to_string();
+            // Appended after the trim, so a host with no options gets one space
+            // before the marker rather than two.
+            if r.clipboard {
+                detail.push_str(" \u{1f4cb}");
+            }
             lines.push(Line::from(Span::styled(
-                format!(
-                    "      {} {} {}",
-                    if r.is_socket { "socket" } else { "ssh" },
-                    r.target.text(),
-                    r.options.text().trim()
-                )
-                .trim_end()
-                .to_string(),
+                detail,
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }
@@ -1974,6 +1985,7 @@ impl App {
                     spans.extend(hint_pair("^e", "icon"));
                     spans.extend(hint_pair("^t", "target"));
                     spans.extend(hint_pair("c", "connect/disconnect"));
+                    spans.extend(hint_pair("p", "clipboard"));
                     spans.extend(hint_pair("d", "delete"));
                     // Shown only on a row that has somewhere to go, which is the
                     // same condition the row's `↑` marker draws under: a hint

@@ -303,6 +303,34 @@ full connection log, `c` suspends it, `u` upgrades its server.
 - **Run `loginctl enable-linger "$USER"`** on any Linux host running the daemon,
   or systemd-logind takes its sockets away at your last logout.
 
+#### Pasting a screenshot into a remote session
+
+`p` in the hosts panel offers that host **this machine's clipboard**, so `Ctrl+V`
+in an agent running there attaches a screenshot you just took here. It works by
+shadowing `xclip`/`wl-paste` on the agent's `PATH` with a shim that asks back over
+an owner-only unix socket, ssh-forwarded while the host is connected.
+
+**Only images are ever served.** Text is not filtered out — it is never requested,
+so a remote can't read your password manager through this. It is off by default
+and per-host, because while a host is connected anything running as you there
+(including the agent, which runs arbitrary code by design) can read your clipboard
+when it holds an image.
+
+Sharp edges worth knowing:
+
+- **Codex has no `Ctrl+V`** here: it reads the clipboard in-process, so no shim
+  can serve it. Run `clipboard-paste` in the session instead — it writes the image
+  beside the agent and prints the path to hand it.
+- **A macOS host** gets nothing: the agent's clipboard path there is `osascript`,
+  which never reaches a shim. `clipboard-paste` is the whole story on such a host.
+- **On a Linux dashboard** only what the clipboard actually offers can be served,
+  so a browser-copied JPEG answers "no image" — there is no converter on that side.
+  macOS re-encodes, so anything on the pasteboard works.
+- **Only sessions started after you enable it** are shimmed; restart a session to
+  pick it up.
+- **Two dashboards on different machines against one host** collide: the later one
+  wins the forward and the earlier one's paste stops working until it reconnects.
+
 ## How it works
 
 captain-miao is built around a strict unidirectional data flow:
