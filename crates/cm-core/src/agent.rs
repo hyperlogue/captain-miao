@@ -261,13 +261,13 @@ impl AgentControl {
             // also why the bare `--session` form (which opens Kimi's session
             // browser) can't be reached from here.
             AgentControl::Kimi => vec!["--session".to_string(), session_id.to_string()],
-            // `-s <id>` plus `--fork`, both documented flags. Correct and, for
-            // now, unreachable from the dashboard: no opencode hook payload
-            // names a session id, so `LauncherState.session_id` is never set
-            // and `r` / `f` have nothing to pass here. See `agents::opencode`.
-            // (`-c` / `--continue` resumes the most recent session in a
-            // directory without an id, but this seam is id-shaped and inventing
-            // an id-less path for one backend is not the trade.)
+            // `-s <id>` plus `--fork`, both documented flags on the root TUI
+            // command. The id reaches `LauncherState` on `session.created` and
+            // on every direct hook (`agents::opencode`), so unlike the first cut
+            // of that backend this is reachable. (`-c` / `--continue` resumes
+            // the most recent session in a directory without an id, but this
+            // seam is id-shaped and inventing an id-less path for one backend is
+            // not the trade.)
             AgentControl::OpenCode => {
                 let mut v = vec!["-s".to_string(), session_id.to_string()];
                 if fork {

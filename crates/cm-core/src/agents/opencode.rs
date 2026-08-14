@@ -2,23 +2,30 @@
 //! payload shape; the dashboard reaches all of it only via
 //! `crate::agent::AgentControl::OpenCode`'s match arms.
 //!
-//! **Neither run nor source-read — derived from this project's design note
-//! (§9) alone, and that section is the one the note never marked
-//! source-verified.** §5 (Grok), §6 (Reasonix) and §8 (Pi) each carry a
-//! citation trail back to a vendor checkout; §9 does not. No `opencode` binary
-//! and no `sst/opencode` checkout were available here either. So this is the
-//! **weakest-footed backend in the tree** — weaker than Kimi, which at least
-//! came from published vendor documentation — and it is built to fail *visibly
-//! and cheaply* rather than to look complete: every fact §9 states is honoured
-//! exactly, and every fact it does not state leaves the corresponding field
-//! `None` with the missing name written down. Nothing here has been observed.
+//! **Source-read against opencode itself** — `packages/plugin/src/index.ts`
+//! for the hook interface and `packages/sdk/js/src/gen/types.gen.ts` for every
+//! payload shape. It is not run against a binary yet; the probe list at the end
+//! says what that would still settle.
+//!
+//! The first cut of this backend was derived from this project's design note
+//! (§9) alone, which named opencode's *events* but no field inside any payload,
+//! and guessed that a handlers object keyed by those event names would
+//! subscribe them. **It does not.** `Hooks` is a closed interface, and six of
+//! the nine keys that cut registered — `session.created`, `session.idle`,
+//! `session.error`, `session.compacted`, `permission.replied`, and
+//! `permission.asked` (whose hook is spelled `permission.ask`) — are bus event
+//! names opencode never looks for. Only `tool.execute.before` / `.after` and
+//! `experimental.session.compacting` happened to coincide with real hook keys,
+//! so a row went `Active` at its first tool call and **never came back**: the
+//! turn-end signal was one of the six that fired nothing.
 //!
 //! **The delivery is a generated JavaScript plugin, and that is the one
 //! genuinely new mechanism in this backend.** opencode has no shell-command
 //! hooks at all (§9's facts table: *"hooks — none; extensibility is JS/TS
-//! plugin modules only"*). Its event surface is a module exporting a function
-//! that receives `{project, client, $, directory, worktree}` and returns a
-//! handlers object. So [`plugin_source`] emits that module,
+//! plugin modules only"*). Its event surface is a module exporting
+//! `(input: PluginInput, options?) => Promise<Hooks>`, where `PluginInput` is
+//! `{client, project, directory, worktree, serverUrl, $, …}`. So
+//! [`plugin_source`] emits that module,
 //! [`crate::agent::AgentControl::hooks_settings_json`] returns its **JS
 //! source** — the seam calls it "the per-session hook-settings file" and
 //! nothing requires it to be JSON; Kimi already puts TOML through it — and
@@ -31,9 +38,15 @@
 //! test. §9.1's containment is therefore followed to the letter and is not
 //! negotiable —
 //!
-//! - the plugin does **no logic**: no filtering, no state, no retries, no reads
-//!   of the agent's own data. It serializes what it was handed and spawns
-//!   `miao hook --agent opencode <event>`;
+//! - the plugin holds **no state, no retries and no reads of the agent's own
+//!   data**. It serializes what it was handed and spawns
+//!   `miao hook --agent opencode <event>`. What it does decide is the *event
+//!   name*, which is our argv and therefore cannot be deferred to Rust — see
+//!   [`BUS_EVENTS`] for the two places that decision needs a payload field, and
+//!   why forwarding those two unfiltered would be a denial of service against
+//!   the user's own session. Every other field is dug out in
+//!   [`parse_hook_payload`], where it is testable, rather than in JavaScript
+//!   this tree cannot execute;
 //! - the socket arrives via `$CAPTAIN_MIAO_SOCK`, never spliced into the file,
 //!   so one plugin serves every session byte-for-byte (and nothing in the JS
 //!   needs shell quoting: the child is spawned with an argv array, never
@@ -62,31 +75,34 @@
 //! *in* the config). A symlink is enough, and it keeps a `/model` change inside
 //! a captain-miao session landing in the user's real file.
 //!
-//! **What this backend deliberately does not report, and why each is a name we
-//! do not have rather than a feature out of reach.** §9.3 names the *events*;
-//! it names no **field inside any payload**. A guessed field name would put a
-//! wrong value in a column read as fact, so every one of these is `None` and
-//! the raw envelope is forwarded whole so that a single captured payload turns
-//! several of them on at once:
+//! ## Two mechanisms, because `Hooks` is two mechanisms
 //!
-//! - **No session id.** This is the expensive one: `LauncherState.session_id`
-//!   is what `r` / `f` resume from, so an opencode row **cannot be resumed from
-//!   the dashboard** — [`crate::agent::AgentControl::resume_args`] is correct
-//!   (`-s <id>`, `--fork`) and simply never gets an id to use. `opencode -c` in
-//!   the session's directory is the workaround until a payload field is known.
-//! - **No title.** §9.3 says `session.updated` carries it, but names no field,
-//!   so the event is not even registered: subscribing in order to discard the
-//!   payload would spawn a subprocess per title change for nothing.
-//! - **No tool name** — the Tool column stays empty on `PreToolUse`.
-//! - **No tokens and no model.** §9.4 ships phase 1 without them deliberately.
-//!   `HookMessage` now carries `context_tokens` / `model` (§9.4's option 2, and
-//!   it is *built*), so the moment a usage field is named this is a two-line
-//!   change with no transcript machinery at all. Reading `opencode.db` is
-//!   explicitly **not** done here: the schema is unprobed, and cm-core linking
-//!   SQLite already (for Codex titles) makes it tempting rather than justified.
-//! - **No prompt, and so no rest→`Active` edge until the first tool call** —
-//!   see [`EVENTS`], which is where that decision is argued. It is the largest
-//!   behavioural gap and the top probe item.
+//! - **Direct hooks** — `chat.message`, `tool.execute.before` / `.after`,
+//!   `permission.ask`, `experimental.session.compacting`, … Each is a named key
+//!   on `Hooks` taking `(input, output)`, and `output` is **mutable**: these are
+//!   decision points opencode waits on, not notifications.
+//! - **The bus** — one `event(input: {event: Event})` key receiving the whole
+//!   typed union, where `event.type` names it and `event.properties` carries it.
+//!   Observation only; opencode does not act on the return.
+//!
+//! We take the direct hooks only for the facts opencode states *nowhere else* —
+//! the tool name, and the turn-start that `chat.message` is — and read the rest
+//! off the bus, because an observer on the bus cannot delay a turn.
+//! `permission.ask` is deliberately **not** used despite existing and being the
+//! obvious fit: it can set `output.status`, so a plugin sitting in it is in the
+//! path of the user's own approval prompt. The bus's `permission.updated`
+//! carries the same `Permission` and cannot block.
+//!
+//! `session.status` is the one genuinely authoritative signal here — its
+//! `{type: "idle" | "busy" | "retry"}` is opencode's own view of whether the
+//! session is working — and it is still **not** what drives the row, for the
+//! reason a capability gate usually exists: it is strictly *coarser* than our
+//! vocabulary. A session waiting on an approval is `busy`, and a `busy` arriving
+//! after `permission.updated` would knock the row out of `WaitingForApproval`
+//! back to `Active`. Only its `idle` edge is forwarded (as `Stop`), where it
+//! costs nothing and buys the one thing the finer events might miss — an
+//! **interrupted** turn that never reaches `session.idle`. That asymmetry is the
+//! whole of [`BUS_EVENTS`]'s special-casing besides `message.updated`.
 //!
 //! **The documented upgrade path is not the plugin.** §9.2: `opencode serve`
 //! exposes an HTTP API with an SSE event stream and an official SDK, which
@@ -96,37 +112,25 @@
 //! mechanism in the one file this whole design exists to keep small. Revisit if
 //! the plugin proves unreliable; do not mistake the plugin for the optimum.
 //!
-//! What a probe against a real binary must settle, worst-breakage first:
+//! What a probe against a real binary must still settle — the payload shapes
+//! are no longer among them, since the SDK's generated types give every one:
 //!
-//! - **whether a handlers object keyed by §9.3's event names actually
-//!   subscribes anything.** §9 states the module shape ("returns a handlers
-//!   object") and lists the event names, but never states that the object's
-//!   *keys* are those names. [`plugin_source`] bets that they are, on the
-//!   strength of `tool.execute.before` / `.after` being handler-key-shaped in
-//!   §9.3's own table. If opencode instead delivers everything through a single
-//!   bus subscription, **no event ever fires and every row sits at
-//!   `Starting`** — which is also what a wrong file name or an unloaded plugin
-//!   looks like, so check this before believing any other symptom;
 //! - **that a `plugins/` directory loads every module in it**, and that
 //!   `captain-miao.js` (not `index.ts`, not a package) is a shape it accepts;
-//!   and that the export is picked up — the file exports the same function both
-//!   named and default, deliberately, because §9 does not say which convention
-//!   applies and offering both costs nothing;
-//! - **the turn-start signal.** §9.3 marks it `[PROBE]` itself. See [`EVENTS`];
-//! - **whether `session.status` carries a busy/idle string.** If it does it is
-//!   an *authoritative* status source and should drive the row directly, the way
-//!   Claude's session file does, retiring the edge mapping below. §9.3 does not
-//!   establish that it does, so the edges are what ships;
-//! - **the payload field names**, in one go: session id, title, tool name,
-//!   usage, model. Point `OPENCODE_CONFIG_DIR` at a scratch dir holding a
-//!   hand-written plugin that appends `JSON.stringify(arguments)` to a file, run
-//!   one turn, and every `None` above is answered at once;
-//! - **whether `opencode session list` takes `--json`** (§9.4 marks the flag
-//!   `[PROBE]`), which is the whole of `list_resumable`;
-//! - **whether an interrupted turn still ends in `session.idle`.** §9.3 calls
-//!   it "the turn-ended signal" without qualifying it. If Esc skips it, this
-//!   backend inherits Grok's problem — a live row stranded at `Active` — and
-//!   there is no transcript of ours to scan for a sentinel;
+//!   and which export convention applies. The file exports the same function
+//!   named *and* default; `PluginModule` in `packages/plugin/src/index.ts` also
+//!   describes a `{id?, server}` object form, which we do **not** emit — if
+//!   nothing fires and the module is demonstrably loaded, that is the next
+//!   thing to try;
+//! - **whether an interrupted turn still ends in `session.idle`.** If Esc skips
+//!   it, the `session.status` → `idle` edge above is what saves the row from
+//!   stranding at `Active` — which is why it is subscribed even though the
+//!   finer events would normally cover it;
+//! - **whether `message.updated` fires with `time.completed` set exactly once
+//!   per assistant turn.** [`BUS_EVENTS`] gates on that field to keep one
+//!   subprocess per turn rather than one per streamed chunk; if the completed
+//!   message is re-emitted, the token column simply updates twice with the same
+//!   number, but if it is *never* emitted the column stays empty;
 //! - **whether `$XDG_CONFIG_HOME` moves the real config dir.** §9 spells it
 //!   `~/.config/opencode/`, the XDG default; [`config_dir`] honours the
 //!   variable when it is set, which is a guess in the direction that fails
@@ -142,6 +146,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -168,49 +173,60 @@ const PLUGINS_DIR: &str = "plugins";
 /// transpile step is the one to pick.
 const PLUGIN_FILE: &str = "captain-miao.js";
 
-/// The opencode events we subscribe to, and the [`HookEvent`] each becomes.
-/// Straight from §9.3, and the **only** vocabulary this backend has: no payload
-/// field name in it is known, so an event's *name* is the entire signal.
+/// Bus event `type` → the [`HookEvent`] it becomes, for every event forwarded
+/// by name alone. Types absent from this table are dropped in the plugin, which
+/// is the difference between subscribing to opencode's bus and drowning in it:
+/// `file.watcher.updated` and `message.part.updated` alone would spawn hundreds
+/// of processes a turn.
 ///
-/// Three rows of §9.3 are deliberately absent, each because subscribing would
-/// cost more than the silence does:
+/// Two types are handled *outside* this table because forwarding them by name
+/// alone is wrong, and both are the reason the plugin reads one field:
 ///
-/// - **`message.updated` → `PromptSubmit`**, §9.3's own `[PROBE]` row ("no
-///   explicit 'prompt submitted' event; find the cleanest turn-start signal").
-///   §9 qualifies it *"(user part)"* — i.e. the mapping is specified for user
-///   messages only, and the field distinguishing those is one of the names we
-///   do not have. §9.1 forbids the plugin from filtering anyway. Subscribing
-///   **unfiltered** is therefore not the specified mapping but a superset of
-///   it, and a dangerous one in three separate ways: it spawns one `miao hook`
-///   process per message update — plausibly per streamed chunk, i.e. hundreds
-///   per turn inside the agent's own process tree, which is a load captain-miao
-///   must never put on a session; `dispatch_default`'s `PromptSubmit` arm
-///   clears `last_tool`, so the Tool column would blank mid-tool; and one
-///   update landing *after* `session.idle` re-`Active`s a settled row. The
-///   honest cost of leaving it out is stated plainly: **a turn goes `Active` at
-///   its first tool call rather than at submission, and a tool-free turn never
-///   leaves rest at all.** This is the top probe item.
-/// - **`session.updated`** — carries the title, under a field name §9 never
-///   gives (module doc).
-/// - **`session.status`** — if it carries a busy/idle string it is the
-///   authoritative source that should replace this whole table (module doc),
-///   but the string's field name is unknown, so subscribing today would
-///   forward a payload nothing can read.
+/// - **`session.status`** — forwarded only on `properties.status.type ===
+///   "idle"`, as `Stop`. `busy` is dropped rather than mapped, because it is
+///   coarser than the state the finer events have already established (module
+///   doc). This is the safety net for an interrupted turn.
+/// - **`message.updated`** — forwarded only for an assistant message with
+///   `time.completed` set, i.e. **once per turn** rather than once per streamed
+///   chunk. It is not a status edge at all; it is how the token and model
+///   columns arrive (see [`parse_hook_payload`]), which is why it maps to
+///   `CwdChanged` — the one arm of `common::dispatch_default` that touches no
+///   status, while `adopt_session_facts` still takes the tokens, the model and
+///   the id off the payload.
 ///
-/// `experimental.session.compacting` is registered despite §9 flagging it
-/// experimental: an event opencode does not emit costs one dead handler key,
-/// while omitting one it does emit leaves a row stuck in `Compacting` until the
-/// next event of any kind.
-const EVENTS: &[(&str, HookEvent)] = &[
+/// `session.updated` maps to `CwdChanged` for the same reason: it is a title
+/// change (and a `directory`), never a status edge, so it must reach
+/// `adopt_session_facts` without disturbing a row mid-turn.
+const BUS_EVENTS: &[(&str, HookEvent)] = &[
     ("session.created", HookEvent::SessionStart),
-    ("tool.execute.before", HookEvent::PreToolUse),
-    ("tool.execute.after", HookEvent::PostToolUse),
-    ("permission.asked", HookEvent::PermissionRequest),
+    ("session.updated", HookEvent::CwdChanged),
+    ("permission.updated", HookEvent::PermissionRequest),
     ("permission.replied", HookEvent::ElicitationResult),
     ("session.idle", HookEvent::Stop),
     ("session.error", HookEvent::StopFailure),
-    ("experimental.session.compacting", HookEvent::PreCompact),
     ("session.compacted", HookEvent::PostCompact),
+];
+
+/// The `Hooks` keys we implement directly, and the [`HookEvent`] each becomes.
+/// These are the facts opencode states nowhere else:
+///
+/// - `chat.message` is the **turn start** — a real "the user submitted this"
+///   signal, carrying `sessionID` and the `{providerID, modelID}` of the model
+///   about to run. This is what makes a tool-free turn show as working, which
+///   the bus alone cannot do.
+/// - `tool.execute.before` / `.after` carry `tool`, the only source of the Tool
+///   column.
+/// - `experimental.session.compacting` is the only pre-compaction signal;
+///   `session.compacted` on the bus is the matching end, so a row leaves
+///   `Compacting` on its own.
+///
+/// Every one of these also carries `sessionID`, which is what `r` and `f`
+/// resume from.
+const DIRECT_HOOKS: &[(&str, HookEvent)] = &[
+    ("chat.message", HookEvent::PromptSubmit),
+    ("tool.execute.before", HookEvent::PreToolUse),
+    ("tool.execute.after", HookEvent::PostToolUse),
+    ("experimental.session.compacting", HookEvent::PreCompact),
 ];
 
 // =============================================================================
@@ -420,12 +436,22 @@ const BIN_FALLBACK: &str = "miao";
 /// plugin "export[s] a function" without saying under which convention. Both
 /// point at the same function; the unused one costs a line.
 fn plugin_source(miao: &str) -> String {
-    let handlers: String = EVENTS
+    let bus: String = BUS_EVENTS
         .iter()
         .map(|(native, event)| {
             format!(
-                "    {}: report({}),\n",
+                "  {}: {},\n",
                 js_string(native),
+                js_string(event.as_kebab())
+            )
+        })
+        .collect();
+    let handlers: String = DIRECT_HOOKS
+        .iter()
+        .map(|(key, event)| {
+            format!(
+                "    {}: report({}),\n",
+                js_string(key),
                 js_string(event.as_kebab())
             )
         })
@@ -436,40 +462,71 @@ fn plugin_source(miao: &str) -> String {
 // captain-miao's `agents/opencode.rs` on every launch, so edits here are lost.
 //
 // It forwards opencode's lifecycle events to the captain-miao launcher that
-// started this session and does nothing else: no filtering, no state, no
-// retries, no reads of your data. The launcher socket arrives in
-// $CAPTAIN_MIAO_SOCK — it is never written into this file, so the file is
-// identical for every session. Delete it and sessions stop being tracked;
-// nothing else changes.
+// started this session and does nothing else: no state, no retries, no reads of
+// your data. Payloads are forwarded whole and picked apart on the other side;
+// the only fields read here are the two that decide whether to forward at all.
+// The launcher socket arrives in $CAPTAIN_MIAO_SOCK — it is never written into
+// this file, so the file is identical for every session. Delete it and sessions
+// stop being tracked; nothing else changes.
 import {{ spawn }} from "node:child_process";
 
 const MIAO = {miao};
 
-const CaptainMiao = (ctx) => {{
+// opencode bus event type -> captain-miao event name. Anything not listed is
+// dropped: the bus carries per-chunk and per-file events that would otherwise
+// spawn hundreds of processes inside your session.
+const BUS = {{
+{bus}}};
+
+const CaptainMiao = async (ctx) => {{
   const directory = ctx?.directory ?? null;
+  const send = (event, args) => {{
+    let body;
+    try {{
+      body = JSON.stringify({{ event, directory, payload: args }});
+    }} catch {{
+      body = JSON.stringify({{ event, directory }});
+    }}
+    let child;
+    try {{
+      child = spawn(MIAO, ["hook", "--agent", "opencode", event], {{
+        stdio: ["pipe", "ignore", "ignore"],
+      }});
+    }} catch {{
+      return;
+    }}
+    child.on("error", () => {{}});
+    child.stdin.on("error", () => {{}});
+    child.stdin.end(body);
+  }};
   const report =
     (event) =>
-    (...args) => {{
-      let body;
-      try {{
-        body = JSON.stringify({{ event, directory, payload: args }});
-      }} catch {{
-        body = JSON.stringify({{ event, directory }});
-      }}
-      let child;
-      try {{
-        child = spawn(MIAO, ["hook", "--agent", "opencode", event], {{
-          stdio: ["pipe", "ignore", "ignore"],
-        }});
-      }} catch {{
-        return;
-      }}
-      child.on("error", () => {{}});
-      child.stdin.on("error", () => {{}});
-      child.stdin.end(body);
+    async (...args) => {{
+      send(event, args);
     }};
 
   return {{
+    event: async (input) => {{
+      const e = input?.event;
+      const type = e?.type;
+      if (!type) return;
+      // Authoritative but coarser than the dashboard's states, so only the
+      // settle edge is taken: a session waiting on an approval is "busy" too.
+      if (type === "session.status") {{
+        if (e.properties?.status?.type === "idle") send("stop", [input]);
+        return;
+      }}
+      // Once per assistant turn, not once per streamed chunk. This is the
+      // token and model column, not a status edge.
+      if (type === "message.updated") {{
+        const info = e.properties?.info;
+        if (info?.role !== "assistant" || !info?.time?.completed) return;
+        send("cwd-changed", [input]);
+        return;
+      }}
+      const name = BUS[type];
+      if (name) send(name, [input]);
+    }},
 {handlers}  }};
 }};
 
@@ -509,38 +566,131 @@ fn js_string(s: &str) -> String {
 /// stdin is self-describing.
 #[derive(Deserialize)]
 struct HookPayload {
-    /// The plugin context's `directory` (§9.1), the one field of the whole
-    /// mechanism whose meaning §9 states. Reported as `cwd` for honesty and for
-    /// a probe's benefit; nothing consumes it, since `dispatch_default` reads
-    /// `msg.cwd` only on `CwdChanged` and opencode registers no such event.
+    /// The plugin context's `directory` — the session's own working directory,
+    /// and the fallback `cwd` for a payload that names none itself.
     directory: Option<String>,
+    /// The handler's arguments, verbatim. `[{event}]` for a bus event,
+    /// `[input, output]` for a direct hook.
+    #[serde(default)]
+    payload: Vec<Value>,
+}
+
+/// Follow `path` through nested objects. Every lookup below is one of these, so
+/// a payload that is a different shape than expected yields `None` rather than
+/// an error — the plugin forwards several event shapes under one of our names,
+/// and a miss on one shape is how the next is reached.
+fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter().try_fold(v, |acc, key| acc.get(key))
+}
+
+fn str_at(v: &Value, path: &[&str]) -> Option<String> {
+    at(v, path)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
+    at(v, path).and_then(Value::as_u64)
+}
+
+/// `providerID/modelID`, the spelling opencode itself uses for a model
+/// reference — kept whole rather than reduced to `modelID`, because the same
+/// model id is served by several providers and the pair is what a `/model`
+/// switch actually changes.
+fn model_ref(v: &Value, path: &[&str]) -> Option<String> {
+    let scope = at(v, path)?;
+    let model = str_at(scope, &["modelID"])?;
+    match str_at(scope, &["providerID"]) {
+        Some(provider) => Some(format!("{provider}/{model}")),
+        None => Some(model),
+    }
+}
+
+/// Pull everything the launcher can use out of one handler's arguments.
+///
+/// The field names all come from opencode's generated SDK types
+/// (`packages/sdk/js/src/gen/types.gen.ts`): `Session` for `session.*`,
+/// `AssistantMessage` / `UserMessage` for `message.updated`, `Permission` for
+/// `permission.updated`, and `Hooks` in `packages/plugin/src/index.ts` for the
+/// direct hooks' `input`. Several event shapes arrive under one of our event
+/// names, so each fact is a short ordered list of the places it can be, not a
+/// single path — the ordering is what keeps a `Message.id` from being read as a
+/// session id.
+fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMessage {
+    let first = payload.payload.first().cloned().unwrap_or(Value::Null);
+    let props = at(&first, &["event", "properties"])
+        .cloned()
+        .unwrap_or(Value::Null);
+    let info = at(&props, &["info"]).cloned().unwrap_or(Value::Null);
+    // A `Session` has a `directory`; a `Message` does not. That one field is
+    // what tells the two `info` shapes apart, and every lookup keyed on
+    // "is this a Session" below uses it.
+    let info_is_session = at(&info, &["directory"]).and_then(Value::as_str).is_some();
+    let assistant = at(&info, &["role"]).and_then(Value::as_str) == Some("assistant");
+
+    let session_id = str_at(&info, &["sessionID"])
+        .or_else(|| info_is_session.then(|| str_at(&info, &["id"])).flatten())
+        .or_else(|| str_at(&props, &["sessionID"]))
+        .or_else(|| str_at(&first, &["sessionID"]));
+
+    // Only a `Session` has a session title. `UserMessage.summary.title`
+    // summarises one message and is deliberately not taken for it.
+    let session_title = info_is_session.then(|| str_at(&info, &["title"])).flatten();
+
+    // Input-side only, matching `agents::claude`'s fold: this column is "how
+    // full is the context window", and completion tokens are not in the next
+    // request. Cache reads and writes are, so both are counted.
+    let context_tokens = assistant.then(|| {
+        let t = |k: &[&str]| u64_at(&info, k).unwrap_or(0);
+        t(&["tokens", "input"]) + t(&["tokens", "cache", "read"]) + t(&["tokens", "cache", "write"])
+    });
+
+    let model = model_ref(&first, &["model"]).or_else(|| model_ref(&info, &[]));
+
+    HookMessage {
+        event,
+        session_id,
+        tool_name: str_at(&first, &["tool"]),
+        // `session.error`'s error is a tagged union whose payloads all nest a
+        // `data.message`; anything else falls through to the raw envelope in
+        // `dispatch_default`'s `StopFailure` arm.
+        message: str_at(&props, &["error", "data", "message"]),
+        cwd: str_at(&info, &["directory"])
+            .or_else(|| str_at(&info, &["path", "cwd"]))
+            .or_else(|| payload.directory.clone()),
+        // `chat.message`'s `output.parts` — the text the user just submitted.
+        prompt: payload.payload.get(1).and_then(first_text_part),
+        session_title,
+        context_tokens,
+        model,
+        // No transcript path, and this is the field the launcher gates its
+        // entire transcript watch on — so nothing reads an opencode transcript.
+        // Nothing needs to: tokens, model and title all arrive here by push,
+        // which is strictly better than a fold (`common::adopt_session_facts`
+        // is explicit that a backend picks one source, not both).
+        transcript_path: None,
+        raw: None,
+    }
+}
+
+/// The first text part of a `chat.message` `output`, which is the prompt as the
+/// user typed it. Parts are a tagged union (`text`, `reasoning`, `file`, …) and
+/// only `text` has a body worth showing on a row.
+fn first_text_part(output: &Value) -> Option<String> {
+    at(output, &["parts"])?
+        .as_array()?
+        .iter()
+        .find(|p| at(p, &["type"]).and_then(Value::as_str) == Some("text"))
+        .and_then(|p| str_at(p, &["text"]))
 }
 
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse opencode hook JSON from stdin")?;
     Ok(HookMessage {
-        event,
-        // Every one of these is a field name §9 does not give (module doc). The
-        // raw envelope below carries the agent's own payload, so none of this
-        // is lost — only unread.
-        session_id: None,
-        tool_name: None,
-        message: None,
-        cwd: payload.directory,
-        prompt: None,
-        session_title: None,
-        context_tokens: None,
-        model: None,
-        // No transcript path, and this is the field the launcher gates its
-        // entire transcript watch on — so nothing reads an opencode transcript,
-        // which is what makes the empty `read_transcript_stats` and
-        // `scan_transcript_signals` consistent rather than merely
-        // unimplemented. opencode's sessions live in `opencode.db` + `storage/`
-        // besides, which is not a file the launcher's byte-offset fold could
-        // follow even if it had the path.
-        transcript_path: None,
         raw: Some(stdin.to_string()),
+        ..parse_hook_payload_inner(event, &payload)
     })
 }
 
@@ -548,15 +698,14 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 // Hook event → status mapping
 // =============================================================================
 
-/// opencode departs from [`common::dispatch_default`] nowhere.
-///
-/// That is a consequence of how little it reports, not a fit: the nine events
-/// in [`EVENTS`] are nine of ours under different spellings, and the two places
-/// another backend needed an arm — an interrupt arriving as something else
-/// (Reasonix), a session-end `Stop` to tell from a turn-end one (Grok) — are
-/// both distinctions that need a payload *field*, and we have none. The wrapper
-/// stays so the seam keeps one callee per backend, and so the day a probe names
-/// a field, it has a place to land.
+/// opencode departs from [`common::dispatch_default`] nowhere, and here that is
+/// a genuine fit rather than a shrug: every event in [`BUS_EVENTS`] and
+/// [`DIRECT_HOOKS`] is one of ours under a different spelling, and the two
+/// places another backend needed an arm — an interrupt arriving as something
+/// else (Reasonix), a session-end `Stop` to tell from a turn-end one (Grok) —
+/// are both handled upstream instead, in the plugin, by not forwarding the
+/// events that would need the distinction. The wrapper stays so the seam keeps
+/// one callee per backend.
 pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
     common::dispatch_default(state, msg)
 }
@@ -571,12 +720,21 @@ mod tests {
     use crate::agent::AgentControl;
     use crate::state::SessionStatus;
 
-    /// A stdin body in exactly the shape [`plugin_source`]'s `report` writes —
+    /// A stdin body in exactly the shape [`plugin_source`]'s `send` writes —
     /// **hand-written to match the template above, not captured from a running
-    /// binary**. Its `payload` is deliberately opaque: no field in it is read,
-    /// and that is the property under test.
+    /// binary**, but with `args` in the shapes opencode's generated SDK types
+    /// declare, which is what makes the field lookups testable at all.
     fn payload(event: &str, args: &str) -> String {
         format!(r#"{{"event":"{event}","directory":"/home/miao/p","payload":[{args}]}}"#)
+    }
+
+    /// One bus event, wrapped the way the `event` hook receives it:
+    /// `{event: {type, properties}}`.
+    fn bus(name: &str, ty: &str, properties: &str) -> String {
+        payload(
+            name,
+            &format!(r#"{{"event":{{"type":"{ty}","properties":{properties}}}}}"#),
+        )
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
@@ -618,62 +776,150 @@ mod tests {
             .block_on(dispatch_hook(state, msg));
     }
 
-    /// The turn as this backend can see it: `session.created` settles the row
-    /// out of `Starting`, the first **tool call** is what makes it `Active`
-    /// (there is no prompt event — see [`EVENTS`]), and `session.idle` ends it.
+    /// A whole turn, in the order a live session produces it: `session.created`
+    /// settles the row out of `Starting` and names it, `chat.message` starts the
+    /// turn (the thing the first cut of this backend could not see at all), a
+    /// tool runs, and `session.idle` ends it.
     #[test]
-    fn a_turn_runs_from_the_first_tool_call_to_idle() {
+    fn a_turn_runs_from_the_prompt_to_idle() {
         let mut state = state_at(SessionStatus::Starting);
         feed(
             &mut state,
             HookEvent::SessionStart,
-            &payload("session-start", ""),
+            &bus(
+                "session-start",
+                "session.created",
+                r#"{"info":{"id":"ses_1","title":"wire up the parser","directory":"/home/miao/p"}}"#,
+            ),
         );
         assert_eq!(state.status, SessionStatus::Idle);
-        // No session id rides any payload, so the launcher never learns one —
-        // which is what makes an opencode row unresumable from the dashboard.
-        assert_eq!(state.session_id, None);
+        // The id is what `r` and `f` resume from, and it rides the very first
+        // event of the session.
+        assert_eq!(state.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(state.name.as_deref(), Some("wire up the parser"));
+
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload(
+                "prompt-submit",
+                r#"{"sessionID":"ses_1","model":{"providerID":"anthropic","modelID":"some-model-1"}},
+                   {"parts":[{"type":"text","text":"add a test"}]}"#,
+            ),
+        );
+        // A turn is working from the prompt, not from its first tool call — the
+        // whole point of `chat.message`, and what makes a tool-free turn visible.
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.model.as_deref(), Some("anthropic/some-model-1"));
+        assert_eq!(state.last_prompt.as_deref(), Some("add a test"));
 
         feed(
             &mut state,
             HookEvent::PreToolUse,
-            &payload("pre-tool-use", r#"{"tool":"bash"}"#),
+            &payload("pre-tool-use", r#"{"tool":"bash","sessionID":"ses_1"}"#),
         );
         assert_eq!(state.status, SessionStatus::Active);
-        // The tool name is *in* the forwarded payload and deliberately not read
-        // out of it: `"tool"` here is the fixture's invention, not a documented
-        // field, and a wrong guess would fill the Tool column with fiction.
-        assert_eq!(state.last_tool, None);
+        assert_eq!(state.last_tool.as_deref(), Some("bash"));
 
         feed(
             &mut state,
             HookEvent::PostToolUse,
-            &payload("post-tool-use", ""),
+            &payload("post-tool-use", r#"{"tool":"bash","sessionID":"ses_1"}"#),
         );
         assert_eq!(state.status, SessionStatus::Active);
 
-        feed(&mut state, HookEvent::Stop, &payload("stop", ""));
+        feed(
+            &mut state,
+            HookEvent::Stop,
+            &bus("stop", "session.idle", r#"{"sessionID":"ses_1"}"#),
+        );
         assert_eq!(state.status, SessionStatus::Idle);
         assert_eq!(state.last_tool, None);
     }
 
+    /// The token and model columns, which arrive on a *completed* assistant
+    /// message and nowhere else. `CwdChanged` is the carrier because this is not
+    /// a status edge: a settled row must stay settled.
+    #[test]
+    fn a_completed_assistant_message_fills_the_token_and_model_columns() {
+        let mut state = state_at(SessionStatus::Idle);
+        feed(
+            &mut state,
+            HookEvent::CwdChanged,
+            &bus(
+                "cwd-changed",
+                "message.updated",
+                r#"{"info":{"id":"msg_1","sessionID":"ses_1","role":"assistant",
+                    "providerID":"anthropic","modelID":"some-model-1",
+                    "path":{"cwd":"/home/miao/p","root":"/home/miao/p"},
+                    "time":{"created":1,"completed":2},
+                    "tokens":{"input":100,"output":900,"reasoning":10,
+                              "cache":{"read":50,"write":25}}}}"#,
+            ),
+        );
+        // Input side only — 100 + 50 + 25. The 900 output tokens are not in the
+        // next request, so they are not in the context gauge; this is the same
+        // fold `agents::claude` does.
+        assert_eq!(state.context_tokens, Some(175));
+        assert_eq!(state.model.as_deref(), Some("anthropic/some-model-1"));
+        assert_eq!(state.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(state.status, SessionStatus::Idle, "not a status edge");
+        // `Message.id` is a *message* id and must never be read as the session's
+        // — the ordering in `parse_hook_payload_inner` is what prevents it.
+        assert_ne!(state.session_id.as_deref(), Some("msg_1"));
+    }
+
+    /// A rename mid-session lands on the row without disturbing a running turn.
+    #[test]
+    fn a_session_update_renames_without_touching_the_status() {
+        let mut state = state_at(SessionStatus::Active);
+        state.name = Some("old".to_string());
+        feed(
+            &mut state,
+            HookEvent::CwdChanged,
+            &bus(
+                "cwd-changed",
+                "session.updated",
+                r#"{"info":{"id":"ses_1","title":"renamed","directory":"/home/miao/q"}}"#,
+            ),
+        );
+        assert_eq!(state.name.as_deref(), Some("renamed"));
+        assert_eq!(state.cwd, "/home/miao/q");
+        assert_eq!(state.status, SessionStatus::Active);
+    }
+
     /// Approval is reachable and needs no second mechanism (Grok reaches it
     /// only through a separate notification system), and the reply settles the
-    /// row back to `Active` rather than leaving it parked.
+    /// row back to `Active` rather than leaving it parked. Both edges come off
+    /// the **bus**, never from the `permission.ask` hook, which opencode waits
+    /// on — see the module doc.
     #[test]
     fn a_permission_gate_opens_and_closes() {
         let mut state = state_at(SessionStatus::Active);
         feed(
             &mut state,
             HookEvent::PermissionRequest,
-            &payload("permission-request", ""),
+            // `EventPermissionUpdated.properties` *is* the `Permission`, spread
+            // rather than nested under `info` — hence the `props.sessionID` step.
+            &bus(
+                "permission-request",
+                "permission.updated",
+                r#"{"id":"per_1","type":"bash","sessionID":"ses_1",
+                    "messageID":"msg_1","title":"run tests","metadata":{},
+                    "time":{"created":1}}"#,
+            ),
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
+        assert_eq!(state.session_id.as_deref(), Some("ses_1"));
 
         feed(
             &mut state,
             HookEvent::ElicitationResult,
-            &payload("elicitation-result", ""),
+            &bus(
+                "elicitation-result",
+                "permission.replied",
+                r#"{"sessionID":"ses_1","permissionID":"per_1","response":"once"}"#,
+            ),
         );
         assert_eq!(state.status, SessionStatus::Active);
     }
@@ -697,42 +943,78 @@ mod tests {
         assert_eq!(state.status, SessionStatus::Compacted);
     }
 
-    /// `session.error` ends the turn and puts *something* on the row. With no
-    /// documented error field, `dispatch_default` falls back to the raw
-    /// envelope — which is at least honest about what the agent actually sent,
-    /// and is the payload a probe wants to see.
+    /// `session.error` ends the turn and puts the agent's own message on the
+    /// row. Every arm of opencode's error union (`ProviderAuthError`,
+    /// `UnknownError`, `MessageOutputLengthError`, …) nests its text at
+    /// `data.message`, so one path serves them all.
     #[test]
-    fn a_session_error_settles_the_row_and_surfaces_the_raw_payload() {
+    fn a_session_error_settles_the_row_with_the_agents_own_message() {
         let mut state = state_at(SessionStatus::Active);
-        let stdin = payload("stop-failure", r#"{"boom":true}"#);
+        feed(
+            &mut state,
+            HookEvent::StopFailure,
+            &bus(
+                "stop-failure",
+                "session.error",
+                r#"{"sessionID":"ses_1","error":{"name":"ProviderAuthError",
+                    "data":{"providerID":"anthropic","message":"missing api key"}}}"#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(state.last_error.as_deref(), Some("missing api key"));
+    }
+
+    /// An error shape we do not recognise still settles the row, and falls back
+    /// to the raw envelope rather than to nothing — which is also the payload a
+    /// probe wants to see.
+    #[test]
+    fn an_unrecognised_error_falls_back_to_the_raw_envelope() {
+        let mut state = state_at(SessionStatus::Active);
+        let stdin = bus("stop-failure", "session.error", r#"{"boom":true}"#);
         feed(&mut state, HookEvent::StopFailure, &stdin);
         assert_eq!(state.status, SessionStatus::Idle);
         assert_eq!(state.last_error.as_deref(), Some(stdin.as_str()));
     }
 
-    /// The envelope is *ours*, so what it must guarantee is that nothing is
-    /// read out of opencode's own payload by accident — a field that later
-    /// turns out to mean something else is the failure this backend is built to
-    /// avoid.
+    /// A payload in a shape none of the lookups match must yield an empty
+    /// `HookMessage` rather than a wrong one — the ordered fallbacks in
+    /// `parse_hook_payload_inner` all end in `None`, and this is what stops a
+    /// future opencode event shape from filling a column with fiction.
     #[test]
-    fn nothing_is_read_out_of_the_agents_payload() {
-        let stdin = payload(
-            "pre-tool-use",
-            r#"{"sessionID":"s1","title":"a title","tool":"bash","tokens":42,"model":"m"}"#,
-        );
-        let msg = parse_hook_payload(HookEvent::PreToolUse, &stdin).expect("parses");
+    fn an_unfamiliar_payload_reads_as_nothing_rather_than_as_something() {
+        let stdin = payload("stop", r#"{"unexpected":{"id":"x","title":"y"}}"#);
+        let msg = parse_hook_payload(HookEvent::Stop, &stdin).expect("parses");
+        assert_eq!(msg.session_id, None);
+        assert_eq!(msg.session_title, None);
+        assert_eq!(msg.tool_name, None);
+        assert_eq!(msg.context_tokens, None);
+        assert_eq!(msg.model, None);
+        // The plugin context's directory is the one fact every payload carries.
         assert_eq!(msg.cwd.as_deref(), Some("/home/miao/p"));
-        assert_eq!(msg.session_id, None, "no documented session-id field");
-        assert_eq!(msg.session_title, None, "no documented title field");
-        assert_eq!(msg.tool_name, None, "no documented tool-name field");
-        assert_eq!(msg.context_tokens, None, "no documented usage field");
-        assert_eq!(msg.model, None, "no documented model field");
         // No transcript path is derived, which is what keeps the launcher's
         // transcript machinery inert for opencode.
         assert_eq!(msg.transcript_path, None);
-        // Everything the agent sent survives verbatim, so one captured hook
-        // fills in every assertion above.
+        // Everything the agent sent survives verbatim regardless.
         assert_eq!(msg.raw.as_deref(), Some(stdin.as_str()));
+    }
+
+    /// A `UserMessage` carries `summary.title`, which summarises *that message*
+    /// and is not the session's name. Taking it would rename the row on every
+    /// turn.
+    #[test]
+    fn a_message_summary_is_never_read_as_the_session_title() {
+        let stdin = bus(
+            "cwd-changed",
+            "message.updated",
+            r#"{"info":{"id":"msg_1","sessionID":"ses_1","role":"user",
+                "summary":{"title":"a summary of one message"},
+                "time":{"created":1}}}"#,
+        );
+        let msg = parse_hook_payload(HookEvent::CwdChanged, &stdin).expect("parses");
+        assert_eq!(msg.session_title, None);
+        assert_eq!(msg.session_id.as_deref(), Some("ses_1"));
+        // Not an assistant message, so no token total is invented for it.
+        assert_eq!(msg.context_tokens, None);
     }
 
     /// One plugin serves every session, so it must carry no per-session data.
@@ -747,43 +1029,76 @@ mod tests {
         assert!(a.contains("CAPTAIN_MIAO_SOCK"), "{a}");
     }
 
-    /// Every handler key is an event name from §9.3 and every value is a
-    /// [`HookEvent`] this build knows — the two halves of the mechanism live in
-    /// different languages and nothing else pins them together. A kebab name
-    /// that stopped round-tripping would make `miao hook` reject its own
-    /// plugin's calls at runtime, with the row simply never moving.
+    /// Every registered name round-trips through the forwarder — the two halves
+    /// of the mechanism live in different languages and nothing else pins them
+    /// together. A kebab name that stopped round-tripping would make `miao hook`
+    /// reject its own plugin's calls at runtime, with the row simply never
+    /// moving.
     #[test]
     fn every_registered_event_round_trips_through_the_forwarder() {
-        for (native, event) in EVENTS {
+        for (native, event) in BUS_EVENTS.iter().chain(DIRECT_HOOKS) {
             assert_eq!(
                 HookEvent::from_kebab(event.as_kebab()),
                 Some(*event),
                 "{native}"
             );
         }
-        let names: Vec<&str> = EVENTS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(
-            names,
-            [
-                "session.created",
-                "tool.execute.before",
-                "tool.execute.after",
-                "permission.asked",
-                "permission.replied",
-                "session.idle",
-                "session.error",
-                "experimental.session.compacting",
-                "session.compacted",
-            ],
-            "the event names are the entire signal this backend has — no \
-             payload field of opencode's is read, so a name changing here \
-             changes what the dashboard can see"
-        );
-        // The three rows of §9.3 that are deliberately not subscribed. Named
-        // rather than merely absent, so adding one is a deliberate act with the
-        // reasoning in `EVENTS` in front of whoever does it.
-        for skipped in ["message.updated", "session.updated", "session.status"] {
-            assert!(!names.contains(&skipped), "{skipped}");
+    }
+
+    /// **The distinction the first cut of this backend got wrong**, and the one
+    /// worth a test of its own: [`DIRECT_HOOKS`] must contain only keys that
+    /// exist on opencode's `Hooks` interface, and [`BUS_EVENTS`] only names that
+    /// do *not*. A bus event name registered as a handler key subscribes
+    /// nothing at all — silently, since a plugin returning an object with extra
+    /// keys is not an error — and the row it was meant to move never moves.
+    #[test]
+    fn direct_hooks_are_hook_keys_and_bus_events_are_not() {
+        // Verbatim from `packages/plugin/src/index.ts`'s `Hooks` interface.
+        const HOOK_KEYS: &[&str] = &[
+            "dispose",
+            "event",
+            "config",
+            "tool",
+            "auth",
+            "provider",
+            "chat.message",
+            "chat.params",
+            "chat.headers",
+            "permission.ask",
+            "command.execute.before",
+            "tool.execute.before",
+            "shell.env",
+            "tool.execute.after",
+            "experimental.chat.messages.transform",
+            "experimental.chat.system.transform",
+            "experimental.provider.small_model",
+            "experimental.session.compacting",
+            "experimental.compaction.autocontinue",
+            "experimental.text.complete",
+            "tool.definition",
+        ];
+        for (key, _) in DIRECT_HOOKS {
+            assert!(HOOK_KEYS.contains(key), "{key} is not a Hooks key");
+        }
+        for (name, _) in BUS_EVENTS {
+            assert!(
+                !HOOK_KEYS.contains(name),
+                "{name} is a Hooks key and must not be routed through the bus"
+            );
+        }
+        // The specific six that were registered as handler keys and fired
+        // nothing. Named so a future edit that re-adds one has to argue with
+        // this test rather than rediscover the symptom.
+        let direct: Vec<&str> = DIRECT_HOOKS.iter().map(|(k, _)| *k).collect();
+        for was_wrong in [
+            "session.created",
+            "session.idle",
+            "session.error",
+            "session.compacted",
+            "permission.asked",
+            "permission.replied",
+        ] {
+            assert!(!direct.contains(&was_wrong), "{was_wrong}");
         }
     }
 
@@ -797,49 +1112,82 @@ mod tests {
 // captain-miao's `agents/opencode.rs` on every launch, so edits here are lost.
 //
 // It forwards opencode's lifecycle events to the captain-miao launcher that
-// started this session and does nothing else: no filtering, no state, no
-// retries, no reads of your data. The launcher socket arrives in
-// $CAPTAIN_MIAO_SOCK — it is never written into this file, so the file is
-// identical for every session. Delete it and sessions stop being tracked;
-// nothing else changes.
+// started this session and does nothing else: no state, no retries, no reads of
+// your data. Payloads are forwarded whole and picked apart on the other side;
+// the only fields read here are the two that decide whether to forward at all.
+// The launcher socket arrives in $CAPTAIN_MIAO_SOCK — it is never written into
+// this file, so the file is identical for every session. Delete it and sessions
+// stop being tracked; nothing else changes.
 import { spawn } from "node:child_process";
 
 const MIAO = "/home/miao/.local/bin/miao";
 
-const CaptainMiao = (ctx) => {
+// opencode bus event type -> captain-miao event name. Anything not listed is
+// dropped: the bus carries per-chunk and per-file events that would otherwise
+// spawn hundreds of processes inside your session.
+const BUS = {
+  "session.created": "session-start",
+  "session.updated": "cwd-changed",
+  "permission.updated": "permission-request",
+  "permission.replied": "elicitation-result",
+  "session.idle": "stop",
+  "session.error": "stop-failure",
+  "session.compacted": "post-compact",
+};
+
+const CaptainMiao = async (ctx) => {
   const directory = ctx?.directory ?? null;
+  const send = (event, args) => {
+    let body;
+    try {
+      body = JSON.stringify({ event, directory, payload: args });
+    } catch {
+      body = JSON.stringify({ event, directory });
+    }
+    let child;
+    try {
+      child = spawn(MIAO, ["hook", "--agent", "opencode", event], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+    } catch {
+      return;
+    }
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(body);
+  };
   const report =
     (event) =>
-    (...args) => {
-      let body;
-      try {
-        body = JSON.stringify({ event, directory, payload: args });
-      } catch {
-        body = JSON.stringify({ event, directory });
-      }
-      let child;
-      try {
-        child = spawn(MIAO, ["hook", "--agent", "opencode", event], {
-          stdio: ["pipe", "ignore", "ignore"],
-        });
-      } catch {
-        return;
-      }
-      child.on("error", () => {});
-      child.stdin.on("error", () => {});
-      child.stdin.end(body);
+    async (...args) => {
+      send(event, args);
     };
 
   return {
-    "session.created": report("session-start"),
+    event: async (input) => {
+      const e = input?.event;
+      const type = e?.type;
+      if (!type) return;
+      // Authoritative but coarser than the dashboard's states, so only the
+      // settle edge is taken: a session waiting on an approval is "busy" too.
+      if (type === "session.status") {
+        if (e.properties?.status?.type === "idle") send("stop", [input]);
+        return;
+      }
+      // Once per assistant turn, not once per streamed chunk. This is the
+      // token and model column, not a status edge.
+      if (type === "message.updated") {
+        const info = e.properties?.info;
+        if (info?.role !== "assistant" || !info?.time?.completed) return;
+        send("cwd-changed", [input]);
+        return;
+      }
+      const name = BUS[type];
+      if (name) send(name, [input]);
+    },
+    "chat.message": report("prompt-submit"),
     "tool.execute.before": report("pre-tool-use"),
     "tool.execute.after": report("post-tool-use"),
-    "permission.asked": report("permission-request"),
-    "permission.replied": report("elicitation-result"),
-    "session.idle": report("stop"),
-    "session.error": report("stop-failure"),
     "experimental.session.compacting": report("pre-compact"),
-    "session.compacted": report("post-compact"),
   };
 };
 
