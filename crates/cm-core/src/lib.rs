@@ -12,12 +12,15 @@
 //! server-core [`backend::LocalBackend`] + the shared open-session types, the
 //! opaque [`terminal`] ids + the launcher's `current_window` self-report, the
 //! host-canonical [`paths`] wire spelling, the host [`vitals`] a daemon samples
-//! for its own machine, plus shared [`cli`] arg helpers and [`logging`] setup.
+//! for its own machine, the [`clipboard`] bridge that lets a pooled agent read
+//! the dashboard machine's clipboard, plus shared [`cli`] arg helpers and
+//! [`logging`] setup.
 
 pub mod agent;
 pub mod agents;
 pub mod backend;
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 pub mod hooks;
 pub mod launcher;
