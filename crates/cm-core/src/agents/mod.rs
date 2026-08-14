@@ -8,6 +8,7 @@ pub mod codex;
 pub mod grok;
 pub mod kimi;
 pub mod opencode;
+pub mod pi;
 pub mod reasonix;
 
 // Shared machinery the backend modules build on: the hook mapping they all

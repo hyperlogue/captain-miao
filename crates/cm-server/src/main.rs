@@ -94,6 +94,12 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Pi with hooks injected, inside the pty pool (headless).
+    Pi {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts).
     Hook {
         /// Hook event type.
@@ -191,6 +197,7 @@ impl Commands {
             Commands::Kimi { args } => Some((AgentControl::Kimi, args)),
             Commands::Grok { args } => Some((AgentControl::Grok, args)),
             Commands::OpenCode { args } => Some((AgentControl::OpenCode, args)),
+            Commands::Pi { args } => Some((AgentControl::Pi, args)),
             _ => None,
         }
     }
@@ -357,7 +364,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         | Commands::Reasonix { .. }
         | Commands::Kimi { .. }
         | Commands::Grok { .. }
-        | Commands::OpenCode { .. }) => {
+        | Commands::OpenCode { .. }
+        | Commands::Pi { .. }) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
             // runs inside the pty pool, so its agent gets the clipboard shims on

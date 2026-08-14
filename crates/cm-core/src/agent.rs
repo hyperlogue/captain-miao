@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{claude, codex, grok, kimi, opencode, reasonix};
+use crate::agents::{claude, codex, grok, kimi, opencode, pi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -65,6 +65,7 @@ pub enum AgentControl {
     /// sst's `opencode`. Spelled lowercase everywhere, including
     /// [`Self::label`] — it is the project's own styling, not a typo.
     OpenCode,
+    Pi,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -109,6 +110,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "kimi" => AgentControl::Kimi,
                     "grok" => AgentControl::Grok,
                     "opencode" => AgentControl::OpenCode,
+                    "pi" => AgentControl::Pi,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -131,6 +133,7 @@ impl AgentControl {
         AgentControl::Kimi,
         AgentControl::Grok,
         AgentControl::OpenCode,
+        AgentControl::Pi,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -143,6 +146,7 @@ impl AgentControl {
             AgentControl::Kimi => "kimi",
             AgentControl::Grok => "grok",
             AgentControl::OpenCode => "opencode",
+            AgentControl::Pi => "pi",
             AgentControl::Unknown => "",
         }
     }
@@ -159,6 +163,7 @@ impl AgentControl {
             "kimi" => Some(AgentControl::Kimi),
             "grok" => Some(AgentControl::Grok),
             "opencode" => Some(AgentControl::OpenCode),
+            "pi" => Some(AgentControl::Pi),
             _ => None,
         }
     }
@@ -183,6 +188,7 @@ impl AgentControl {
             AgentControl::Kimi => agents::binary_available(kimi::BIN),
             AgentControl::Grok => agents::binary_available(grok::BIN),
             AgentControl::OpenCode => agents::binary_available(opencode::BIN),
+            AgentControl::Pi => agents::binary_available(pi::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -199,6 +205,7 @@ impl AgentControl {
             AgentControl::Grok => "Grok",
             // Lowercase on purpose: sst styles the project `opencode`.
             AgentControl::OpenCode => "opencode",
+            AgentControl::Pi => "Pi",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -266,6 +273,16 @@ impl AgentControl {
                 }
                 v
             }
+            // Pi's fork **replaces** the resume rather than decorating it:
+            // `--session <path|id>` opens that session, `--fork <path|id>` forks
+            // it into a new one, and they are alternative entry points rather
+            // than a flag and its modifier. So the flag name swaps and the id
+            // stays — the same shape as Codex's `resume`/`fork` subcommands, and
+            // the reason `supports_fork()` needs no special case here.
+            AgentControl::Pi => {
+                let flag = if fork { "--fork" } else { "--session" };
+                vec![flag.to_string(), session_id.to_string()]
+            }
             AgentControl::Unknown => vec![],
         }
     }
@@ -326,6 +343,12 @@ impl AgentControl {
             // the concept — but no CLI flag launches into one, and there is
             // nothing to spend a worktree request on. `Ctrl-g` hides itself.
             AgentControl::OpenCode => None,
+            // Pi documents no worktree flag — its own isolation story is
+            // `docs/containerization.md`, which is the agent sandboxing the
+            // dashboard deliberately stays out of. `supports_worktrees()` is
+            // derived from this, so `Ctrl-g` hides itself with nothing else to
+            // change.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -380,6 +403,11 @@ impl AgentControl {
             // `storage/` blobs, and nothing here reads either — see
             // `read_transcript_stats`.
             AgentControl::OpenCode => vec![],
+            // Nothing, and for the strongest reason of any backend: every fact
+            // a Pi row carries — status, title, tokens, model — rides a hook
+            // payload, and nothing of ours reads a Pi file at all. There is no
+            // file whose change could make a Pi row stale.
+            AgentControl::Pi => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -430,6 +458,11 @@ impl AgentControl {
             // here only because its rename lands in sqlite with no hook; for
             // opencode there is no reader on the other end to wake.
             AgentControl::OpenCode => vec![],
+            // Nothing: the title is the only fact that would want an entry
+            // here, and it arrives on the *next hook payload* — a `sessions/`
+            // write the host already watches. Codex needs one only because its
+            // rename lands in sqlite with no hook at all.
+            AgentControl::Pi => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -456,6 +489,9 @@ impl AgentControl {
             // back *to*. That is the gap that makes an opencode row
             // unresumable; see `agents::opencode`.
             AgentControl::OpenCode => SessionIndex::default(),
+            // No per-pid manifest: a Pi session's id (and name) arrive on every
+            // hook payload, which is what this index is a fallback for.
+            AgentControl::Pi => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -519,6 +555,16 @@ impl AgentControl {
             // carries `context_tokens` / `model` now — the moment a usage field
             // in an event payload is named.
             AgentControl::OpenCode => TranscriptStats::default(),
+            // Unreachable, and the only one of these arms that is a *decision*
+            // rather than a missing schema. Pi's JSONL is fully documented and
+            // its path is exported as `PI_SESSION_FILE`, so this fold could be
+            // written — but the file is a **tree**, not a log (`id`/`parentId`
+            // with an active leaf), so a correct fold has to walk back from the
+            // active leaf rather than tail the last append. The tokens and model
+            // come off the hook instead, and `agents::pi` supplies no transcript
+            // path, which is what makes this consistent rather than merely
+            // unimplemented: one fact, one source.
+            AgentControl::Pi => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -567,6 +613,14 @@ impl AgentControl {
             // starts showing fiction. One `opencode session list --help` fills
             // this in.
             AgentControl::OpenCode => Ok(vec![]),
+            // Empty for now. Pi's sessions are plain JSONL under
+            // `~/.pi/agent/sessions/`, grouped by working directory, so this is
+            // reachable — but a candidate needs a cwd, a first prompt and an id,
+            // and reading them means committing to the same active-branch walk
+            // `read_transcript_stats` declines. `pi -r` opens Pi's own session
+            // picker in the meantime, which is the usable answer until this and
+            // that fold land together.
+            AgentControl::Pi => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -610,6 +664,9 @@ impl AgentControl {
             AgentControl::OpenCode => {
                 opencode::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Pi => {
+                pi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -641,6 +698,12 @@ impl AgentControl {
             // launcher, which is what lets each backend put its own format
             // through it.
             AgentControl::OpenCode => opencode::build_hooks_settings(sock_path),
+            // **TypeScript**, not JSON — Pi has no shell-command hooks at all,
+            // so what the launcher writes here is the extension module `pi -e`
+            // loads. Same argument as Kimi's TOML: the path is generic
+            // transport, the contents are opaque to the launcher, and each
+            // backend puts its own format through it.
+            AgentControl::Pi => pi::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -656,6 +719,7 @@ impl AgentControl {
             AgentControl::Kimi => kimi::dispatch_hook(state, msg).await,
             AgentControl::Grok => grok::dispatch_hook(state, msg).await,
             AgentControl::OpenCode => opencode::dispatch_hook(state, msg).await,
+            AgentControl::Pi => pi::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -670,6 +734,7 @@ impl AgentControl {
             AgentControl::Kimi => kimi::parse_hook_payload(event, stdin),
             AgentControl::Grok => grok::parse_hook_payload(event, stdin),
             AgentControl::OpenCode => opencode::parse_hook_payload(event, stdin),
+            AgentControl::Pi => pi::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -714,6 +779,15 @@ impl AgentControl {
             // nothing of the agent's to read instead; that is on the probe list
             // in `agents::opencode`.
             AgentControl::OpenCode => TranscriptScan::default(),
+            // Empty because Pi needs no sentinel, not because none was found —
+            // the same standing as Reasonix's and Kimi's, reached differently.
+            // Neither carries an interrupt *flag*; Pi instead has a turn-end
+            // event that fires once the run will not continue at all
+            // (`agent_settled`), and a cancelled run is exactly that. So the
+            // case that forced Codex to read its rollout cannot arise, and no
+            // transcript of Pi's is read for any purpose (`agents::pi` names
+            // none).
+            AgentControl::Pi => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -743,6 +817,10 @@ impl AgentControl {
             // busy/idle string it should drive the row *directly*, the way
             // Claude's session file does, rather than arriving here.
             AgentControl::OpenCode => None,
+            // No status file, and none needed: the interrupt this exists to
+            // catch for Claude is covered by `agent_settled`, which fires when
+            // Pi will not continue running — a cancelled run included.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -782,6 +860,12 @@ impl AgentControl {
             // read instead. An opencode row therefore shows no agent-supplied
             // name; see `agents::opencode`.
             AgentControl::OpenCode => None,
+            // `None` because there is nothing left to read, not because Pi has
+            // no name: `pi.getSessionName()` rides every hook payload as
+            // `session_title` and is already on `LauncherState.name` by the time
+            // this would be asked — the Kimi standing, reached from an
+            // extension call rather than a documented payload field.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -798,6 +882,8 @@ impl AgentControl {
             AgentControl::Kimi => None,
             AgentControl::Grok => None,
             AgentControl::OpenCode => None,
+            // No status file to watch — see `agent_activity`.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -861,6 +947,11 @@ impl AgentControl {
             // appended transcript for either kind of watch to follow, whatever
             // a payload might one day name.
             AgentControl::OpenCode => None,
+            // Moot, and permanently so rather than pending like the other three:
+            // `agents::pi` supplies no transcript path *by decision*, not for
+            // want of one, so the launcher starts no watch of either kind for a
+            // Pi session and there is no poll for this to configure.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -912,6 +1003,12 @@ impl AgentControl {
             // foreground turn ended" and the row reads `Idle` — never
             // `BackgroundServer` or `ReviewPending`.
             AgentControl::OpenCode => None,
+            // Pi has no background-shell concept in its event surface at all —
+            // no `run_in_background` tool, no background-task list on any
+            // payload — so a `Stop` is simply the end of the work, and the row
+            // never reaches `BackgroundActive`, `BackgroundServer` or
+            // `ReviewPending`. An absence, with nothing to wire up later.
+            AgentControl::Pi => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1184,6 +1281,8 @@ mod tests {
         assert_eq!(reasonix, AgentControl::Reasonix);
         assert_eq!(kimi, AgentControl::Kimi);
         let grok: AgentControl = serde_json::from_str(r#""grok""#).expect("grok decodes");
+        let pi: AgentControl = serde_json::from_str(r#""pi""#).expect("pi decodes");
+        assert_eq!(pi, AgentControl::Pi);
         assert_eq!(claude, AgentControl::Claude);
         assert_eq!(codex, AgentControl::Codex);
         assert_eq!(reasonix, AgentControl::Reasonix);
@@ -1262,7 +1361,8 @@ mod tests {
                 AgentControl::Reasonix,
                 AgentControl::Kimi,
                 AgentControl::Grok,
-                AgentControl::OpenCode
+                AgentControl::OpenCode,
+                AgentControl::Pi
             ]
         );
     }
@@ -1329,6 +1429,10 @@ mod tests {
         assert!(AgentControl::Claude.supports_fork());
         assert!(AgentControl::Codex.supports_fork());
         assert!(AgentControl::Reasonix.supports_fork());
+        assert!(
+            AgentControl::Pi.supports_fork(),
+            "Pi forks by swapping --session for --fork, which is still a differing argv"
+        );
         assert!(
             !AgentControl::Kimi.supports_fork(),
             "Kimi has no fork flag, so `f` must hide rather than resume in place"

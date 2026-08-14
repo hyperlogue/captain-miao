@@ -23,7 +23,7 @@ focused tool and the rest of your workflow is yours to compose.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build) and [opencode](https://github.com/sst/opencode) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support)).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/sst/opencode) and [Pi](https://github.com/earendil-works/pi) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -51,6 +51,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork, no token/model columns, no resume-picker entries and no worktrees ([known limits](#kimi-code-support)).                                                  |
 | **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. Token/model columns and resume-picker entries don't work, and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                               |
 | **[opencode](https://github.com/sst/opencode)**               | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. Status is coarser than the others' and sessions can't be resumed from the dashboard ([known limits](#opencode-support)).                             |
+| **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                        |
 
 ## Installation
 
@@ -160,10 +161,11 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao kimi [dir] [args…]`       | Launch Kimi Code in `dir` with tracking hooks; extra args are forwarded to `kimi`. See [known limits](#kimi-code-support).                  |
 | `miao grok [dir] [args…]`       | Launch Grok Build in `dir` with tracking hooks; extra args are forwarded to `grok`. See [known limits](#grok-build-support).                |
 | `miao opencode [dir] [args…]`   | Launch opencode in `dir` with a tracking plugin; extra args are forwarded to `opencode`. See [known limits](#opencode-support).             |
+| `miao pi [dir] [args…]`         | Launch Pi in `dir` with tracking hooks; extra args are forwarded to `pi`. See [known limits](#pi-support).                                  |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
 
 #### Reasonix support
 
@@ -208,6 +210,16 @@ opencode rows track a **coarser** status than every other backend here, and that
 - **A session runs under a synthetic `OPENCODE_CONFIG_DIR`** that symlinks your real one, with `plugins/` the single exception: that directory is ours, and it is rebuilt to symlink each of your own plugins beside our generated `captain-miao.js`, so your plugins keep loading. Nothing of yours is written to. If you've moved your config with `$XDG_CONFIG_HOME`, captain-miao follows it; if your agents and commands go missing inside a session, that's the thing to check.
 
 It is **the least verified backend here** — written from a design note that was never checked against opencode's source or a running binary, unlike every other backend. If every row sits at "Starting", the generated plugin is the first thing to suspect: it's a plain file at `~/.local/state/captain-miao/opencode-config/plugins/captain-miao.js`, and whether opencode loads a plugin from that directory, under that name, and subscribes handlers keyed the way that file keys them, are all unconfirmed. Please report anything that looks wrong rather than assuming it's expected.
+#### Pi support
+
+Pi rows track status — working, idle, compacting — and launch, resume and fork all work, as do the **token, model and title columns**, which no other new backend here manages. Pi is also the only agent whose hooks need nothing of yours: they arrive as a generated extension passed on the command line (`pi -e`), so there is no synthetic home, no copied config and no trust prompt to seed. What it doesn't do:
+
+- **No "waiting for approval" state.** Pi has no per-tool approval gate at all — its trust machinery guards loading settings and extensions, not running tools — so there is no prompt for the dashboard to reflect. This is an absence in Pi, not a gap in captain-miao.
+- **No resume picker entries.** Pi's sessions are readable JSONL, but each is a **tree** rather than a log, so listing them correctly means walking back from the active branch; that is deferred rather than guessed. `pi -r` opens Pi's own session picker in the meantime.
+- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — Pi has neither a worktree flag nor a background-shell concept.
+- **A row stuck at "Starting" is usually Pi's project-trust prompt**, not a broken hook. Pi asks before it loads a project's own config, and that happens before the first event we see, so the two look identical from the dashboard — answer it in the session window.
+
+Everything above was written from Pi's published documentation and source, against no running binary. The one behaviour worth reporting if it looks wrong: pressing Esc mid-turn should settle the row immediately (captain-miao takes Pi's `agent_settled` as the end of a turn, and expects a cancelled run to settle too).
 
 ### Key bindings
 
@@ -413,7 +425,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 ## Roadmap
 
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code, Grok Build and opencode have slotted in and are all still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support)); Pi is mapped but unwritten.
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code, Grok Build, opencode and Pi have all slotted in and are every one of them still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)) — running the probe each one's module doc lists is what graduates them.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 

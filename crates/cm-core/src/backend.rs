@@ -650,6 +650,10 @@ mod tests {
             open_argv(AgentControl::OpenCode, None),
             ["opencode", "/work"]
         );
+        // Pi takes no directory argument either — its trailing positionals are
+        // *prompts*, so `build_launch_command` sets the process cwd and passes
+        // nothing positional. Ours is the only positional here too.
+        assert_eq!(open_argv(AgentControl::Pi, None), ["pi", "/work"]);
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -728,6 +732,11 @@ mod tests {
             open_argv_worktree(AgentControl::OpenCode, None, Some("feature-auth")),
             ["opencode", "/work"]
         );
+        // Pi has no worktree flag either.
+        assert_eq!(
+            open_argv_worktree(AgentControl::Pi, None, Some("feature-auth")),
+            ["pi", "/work"]
+        );
     }
 
     #[test]
@@ -779,6 +788,21 @@ mod tests {
             open_argv(AgentControl::OpenCode, Some(("s5", true))),
             ["opencode", "/work", "-s", "s5", "--fork"]
         );
+        // Pi swaps the *flag* rather than adding one: `--session` opens that
+        // session, `--fork` forks it into a new one, and the two are
+        // alternatives — so a fork must never carry both.
+        assert_eq!(
+            open_argv(AgentControl::Pi, Some(("s5", false))),
+            ["pi", "/work", "--session", "s5"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Pi, Some(("s5", true))),
+            ["pi", "/work", "--fork", "s5"]
+        );
+        assert!(
+            !open_argv(AgentControl::Pi, Some(("s5", true))).contains(&"--session".to_string()),
+            "a Pi fork resumes through --fork alone"
+        );
     }
 
     /// Kimi has no fork flag, so the two argvs are **identical** — which is the
@@ -799,6 +823,7 @@ mod tests {
             AgentControl::Claude,
             AgentControl::Codex,
             AgentControl::Reasonix,
+            AgentControl::Pi,
         ] {
             assert_ne!(
                 open_argv(agent, Some(("s4", false))),

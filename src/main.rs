@@ -117,6 +117,15 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Pi with hooks injected for session tracking. Argument handling
+    /// matches the `claude` subcommand.
+    Pi {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to pi.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts)
     Hook {
         /// Hook event type
@@ -197,6 +206,7 @@ impl Commands {
             Commands::Kimi { args } => Some((agent::AgentControl::Kimi, args)),
             Commands::Grok { args } => Some((agent::AgentControl::Grok, args)),
             Commands::OpenCode { args } => Some((agent::AgentControl::OpenCode, args)),
+            Commands::Pi { args } => Some((agent::AgentControl::Pi, args)),
             _ => None,
         }
     }
@@ -387,7 +397,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Commands::Reasonix { .. }
             | Commands::Kimi { .. }
             | Commands::Grok { .. }
-            | Commands::OpenCode { .. }),
+            | Commands::OpenCode { .. }
+            | Commands::Pi { .. }),
         ) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             cm_core::cli::run_launch(agent, args.to_vec()).await
