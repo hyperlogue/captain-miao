@@ -148,6 +148,24 @@ enum Commands {
     SelfCheck,
 }
 
+impl Commands {
+    /// `Some((agent, args))` for the launcher subcommands, `None` for everything
+    /// else — the single place a clap variant maps to an [`AgentControl`], so a
+    /// new backend is a new variant plus one arm below.
+    ///
+    /// The dashboard's `Commands` (`src/main.rs`) carries a twin. They are
+    /// separate clap enums over different subcommand sets — the server has no
+    /// `focus`, the dashboard no `daemon` — so this is duplicated on purpose
+    /// rather than hoisted into `cm-core`.
+    fn launcher(&self) -> Option<(AgentControl, &[String])> {
+        match self {
+            Commands::Claude { args } => Some((AgentControl::Claude, args)),
+            Commands::Codex { args } => Some((AgentControl::Codex, args)),
+            _ => None,
+        }
+    }
+}
+
 /// Clipboard-bridge actions on the machine an agent runs on. The *server* half
 /// (`clipboard serve`) belongs to the dashboard's binary, since that is the
 /// machine that owns a clipboard.
@@ -284,18 +302,6 @@ fn main() -> Result<()> {
 
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Clipboard {
-            action: ClipboardAction::Paste,
-        } => cm_core::clipboard::shim::paste().await,
-        // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher runs
-        // inside the pty pool, so its agent gets the clipboard shims on its PATH.
-        // The dashboard's own launcher arms call the other one.
-        Commands::Claude { args } => {
-            cm_core::cli::run_launch_pooled(AgentControl::Claude, args).await
-        }
-        Commands::Codex { args } => {
-            cm_core::cli::run_launch_pooled(AgentControl::Codex, args).await
-        }
         Commands::Hook { event, sock, agent } => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
         }
@@ -308,6 +314,20 @@ async fn async_main(cli: Cli) -> Result<()> {
         #[cfg(feature = "pty-pool")]
         Commands::PtyDaemon | Commands::Attach { .. } => {
             unreachable!("pty-pool commands are dispatched in main() before the runtime")
+        }
+        // Every launcher subcommand, dispatched through `Commands::launcher` so
+        // the variant→`AgentControl` mapping stays in that one place. Named here
+        // rather than swept up by a catch-all so the match stays exhaustive —
+        // see the twin in the dashboard's `main.rs`.
+        Commands::Clipboard {
+            action: ClipboardAction::Paste,
+        } => cm_core::clipboard::shim::paste().await,
+        cmd @ (Commands::Claude { .. } | Commands::Codex { .. }) => {
+            let (agent, args) = cmd.launcher().expect("the launcher variants");
+            // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
+            // runs inside the pty pool, so its agent gets the clipboard shims on
+            // its PATH. The dashboard's own launcher arms call the other one.
+            cm_core::cli::run_launch_pooled(agent, args.to_vec()).await
         }
     }
 }

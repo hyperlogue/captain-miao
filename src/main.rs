@@ -139,6 +139,24 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// `Some((agent, args))` for the launcher subcommands, `None` for everything
+    /// else — the single place a clap variant maps to an [`agent::AgentControl`].
+    ///
+    /// Every consumer of that mapping goes through here (the terminal gate and
+    /// the dispatch in `async_main`), so a new backend is a new clap variant plus
+    /// one arm below and nothing else. Routing the *gate* through it matters
+    /// most: a variant missing from `requires_terminal` fails silently and
+    /// specifically on headless pool hosts — the one place nobody is watching.
+    fn launcher(&self) -> Option<(agent::AgentControl, &[String])> {
+        match self {
+            Commands::Claude { args } => Some((agent::AgentControl::Claude, args)),
+            Commands::Codex { args } => Some((agent::AgentControl::Codex, args)),
+            _ => None,
+        }
+    }
+}
+
 /// Actions for the clipboard bridge. `serve` is the only one the dashboard's own
 /// binary needs; the shim and `clipboard paste` live in `miao-server`, which is
 /// what runs on the machine the *agent* is on.
@@ -187,6 +205,13 @@ fn main() -> Result<()> {
 /// including a headless remote pool) and a pooled launcher still carrying
 /// `--pool-session`. Everything else drives a local Kitty/zellij window.
 fn requires_terminal(command: &Option<Commands>) -> bool {
+    // A pooled launcher carries `--pool-session` in its passthrough args here
+    // (stripped later); it runs on a headless pool host, not in a terminal. Asked
+    // through `launcher` rather than matched per backend, so a new one can't be
+    // left out of the exemption.
+    if let Some((_, args)) = command.as_ref().and_then(Commands::launcher) {
+        return !args.iter().any(|a| a == "--pool-session");
+    }
     match command {
         // A hook is a thin forwarder (parse the agent's stdin JSON → send to the
         // launcher socket); it never touches a terminal and runs wherever the
@@ -196,11 +221,6 @@ fn requires_terminal(command: &Option<Commands>) -> bool {
         // trap. It drives no window, and gating it on the terminal would make it
         // fail exactly when the terminal is going away — the case it exists for.
         Some(Commands::AttachExited { .. }) => false,
-        // A pooled launcher carries `--pool-session` in its passthrough args here
-        // (stripped later); it runs on a headless pool host, not in a terminal.
-        Some(Commands::Claude { args } | Commands::Codex { args }) => {
-            !args.iter().any(|a| a == "--pool-session")
-        }
         _ => true,
     }
 }
@@ -241,12 +261,6 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Claude { args }) => {
-            cm_core::cli::run_launch(agent::AgentControl::Claude, args).await
-        }
-        Some(Commands::Codex { args }) => {
-            cm_core::cli::run_launch(agent::AgentControl::Codex, args).await
-        }
         Some(Commands::Hook { event, sock, agent }) => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
         }
@@ -314,6 +328,17 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Commands::Clipboard { .. }) => {
             unreachable!("clipboard is dispatched in main() before the runtime")
+        }
+        // Every launcher subcommand, dispatched through `Commands::launcher` so
+        // the variant→`AgentControl` mapping stays in that one place. The
+        // variants are still *named* here rather than swept up by a catch-all,
+        // which keeps the match exhaustive: a new backend then costs one name in
+        // this pattern, and the compiler asks for it, while a non-launcher
+        // subcommand added without a dispatch arm still fails to build instead
+        // of reaching a runtime panic.
+        Some(cmd @ (Commands::Claude { .. } | Commands::Codex { .. })) => {
+            let (agent, args) = cmd.launcher().expect("the launcher variants");
+            cm_core::cli::run_launch(agent, args.to_vec()).await
         }
         None => app::run().await,
     }
