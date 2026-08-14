@@ -34,24 +34,20 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 
 ### Terminals
 
-| Terminal | Notes |
-| --- | --- |
-| **Kitty** | Needs remote control enabled — a password and a `listen_on` socket ([Kitty setup](#kitty-setup)). The most capable backend, and the only one with all of: live preview, move-to-tab (`t`), several sessions stacked in one tab, and a header logo drawn as a real image over the TUI via the kitty graphics protocol. |
-| **Ghostty** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary — no config to edit, but macOS asks you to approve Automation once ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**; no move-to-tab, one tab per session, and every spawn brings Ghostty to the front. The Linux build exposes no control channel at all — run it under zellij or tmux there. |
-| **zellij** ≥ 0.44 | Run captain-miao inside the session it should drive; no setup. Sessions live as full-size floating panes in one `miao:sessions` tab, so switching between them is a pure z-order raise — no pty resize, no flicker. No move-to-tab: zellij has no CLI to reparent a pane, so `t` is hidden. |
-| **tmux** ≥ 3.2 | Run captain-miao inside the session it should drive; no setup. One window per session — there is no shared-tab arrangement, so `Space l` is hidden — but move-to-tab works. The one backend a machine with no GUI can drive, so its live-server test runs in CI on Linux and macOS. |
+| Terminal                                                    | Notes                                                                                                                                                                       |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Kitty](https://github.com/kovidgoyal/kitty)**             | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                                                     |
+| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3  | **macOS only**, driven through Ghostty's AppleScript dictionary ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**. |
+| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44    | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
+| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2               | One window per session.                                                                                                                                                     |
 
 ### Agents
 
-| Agent | Notes |
-| --- | --- |
-| **[Claude Code](https://claude.com/claude-code)** | The most complete backend: worktrees (`Ctrl-g`), background-task tiers (dev server vs. finite task vs. [r3](https://github.com/hyperlogue/r3) review-watch), `/rename` titles, and an incremental transcript fold behind the token and model columns. Hooks are injected per-session with `--settings`; nothing is written to your `~/.claude/settings.json`. |
-| **[Codex](https://github.com/openai/codex)** | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. Its rollout JSONL is richer than a transcript, so tokens and lifecycle come from typed events; titles come from Codex's own sqlite store. No worktrees and no background tasks. On macOS the rollout is stat-polled rather than watched, because FSEvents stays silent for Codex's long-held fd. It also can't take a shimmed clipboard paste — it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
-| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Newest, and written against the source rather than a running binary. Status, launch, resume and fork work; token/model columns, resume-picker entries, worktrees and background tiers don't ([known limits](#reasonix-support)). Its hook vocabulary is a 1:1 fit — approvals and Esc-interrupts arrive as real events — so nothing about a row is inferred from disk. |
-
-A session started under a backend your build doesn't know (a newer host seen by
-an older dashboard) still shows up: the row stays visible, sortable and
-killable, and only launching from it is refused.
+| Agent                                                         | Notes                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Claude Code](https://claude.com/claude-code)**             |                                                                                                                                                                                                                                                                 |
+| **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
+| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns, resume-picker entries and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
 
 ## Installation
 
@@ -152,9 +148,9 @@ miao
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-| Command                       | What it does                                                                                                                               |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `miao`                          | Run the TUI dashboard (the default).                                                                                                       |
+| Command                         | What it does                                                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `miao`                          | Run the TUI dashboard (the default).                                                                                                        |
 | `miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
 | `miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
 | `miao reasonix [dir] [args…]`   | Launch Reasonix in `dir` with tracking hooks; extra args are forwarded to `reasonix`. See [known limits](#reasonix-support).                |
@@ -169,7 +165,7 @@ Reasonix rows track status — working, idle, waiting for approval, compacting �
 
 - **No token or model columns, and no resume picker entries.** Both need Reasonix's session sidecars, whose on-disk schema hasn't been settled yet. Its hook payload carries no transcript path, so the dashboard reads nothing from disk for these sessions.
 - **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a background task runs reads as `Idle`.
-- **Run `reasonix setup` outside captain-miao once first.** A session runs under a synthetic config home that mirrors your real one; a first-time setup performed *inside* a session lands in that mirror and is cleared on a later launch.
+- **Run `reasonix setup` outside captain-miao once first.** A session runs under a synthetic config home that mirrors your real one; a first-time setup performed _inside_ a session lands in that mirror and is cleared on a later launch.
 
 It also hasn't yet been exercised against a released `reasonix` build end to end, so please report anything that looks wrong rather than assuming it's expected.
 
@@ -177,38 +173,38 @@ It also hasn't yet been exercised against a released `reasonix` build end to end
 
 Press `?` in the dashboard for the complete list. The six you'll reach for most:
 
-| Key                            | Action                                                                 |
-| ------------------------------ | ---------------------------------------------------------------------- |
-| `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                      |
+| Key                            | Action                                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                                                                  |
 | `Enter`                        | Focus the selected session's window, or attach one to a detached session (asking first if another client holds it) |
-| `o` / `O`                      | New session (same cwd / prompt for cwd)                                |
-| `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session |
-| `x` / `D`                      | Kill the selected session / detach from it, leaving it running         |
-| `s`                            | Jump to the next session needing attention                             |
+| `o` / `O`                      | New session (same cwd / prompt for cwd)                                                                            |
+| `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session                                            |
+| `x` / `D`                      | Kill the selected session / detach from it, leaving it running                                                     |
+| `s`                            | Jump to the next session needing attention                                                                         |
 
 #### Remaining key bindings
 
-| Key                            | Action                                                                 |
-| ------------------------------ | ---------------------------------------------------------------------- |
-| `gg` / `G`                     | Jump to top / bottom                                                   |
-| `1..9` / `Ctrl-1..9`           | Select Nth session / select and focus its window                       |
-| `p` / `i`                      | Pin / toggle needs-input on the selected session                       |
-| `y`                            | Copy the selected session id to the clipboard                          |
-| `t` / `w`                      | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab |
-| `h`/`l`, `←`/`→`               | Scroll the preview horizontally                                        |
-| `Ctrl-u` / `Ctrl-d`            | Scroll the preview up / down                                           |
-| `R`                            | Refresh the preview now                                                |
-| `Space v` / `Space d`          | Toggle the preview / detail panel                                      |
-| `Space i`                      | Edit the selected directory's icon + color                             |
-| `Space e` / `Space E`          | Restart the selected / all idle sessions                               |
-| `Space z`                      | Toggle keep-awake (inhibit OS sleep while sessions work)               |
-| `Space a` / `Space H`          | Set the default backend / default host for new sessions                |
-| `Space l`                      | Switch session layout (stacked in one tab / one tab per session; not offered on tmux or Ghostty, which have only the one) |
-| `Space h` / `Space s`          | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
-| `Space A`                      | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen) |
-| `?`                            | Show the full key list (help overlay)                                  |
-| `/`                            | Search                                                                 |
-| `q` / `Ctrl-c`                 | Quit                                                                   |
+| Key                   | Action                                                                                                                                                                     |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gg` / `G`            | Jump to top / bottom                                                                                                                                                       |
+| `1..9` / `Ctrl-1..9`  | Select Nth session / select and focus its window                                                                                                                           |
+| `p` / `i`             | Pin / toggle needs-input on the selected session                                                                                                                           |
+| `y`                   | Copy the selected session id to the clipboard                                                                                                                              |
+| `t` / `w`             | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab                                                                                                 |
+| `h`/`l`, `←`/`→`      | Scroll the preview horizontally                                                                                                                                            |
+| `Ctrl-u` / `Ctrl-d`   | Scroll the preview up / down                                                                                                                                               |
+| `R`                   | Refresh the preview now                                                                                                                                                    |
+| `Space v` / `Space d` | Toggle the preview / detail panel                                                                                                                                          |
+| `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
+| `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
+| `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
+| `Space a` / `Space H` | Set the default backend / default host for new sessions                                                                                                                    |
+| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux or Ghostty, which have only the one)                                                  |
+| `Space h` / `Space s` | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
+| `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
+| `?`                   | Show the full key list (help overlay)                                                                                                                                      |
+| `/`                   | Search                                                                                                                                                                     |
+| `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
@@ -320,7 +316,7 @@ full connection log, `c` suspends it, `u` upgrades its server.
   when free or 👀 when another client is holding one. `Enter` attaches, `Space A`
   attaches every free one, `Space s` steals a held one.
 - **Closing a session's window ends it**, the same as `x`; set `on_window_close =
-  "detach"` under `[remote]` for the opposite. A window lost to a dropped link
+"detach"` under `[remote]` for the opposite. A window lost to a dropped link
   detaches instead, so a flaky network never costs you a session.
 - **`Options`** takes verbatim ssh arguments, mainly port forwards
   (`-L 8080:localhost:3000`), which come up and go away with the connection.
@@ -374,7 +370,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 
 ## Roadmap
 
-- [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that *can* be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
+- [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix is the first to do so and is still unproven against a released build ([known limits](#reasonix-support)); Grok, Kimi Code, Pi and opencode are mapped but unwritten.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
