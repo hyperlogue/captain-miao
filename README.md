@@ -48,7 +48,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[Claude Code](https://claude.com/claude-code)**             |                                                                                                                                                                                                                                                                 |
 | **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
-| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork, no token/model columns and no worktrees ([known limits](#kimi-code-support)).                                                  |
+| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                  |
 | **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                               |
 | **[opencode](https://github.com/anomalyco/opencode)**               | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                       |
 | **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                        |
@@ -179,10 +179,9 @@ It also hasn't yet been exercised against a released `reasonix` build end to end
 
 #### Kimi Code support
 
-Kimi rows track status — working, idle, waiting for approval, compacting — and launch and resume both work. Kimi reports an **interrupt** as a real hook, so pressing Esc mid-turn settles the row immediately, which is something no other backend here manages. What it doesn't do:
+Kimi rows track status — working, idle, waiting for approval, compacting — and launch and resume both work, as do the **title, token and model columns**. Kimi reports an **interrupt** as a real hook, so pressing Esc mid-turn settles the row immediately, which is something no other backend here manages. What it doesn't do:
 
 - **No fork** (`f` hides itself on a Kimi row). Kimi documents no flag to branch a resume, and offering the key would silently resume in place — the one outcome someone pressing fork is trying to avoid.
-- **No token or model columns.** Kimi records both, in `wire.jsonl` — reading them is a fold over that log, which hasn't been written yet. The resume picker works.
 - **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a subagent or task runs reads as `Idle`.
 - **A session runs under a synthetic `KIMI_CODE_HOME`** that symlinks your real `~/.kimi-code/`, with `config.toml` a writable **copy** carrying our `[[hooks]]` entries. Your real config is never written to. Your own `[[hooks]]` in it are preserved; anything else in that copy (comments, key order) is rewritten, and refreshed from the real file whenever you change it.
 

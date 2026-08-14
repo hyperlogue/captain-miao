@@ -57,17 +57,22 @@
 //!   a transcript path up does not silently inherit an event-driven watch macOS
 //!   cannot deliver.
 //!
-//! **What is deliberately not read.** The token and model columns are empty for
-//! Kimi. The names are no longer the obstacle — `agent-core-v2` ships a
-//! *generated* manifest of its whole wire protocol
-//! (`docs/wire-manifest.d.ts`, `protocol_version 1.5`) in which `usage.record`
-//! is flagged `persisted` and carries `model` plus
-//! `usage: {inputOther, output, inputCacheRead, inputCacheCreation}` — so this
-//! is now a fold over `sessions/<bucket>/<id>/agents/<agent>/wire.jsonl`
-//! waiting to be written, not a schema question. [`list_resumable`] needed
-//! neither: `<workDirKey>` is never decoded, because `session_index.jsonl`
-//! records each session's working directory outright and the bucket is a
-//! directory to walk.
+//! **The token and model columns come off `wire.jsonl`, and the schema is not
+//! guessed.** `agent-core-v2` ships a *generated* manifest of its whole wire
+//! protocol (`docs/wire-manifest.d.ts`, `protocol_version 1.5`) in which
+//! `usage.record` is flagged `persisted` and carries `model` plus
+//! `usage: {inputOther, output, inputCacheRead, inputCacheCreation}`. The one
+//! thing that manifest does not tell you is the part worth getting right:
+//! `usage.record`'s `apply` **accumulates** into per-model lifetime totals, so
+//! each record is one generation's delta. [`read_transcript_stats`] therefore
+//! takes the *last* record rather than the sum — summing is a billing figure
+//! that only grows, and as a context gauge would show a long session at several
+//! hundred percent.
+//!
+//! `<workDirKey>` is never decoded anywhere in this module. The picker doesn't
+//! need it (`session_index.jsonl` records each session's working directory
+//! outright), and [`wire_log_for`] walks the buckets to find a session by id,
+//! which is what Kimi's own readers do.
 //!
 //! What a probe against a real binary must settle, in the order the failures
 //! hurt:
@@ -123,7 +128,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
-use crate::agent::ResumeCandidate;
+use crate::agent::{ResumeCandidate, TranscriptStats};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -160,6 +165,81 @@ fn synth_home() -> PathBuf {
 }
 
 // =============================================================================
+// Transcript stats (wire.jsonl → context tokens + model)
+// =============================================================================
+
+/// One `usage.record` line of `wire.jsonl`. Every op record is written as
+/// `{"type": <name>, ...payload, "time": …}` — the payload spread at the top
+/// level rather than nested — so these fields sit beside `type`.
+///
+/// Field names and types are from `agent-core-v2`'s **generated** wire manifest
+/// (`docs/wire-manifest.d.ts`, `protocol_version 1.5`), which flags
+/// `usage.record` `persisted`. This is not a guessed schema.
+#[derive(Deserialize)]
+struct UsageRecord {
+    model: String,
+    usage: TokenUsage,
+}
+
+/// `kosong/contract`'s "usage breakdown for a **single LLM generation**".
+/// camelCase on the wire, which is why the rename is explicit — the rest of
+/// Kimi's hook payload is snake_case, and the two conventions meet in this file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    #[serde(default)]
+    input_other: u64,
+    #[serde(default)]
+    input_cache_read: u64,
+    #[serde(default)]
+    input_cache_creation: u64,
+}
+
+impl TokenUsage {
+    /// Kimi's own `inputTotal` — everything that went *into* the model,
+    /// cache hits and writes included. Output tokens are excluded, matching
+    /// `agents::claude`'s fold and for the same reason: this column asks how
+    /// full the context window is, and a completion is not in the next request.
+    fn input_total(&self) -> u64 {
+        self.input_other + self.input_cache_read + self.input_cache_creation
+    }
+}
+
+/// The context gauge and model, from the **last** `usage.record` in the log.
+///
+/// The last one, emphatically not the sum. Each record is one generation's
+/// usage, and Kimi's persisted model folds them with `addUsage` into lifetime
+/// per-model totals — so summing gives a billing figure that only ever grows,
+/// which as a context gauge would show a long session at several hundred
+/// percent. The last record's input side is the size of the prompt that was
+/// actually sent, which is what the column means.
+///
+/// Recomputed from a whole-file read rather than an incremental one: `prior`'s
+/// cursor is Claude-only, and Kimi's records are small. If that ever costs too
+/// much, a bounded tail is the fix (Codex's approach), not a cursor.
+pub fn read_transcript_stats(transcript: &Path) -> TranscriptStats {
+    let Ok(body) = std::fs::read_to_string(transcript) else {
+        return TranscriptStats::default();
+    };
+    let mut stats = TranscriptStats::default();
+    for line in body.lines() {
+        // Cheap pre-filter: the log carries 49 record types and only one of
+        // them is worth deserializing.
+        if !line.contains("\"usage.record\"") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<UsageRecord>(line) else {
+            continue;
+        };
+        stats.context_tokens = Some(record.usage.input_total());
+        if !record.model.trim().is_empty() {
+            stats.model = Some(record.model);
+        }
+    }
+    stats
+}
+
+// =============================================================================
 // Resume picker
 // =============================================================================
 
@@ -175,6 +255,13 @@ const SESSION_INDEX: &str = "session_index.jsonl";
 
 /// The session directory Kimi keeps under `<home>/sessions/<bucket>/`.
 const SESSIONS_DIR: &str = "sessions";
+
+/// The conversation's own agent, as opposed to the `agent-N` subagents that can
+/// appear beside it in a session's `agents/` directory.
+const MAIN_AGENT: &str = "main";
+
+/// One agent's append-only journal, `agents/<id>/wire.jsonl`.
+const WIRE_LOG: &str = "wire.jsonl";
 
 /// Kimi's per-session `state.json`. It carries more than this (`agents`,
 /// `custom`, `isCustomTitle`); everything unnamed is ignored so a Kimi that
@@ -572,9 +659,10 @@ struct HookPayload {
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse kimi hook JSON from stdin")?;
+    let session_id = payload.session_id;
     Ok(HookMessage {
         event,
-        session_id: payload.session_id,
+        session_id: session_id.clone(),
         tool_name: payload.tool_name,
         // See the struct doc: the failure events' error field has no documented
         // name, so the raw payload stands in rather than a guess that silently
@@ -584,13 +672,50 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         prompt: payload.prompt,
         // The field this whole backend is cheap because of.
         session_title: payload.session_title,
-        // Kimi's payload names neither; both wait on `wire.jsonl`'s field
-        // names (module doc).
+        // Folded from `wire.jsonl` rather than reported here — one fact, one
+        // source (`common::adopt_session_facts`).
         context_tokens: None,
         model: None,
-        transcript_path: None,
+        transcript_path: session_id
+            .as_deref()
+            .and_then(wire_log_for)
+            .map(|p| p.to_string_lossy().into_owned()),
         raw: Some(stdin.to_string()),
     })
+}
+
+/// The main agent's wire log for `session_id`, or `None` if its session
+/// directory can't be found.
+///
+/// **Kimi's payload names no transcript**, so the path is resolved from the
+/// session id instead: `sessions/*/<session_id>/agents/main/wire.jsonl`. The
+/// bucket is walked rather than derived — the same reason [`list_resumable`]
+/// walks it, and Kimi's own readers do too.
+///
+/// `main` specifically, out of the several agents a session can hold
+/// (`state.json`'s `agents` map is keyed `main` / `agent-N`): the row's context
+/// gauge is the *conversation's*, and a subagent's log is a separate one whose
+/// numbers would overwrite it on whichever hook fired last.
+///
+/// This runs inside the `miao hook` subprocess, once per event, so it is one
+/// `read_dir` over the buckets — deliberately not a glob crate or a recursive
+/// walk. A miss just leaves the columns empty.
+fn wire_log_for(session_id: &str) -> Option<PathBuf> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let root = kimi_home()?.join(SESSIONS_DIR);
+    for bucket in super::common::read_subdirs(&root) {
+        let candidate = bucket
+            .join(session_id)
+            .join("agents")
+            .join(MAIN_AGENT)
+            .join(WIRE_LOG);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // =============================================================================
@@ -712,6 +837,69 @@ mod tests {
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title, None);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **The fold that matters.** Each `usage.record` is one generation's usage,
+    /// and Kimi's own reducer sums them into lifetime totals — so the context
+    /// gauge is the *last* record's input side, never the running total.
+    #[test]
+    fn the_context_gauge_is_the_last_generation_not_the_sum() {
+        let path = std::env::temp_dir().join(format!("cm-kimi-wire-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"metadata","protocol_version":"1.5","created_at":1}"#,
+                "\n",
+                r#"{"type":"turn.prompt","prompt":"hi","time":2}"#,
+                "\n",
+                r#"{"type":"usage.record","model":"kimi-k2","usage":{"inputOther":100,"output":500,"inputCacheRead":50,"inputCacheCreation":25},"time":3}"#,
+                "\n",
+                r#"{"type":"usage.record","model":"kimi-k2","usage":{"inputOther":200,"output":900,"inputCacheRead":300,"inputCacheCreation":0},"time":4}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let stats = read_transcript_stats(&path);
+        // 200 + 300 + 0 — the last generation's prompt. Not 675 (the sum), and
+        // not 1400 (the sum with completions).
+        assert_eq!(stats.context_tokens, Some(500));
+        assert_eq!(stats.model.as_deref(), Some("kimi-k2"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A log with no usage yet — every session's first moments — leaves both
+    /// columns empty rather than showing a zero.
+    #[test]
+    fn a_log_with_no_usage_yet_reports_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("cm-kimi-nousage-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"metadata","protocol_version":"1.5"}"#,
+                "\n",
+                r#"{"type":"turn.prompt","prompt":"hi"}"#,
+                "\n",
+                "not json at all\n",
+            ),
+        )
+        .unwrap();
+        let stats = read_transcript_stats(&path);
+        assert_eq!(stats.context_tokens, None);
+        assert_eq!(stats.model, None);
+        let _ = std::fs::remove_file(&path);
+
+        // And an absent log is the same answer, not an error.
+        let stats = read_transcript_stats(Path::new("/nonexistent/wire.jsonl"));
+        assert_eq!(stats.context_tokens, None);
+    }
+
+    /// The path is resolved from the session id by walking the buckets, so a
+    /// session id that matches nothing simply leaves the transcript unset.
+    #[test]
+    fn an_unknown_session_id_resolves_to_no_transcript() {
+        assert_eq!(wire_log_for(""), None);
+        assert_eq!(wire_log_for("   "), None);
     }
 
     /// An empty or absent home is an empty picker, not an error.

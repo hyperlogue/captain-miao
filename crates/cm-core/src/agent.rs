@@ -524,17 +524,12 @@ impl AgentControl {
             // them are documented as a rebuildable projection, so they are the
             // wrong thing to parse however convenient they look.
             AgentControl::Reasonix => TranscriptStats::default(),
-            // Unreachable rather than unimplemented, as for Reasonix: this runs
-            // only on a path a hook payload supplied, and no documented Kimi
-            // payload field names one. The transcript itself is known —
-            // `sessions/<workDirKey>/<sessionId>/agents/*/wire.jsonl`, carrying
-            // message history and request traces — but neither the field names
-            // for token usage and model nor `<workDirKey>`'s derivation is
-            // documented, and a guessed field would put a wrong number in a
-            // column read as fact. What fills this: one real session dir, read.
-            // (Resolve it by globbing `sessions/*/<sessionId>/` rather than
-            // recomputing the key.)
-            AgentControl::Kimi => TranscriptStats::default(),
+            // Kimi's payload names no transcript, so `agents::kimi` resolves
+            // one from the session id and puts it on the message — which is
+            // what makes this arm reachable at all. `prior` is unused: the
+            // cursor is Claude's, and this is a whole-file read of a log of
+            // small records.
+            AgentControl::Kimi => kimi::read_transcript_stats(transcript),
             // Unreachable rather than unimplemented, the same shape as Reasonix
             // but for a different reason: Grok's transcript path *is* derivable
             // (cwd + session id), and `agents::grok` deliberately does not derive
