@@ -5,45 +5,80 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- **Every prebuilt binary now carries a server.** `npx @hyperlogue/captain-miao`
-  and the GitHub tarballs all ship with an x86-64 glibc `miao-server` embedded,
-  so setting up a remote host that has nothing installed no longer waits on a
-  download. Hosts on another architecture, or with no glibc, still fetch theirs
-  at deploy time.
-- **Release tarballs are named `miao-v<version>-<target>.tar.gz`**, matching the
-  binary rather than the project. The old `captain-miao-v…` name is gone; npm
-  installs are unaffected.
-- **The bundled `miao-server` is 44% smaller**, which more than claws back what
-  carrying one costs: it builds size-tuned and without the SQLite features it
-  never uses — keeping the pty path at full optimization — and the payload is now
-  compressed with xz rather than gzip. About 1.24 MiB off every download.
+## [0.4.0] - 2026-08-14
 
 ### Added
 
+- **Ghostty is a third terminal backend** (macOS only, Ghostty ≥ 1.3), driven
+  through its AppleScript dictionary — which reads no window screen, so there is
+  no preview, and cannot reparent a surface, so `t` and `Space l` hide
+  themselves.
+- **Reasonix is a third agent backend**, launched with `miao reasonix [dir]`:
+  rows track status and launch, resume and fork work, but there are no token or
+  model columns, no resume-picker entries, no worktrees and no background-task
+  tiers.
+- **`p` in the hosts panel offers that host this machine's clipboard**, so
+  `Ctrl+V` in an agent running there attaches a screenshot you just took here —
+  images only, never text, off by default and per host (Codex reads the
+  clipboard in-process, so it instead gets a `clipboard-paste` command that
+  writes the image into the session and prints the path to hand it).
 - **`miao-bundled-all-server-v<version>-<target>.tar.gz`** — a larger download
   carrying every published server (both arches, glibc and musl), for a mixed
   fleet or a machine that can't reach the network at deploy time.
-- **Nix: the servers a dashboard can deploy are now an override.**
-  `captain-miao-with-servers` carries a static musl x86-64 server by default —
-  which runs on any x86-64 Linux host regardless of its libc — and
+- **Nix: the servers a dashboard can deploy are now an override** —
+  `captain-miao-with-servers` carries a static musl x86-64 server that runs on
+  any x86-64 Linux host regardless of its libc, and
   `.override { targets = [ … ]; }` widens that fleet without rebuilding the
   dashboard.
 
+### Changed
+
+- **Every prebuilt binary now carries an x86-64 glibc `miao-server`**, so setting
+  up a remote host that has nothing installed no longer waits on a download
+  (other architectures, and hosts with no glibc, still fetch theirs at deploy
+  time).
+- **Release tarballs are named `miao-v<version>-<target>.tar.gz`**, matching the
+  binary rather than the project; npm installs are unaffected.
+- **The bundled `miao-server` is 44% smaller** — about 1.24 MiB off every
+  download — since it builds size-tuned without the SQLite features it never
+  uses, keeping the pty path at full optimization, and its payload is compressed
+  with xz rather than gzip.
+- **The hosts panel never shows a stale CPU, memory or latency figure** — a
+  spinner stands in until a reading arrives and `cpu/mem unavailable` where a
+  probe came back empty-handed — so the three numbers on a row are always
+  current, and the latency one is now labelled.
+- **The hosts panel's row editor behaves like a form**: `S-Tab`, the arrows and
+  `Ctrl-n`/`Ctrl-p` walk the fields both ways, each field takes the usual
+  readline keys, `Esc` abandons an edit instead of committing it, and `Ctrl-e` /
+  `Ctrl-t` open it straight on the icon or the target.
+- **A refused attach now names its refusal** — a pty another client holds, or a
+  session that is already gone — and corrects the row it came from, rather than
+  sharing one catch-all failure message.
+- **Pooled sessions no longer swallow `Ctrl-Space Ctrl-q`**, libshpool's own
+  detach chord, which duplicated `D` and squatted a prefix an agent TUI may want.
+
+### Fixed
+
+- **The dashboard header no longer smears** when the ☁️ tally or the default
+  host's icon changes width, which could leave a stray digit, a swallowed one,
+  and no host icon at all.
+- **A session waiting on an [r3](https://github.com/hyperlogue/r3) review is
+  flagged again** when its `r3 watch` was `exec`'d and left no wrapper shell
+  behind, instead of sitting busy on `Task` while a person waited.
+- **A detached row held by another client now clears when that client leaves**,
+  so it no longer sits marked 👀 indefinitely with `Space A` skipping it and
+  `Enter` offering to kick nobody.
+- **A host running an agent backend this dashboard predates no longer costs you
+  every row on it**: an unrecognized name used to fail the whole snapshot frame,
+  and now decodes to an inert unknown backend.
+
 ### Removed
 
-- **Nix: the `captain-miao-bundle-*` packages.** They compiled servers into the
-  `miao` binary for parity with the published artifacts, which buys nothing when
-  nothing is downloaded — and every change to the fleet relinked the dashboard.
-  Use `captain-miao-with-servers` instead.
-- **Nix: `captain-miao-servers` is renamed `captain-miao-server-payloads`.** One
-  letter apart from `captain-miao-server`, they meant opposite things — the
-  former is cross-built to run on other machines, the latter is a store-linked
-  binary for this one — and mixing them up produces a server that looks right
-  and fails to start on every host it reaches. Most people want
+- **Nix: the `captain-miao-bundle-*` packages** — use `captain-miao-with-servers`
+  instead, which doesn't relink the dashboard every time the server fleet
+  changes.
+- **Nix: `captain-miao-servers` is renamed `captain-miao-server-payloads`**, one
+  letter from `captain-miao-server` and meaning the opposite — most people want
   `captain-miao-with-servers` and never name either.
 
 ## [0.3.0] - 2026-08-12
@@ -246,6 +281,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hyperlogue/captain-miao/releases/tag/v0.2.0
