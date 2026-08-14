@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+use super::common;
 use super::{collapse_whitespace, find_in_path, shell_quote};
 
 use crate::agent::{
@@ -1253,51 +1254,21 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 // Hook event → status mapping
 // =============================================================================
 
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+/// Claude's departures from [`common::dispatch_default`]; everything else maps
+/// the way every backend maps it.
+pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // Claude mints a new sessionId on `/resume`; always take the freshest.
-    if let Some(sid) = msg.session_id {
-        state.session_id = Some(sid);
-    }
+    common::adopt_session_id(state, &mut msg);
 
     match msg.event {
-        HookEvent::SessionStart => {
-            if state.status == SessionStatus::Starting {
-                state.status = SessionStatus::Idle;
-            }
-        }
-        HookEvent::PromptSubmit => {
-            state.status = SessionStatus::Active;
-            state.last_tool = None;
-            state.last_error = None;
-            if let Some(prompt) = msg.prompt {
-                state.last_prompt = Some(prompt);
-            }
-        }
-        HookEvent::PreToolUse => {
-            state.status = SessionStatus::Active;
-            state.last_tool = msg.tool_name;
-        }
-        HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
-            state.status = SessionStatus::Active;
-            state.last_tool = None;
-        }
-        HookEvent::PermissionRequest => {
-            // AskUserQuestion fires a PermissionRequest like any gated tool, but
-            // it's a question/answer selection, not a permission grant. Route it
-            // to WaitingForDecision ("Decision") — same bucket as Elicitation,
-            // the other "agent is asking the user something" case — so the
-            // dashboard can tell it apart from a real tool-approval gate.
-            state.status = if msg.tool_name.as_deref() == Some("AskUserQuestion") {
-                SessionStatus::WaitingForDecision
-            } else {
-                SessionStatus::WaitingForApproval
-            };
-        }
-        HookEvent::Elicitation => {
+        // AskUserQuestion fires a PermissionRequest like any gated tool, but
+        // it's a question/answer selection, not a permission grant. Route it
+        // to WaitingForDecision ("Decision") — same bucket as Elicitation,
+        // the other "agent is asking the user something" case — so the
+        // dashboard can tell it apart from a real tool-approval gate. Every
+        // other tool takes the shared mapping (WaitingForApproval).
+        HookEvent::PermissionRequest if msg.tool_name.as_deref() == Some("AskUserQuestion") => {
             state.status = SessionStatus::WaitingForDecision;
-        }
-        HookEvent::ElicitationResult => {
-            state.status = SessionStatus::Active;
         }
         HookEvent::Stop => {
             state.last_tool = None;
@@ -1318,30 +1289,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
             let activity = state.child_pid.and_then(session_activity);
             state.status = status_after_stop(&state.status, activity);
         }
-        HookEvent::StopFailure => {
-            state.status = SessionStatus::Idle;
-            state.last_tool = None;
-            state.last_error = msg
-                .message
-                .or(msg.raw)
-                .or_else(|| Some("Stop hook failed".to_string()));
-        }
-        HookEvent::PreCompact => {
-            state.status = SessionStatus::Compacting;
-        }
-        HookEvent::PostCompact => {
-            // Manual `/compact` doesn't fire a Stop hook, so we must leave
-            // Compacting ourselves. The dashboard treats Compacted as a rest
-            // state and auto-marks it as needing follow-up. If compact was
-            // triggered mid-turn, the next PreToolUse/Stop overwrites this
-            // within milliseconds and the dashboard clears the bell.
-            state.status = SessionStatus::Compacted;
-        }
-        HookEvent::CwdChanged => {
-            if let Some(cwd) = msg.cwd {
-                state.cwd = cwd;
-            }
-        }
+        _ => common::dispatch_default(state, msg),
     }
 }
 

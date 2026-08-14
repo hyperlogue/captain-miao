@@ -16,12 +16,13 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::process::Command;
 
+use super::common;
+use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
 use super::{collapse_whitespace, find_in_path, shell_quote};
 use crate::agent::{
     AgentActivity, ResumeCandidate, SessionIndex, SessionIndexCache, TranscriptScan,
@@ -487,90 +488,32 @@ pub fn build_launch_command(
     Ok(cmd)
 }
 
-/// Create / refresh the synthetic home: symlink every entry of the real Codex
-/// home (except `hooks.json` and `config.toml`, which we own / copy) and write
-/// our `hooks.json` only when its contents would change (so concurrent launches
-/// never race a half-written file and the trust hash stays put).
+/// Create / refresh the synthetic home and return it: mirror the real Codex home
+/// (all but `hooks.json`, which is ours, and `config.toml`, which is copied
+/// writable because Codex persists hook trust into it), write our `hooks.json`,
+/// then pre-trust it. The mirroring itself — and the hard-won rules about
+/// dangling links, shadowing entries and file modes — lives in
+/// [`super::synth_home`].
 fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
-    let home = synth_home();
-    std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    // The synth home holds a copy of the (possibly 0600) real config.toml, so
-    // restrict the directory to the owner (0700) — best-effort, an older 0755
-    // dir from a previous build gets tightened here too.
-    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
-
-    if let Some(real) = codex_home()
-        && let Ok(entries) = std::fs::read_dir(&real)
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            // `hooks.json` is ours; `config.toml` is copied writable below.
-            if name == "hooks.json" || name == "config.toml" {
-                continue;
-            }
-            let link = home.join(&name);
-            match std::fs::read_link(&link) {
-                // Already a symlink: refresh only when it points elsewhere. A
-                // *dangling* one is fine — the target path is right, and Codex
-                // creating the file through it lands in the real home.
-                Ok(target) => {
-                    if target != entry.path() {
-                        atomic_symlink(&entry.path(), &link);
-                    }
-                }
-                // Not a symlink: either nothing is here (link it), or a real
-                // file/dir is shadowing the real home's entry. That happens
-                // whenever Codex adds a new state file: it creates it *inside*
-                // the synthetic home before the name exists in the real one, so
-                // no symlink is ever made and the two copies then diverge —
-                // which the old `!link.exists()` guard made permanent. Worst
-                // case is a split-brain SQLite DB: the main file resolves to the
-                // stale synthetic copy while `-wal`/`-shm`, symlinked once the
-                // real home grew them, resolve to the real home's — and Codex
-                // refuses to start ("local database appears to be damaged").
-                // Everything mirrored here belongs to the real home by
-                // construction, so replacing a shadow is safe — the synthetic
-                // home holds nothing of its own but `hooks.json` and the
-                // config copy, both rewritten below.
-                Err(_) => {
-                    if let Ok(meta) = std::fs::symlink_metadata(&link) {
-                        // rename(2) can't replace a directory, so clear it first.
-                        let removed = if meta.is_dir() {
-                            std::fs::remove_dir_all(&link)
-                        } else {
-                            std::fs::remove_file(&link)
-                        };
-                        if removed.is_ok() {
-                            tracing::debug!(
-                                "replaced shadow entry {} with a link to the real home",
-                                link.display()
-                            );
-                        }
-                    }
-                    atomic_symlink(&entry.path(), &link);
-                }
-            }
-        }
-    }
-
-    sync_config(&home);
-
-    let hooks_path = home.join("hooks.json");
-    let unchanged = std::fs::read_to_string(&hooks_path)
-        .map(|cur| cur == hooks_json)
-        .unwrap_or(false);
-    if !unchanged {
-        atomic_write(&hooks_path, hooks_json.as_bytes())
-            .with_context(|| format!("writing {}", hooks_path.display()))?;
-    }
+    let home = SynthHome {
+        dir: synth_home(),
+        real: codex_home(),
+        owned: &["hooks.json"],
+        copied: &[CopiedEntry {
+            name: "config.toml",
+            snapshot: ".config-source.toml",
+        }],
+    };
+    home.ensure()?;
+    home.write_owned("hooks.json", hooks_json)?;
 
     // Pre-trust our own hooks: compute the hash Codex persists on interactive
     // approval and write it into config.toml's [hooks.state]. Recomputed every
     // launch so it tracks any change to hooks.json (e.g. the embedded exe path
     // shifting on a rebuild) and never goes stale — which is what lets us drop
     // `--dangerously-bypass-hook-trust`.
-    seed_hook_trust(&home);
-    Ok(home)
+    seed_hook_trust(&home.dir);
+    Ok(home.dir)
 }
 
 /// PascalCase Codex event key (as it appears in hooks.json) → the snake_case
@@ -706,101 +649,6 @@ fn seed_hook_trust(home: &Path) {
     }
 }
 
-/// Replace `link` with a symlink to `target` atomically: build it at a temp
-/// path, then rename over `link` (rename is atomic on POSIX). Two concurrent
-/// Codex launches can each refresh the same link without ever exposing a window
-/// where it's missing. Best-effort — failures leave the next launch to retry.
-fn atomic_symlink(target: &Path, link: &Path) {
-    let (Some(parent), Some(name)) = (link.parent(), link.file_name().and_then(|n| n.to_str()))
-    else {
-        return;
-    };
-    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    if std::os::unix::fs::symlink(target, &tmp).is_ok() && std::fs::rename(&tmp, link).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-/// Write `bytes` to `path` atomically (temp file in the same dir + rename), so
-/// a concurrently-launching Codex never reads a half-written file. Renaming a
-/// regular file over a symlink replaces the link itself, which is what lets the
-/// config copy supersede a stale read-only symlink.
-///
-/// The temp file is created mode 0600 so the final file is 0600 too: these
-/// writes copy the user's real `~/.codex/config.toml` (often 0600), and going
-/// through the default umask (typically 0644) would silently downgrade a private
-/// config to world/group-readable.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("no parent dir"))?;
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| std::io::Error::other("bad file name"))?;
-    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
-    let write_tmp = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        // An existing temp left by a crashed run keeps its old mode through
-        // `open`, so set it explicitly to be sure the final file is 0600.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    };
-    if let Err(e) = write_tmp() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
-}
-
-/// Seed the synth home's `config.toml` as a **writable copy** of the real one.
-///
-/// It must not be a symlink: the real config is frequently a read-only file
-/// (e.g. a nix-store / home-manager symlink), and Codex persists hook trust by
-/// writing to `$CODEX_HOME/config.toml` — a write that fails on a read-only
-/// target ("config/batchWrite failed while updating hook trust"). Copying lets
-/// that write land.
-///
-/// We refresh the copy only when the real config's content changes (tracked via
-/// a `.config-source.toml` snapshot), never when Codex mutates the copy itself,
-/// so trust survives across launches but the user's own config edits still
-/// propagate (re-prompting trust once).
-fn sync_config(home: &Path) {
-    let Some(real_home) = codex_home() else {
-        return;
-    };
-    let Ok(real_content) = std::fs::read_to_string(real_home.join("config.toml")) else {
-        return; // no readable real config; leave any existing synth copy as-is
-    };
-    let synth_config = home.join("config.toml");
-    let snapshot = home.join(".config-source.toml");
-
-    let is_symlink = std::fs::symlink_metadata(&synth_config)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
-    let last_source = std::fs::read_to_string(&snapshot).unwrap_or_default();
-    // In sync already (and a real file, not a leftover symlink from an older
-    // build) → keep Codex's writes (trust) intact.
-    if synth_config.exists() && !is_symlink && last_source == real_content {
-        return;
-    }
-    // Write a fresh writable copy atomically. The rename replaces a stale
-    // symlink (or out-of-date copy) in one step, so a launching Codex never
-    // sees it missing or half-written.
-    if atomic_write(&synth_config, real_content.as_bytes()).is_ok() {
-        let _ = atomic_write(&snapshot, real_content.as_bytes());
-    }
-}
-
 /// Build the Codex `hooks.json`. The structure mirrors Claude's settings
 /// (`{event: [{matcher, hooks:[{type,command}]}]}`) but uses Codex's PascalCase
 /// event keys. The command is intentionally free of per-session data — the
@@ -879,67 +727,34 @@ pub fn session_activity(_agent_pid: u32) -> Option<AgentActivity> {
 // Hook event → status mapping
 // =============================================================================
 
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
-    if let Some(sid) = msg.session_id {
-        state.session_id = Some(sid);
-    }
+/// Codex's departures from [`common::dispatch_default`]; everything else maps
+/// the way every backend maps it.
+pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+    common::adopt_session_id(state, &mut msg);
 
     match msg.event {
-        HookEvent::SessionStart => {
-            if state.status == SessionStatus::Starting {
-                state.status = SessionStatus::Idle;
-            }
-        }
-        HookEvent::PromptSubmit => {
-            state.status = SessionStatus::Active;
-            state.last_tool = None;
-            state.last_error = None;
-            if let Some(prompt) = msg.prompt {
-                state.last_prompt = Some(prompt);
-            }
-        }
-        HookEvent::PreToolUse => {
-            // request_user_input is Codex's AskUserQuestion analog: a function
-            // tool that blocks waiting for the user, not an approval. It never
-            // fires PermissionRequest (it's outside the approval path) and its
-            // RequestUserInput event isn't persisted to the rollout, so this
-            // PreToolUse hook is the only signal it's waiting. Surface it as
-            // "Decision" (needs attention) — the paired PostToolUse, which
-            // fires once the user answers, resets it to Active.
-            state.status = if msg.tool_name.as_deref() == Some("request_user_input") {
-                SessionStatus::WaitingForDecision
-            } else {
-                SessionStatus::Active
-            };
+        // request_user_input is Codex's AskUserQuestion analog: a function tool
+        // that blocks waiting for the user, not an approval. It never fires
+        // PermissionRequest (it's outside the approval path) and its
+        // RequestUserInput event isn't persisted to the rollout, so this
+        // PreToolUse hook is the only signal it's waiting. Surface it as
+        // "Decision" (needs attention) — the paired PostToolUse, which fires
+        // once the user answers, resets it to Active. Any other tool takes the
+        // shared PreToolUse mapping (Active + last_tool).
+        HookEvent::PreToolUse if msg.tool_name.as_deref() == Some("request_user_input") => {
+            state.status = SessionStatus::WaitingForDecision;
             state.last_tool = msg.tool_name;
         }
-        // Codex folds tool failures into PostToolUse (the failure shows up in
-        // its `tool_response`), so there is no separate failure event to map.
-        HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
-            state.status = SessionStatus::Active;
-            state.last_tool = None;
-        }
-        HookEvent::PermissionRequest => {
-            state.status = SessionStatus::WaitingForApproval;
-        }
-        HookEvent::Stop => {
-            state.status = SessionStatus::Idle;
-            state.last_tool = None;
-        }
-        HookEvent::PreCompact => {
-            state.status = SessionStatus::Compacting;
-        }
-        HookEvent::PostCompact => {
-            state.status = SessionStatus::Compacted;
-        }
-        // Events Codex never emits — no hooks.json entry registers them, so
-        // they never reach this dispatcher. Ignored rather than mapped
-        // defensively; listed explicitly (not `_`) so the match stays exhaustive
-        // and a newly-added `HookEvent` variant still forces a decision here.
+        // Events Codex never emits — no hooks.json entry registers them, so they
+        // never reach this dispatcher. Ignored rather than mapped defensively,
+        // which is why they're intercepted here instead of falling through to
+        // the shared defaults. (The exhaustive match that forces a decision on a
+        // newly-added `HookEvent` variant is `common::dispatch_default`'s.)
         HookEvent::Elicitation
         | HookEvent::ElicitationResult
         | HookEvent::StopFailure
         | HookEvent::CwdChanged => {}
+        _ => common::dispatch_default(state, msg),
     }
 }
 

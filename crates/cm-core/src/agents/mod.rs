@@ -6,6 +6,12 @@ use tokio::process::Command;
 pub mod claude;
 pub mod codex;
 
+// Shared machinery the backend modules build on: the hook mapping they all
+// start from, and the synthetic-home builder an agent needs when its hooks can
+// only be discovered from its home directory.
+mod common;
+mod synth_home;
+
 // Small helpers shared by the backend modules. They live here (rather than
 // duplicated in each backend) because both `claude` and `codex` need byte-for-
 // byte the same behaviour and had drifted as copies.
