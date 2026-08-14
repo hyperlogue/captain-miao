@@ -5,6 +5,7 @@ use tokio::process::Command;
 
 pub mod claude;
 pub mod codex;
+pub mod reasonix;
 
 // Shared machinery the backend modules build on: the hook mapping they all
 // start from, and the synthetic-home builder an agent needs when its hooks can

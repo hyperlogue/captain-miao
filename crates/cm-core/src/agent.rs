@@ -1,8 +1,7 @@
-//! `AgentControl` is the dashboard's interface to a coding-agent CLI
-//! (Claude Code and Codex). It is per-session, not
-//! per-process: a single dashboard runs sessions from several backends side
-//! by side, dispatching every backend-shaped operation through the variant
-//! stored on each `LauncherState`.
+//! `AgentControl` is the dashboard's interface to a coding-agent CLI. It is
+//! per-session, not per-process: a single dashboard runs sessions from several
+//! backends side by side, dispatching every backend-shaped operation through
+//! the variant stored on each `LauncherState`.
 //!
 //! The variants carry no instance state — methods are pure functions of
 //! `self` and forward to the matching `agents::<name>` module.
@@ -47,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
-use crate::agents::{claude, codex};
+use crate::agents::{claude, codex, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -59,6 +58,7 @@ pub enum AgentControl {
     #[default]
     Claude,
     Codex,
+    Reasonix,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -99,6 +99,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                 Ok(match v {
                     "claude" => AgentControl::Claude,
                     "codex" => AgentControl::Codex,
+                    "reasonix" => AgentControl::Reasonix,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -111,7 +112,14 @@ impl AgentControl {
     /// Every backend this build can actually drive — `Unknown` is deliberately
     /// absent, which is what keeps it out of the `Space a` picker and the
     /// `Ctrl-t` cycle.
-    pub const ALL: &'static [AgentControl] = &[AgentControl::Claude, AgentControl::Codex];
+    ///
+    /// **Append, never reorder**: this order *is* the `Ctrl-t` cycle order and
+    /// the `Space a` picker order, both of which users learn by muscle memory.
+    pub const ALL: &'static [AgentControl] = &[
+        AgentControl::Claude,
+        AgentControl::Codex,
+        AgentControl::Reasonix,
+    ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
     /// (e.g. `miao claude .`).
@@ -119,6 +127,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => "claude",
             AgentControl::Codex => "codex",
+            AgentControl::Reasonix => "reasonix",
             AgentControl::Unknown => "",
         }
     }
@@ -131,6 +140,7 @@ impl AgentControl {
         match s.to_ascii_lowercase().as_str() {
             "claude" => Some(AgentControl::Claude),
             "codex" => Some(AgentControl::Codex),
+            "reasonix" => Some(AgentControl::Reasonix),
             _ => None,
         }
     }
@@ -140,6 +150,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => "Claude",
             AgentControl::Codex => "Codex",
+            AgentControl::Reasonix => "Reasonix",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -148,7 +159,8 @@ impl AgentControl {
 
     /// Extra args appended after the cwd to resume (or fork) `session_id`. The
     /// flag shapes differ per backend: Claude takes `--resume <id>` plus an
-    /// optional `--fork-session`; Codex uses the `resume` / `fork` subcommands.
+    /// optional `--fork-session`; Codex uses the `resume` / `fork` subcommands;
+    /// Reasonix takes `-r <id>` plus `--copy` to continue in a writable copy.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         match self {
             AgentControl::Claude => {
@@ -161,6 +173,17 @@ impl AgentControl {
             AgentControl::Codex => {
                 let sub = if fork { "fork" } else { "resume" };
                 vec![sub.to_string(), session_id.to_string()]
+            }
+            AgentControl::Reasonix => {
+                // `--resume QUERY` also accepts a path or a unique title; the id
+                // is the exact form. `--copy` is its fork: the original
+                // transcript is left untouched and the copy is writable, which
+                // is also how you resume a session another process holds.
+                let mut v = vec!["-r".to_string(), session_id.to_string()];
+                if fork {
+                    v.push("--copy".to_string());
+                }
+                v
             }
             AgentControl::Unknown => vec![],
         }
@@ -194,6 +217,10 @@ impl AgentControl {
                 Some(v)
             }
             AgentControl::Codex => None,
+            // Reasonix has isolated "Delivery" workspaces of its own (they even
+            // have a state dir), but no CLI flag launches into one, so there is
+            // nothing to spend a worktree request on.
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -214,6 +241,10 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::watch_paths(),
             AgentControl::Codex => codex::watch_paths(),
+            // Nothing: the dashboard derives no Reasonix fact from disk — no
+            // session-name manifest, no title store, no transcript read — so
+            // there is no file whose change could make a row stale.
+            AgentControl::Reasonix => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -241,6 +272,13 @@ impl AgentControl {
             // and is read back by the per-host title overlay, so this wake is the
             // only thing that gets a rename onto the wire.
             AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
+            // Nothing, and for a stronger reason than Claude's: every fact a
+            // Reasonix row carries arrives over a hook and is written to the
+            // state file, which the host already watches. There is no store we
+            // read out of band, so a wake here could only ever re-diff rows that
+            // hadn't changed. If a rename or a token count is ever read from the
+            // session sidecars, that sidecar dir belongs here.
+            AgentControl::Reasonix => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -252,6 +290,9 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_session_index(cache),
             AgentControl::Codex => codex::read_session_index(cache),
+            // No per-pid manifest to scan: a Reasonix session's id arrives on
+            // every hook payload, which is what this index is a fallback for.
+            AgentControl::Reasonix => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -273,6 +314,15 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_transcript_stats_incremental(transcript, prior),
             AgentControl::Codex => codex::read_transcript_stats(transcript, prior),
+            // Unreachable rather than unimplemented: this runs only on a path a
+            // hook payload supplied, and Reasonix's carries none. Its sessions
+            // are JSONL transcripts plus **metadata sidecars** under the state
+            // root, and the sidecar schema — where title, model and token totals
+            // sit — is the one thing source reading could not settle. Reading a
+            // real session dir is the prerequisite; the sqlite catalogs beside
+            // them are documented as a rebuildable projection, so they are the
+            // wrong thing to parse however convenient they look.
+            AgentControl::Reasonix => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -284,6 +334,16 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::list_resumable(limit),
             AgentControl::Codex => codex::list_resumable(limit),
+            // Empty on purpose. Reasonix does ship an introspection command
+            // (`reasonix session list --json`), but it is documented as
+            // *redacted*: it deliberately exposes no transcript, label, path or
+            // host content — i.e. none of the cwd, title or first prompt a
+            // candidate is made of, and machine session ids are opaque hashes
+            // keyed to an installation. Shelling out per picker open to get rows
+            // we couldn't render is worse than an honest empty list, and reading
+            // the sidecars directly waits on the same schema question as
+            // `read_transcript_stats`.
+            AgentControl::Reasonix => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -315,6 +375,9 @@ impl AgentControl {
             AgentControl::Codex => {
                 codex::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Reasonix => {
+                reasonix::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -330,6 +393,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::build_hooks_settings(sock_path),
             AgentControl::Codex => codex::build_hooks_settings(sock_path),
+            AgentControl::Reasonix => reasonix::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -341,6 +405,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::dispatch_hook(state, msg).await,
             AgentControl::Codex => codex::dispatch_hook(state, msg).await,
+            AgentControl::Reasonix => reasonix::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -351,6 +416,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::parse_hook_payload(event, stdin),
             AgentControl::Codex => codex::parse_hook_payload(event, stdin),
+            AgentControl::Reasonix => reasonix::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -365,6 +431,11 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::scan_transcript_signals(path, offset),
             AgentControl::Codex => codex::scan_transcript_signals(path, offset),
+            // Empty because Reasonix needs no sentinel, not because none was
+            // found: an interrupt is a payload field (`isInterrupt`) on a real
+            // hook, so the case that forced Codex to read its rollout — Esc
+            // firing nothing — cannot arise here.
+            AgentControl::Reasonix => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -379,6 +450,9 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::session_activity(agent_pid),
             AgentControl::Codex => codex::session_activity(agent_pid),
+            // No status file, so no second opinion on the working/idle axis —
+            // Reasonix's transitions ride hooks alone, interrupts included.
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -395,6 +469,11 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_session_name(agent_pid),
             AgentControl::Codex => None,
+            // Reasonix titles exist (the pickers search them) but live in the
+            // session sidecars, keyed by session id rather than by pid — so
+            // there is no per-pid file to read, and surfacing one waits on the
+            // same schema question as `read_transcript_stats`.
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -406,6 +485,7 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::session_file_path(agent_pid),
             AgentControl::Codex => None,
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -444,6 +524,9 @@ impl AgentControl {
             AgentControl::Claude => None,
             AgentControl::Codex if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Codex => None,
+            // Moot: no hook payload names a transcript, so no watch of either
+            // kind is ever started for a Reasonix session.
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -463,6 +546,13 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::bg_shells(agent_pid),
             AgentControl::Codex => None,
+            // Reasonix *does* have real background tasks — and deliberately
+            // fires no `SubagentStop` for them — but the only view of them is a
+            // subprocess (`reasonix task list --json`) over a cache the docs call
+            // a projection, not a process tree we can walk. Until that is worth a
+            // spawn per refresh, a `Stop` while a background task runs means "the
+            // foreground turn ended" and the row reads Idle.
+            AgentControl::Reasonix => None,
             AgentControl::Unknown => None,
         }
     }
@@ -721,8 +811,11 @@ mod tests {
     fn known_agent_names_still_decode() {
         let claude: AgentControl = serde_json::from_str(r#""claude""#).expect("claude decodes");
         let codex: AgentControl = serde_json::from_str(r#""codex""#).expect("codex decodes");
+        let reasonix: AgentControl =
+            serde_json::from_str(r#""reasonix""#).expect("reasonix decodes");
         assert_eq!(claude, AgentControl::Claude);
         assert_eq!(codex, AgentControl::Codex);
+        assert_eq!(reasonix, AgentControl::Reasonix);
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
@@ -730,7 +823,7 @@ mod tests {
     /// name is gone, but it never silently becomes Claude).
     #[test]
     fn an_unrecognized_agent_name_decodes_to_unknown() {
-        let a: AgentControl = serde_json::from_str(r#""reasonix""#).expect("decodes, not errors");
+        let a: AgentControl = serde_json::from_str(r#""kimi""#).expect("decodes, not errors");
         assert_eq!(a, AgentControl::Unknown);
 
         let encoded = serde_json::to_string(&a).expect("encodes");
@@ -748,7 +841,7 @@ mod tests {
         let snapshot = format!(
             "[{},{},{}]",
             state_json("claude", 1),
-            state_json("reasonix", 2),
+            state_json("kimi", 2),
             state_json("codex", 3),
         );
         let sessions: Vec<LauncherState> =
@@ -777,9 +870,15 @@ mod tests {
     #[test]
     fn all_excludes_unknown() {
         assert!(!AgentControl::ALL.contains(&AgentControl::Unknown));
+        // Order is the `Ctrl-t` cycle and the picker order, so this pins it:
+        // a new backend appends, it never inserts.
         assert_eq!(
             AgentControl::ALL,
-            &[AgentControl::Claude, AgentControl::Codex]
+            &[
+                AgentControl::Claude,
+                AgentControl::Codex,
+                AgentControl::Reasonix
+            ]
         );
     }
 
@@ -787,9 +886,14 @@ mod tests {
     /// `from_cli` still refuses rather than handing back an inert backend.
     #[test]
     fn from_cli_rejects_an_unrecognized_name_instead_of_unknown() {
-        assert_eq!(AgentControl::from_cli("reasonix"), None);
+        assert_eq!(AgentControl::from_cli("kimi"), None);
         assert_eq!(AgentControl::from_cli(""), None);
         assert_eq!(AgentControl::from_cli("claude"), Some(AgentControl::Claude));
+        assert_eq!(
+            AgentControl::from_cli("Reasonix"),
+            Some(AgentControl::Reasonix),
+            "the CLI spelling is case-insensitive, unlike the on-disk one"
+        );
     }
 
     /// Nothing may be launched from a backend we can't name — guessing an argv

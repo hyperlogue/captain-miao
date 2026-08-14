@@ -23,7 +23,7 @@ focused tool and the rest of your workflow is yours to compose.
 - **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
 - **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents.
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) ships too, with [known limits](#reasonix-support).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -31,7 +31,7 @@ focused tool and the rest of your workflow is yours to compose.
 ## Requirements
 
 - A supported terminal: **Kitty** with remote control enabled (see [Kitty setup](#kitty-setup)), **Ghostty** ≥ 1.3 on macOS (see [Ghostty setup](#ghostty-setup)), **zellij** ≥ 0.44, or **tmux** ≥ 3.2 (for either multiplexer, run captain-miao inside the session it should drive; no extra setup needed).
-- **Claude Code** and/or **Codex** on your `PATH`.
+- **Claude Code**, **Codex** and/or **Reasonix** on your `PATH`.
 
 ## Installation
 
@@ -137,10 +137,21 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao`                          | Run the TUI dashboard (the default).                                                                                                       |
 | `miao claude [dir] [args…]`     | Launch Claude Code in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to `claude`. |
 | `miao codex [dir] [args…]`      | Launch Codex in `dir` with tracking hooks; extra args are forwarded to `codex`.                                                             |
+| `miao reasonix [dir] [args…]`   | Launch Reasonix in `dir` with tracking hooks; extra args are forwarded to `reasonix`. See [known limits](#reasonix-support).                |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+
+#### Reasonix support
+
+Reasonix rows track status — working, idle, waiting for approval, compacting — and launch, resume and fork all work. It is newer than the other two backends and does less:
+
+- **No token or model columns, and no resume picker entries.** Both need Reasonix's session sidecars, whose on-disk schema hasn't been settled yet. Its hook payload carries no transcript path, so the dashboard reads nothing from disk for these sessions.
+- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a background task runs reads as `Idle`.
+- **Run `reasonix setup` outside captain-miao once first.** A session runs under a synthetic config home that mirrors your real one; a first-time setup performed *inside* a session lands in that mirror and is cleared on a later launch.
+
+It also hasn't yet been exercised against a released `reasonix` build end to end, so please report anything that looks wrong rather than assuming it's expected.
 
 ### Key bindings
 
@@ -344,7 +355,7 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 ## Roadmap
 
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that *can* be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents (Kimi Code, opencode, Grok, …) can slot in alongside Claude Code and Codex.
+- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix is the first to do so and is still unproven against a released build ([known limits](#reasonix-support)); Grok, Kimi Code, Pi and opencode are mapped but unwritten.
 - [ ] **Ghostty**: shipped, but nothing in it has run against a live Ghostty — the AppleScript backend is unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation on a real Mac is what graduates it.
 - [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 

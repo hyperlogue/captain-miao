@@ -627,6 +627,14 @@ mod tests {
     fn open_session_new_session_argv() {
         assert_eq!(open_argv(AgentControl::Claude, None), ["claude", "/work"]);
         assert_eq!(open_argv(AgentControl::Codex, None), ["codex", "/work"]);
+        // The cwd is *our* positional in every case — `miao <agent> <cwd>` — and
+        // stays one for Reasonix even though the agent itself takes `--dir`,
+        // because translating it is `build_launch_command`'s job (and must be:
+        // `reasonix`'s own positional is a prompt).
+        assert_eq!(
+            open_argv(AgentControl::Reasonix, None),
+            ["reasonix", "/work"]
+        );
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -677,6 +685,10 @@ mod tests {
             open_argv_worktree(AgentControl::Codex, None, Some("feature-auth")),
             ["codex", "/work"]
         );
+        assert_eq!(
+            open_argv_worktree(AgentControl::Reasonix, None, Some("feature-auth")),
+            ["reasonix", "/work"]
+        );
     }
 
     #[test]
@@ -698,6 +710,16 @@ mod tests {
         assert_eq!(
             open_argv(AgentControl::Codex, Some(("s2", true))),
             ["codex", "/work", "fork", "s2"]
+        );
+        // Reasonix resumes with a short flag and forks with `--copy`, which
+        // continues in a writable copy rather than reopening the original.
+        assert_eq!(
+            open_argv(AgentControl::Reasonix, Some(("s3", false))),
+            ["reasonix", "/work", "-r", "s3"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Reasonix, Some(("s3", true))),
+            ["reasonix", "/work", "-r", "s3", "--copy"]
         );
     }
 

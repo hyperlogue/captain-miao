@@ -76,6 +76,15 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Reasonix with hooks injected for session tracking. Argument
+    /// handling matches the `claude` subcommand.
+    Reasonix {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to reasonix.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts)
     Hook {
         /// Hook event type
@@ -152,6 +161,7 @@ impl Commands {
         match self {
             Commands::Claude { args } => Some((agent::AgentControl::Claude, args)),
             Commands::Codex { args } => Some((agent::AgentControl::Codex, args)),
+            Commands::Reasonix { args } => Some((agent::AgentControl::Reasonix, args)),
             _ => None,
         }
     }
@@ -336,7 +346,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         // this pattern, and the compiler asks for it, while a non-launcher
         // subcommand added without a dispatch arm still fails to build instead
         // of reaching a runtime panic.
-        Some(cmd @ (Commands::Claude { .. } | Commands::Codex { .. })) => {
+        Some(
+            cmd @ (Commands::Claude { .. } | Commands::Codex { .. } | Commands::Reasonix { .. }),
+        ) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             cm_core::cli::run_launch(agent, args.to_vec()).await
         }
