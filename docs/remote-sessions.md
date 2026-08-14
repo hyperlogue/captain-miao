@@ -498,7 +498,20 @@ the full sequence and re-runs it on every reconnect:
 3. **Forward** — cancel any stale forward, then a **forward-only**
    `ssh -N -L <local>:<remote> <target>` child (`kill_on_drop`), under
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth
-   only). Steps 1–3 ride one authenticated TCP connection. Control sockets
+   only). Steps 1–3 ride one authenticated TCP connection.
+
+   A host offered the clipboard (`p`, §9) takes **one extra round trip between
+   the cancel and the tunnel child**, and then a second forward on it: a `-R`
+   pointing the host's `~/.cache/captain-miao/clipboard.sock` at this machine's
+   `clipboard serve` socket, synthesized rather than typed but otherwise an
+   ordinary member of the `Forward` list. The round trip is what makes the `-R`
+   bindable, and it does two things a forward spec cannot: `mkdir -p` the parent
+   (ssh creates none, as `ControlPath` taught us) and **`rm -f` the socket path**.
+   The `rm` is the load-bearing half. `streamlocal-forward@openssh.com` carries
+   only a path, so the client-side `StreamLocalBindUnlink` that would handle this
+   is inert for `-R` — a dropped link leaves the socket file behind, and the next
+   reconnect's bind fails on it. Without the prep, the bridge comes back dead
+   exactly once per network blip. Control sockets
    live in a flat `cm-<uid>` dir to stay under the ~104-byte `sockaddr_un`
    limit. **Attach and `w`-shell windows now share that same ControlMaster**
    (`attach_argv`/`remote_shell_argv` both splice `ssh_common_opts`), so
@@ -1041,6 +1054,14 @@ decides what they mean**.
     tunnel child, and nothing else carries them. `ExitOnForwardFailure` stays at
     its default `no`: a port already in use must cost that one forward, not the
     link to the host.
+  - **The field is no longer the only source of forwards.** `p` (below)
+    synthesizes a `-R` the user never typed, and it joins the same `Forward` list,
+    the same lift onto the tunnel child, and the same `REQUESTED_FORWARDS`
+    bookkeeping — so everything in this bullet holds for it unchanged. Two
+    consequences worth naming: `-O cancel` cancels *every* forward on its command
+    line, so the clipboard's rides the one existing cancel-then-request pass
+    rather than a second one; and `ExitOnForwardFailure=no` means a clipboard
+    socket that won't bind costs the paste, never the link to the host.
   - **The user's arguments go first**, because ssh keeps the first value it
     obtains for an option. Ours first would make the field inert for exactly its
     motivating settings — `ConnectTimeout`, `ServerAliveInterval` and
@@ -1064,6 +1085,30 @@ decides what they mean**.
     reason the panel shows. The one exception is a trailing `-L` with no
     argument, dropped because it is a usage error on *every* call that would
     carry it — including the attach window.
+- **`p` — offer this machine's clipboard to the host** (`clipboard` in
+  `hosts.json`, off by default, `📋` on the row when on). What it buys is pasting
+  a screenshot into an agent that is running somewhere else: the launcher shadows
+  `xclip`/`wl-paste` on the agent's `PATH` with symlinks back to `miao-server`,
+  and the shim asks *this* machine over the `-R` socket from §4.
+  - **Per-host and off by default**, because the direction of the trust is
+    unusual: every other remote feature sends the host what the user asked it to,
+    and this one lets the host read something it did not. So the flag is a
+    property of one host, and revoking it is the same key.
+  - **Images only, structurally.** The protocol's format token is a two-entry
+    allowlist (`png`, `bmp`), compared and never interpolated, and the type reply
+    only ever *names* image types — so there is no request a shim can send that
+    returns the text on the user's clipboard, rather than a filter that has to
+    keep getting it right.
+  - **The server is the dashboard's own child**, supervised with a capped
+    backoff, started when any non-suspended host wants it and stopped when the
+    last one stops. It holds a `0600` socket under `runtime_dir()`, reads the
+    clipboard on the process's main thread (`NSPasteboard` requires it), and dies
+    with the dashboard through a held stdin pipe rather than a signal.
+  - **Not reachable for pooled-localhost**, which is the one gap: that backend is
+    synthesized from `[launcher] pooled`, not from `hosts.json`, so it has no row
+    and no `p`. The shim tries the local socket before the forwarded one, so the
+    mechanism works there the moment the server is running for some *other*
+    host's sake — there is simply no way to ask for it on its own.
 - **`l` — the connection log** (per host, in the panel). The row gets one line
   for a failure whose reason is routinely a paragraph, and the *sequence* is
   what diagnoses: "probed the host, decided to deploy, the deploy came back with
