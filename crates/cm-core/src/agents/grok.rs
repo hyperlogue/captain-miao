@@ -538,14 +538,14 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         prompt: None,
         // Grok's title is per-session in `summary.json`, not on the hook.
         session_title: None,
-        // Derivable but deliberately not derived — see the module doc. This is
-        // the field the launcher gates its entire transcript watch on, so `None`
-        // is what keeps the empty stats fold and the absent interrupt scan
-        // consistent rather than merely unimplemented.
         // Grok records both per session, but on disk rather than on the
         // payload; see the module doc's probe list.
         context_tokens: None,
         model: None,
+        // Derivable but deliberately not derived — see the module doc. This is
+        // the field the launcher gates its entire transcript watch on, so `None`
+        // is what keeps the empty stats fold and the absent interrupt scan
+        // consistent rather than merely unimplemented.
         transcript_path: None,
         raw: Some(stdin.to_string()),
     })

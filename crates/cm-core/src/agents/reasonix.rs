@@ -345,14 +345,14 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Reasonix's payload carries no title; `subject` is the turn's, not the
         // session's, and it is one of the fields deliberately left unread.
         session_title: None,
-        // Reasonix's payload has no transcript path, and this is the field the
-        // launcher gates its entire transcript watch on — so nothing reads a
-        // Reasonix transcript, which is what makes the empty `read_transcript_stats`
-        // and `scan_transcript_signals` consistent rather than merely unimplemented.
         // Reasonix's payload names neither; both wait on the session sidecar
         // schema (module doc).
         context_tokens: None,
         model: None,
+        // Reasonix's payload has no transcript path, and this is the field the
+        // launcher gates its entire transcript watch on — so nothing reads a
+        // Reasonix transcript, which is what makes the empty `read_transcript_stats`
+        // and `scan_transcript_signals` consistent rather than merely unimplemented.
         transcript_path: None,
         raw: Some(stdin.to_string()),
     })

@@ -94,6 +94,16 @@
 //! - **that there is genuinely no fork** (`kimi --help | grep -i fork`). If one
 //!   appears, [`crate::agent::AgentControl::resume_args`] grows a flag under
 //!   `fork` and `supports_fork()` flips itself — nothing else changes.
+//! - **what `TurnStarted`'s granularity actually is.** It is registered as a
+//!   second `prompt-submit` so that a turn beginning without a user prompt still
+//!   moves the row, on the assumption that a "turn" is a user-visible one. Pi is
+//!   the warning: *its* `turn_*` events fire per **LLM call**, which is why
+//!   `agents::pi` declines them outright. If Kimi's mean the same, this
+//!   registration spawns one `miao hook` per model call inside the user's
+//!   session — the one load this design must never impose — and the shared
+//!   `PromptSubmit` arm clears `last_tool` mid-run, blanking the Tool column
+//!   between tools. Count the hook invocations across one multi-tool turn;
+//!   unregistering is a one-line fix.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;

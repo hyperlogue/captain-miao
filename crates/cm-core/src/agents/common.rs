@@ -1,9 +1,10 @@
 //! The hook-event mapping every backend starts from.
 //!
-//! Claude's and Codex's dispatchers were near-identical copies; a third, fourth
-//! and fifth would be the wrong direction. A backend now handles only the events
+//! Claude's and Codex's dispatchers were near-identical copies, and every
+//! backend since would have been another. A backend now handles only the events
 //! it genuinely treats differently and delegates the rest here, so the arms that
-//! *are* common exist once.
+//! *are* common exist once — which is why five of the seven dispatchers are a
+//! single delegating line.
 //!
 //! [`dispatch_default`]'s match is deliberately exhaustive (no `_` arm): a newly
 //! added [`HookEvent`] variant must force a decision, and this is the one place

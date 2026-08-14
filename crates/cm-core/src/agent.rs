@@ -212,15 +212,17 @@ impl AgentControl {
         }
     }
 
-    /// Extra args appended after the cwd to resume (or fork) `session_id`. The
-    /// flag shapes differ per backend: Claude takes `--resume <id>` plus an
-    /// optional `--fork-session`; Codex uses the `resume` / `fork` subcommands;
-    /// Reasonix takes `-r <id>` plus `--copy` to continue in a writable copy;
-    /// Kimi takes `--session <id>` and has no fork at all.
-    /// flag shapes differ per backend: Claude and Grok take `--resume <id>` plus
-    /// an optional `--fork-session`; Codex uses the `resume` / `fork`
-    /// subcommands; Reasonix takes `-r <id>` plus `--copy` to continue in a
-    /// writable copy; opencode takes `-s <id>` plus `--fork`.
+    /// Extra args appended after the cwd to resume (or fork) `session_id`.
+    ///
+    /// The flag shapes differ per backend and each arm states its own; the
+    /// three *kinds* are what matter here. Most decorate a resume with a fork
+    /// flag (Claude and Grok share `--resume <id>` / `--fork-session`; Reasonix
+    /// takes `-r <id>` / `--copy`; opencode `-s <id>` / `--fork`). Two swap the
+    /// entry point instead of adding to it — Codex's `resume` / `fork`
+    /// subcommands, and Pi's `--session` / `--fork`, which are alternatives
+    /// rather than a flag and its modifier. One ignores `fork` entirely (Kimi),
+    /// which is how a backend says it cannot branch: the two argvs come out
+    /// equal and [`Self::supports_fork`] reads that off directly.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         match self {
             // Grok's flags are byte-identical to Claude's here (`17-sessions.md`
@@ -484,7 +486,7 @@ impl AgentControl {
             // id arrives on every hook payload — which is what this index is a
             // fallback for.
             AgentControl::Grok => SessionIndex::default(),
-            // No per-pid manifest — and unlike the other three, no session id
+            // No per-pid manifest — and alone among the backends, no session id
             // arrives on the hook either, so this index has nothing to fall
             // back *to*. That is the gap that makes an opencode row
             // unresumable; see `agents::opencode`.
@@ -1271,31 +1273,27 @@ mod tests {
     /// The hand-written `Deserialize` must not have moved the names it replaced.
     #[test]
     fn known_agent_names_still_decode() {
-        let claude: AgentControl = serde_json::from_str(r#""claude""#).expect("claude decodes");
-        let codex: AgentControl = serde_json::from_str(r#""codex""#).expect("codex decodes");
-        let reasonix: AgentControl =
-            serde_json::from_str(r#""reasonix""#).expect("reasonix decodes");
-        let kimi: AgentControl = serde_json::from_str(r#""kimi""#).expect("kimi decodes");
-        assert_eq!(claude, AgentControl::Claude);
-        assert_eq!(codex, AgentControl::Codex);
-        assert_eq!(reasonix, AgentControl::Reasonix);
-        assert_eq!(kimi, AgentControl::Kimi);
-        let grok: AgentControl = serde_json::from_str(r#""grok""#).expect("grok decodes");
-        let pi: AgentControl = serde_json::from_str(r#""pi""#).expect("pi decodes");
-        assert_eq!(pi, AgentControl::Pi);
-        assert_eq!(claude, AgentControl::Claude);
-        assert_eq!(codex, AgentControl::Codex);
-        assert_eq!(reasonix, AgentControl::Reasonix);
-        assert_eq!(grok, AgentControl::Grok);
-        // One word, all lowercase — the derived `rename_all` spelling of
-        // `OpenCode` and the project's own styling agree, which is the only
-        // reason no `#[serde(rename)]` is needed here.
-        let opencode: AgentControl = serde_json::from_str(r#""opencode""#).expect("decodes");
-        assert_eq!(opencode, AgentControl::OpenCode);
-        assert_eq!(
-            serde_json::to_string(&AgentControl::OpenCode).expect("encodes"),
-            r#""opencode""#
-        );
+        // Every backend, by the name it advertises — so a `visit_str` arm that
+        // is dropped, misspelled or reordered fails here rather than turning a
+        // live session's rows into `Unknown` on the next dashboard.
+        for &agent in AgentControl::ALL {
+            let name = agent.cli_subcommand();
+            let decoded: AgentControl = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            assert_eq!(decoded, agent, "{name} decoded to the wrong backend");
+            // …and round-trips, which is what keeps a state file written by one
+            // build readable by the next.
+            assert_eq!(
+                serde_json::to_string(&agent).expect("encodes"),
+                format!("\"{name}\""),
+                "{agent:?} does not serialize as the name it decodes from"
+            );
+        }
+        // The one that could have needed a `#[serde(rename)]` and doesn't: the
+        // derived `rename_all` spelling of `OpenCode` is one lowercase word,
+        // which is also how the project spells it. The loop above would catch a
+        // divergence, but this names the reason nobody has to re-derive it.
+        assert_eq!(AgentControl::OpenCode.cli_subcommand(), "opencode");
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
