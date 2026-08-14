@@ -603,6 +603,18 @@ pub struct HookMessage {
     pub cwd: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// The title the agent itself has already settled on for this session, when
+    /// its payload carries one. Stamped straight onto [`LauncherState::name`],
+    /// so a backend that reports it needs no title store, no sqlite reader and
+    /// no per-host overlay — the two mechanisms Claude and Codex each had to
+    /// grow are simply absent for it.
+    ///
+    /// Carried on `HookMessage` rather than handled per-event because it is not
+    /// an event: it rides *every* payload of the backends that have it, so the
+    /// adoption belongs with the session id's, in
+    /// [`crate::agents::common::adopt_session_identity`].
+    #[serde(default)]
+    pub session_title: Option<String>,
     /// Path to the current session's transcript on disk, if the agent
     /// exposes one in its hook payload. The launcher watches it to detect
     /// out-of-band signals (approval dismissed, assistant message appended,

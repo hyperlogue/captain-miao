@@ -342,6 +342,9 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         message: payload.error,
         cwd: payload.cwd,
         prompt: payload.prompt,
+        // Reasonix's payload carries no title; `subject` is the turn's, not the
+        // session's, and it is one of the fields deliberately left unread.
+        session_title: None,
         // Reasonix's payload has no transcript path, and this is the field the
         // launcher gates its entire transcript watch on — so nothing reads a
         // Reasonix transcript, which is what makes the empty `read_transcript_stats`

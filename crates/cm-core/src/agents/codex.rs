@@ -709,6 +709,9 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         message: None,
         cwd: payload.cwd,
         prompt: payload.prompt,
+        // Codex's payload has no title either; its titles live in
+        // `state_5.sqlite` and reach `name` through the per-host overlay.
+        session_title: None,
         transcript_path: payload.transcript_path,
         raw: Some(stdin.to_string()),
     })
@@ -733,7 +736,7 @@ pub fn session_activity(_agent_pid: u32) -> Option<AgentActivity> {
 /// Codex's departures from [`common::dispatch_default`]; everything else maps
 /// the way every backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
-    common::adopt_session_id(state, &mut msg);
+    common::adopt_session_identity(state, &mut msg);
 
     match msg.event {
         // request_user_input is Codex's AskUserQuestion analog: a function tool
@@ -1103,6 +1106,7 @@ mod tests {
             message: None,
             cwd: None,
             prompt: None,
+            session_title: None,
             transcript_path: None,
             raw: None,
         }
