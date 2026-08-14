@@ -34,6 +34,13 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Whether `name` resolves to an executable on `$PATH`. Backs
+/// [`crate::agent::AgentControl::is_available`]; the `find_in_path` it wraps is
+/// module-private because callers outside want the yes/no, not the path.
+pub(crate) fn binary_available(name: &str) -> bool {
+    find_in_path(name).is_some()
+}
+
 /// Put the clipboard shim farm at the front of the agent's `PATH`, when there is
 /// one.
 ///

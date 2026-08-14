@@ -17,6 +17,30 @@ use super::{
 /// Max gap between two left-clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
+/// The backend `Ctrl-t` lands on next, given the ones currently installed.
+///
+/// Pure and separate from the key handler for its two edge cases, both of which
+/// only became reachable once the cycle stopped walking the full set:
+///
+/// - **`available` is empty** — nothing resolved on `$PATH`, which is as likely
+///   to mean a `PATH` we can't see as an empty machine. Fall back to every
+///   backend so the key still does something rather than silently going inert.
+/// - **`current` isn't in the list** — `Space a`, `--agent` and the config file
+///   all still name uninstalled backends deliberately, so this is a normal
+///   state, not a bug. Land on the *first* stop; advancing from a defaulted
+///   index would skip it and make the second press the one that reaches it.
+pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> AgentControl {
+    let all: &[AgentControl] = if available.is_empty() {
+        AgentControl::ALL
+    } else {
+        available
+    };
+    match all.iter().position(|a| *a == current) {
+        Some(cur) => all[(cur + 1) % all.len()],
+        None => all[0],
+    }
+}
+
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         // Ctrl+c always quits, regardless of current mode.
@@ -789,9 +813,16 @@ impl App {
                 worktree,
             } = &mut active.kind
         {
-            let all = AgentControl::ALL;
-            let cur = all.iter().position(|a| a == agent).unwrap_or(0);
-            *agent = all[(cur + 1) % all.len()];
+            // Cycle only the backends actually installed. At two this key was a
+            // toggle; every agent we add is another stop the user probably
+            // doesn't have, so without the filter the key gets worse each time
+            // we add one (see `AgentControl::is_available`).
+            let installed: Vec<AgentControl> = AgentControl::ALL
+                .iter()
+                .copied()
+                .filter(|a| a.is_available())
+                .collect();
+            *agent = cycle_agent(*agent, &installed);
             // Switching onto an agent without worktrees disarms the request
             // rather than holding it: it would be dropped at launch, and the
             // footer hides it, so it would sit invisibly armed and then reappear

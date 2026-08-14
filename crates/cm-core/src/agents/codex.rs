@@ -30,6 +30,9 @@ use crate::agent::{
 };
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
+/// The executable this backend drives — see [`super::claude::BIN`].
+pub(crate) const BIN: &str = "codex";
+
 // =============================================================================
 // Filesystem locations
 // =============================================================================
@@ -450,7 +453,7 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let codex_bin = find_in_path("codex").context("codex not found in PATH")?;
+    let codex_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
 
     // The launcher already wrote our hooks.json contents to `settings_path`;
     // relocate them into the synthetic home where Codex will discover them.

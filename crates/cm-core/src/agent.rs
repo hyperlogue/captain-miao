@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
+use crate::agents;
 use crate::agents::{claude, codex, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
@@ -142,6 +143,29 @@ impl AgentControl {
             "codex" => Some(AgentControl::Codex),
             "reasonix" => Some(AgentControl::Reasonix),
             _ => None,
+        }
+    }
+
+    /// Whether this agent's binary resolves on `$PATH`.
+    ///
+    /// **Advisory, and it gates the cycle rather than the launch.** `Ctrl-t`
+    /// steps through [`Self::ALL`] modulo its length: at two backends that was a
+    /// toggle, but each new one adds a stop the user most likely has not
+    /// installed, and an affordance that degrades with every agent we add is the
+    /// kind of cost that should not ride along silently. Choosing an agent
+    /// *deliberately* — `Space a`'s picker, a config value, `--agent` — is never
+    /// filtered: the answer here can only be stale (a `PATH` we can't see, an
+    /// agent installed a second ago), so it must not be able to make a session
+    /// unlaunchable. A missing binary still errors honestly, and from the one
+    /// place that actually knows: `build_launch_command`.
+    pub fn is_available(self) -> bool {
+        match self {
+            AgentControl::Claude => agents::binary_available(claude::BIN),
+            AgentControl::Codex => agents::binary_available(codex::BIN),
+            AgentControl::Reasonix => agents::binary_available(reasonix::BIN),
+            // Not a backend this build can launch at all, so no binary could
+            // make it available. It is absent from `ALL` besides.
+            AgentControl::Unknown => false,
         }
     }
 

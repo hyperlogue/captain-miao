@@ -92,6 +92,9 @@ use super::synth_home::SynthHome;
 use super::{find_in_path, shell_quote};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
+/// The executable this backend drives — see [`super::claude::BIN`].
+pub(crate) const BIN: &str = "reasonix";
+
 // =============================================================================
 // Filesystem locations — the three real roots (internal/config/paths.go)
 // =============================================================================
@@ -168,7 +171,7 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let reasonix_bin = find_in_path("reasonix").context("reasonix not found in PATH")?;
+    let reasonix_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
 
     // The launcher already wrote our settings.json contents to `settings_path`;
     // relocate them into the synthetic home, which is the only place Reasonix

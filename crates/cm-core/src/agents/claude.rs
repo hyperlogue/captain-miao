@@ -17,6 +17,10 @@ use crate::agent::{
 };
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
+/// The executable this backend drives. Named once so the seam's availability
+/// check and the launch path can't disagree about what to look for.
+pub(crate) const BIN: &str = "claude";
+
 // =============================================================================
 // Filesystem locations
 // =============================================================================
@@ -1123,7 +1127,7 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    let claude_bin = find_in_path("claude").context("claude not found in PATH")?;
+    let claude_bin = find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
     let has_envrc = Path::new(cwd).join(".envrc").is_file();
     let mut cmd = match has_envrc.then(|| find_in_path("direnv")).flatten() {
         Some(direnv) => {

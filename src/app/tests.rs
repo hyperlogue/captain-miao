@@ -6545,3 +6545,43 @@ fn resize_invalidation_forces_a_logo_re_upload() {
     // rather than finishing its trip invisibly.
     assert!(d.app.cat_walking());
 }
+
+// -- Ctrl-t backend cycle --
+
+/// The ordinary case, and the one the key was designed for when there were two
+/// backends: step through the installed set and wrap.
+#[test]
+fn the_backend_cycle_walks_only_what_is_installed() {
+    use super::keys::cycle_agent;
+    use crate::agent::AgentControl::{Claude, Codex, Reasonix};
+
+    let installed = [Claude, Reasonix];
+    assert_eq!(cycle_agent(Claude, &installed), Reasonix);
+    // Wraps rather than stopping at the end.
+    assert_eq!(cycle_agent(Reasonix, &installed), Claude);
+    // A single installed backend is a no-op, not a panic on `% 1`.
+    assert_eq!(cycle_agent(Claude, &[Claude]), Claude);
+    // Codex isn't installed here, so the cycle never offers it.
+    assert!(!installed.contains(&Codex));
+}
+
+/// Both cases that only became reachable once the cycle stopped walking
+/// `ALL` — an uninstalled current agent, and nothing installed at all.
+#[test]
+fn the_backend_cycle_survives_an_agent_it_cannot_see() {
+    use super::keys::cycle_agent;
+    use crate::agent::AgentControl::{self, Claude, Codex, Reasonix};
+
+    // Selected deliberately (`Space a`, `--agent`, config) but not on `$PATH`.
+    // The first press must reach the first stop, not skip past it.
+    assert_eq!(cycle_agent(Codex, &[Claude, Reasonix]), Claude);
+
+    // Nothing resolved: far more likely a `PATH` we can't read than a machine
+    // with no agents, so the key falls back to the full set instead of going
+    // inert.
+    assert_eq!(
+        cycle_agent(Claude, &[]),
+        AgentControl::ALL[1],
+        "an empty available set must still advance through ALL"
+    );
+}
