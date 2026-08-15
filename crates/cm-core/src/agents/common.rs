@@ -129,7 +129,11 @@ pub(super) fn newest_first<T>(
 /// here regardless of `msg.event`.
 ///
 /// Session ids: agents mint a fresh one on resume (Claude's `/resume`), so the
-/// freshest always wins.
+/// freshest always wins. An **empty** id is absent, not a new identity — the
+/// same rule as the title's, and load-bearing for any backend whose id is dug
+/// out of a payload or a getter that can come up blank (Grok's approval hook
+/// synthesizes it from `$GROK_SESSION_ID` in shell; Pi's extension calls a
+/// getter): taking it would overwrite the real id `r` and `f` resume from.
 ///
 /// Titles: an agent that puts its own title on the payload has already done the
 /// work Claude's session-file fold and Codex's sqlite overlay exist to do, so
@@ -151,7 +155,7 @@ pub(super) fn newest_first<T>(
 /// *itself* must still do all of this, and the point of the grouping is that
 /// there is no way to remember the id and forget the rest.
 pub(super) fn adopt_session_facts(state: &mut LauncherState, msg: &mut HookMessage) {
-    if let Some(sid) = msg.session_id.take() {
+    if let Some(sid) = msg.session_id.take().filter(|s| !s.trim().is_empty()) {
         state.session_id = Some(sid);
     }
     if let Some(title) = msg.session_title.take().filter(|t| !t.trim().is_empty()) {
@@ -343,6 +347,32 @@ mod tests {
         // Codex send on every hook.
         adopt_session_facts(&mut s, &mut msg(None));
         assert_eq!(s.name.as_deref(), Some("folded from the session file"));
+    }
+
+    /// A blank session id is absent, not a new identity — a backend whose id
+    /// is synthesized from a shell variable (Grok) or read off a getter (Pi)
+    /// can come up empty, and taking it would overwrite the real id `r` and
+    /// `f` resume from.
+    #[test]
+    fn a_blank_session_id_never_overwrites_a_real_one() {
+        let mut s = state();
+        s.session_id = Some("real-id".to_string());
+
+        for empty in ["", "   "] {
+            let mut m = HookMessage {
+                session_id: Some(empty.to_string()),
+                ..blank()
+            };
+            adopt_session_facts(&mut s, &mut m);
+            assert_eq!(s.session_id.as_deref(), Some("real-id"));
+        }
+        // A real one still wins — the freshest id is the resumable one.
+        let mut m = HookMessage {
+            session_id: Some("minted-on-resume".to_string()),
+            ..blank()
+        };
+        adopt_session_facts(&mut s, &mut m);
+        assert_eq!(s.session_id.as_deref(), Some("minted-on-resume"));
     }
 
     /// The route for a backend with no readable transcript: the agent reports
