@@ -8,9 +8,10 @@
 //! different home. Codex is the first backend that needs this; every comment
 //! below is a lesson paid for there, and a later backend gets it for free.
 //!
-//! The synthetic home holds **nothing of its own** but the owned files and the
-//! copies — everything else in it belongs to the real home by construction. That
-//! invariant is what makes the shadow-replacement below safe.
+//! The synthetic home holds **nothing of its own** but the owned files, the
+//! copies, and any `.shadow-*` quarantine a past launch set aside — everything
+//! else in it belongs to the real home by construction. That invariant is what
+//! makes the shadow-replacement below safe.
 
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
@@ -105,24 +106,39 @@ impl SynthHome<'_> {
                     // main file resolved to the stale synthetic copy while
                     // `-wal`/`-shm`, symlinked once the real home grew them,
                     // resolved to the real home's — and Codex refused to start
-                    // ("local database appears to be damaged"). Everything
-                    // mirrored here belongs to the real home by construction, so
-                    // replacing a shadow is safe — the synthetic home holds
-                    // nothing of its own but the owned files and the copies, both
-                    // (re)written on every launch.
+                    // ("local database appears to be damaged"). The shadow must
+                    // go, but not its *contents*: a shadow can hold state the
+                    // agent minted before the real home grew the name — at worst
+                    // a whole session tree — so it is set aside under a dotted
+                    // quarantine name the mirror never touches, and only deleted
+                    // when even the rename fails. Recovering a quarantined
+                    // shadow is a manual merge; losing it silently was the
+                    // defect.
                     Err(_) => {
-                        if let Ok(meta) = std::fs::symlink_metadata(&link) {
-                            // rename(2) can't replace a directory, so clear it first.
-                            let removed = if meta.is_dir() {
-                                std::fs::remove_dir_all(&link)
-                            } else {
-                                std::fs::remove_file(&link)
-                            };
-                            if removed.is_ok() {
-                                tracing::debug!(
-                                    "replaced shadow entry {} with a link to the real home",
-                                    link.display()
+                        if std::fs::symlink_metadata(&link).is_ok() {
+                            let secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let quarantine = self.dir.join(format!(
+                                ".shadow-{}-{}-{secs}",
+                                name.to_string_lossy(),
+                                std::process::id()
+                            ));
+                            if std::fs::rename(&link, &quarantine).is_ok() {
+                                tracing::warn!(
+                                    "quarantined shadow entry {} to {} and linked the real \
+                                     home's; merge it back by hand if it held anything",
+                                    link.display(),
+                                    quarantine.display()
                                 );
+                            } else {
+                                let meta = std::fs::symlink_metadata(&link);
+                                let _ = if meta.map(|m| m.is_dir()).unwrap_or(false) {
+                                    std::fs::remove_dir_all(&link)
+                                } else {
+                                    std::fs::remove_file(&link)
+                                };
                             }
                         }
                         atomic_symlink(&entry.path(), &link);
@@ -357,6 +373,44 @@ mod tests {
         home.ensure().unwrap();
         assert!(foreign.symlink_metadata().is_ok());
         assert!(s.synth().join("shadow.js").symlink_metadata().is_ok());
+    }
+
+    /// A shadow is replaced by the link but its contents survive under a
+    /// quarantine name — a whole session tree minted into the synthetic home is
+    /// recoverable by hand, where the old `remove_dir_all` destroyed it.
+    #[test]
+    fn a_replaced_shadow_is_quarantined_not_destroyed() {
+        let s = Scratch::new("quarantine");
+        let home = s.home(false);
+        home.ensure().unwrap();
+
+        // The agent minted a directory in the synthetic home before the real
+        // home had the name; then the real home grew it.
+        std::fs::create_dir_all(s.synth().join("sessions")).unwrap();
+        std::fs::write(s.synth().join("sessions/transcript.jsonl"), "turns").unwrap();
+        std::fs::create_dir_all(s.real().join("sessions")).unwrap();
+
+        home.ensure().unwrap();
+        // The name now resolves through a link into the real home…
+        assert_eq!(
+            std::fs::read_link(s.synth().join("sessions")).unwrap(),
+            s.real().join("sessions")
+        );
+        // …and the shadow's contents sit in a `.shadow-*` sibling.
+        let quarantined: Vec<_> = std::fs::read_dir(s.synth())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".shadow-sessions-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(quarantined[0].path().join("transcript.jsonl")).unwrap(),
+            "turns"
+        );
     }
 
     /// The state-mirror case ([`SynthHome::prune`] off): a dangling link stays,
