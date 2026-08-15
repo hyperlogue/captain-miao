@@ -4622,11 +4622,36 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if attention_indices.is_empty() {
+            // "No sessions need attention" is a claim about every visible row,
+            // and it is only true of rows whose backend could have told us.
+            // A backend with no approval gate (`AgentCapabilities::approval_gate`
+            // — Pi, which has no per-tool prompt at all) renders a session
+            // blocked on the user identically to one that is working, so name it
+            // rather than let the sweep read as exhaustive. The same treatment
+            // `RefreshPreview` gives a terminal that cannot read a window.
+            let mut blind: Vec<&'static str> = visible
+                .iter()
+                // Only backends this build knows: `Unknown` reports no gate
+                // either, but that is ignorance rather than the agent's limit,
+                // and naming it would state the opposite of what we know.
+                .filter(|s| {
+                    AgentControl::ALL.contains(&s.agent) && !s.agent.capabilities().approval_gate
+                })
+                .map(|s| s.agent.label())
+                .collect();
+            blind.sort_unstable();
+            blind.dedup();
             self.set_status(
                 if skipped_detached {
                     "Only detached sessions need attention".to_string()
-                } else {
+                } else if blind.is_empty() {
                     "No sessions need attention".to_string()
+                } else {
+                    format!(
+                        "No sessions need attention — {} has no approval prompt to report, so a \
+                         blocked one there looks busy",
+                        blind.join(" and ")
+                    )
                 },
                 false,
             );
@@ -4946,7 +4971,7 @@ impl App {
                 // Shown only when armed, and only where it's possible. An
                 // agent without worktrees says nothing rather than showing a
                 // permanent "off" for a thing it can't do.
-                if let Some(arm) = worktree.as_ref().filter(|_| agent.supports_worktrees()) {
+                if let Some(arm) = worktree.as_ref().filter(|_| agent.capabilities().worktrees) {
                     spans.push(Span::styled("   Worktree ", dim));
                     let name = arm.name.text();
                     if arm.naming {

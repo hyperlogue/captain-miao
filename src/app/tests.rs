@@ -1625,6 +1625,38 @@ fn the_attention_jump_skips_a_detached_row() {
     );
 }
 
+/// "No sessions need attention" is a claim about every visible row, and one
+/// backend cannot back it: Pi has no per-tool approval prompt at all
+/// (`AgentCapabilities::approval_gate`), so a Pi session blocked on the user
+/// looks exactly like one that is working. The sweep therefore names the backend
+/// instead of reading as exhaustive — the treatment `RefreshPreview` already
+/// gives a terminal that cannot read a window.
+#[test]
+fn the_attention_sweep_says_when_a_backend_could_not_have_told_it() {
+    let mut d = TestDashboard::new(120, 12);
+    let claude = session(1, "/home/test/one", SessionStatus::Idle);
+    d.set_sessions(vec![claude.clone()]);
+    d.app.table_state.select(Some(0));
+    d.press(KeyCode::Char('s'));
+    assert_eq!(
+        d.app.status_msg.as_deref(),
+        Some("No sessions need attention"),
+        "every visible backend can report an approval, so the sweep is exhaustive"
+    );
+
+    // Add a Pi row and the same keypress stops promising as much.
+    let mut pi = session(2, "/home/test/two", SessionStatus::Active);
+    pi.agent = crate::agent::AgentControl::Pi;
+    d.set_sessions(vec![claude, pi]);
+    d.app.table_state.select(Some(0));
+    d.press(KeyCode::Char('s'));
+    let msg = d.app.status_msg.clone().expect("a status message");
+    assert!(
+        msg.starts_with("No sessions need attention — Pi has no approval prompt"),
+        "the sweep must name the backend that could not answer: {msg}"
+    );
+}
+
 /// The one thing that does outrank detachment is an explicit pin: `p` is the
 /// user saying "keep this in front of me" about that exact row, which is the
 /// whole job of the flag — unlike a status, which the dashboard infers.
@@ -4138,6 +4170,49 @@ fn narrow_layout_stacks_panels_and_trims_columns() {
         "compact detail drops first-prompt"
     );
     assert!(!out.contains("PID"), "compact detail drops the PID line");
+}
+
+/// An empty context reading means two different things, and both views that
+/// show one have to say which. On a backend that reports a total, empty is "the
+/// first turn hasn't landed" and a number is coming; on Reasonix or Grok — which
+/// persist no context total at all (`AgentCapabilities::context_tokens`) —
+/// nothing is ever coming, and a cell that never fills reads as a session
+/// stalled before its first reply.
+#[test]
+fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
+    let render = |agent: crate::agent::AgentControl, cols: u16| {
+        let mut d = TestDashboard::new(cols, 20);
+        let mut s = session(1, "/home/test/proj", SessionStatus::Active);
+        s.agent = agent;
+        s.context_tokens = None;
+        d.set_sessions(vec![s]);
+        d.render()
+    };
+    // The wide table's `Ctx` column: blank while Claude has yet to report…
+    let claude = render(crate::agent::AgentControl::Claude, 120);
+    assert!(
+        !claude.contains("n/a"),
+        "a pending total leaves the column blank: {claude}"
+    );
+    // …and marked on the backend that will never report one.
+    let grok = render(crate::agent::AgentControl::Grok, 120);
+    assert!(
+        grok.contains("n/a"),
+        "a backend with no context total to give must not read as pending: {grok}"
+    );
+
+    // The narrow layout drops that column and shows a `Context` line instead,
+    // which needs the same distinction: an em dash pends, `n/a` doesn't.
+    let claude_narrow = render(crate::agent::AgentControl::Claude, 60);
+    assert!(
+        claude_narrow.contains("Context") && !claude_narrow.contains("n/a"),
+        "the compact detail pends with an em dash: {claude_narrow}"
+    );
+    let grok_narrow = render(crate::agent::AgentControl::Grok, 60);
+    assert!(
+        grok_narrow.contains("Context") && grok_narrow.contains("n/a"),
+        "…and says so when nothing is coming: {grok_narrow}"
+    );
 }
 
 #[test]

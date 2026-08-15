@@ -32,8 +32,12 @@ Claude/Codex hook → miao hook → launcher (Unix socket)
 
 Four seams carry the whole design; each is documented at its definition.
 
-- **`AgentControl`** (`cm-core/agent.rs`) — Claude vs Codex. A feature one agent
-  lacks returns `None`/empty from its method; the UI gates on that.
+- **`AgentControl`** (`cm-core/agent.rs`) — which coding-agent CLI a session
+  runs. A feature one agent lacks returns `None`/empty from its method; a
+  *structural* limit the UI has to gate on is a field on `capabilities()`
+  instead, the same shape as `Terminal`'s. That table is declared (it is read
+  while drawing) and every entry is checked against the code that owns it, so a
+  capability can only change by changing an argv or a hook config.
 - **`Backend`** (`src/backend.rs`) — where sessions run. `LocalBackend`
   (`cm-core/backend.rs`) is also the server-core.
 - **`Terminal`** (`src/terminal/`) — per-emulator control. One `capabilities()`
@@ -132,6 +136,11 @@ Anything local to one module is in that module's doc instead.
   the gate at the call site too, not just in the UI: the preview loop treats a
   failed `capture_text` as evidence the binding is stale, so `capture: false`
   has to stop the fetch rather than let it error.
+- **Don't render an absence that looks like a pending value, either.** The same
+  rule one level down: an empty Context cell means "no number yet", so a backend
+  that persists none reads `n/a`, and "No sessions need attention" names the
+  backend that has no approval prompt to report rather than claiming the sweep
+  was exhaustive. Both gate on `AgentControl::capabilities()`.
 - **Wrap anything sent over ssh in `/bin/sh -c '<script>'`** (`login_shell_safe`)
   — the account's login shell is routinely fish. Such a script may contain **no
   single quote and no backslash**.

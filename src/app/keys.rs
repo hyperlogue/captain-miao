@@ -334,7 +334,7 @@ impl App {
                 // continuing the session in place is the single outcome someone
                 // pressing `f` is trying to avoid, and it would look like it
                 // had worked.
-                if !s.agent.supports_fork() {
+                if !s.agent.capabilities().fork {
                     return None;
                 }
                 // A fork follows the **focused session's** host, never the
@@ -857,7 +857,7 @@ impl App {
             // rather than holding it: it would be dropped at launch, and the
             // footer hides it, so it would sit invisibly armed and then reappear
             // on a switch back — a launch nobody asked for.
-            if !agent.supports_worktrees() {
+            if !agent.capabilities().worktrees {
                 *worktree = None;
             }
             active.picker.title = super::format::workdir_picker_title(*agent, host);
@@ -884,7 +884,7 @@ impl App {
                 agent, worktree, ..
             } = &mut active.kind
         {
-            if !agent.supports_worktrees() {
+            if !agent.capabilities().worktrees {
                 let label = agent.label();
                 self.set_status(format!("{label} has no worktree support"), true);
                 return None;

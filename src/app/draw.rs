@@ -1097,9 +1097,15 @@ impl App {
         };
 
         let ctx_tokens = s.context_tokens;
-        let ctx = ctx_tokens
-            .map(format_tokens)
-            .unwrap_or_else(|| "—".to_string());
+        // `—` means "no number yet" — the first turn hasn't landed. A backend
+        // that will never have one (`AgentCapabilities::context_tokens`:
+        // Reasonix and Grok persist no context total) says so instead, so the
+        // field stops reading as a session that stalled before its first reply.
+        let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
+            (Some(t), _) => format_tokens(t),
+            (None, true) => "—".to_string(),
+            (None, false) => "n/a".to_string(),
+        };
         let model = s
             .model
             .as_deref()
@@ -1540,8 +1546,19 @@ impl App {
                 let mut row_cells = vec![override_cell, status_cell, icon_cell, name_cell];
                 if !narrow {
                     let ctx_tokens = s.context_tokens;
-                    let ctx = ctx_tokens.map(format_tokens).unwrap_or_default();
-                    let ctx_style = ctx_tokens.map(context_pressure_style).unwrap_or_default();
+                    // Blank is "no number yet". A backend that persists no
+                    // context total at all (`AgentCapabilities::context_tokens`)
+                    // would otherwise leave this column permanently blank and
+                    // indistinguishable from a session still on its first turn —
+                    // so it says `n/a`, dimmed.
+                    let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
+                        (Some(t), _) => format_tokens(t),
+                        (None, true) => String::new(),
+                        (None, false) => "n/a".to_string(),
+                    };
+                    let ctx_style = ctx_tokens
+                        .map(context_pressure_style)
+                        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
                     let last_prompt = s
                         .last_prompt
                         .as_deref()
@@ -1823,7 +1840,7 @@ impl App {
         // list is generic, so the key stays.
         if self
             .selected_session_ref()
-            .is_none_or(|s| s.agent.supports_fork())
+            .is_none_or(|s| s.agent.capabilities().fork)
         {
             lines.push(cmd(Command::ForkSession));
         }
@@ -2097,7 +2114,7 @@ impl App {
                         // Hidden for an agent that has no worktrees, the same
                         // rule as `t` on zellij and `Space l` on tmux: don't
                         // offer a key that can only report it does nothing.
-                        if agent.supports_worktrees() {
+                        if agent.capabilities().worktrees {
                             spans.extend(hint_pair("Ctrl-g", "worktree"));
                         }
                         if multi_host {
