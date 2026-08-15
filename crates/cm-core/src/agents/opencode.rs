@@ -362,6 +362,7 @@ fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
         real: real.clone(),
         owned: &[PLUGINS_DIR],
         copied: &[],
+        prune: false,
     };
     config.ensure()?;
 
@@ -370,6 +371,10 @@ fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
         real: real.map(|r| r.join(PLUGINS_DIR)),
         owned: &[PLUGIN_FILE],
         copied: &[],
+        // A loader-scanned collection: a plugin the user deletes must not
+        // leave a dangling import behind for opencode's loader to trip on
+        // (see [`SynthHome::prune`]).
+        prune: true,
     };
     plugins.ensure()?;
     plugins.write_owned(PLUGIN_FILE, plugin_js)?;

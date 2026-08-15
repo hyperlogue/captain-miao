@@ -271,6 +271,7 @@ fn ensure_synth_home(settings_json: &str) -> Result<PathBuf> {
         real: reasonix_home(),
         owned: &["settings.json"],
         copied: &[],
+        prune: false,
     };
     home.ensure()?;
     home.write_owned("settings.json", settings_json)?;

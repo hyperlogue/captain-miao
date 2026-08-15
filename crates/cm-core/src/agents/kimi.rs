@@ -427,6 +427,7 @@ fn ensure_synth_home(hooks_toml: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        prune: false,
     };
     home.ensure()?;
     merge_hooks(&home.dir.join("config.toml"), hooks_toml);

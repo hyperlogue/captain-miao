@@ -376,6 +376,7 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        prune: false,
     };
     home.ensure()?;
 
@@ -384,6 +385,9 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
         real: real.map(|r| r.join("hooks")),
         owned: &[HOOKS_FILE],
         copied: &[],
+        // A loader-scanned collection: a hook the user deletes must not leave
+        // a dangling import behind (see [`SynthHome::prune`]).
+        prune: true,
     };
     hooks.ensure()?;
     hooks.write_owned(HOOKS_FILE, hooks_json)?;

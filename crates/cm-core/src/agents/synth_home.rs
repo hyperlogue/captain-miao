@@ -51,6 +51,18 @@ pub(super) struct SynthHome<'a> {
     pub owned: &'a [&'a str],
     /// Entries copied writable rather than symlinked (see [`CopiedEntry`]).
     pub copied: &'a [CopiedEntry],
+    /// Remove links we minted whose real-home entry has since been deleted.
+    ///
+    /// Set it on a mirror of a **loader-scanned collection** — opencode's
+    /// `plugins/`, Grok's `hooks/` — where every entry is read by the agent and
+    /// a dangling import is at best noise and at worst fails the whole load.
+    ///
+    /// Leave it off for a **state mirror** (the homes themselves), where a
+    /// dangling link is load-bearing: the agent recreating the file writes
+    /// *through* the link into the real home, keeping both sides converged. A
+    /// prune there would turn that recreation into a shadow file the real home
+    /// never sees — the exact divergence this module exists to prevent.
+    pub prune: bool,
 }
 
 impl SynthHome<'_> {
@@ -119,10 +131,45 @@ impl SynthHome<'_> {
             }
         }
 
+        if self.prune {
+            self.prune_stale_links();
+        }
+
         for entry in self.copied {
             self.sync_copy(entry);
         }
         Ok(())
+    }
+
+    /// Drop symlinks we minted for real-home entries that no longer exist (see
+    /// [`SynthHome::prune`]). Only exact mints are touched — a symlink pointing
+    /// anywhere but the real home's entry of the same name, or a plain file,
+    /// is not ours to judge and is left alone. Best-effort, like the linking.
+    fn prune_stale_links(&self) {
+        let Some(real) = &self.real else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if self.is_ours(&name) {
+                continue;
+            }
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if target != real.join(&name) {
+                continue;
+            }
+            // lstat, not stat: a real-home entry that is itself a dangling
+            // symlink is still present, and mirroring it is not our call to
+            // revisit here.
+            if std::fs::symlink_metadata(&target).is_err() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Write one of our own files into the synthetic home — but only when its
@@ -231,4 +278,98 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch (real, synth) pair under the OS temp dir, cleaned on drop.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("cm-synth-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("real")).unwrap();
+            Scratch { root }
+        }
+        fn real(&self) -> PathBuf {
+            self.root.join("real")
+        }
+        fn synth(&self) -> PathBuf {
+            self.root.join("synth")
+        }
+        fn home(&self, prune: bool) -> SynthHome<'static> {
+            SynthHome {
+                dir: self.synth(),
+                real: Some(self.real()),
+                owned: &["captain-miao.js"],
+                copied: &[],
+                prune,
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The loader-scanned-collection case ([`SynthHome::prune`]): a plugin the
+    /// user deletes must not leave a dangling import behind in the mirror.
+    #[test]
+    fn a_pruning_mirror_drops_links_to_deleted_real_entries() {
+        let s = Scratch::new("prune");
+        std::fs::write(s.real().join("user.js"), "x").unwrap();
+        let home = s.home(true);
+        home.ensure().unwrap();
+        home.write_owned("captain-miao.js", "ours").unwrap();
+        assert!(s.synth().join("user.js").symlink_metadata().is_ok());
+
+        std::fs::remove_file(s.real().join("user.js")).unwrap();
+        home.ensure().unwrap();
+        assert!(
+            s.synth().join("user.js").symlink_metadata().is_err(),
+            "stale link survived the prune"
+        );
+        // Our own file is never a prune candidate.
+        assert_eq!(
+            std::fs::read_to_string(s.synth().join("captain-miao.js")).unwrap(),
+            "ours"
+        );
+    }
+
+    /// Only exact mints are pruned: a foreign symlink (even dangling) and a
+    /// plain file the agent shadowed in are not ours to judge.
+    #[test]
+    fn a_pruning_mirror_keeps_foreign_links_and_shadows() {
+        let s = Scratch::new("keep");
+        let home = s.home(true);
+        home.ensure().unwrap();
+        let foreign = s.synth().join("elsewhere.js");
+        std::os::unix::fs::symlink(s.root.join("nowhere"), &foreign).unwrap();
+        std::fs::write(s.synth().join("shadow.js"), "agent-made").unwrap();
+
+        home.ensure().unwrap();
+        assert!(foreign.symlink_metadata().is_ok());
+        assert!(s.synth().join("shadow.js").symlink_metadata().is_ok());
+    }
+
+    /// The state-mirror case ([`SynthHome::prune`] off): a dangling link stays,
+    /// so an agent recreating the file writes through it into the real home.
+    #[test]
+    fn a_state_mirror_keeps_dangling_links() {
+        let s = Scratch::new("state");
+        std::fs::write(s.real().join("sessions.json"), "x").unwrap();
+        let home = s.home(false);
+        home.ensure().unwrap();
+
+        std::fs::remove_file(s.real().join("sessions.json")).unwrap();
+        home.ensure().unwrap();
+        assert!(s.synth().join("sessions.json").symlink_metadata().is_ok());
+    }
 }

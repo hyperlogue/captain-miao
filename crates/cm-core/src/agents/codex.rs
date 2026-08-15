@@ -493,6 +493,7 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        prune: false,
     };
     home.ensure()?;
     home.write_owned("hooks.json", hooks_json)?;
