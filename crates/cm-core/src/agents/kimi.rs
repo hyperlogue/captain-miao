@@ -659,10 +659,15 @@ struct HookPayload {
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse kimi hook JSON from stdin")?;
-    let session_id = payload.session_id;
+    // Resolved before the message is built so the id needn't be cloned.
+    let transcript_path = payload
+        .session_id
+        .as_deref()
+        .and_then(wire_log_for)
+        .map(|p| p.to_string_lossy().into_owned());
     Ok(HookMessage {
         event,
-        session_id: session_id.clone(),
+        session_id: payload.session_id,
         tool_name: payload.tool_name,
         // See the struct doc: the failure events' error field has no documented
         // name, so the raw payload stands in rather than a guess that silently
@@ -676,10 +681,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // source (`common::adopt_session_facts`).
         context_tokens: None,
         model: None,
-        transcript_path: session_id
-            .as_deref()
-            .and_then(wire_log_for)
-            .map(|p| p.to_string_lossy().into_owned()),
+        transcript_path,
         raw: Some(stdin.to_string()),
     })
 }
