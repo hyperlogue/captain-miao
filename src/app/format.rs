@@ -484,29 +484,41 @@ pub(crate) enum Detached {
     HeldElsewhere,
 }
 
-/// Renders the override column using emoji. Bell sits on the left and a
-/// secondary indicator (pin or detached) sits on the right; without a bell, the
+/// Renders the override column. The follow-up dot sits on the left and a
+/// secondary indicator (pin or detached) sits on the right; without a dot, the
 /// secondary occupies the left position alone.
 ///
-/// Layout note: every glyph here is emoji-presentation by default, so
-/// `unicode-width` measures it 2 and the terminal paints it 2 — the column is
-/// `Length(4)` and the two slots pack tight (`[L][L][R][R]`) with no separator
-/// between them. That agreement is the reason to prefer emoji over the Nerd
-/// Font PUA glyphs this column used to carry: those measure 1 and paint 2, so
-/// ratatui's diff never skipped the following cell and a neighbouring column's
-/// update clipped the glyph's right half — which needed a post-render buffer
-/// fix-up in `draw_table` to undo. Keep any replacement glyph in that same
-/// class: no text-presentation symbol, and nothing that needs a VS16 to become
-/// emoji, or the tight layout silently goes back to being half-painted.
+/// Layout note: the invariant is **measured width == painted width**, not "emoji
+/// only". `OVERRIDE_COL_WIDTH` is the 1-cell dot plus the 2-cell secondary and
+/// the slots pack tight (`[L][R][R]`) with no separator between them, so any
+/// glyph whose paint disagrees with `unicode-width` shifts everything after it.
+/// That is what the Nerd Font PUA glyphs this column used to carry got wrong:
+/// they measure 1 and paint 2, so ratatui's diff never skipped the following
+/// cell and a neighbouring column's update clipped the glyph's right half —
+/// which needed a post-render buffer fix-up in `draw_table` to undo. The
+/// secondaries are emoji-presentation by default (measure 2, paint 2); the dot
+/// is East-Asian-Width **N**, so it measures 1 and paints 1 everywhere. Keep any
+/// replacement in one of those two classes. In particular a 1-cell dot must not
+/// be East-Asian-Width *Ambiguous* — `●` U+25CF and `•` U+2022 both are, and a
+/// terminal configured ambiguous-as-wide paints them 2 while `unicode-width`
+/// still says 1, which is the half-painted bug all over again. Nothing here may
+/// need a VS16 to reach its presentation, for the same reason.
 pub(super) fn override_indicator_cell(
     follow_up: bool,
     pinned: bool,
     detached: Option<Detached>,
 ) -> Cell<'static> {
-    // The styles only reach a terminal that renders these monochrome; a color
-    // emoji font paints its own hues and ignores the fg. Kept anyway so such a
-    // terminal still gets the accent.
-    let bell = Span::styled("\u{1F514}", Style::default().fg(Color::Yellow)); // 🔔 bell
+    // The dot is a *text* glyph, so unlike the emoji below it the fg actually
+    // paints — which is why it reads from `attention_fg` rather than a hardcoded
+    // yellow: it marks the same state `status_fg` recolours the status text for,
+    // and the two would drift apart under a remapped palette. The emoji styles
+    // only reach a terminal that renders them monochrome; a color emoji font
+    // paints its own hues and ignores the fg. Kept anyway so such a terminal
+    // still gets the accent.
+    let dot = Span::styled(
+        "\u{25C9}", // ◉ fisheye — see the layout note above before swapping it
+        Style::default().fg(crate::config::get().colors.ui.attention_fg),
+    );
     let pin = Span::styled("\u{1F4CC}", Style::default().fg(Color::Blue)); // 📌 pushpin
     // A pooled session still running on its host with no window on this screen
     // (§9). It joins the existing icon set rather than getting a column of its
@@ -533,8 +545,8 @@ pub(super) fn override_indicator_cell(
     };
 
     let line = match (follow_up, secondary) {
-        (true, Some(s)) => Line::from(vec![bell, s]),
-        (true, None) => Line::from(vec![bell]),
+        (true, Some(s)) => Line::from(vec![dot, s]),
+        (true, None) => Line::from(vec![dot]),
         (false, Some(s)) => Line::from(vec![s]),
         (false, None) => Line::from(""),
     };

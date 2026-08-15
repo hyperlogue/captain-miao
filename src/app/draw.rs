@@ -2206,11 +2206,12 @@ impl App {
 /// up.
 const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
 
-/// Width of the leading override column: two emoji slots, each 2 cells wide.
-/// Sized here rather than inline because both the narrow and wide constraint
-/// lists have to agree with what `override_indicator_cell` builds — a column
-/// narrower than the line right-aligned into it silently clips the bell.
-const OVERRIDE_COL_WIDTH: u16 = 4;
+/// Width of the leading override column: the 1-cell follow-up dot plus one
+/// 2-cell emoji slot for the secondary indicator. Sized here rather than inline
+/// because both the narrow and wide constraint lists have to agree with what
+/// `override_indicator_cell` builds — a column narrower than the line
+/// right-aligned into it silently clips the dot.
+pub(super) const OVERRIDE_COL_WIDTH: u16 = 3;
 
 /// One form field's spans, with the cursor drawn where it actually is.
 ///

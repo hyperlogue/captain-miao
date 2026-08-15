@@ -1386,8 +1386,8 @@ fn detached_rows_sink_below_plain_idle() {
 
 /// …and it *reads* as background too. The sort tier alone only helps once you
 /// know the ordering rule; dimming the whole row says "running elsewhere"
-/// where the eye already is. The override glyph is two cells at the far left
-/// and was carrying that on its own.
+/// where the eye already is. The override glyph is a couple of cells at the far
+/// left and was carrying that on its own.
 #[test]
 fn a_detached_row_draws_dim() {
     use crate::state::HostId;
@@ -6256,39 +6256,55 @@ fn snapshot_entry_flags_roundtrip_and_back_compat() {
 }
 
 #[test]
-fn override_glyph_is_a_self_measuring_wide_emoji() {
-    // The override column's tight two-slot layout rests on the glyph measuring
-    // exactly what the terminal paints. These are emoji-presentation
-    // codepoints, so `unicode-width` says 2 and ratatui parks the glyph in one
-    // buffer cell, blanks the cell behind it, and its diff then skips that cell
-    // — which is what keeps a neighbouring column's update from clipping the
-    // glyph's right half. The Nerd Font PUA glyphs this column used to carry
-    // measured 1 and painted 2, and needed a post-render buffer fix-up to fake
-    // the same thing. A replacement glyph that measures 1 (text presentation,
-    // or emoji only via VS16) puts that bug straight back.
+fn override_glyphs_measure_what_they_paint() {
+    // The override column's tight two-slot layout rests on every glyph measuring
+    // exactly what the terminal paints — the invariant is that agreement, not
+    // "emoji only". The secondaries are emoji-presentation codepoints, so
+    // `unicode-width` says 2 and ratatui parks the glyph in one buffer cell,
+    // blanks the cell behind it, and its diff then skips that cell — which is
+    // what keeps a neighbouring column's update from clipping the glyph's right
+    // half. The follow-up dot is the other legal class: East-Asian-Width `N`, so
+    // it measures 1 and paints 1 with no cell behind it to blank. What is
+    // *illegal* is a glyph that measures 1 and paints 2 — the Nerd Font PUA
+    // glyphs this column used to carry did, and needed a post-render buffer
+    // fix-up to fake the agreement. An East-Asian-Width *Ambiguous* dot (`●`,
+    // `•`) is the same bug on a terminal configured ambiguous-as-wide.
     use unicode_width::UnicodeWidthStr;
     let pin = "\u{1F4CC}";
+    let dot = "\u{25C9}";
     assert_eq!(pin.width(), 2, "pin glyph must measure two cells");
+    assert_eq!(dot.width(), 1, "follow-up dot must measure one cell");
+    // The column is sized for the worst case: both slots occupied at once.
+    assert_eq!(
+        dot.width() + pin.width(),
+        super::draw::OVERRIDE_COL_WIDTH as usize,
+        "the column must be exactly wide enough for both slots — narrower \
+         silently clips the dot the line is right-aligned against"
+    );
 
     let mut d = TestDashboard::new(120, 18);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
     d.app
         .update_flags((crate::state::HostId::local(), 1), Cursor::HoldIndex, |f| {
-            f.pinned = true
+            f.pinned = true;
+            f.follow_up = true;
         });
     d.render();
 
     let buf = d.terminal.backend().buffer();
-    let hits: Vec<(u16, u16)> = (0..buf.area.height)
-        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-        .filter(|&(x, y)| buf[(x, y)].symbol().contains(pin))
-        .collect();
+    let cells_of = |needle: &str| -> Vec<(u16, u16)> {
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol().contains(needle))
+            .collect()
+    };
+    let pin_hits = cells_of(pin);
     assert_eq!(
-        hits.len(),
+        pin_hits.len(),
         1,
-        "expected exactly one pin glyph cell, got {hits:?}"
+        "expected exactly one pin glyph cell, got {pin_hits:?}"
     );
-    let (x, y) = hits[0];
+    let (x, y) = pin_hits[0];
     assert_eq!(
         buf[(x, y)].symbol(),
         pin,
@@ -6298,6 +6314,20 @@ fn override_glyph_is_a_self_measuring_wide_emoji() {
         buf[(x + 1, y)].symbol(),
         " ",
         "the cell the glyph paints over must stay blank"
+    );
+
+    // Both slots drew, packed tight and in order: dot immediately left of the
+    // secondary. A clipped dot is the failure this pins.
+    let dot_hits = cells_of(dot);
+    assert_eq!(
+        dot_hits.len(),
+        1,
+        "expected exactly one follow-up dot cell, got {dot_hits:?}"
+    );
+    assert_eq!(
+        dot_hits[0],
+        (x - 1, y),
+        "the dot must pack tight against the secondary, no separator"
     );
 }
 
