@@ -1246,6 +1246,22 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             let activity = state.child_pid.and_then(session_activity);
             state.status = status_after_stop(&state.status, activity);
         }
+        HookEvent::PostCompact => {
+            // A manual `/compact` fires no `Stop`, so this hook is also the turn
+            // end — and it must answer the same question `Stop` does: did a
+            // `run_in_background` shell outlive it? If so the row's real shape
+            // is that shell's (`Task`/`Server`/`Review`, resolved by the
+            // launcher's classifier), not the compaction's.
+            //
+            // Paired with the `Compacted` arm of `reconcile_activity`, which
+            // covers the opposite interleaving: Claude's status write and this
+            // hook race, and whichever lands second is the one that converges
+            // the row. Reading here catches a file already back to `"shell"`
+            // (the reconciliation can't — it skips `Compacting`); the
+            // reconciliation catches a file written after this hook.
+            let activity = state.child_pid.and_then(session_activity);
+            state.status = status_after_compact(activity);
+        }
         _ => common::dispatch_default(state, msg),
     }
 }
@@ -1293,6 +1309,23 @@ fn status_after_stop(current: &SessionStatus, activity: Option<AgentActivity>) -
         (SessionStatus::Active, Some(AgentActivity::Working)) => SessionStatus::Active,
         (_, Some(AgentActivity::BackgroundShell)) => SessionStatus::BackgroundActive,
         _ => SessionStatus::Idle,
+    }
+}
+
+/// Resolve the status a `PostCompact` hook should settle to (see its arm).
+/// `Compacted` unless Claude reports a `run_in_background` shell still running,
+/// in which case the row belongs to that shell — `BackgroundActive`, which the
+/// launcher's classifier refines to `Server`/`Review` in the same wake.
+///
+/// Everything else keeps `Compacted`: a rest status the dashboard bells as
+/// "compaction landed, look at me". In particular a mid-turn *auto*-compaction
+/// reads `"busy"` (`Working`) and stays `Compacted`, which the turn's next hook
+/// overwrites within milliseconds anyway — the pre-existing behaviour. An
+/// unreadable/missing file (`None`) falls back the same way.
+fn status_after_compact(activity: Option<AgentActivity>) -> SessionStatus {
+    match activity {
+        Some(AgentActivity::BackgroundShell) => SessionStatus::BackgroundActive,
+        _ => SessionStatus::Compacted,
     }
 }
 
@@ -1840,6 +1873,27 @@ mod tests {
         for st in [S::Idle, S::Compacted, S::WaitingForApproval, S::Compacting] {
             assert_eq!(status_after_stop(&st, Some(A::Working)), S::Idle);
         }
+    }
+
+    /// A `/compact` fires no `Stop`, so `PostCompact` is the turn end for a
+    /// session at rest — and a `run_in_background` shell that outlived the
+    /// compaction owns the row. Without this, compacting a session that is
+    /// watching an r3 review reads `Compacted` until the watch ends, instead of
+    /// going back to `Review`.
+    #[test]
+    fn post_compact_yields_to_a_surviving_background_shell() {
+        use AgentActivity as A;
+        use SessionStatus as S;
+        assert_eq!(
+            status_after_compact(Some(A::BackgroundShell)),
+            S::BackgroundActive
+        );
+        // Everything else keeps the compaction signal: at rest, mid-turn (an
+        // auto-compaction, whose next hook overwrites this anyway), and an
+        // unreadable/torn file.
+        assert_eq!(status_after_compact(Some(A::Idle)), S::Compacted);
+        assert_eq!(status_after_compact(Some(A::Working)), S::Compacted);
+        assert_eq!(status_after_compact(None), S::Compacted);
     }
 
     // ---- fixture vocabulary -------------------------------------------------

@@ -763,13 +763,9 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         //     agent is at rest, settle `Active` to the rest shape it reports.
         //   - A turn can also end while a `run_in_background` shell keeps running
         //     (`"shell"`), which reads as `BackgroundActive` rather than `Idle`.
-        // We only ever *demote* toward rest here; hook events own the rest→`Active`
-        // direction, so a momentary `"busy"` read can never bounce us into `Active`.
-        // (The one promotion in this loop lives in the classification block below,
-        // and turns on corroborating process-tree evidence rather than on this read
-        // alone.) Only the working/idle/shell statuses are consulted; the
-        // fine-grained, hook/transcript-backed states (Approval, Decision,
-        // Compacting, Compacted) are left untouched so the file can't clobber them.
+        // The table itself is `reconcile_activity`; the gate below is only an
+        // optimization, keeping the read (and, on a background row, the
+        // process-tree scan under it) off wakes that could not change anything.
         //
         // Kept for the classification block, which needs the same read: `None`
         // whenever this didn't run, which is exactly when there is no fresh
@@ -781,6 +777,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 state.status,
                 SessionStatus::Active
                     | SessionStatus::Idle
+                    | SessionStatus::Compacted
                     | SessionStatus::BackgroundActive
                     | SessionStatus::BackgroundServer
                     | SessionStatus::ReviewPending
@@ -792,34 +789,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             activity = tokio::task::spawn_blocking(move || agent.agent_activity(cpid))
                 .await
                 .unwrap_or(None);
-            let next = match (&state.status, activity) {
-                // Interrupt: a busy turn ended with no hook.
-                (SessionStatus::Active, Some(AgentActivity::Idle)) => Some(SessionStatus::Idle),
-                (SessionStatus::Active, Some(AgentActivity::BackgroundShell)) => {
-                    Some(SessionStatus::BackgroundActive)
-                }
-                // At rest: track the background shell appearing / clearing.
-                (SessionStatus::Idle, Some(AgentActivity::BackgroundShell)) => {
-                    Some(SessionStatus::BackgroundActive)
-                }
-                (SessionStatus::BackgroundActive, Some(AgentActivity::Idle)) => {
-                    Some(SessionStatus::Idle)
-                }
-                // A long-running server / review-watch is a background shell too —
-                // when it ends (killed, human submitted, timed out) the shell is
-                // gone, so settle to rest just like `BackgroundActive`.
-                // Staying-in-shell is left to the classification refinement below
-                // (which decides transient-task vs server vs review).
-                (SessionStatus::BackgroundServer, Some(AgentActivity::Idle)) => {
-                    Some(SessionStatus::Idle)
-                }
-                (SessionStatus::ReviewPending, Some(AgentActivity::Idle)) => {
-                    Some(SessionStatus::Idle)
-                }
-                // Working, unknown/torn read (None), or already-consistent: hold.
-                _ => None,
-            };
-            if let Some(next) = next {
+            if let Some(next) = reconcile_activity(&state.status, activity) {
                 // Settling out of `Active` here means the turn ended with no hook
                 // (an interrupt). Clear `last_tool` to match the Stop hook and the
                 // transcript-scan interrupt path, so a rest row doesn't carry the
@@ -1331,6 +1301,56 @@ fn classify_and_learn(
     (Some(class), next_deadline)
 }
 
+/// The status a fresh session-file read settles `current` to, or `None` to hold
+/// it. The agent's own file is authoritative on the coarse
+/// working/idle/background-shell axis; this is the table that mirrors it (the
+/// call site owns *when* it runs — only on a session-file wake).
+///
+/// **Demote-only**: hook events own the rest→`Active` direction, so a momentary
+/// or lagging `"busy"` read can never bounce a resting row into `Active`. The
+/// one promotion in the loop is `promote_stale_background`, which turns on
+/// corroborating process-tree evidence rather than on this read alone. An
+/// unknown/torn read (`None`) always holds.
+///
+/// Only the working/idle/shell axis is consulted; the fine-grained,
+/// hook/transcript-backed states (Approval, Decision, `Compacting`) are left
+/// untouched so the file can't clobber them. `Compacted` is the one that also
+/// takes a `BackgroundShell`, for the same reason `Idle` does: it is a **rest**
+/// status, so a `run_in_background` shell that outlives the compaction is the
+/// truer shape of the row — otherwise a session compacted while an r3
+/// review-watch runs reads `Compacted` until the watch ends, rather than the
+/// `Review` its shells say it is. It is never demoted to `Idle`, though: both
+/// are at rest, so that trades away the compaction signal (and the follow-up
+/// bell armed on entering it) for nothing.
+fn reconcile_activity(
+    current: &SessionStatus,
+    activity: Option<AgentActivity>,
+) -> Option<SessionStatus> {
+    match (current, activity) {
+        // Interrupt: a busy turn ended with no hook.
+        (SessionStatus::Active, Some(AgentActivity::Idle)) => Some(SessionStatus::Idle),
+        (SessionStatus::Active, Some(AgentActivity::BackgroundShell)) => {
+            Some(SessionStatus::BackgroundActive)
+        }
+        // At rest: track the background shell appearing / clearing.
+        (SessionStatus::Idle | SessionStatus::Compacted, Some(AgentActivity::BackgroundShell)) => {
+            Some(SessionStatus::BackgroundActive)
+        }
+        (SessionStatus::BackgroundActive, Some(AgentActivity::Idle)) => Some(SessionStatus::Idle),
+        // A long-running server / review-watch is a background shell too — when
+        // it ends (killed, human submitted, timed out) the shell is gone, so
+        // settle to rest just like `BackgroundActive`. Staying-in-shell is left
+        // to the classification refinement (which decides transient-task vs
+        // server vs review).
+        (
+            SessionStatus::BackgroundServer | SessionStatus::ReviewPending,
+            Some(AgentActivity::Idle),
+        ) => Some(SessionStatus::Idle),
+        // Working, unknown/torn read (None), or already-consistent: hold.
+        _ => None,
+    }
+}
+
 /// Retire a background-shell status the process tree has disproved, promoting
 /// the row to `Active`. Returns whether the status changed.
 ///
@@ -1589,6 +1609,63 @@ mod tests {
             key: key.to_string(),
             kind,
         }
+    }
+
+    /// The demote-only mirror of the agent's session file, plus the one rest
+    /// status that also takes a background shell.
+    #[test]
+    fn reconcile_activity_mirrors_the_session_file() {
+        use AgentActivity as A;
+        use SessionStatus as S;
+
+        // A turn that ended with no hook (an interrupt) settles to the shape the
+        // file reports.
+        assert_eq!(reconcile_activity(&S::Active, Some(A::Idle)), Some(S::Idle));
+        assert_eq!(
+            reconcile_activity(&S::Active, Some(A::BackgroundShell)),
+            Some(S::BackgroundActive)
+        );
+        // A background shell appearing on a resting row, and clearing again from
+        // each of the three background states.
+        assert_eq!(
+            reconcile_activity(&S::Idle, Some(A::BackgroundShell)),
+            Some(S::BackgroundActive)
+        );
+        for st in [S::BackgroundActive, S::BackgroundServer, S::ReviewPending] {
+            assert_eq!(reconcile_activity(&st, Some(A::Idle)), Some(S::Idle));
+        }
+
+        // Demote-only: a "busy" read never promotes a resting row to Active
+        // (that's `promote_stale_background`'s job, on corroborated evidence),
+        // and an unknown/torn read holds everything.
+        for st in [S::Idle, S::Compacted, S::BackgroundActive, S::ReviewPending] {
+            assert_eq!(reconcile_activity(&st, Some(A::Working)), None);
+            assert_eq!(reconcile_activity(&st, None), None);
+        }
+        // The fine-grained hook/transcript-backed states are none of the file's
+        // business, whatever it reports.
+        for st in [S::Compacting, S::WaitingForApproval, S::WaitingForDecision] {
+            for act in [Some(A::Idle), Some(A::Working), Some(A::BackgroundShell)] {
+                assert_eq!(reconcile_activity(&st, act), None);
+            }
+        }
+    }
+
+    /// `Compacted` is a **rest** status, so a `run_in_background` shell that
+    /// outlived the compaction has to show through it — otherwise a session
+    /// compacted while an r3 review-watch runs reads `Compacted` for as long as
+    /// the watch does, instead of the `Review` its shells say it is. It is only
+    /// ever moved by a shell, never demoted to `Idle`: both are at rest, so that
+    /// would drop the compaction signal for nothing.
+    #[test]
+    fn a_background_shell_shows_through_compacted() {
+        use AgentActivity as A;
+        use SessionStatus as S;
+        assert_eq!(
+            reconcile_activity(&S::Compacted, Some(A::BackgroundShell)),
+            Some(S::BackgroundActive)
+        );
+        assert_eq!(reconcile_activity(&S::Compacted, Some(A::Idle)), None);
     }
 
     #[test]
