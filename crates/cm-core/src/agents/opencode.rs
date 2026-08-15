@@ -769,7 +769,17 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 /// `--format json` never paginates (opencode pages only the table form, and
 /// only on a tty), so this cannot hang waiting on a pager.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    let exe = super::find_in_path(BIN).with_context(|| format!("{BIN} not found in PATH"))?;
+    // **Not installed is an empty list, not an error.** `LocalBackend` asks
+    // every backend in `AgentControl::ALL` for candidates whenever the resume
+    // picker opens, and surfaces whatever errors come back — so refusing here
+    // would put "opencode not found in PATH" in front of every user who has
+    // never installed it. Every other backend answers a missing state directory
+    // with no rows; a missing binary is the same fact, spelled the way this
+    // backend has to spell it (its sessions are only reachable through its own
+    // CLI). A genuinely broken opencode still reports below.
+    let Some(exe) = super::find_in_path(BIN) else {
+        return Ok(Vec::new());
+    };
     let out = std::process::Command::new(exe)
         .args(["session", "list", "--format", "json", "-n"])
         .arg(limit.to_string())
