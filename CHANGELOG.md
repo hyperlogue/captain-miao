@@ -44,6 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **opencode is no longer launched with a flag its root command rejects**, which
   killed the window before any hook could fire.
 - **`f` on a session with no known id says so** instead of doing nothing.
+- **Kimi hooks never fired at all.** Kimi compiles a hook's matcher as a JS
+  regex, and the `matcher = "*"` every other backend spells "every tool" fails
+  to compile — which Kimi reads as matching *nothing*. The matcher is now
+  omitted, whose absence matches everything.
+- **An opencode approval prompt now reaches the dashboard.** The plugin
+  subscribed `permission.updated`, an event that exists only in opencode's
+  drifted SDK types; the runtime publishes `permission.asked`.
+- **An opencode subagent no longer wears the parent's row.** The bus carries
+  every session in the process, so a task-tool child's idle settled the row
+  mid-turn, its tokens and model overwrote the columns, and its id became what
+  `r` and `f` resumed. Proven-child events are now dropped — except a child's
+  approval ask, which blocks the whole turn and still stops the row.
+- **Pressing Esc in opencode no longer parks an error on the row.** The abort
+  it publishes beside the idle events is the turn ending, not failing.
+- **A first-ever Kimi session's transcripts and login land in the real
+  `~/.kimi-code`**, not inside the synthetic home where the dashboard never saw
+  them; and a shadow the mirror replaces is now set aside under a `.shadow-*`
+  name instead of destroyed.
+- **A plugin or hook deleted from the real config dir no longer leaves a
+  dangling symlink** in the opencode/Grok mirrors for the agent's loader to
+  trip on.
 
 ## [0.4.0] - 2026-08-14
 
