@@ -376,6 +376,110 @@ impl AgentControl {
         self.resume_args("id", true) != self.resume_args("id", false)
     }
 
+    /// Everything a backend may structurally lack, in one query — the
+    /// `AgentControl` counterpart to [`crate::terminal::Capabilities`], and the
+    /// same bargain: a limit the UI has to gate on is a *field* here, not a
+    /// special case at the call site.
+    ///
+    /// **Constants, not derivations, because the dashboard reads this while
+    /// drawing a frame.** Every field could be computed from the method that
+    /// owns it — `fork` from the two argvs, `approval_gate` from the generated
+    /// hook config — but three of the four would then allocate per row per
+    /// redraw, and [`crate::terminal::Capabilities`] set the precedent that this
+    /// query does no work.
+    ///
+    /// What keeps a constant honest is that the derivation still runs, in
+    /// `the_capability_matrix_agrees_with_the_implementations`: every field here
+    /// is checked against the code that would have to change for it to be
+    /// wrong. So a backend that loses its permission hook to an upstream rename,
+    /// or grows a fork flag, fails that test rather than shipping a dashboard
+    /// that promises the wrong thing. Declaring a capability is cheap; declaring
+    /// one that isn't true is not possible.
+    pub fn capabilities(self) -> AgentCapabilities {
+        // Each backend's row in full, so the matrix reads down the page rather
+        // than being assembled from four separate matches.
+        let caps = |fork, worktrees, approval_gate, context_tokens| AgentCapabilities {
+            fork,
+            worktrees,
+            approval_gate,
+            context_tokens,
+        };
+        match self {
+            AgentControl::Claude => caps(true, true, true, true),
+            AgentControl::Codex => caps(true, false, true, true),
+            // No context total: Reasonix persists none we can read, and its own
+            // docs warn that its nearest number reads zero on a rebound session
+            // — a limit of the agent, not a fold nobody has written.
+            AgentControl::Reasonix => caps(true, false, true, false),
+            // No fork flag documented, so `f` hides itself.
+            AgentControl::Kimi => caps(false, false, true, true),
+            // No context total: Grok keeps its token ledgers in memory rather
+            // than serializing them. `miao-y5m.4` holds the standing offer to
+            // revisit if that changes.
+            AgentControl::Grok => caps(true, true, true, false),
+            AgentControl::OpenCode => caps(true, false, true, true),
+            // The one backend with no approval gate — see
+            // [`AgentCapabilities::approval_gate`].
+            AgentControl::Pi => caps(true, false, false, true),
+            // Nothing may be claimed for a backend this build can't drive: it
+            // launches nothing, writes no hook config and fills no column.
+            AgentControl::Unknown => caps(false, false, false, false),
+        }
+    }
+
+    /// Every [`HookEvent`] this backend actually subscribes to, read back out of
+    /// the hook config it generates rather than declared a second time.
+    ///
+    /// This works uniformly because every backend renders
+    /// [`HookEvent::as_kebab`] into what it writes: Claude and the four
+    /// shell-hook backends as the last word of the `miao hook …` command, and
+    /// opencode and Pi as a `[native, event]` row in the generated plugin or
+    /// extension. The generated file *is* the subscription list, so reading it
+    /// back cannot disagree with it — which is what lets
+    /// [`Self::capabilities`] derive `approval_gate` instead of asserting it.
+    ///
+    /// Order follows [`HookEvent::ALL`], not the config.
+    pub fn forwarded_events(self) -> Vec<HookEvent> {
+        // Only Claude splices the socket in at all, and no event name can be
+        // confused with this: it is a path, not a bare token.
+        let mut config = self.hooks_settings_json("/dev/null");
+        for extra in self.extra_hook_registrations() {
+            config.push(' ');
+            config.push_str(&extra);
+        }
+        HookEvent::ALL
+            .iter()
+            .copied()
+            .filter(|e| mentions_event(&config, e.as_kebab()))
+            .collect()
+    }
+
+    /// Hook commands a backend installs **somewhere other than** the file
+    /// [`Self::hooks_settings_json`] returns, so [`Self::forwarded_events`] can
+    /// see the whole subscription rather than the largest part of it.
+    ///
+    /// Grok is the only backend with a second site and the reason this exists:
+    /// its approval signal is not a lifecycle hook at all but a
+    /// `[[ui.notifications.hooks]]` entry merged into the user's own
+    /// `~/.grok/config` at launch. Reading only the settings file would have
+    /// reported Grok as having no approval gate — the exact false negative that
+    /// would have hidden `WaitingForApproval` on the backend that has it.
+    ///
+    /// Still the real installed command, not a second declaration of it: this
+    /// returns what the merge writes.
+    fn extra_hook_registrations(self) -> Vec<String> {
+        match self {
+            AgentControl::Grok => vec![grok::notification_hook_command()],
+            AgentControl::Claude
+            | AgentControl::Codex
+            | AgentControl::Reasonix
+            | AgentControl::Kimi
+            | AgentControl::OpenCode
+            | AgentControl::Pi
+            | AgentControl::Unknown => vec![],
+        }
+    }
+
     // -- Dashboard-side: filesystem watching, transcript reading, naming --
 
     /// Filesystem paths whose changes should trigger a dashboard reload —
@@ -393,17 +497,21 @@ impl AgentControl {
             // title store (the title rides the hook payload), no transcript
             // read. There is no file whose change could make a Kimi row stale.
             AgentControl::Kimi => vec![],
-            // Nothing *yet*, and for a reason worth keeping next to the code that
-            // would change: Grok's per-session `summary.json` holds the title,
-            // model and git head, but its directory is keyed by a URL-encoded cwd
-            // whose encoder source reading could not pin down, and its JSON key
-            // spellings were only ever read as Rust field names. When that read
-            // lands, `sessions/` is what belongs here.
+            // Nothing *yet*, and the blocker has moved: `list_resumable` now
+            // reads `sessions/<cwd-key>/<id>/summary.json`, so both the cwd-key
+            // encoding (walk every key — Grok's own resolver does) and the JSON
+            // spellings are settled. What is left is a decision, not a schema
+            // question: `summary.json` holds the title, model and git head, and
+            // watching `sessions/` would mean folding a whole JSON file on every
+            // append rather than advancing a byte cursor. `miao-y5m.5` carries
+            // it; when that lands, `sessions/` is what belongs here.
             AgentControl::Grok => vec![],
-            // Nothing: the dashboard derives no opencode fact from disk. Its
-            // sessions live in `~/.local/share/opencode/`'s sqlite db and
-            // `storage/` blobs, and nothing here reads either — see
-            // `read_transcript_stats`.
+            // Nothing: every fact an opencode row carries rides the plugin's
+            // events. Its sessions do sit on disk — JSON blobs under
+            // `~/.local/share/opencode/storage/session/` — but nothing here
+            // reads them, and `list_resumable` deliberately goes through
+            // `opencode session list` rather than that internal, twice-migrated
+            // schema. So there is no file whose change could make a row stale.
             AgentControl::OpenCode => vec![],
             // Nothing, and for the strongest reason of any backend: every fact
             // a Pi row carries — status, title, tokens, model — rides a hook
@@ -454,11 +562,11 @@ impl AgentControl {
             // written to the state file, which the host already watches. A wake
             // here could only re-diff rows that hadn't changed.
             AgentControl::Grok => vec![],
-            // Nothing to wake on: opencode's title never reaches us at all (no
-            // documented payload field, so `session.updated` isn't even
-            // subscribed), and its sqlite db is not read. Codex needs an entry
-            // here only because its rename lands in sqlite with no hook; for
-            // opencode there is no reader on the other end to wake.
+            // Nothing, and now for Kimi's reason rather than for want of a
+            // title: `session.updated` carries `info.title`, so a rename arrives
+            // on a hook the launcher folds onto the state file — a `sessions/`
+            // write the host already watches. Codex needs an entry here only
+            // because its rename lands in sqlite with no hook at all.
             AgentControl::OpenCode => vec![],
             // Nothing: the title is the only fact that would want an entry
             // here, and it arrives on the *next hook payload* — a `sessions/`
@@ -515,13 +623,13 @@ impl AgentControl {
             AgentControl::Claude => claude::read_transcript_stats_incremental(transcript, prior),
             AgentControl::Codex => codex::read_transcript_stats(transcript, prior),
             // Unreachable rather than unimplemented: this runs only on a path a
-            // hook payload supplied, and Reasonix's carries none. Its sessions
-            // are JSONL transcripts plus **metadata sidecars** under the state
-            // root, and the sidecar schema — where title, model and token totals
-            // sit — is the one thing source reading could not settle. Reading a
-            // real session dir is the prerequisite; the sqlite catalogs beside
-            // them are documented as a rebuildable projection, so they are the
-            // wrong thing to parse however convenient they look.
+            // hook payload supplied, and Reasonix's carries none. The sidecar
+            // schema that once blocked this is settled — `list_resumable` reads
+            // `<session>.jsonl.meta` for the title and cwd — but the sidecar
+            // holds no token total, and `AgentCapabilities::context_tokens` is
+            // `false` for this backend because the agent persists none: its own
+            // docs warn that the nearest number reads zero on a rebound session.
+            // So there is nothing here left to fold, not merely nothing folded.
             AgentControl::Reasonix => TranscriptStats::default(),
             // Kimi's payload names no transcript, so `agents::kimi` resolves
             // one from the session id and puts it on the message — which is
@@ -532,24 +640,23 @@ impl AgentControl {
             // Unreachable rather than unimplemented, the same shape as Reasonix
             // but for a different reason: Grok's transcript path *is* derivable
             // (cwd + session id), and `agents::grok` deliberately does not derive
-            // it. Every fact this would fold — the token total from
-            // `updates.jsonl`'s `TurnCompleted.usage`, the model from
-            // `summary.json` — sits under a line envelope and a key spelling that
-            // source reading never settled, so a derived path would only start a
-            // watch that folds nothing on every append. The path and the fold
-            // land together, once a real session dir has been read.
+            // it. Of the two facts this would fold, one is gone and one is
+            // deferred — Grok serializes no context total at all
+            // (`AgentCapabilities::context_tokens` is `false`), and the model
+            // sits in `summary.json`, which is a whole-file JSON read rather than
+            // anything this byte-cursor fold could follow (`miao-y5m.5`). So a
+            // derived path today would only start a watch that folds nothing on
+            // every append.
             AgentControl::Grok => TranscriptStats::default(),
-            // Unreachable rather than unimplemented, as for Reasonix: this runs
-            // only on a path a hook payload supplied, and opencode's carries
-            // none. It would not be a *transcript* if it did — its sessions are
-            // `opencode.db` (sqlite) plus `storage/` blobs, not an appended
-            // file this fold's byte cursor could follow. cm-core already links
-            // bundled SQLite for Codex's titles, so reading it costs no new
-            // dependency and is deliberately still not done: the schema is
-            // unprobed, and phase 1 ships without it (design §9.4). The route
-            // that fits this backend better is the hook itself — `HookMessage`
-            // carries `context_tokens` / `model` now — the moment a usage field
-            // in an event payload is named.
+            // Unreachable **and settled**, which is the difference between this
+            // arm and Reasonix's: opencode reports its tokens and model on the
+            // hook itself. `message.updated` carries an `AssistantMessage` whose
+            // `tokens` and `modelID` the plugin forwards once the message
+            // completes, so `common::adopt_session_facts` stamps both onto the
+            // row and this fold has nothing left to do. Nor could it do it — the
+            // sessions are per-message JSON blobs under `storage/`, not an
+            // appended file a byte cursor could follow — and `adopt_session_facts`
+            // is explicit that one fact gets one source.
             AgentControl::OpenCode => TranscriptStats::default(),
             // Unreachable, and the only one of these arms that is a *decision*
             // rather than a missing schema. Pi's JSONL is fully documented and
@@ -739,13 +846,14 @@ impl AgentControl {
             // transcript for the launcher to watch.
             AgentControl::Grok => TranscriptScan::default(),
             // Empty because there is no transcript to scan: opencode's sessions
-            // are sqlite plus JSON blobs, and no hook payload names a path
-            // regardless. Whether a sentinel is even *wanted* is unsettled —
-            // design §9.3 calls `session.idle` "the turn-ended signal" without
-            // saying whether an Esc-interrupted turn still reaches it. If it
-            // doesn't, this backend inherits Grok's stranded-`Active` row with
-            // nothing of the agent's to read instead; that is on the probe list
-            // in `agents::opencode`.
+            // are per-message JSON blobs under `storage/`, and no hook payload
+            // names a path regardless. Whether a sentinel is even *wanted* is
+            // still unsettled — the plugin takes its turn-end from
+            // `session.status`'s `idle` edge, and nothing source-read says
+            // whether an Esc-interrupted turn reaches it. If it doesn't, this
+            // backend inherits Grok's stranded-`Active` row with nothing of the
+            // agent's to read instead; that is on the probe list in
+            // `agents::opencode`.
             AgentControl::OpenCode => TranscriptScan::default(),
             // Empty because Pi needs no sentinel, not because none was found —
             // the same standing as Reasonix's and Kimi's, reached differently.
@@ -780,10 +888,12 @@ impl AgentControl {
             // No status file, so no second opinion on the working/idle axis. It
             // is the interrupt case above that would have wanted one.
             AgentControl::Grok => None,
-            // No status file. `session.status` may be exactly this second
-            // opinion — design §9.3 flags it `[PROBE]` — and if it carries a
-            // busy/idle string it should drive the row *directly*, the way
-            // Claude's session file does, rather than arriving here.
+            // No status file, and none wanted: `session.status` is the second
+            // opinion this would have been, and it drives the row *directly* the
+            // way Claude's session file does. The plugin forwards only its
+            // `idle` edge — `busy` is coarser than our vocabulary and would knock
+            // a row out of `WaitingForApproval` — so the signal arrives as a
+            // `Stop`, not as an activity read.
             AgentControl::OpenCode => None,
             // No status file, and none needed: the interrupt this exists to
             // catch for Claude is covered by `agent_settled`, which fires when
@@ -805,10 +915,12 @@ impl AgentControl {
         match self {
             AgentControl::Claude => claude::read_session_name(agent_pid),
             AgentControl::Codex => None,
-            // Reasonix titles exist (the pickers search them) but live in the
-            // session sidecars, keyed by session id rather than by pid — so
-            // there is no per-pid file to read, and surfacing one waits on the
-            // same schema question as `read_transcript_stats`.
+            // Reasonix titles exist and are now read — `list_resumable` takes
+            // `custom_title` off the `.jsonl.meta` sidecar — but they are keyed
+            // by session id, not by pid, so there is no per-pid file for *this*
+            // method to open. The picker is where they surface; a running row
+            // takes its name from the first prompt like every other backend
+            // without a rename hook.
             AgentControl::Reasonix => None,
             // `None` because there is nothing left to read, not because Kimi has
             // no name: `session_title` rides every hook payload and is already
@@ -816,17 +928,17 @@ impl AgentControl {
             // what makes this the one backend needing neither a session-file
             // fold (Claude) nor a sqlite overlay (Codex).
             AgentControl::Kimi => None,
-            // Grok titles its own sessions (`summary.json`'s `generated_title`),
-            // but keyed by session id and under a JSON spelling read only as a
-            // Rust field name — so there is no per-pid file to read, and
-            // surfacing one waits on the same schema question as
-            // `read_transcript_stats`.
+            // Grok titles its own sessions (`summary.json`'s `session_summary`),
+            // and `list_resumable` reads them — but keyed by session id, not by
+            // pid, so there is no per-pid file for *this* method to open. Same
+            // standing as Reasonix: the title surfaces in the picker, and a
+            // running row falls back to the first prompt.
             AgentControl::Grok => None,
-            // opencode titles its own sessions and puts the title on
-            // `session.updated` — but under no documented field name, so that
-            // event is not subscribed at all and there is no per-pid file to
-            // read instead. An opencode row therefore shows no agent-supplied
-            // name; see `agents::opencode`.
+            // `None` because there is nothing left to read, not because
+            // opencode has no name: `session.updated` carries `info.title`, the
+            // plugin forwards it, and it is already on `LauncherState.name` by
+            // the time this would be asked. The Kimi standing, reached from a
+            // bus event rather than a documented hook field.
             AgentControl::OpenCode => None,
             // `None` because there is nothing left to read, not because Pi has
             // no name: `pi.getSessionName()` rides every hook payload as
@@ -911,9 +1023,9 @@ impl AgentControl {
             // arrive back here before assuming an event-driven watch works.
             AgentControl::Grok => None,
             // Moot, and structurally so rather than merely for now: opencode
-            // keeps its sessions in sqlite and JSON blobs, so there is no
-            // appended transcript for either kind of watch to follow, whatever
-            // a payload might one day name.
+            // keeps each message as its own JSON blob under `storage/`, so there
+            // is no appended transcript for either kind of watch to follow,
+            // whatever a payload might one day name.
             AgentControl::OpenCode => None,
             // Moot, and permanently so rather than pending like the other three:
             // `agents::pi` supplies no transcript path *by decision*, not for
@@ -980,6 +1092,67 @@ impl AgentControl {
             AgentControl::Unknown => None,
         }
     }
+}
+
+/// What a backend structurally cannot do, queried in one place via
+/// [`AgentControl::capabilities`]. Constants or derivations per backend — no IO.
+///
+/// **Only structural limits belong here.** A field means *the agent has no
+/// mechanism for this at all*, never *we haven't wired it up yet*: the
+/// dashboard's answer to a missing capability is to stop offering the thing, and
+/// doing that to work that merely hasn't been done buries it as impossible.
+/// Pi's absent resume-picker entries and Grok's absent model column are both
+/// unfinished folds against data that exists, so neither is a field here — they
+/// are tracker items. Pi's missing approval gate is the opposite: `security.md`
+/// says the agent runs shell commands with its own permissions and has no
+/// per-tool prompt, so there is nothing to reflect however much code we write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    /// A resume can **branch** rather than continue the session in place, so `f`
+    /// has something to offer. Derived from [`AgentControl::resume_args`] —
+    /// Kimi documents no fork flag, so its two argvs come out equal.
+    pub fork: bool,
+    /// The agent can launch itself into an isolated git worktree, so `Ctrl-g` in
+    /// the workdir picker has something to arm. Derived from
+    /// [`AgentControl::worktree_args`]; Claude and Grok are the two that can.
+    pub worktrees: bool,
+    /// The agent has a per-tool approval prompt it tells us about, so a row can
+    /// reach [`crate::state::SessionStatus::WaitingForApproval`] and `s` can
+    /// stop on it. Derived from [`AgentControl::forwarded_events`].
+    ///
+    /// **Pi is the one backend that answers `false`**, and it is not for want of
+    /// a hook to subscribe to: `security.md` states it ships no sandbox and runs
+    /// shell commands with the pi process's own permissions, and its `--approve`
+    /// / trust machinery guards *loading settings and extensions*, not tool
+    /// calls. So a blocked Pi session does not exist to be detected, and the
+    /// only thing the dashboard owes the user is not to imply it looked.
+    pub approval_gate: bool,
+    /// A context-token total reaches the row at all, so an empty Context field
+    /// means "not yet" rather than "not ever". Reasonix and Grok answer `false`;
+    /// see [`AgentControl::capabilities`] for why that is the agent's limit
+    /// rather than ours.
+    pub context_tokens: bool,
+}
+
+/// Whether `config` names `kebab` as a **whole** event token.
+///
+/// Every generated hook config renders an event one of two ways — as the last
+/// word of a `miao hook …` command, or as a bare JSON/JS string — so an event is
+/// present exactly when its name sits between a space-or-quote and either a
+/// closing quote or the end of the input. (The end case is where an
+/// [`AgentControl::extra_hook_registrations`] command stops, since that one is
+/// appended raw rather than embedded in a document.)
+///
+/// The boundary check is load-bearing, not decoration: `stop` is a prefix of
+/// `stop-failure`, `elicitation` of `elicitation-result` and `post-tool-use` of
+/// `post-tool-use-failure`, so a plain `contains` would report three
+/// subscriptions no backend ever registered.
+fn mentions_event(config: &str, kebab: &str) -> bool {
+    config.match_indices(kebab).any(|(at, _)| {
+        let before = config[..at].chars().next_back();
+        let after = config[at + kebab.len()..].chars().next();
+        matches!(before, Some(' ' | '"')) && matches!(after, Some('"') | None)
+    })
 }
 
 /// One of an agent's running `run_in_background` shells, reduced to what the
@@ -1414,5 +1587,236 @@ mod tests {
             AgentControl::Unknown.resume_args("id", false)
         );
         assert!(!AgentControl::Unknown.supports_fork());
+    }
+
+    /// The whole subscription surface, backend by backend, read back out of the
+    /// configs themselves. This is the test that makes `forwarded_events`
+    /// trustworthy enough to derive a capability from: if the token scan ever
+    /// stops matching — a backend rewrites its config in a shape the boundary
+    /// rule doesn't cover, say — every set here collapses at once rather than
+    /// one capability quietly turning false.
+    #[test]
+    fn every_backend_forwards_exactly_the_events_its_config_registers() {
+        use HookEvent::*;
+        let expected: &[(AgentControl, &[HookEvent])] = &[
+            (
+                AgentControl::Claude,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PostToolUseFailure,
+                    PermissionRequest,
+                    Elicitation,
+                    ElicitationResult,
+                    Stop,
+                    StopFailure,
+                    PreCompact,
+                    PostCompact,
+                    CwdChanged,
+                ],
+            ),
+            // Eight, not the twelve `HookEvent`s that appear in `agents::codex`:
+            // `Elicitation`, `ElicitationResult`, `StopFailure` and `CwdChanged`
+            // are *produced* there — refined out of a `PreToolUse` payload, or
+            // synthesized — rather than registered with Codex. Reading the
+            // config is what tells the two apart.
+            (
+                AgentControl::Codex,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PermissionRequest,
+                    Stop,
+                    PreCompact,
+                    PostCompact,
+                ],
+            ),
+            // No `PostCompact`: Reasonix has no such hook, which is why
+            // `Compacting` is left by the next event of any kind.
+            (
+                AgentControl::Reasonix,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PostToolUseFailure,
+                    PermissionRequest,
+                    Stop,
+                    StopFailure,
+                    PreCompact,
+                ],
+            ),
+            (
+                AgentControl::Kimi,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PostToolUseFailure,
+                    PermissionRequest,
+                    ElicitationResult,
+                    Stop,
+                    StopFailure,
+                    PreCompact,
+                    PostCompact,
+                ],
+            ),
+            // No `Elicitation`: opencode's `permission.updated` is the gate and
+            // `permission.replied` releases it, so the approval pair carries
+            // what a decision prompt would.
+            // `PermissionRequest` is here only because `extra_hook_registrations`
+            // contributes it: Grok's approval signal is a notification hook in
+            // the user's own config, not a lifecycle hook in the settings file.
+            (
+                AgentControl::Grok,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PermissionRequest,
+                    Stop,
+                    StopFailure,
+                    PreCompact,
+                    PostCompact,
+                ],
+            ),
+            (
+                AgentControl::OpenCode,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PermissionRequest,
+                    ElicitationResult,
+                    Stop,
+                    StopFailure,
+                    PreCompact,
+                    PostCompact,
+                    CwdChanged,
+                ],
+            ),
+            // The shortest list, and the one the capability matrix turns on:
+            // **no `PermissionRequest` and no `Elicitation`**, because Pi has no
+            // per-tool gate to subscribe to at all.
+            (
+                AgentControl::Pi,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    Stop,
+                    PreCompact,
+                    PostCompact,
+                ],
+            ),
+        ];
+        for (agent, events) in expected {
+            assert_eq!(
+                &agent.forwarded_events(),
+                events,
+                "{agent:?}'s generated hook config no longer registers what this pins"
+            );
+        }
+        // The read-side-only variant writes no config, so it subscribes to
+        // nothing — which is also what makes every one of its capabilities
+        // false without a special case.
+        assert!(AgentControl::Unknown.forwarded_events().is_empty());
+    }
+
+    /// The three prefix pairs that make the boundary rule load-bearing. Without
+    /// it, every backend that registers `stop-failure` would also report a
+    /// `Stop` it may not have — and Pi, which registers neither
+    /// `post-tool-use-failure` nor `elicitation-result`, is the backend whose
+    /// set would change shape.
+    #[test]
+    fn an_event_name_that_prefixes_another_is_not_read_as_that_other() {
+        assert!(mentions_event(
+            r#"{"c":"miao hook stop-failure"}"#,
+            "stop-failure"
+        ));
+        assert!(!mentions_event(r#"{"c":"miao hook stop-failure"}"#, "stop"));
+        assert!(!mentions_event(
+            r#"{"c":"miao hook post-tool-use-failure"}"#,
+            "post-tool-use"
+        ));
+        assert!(!mentions_event(
+            r#"{"c":"miao hook elicitation-result"}"#,
+            "elicitation"
+        ));
+        // A path that happens to spell an event is not a subscription: nothing
+        // in the config puts a `"` straight after it.
+        assert!(!mentions_event(
+            r#"{"c":"/opt/stop/miao hook stop-failure"}"#,
+            "stop"
+        ));
+    }
+
+    /// **The test the declared matrix is worth having.** `capabilities()` is a
+    /// table of constants so the draw loop can read it for free; this runs the
+    /// derivation it skipped and demands the two agree, for every backend and
+    /// every field. Three of the four are then unfalsifiable by hand: a
+    /// capability can only change by changing the argv, the worktree flag or the
+    /// hook config that produced it.
+    ///
+    /// `context_tokens` is the one field with nothing to derive from — no method
+    /// answers "could this backend ever report a total" without a live session —
+    /// so it is pinned by the matrix test below and by the module docs that
+    /// state, per backend, why the agent has no number to give.
+    #[test]
+    fn the_capability_matrix_agrees_with_the_implementations() {
+        for &agent in AgentControl::ALL {
+            let c = agent.capabilities();
+            assert_eq!(
+                c.fork,
+                agent.supports_fork(),
+                "{agent:?}: the declared fork capability is not what its resume argv does"
+            );
+            assert_eq!(
+                c.worktrees,
+                agent.supports_worktrees(),
+                "{agent:?}: the declared worktree capability is not what its worktree argv does"
+            );
+            let forwarded = agent.forwarded_events();
+            let gates = forwarded.contains(&HookEvent::PermissionRequest)
+                || forwarded.contains(&HookEvent::Elicitation);
+            assert_eq!(
+                c.approval_gate, gates,
+                "{agent:?}: the declared approval gate is not what its hook config registers \
+                 (forwarded: {forwarded:?})"
+            );
+        }
+        // Same three checks for the variant that is not in `ALL`, since it is
+        // the one whose row is all-false by policy rather than by behaviour.
+        let c = AgentControl::Unknown.capabilities();
+        assert!(!c.fork && !c.worktrees && !c.approval_gate && !c.context_tokens);
+    }
+
+    /// The matrix itself, written out — what the README's per-agent notes
+    /// promise, in one reviewable block. The test above proves each row is
+    /// *consistent*; this one is where a deliberate change has to be seen and
+    /// agreed to.
+    #[test]
+    fn the_capability_matrix_is_what_the_readme_promises() {
+        let row = |a: AgentControl| {
+            let c = a.capabilities();
+            (c.fork, c.worktrees, c.approval_gate, c.context_tokens)
+        };
+        //                                        fork   tree   appr   ctx
+        assert_eq!(row(AgentControl::Claude), (true, true, true, true));
+        assert_eq!(row(AgentControl::Codex), (true, false, true, true));
+        assert_eq!(row(AgentControl::Reasonix), (true, false, true, false));
+        assert_eq!(row(AgentControl::Kimi), (false, false, true, true));
+        assert_eq!(row(AgentControl::Grok), (true, true, true, false));
+        assert_eq!(row(AgentControl::OpenCode), (true, false, true, true));
+        assert_eq!(row(AgentControl::Pi), (true, false, false, true));
     }
 }

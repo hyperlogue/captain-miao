@@ -432,7 +432,7 @@ fn register_notification_hook(home: &Path) {
 ///
 /// Carries no `--sock`: the socket rides `$CAPTAIN_MIAO_SOCK`, because one
 /// `config.toml` serves every session (see [`synth_home`]).
-fn notification_hook_command() -> String {
+pub(crate) fn notification_hook_command() -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
     format!(
