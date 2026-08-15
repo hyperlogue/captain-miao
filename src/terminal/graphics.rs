@@ -58,6 +58,14 @@ pub struct Placement {
 /// Whether this process is talking to kitty and not through a multiplexer that
 /// swallows the graphics protocol. Cached — the terminal identity is fixed for
 /// the process lifetime (a window resize keeps kitty kitty).
+///
+/// The kitty variables alone are **not** the question, because they are
+/// inherited: another emulator launched from a kitty shell exports them into
+/// every session it opens, so a `KITTY_PID` can outlive the kitty that set it.
+/// [`Capabilities::graphics`](super::Capabilities::graphics) is what settles who
+/// is actually drawing these cells; the env read stays as the second half of the
+/// `and`, since the resolved backend falls back to Kitty when nothing claims the
+/// process.
 fn graphics_env_ok() -> bool {
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
@@ -65,9 +73,12 @@ fn graphics_env_ok() -> bool {
             || std::env::var_os("KITTY_WINDOW_ID").is_some();
         // zellij/tmux don't forward the kitty graphics protocol, so even inside a
         // kitty window an image would land nowhere. Treat them as incapable.
+        // Their backends answer `graphics: false` too — this stays because the
+        // config can pin `backend = "kitty"` from inside a multiplexer, to drive
+        // the outer window, and the escapes would still land in the pane.
         let multiplexed =
             std::env::var_os("ZELLIJ").is_some() || std::env::var_os("TMUX").is_some();
-        in_kitty && !multiplexed
+        in_kitty && !multiplexed && super::get().capabilities().graphics
     })
 }
 

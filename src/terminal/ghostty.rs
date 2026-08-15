@@ -370,6 +370,7 @@ pub(crate) const CAPABILITIES: Capabilities = Capabilities {
     window_stacking: false,
     floating_sessions: false,
     capture: false,
+    graphics: false,
 };
 
 /// The one snapshot script, run per [`snapshot`](Terminal::snapshot).

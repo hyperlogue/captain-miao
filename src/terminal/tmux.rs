@@ -338,6 +338,7 @@ pub(crate) const CAPABILITIES: Capabilities = Capabilities {
     window_stacking: false,
     floating_sessions: false,
     capture: true,
+    graphics: false,
 };
 
 #[async_trait]

@@ -213,6 +213,22 @@ pub struct Capabilities {
     /// session. Gating it up front keeps the unsupported case a rendered
     /// sentence instead of an inference.
     pub capture: bool,
+    /// The terminal renders the **kitty graphics protocol**, animation frames
+    /// included, so the header paw and the cat it sends walking are real images
+    /// rather than the `🐾` fallback glyph. Kitty only.
+    ///
+    /// This is a capability rather than the env probe it reads like because
+    /// `KITTY_PID`/`KITTY_WINDOW_ID` are *inherited*: anything a kitty shell
+    /// launches carries them, including another terminal emulator, which then
+    /// exports them into every session it opens. On that env the dashboard
+    /// would believe kitty was drawing its cells and speak the protocol at an
+    /// app implementing only part of it — iTerm2 renders the still paw and then
+    /// ignores the animation control, leaving the cat stuck mid-stride at the
+    /// wrong size. Resolving it from the backend instead reuses the tie-break
+    /// [`detect_backend`] already makes (`TERM_PROGRAM` beats a stale kitty
+    /// variable) and the one knob that corrects a wrong guess, `[terminal]
+    /// backend`.
+    pub graphics: bool,
 }
 
 impl Default for Capabilities {
@@ -223,6 +239,7 @@ impl Default for Capabilities {
             window_stacking: true,
             floating_sessions: false,
             capture: true,
+            graphics: true,
         }
     }
 }

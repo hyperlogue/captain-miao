@@ -198,6 +198,26 @@ fn ghostty_capabilities_resolve_the_derived_policies() {
     );
 }
 
+/// The header paw and its cat are kitty-graphics images, and kitty is the only
+/// backend that can draw them. The check that matters is the *negative* one: an
+/// emulator launched from a kitty shell inherits `KITTY_PID`, so anything
+/// answering `true` here would be sent a protocol it only half implements.
+#[test]
+fn kitty_is_the_only_backend_that_draws_the_paw() {
+    assert!(
+        Capabilities::default().graphics,
+        "the default is kitty's own answer"
+    );
+    for (name, caps) in [
+        ("zellij", zellij::CAPABILITIES),
+        ("tmux", tmux::CAPABILITIES),
+        ("ghostty", ghostty::CAPABILITIES),
+        ("iterm", iterm::CAPABILITIES),
+    ] {
+        assert!(!caps.graphics, "{name} cannot render kitty graphics");
+    }
+}
+
 /// Both multiplexer backends share this: a pane command inherits the *server*'s
 /// environment, so an exec argv is re-pointed at the dashboard's `PATH`. One
 /// test, since there is now one implementation.

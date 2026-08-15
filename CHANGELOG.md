@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folds for status, title and context tokens, so the row never filled in. The
   five variables scoped to one session's run are now cleared at launch; the
   user's own settings are inherited as before.
+- **The header paw and its cat no longer draw on iTerm2**, where they came out
+  as a still image and a cat stuck mid-stride at the wrong size. Kitty's
+  `KITTY_PID`/`KITTY_WINDOW_ID` are inherited by anything a kitty shell
+  launches, so an iTerm2 started that way carried them into every session it
+  opened and the dashboard believed kitty was drawing its cells. Whether the
+  graphics protocol is spoken is now the resolved backend's answer, not an env
+  probe, so it follows the same detection (and the same `[terminal] backend`
+  override) as everything else.
 - **Ghostty could not launch a session at all.** Two independent faults, both
   found by driving a real Ghostty 1.3.1 for the first time. The command was sent
   with the `shell:` prefix Ghostty's *config file* accepts, but the AppleScript
