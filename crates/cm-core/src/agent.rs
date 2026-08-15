@@ -486,10 +486,9 @@ impl AgentControl {
             // id arrives on every hook payload — which is what this index is a
             // fallback for.
             AgentControl::Grok => SessionIndex::default(),
-            // No per-pid manifest — and alone among the backends, no session id
-            // arrives on the hook either, so this index has nothing to fall
-            // back *to*. That is the gap that makes an opencode row
-            // unresumable; see `agents::opencode`.
+            // No per-pid manifest: an opencode session's id arrives on
+            // `session.created` and on every direct hook (`agents::opencode`),
+            // which is what this index is a fallback for.
             AgentControl::OpenCode => SessionIndex::default(),
             // No per-pid manifest: a Pi session's id (and name) arrive on every
             // hook payload, which is what this index is a fallback for.
@@ -897,12 +896,12 @@ impl AgentControl {
             // **Unverified, and set anyway.** Kimi appends
             // `agents/*/wire.jsonl` for the life of a session, which is the
             // long-held-fd shape that defeats macOS FSEvents entirely — so this
-            // matches Codex. It is *moot* today: no hook payload names a
-            // transcript, so the launcher starts no watch of either kind for a
-            // Kimi session. It is set now so that wiring a transcript path up
-            // later doesn't silently inherit an event-driven watch macOS can't
-            // deliver. This machine is Linux and could not test it; no macOS
-            // behaviour is being claimed, only the same defence Codex needed.
+            // matches Codex. And it is live, not precautionary: `agents::kimi`
+            // resolves the wire log from the session id and names it on every
+            // payload, so without this a Kimi session on macOS would inherit an
+            // event-driven watch FSEvents cannot deliver. This machine is Linux
+            // and could not test it; no macOS behaviour is being claimed, only
+            // the same defence Codex needed.
             AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Kimi => None,
             // Moot for the same reason today — `agents::grok` supplies no

@@ -642,10 +642,11 @@ mod tests {
         // sets the process cwd and passes nothing positional, because a bare
         // `--worktree` would otherwise swallow it.
         assert_eq!(open_argv(AgentControl::Grok, None), ["grok", "/work"]);
-        // opencode's cwd is *our* positional here and becomes `--dir <path>`
-        // inside `build_launch_command`, the same split Reasonix has: what
-        // `opencode`'s own positional means is undocumented, so translating it
-        // is the backend module's job and never this argv's.
+        // opencode takes no directory argument either: `build_launch_command`
+        // sets the process cwd and passes nothing positional. Its documented
+        // `[project]` positional is unverified against a real binary, and a
+        // flag guessed here is how the first cut died on `--dir`. Ours is the
+        // only positional here too.
         assert_eq!(
             open_argv(AgentControl::OpenCode, None),
             ["opencode", "/work"]
@@ -776,10 +777,9 @@ mod tests {
             open_argv(AgentControl::Kimi, Some(("s4", false))),
             ["kimi", "/work", "--session", "s4"]
         );
-        // opencode resumes with `-s <id>` and branches with `--fork`. Both are
-        // pinned even though the dashboard cannot reach them yet — no opencode
-        // hook payload names a session id, so nothing ever fills `s5` — because
-        // the day one does, this is what has to already be right.
+        // opencode resumes with `-s <id>` and branches with `--fork`. The id
+        // arrives on `session.created` and on every direct hook
+        // (`agents::opencode`), so both paths are reachable from the dashboard.
         assert_eq!(
             open_argv(AgentControl::OpenCode, Some(("s5", false))),
             ["opencode", "/work", "-s", "s5"]

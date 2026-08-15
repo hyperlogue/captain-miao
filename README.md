@@ -208,6 +208,7 @@ opencode rows track status — working, waiting on an approval, compacting, idle
 Two things worth knowing about how the plugin behaves inside your session. It subscribes opencode's event bus but forwards only the events the dashboard uses, because the bus also carries per-chunk and per-file events that would otherwise start hundreds of processes a turn. And it deliberately stays out of `permission.ask`, the hook that could answer an approval prompt for you — captain-miao only watches the matching bus event, so nothing it does can delay a decision you're being asked to make.
 
 This backend is written against opencode's own source but has still **not been run against a released binary**. If every row sits at "Starting", the generated plugin is the first thing to suspect: it's a plain file at `~/.local/state/captain-miao/opencode-config/plugins/captain-miao.js`, and whether opencode loads a plugin from that directory and under that name is unconfirmed. Please report anything that looks wrong rather than assuming it's expected.
+
 #### Pi support
 
 Pi rows track status — working, idle, compacting — and launch, resume and fork all work, as do the **token, model and title columns**, which no other new backend here manages. Pi is also the only agent whose hooks need nothing of yours: they arrive as a generated extension passed on the command line (`pi -e`), so there is no synthetic home, no copied config and no trust prompt to seed. What it doesn't do:

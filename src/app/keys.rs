@@ -344,12 +344,12 @@ impl App {
                 //
                 // Say so when there is no id, rather than returning `None` into
                 // silence — the treatment `CopySessionId` below already gives
-                // the identical condition. For most backends this is the first
-                // second of a session and the message is never seen; for one
-                // whose payloads name no id at all (opencode) it is permanent,
-                // and a key that does nothing forever with no explanation is the
-                // worst version of it. Deliberately not phrased "yet": on that
-                // backend the wait never ends.
+                // the identical condition. Usually this is the first second of
+                // a session and the message is never seen, but a backend can
+                // also lose its id path wholesale (opencode's first cut named
+                // none), and a key that does nothing with no explanation is the
+                // worst version of that. Deliberately not phrased "yet":
+                // nothing promises the id ever arrives.
                 let Some(session_id) = self.index_of(&s).live_session_id(&s).map(str::to_string)
                 else {
                     self.set_status("No session id known for this session".to_string(), true);
