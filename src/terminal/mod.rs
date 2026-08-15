@@ -21,6 +21,7 @@ use crate::config::{self, ConfiguredBackend};
 mod applescript;
 pub mod ghostty;
 pub mod graphics;
+pub mod iterm;
 pub mod kitty;
 pub mod tmux;
 pub mod zellij;
@@ -438,6 +439,7 @@ pub struct LiveBackends {
     pub zellij: bool,
     pub tmux: bool,
     pub ghostty: bool,
+    pub iterm: bool,
 }
 
 /// Which backend `get()` should build: a config override wins, then a live
@@ -457,16 +459,20 @@ pub struct LiveBackends {
 /// existing zellij users. The wrong guess is corrected the same way the
 /// nested-zellij-in-Kitty case already is: pin `[terminal] backend`.
 ///
-/// **Ghostty sits below both multiplexers for the same reason Kitty does** —
-/// `TERM_PROGRAM` survives into every pane — and below Kitty because it is the
-/// strictly weaker signal: `KITTY_WINDOW_ID` names a window, `TERM_PROGRAM` names
-/// only a vendor. The two never co-occur in practice, so the order between them
-/// is a tie-break rather than a policy.
+/// **Both macOS backends sit below both multiplexers for the same reason Kitty
+/// does** — `TERM_PROGRAM` survives into every pane — and below Kitty, which
+/// stays the fallback. For Ghostty that is a strict ordering:
+/// `KITTY_WINDOW_ID` names a window and `TERM_PROGRAM` names only a vendor, and
+/// the two never co-occur in practice. For iTerm2 it is a genuine tie-break,
+/// argued where the id it costs is decided
+/// (`cm_core::terminal::resolve_terminal_env`). The order *between* Ghostty and
+/// iTerm2 carries no meaning: one `TERM_PROGRAM` cannot be both.
 fn detect_backend(over: Option<ConfiguredBackend>, live: LiveBackends) -> ConfiguredBackend {
     match over {
         Some(b) => b,
         None if live.zellij => ConfiguredBackend::Zellij,
         None if live.tmux => ConfiguredBackend::Tmux,
+        None if live.iterm => ConfiguredBackend::Iterm,
         None if live.ghostty => ConfiguredBackend::Ghostty,
         None => ConfiguredBackend::Kitty,
     }
@@ -485,18 +491,21 @@ pub fn supported_terminal_present() -> bool {
         zellij: zellij::ZellijTerminal::from_env().is_some(),
         tmux: tmux::TmuxTerminal::from_env().is_some(),
         ghostty: ghostty::GhosttyTerminal::from_env().is_some(),
+        iterm: iterm::ItermTerminal::from_env().is_some(),
     };
     match detect_backend(config::get().terminal.backend, live) {
         // `get()` builds a non-Kitty backend only when one is actually live; when
-        // it isn't (config pinned zellij/tmux/ghostty outside one, or pinned
-        // ghostty off macOS) `get()` falls back to Kitty, so the gate then
-        // requires Kitty like the Kitty arm.
+        // it isn't (config pinned zellij/tmux/ghostty/iterm outside one, or
+        // pinned a macOS backend off macOS) `get()` falls back to Kitty, so the
+        // gate then requires Kitty like the Kitty arm.
         ConfiguredBackend::Zellij if live.zellij => true,
         ConfiguredBackend::Tmux if live.tmux => true,
         ConfiguredBackend::Ghostty if live.ghostty => true,
+        ConfiguredBackend::Iterm if live.iterm => true,
         ConfiguredBackend::Zellij
         | ConfiguredBackend::Tmux
         | ConfiguredBackend::Ghostty
+        | ConfiguredBackend::Iterm
         | ConfiguredBackend::Kitty => std::env::var_os("KITTY_PID").is_some(),
     }
 }
@@ -529,10 +538,12 @@ pub fn get() -> &'static dyn Terminal {
         let zellij = zellij::ZellijTerminal::from_env();
         let tmux = tmux::TmuxTerminal::from_env();
         let ghostty = ghostty::GhosttyTerminal::from_env();
+        let iterm = iterm::ItermTerminal::from_env();
         let live = LiveBackends {
             zellij: zellij.is_some(),
             tmux: tmux.is_some(),
             ghostty: ghostty.is_some(),
+            iterm: iterm.is_some(),
         };
         match detect_backend(config::get().terminal.backend, live) {
             ConfiguredBackend::Zellij => match zellij {
@@ -568,6 +579,19 @@ pub fn get() -> &'static dyn Terminal {
                     tracing::warn!(
                         "[terminal] backend = \"ghostty\" but this is not a macOS Ghostty \
                          surface; falling back to Kitty"
+                    );
+                    Box::new(kitty::KittyTerminal)
+                }
+            },
+            ConfiguredBackend::Iterm => match iterm {
+                Some(i) => Box::new(i) as Box<dyn Terminal>,
+                // Same fallback as the three above: the config pinned iterm with
+                // no iTerm2 session to drive, or pinned it off macOS, where
+                // `from_env` refuses regardless of `TERM_PROGRAM`.
+                None => {
+                    tracing::warn!(
+                        "[terminal] backend = \"iterm\" but this is not a macOS iTerm2 session; \
+                         falling back to Kitty"
                     );
                     Box::new(kitty::KittyTerminal)
                 }

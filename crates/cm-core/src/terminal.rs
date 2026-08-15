@@ -125,10 +125,15 @@ pub struct TerminalEnv {
     pub kitty_window: Option<String>,
     pub kitty_listen: Option<String>,
     pub kitty_pid: Option<String>,
-    /// `TERM_PROGRAM` — Ghostty's only self-identifying variable. It exports no
-    /// per-surface id at all, which is why the Ghostty arm below yields an
-    /// identity and no window (see [`ghostty_identity`]).
+    /// `TERM_PROGRAM` — the only self-identifying variable Ghostty has, and the
+    /// one that tells iTerm2 apart from it. Ghostty exports no per-surface id at
+    /// all, which is why its arm below yields an identity and no window (see
+    /// [`ghostty_identity`]); iTerm2 does, in `iterm_session`.
     pub term_program: Option<String>,
+    /// `ITERM_SESSION_ID` (`w0t0p0:<UUID>`) — iTerm2's per-session variable, and
+    /// the whole reason its arm can name a window where Ghostty's cannot. See
+    /// [`iterm_surface`].
+    pub iterm_session: Option<String>,
 }
 
 /// The terminal *instance* identity and the window/pane of the current process,
@@ -150,6 +155,7 @@ fn terminal_env() -> (Option<String>, Option<WindowId>) {
         kitty_listen: read("KITTY_LISTEN_ON"),
         kitty_pid: read("KITTY_PID"),
         term_program: read("TERM_PROGRAM"),
+        iterm_session: read("ITERM_SESSION_ID"),
     })
 }
 
@@ -163,12 +169,24 @@ fn terminal_env() -> (Option<String>, Option<WindowId>) {
 ///   with the same both-halves-or-neither rule.
 /// - else a Kitty window ⇒ (`kitty:<KITTY_LISTEN_ON>`, falling back to
 ///   `kitty:<KITTY_PID>`; `None` when neither is set — window id).
+/// - else `TERM_PROGRAM=iTerm.app` ⇒ (`iterm`, the UUID out of
+///   `ITERM_SESSION_ID`). iTerm2 is the *only* AppleScript-driven terminal that
+///   names its own surface in the environment, so unlike Ghostty this half is a
+///   plain env read — no probe, no title write.
 /// - else `TERM_PROGRAM=ghostty` ⇒ (`ghostty`, **no window**). Ghostty is the
 ///   one supported terminal that exports nothing per surface, so this half is
 ///   structurally `None`; the dashboard's backend recovers *its own* surface a
-///   different way (`ttyname` → the AppleScript `tty` property) and every
-///   dashboard-spawned session is bound from its `SpawnResult` instead.
+///   different way (a nonce title) and every dashboard-spawned session is bound
+///   from its `SpawnResult` instead.
 /// - else `(None, None)`.
+///
+/// **Kitty stays ahead of iTerm2**, and that is a tie-break rather than a
+/// judgement: both name a real window, and either variable can be left stale in
+/// the other's session by an app launched from a shell. Symmetric, so the rule
+/// is zellij-over-tmux's — keeping the incumbent first means adding iTerm2
+/// changes nothing for existing Kitty users, and the wrong guess is corrected
+/// the same way, by pinning `[terminal] backend`. The order between iTerm2 and
+/// Ghostty carries no meaning at all: one `TERM_PROGRAM` cannot be both.
 ///
 /// Env values are trimmed (most are bare integer strings, so trimming is
 /// purely defensive) and an empty value counts as absent.
@@ -189,12 +207,59 @@ fn resolve_terminal_env(env: TerminalEnv) -> (Option<String>, Option<WindowId>) 
             Some(WindowId(window)),
         );
     }
-    // Last, because it is the weakest signal: `TERM_PROGRAM` is set by many
-    // emulators and carries no window, so anything that *can* name one wins.
-    if is_ghostty(clean(env.term_program).as_deref()) {
+    // Both remaining arms key on `TERM_PROGRAM`, which is set by many emulators
+    // and survives into a multiplexer's panes — so they come after everything
+    // that can name a window from a variable of its own.
+    let term_program = clean(env.term_program);
+    if is_iterm(term_program.as_deref()) {
+        let surface = clean(env.iterm_session)
+            .as_deref()
+            .and_then(iterm_surface)
+            .map(WindowId);
+        return (Some(iterm_identity()), surface);
+    }
+    // Last, because it is the weakest signal of all: it carries no window.
+    if is_ghostty(term_program.as_deref()) {
         return (Some(ghostty_identity()), None);
     }
     (None, None)
+}
+
+/// Whether a `TERM_PROGRAM` value names iTerm2. Compared case-insensitively for
+/// the same reason [`is_ghostty`] is — it is a display-ish string and leniency
+/// costs nothing. iTerm2 3.6.11 writes it exactly `iTerm.app` (measured).
+pub fn is_iterm(term_program: Option<&str>) -> bool {
+    term_program.is_some_and(|s| s.eq_ignore_ascii_case("iTerm.app"))
+}
+
+/// The surface (session) id inside a raw `ITERM_SESSION_ID`.
+///
+/// iTerm2 exports `w<window>t<tab>p<pane>:<UUID>` — a *positional* prefix that
+/// goes stale the moment a tab is dragged, followed by the id that does not.
+/// Only the UUID is kept, because it is exactly what the scripting dictionary
+/// answers for `id of session` (measured on 3.6.11: the environment's
+/// `w0t0p0:D36E57AE-…` against an `id of session` of `D36E57AE-…`), and a
+/// self-report that didn't match it would name nothing.
+///
+/// Split from the **right**: a UUID contains no colon, so the last one always
+/// ends the prefix. A value with no colon at all is taken whole rather than
+/// rejected — that is the shape iTerm2 would export if it ever dropped the
+/// prefix, and it is still a usable id.
+pub fn iterm_surface(session: &str) -> Option<String> {
+    let id = session
+        .rsplit_once(':')
+        .map_or(session, |(_, id)| id)
+        .trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The identity of an iTerm2 instance — **deliberately not instance-granular**,
+/// for the reason [`ghostty_identity`] spells out in full: the rule exists
+/// because window ids overlap between instances, and iTerm2's session ids are
+/// UUIDs, so they collide with nothing — not another instance's, and not a
+/// restarted iTerm2's.
+pub fn iterm_identity() -> String {
+    "iterm".to_string()
 }
 
 /// Whether a `TERM_PROGRAM` value names Ghostty. Compared case-insensitively:
@@ -539,13 +604,123 @@ mod tests {
             });
             assert_eq!(id.as_deref(), Some("ghostty"), "TERM_PROGRAM={other}");
         }
-        for other in ["Apple_Terminal", "iTerm.app", "WezTerm", "", "  "] {
+        for other in ["Apple_Terminal", "WezTerm", "", "  "] {
             let (id, _) = resolve_terminal_env(TerminalEnv {
                 term_program: Some(other.into()),
                 ..Default::default()
             });
             assert_eq!(id, None, "TERM_PROGRAM={other}");
         }
+    }
+
+    #[test]
+    fn iterm_yields_an_identity_and_the_session_uuid() {
+        // The half Ghostty structurally lacks: iTerm2 names its own surface in
+        // the environment, so a launcher there self-reports like a Kitty one.
+        let (id, win) = resolve_terminal_env(TerminalEnv {
+            term_program: Some("iTerm.app".into()),
+            iterm_session: Some("w0t0p0:D36E57AE-D742-4DB5-8EB7-32F6AE35D8A2".into()),
+            ..Default::default()
+        });
+        assert_eq!(id.as_deref(), Some("iterm"));
+        assert_eq!(
+            win,
+            Some(WindowId("D36E57AE-D742-4DB5-8EB7-32F6AE35D8A2".into()))
+        );
+
+        // Case-insensitive, like the Ghostty arm.
+        for other in ["iterm.app", "ITERM.APP"] {
+            let (id, _) = resolve_terminal_env(TerminalEnv {
+                term_program: Some(other.into()),
+                ..Default::default()
+            });
+            assert_eq!(id.as_deref(), Some("iterm"), "TERM_PROGRAM={other}");
+        }
+
+        // No (or unusable) `ITERM_SESSION_ID` still classifies the row — the
+        // session is *ours*, it just carries no window, which is the Ghostty
+        // shape and the one the dashboard already renders honestly.
+        for session in [
+            None,
+            Some(String::new()),
+            Some("  ".into()),
+            Some(":".into()),
+        ] {
+            let (id, win) = resolve_terminal_env(TerminalEnv {
+                term_program: Some("iTerm.app".into()),
+                iterm_session: session.clone(),
+                ..Default::default()
+            });
+            assert_eq!(id.as_deref(), Some("iterm"), "{session:?}");
+            assert_eq!(win, None, "{session:?}");
+        }
+    }
+
+    #[test]
+    fn an_iterm_surface_is_the_uuid_after_the_positional_prefix() {
+        // The `w0t0p0` prefix is positional and goes stale when a tab moves; the
+        // UUID is what `id of session` answers, so only it survives.
+        assert_eq!(
+            iterm_surface("w0t0p0:D36E57AE-D742-4DB5-8EB7-32F6AE35D8A2").as_deref(),
+            Some("D36E57AE-D742-4DB5-8EB7-32F6AE35D8A2")
+        );
+        // Two windows, two tabs in: same rule, split from the right.
+        assert_eq!(
+            iterm_surface("w2t7p1:AAAA-BBBB").as_deref(),
+            Some("AAAA-BBBB")
+        );
+        // No prefix at all is taken whole — still a usable id.
+        assert_eq!(iterm_surface("AAAA-BBBB").as_deref(), Some("AAAA-BBBB"));
+        // Nothing to name.
+        assert_eq!(iterm_surface(""), None);
+        assert_eq!(iterm_surface("w0t0p0:"), None);
+        assert_eq!(iterm_surface("w0t0p0:   "), None);
+    }
+
+    #[test]
+    fn kitty_stays_ahead_of_iterm_and_a_multiplexer_beats_both() {
+        // A stale `KITTY_WINDOW_ID` inherited into an iTerm2 session is the
+        // tie-break case: the incumbent wins, and `[terminal] backend` is the fix.
+        let (id, win) = resolve_terminal_env(TerminalEnv {
+            term_program: Some("iTerm.app".into()),
+            iterm_session: Some("w0t0p0:AAAA".into()),
+            ..kitty_env()
+        });
+        assert_eq!(id.as_deref(), Some("kitty:unix:/tmp/k"));
+        assert_eq!(win, Some(WindowId("7".into())));
+
+        // But a multiplexer inside iTerm2 names its own pane, and `TERM_PROGRAM`
+        // survives into every one of them — so it must still win.
+        let (id, win) = resolve_terminal_env(TerminalEnv {
+            tmux: Some("/tmp/s,4242,0".into()),
+            tmux_pane: Some("%5".into()),
+            term_program: Some("iTerm.app".into()),
+            iterm_session: Some("w0t0p0:AAAA".into()),
+            ..Default::default()
+        });
+        assert_eq!(id.as_deref(), Some("tmux:/tmp/s,4242"));
+        assert_eq!(win, Some(WindowId("%5".into())));
+    }
+
+    #[test]
+    fn an_iterm_session_is_never_unbindable() {
+        // The Ghostty refusal must not spread to the backend that fixed the
+        // problem it exists for: iTerm2 binds from the environment.
+        let unbindable = |env| {
+            let (id, win) = resolve_terminal_env(env);
+            is_unbindable(id.as_deref(), win.as_ref())
+        };
+        assert!(!unbindable(TerminalEnv {
+            term_program: Some("iTerm.app".into()),
+            iterm_session: Some("w0t0p0:AAAA".into()),
+            ..Default::default()
+        }));
+        // Even with no session id it is not *Ghostty*, so the gate keyed on
+        // Ghostty's identity leaves it alone.
+        assert!(!unbindable(TerminalEnv {
+            term_program: Some("iTerm.app".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]

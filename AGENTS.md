@@ -1,7 +1,7 @@
 # captain-miao
 
 TUI dashboard to monitor and manage multiple Claude Code / Codex sessions across
-Kitty, Ghostty, zellij and tmux.
+Kitty, Ghostty, iTerm2, zellij and tmux.
 
 This file is the **map and the house rules**: where things live, and the
 constraints you can't discover by reading the file you're editing. Design
@@ -130,9 +130,10 @@ Anything local to one module is in that module's doc instead.
 - **Keep protocol changes additive** (`#[serde(default)]`). v4 is meant to be the
   last refusing bump; unknown frames decode to `Unknown` and are ignored.
 - **Hide an unsupported affordance, don't offer a key that only errors.** `t` on
-  zellij and Ghostty, `Space l` on tmux and Ghostty, `Ctrl-g` on Codex all do
-  this. Render bindings via `keys_for`/`primary_key` so a remap shows through
-  without touching `draw.rs`. A capability that gates a *recurring* read needs
+  zellij, Ghostty and iTerm2, `Space l` on tmux, Ghostty and iTerm2, `Ctrl-g` on
+  Codex all do this. Render bindings via `keys_for`/`primary_key` so a remap
+  shows through without touching `draw.rs`. A capability that gates a
+  *recurring* read needs
   the gate at the call site too, not just in the UI: the preview loop treats a
   failed `capture_text` as evidence the binding is stale, so `capture: false`
   has to stop the fetch rather than let it error.

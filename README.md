@@ -6,14 +6,14 @@
 
 <img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
 
-A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
+A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [iTerm2](https://iterm2.com/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
 
 https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
 
 When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
 
 Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
-Kitty, Ghostty, zellij or tmux you already run (every session is a native window
+Kitty, Ghostty, iTerm2, zellij or tmux you already run (every session is a native window
 or pane, controlled through the terminal's own protocol), so it stays one small,
 focused tool and the rest of your workflow is yours to compose.
 
@@ -38,6 +38,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **[Kitty](https://github.com/kovidgoyal/kitty)**             | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                                                     |
 | **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3  | **macOS only**, driven through Ghostty's AppleScript dictionary ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**. |
+| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0       | **macOS only**, driven through iTerm2's AppleScript dictionary ([iTerm2 setup](#iterm2-setup)). Previews are plain text — iTerm2 returns no colour.                          |
 | **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44    | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
 | **[tmux](https://github.com/tmux/tmux)** ≥ 3.2               | One window per session.                                                                                                                                                     |
 
@@ -144,9 +145,21 @@ Sessions always get their own tab: Ghostty has neither a stack layout nor floati
 
 **Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij *inside* Ghostty the pane names itself, so hand launches work there exactly as they always have.
 
+## iTerm2 setup
+
+**macOS only, iTerm2 ≥ 3.0.** captain-miao drives iTerm2 through its [AppleScript dictionary](https://iterm2.com/documentation-scripting.html), which is on by default — there is nothing to enable. As with Ghostty, approve the Automation prompt macOS raises the first time captain-miao talks to iTerm2; if you dismissed it, re-enable it under **System Settings → Privacy & Security → Automation**, in the entry for whatever launched captain-miao. The channel is verified at startup, with a diagnostic naming the fix if it can't get through.
+
+Unlike Ghostty, iTerm2 tells a process which session it is in, so nothing here is second-class: hand-typed launches bind to their window, `Enter` focuses, `D` closes, and `miao focus` works. Three smaller differences:
+
+- **Previews are plain.** iTerm2 returns a session's visible screen without colour, so the preview shows the right text in the wrong palette. It also has no scrollback in the API, so the preview never reaches back further than the window itself.
+- **No move-to-tab.** `t` is hidden, as it is on zellij and Ghostty.
+- **Sessions always get their own tab**, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
+
+One iTerm2 bug is worth knowing about: after any window or tab is created with a command that exits immediately, iTerm2 stops answering "create tab" altogether — later spawns hang even when their command is long-lived, until iTerm2 is restarted. captain-miao bounds the wait and says so rather than hanging, and the sessions it starts hold themselves open on failure, so this is hard to reach in normal use.
+
 ## Usage
 
-Run the dashboard inside a supported terminal (Kitty, Ghostty, zellij or tmux):
+Run the dashboard inside a supported terminal (Kitty, Ghostty, iTerm2, zellij or tmux):
 
 ```sh
 miao
@@ -252,7 +265,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
 | `Space a` / `Space H` | Set the default backend / default host for new sessions                                                                                                                    |
-| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux or Ghostty, which have only the one)                                                  |
+| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                                  |
 | `Space h` / `Space s` | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — the footer's status messages, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
@@ -284,10 +297,11 @@ captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml`
 
 ```toml
 [terminal]
-backend = "kitty"            # "kitty" | "ghostty" | "zellij" | "tmux"; unset auto-detects
-                             # (zellij, then tmux, then Ghostty, else Kitty)
+backend = "kitty"            # "kitty" | "ghostty" | "iterm" | "zellij" | "tmux"; unset
+                             # auto-detects (zellij, then tmux, then iTerm2/Ghostty,
+                             # else Kitty)
 sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this;
-                             # tmux and Ghostty are always per-tab)
+                             # tmux, Ghostty and iTerm2 are always per-tab)
 
 [kitty]
 rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
@@ -435,7 +449,8 @@ State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG
 - [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
 - [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code, Grok Build, opencode and Pi have all slotted in and are every one of them still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)) — running the probe each one's module doc lists is what graduates them.
 - [ ] **Ghostty**: spawning and dashboard-window discovery have now been driven by hand against a live Ghostty 1.3.1 — and needed three fixes to work at all — but the rest of the AppleScript backend is still unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation of a full session lifecycle (resume, restart, kill, detach) on a real Mac is what graduates it.
-- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
+- [ ] **iTerm2**: spawn, snapshot, focus, capture and close have each been driven by hand against a live iTerm2 3.6.11, including that a spawn's reported id matches what the process inside reports for itself. Like Ghostty it can't be tested in CI, so a full session lifecycle (resume, restart, kill, detach) on a real Mac is what graduates it.
+- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, iTerm2, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
 ## License
 

@@ -83,18 +83,22 @@ fn detect_backend_override_beats_env() {
     for zellij in [true, false] {
         for tmux in [true, false] {
             for ghostty in [true, false] {
-                for pinned in [
-                    ConfiguredBackend::Kitty,
-                    ConfiguredBackend::Tmux,
-                    ConfiguredBackend::Zellij,
-                    ConfiguredBackend::Ghostty,
-                ] {
-                    let live = LiveBackends {
-                        zellij,
-                        tmux,
-                        ghostty,
-                    };
-                    assert_eq!(detect_backend(Some(pinned), live), pinned);
+                for iterm in [true, false] {
+                    for pinned in [
+                        ConfiguredBackend::Kitty,
+                        ConfiguredBackend::Tmux,
+                        ConfiguredBackend::Zellij,
+                        ConfiguredBackend::Ghostty,
+                        ConfiguredBackend::Iterm,
+                    ] {
+                        let live = LiveBackends {
+                            zellij,
+                            tmux,
+                            ghostty,
+                            iterm,
+                        };
+                        assert_eq!(detect_backend(Some(pinned), live), pinned);
+                    }
                 }
             }
         }
@@ -102,36 +106,69 @@ fn detect_backend_override_beats_env() {
 }
 
 #[test]
-fn detect_backend_prefers_zellij_then_tmux_then_ghostty_then_kitty() {
+fn detect_backend_prefers_a_multiplexer_then_a_macos_emulator_then_kitty() {
     // No override: a live multiplexer wins over the ambient emulator env (a
     // nested mux shares both the outer KITTY_WINDOW_ID and the outer
     // TERM_PROGRAM), else Kitty is the status-quo fallback. Zellij stays ahead
     // of tmux when both are live — the env can't say which is inner, and this
     // order keeps existing zellij users unchanged.
-    let live = |zellij, tmux, ghostty| LiveBackends {
+    let live = |zellij, tmux, ghostty, iterm| LiveBackends {
         zellij,
         tmux,
         ghostty,
+        iterm,
     };
     assert_eq!(
-        detect_backend(None, live(true, true, true)),
+        detect_backend(None, live(true, true, true, true)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, live(true, false, true)),
+        detect_backend(None, live(true, false, true, false)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, live(false, true, true)),
+        detect_backend(None, live(false, true, true, false)),
         ConfiguredBackend::Tmux
     );
     assert_eq!(
-        detect_backend(None, live(false, false, true)),
+        detect_backend(None, live(false, false, true, false)),
         ConfiguredBackend::Ghostty
+    );
+    assert_eq!(
+        detect_backend(None, live(false, false, false, true)),
+        ConfiguredBackend::Iterm
+    );
+    // A multiplexer inside iTerm2 is the case that matters: `TERM_PROGRAM`
+    // survives into every pane, so the pane must still win.
+    assert_eq!(
+        detect_backend(None, live(false, true, false, true)),
+        ConfiguredBackend::Tmux
     );
     assert_eq!(
         detect_backend(None, LiveBackends::default()),
         ConfiguredBackend::Kitty
+    );
+}
+
+/// iTerm2 is the first AppleScript backend that can read a window, so its
+/// capabilities must differ from Ghostty's in exactly that one field — a new
+/// flag either of them can't do should be a deliberate edit here, not a silent
+/// divergence.
+#[test]
+fn iterm_capabilities_differ_from_ghostty_only_in_capture() {
+    let caps = iterm::CAPABILITIES;
+    assert!(caps.capture);
+    assert!(!caps.move_to_tab);
+    assert!(
+        !caps.layout_is_a_choice(),
+        "with neither stacked arrangement, `Space l` would toggle a label that changes nothing"
+    );
+    assert_eq!(
+        caps,
+        Capabilities {
+            capture: true,
+            ..ghostty::CAPABILITIES
+        }
     );
 }
 

@@ -138,9 +138,9 @@ pub struct TerminalConfig {
 }
 
 /// A `[terminal] backend` value. Serde-renamed so the config reads
-/// `backend = "kitty"` / `"zellij"` / `"tmux"` / `"ghostty"`; any other string
-/// fails the parse loudly (the loader logs it and falls back to defaults) rather
-/// than silently picking a backend.
+/// `backend = "kitty"` / `"zellij"` / `"tmux"` / `"ghostty"` / `"iterm"`; any
+/// other string fails the parse loudly (the loader logs it and falls back to
+/// defaults) rather than silently picking a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfiguredBackend {
@@ -149,6 +149,10 @@ pub enum ConfiguredBackend {
     Tmux,
     /// macOS only — the Linux Ghostty exposes no control channel at all.
     Ghostty,
+    /// macOS only, and the one worth pinning by hand: Kitty wins the tie when a
+    /// stale `KITTY_WINDOW_ID` is inherited into an iTerm2 session
+    /// (`cm_core::terminal::resolve_terminal_env`).
+    Iterm,
 }
 
 // -- remote --
@@ -443,6 +447,8 @@ mod tests {
         assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Tmux));
         let cfg: Config = toml::from_str("[terminal]\nbackend = \"ghostty\"").unwrap();
         assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Ghostty));
+        let cfg: Config = toml::from_str("[terminal]\nbackend = \"iterm\"").unwrap();
+        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Iterm));
         // An unknown value fails the parse loudly rather than being ignored.
         assert!(toml::from_str::<Config>("[terminal]\nbackend = \"wezterm\"").is_err());
     }

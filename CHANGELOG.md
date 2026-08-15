@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An iTerm2 terminal backend** (macOS, iTerm2 ≥ 3.0), driven through its
+  AppleScript dictionary. Unlike Ghostty it exports a per-session id, so hand
+  launches bind to their window, `Enter` focuses, `D` closes and `miao focus`
+  works; previews come back as plain text, since iTerm2 returns no colour.
+  Auto-detected, or pinned with `[terminal] backend = "iterm"`.
 - **Four more agent backends**: `miao kimi`, `miao grok`, `miao opencode` and
   `miao pi`. Each tracks status and launches, resumes and (where the agent can)
   forks; each carries its own known limits in the README.
