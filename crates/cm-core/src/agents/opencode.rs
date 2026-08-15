@@ -3,8 +3,12 @@
 //! `crate::agent::AgentControl::OpenCode`'s match arms.
 //!
 //! **Source-read against opencode itself** — `packages/plugin/src/index.ts`
-//! for the hook interface and `packages/sdk/js/src/gen/types.gen.ts` for every
-//! payload shape. It is not run against a binary yet; the probe list at the end
+//! for the hook interface, and (as of a re-read at 1.18.18) `packages/schema/
+//! src/v1` for every payload shape. The SDK's `types.gen.ts`, which the first
+//! read used, is a committed generated artifact that has drifted from the
+//! runtime — it still names a `permission.updated` event the runtime does not
+//! publish (it publishes `permission.asked`) — so the schema package is the
+//! authority. It is not run against a binary yet; the probe list at the end
 //! says what that would still settle.
 //!
 //! The first cut of this backend was derived from this project's design note
@@ -90,15 +94,15 @@
 //! off the bus, because an observer on the bus cannot delay a turn.
 //! `permission.ask` is deliberately **not** used despite existing and being the
 //! obvious fit: it can set `output.status`, so a plugin sitting in it is in the
-//! path of the user's own approval prompt. The bus's `permission.updated`
-//! carries the same `Permission` and cannot block.
+//! path of the user's own approval prompt. The bus's `permission.asked`
+//! carries the same request and cannot block.
 //!
 //! `session.status` is the one genuinely authoritative signal here — its
 //! `{type: "idle" | "busy" | "retry"}` is opencode's own view of whether the
 //! session is working — and it is still **not** what drives the row, for the
 //! reason a capability gate usually exists: it is strictly *coarser* than our
 //! vocabulary. A session waiting on an approval is `busy`, and a `busy` arriving
-//! after `permission.updated` would knock the row out of `WaitingForApproval`
+//! after `permission.asked` would knock the row out of `WaitingForApproval`
 //! back to `Active`. Only its `idle` edge is forwarded (as `Stop`), where it
 //! costs nothing and buys the one thing the finer events might miss — an
 //! **interrupted** turn that never reaches `session.idle`. That asymmetry is the
@@ -197,10 +201,23 @@ const PLUGIN_FILE: &str = "captain-miao.js";
 /// `session.updated` maps to `CwdChanged` for the same reason: it is a title
 /// change (and a `directory`), never a status edge, so it must reach
 /// `adopt_session_facts` without disturbing a row mid-turn.
+///
+/// Two entries carry a source-read footnote (opencode 1.18.18):
+///
+/// - **`permission.asked`**, not `permission.updated` — the runtime publishes
+///   `asked` (`permission/index.ts`); `updated` exists only in the SDK's
+///   committed `types.gen.ts`, a generated artifact that has visibly drifted
+///   from `packages/schema/src/v1`, which is the authority these payload
+///   shapes now follow. Its payload is `Permission.Request`'s fields **flat**
+///   (`{id, sessionID, …}`), not `{info: …}`.
+/// - **`session.idle` is marked deprecated** in the schema, published beside
+///   `session.status` on every idle transition. Both stay subscribed —
+///   `Stop` is idempotent — but `session.status`'s idle edge is the durable
+///   one if `session.idle` ever vanishes.
 const BUS_EVENTS: &[(&str, HookEvent)] = &[
     ("session.created", HookEvent::SessionStart),
     ("session.updated", HookEvent::CwdChanged),
-    ("permission.updated", HookEvent::PermissionRequest),
+    ("permission.asked", HookEvent::PermissionRequest),
     ("permission.replied", HookEvent::ElicitationResult),
     ("session.idle", HookEvent::Stop),
     ("session.error", HookEvent::StopFailure),
@@ -616,10 +633,11 @@ fn model_ref(v: &Value, path: &[&str]) -> Option<String> {
 
 /// Pull everything the launcher can use out of one handler's arguments.
 ///
-/// The field names all come from opencode's generated SDK types
-/// (`packages/sdk/js/src/gen/types.gen.ts`): `Session` for `session.*`,
-/// `AssistantMessage` / `UserMessage` for `message.updated`, `Permission` for
-/// `permission.updated`, and `Hooks` in `packages/plugin/src/index.ts` for the
+/// The field names all come from opencode's schema package
+/// (`packages/schema/src/v1` — the module doc says why the SDK's `types.gen.ts`
+/// is no longer trusted): `SessionInfo` for `session.*`, the message schemas
+/// for `message.updated`, `Permission.Request`'s flat fields for
+/// `permission.asked`, and `Hooks` in `packages/plugin/src/index.ts` for the
 /// direct hooks' `input`. Several event shapes arrive under one of our event
 /// names, so each fact is a short ordered list of the places it can be, not a
 /// single path — the ordering is what keeps a `Message.id` from being read as a
@@ -1024,14 +1042,14 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PermissionRequest,
-            // `EventPermissionUpdated.properties` *is* the `Permission`, spread
-            // rather than nested under `info` — hence the `props.sessionID` step.
+            // `permission.asked`'s properties are `Permission.Request`'s fields
+            // spread flat, not nested under `info` — hence the
+            // `props.sessionID` step.
             &bus(
                 "permission-request",
-                "permission.updated",
-                r#"{"id":"per_1","type":"bash","sessionID":"ses_1",
-                    "messageID":"msg_1","title":"run tests","metadata":{},
-                    "time":{"created":1}}"#,
+                "permission.asked",
+                r#"{"id":"per_1","sessionID":"ses_1","permission":"bash",
+                    "patterns":["cargo *"],"metadata":{},"always":true}"#,
             ),
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
@@ -1446,7 +1464,7 @@ const MIAO = "/home/miao/.local/bin/miao";
 const BUS = {
   "session.created": "session-start",
   "session.updated": "cwd-changed",
-  "permission.updated": "permission-request",
+  "permission.asked": "permission-request",
   "permission.replied": "elicitation-result",
   "session.idle": "stop",
   "session.error": "stop-failure",
