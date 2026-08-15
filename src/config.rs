@@ -222,6 +222,13 @@ pub struct UiColors {
     pub highlight_bg: Color,
     #[serde(deserialize_with = "de_color")]
     pub selection_fg: Color,
+    /// The session table's cursor marker. Its **display width is the gutter
+    /// width** — ratatui reserves exactly `highlight_symbol.width()` and carves
+    /// that area out before the spaced column layout runs, so `column_spacing`
+    /// never applies between it and the first column. A trailing space here is
+    /// therefore not padding but a second reserved cell on every row; the
+    /// default omits one and lets the override column's own right-alignment
+    /// supply the gap.
     pub selection_symbol: String,
 }
 
@@ -234,7 +241,7 @@ impl Default for UiColors {
             error_fg: Color::Red,
             highlight_bg: Color::DarkGray,
             selection_fg: Color::Blue,
-            selection_symbol: "\u{276F} ".to_string(),
+            selection_symbol: "\u{276F}".to_string(),
         }
     }
 }
