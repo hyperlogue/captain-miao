@@ -16,12 +16,20 @@
 //! addresses the thing an agent runs in, and the OS window it happens to sit in
 //! is presentation.
 //!
+//! What is *verified*. Everything covered by a test here is pure (script
+//! building, snapshot parsing, id validation, shell quoting, the startup
+//! diagnosis); driving a real Ghostty needs a Mac with a GUI session and a
+//! hand-clicked Automation grant, which no CI can supply, so nothing below runs
+//! in the suite. The **spawn** path has been driven by hand against Ghostty
+//! 1.3.1, which contradicted the dictionary reading twice — the `command`
+//! property does not parse the `shell:` prefix the config file accepts
+//! ([`spawn_config_script`]), and `new tab` must name its window or it creates
+//! the tab and *then* fails the event ([`CREATE_TAB_SCRIPT`]). Both corrections
+//! are documented where they live.
+//!
 //! Backend properties this module encodes, read off the shipped `Ghostty.sdef`
-//! and the Swift behind it — **not** measured against a live Ghostty. Everything
-//! covered by a test here is pure (script building, snapshot parsing, id
-//! validation, shell quoting, the startup diagnosis); the rest would need a Mac
-//! with a GUI session and a hand-clicked Automation grant, which no CI can
-//! supply, so it is unverified rather than verified-elsewhere:
+//! and the Swift behind it — so, per the above, what the dictionary says rather
+//! than what a Ghostty was seen doing:
 //! - **Ids are opaque strings of three different shapes.** A terminal id is a
 //!   UUID (`SurfaceView.id.uuidString`); a tab id is `tab-<hex>`; a window id is
 //!   `window-<hex>` / `tab-group-<hex>` / `controller-<hex>`. So the digit-only
@@ -29,11 +37,12 @@
 //!   [`script_id`] validates the union instead.
 //! - **Surface ids never recycle**, being UUIDs, which is what makes the
 //!   speculative `close_window` the restart/kill paths rely on safe.
-//! - **Ghostty exports no per-surface environment variable.** There is no
-//!   `KITTY_WINDOW_ID` analog, so `current_window` cannot be an env read. It is
-//!   recovered instead from the one thing that *is* both knowable locally and
-//!   exposed to script — the tty: `ttyname(0)` here, `tty of terminal` there.
-//!   Resolved once, lazily, and cached ([`GhosttyTerminal::own_surface`]).
+//! - **A process cannot learn which surface it is in.** There is no
+//!   `KITTY_WINDOW_ID` analog in the environment, and — measured, unlike the
+//!   rest of this list — no `tty` on the `terminal` class to match `ttyname(0)`
+//!   against either, so [`GhosttyTerminal::resolve_own_surface`] settles on
+//!   `None` and `miao focus` has no dashboard window to raise. Its doc carries
+//!   what was tried.
 //! - **Creation always activates Ghostty** (upstream ghostty#11457:
 //!   `new window` / `new tab` bring the app forward with no way to opt out), so
 //!   `SpawnSpec::take_focus` cannot be honoured in its `false` direction. Left
@@ -157,6 +166,18 @@ impl GhosttyTerminal {
     }
 
     /// The dashboard's own surface id, resolved once.
+    ///
+    /// **Answers `None` on every Ghostty shipping today**, and is kept anyway.
+    /// `tty of terminal` is not in 1.3.1's dictionary — the `terminal` class
+    /// carries `id`, `name` and `working directory`, nothing else — so the
+    /// script fails to compile (-1700) and this settles on `None`. Kept rather
+    /// than deleted because the code is right the moment the property exists,
+    /// and because there is no second way to ask: no surface id in the
+    /// environment either (measured — 1.3.1 exports `GHOSTTY_RESOURCES_DIR`,
+    /// `GHOSTTY_BIN_DIR` and `GHOSTTY_SHELL_FEATURES`, and no `KITTY_WINDOW_ID`
+    /// analog), and nothing else on a surface distinguishes it from its
+    /// neighbours. The cost is `miao focus`: it has no dashboard window to raise
+    /// on Ghostty.
     ///
     /// Blocking on purpose: this is one `osascript` at most per process, and
     /// [`Terminal::current_window`] is sync on every backend because every other
@@ -465,12 +486,18 @@ fn parse_snapshot(out: &str) -> Vec<Tab> {
 /// Build the `surface configuration` prelude every spawn shares — the lines that
 /// set a fresh `cfg` up from `spec`, ready for `new window`/`new tab`.
 ///
-/// `command` is emitted with Ghostty's **`shell:`** prefix and a shell-quoted
-/// argv rather than the cheaper `direct:`. `direct:` skips the `/bin/sh`
-/// round-trip but splits on whitespace, and captain-miao's argvs routinely carry
-/// elements that contain spaces — a cwd with one, and the whole
-/// `/bin/sh -c '<script>'` the remote attach wrapper is. Splitting those would
-/// silently run something else.
+/// `command` is a shell-quoted argv carrying **no prefix**. Ghostty's *config
+/// file* accepts `shell:` and `direct:` there, but the scripting property is
+/// plain text that reaches the shell whole: a `shell:` prefix is not stripped,
+/// it becomes part of the command, and Ghostty dies trying to exec a file named
+/// `shell:/bin/sh`. Measured on 1.3.1.
+///
+/// Unprefixed is what we would want even if the property did learn to parse
+/// them. A command carrying arguments takes the documented `/bin/sh -c` path,
+/// which is the one captain-miao needs — its argvs routinely hold elements that
+/// contain spaces (a cwd with one, and the whole `/bin/sh -c '<script>'` the
+/// remote attach wrapper is), and `direct:`'s whitespace split would silently
+/// run something else. The quoting is what makes that round-trip lossless.
 fn spawn_config_script(spec: &SpawnSpec) -> String {
     let mut s = String::from("  set cfg to new surface configuration\n");
     if !spec.cwd.is_empty() {
@@ -489,7 +516,7 @@ fn spawn_config_script(spec: &SpawnSpec) -> String {
             .join(" ");
         s.push_str(&format!(
             "  set command of cfg to {}\n",
-            applescript_string(&format!("shell:{joined}"))
+            applescript_string(&joined)
         ));
     }
     // `SpawnCommand::Shell` sets nothing — Ghostty launches the configured shell.
@@ -507,6 +534,65 @@ fn spawn_config_script(spec: &SpawnSpec) -> String {
         ));
     }
     s
+}
+
+/// The creating half of a spawn: make the surface `cfg` describes and leave its
+/// tab in `t`.
+///
+/// **The window is named, and that is not a nicety.** Ghostty's handler for the
+/// parameterless `new tab` creates the tab and *then* fails the Apple event with
+/// `errAEEventNotHandled` (-1708) — measured on 1.3.1 — so the spawn reports
+/// failure while leaving a live agent in a surface captain-miao never learned
+/// the id of, and the user sees only the error. `in front window` asks for the
+/// same tab the bare form means, spelled the way the handler answers.
+///
+/// `front window` is `missing value` when Ghostty holds no window, which is an
+/// ordinary state rather than a race — Ghostty stays running with every window
+/// closed, and captain-miao's own surface may be the one the user just closed.
+/// That case takes `new window`, the one creation command that needs nothing to
+/// already exist; it answers with a *window*, so the tab comes back off
+/// `selected tab` — the tab it just made is the selected one.
+const CREATE_TAB_SCRIPT: &str = concat!(
+    "  set w to front window\n",
+    "  if w is missing value then\n",
+    "    set t to selected tab of (new window with configuration cfg)\n",
+    "  else\n",
+    "    set t to new tab in w with configuration cfg\n",
+    "  end if\n",
+);
+
+/// The whole of what a [`spawn`](Terminal::spawn) sends: configure, create, and
+/// read the two ids back.
+///
+/// One script, because both arms of [`CREATE_TAB_SCRIPT`] leave the new tab in
+/// `t` and `terminal 1 of t` is its surface — so a single round-trip yields a
+/// fully-populated `SpawnResult` whose tab is genuinely the one holding the
+/// window, which is what lets the dashboard trust it and skip the resolving
+/// snapshot.
+///
+/// Pure, and separated from the call for that reason: the script is the part
+/// that can be wrong, and it is the part no CI can run.
+fn spawn_script(spec: &SpawnSpec) -> Result<String> {
+    // Both Stacked arrangements are unsupported here (`CAPABILITIES`), so
+    // `resolve_spawn_target` only ever yields `NewTab`; reaching either other
+    // arm is a policy bug upstream rather than something to approximate.
+    let create = match spec.target {
+        SpawnTarget::NewTab => CREATE_TAB_SCRIPT,
+        SpawnTarget::Floating => {
+            anyhow::bail!("floating session panes are not supported by the ghostty backend")
+        }
+        SpawnTarget::SharedStackTab => {
+            anyhow::bail!("stacked session tabs are not supported by the ghostty backend")
+        }
+    };
+    Ok(format!(
+        "{SEP_PREAMBLE}\
+         tell application \"Ghostty\"\n{}{create}\
+         \x20 set s to terminal 1 of t\n\
+         \x20 return (id of s) & sep & (id of t)\n\
+         end tell",
+        spawn_config_script(spec),
+    ))
 }
 
 /// Quote one argv element for `/bin/sh`. Single-quote wrapping, with the one
@@ -570,32 +656,7 @@ impl Terminal for GhosttyTerminal {
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnResult> {
-        // Both Stacked arrangements are unsupported here (`CAPABILITIES`), so
-        // `resolve_spawn_target` only ever yields `NewTab`; reaching either other
-        // arm is a policy bug upstream rather than something to approximate.
-        let create = match spec.target {
-            SpawnTarget::NewTab => "  set t to new tab with configuration cfg\n",
-            SpawnTarget::Floating => {
-                anyhow::bail!("floating session panes are not supported by the ghostty backend")
-            }
-            SpawnTarget::SharedStackTab => {
-                anyhow::bail!("stacked session tabs are not supported by the ghostty backend")
-            }
-        };
-        // `new tab` returns the tab and `terminal 1 of t` its surface, so one
-        // script yields a fully-populated `SpawnResult` — the tab is genuinely
-        // the one holding the window, which is what lets the dashboard trust it
-        // and skip the resolving snapshot.
-        let script = format!(
-            "{SEP_PREAMBLE}\
-             tell application \"Ghostty\"\n{}{}\
-             \x20 set s to terminal 1 of t\n\
-             \x20 return (id of s) & sep & (id of t)\n\
-             end tell",
-            spawn_config_script(&spec),
-            create,
-        );
-        let out = osascript(&script).await?;
+        let out = osascript(&spawn_script(&spec)?).await?;
         let (window, tab) = out
             .trim()
             .split_once(SEP)
@@ -822,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_spawn_is_shell_prefixed_and_quoted() {
+    fn an_exec_spawn_is_quoted_and_carries_no_prefix() {
         let spec = SpawnSpec {
             cwd: "/home/miao/my code".into(),
             target: SpawnTarget::NewTab,
@@ -839,13 +900,17 @@ mod tests {
             stack: true,
         };
         let script = spawn_config_script(&spec);
-        // `shell:`, not `direct:` — `direct:` splits on whitespace, which would
-        // tear both the cwd and the JSON blob into separate argv elements.
+        // Quoted, so the `/bin/sh -c` Ghostty runs a multi-argument command
+        // through cannot tear the cwd or the JSON blob into separate elements…
         assert!(
-            script.contains("shell:miao claude '/home/miao/my code'"),
+            script.contains("set command of cfg to \"miao claude '/home/miao/my code'"),
             "{script}"
         );
         assert!(script.contains(r#"--settings '{\"a\":1}'"#), "{script}");
+        // …and unprefixed, because the scripting property takes plain text: a
+        // `shell:` would be exec'd as part of the command rather than stripped.
+        assert!(!script.contains("shell:"), "{script}");
+        assert!(!script.contains("direct:"), "{script}");
         assert!(
             script.contains("set initial working directory of cfg to \"/home/miao/my code\""),
             "{script}"
@@ -871,6 +936,59 @@ mod tests {
             script.contains("set wait after command of cfg to true"),
             "{script}"
         );
+    }
+
+    #[test]
+    fn a_spawn_never_asks_for_a_tab_without_saying_where() {
+        // A parameterless `new tab` creates the tab and *then* fails the event,
+        // so a spawn that used one would report failure over a live agent. Every
+        // `new tab` here names its window, and the no-window arm — where there
+        // is no window to name — reaches for `new window` rather than skipping
+        // the parameter.
+        for line in CREATE_TAB_SCRIPT.lines() {
+            if line.contains("new tab") {
+                assert!(line.contains(" in w "), "{line}");
+            }
+        }
+        assert!(
+            CREATE_TAB_SCRIPT.contains("if w is missing value then"),
+            "{CREATE_TAB_SCRIPT}"
+        );
+        assert!(
+            CREATE_TAB_SCRIPT.contains("new window with configuration cfg"),
+            "{CREATE_TAB_SCRIPT}"
+        );
+        // Both arms leave the tab in `t`, which is what `spawn` reads back.
+        assert_eq!(CREATE_TAB_SCRIPT.matches("set t to").count(), 2);
+    }
+
+    #[test]
+    fn a_spawn_script_configures_creates_and_reads_both_ids_back() {
+        let spec = |target| SpawnSpec {
+            cwd: "/home/miao".into(),
+            target,
+            command: SpawnCommand::Shell,
+            title: None,
+            hold: false,
+            take_focus: true,
+            stack: false,
+        };
+        let script = spawn_script(&spec(SpawnTarget::NewTab)).unwrap();
+        // The order is the contract: `cfg` has to be complete before the create
+        // consumes it, and `t` has to exist before the surface is read off it.
+        let at = |needle: &str| script.find(needle).unwrap_or_else(|| panic!("{script}"));
+        assert!(at("set cfg to new surface configuration") < at("new tab in w"));
+        assert!(at("new tab in w") < at("set s to terminal 1 of t"));
+        assert!(
+            script.contains("return (id of s) & sep & (id of t)"),
+            "{script}"
+        );
+
+        // The two arrangements `CAPABILITIES` denies are refused rather than
+        // approximated, so a policy bug upstream is loud.
+        for target in [SpawnTarget::Floating, SpawnTarget::SharedStackTab] {
+            assert!(spawn_script(&spec(target)).is_err());
+        }
     }
 
     #[test]

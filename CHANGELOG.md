@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ghostty could not launch a session at all.** Two independent faults, both
+  found by driving a real Ghostty 1.3.1 for the first time. The command was sent
+  with the `shell:` prefix Ghostty's *config file* accepts, but the AppleScript
+  property does not parse it — so Ghostty tried to execute a program literally
+  named `shell:/bin/sh`. And `new tab` was asked for without naming a window,
+  which Ghostty answers by creating the tab and *then* failing the event
+  (`-1708`), so the spawn reported failure while leaving a live agent behind.
 - **opencode sessions stuck reading as "working" forever.** The generated plugin
   registered six handler keys that opencode never looks for — including the
   turn-end signal — because they are event names on its bus rather than keys on
