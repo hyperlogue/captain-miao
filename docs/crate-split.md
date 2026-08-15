@@ -323,6 +323,17 @@ combination resolves without a guess, including the honest failure — a NixOS h
 with LDAP/SSSD users can be served by *no* payload we could ship, and is told so
 rather than handed a binary that breaks at first attach.
 
+**And the answer outlives the release that established it.** The marker records
+which *target* won, and `decide_provision` reads that field outside its
+version gate: the deployed build is only interesting at the same version, but
+whether this host has a generic loader is a fact about the host, and a version
+bump does not repeal it. Re-running the race from gnu on every release cost a
+mainstream host nothing and cost a no-loader host a wasted upload per upgrade —
+and on the hosts-panel path, which gets **one** attempt rather than a loop, cost
+it the upgrade entirely. That path now carries the candidates it didn't choose
+(`UpgradeOffer::fallbacks`) and walks them on a refusal, so the two paths answer
+a refusal the same way.
+
 **What is embedded and what is published deliberately differ.** A release
 publishes all four targets but embeds only the gnu pair (`PUBLISHED_TARGETS` vs
 `LINUX_TARGETS` in `xtask`). musl's audience is Nix hosts, which have a better

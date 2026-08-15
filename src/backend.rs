@@ -2130,38 +2130,50 @@ fn decide_provision(
     // What is already deployed at *our* path. The four cases below are what make
     // the candidate loop terminate; the ordering among them matters more than
     // any one of them.
+    //
+    // (2) The marker names which build won here, and its *target* is read
+    // outside the version gate on purpose: the two facts it records have
+    // different lifetimes. Which build is deployed is only interesting at the
+    // same version — but which target this host can execute is a fact about the
+    // *host*, its loader and its libc, and a release does not repeal it. Reading
+    // it only at equal versions meant every version bump restarted the gnu-first
+    // race on a host that had already settled the question, which the connect
+    // loop recovers from at the cost of a wasted upload and the upgrade path —
+    // one shot, no loop — does not recover from at all.
+    //
+    // So: same target, same digest, same version is this exact build, and
+    // anything else re-deploys **that** target rather than the one we merely
+    // prefer. The dev loop and the upgrade are the same move at different
+    // versions.
+    if let Some(marker) = probe.cache_target.as_deref()
+        && let Some((t, sha)) = candidates.iter().find(|(t, _)| *t == marker)
+    {
+        if probe.cache_version.as_deref() == Some(local_version)
+            && probe.cache_sha.as_deref() == Some(*sha)
+        {
+            return Provision::UseCache;
+        }
+        return Provision::Upload {
+            target: (*t).to_string(),
+            sha256: (*sha).to_string(),
+        };
+    }
     if probe.cache_version.as_deref() == Some(local_version) {
         match probe.cache_target.as_deref() {
-            // (2) and (3): the marker names which build won here. Compare
-            // against *that* target, never against the one we merely prefer.
-            Some(target) => match candidates.iter().find(|(t, _)| *t == target) {
-                // (2) We can still supply that target: same digest means it is
-                // already this exact build; a different one is the dev loop, and
-                // re-deploys the *same* target rather than restarting the race.
-                Some((t, sha)) => {
-                    if probe.cache_sha.as_deref() == Some(*sha) {
-                        return Provision::UseCache;
-                    }
-                    return Provision::Upload {
-                        target: (*t).to_string(),
-                        sha256: (*sha).to_string(),
-                    };
-                }
-                // (3) We can no longer supply it — a released dashboard whose
-                // host runs a downloaded musl, now offline or declined. Keep it:
-                // it is the right version, and it is the binary that proved
-                // itself here. Churning it for one we merely prefer is exactly
-                // how the every-reconnect loop starts.
-                //
-                // But only when it is genuinely beyond us. A target missing from
-                // `candidates` merely because the host *just refused it* is the
-                // opposite situation: keeping the deployed copy there would
-                // strand us on a binary we have watched fail and skip every
-                // remaining candidate — on a no-loader host, exactly the musl
-                // fallback this design exists to reach.
-                None if !suppliable.contains(&target) => return Provision::UseCache,
-                None => {}
-            },
+            // (3) We can no longer supply the target the marker names — a
+            // released dashboard whose host runs a downloaded musl, now offline
+            // or declined. Keep it: it is the right version, and it is the
+            // binary that proved itself here. Churning it for one we merely
+            // prefer is exactly how the every-reconnect loop starts.
+            //
+            // But only when it is genuinely beyond us. A target missing from
+            // `candidates` merely because the host *just refused it* is the
+            // opposite situation: keeping the deployed copy there would strand
+            // us on a binary we have watched fail and skip every remaining
+            // candidate — on a no-loader host, exactly the musl fallback this
+            // design exists to reach.
+            Some(marker) if !suppliable.contains(&marker) => return Provision::UseCache,
+            Some(_) => {}
             // (4) A marker written before targets were recorded: fall back to
             // the single-candidate rule this had before the loop existed.
             None => match candidates.first() {
@@ -2219,6 +2231,16 @@ pub(crate) struct UpgradeOffer {
     /// because the upgrade runs with the backend already torn down, and it is
     /// what decides how the script spells `daemon stop`.
     pub(crate) running: RunningDaemon,
+    /// The remaining targets for this host, in preference order, to try if the
+    /// host refuses `target`.
+    ///
+    /// The connect path answers a refusal by dropping that candidate and asking
+    /// [`decide_provision`] again; the upgrade has no such loop to sit in — it
+    /// is one keystroke, one ssh, one report — so it has to carry the rest of
+    /// the list with it. Without them a host that refuses our first choice is
+    /// simply stuck on its old server, with the one payload that would have
+    /// worked still sitting in the dashboard.
+    pub(crate) fallbacks: Vec<String>,
 }
 
 /// The [`UpgradeOffer`] for a host whose daemon is already up: what
@@ -2231,6 +2253,10 @@ pub(crate) struct UpgradeOffer {
 /// first. Only an `Upload` is an offer: every other outcome comes back on the
 /// same bytes, and killing a host's sessions to redeploy what it already runs is
 /// the one result this must never produce. Pure, so it is unit-tested.
+///
+/// The candidates it did *not* choose ride along as [`UpgradeOffer::fallbacks`]
+/// — the upgrade runs once, with no loop to re-decide in, so the alternatives
+/// have to travel with the decision.
 fn upgrade_offer_for(
     local_version: &str,
     probe: &RemoteProbe,
@@ -2243,6 +2269,11 @@ fn upgrade_offer_for(
     };
     match decide_provision(local_version, &restarted, candidates, suppliable) {
         Provision::Upload { target, sha256 } => Some(UpgradeOffer {
+            fallbacks: candidates
+                .iter()
+                .map(|(t, _)| (*t).to_string())
+                .filter(|t| *t != target)
+                .collect(),
             target,
             sha256,
             version: local_version.to_string(),
@@ -2830,26 +2861,53 @@ fn terminfo_took(stdout: &str) -> bool {
 /// The digest sent is the one resolved *now*, not the one the offer was minted
 /// with: a rebuild between the two is the dev loop, and the marker has to
 /// describe what actually landed.
+///
+/// **A refusal moves to the next candidate**, the same way the connect path's
+/// loop does and for the same reason: `uname` cannot report a libc, so which
+/// payload a host can run is settled by watching it try. Everything destructive
+/// in [`upgrade_script`] sits downstream of the host's own `self-check`, so a
+/// refused candidate cost a transfer and left the daemon serving — which is what
+/// makes trying the next one safe rather than reckless. It stays safe in the
+/// other order too: a failure *after* the stop leaves the daemon down, and the
+/// next candidate's `daemon stop --force` exits 0 with nothing to stop, so the
+/// fallback is the recovery rather than a second casualty.
 pub(crate) async fn upgrade_host_server(
     target: &str,
     options: &[String],
     offer: &UpgradeOffer,
 ) -> Result<(), String> {
-    let payload = crate::server_payload::resolve_target(&offer.target).ok_or_else(|| {
-        format!(
-            "no {} server to deploy any more — the payload this offer named is gone",
-            offer.target
-        )
-    })?;
     let (extra, _forwards) = split_connection_options(options);
     let opts = ssh_common_opts(&crate::state::ssh_control_path(target), &extra);
-    upload_server(
-        target,
-        &opts,
-        &payload,
-        &upgrade_script(&payload.sha256, &payload.target, offer.running),
-    )
-    .await
+    // The preferred candidate's failure is the reported one, as on the connect
+    // path: it is the one whose refusal explains why we are on a fallback at
+    // all. The rest are logged, so a two-refusal host is still diagnosable.
+    let mut first_error: Option<String> = None;
+    for t in std::iter::once(&offer.target).chain(offer.fallbacks.iter()) {
+        let Some(payload) = crate::server_payload::resolve_target(t) else {
+            first_error.get_or_insert(format!(
+                "no {t} server to deploy any more — the payload this offer named is gone"
+            ));
+            continue;
+        };
+        match upload_server(
+            target,
+            &opts,
+            &payload,
+            &upgrade_script(&payload.sha256, &payload.target, offer.running),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    target: "captain_miao::provision",
+                    "{target}: upgrade to {t} refused: {e}"
+                );
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| format!("nothing left to deploy for {}", offer.target)))
 }
 
 /// Stream an embedded server payload to the host's cache path over the ssh
@@ -5150,6 +5208,7 @@ mod tests {
                 sha256: PAYLOAD.1.to_string(),
                 version: "0.1.0".to_string(),
                 running: RunningDaemon::InCache,
+                fallbacks: vec![],
             })
         );
 
@@ -5176,6 +5235,31 @@ mod tests {
         // however stale the host is.
         let p = running(&probe("Linux riscv64", None, Some("0.0.9")));
         assert_eq!(upgrade_offer_for("0.1.0", &p, &[], &[]), None);
+    }
+
+    #[test]
+    fn an_upgrade_carries_the_candidates_it_did_not_choose() {
+        // The upgrade is one keystroke, one ssh, one report — there is no loop
+        // for it to re-decide in the way the connect path does, so a host that
+        // refuses our first choice would simply stay on its old server with the
+        // payload that works still sitting here. The alternatives travel with
+        // the offer instead.
+        let mut p = probe("Linux x86_64", None, None);
+        p.running = Some(RunningDaemon::InCache);
+        let offer = upgrade_offer_for("0.1.0", &p, &[GNU, MUSL], BOTH_TARGETS).expect("an offer");
+        assert_eq!(offer.target, GNU.0);
+        assert_eq!(offer.fallbacks, vec![MUSL.0.to_string()]);
+
+        // Whatever was chosen is not also a fallback — including when the marker
+        // moved the choice off the head of the list.
+        let mut nixos = probe("Linux x86_64", None, Some("0.0.9"));
+        nixos.running = Some(RunningDaemon::InCache);
+        nixos.cache_target = Some(MUSL.0.into());
+        nixos.cache_sha = Some("the-musl-we-deployed".into());
+        let offer =
+            upgrade_offer_for("0.1.0", &nixos, &[GNU, MUSL], BOTH_TARGETS).expect("an offer");
+        assert_eq!(offer.target, MUSL.0);
+        assert_eq!(offer.fallbacks, vec![GNU.0.to_string()]);
     }
 
     #[test]
@@ -5377,13 +5461,29 @@ mod tests {
             upload_of(GNU)
         );
 
-        // (1) A version mismatch runs the loop regardless of what the marker
-        // says: stickiness is about *which* build, not about keeping a stale one.
+        // A version mismatch upgrades — but to the target the marker names, not
+        // to the one at the head of our preference list. The old binary is
+        // stale; the *host's verdict on which target it can execute* is not, and
+        // a release does not repeal a fact about the host's loader.
+        //
+        // This is the polaris case: a NixOS host settled on musl, the dashboard
+        // moved 0.3.0 → 0.4.0, and re-running the race from gnu offered it a
+        // binary it had already proved it cannot start. On the connect path that
+        // costs a wasted 4.8MB upload before the loop recovers; on the upgrade
+        // path — one shot — it was the whole outcome.
         let mut old = probe("Linux x86_64", None, Some("0.0.9"));
         old.cache_sha = Some(MUSL.1.into());
         old.cache_target = Some(MUSL.0.into());
         assert_eq!(
             decide_provision("0.1.0", &old, &both, BOTH_TARGETS),
+            upload_of(MUSL)
+        );
+
+        // Stickiness is not a licence to strand: a marker target we can no
+        // longer supply at all still restarts the race rather than keeping a
+        // binary of the wrong version.
+        assert_eq!(
+            decide_provision("0.1.0", &old, &[GNU], &[GNU.0]),
             upload_of(GNU)
         );
     }

@@ -376,7 +376,11 @@ GetVitals{req_id}                      Vitals{req_id, vitals}
     split at its `mv`, with `daemon stop --force` inserted between the halves
     under one `set -e` — so the host has run the new binary (`self-check`) and
     agreed its version before anything is ended. A payload it refuses costs a
-    transfer and nothing else.
+    transfer and nothing else — and is followed by the next candidate, since
+    the offer carries the ones it didn't choose (`UpgradeOffer::fallbacks`).
+    Without that, the upgrade was the one provisioning path with no answer to a
+    refusal: a single ssh, a single report, and a no-loader host left on its old
+    server with the payload that works still sitting in the dashboard.
   * **Publishing follows the stop**, not merely accompanies it. `mv`-ing onto a
     live daemon's own path leaves its `/proc/<pid>/exe` reading `(deleted)`,
     and the launcher argv it bakes into reservations comes from `current_exe()`
