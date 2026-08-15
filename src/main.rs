@@ -373,6 +373,16 @@ async fn async_main(cli: Cli) -> Result<()> {
                         terminal::get().focus_window(&dwid).await
                     }
                 }
+                // Running, but it never recorded a window — its backend could
+                // not name the one it sits in. The bell above is the whole of
+                // what this command can do, and that is worth saying plainly:
+                // reporting a live dashboard as absent would send the user
+                // looking for one to start, and clearing the sentinels below
+                // would throw away a pid that is still true.
+                (true, None) => {
+                    eprintln!("Dashboard is running but has no known window; not focusing");
+                    Ok(())
+                }
                 _ => {
                     let _ = std::fs::remove_file(state::dashboard_window_id_path());
                     let _ = std::fs::remove_file(state::dashboard_pid_path());
