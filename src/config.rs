@@ -225,10 +225,17 @@ pub struct UiColors {
     /// The session table's cursor marker. Its **display width is the gutter
     /// width** — ratatui reserves exactly `highlight_symbol.width()` and carves
     /// that area out before the spaced column layout runs, so `column_spacing`
-    /// never applies between it and the first column. A trailing space here is
-    /// therefore not padding but a second reserved cell on every row; the
-    /// default omits one and lets the override column's own right-alignment
-    /// supply the gap.
+    /// never applies between it and the first column. Whatever follows the
+    /// symbol is painted right up against it.
+    ///
+    /// The trailing space in the default is therefore **overhang room, not
+    /// padding**. `override_indicator_spans` can hold the glyph set it does
+    /// because every one of them paints within its measured width; this field is
+    /// open config, so the symbol is the one glyph in that gutter no invariant
+    /// can reach. `❯` U+276F measures 1 and many fonts draw it wider, and
+    /// without the space the next cell's glyph overpaints its point — leaving a
+    /// cursor that no longer reads as pointing at anything. One reserved cell
+    /// buys immunity to that for any symbol a user picks.
     pub selection_symbol: String,
 }
 
@@ -241,7 +248,7 @@ impl Default for UiColors {
             error_fg: Color::Red,
             highlight_bg: Color::DarkGray,
             selection_fg: Color::Blue,
-            selection_symbol: "\u{276F}".to_string(),
+            selection_symbol: "\u{276F} ".to_string(),
         }
     }
 }

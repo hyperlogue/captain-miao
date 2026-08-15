@@ -333,7 +333,8 @@ attention_fg = "yellow"
 error_fg = "red"
 highlight_bg = "dark_gray"
 selection_fg = "blue"
-selection_symbol = "❯"          # its display width is the cursor gutter's width
+selection_symbol = "❯ "         # display width = cursor gutter width; keep the
+                                # trailing cell unless the glyph paints within one
 
 [colors.picker]
 highlight_bg = "dark_gray"
