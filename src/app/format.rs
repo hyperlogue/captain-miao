@@ -484,17 +484,27 @@ pub(crate) enum Detached {
     HeldElsewhere,
 }
 
-/// Width of the override indicator: the 1-cell follow-up dot plus one 2-cell
-/// emoji slot for the secondary. It is the *indent* on the status column rather
-/// than a column of its own — see [`override_indicator_spans`] for why — so the
-/// status column's constraint is this plus the widest status label.
-pub(super) const OVERRIDE_COL_WIDTH: u16 = 3;
+/// The secondary indicator's slot: one emoji, 2 cells.
+const SECONDARY_SLOT_WIDTH: u16 = 2;
+
+/// Width of the override indicator: the secondary's emoji slot plus the 1-cell
+/// follow-up slot after it. It is the *indent* on the status column rather than a
+/// column of its own — see [`override_indicator_spans`] for why — so the status
+/// column's constraint is this plus the widest status label.
+pub(super) const OVERRIDE_COL_WIDTH: u16 = SECONDARY_SLOT_WIDTH + 1;
 
 /// The override indicator, as the leading spans of the **status** cell: always
-/// exactly [`OVERRIDE_COL_WIDTH`] cells, blank-padded on the left so the glyphs
-/// sit right against the status label. The follow-up dot sits on the left and a
-/// secondary indicator (pin or detached) sits on the right; without a dot, the
-/// secondary occupies the left position alone.
+/// exactly [`OVERRIDE_COL_WIDTH`] cells.
+///
+/// Two *fixed slots*, not a right-packed run: the secondary indicator (pin or
+/// detached) right-aligned in its emoji slot, then the follow-up dot in the
+/// single cell before the status label. The dot's cell doubles as the gap — blank
+/// when there is no follow-up — which is why the order is this way round. Packed
+/// the other way the label's neighbour changed with the flags: a lone dot sat
+/// flush against the label while a 2-cell emoji appeared to keep a gap (really
+/// just the cell its glyph paints over), so the same column looked inconsistently
+/// spaced row to row. Fixed slots give every row the same skyline, and the label
+/// starts at the same offset whatever is set.
 ///
 /// Why it rides *inside* the status cell instead of getting a column: ratatui's
 /// `column_spacing` is one table-wide value, so a column of its own can only be
@@ -508,9 +518,10 @@ pub(super) const OVERRIDE_COL_WIDTH: u16 = 3;
 /// — the return value *is* the width the layout reserves, so the two can't drift.
 ///
 /// Layout note: the invariant is **measured width == painted width**, not "emoji
-/// only". The dot and the secondary pack tight (`[pad][L][R][R]`) with no
-/// separator between them, so any glyph whose paint disagrees with
-/// `unicode-width` shifts everything after it.
+/// only". The slots pack tight (`[pad][S][S][dot]`) with no separator between
+/// them, so any glyph whose paint disagrees with `unicode-width` is overpainted
+/// by its neighbour — which is exactly what the configurable
+/// `ui.selection_symbol` runs into, and why its default keeps a trailing cell.
 /// That is what the Nerd Font PUA glyphs this column used to carry got wrong:
 /// they measure 1 and paint 2, so ratatui's diff never skipped the following
 /// cell and a neighbouring column's update clipped the glyph's right half —
@@ -564,17 +575,16 @@ pub(super) fn override_indicator_spans(
         }
     };
 
-    let glyphs = match (follow_up, secondary) {
-        (true, Some(s)) => vec![dot, s],
-        (true, None) => vec![dot],
-        (false, Some(s)) => vec![s],
-        (false, None) => Vec::new(),
-    };
-    let used: usize = glyphs.iter().map(|s| s.content.width()).sum();
+    // Slot one: the secondary, right-aligned so a narrower replacement glyph
+    // still sits against the follow-up slot rather than drifting left.
+    let used = secondary.as_ref().map_or(0, |s| s.content.width());
     let mut spans = vec![Span::raw(
-        " ".repeat((OVERRIDE_COL_WIDTH as usize).saturating_sub(used)),
+        " ".repeat((SECONDARY_SLOT_WIDTH as usize).saturating_sub(used)),
     )];
-    spans.extend(glyphs);
+    spans.extend(secondary);
+    // Slot two: the follow-up dot, or the blank that separates the secondary
+    // from the status label when there is no follow-up.
+    spans.push(if follow_up { dot } else { Span::raw(" ") });
     spans
 }
 

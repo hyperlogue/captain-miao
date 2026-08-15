@@ -6316,8 +6316,10 @@ fn override_glyphs_measure_what_they_paint() {
         "the cell the glyph paints over must stay blank"
     );
 
-    // Both slots drew, packed tight and in order: dot immediately left of the
-    // secondary. A clipped dot is the failure this pins.
+    // Both slots drew, packed tight and in order: the dot sits in the cell
+    // *after* the secondary's two — the one that is blank when nothing is
+    // flagged, so the status label's neighbour never moves. A clipped dot, or a
+    // dot back on the far side of the emoji, is what this pins.
     let dot_hits = cells_of(dot);
     assert_eq!(
         dot_hits.len(),
@@ -6326,8 +6328,8 @@ fn override_glyphs_measure_what_they_paint() {
     );
     assert_eq!(
         dot_hits[0],
-        (x - 1, y),
-        "the dot must pack tight against the secondary, no separator"
+        (x + 2, y),
+        "the dot must follow the secondary's slot with no separator"
     );
 }
 
