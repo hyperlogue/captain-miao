@@ -1120,6 +1120,45 @@ fn tag_contents<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 // Launcher: process spawn + hooks settings
 // =============================================================================
 
+/// The variables a *running* Claude Code session exports to its own
+/// subprocesses — every one of them a fact about that session, none of them
+/// true of a new one.
+///
+/// They reach us because a terminal hands its own environment to every command
+/// it runs, and a terminal is routinely started from a shell: an emulator (or a
+/// tmux/zellij server) launched from inside an agent session carries that
+/// session's variables into every window the dashboard later opens in it. The
+/// same inheritance `wrap_env` re-points `PATH` for, one variable further.
+///
+/// The visible cost is the marker Claude Code checks first:
+/// `CLAUDE_CODE_CHILD_SESSION` says "you are a subagent of a session that is
+/// already recording", so an inherited one turns transcript saving **off** and
+/// the new session says so on its first screen. That is also *our* loss — this
+/// backend folds that transcript for status, title and context tokens, and
+/// treats the session file as authoritative — so a spawned session with no
+/// transcript is a row that never fills in. The rest name the parent's identity
+/// and its IPC channel, which a second session must never speak on.
+///
+/// Deliberately narrow: only variables scoped to one session's *run*. The
+/// user's own settings (`CLAUDE_CONFIG_DIR`, effort, feature flags) are theirs
+/// and are inherited on purpose. Other backends have no equivalent measured
+/// yet; one that turns out to leak the same way adds its own list beside this.
+const PARENT_SESSION_ENV: [&str; 5] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+];
+
+/// Drop [`PARENT_SESSION_ENV`] from a launch, so the session starts as its own
+/// rather than as a continuation of whatever launched the terminal.
+fn clear_parent_session_env(cmd: &mut Command) {
+    for key in PARENT_SESSION_ENV {
+        cmd.env_remove(key);
+    }
+}
+
 pub fn build_launch_command(
     cwd: &str,
     _sock_path: &Path,
@@ -1128,6 +1167,7 @@ pub fn build_launch_command(
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
+    clear_parent_session_env(&mut cmd);
     cmd.env("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
     cmd.arg("--settings").arg(settings_path);
     cmd.args(extra_args);
@@ -1452,6 +1492,40 @@ mod tests {
 
         // No home and no override: nothing to read.
         assert_eq!(resolve_claude_home(None, None), None);
+    }
+
+    /// A dashboard-spawned session must start as its own, not as a subagent of
+    /// whatever launched the terminal — and must keep the user's settings while
+    /// doing it. Asserted on the `Command` rather than through
+    /// `build_launch_command`, which needs `claude` on `PATH`.
+    #[test]
+    fn a_spawned_session_sheds_the_launching_sessions_env() {
+        let mut cmd = Command::new("/bin/sh");
+        clear_parent_session_env(&mut cmd);
+        let cleared: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+
+        // The marker that turns transcript saving off, and with it the fold this
+        // backend reads for status, title and context tokens.
+        assert!(
+            cleared.iter().any(|k| k == "CLAUDE_CODE_CHILD_SESSION"),
+            "cleared: {cleared:?}"
+        );
+        assert_eq!(cleared.len(), PARENT_SESSION_ENV.len(), "{cleared:?}");
+
+        // Settings are the user's, not one session's run — clearing
+        // `CLAUDE_CONFIG_DIR` in particular would point the agent at a different
+        // tree than the one `resolve_claude_home` above reads.
+        for keep in ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT"] {
+            assert!(
+                !cleared.iter().any(|k| k == keep),
+                "{keep} is the user's, not the launching session's"
+            );
+        }
     }
 
     fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {

@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Claude session started from the dashboard no longer inherits the
+  launching session's own environment.** A terminal hands its environment to
+  everything it runs, so an emulator (or a tmux/zellij server) that was itself
+  started from inside an agent session exported that session's variables into
+  every window the dashboard opened in it. Claude Code read the inherited
+  `CLAUDE_CODE_CHILD_SESSION` marker as "already being recorded elsewhere" and
+  turned transcript saving off — which also cost captain-miao the transcript it
+  folds for status, title and context tokens, so the row never filled in. The
+  five variables scoped to one session's run are now cleared at launch; the
+  user's own settings are inherited as before.
 - **Ghostty could not launch a session at all.** Two independent faults, both
   found by driving a real Ghostty 1.3.1 for the first time. The command was sent
   with the `shell:` prefix Ghostty's *config file* accepts, but the AppleScript
