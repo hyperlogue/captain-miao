@@ -1307,19 +1307,23 @@ impl App {
     /// hands the freed width back to the elastic last-prompt column.
     ///
     /// An icon rather than a name because it's a glance-level "which box is
-    /// this?", and a name either truncates to noise or eats six cells. The
-    /// foreign case loses its `kitty`/`zellij` wording in the trade — the row is
-    /// already dimmed, and the detail panel names the instance in full. `None`
-    /// for a row on this machine with nothing unusual about it. Drives both the
+    /// this?", and a name either truncates to noise or eats six cells. `None`
+    /// for a row on this machine, which is the common case. Drives both the
     /// column width and the cell so the two can't disagree.
-    fn host_icon_cell(&self, s: &LauncherState) -> Option<(String, bool)> {
-        if self.foreign_terminal(s).is_some() {
-            return Some((FOREIGN_TERMINAL_GLYPH.to_string(), true));
-        }
+    ///
+    /// A row living in **another terminal instance** used to get a glyph of its
+    /// own here. It was dropped: running two dashboards in two terminals at once
+    /// is rare enough not to earn a permanent slot in every row's icon column,
+    /// and it was paying for that rarity twice over — the glyph was the one
+    /// non-emoji in a column of emoji (`U+29C9` ⧉, from a Unicode block
+    /// monospace fonts routinely skip), so on Ghostty it drew as a missing-glyph
+    /// box next to every session. The state still reads: the row is dimmed, and
+    /// the detail panel names the instance it lives in.
+    fn host_icon_cell(&self, s: &LauncherState) -> Option<String> {
         if self.runs_on_this_machine(s) {
             return None;
         }
-        Some((self.host_icon(&s.host), false))
+        Some(self.host_icon(&s.host))
     }
 
     fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
@@ -1434,9 +1438,8 @@ impl App {
             .collect();
         // The host glyphs share that column (see `host_icon_cell`). Both halves
         // are fixed slots, so a row with no host glyph reserves one anyway and
-        // nothing to the right of the column moves when hosts connect or a
-        // foreign row appears.
-        let host_icons: Vec<Option<(String, bool)>> = if show_host {
+        // nothing to the right of the column moves when hosts connect.
+        let host_icons: Vec<Option<String>> = if show_host {
             visible.iter().map(|s| self.host_icon_cell(s)).collect()
         } else {
             Vec::new()
@@ -1463,8 +1466,10 @@ impl App {
                 let important = flags.pinned;
                 let follow_up = flags.follow_up;
                 // A row that lives in another terminal instance is visible but
-                // window-inert (D6) — dimmed, and flagged with
-                // `FOREIGN_TERMINAL_GLYPH` in the icon column's host half.
+                // window-inert (D6). Dimming is the whole of the signal now —
+                // it carried a glyph in the icon column's host half too, which
+                // `host_icon_cell` records the removal of — with the detail
+                // panel naming the instance for the row you are actually on.
                 let foreign = self.foreign_terminal(s).is_some();
                 // Running on its host with no window on this screen (§9). It
                 // already sinks to its own sort tier; dimming says the same
@@ -1506,15 +1511,10 @@ impl App {
                 let mut icon_spans: Vec<Span<'static>> = Vec::new();
                 if show_host {
                     let host_glyph = host_icons.get(row_idx).and_then(|o| o.as_ref());
-                    let glyph_w = host_glyph.map_or(0, |(g, _)| dir_icon_width(g));
+                    let glyph_w = host_glyph.map_or(0, |g| dir_icon_width(g));
                     icon_spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - glyph_w)));
-                    if let Some((glyph, foreign)) = host_glyph {
-                        let style = if *foreign {
-                            Style::default().add_modifier(Modifier::DIM)
-                        } else {
-                            Style::default()
-                        };
-                        icon_spans.push(Span::styled(glyph.clone(), style));
+                    if let Some(glyph) = host_glyph {
+                        icon_spans.push(Span::raw(glyph.clone()));
                     }
                 }
                 let icon_w = dir_icon_width(&icon);
@@ -2177,14 +2177,6 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style()), area);
     }
 }
-
-/// Stands in for a host emoji on a local row that lives in **another terminal
-/// instance** — window-inert here, so it reads as "elsewhere" rather than as a
-/// machine. One dim glyph, since the row is already dimmed and the detail panel
-/// names the instance in full; the `kitty`/`zellij` wording it replaced needed a
-/// column of its own, which is exactly what merging into the icon column gave
-/// up.
-const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
 
 /// One form field's spans, with the cursor drawn where it actually is.
 ///

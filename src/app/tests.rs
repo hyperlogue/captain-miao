@@ -1048,8 +1048,14 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
 /// The host glyph shares the workdir-icon column rather than holding a Host
 /// column of its own — `<host><workdir>`, and no `Host` header anywhere. Both
 /// halves are fixed slots, so the column is the same width whether or not a row
-/// has a host glyph: nothing to its right may move as hosts connect or foreign
-/// rows scroll into view.
+/// has a host glyph: nothing to its right may move as hosts connect.
+///
+/// A row in **another terminal instance** claims no host slot of its own. It
+/// used to, and that glyph is gone: two dashboards in two terminals at once is
+/// rare, and paying for it in every row's icon column cost more than it said —
+/// the more so because the glyph was the column's one non-emoji and drew as a
+/// missing-glyph box on Ghostty. Dimming and the detail panel carry the state
+/// now, so this pins that the slot is left blank exactly like a local row's.
 #[test]
 fn the_host_glyph_shares_the_workdir_icon_column() {
     let mut d = TestDashboard::new(140, 12);
@@ -1064,10 +1070,8 @@ fn the_host_glyph_shares_the_workdir_icon_column() {
         !out.contains("Host"),
         "the Host column should be gone:\n{out}"
     );
-    // The foreign row wears the "lives elsewhere" glyph in the host slot; the
-    // same-terminal row leaves that slot blank. No divider between the halves.
-    // Everything left of the name is the row's icon cell — the detail panel's
-    // own border lives well to the right of it.
+    // No divider between the halves. Everything left of the name is the row's
+    // icon cell — the detail panel's own border lives well to the right of it.
     use unicode_width::UnicodeWidthStr;
     let icons = |name: &str| {
         let line = out
@@ -1077,8 +1081,21 @@ fn the_host_glyph_shares_the_workdir_icon_column() {
         line.split(name).next().unwrap().to_string()
     };
     let foreign_icons = icons("session-1");
-    assert!(foreign_icons.contains('\u{29C9}'), "{foreign_icons:?}");
     let plain_icons = icons("session-2");
+    // Both rows are on this machine, so both leave the host slot blank: the
+    // only glyph in either icon cell is its own workdir mark. Counted rather
+    // than compared verbatim, since the two rows differ by the cursor and by
+    // which mark their cwd hashes to.
+    for (label, cell) in [("foreign", &foreign_icons), ("local", &plain_icons)] {
+        let glyphs = cell
+            .split("Idle")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no status on the {label} row:\n{out}"))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .count();
+        assert_eq!(glyphs, 1, "the {label} row's icon cell:\n{out}");
+    }
     for cell in [&foreign_icons, &plain_icons] {
         assert!(
             !cell.contains('\u{2502}'),

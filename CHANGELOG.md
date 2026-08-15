@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A session running in another terminal instance no longer gets a glyph in the
+  icon column.** Two dashboards in two terminals at once is rare enough not to
+  earn a slot in every row, and the marker was the column's one non-emoji
+  (`U+29C9` ⧉) — a character monospace fonts routinely skip, so on Ghostty it
+  drew as a missing-glyph box beside every session. The row still dims, and both
+  the preview and the detail panel name the instance it lives in.
 - **A hand-typed `miao <agent>` in a bare Ghostty window is refused**, naming
   `o` / `O` instead. Ghostty exports no per-surface id, so such a session can
   never be bound to its window: it would list in the dashboard but neither

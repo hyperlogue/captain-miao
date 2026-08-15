@@ -1160,14 +1160,18 @@ decides what they mean**.
   `<host><workdir>`, the two glyphs adjacent — because both answer "where is
   this?" and read better as one glyph pair than as two columns a table apart;
   the freed width goes to the elastic last-prompt column. A local row that lives
-  in another terminal instance takes `⧉` in the host half (the row is already
-  dimmed, and the detail panel names the instance in full).
+  in another terminal instance claims no host half: it took `⧉` there until that
+  glyph was dropped, because running two dashboards in two terminals at once is
+  rare enough not to earn a slot in every row — and because `⧉` was the column's
+  one non-emoji, from a Unicode block monospace fonts routinely skip, so Ghostty
+  drew a missing-glyph box beside every session. The state still reads three
+  ways without it: the row is dimmed, the preview names the instance, and so
+  does the detail panel.
 
   Its half of the column is **reserved by the layout, not by the content**: the
-  wide layout always holds it, whether or not any host is federated and whether
-  or not any row is foreign. Showing it only when something needed it made the
-  column — and every column right of it — move the moment a host connected or a
-  foreign row scrolled into view. Both halves are a fixed `ICON_SLOT_WIDTH`, and
+  wide layout always holds it, whether or not any host is federated. Showing it
+  only when something needed it made the column — and every column right of it —
+  move the moment a host connected. Both halves are a fixed `ICON_SLOT_WIDTH`, and
   that same constant is the cap the icon editors enforce, so a legal icon always
   fits the column it is drawn in.
   A host carries no configurable **colour**: it said the same thing the emoji
