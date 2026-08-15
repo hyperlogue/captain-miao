@@ -402,7 +402,7 @@ const BIN_FALLBACK: &str = "miao";
 /// The plugin module, as source. Pure and parameterized on the `miao` path so
 /// the snapshot test can pin every other byte of it.
 ///
-/// Three properties this file has to hold, none of which a JS test could check
+/// Four properties this file has to hold, none of which a JS test could check
 /// here (this tree has no JS toolchain, and executing generated JavaScript is
 /// not something a `cargo test` should start doing):
 ///
@@ -418,6 +418,13 @@ const BIN_FALLBACK: &str = "miao";
 /// - **it needs no shell quoting.** The argv is an array, so no metacharacter
 ///   in the `miao` path can word-split or inject. The path is embedded as a
 ///   JSON string literal, which is also a valid JS one.
+/// - **events arrive in order.** Every handler returns `send`'s promise, which
+///   settles when the child exits — so an opencode that awaits its hooks
+///   cannot deliver a turn's `session.idle` ahead of its last
+///   `tool.execute.after`, whose `PostToolUse` would re-mark the settled row
+///   working until the next prompt. An opencode that does *not* await loses
+///   nothing: the promise simply goes unobserved. The same shape as
+///   `agents::pi`'s forwarder, for the same reason.
 ///
 /// The export is emitted **twice**, named and default, because §9 states that a
 /// plugin "export[s] a function" without saying under which convention. Both
@@ -467,6 +474,9 @@ const BUS = {{
 
 const CaptainMiao = async (ctx) => {{
   const directory = ctx?.directory ?? null;
+  // The returned promise settles when the child exits, so an opencode that
+  // awaits its hooks delivers these events in the order it fired them; one
+  // that does not await loses nothing. It never rejects.
   const send = (event, args) => {{
     let body;
     try {{
@@ -474,23 +484,26 @@ const CaptainMiao = async (ctx) => {{
     }} catch {{
       body = JSON.stringify({{ event, directory }});
     }}
-    let child;
-    try {{
-      child = spawn(MIAO, ["hook", "--agent", "opencode", event], {{
-        stdio: ["pipe", "ignore", "ignore"],
-      }});
-    }} catch {{
-      return;
-    }}
-    child.on("error", () => {{}});
-    child.stdin.on("error", () => {{}});
-    child.stdin.end(body);
+    return new Promise((resolve) => {{
+      let child;
+      try {{
+        child = spawn(MIAO, ["hook", "--agent", "opencode", event], {{
+          stdio: ["pipe", "ignore", "ignore"],
+        }});
+      }} catch {{
+        resolve();
+        return;
+      }}
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+      child.stdin.on("error", () => {{}});
+      child.stdin.end(body);
+    }});
   }};
   const report =
     (event) =>
-    async (...args) => {{
+    (...args) =>
       send(event, args);
-    }};
 
   return {{
     event: async (input) => {{
@@ -500,7 +513,7 @@ const CaptainMiao = async (ctx) => {{
       // Authoritative but coarser than the dashboard's states, so only the
       // settle edge is taken: a session waiting on an approval is "busy" too.
       if (type === "session.status") {{
-        if (e.properties?.status?.type === "idle") send("stop", [input]);
+        if (e.properties?.status?.type === "idle") return send("stop", [input]);
         return;
       }}
       // Once per assistant turn, not once per streamed chunk. This is the
@@ -508,11 +521,10 @@ const CaptainMiao = async (ctx) => {{
       if (type === "message.updated") {{
         const info = e.properties?.info;
         if (info?.role !== "assistant" || !info?.time?.completed) return;
-        send("cwd-changed", [input]);
-        return;
+        return send("cwd-changed", [input]);
       }}
       const name = BUS[type];
-      if (name) send(name, [input]);
+      if (name) return send(name, [input]);
     }},
 {handlers}  }};
 }};
@@ -1229,6 +1241,9 @@ const BUS = {
 
 const CaptainMiao = async (ctx) => {
   const directory = ctx?.directory ?? null;
+  // The returned promise settles when the child exits, so an opencode that
+  // awaits its hooks delivers these events in the order it fired them; one
+  // that does not await loses nothing. It never rejects.
   const send = (event, args) => {
     let body;
     try {
@@ -1236,23 +1251,26 @@ const CaptainMiao = async (ctx) => {
     } catch {
       body = JSON.stringify({ event, directory });
     }
-    let child;
-    try {
-      child = spawn(MIAO, ["hook", "--agent", "opencode", event], {
-        stdio: ["pipe", "ignore", "ignore"],
-      });
-    } catch {
-      return;
-    }
-    child.on("error", () => {});
-    child.stdin.on("error", () => {});
-    child.stdin.end(body);
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn(MIAO, ["hook", "--agent", "opencode", event], {
+          stdio: ["pipe", "ignore", "ignore"],
+        });
+      } catch {
+        resolve();
+        return;
+      }
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+      child.stdin.on("error", () => {});
+      child.stdin.end(body);
+    });
   };
   const report =
     (event) =>
-    async (...args) => {
+    (...args) =>
       send(event, args);
-    };
 
   return {
     event: async (input) => {
@@ -1262,7 +1280,7 @@ const CaptainMiao = async (ctx) => {
       // Authoritative but coarser than the dashboard's states, so only the
       // settle edge is taken: a session waiting on an approval is "busy" too.
       if (type === "session.status") {
-        if (e.properties?.status?.type === "idle") send("stop", [input]);
+        if (e.properties?.status?.type === "idle") return send("stop", [input]);
         return;
       }
       // Once per assistant turn, not once per streamed chunk. This is the
@@ -1270,11 +1288,10 @@ const CaptainMiao = async (ctx) => {
       if (type === "message.updated") {
         const info = e.properties?.info;
         if (info?.role !== "assistant" || !info?.time?.completed) return;
-        send("cwd-changed", [input]);
-        return;
+        return send("cwd-changed", [input]);
       }
       const name = BUS[type];
-      if (name) send(name, [input]);
+      if (name) return send(name, [input]);
     },
     "chat.message": report("prompt-submit"),
     "tool.execute.before": report("pre-tool-use"),
