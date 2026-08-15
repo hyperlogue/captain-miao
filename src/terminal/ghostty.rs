@@ -1,10 +1,8 @@
 //! Ghostty backend (macOS only): wraps Ghostty's AppleScript dictionary.
 //!
-//! Transport is one `osascript` subprocess per call, with the script fed on
-//! **stdin** rather than `-e` — the snapshot script is a dozen lines and
-//! `osascript -` takes it whole, so there is no per-line argv assembly to get
-//! wrong. Requires Ghostty ≥ 1.3, which is where the scripting dictionary
-//! landed; older builds expose nothing at all and fail
+//! Transport, quoting and the probe shape are [`super::applescript`]'s; what is
+//! here is what is Ghostty's. Requires Ghostty ≥ 1.3, which is where the
+//! scripting dictionary landed; older builds expose nothing at all and fail
 //! [`verify_control`](Terminal::verify_control) with a message saying so.
 //!
 //! Vocabulary. Ghostty's object model is `application > window > tab >
@@ -93,45 +91,18 @@
 //!   and resolves every spawn to `NewTab` — tmux's shape.
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 
+use super::applescript::{
+    CONTROL_PROBE_TIMEOUT, ProbeOutcome, SEP, SEP_PREAMBLE, applescript_string, osascript,
+    shell_quote,
+};
 use super::{
     Capabilities, SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget,
     Terminal, WindowId,
 };
-
-/// How long [`verify_control`](Terminal::verify_control)'s probe waits before
-/// declaring the channel unusable.
-///
-/// Generous, because the failure it guards is *user-paced*: the first Apple event
-/// captain-miao sends makes macOS put up an Automation (TCC) consent dialog, and
-/// `osascript` blocks on it until someone clicks. Timing that out at a few
-/// seconds would fail the startup check on the one run where the user is being
-/// asked to make it work. Ghostty's own answer, once permitted, is a single
-/// Apple event.
-const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Field separator inside a [`snapshot`](Terminal::snapshot) line. Free text (a
-/// tab title) always comes last, so a title containing this can't shift the id
-/// fields — the discipline tmux's `SNAPSHOT_FORMAT` follows for the same reason.
-const SEP: char = '\u{1f}';
-
-/// The preamble every multi-value script carries: bind the separator to a
-/// variable *before* the `tell` block, then concatenate `sep` rather than a
-/// literal.
-///
-/// Two reasons it can't be written inline. AppleScript string literals have no
-/// `\x` escape — only `\n`, `\t`, `\r`, `\"` and `\\` — so U+001F cannot be
-/// spelled in one at all. And the obvious readable alternative, AppleScript's
-/// built-in `tab` constant, is precisely the wrong word here: inside
-/// `tell application "Ghostty"` the term `tab` resolves against Ghostty's own
-/// dictionary, where it names a *class*. Binding outside the block sidesteps
-/// both.
-const SEP_PREAMBLE: &str = "set sep to character id 31\nset lf to character id 10\n";
 
 /// How long [`GhosttyTerminal::resolve_own_surface`] waits for the title it just
 /// wrote to reach Ghostty's model, as `(tries, seconds between)` — the two halves
@@ -314,32 +285,6 @@ fn own_tty() -> Option<String> {
     None
 }
 
-/// Quote `s` as an AppleScript string literal, escaping the two characters that
-/// can end or continue one (`"` and `\`) and dropping the two that cannot appear
-/// in one at all (CR and LF — AppleScript has no multi-line literal, so a raw
-/// newline is a syntax error rather than a quoted character).
-///
-/// Every value captain-miao splices into a script goes through here or through
-/// [`script_id`]. The values are not hostile by nature — a cwd, a tab title, a
-/// tty — but they are user text reaching a *parser*, and an unescaped quote
-/// would at best fail the call and at worst change what the script says.
-fn applescript_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' | '\\' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '\n' | '\r' => {}
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Validate an id before it is interpolated into a script, failing closed.
 ///
 /// Ghostty mints three shapes — a surface UUID, `tab-<hex>`, and
@@ -360,44 +305,7 @@ fn script_id(id: &str) -> Result<&str> {
     }
 }
 
-/// Run `script` through `osascript`, returning its stdout.
-async fn osascript(script: &str) -> Result<String> {
-    let mut child = Command::new("osascript")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("Failed to run osascript")?;
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut stdin = child.stdin.take().context("osascript stdin unavailable")?;
-        stdin.write_all(script.as_bytes()).await?;
-        stdin.shutdown().await?;
-    }
-    let out = child.wait_with_output().await?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "osascript failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 // ---- startup control check ----
-
-/// What the startup control probe observed. Split from the probe so the
-/// user-facing diagnosis is a pure function of the outcome — testable without a
-/// mis-permissioned Mac to reproduce against (the shape kitty's `diagnose` uses).
-#[derive(Debug, Clone, Copy)]
-enum ProbeOutcome<'a> {
-    /// The probe went out but nothing came back inside [`CONTROL_PROBE_TIMEOUT`].
-    TimedOut,
-    /// `osascript` ran and failed, with this error text.
-    Failed { err: &'a str },
-}
 
 /// Turn a failed probe into an actionable message. The dashboard prints this and
 /// exits, so it is the user's one chance to be told which of the three quite
@@ -660,20 +568,6 @@ fn spawn_script(spec: &SpawnSpec) -> Result<String> {
     ))
 }
 
-/// Quote one argv element for `/bin/sh`. Single-quote wrapping, with the one
-/// escape a single-quoted shell word admits (`'` → `'\''`), so the result is
-/// safe for any byte sequence a path or a flag can hold.
-fn shell_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-./:=@,+".contains(&b))
-    {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
 #[async_trait]
 impl Terminal for GhosttyTerminal {
     fn current_window(&self) -> Option<WindowId> {
@@ -857,16 +751,6 @@ mod tests {
         assert!(script_id("tab 1").is_err());
         assert!(script_id("tab-1\nclose window 1").is_err());
         assert!(script_id(&"a".repeat(129)).is_err());
-    }
-
-    #[test]
-    fn applescript_strings_close_over_their_own_content() {
-        assert_eq!(applescript_string("plain"), "\"plain\"");
-        assert_eq!(applescript_string("say \"hi\""), "\"say \\\"hi\\\"\"");
-        assert_eq!(applescript_string("back\\slash"), "\"back\\\\slash\"");
-        // AppleScript has no multi-line literal, so a newline is dropped rather
-        // than escaped — it would otherwise end the statement mid-string.
-        assert_eq!(applescript_string("a\nb\r\nc"), "\"abc\"");
     }
 
     /// The separator has to be *bound*, never written into a literal.
@@ -1090,16 +974,6 @@ mod tests {
         // went out to the tty verbatim, or the lookup asks for a name no surface
         // wears.
         assert_eq!(applescript_string(&nonce), format!("\"{nonce}\""));
-    }
-
-    #[test]
-    fn shell_quoting_survives_a_quote_of_its_own() {
-        assert_eq!(shell_quote("plain"), "plain");
-        assert_eq!(shell_quote("/home/miao/a-b_c.d"), "/home/miao/a-b_c.d");
-        assert_eq!(shell_quote("two words"), "'two words'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, ConfiguredBackend};
 
+mod applescript;
 pub mod ghostty;
 pub mod graphics;
 pub mod kitty;
