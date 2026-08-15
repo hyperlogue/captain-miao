@@ -126,10 +126,12 @@
 //!   describes a `{id?, server}` object form, which we do **not** emit — if
 //!   nothing fires and the module is demonstrably loaded, that is the next
 //!   thing to try;
-//! - **whether an interrupted turn still ends in `session.idle`.** If Esc skips
-//!   it, the `session.status` → `idle` edge above is what saves the row from
-//!   stranding at `Active` — which is why it is subscribed even though the
-//!   finer events would normally cover it;
+//! - ~~whether an interrupted turn still ends in `session.idle`~~ — settled by
+//!   the 1.18.18 source read, affirmatively: `processor.ts`'s `onInterrupt`
+//!   and `effect/runner.ts`'s `cancel` both end in `status.set(idle)`, which
+//!   publishes `session.status {idle}` *and* `session.idle`. An Esc also
+//!   publishes `session.error` with `MessageAbortedError`, which
+//!   [`parse_hook_payload`] maps to `Stop` rather than a failure;
 //! - **whether `message.updated` fires with `time.completed` set exactly once
 //!   per assistant turn.** [`BUS_EVENTS`] gates on that field to keep one
 //!   subprocess per turn rather than one per streamed chunk; if the completed
@@ -689,6 +691,18 @@ fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMess
 
     let model = model_ref(&first, &["model"]).or_else(|| model_ref(&info, &[]));
 
+    // A deliberate Esc publishes `session.error` with `MessageAbortedError`
+    // (`session/message-v2.ts`'s `fromError`) *alongside* the idle events — it
+    // is the turn ending, not the turn failing, so it settles the row the same
+    // way rather than parking an error on it.
+    let event = if event == HookEvent::StopFailure
+        && str_at(&props, &["error", "name"]).as_deref() == Some("MessageAbortedError")
+    {
+        HookEvent::Stop
+    } else {
+        event
+    };
+
     HookMessage {
         event,
         session_id,
@@ -1197,6 +1211,26 @@ mod tests {
             ),
         );
         assert_eq!(state.session_id.as_deref(), Some("ses_root2"));
+    }
+
+    /// A deliberate Esc publishes `session.error` with `MessageAbortedError`
+    /// beside the idle events. It is the turn ending, not failing: the row
+    /// settles with no error parked on it.
+    #[test]
+    fn an_esc_abort_settles_the_row_without_an_error() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::StopFailure,
+            &bus(
+                "stop-failure",
+                "session.error",
+                r#"{"sessionID":"ses_1","error":{"name":"MessageAbortedError",
+                    "data":{"message":"Aborted"}}}"#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(state.last_error, None);
     }
 
     /// Both compaction edges are registered, so a row leaves `Compacting` on
