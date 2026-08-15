@@ -15,10 +15,10 @@ use crate::config;
 use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
-    DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, OVERRIDE_COL_WIDTH, ansi_to_lines,
-    bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width, elapsed_cell,
-    fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
-    override_indicator_spans, pill, session_display_name, truncate_str,
+    DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
+    ansi_to_lines, bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width,
+    elapsed_cell, fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color,
+    model_label, override_indicator_spans, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -334,7 +334,7 @@ impl App {
         };
         let inner_text = if custom.trim().is_empty() && !custom_focus {
             Span::styled(
-                format!("(emoji or up to {DIR_ICON_MAX_CHARS} chars — empty = default)"),
+                format!("(emoji or up to {ICON_SLOT_WIDTH} chars — empty = default)"),
                 Style::default().add_modifier(Modifier::DIM),
             )
         } else {
@@ -1386,14 +1386,15 @@ impl App {
             spans.push(Span::raw(" "));
             Line::from(spans)
         };
-        // Show the host half of the icon column when remote hosts are federated,
-        // or when a local row lives in another terminal instance (it doubles as
-        // a "lives elsewhere" tag). A pure-local dashboard with no foreign rows
-        // looks exactly as before. Width fits the widest glyph.
-        // The narrow layout trims the table to status / workdir icon / name, so
-        // the host half is dropped there along with the other extra columns.
-        let any_foreign = visible.iter().any(|s| self.foreign_terminal(s).is_some());
-        let show_host = !narrow && (self.backends.len() > 1 || any_foreign);
+        // The icon column's host half is a *layout* decision, not a content one:
+        // reserved whenever the wide layout is up, whether or not any row has a
+        // glyph for it today. Keying it on "are hosts federated / is any row
+        // foreign" made the column — and every column right of it — move the
+        // moment a host connected or a foreign row scrolled into view. The
+        // narrow layout trims the table to status / workdir icon / name, so the
+        // host half is dropped there along with the other extra columns; that is
+        // a switch between two layouts, not a shift within one.
+        let show_host = !narrow;
 
         // Indented past the override indicator the rows carry in this same cell,
         // so the header sits over the status labels rather than over the glyphs.
@@ -1431,34 +1432,15 @@ impl App {
                 (icon, color)
             })
             .collect();
-        let icon_width = icon_marks
-            .iter()
-            .map(|(icon, _)| dir_icon_width(icon))
-            .max()
-            .unwrap_or(1)
-            .max(1) as u16;
-        // The host glyphs share that column, ahead of a divider (see
-        // `host_icon_cell`). Sized off the widest so the divider — and therefore
-        // every workdir icon behind it — lines up down the table.
+        // The host glyphs share that column (see `host_icon_cell`). Both halves
+        // are fixed slots, so a row with no host glyph reserves one anyway and
+        // nothing to the right of the column moves when hosts connect or a
+        // foreign row appears.
         let host_icons: Vec<Option<(String, bool)>> = if show_host {
             visible.iter().map(|s| self.host_icon_cell(s)).collect()
         } else {
             Vec::new()
         };
-        // Measured with `dir_icon_width`, the same ruler the workdir half uses —
-        // it shares the column, so a second ruler would only let the divider
-        // disagree with itself, and its `[1, DIR_ICON_MAX_CHARS]` clamp is what
-        // keeps an over-long configured "emoji" from widening the whole column.
-        let host_width = host_icons
-            .iter()
-            .flatten()
-            .map(|(g, _)| dir_icon_width(g))
-            .max()
-            .unwrap_or(1)
-            .max(1) as u16;
-        // host glyph + the `│` divider, or nothing at all when there's no host
-        // half to show.
-        let host_slot = if show_host { host_width + 1 } else { 0 };
 
         // The Name column is a fixed max-width column (a dynamic fill looked
         // untidy): the truncate width plus 10 cells of headroom. The title is
@@ -1513,39 +1495,31 @@ impl App {
                 } else {
                     Cell::from(name)
                 };
-                // `<host>│<workdir>` when a host half applies, else the workdir
-                // icon alone. Each half is right-aligned inside its own slot, so
-                // 1-cell defaults sit flush against wider custom labels and the
-                // divider lines up down the table. A row with no host glyph pads
-                // the divider away rather than drawing a bar with nothing on its
-                // left.
+                // `<host><workdir>`, each in a fixed `ICON_SLOT_WIDTH` slot and
+                // the two flush against each other — the halves meet in the
+                // middle because the host is right-aligned in its slot and the
+                // workdir left-aligned in its. That is what puts the slack at the
+                // column's outer edges instead of between the glyphs, so a
+                // narrower glyph on either side never moves the other one. A row
+                // with no host glyph leaves its slot blank rather than closing
+                // it up.
                 let mut icon_spans: Vec<Span<'static>> = Vec::new();
                 if show_host {
                     let host_glyph = host_icons.get(row_idx).and_then(|o| o.as_ref());
                     let glyph_w = host_glyph.map_or(0, |(g, _)| dir_icon_width(g));
-                    icon_spans.push(Span::raw(
-                        " ".repeat((host_width as usize).saturating_sub(glyph_w)),
-                    ));
-                    match host_glyph {
-                        Some((glyph, foreign)) => {
-                            let style = if *foreign {
-                                Style::default().add_modifier(Modifier::DIM)
-                            } else {
-                                Style::default()
-                            };
-                            icon_spans.push(Span::styled(glyph.clone(), style));
-                            icon_spans.push(Span::styled(
-                                "\u{2502}",
-                                Style::default().add_modifier(Modifier::DIM),
-                            ));
-                        }
-                        None => icon_spans.push(Span::raw(" ")),
+                    icon_spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - glyph_w)));
+                    if let Some((glyph, foreign)) = host_glyph {
+                        let style = if *foreign {
+                            Style::default().add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default()
+                        };
+                        icon_spans.push(Span::styled(glyph.clone(), style));
                     }
                 }
-                icon_spans.push(Span::raw(
-                    " ".repeat((icon_width as usize).saturating_sub(dir_icon_width(&icon))),
-                ));
+                let icon_w = dir_icon_width(&icon);
                 icon_spans.push(Span::styled(icon, Style::default().fg(icon_color)));
+                icon_spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - icon_w)));
                 let icon_cell = Cell::from(Line::from(icon_spans));
                 // The narrow layout keeps only status / workdir icon / name; the
                 // context, last-prompt and updated columns are dropped.
@@ -1622,19 +1596,19 @@ impl App {
         // bounded), so they get hard `Length` constraints. Name and prompt
         // share the leftover space — name caps at the truncate width but
         // shrinks before status does on narrow viewports.
-        let icon_col_width = host_slot + icon_width;
         let constraints = if narrow {
             // Status / icon stay fixed-width; the name column fills the rest and
-            // the ratatui table clips it when it doesn't fit.
+            // the ratatui table clips it when it doesn't fit. The icon column is
+            // the workdir slot alone here — no host half in this layout.
             vec![
                 Constraint::Length(status_width),
-                Constraint::Length(icon_col_width),
+                Constraint::Length(ICON_SLOT_WIDTH as u16),
                 Constraint::Min(10),
             ]
         } else {
             vec![
                 Constraint::Length(status_width),
-                Constraint::Length(icon_col_width),
+                Constraint::Length(ICON_COL_WIDTH),
                 // Name is a fixed max-width column (see `name_col_max`). Last
                 // prompt is the elastic column: `Fill` soaks up the slack when
                 // there's room and yields (truncates) first when there isn't, so

@@ -1152,17 +1152,24 @@ decides what they mean**.
   *and* default host) hides on, since naming a default is meaningless when
   localhost is the only host. All per-host detail lives one `Space h` away, so
   the header stays glanceable no matter how many hosts exist.
-- **Host icon**: a compact **emoji**, shown only when more than one host exists
-  or a local row lives in another terminal instance. Per-host icons are
-  configured in the panel exactly like the workdir marks, with a deterministic
-  FNV-derived fallback so a host always has one. An icon rather than a name
-  because it is a glance-level "which box is this?", and a name either truncates
-  to noise or eats six cells. It shares the **workdir-icon column** rather than
-  holding one of its own — `<host>│<workdir>`, divider and all — because both
-  answer "where is this?" and read better as one glyph pair than as two columns
-  a table apart; the freed width goes to the elastic last-prompt column. A local
-  row that lives in another terminal instance takes `⧉` in the host half (the
-  row is already dimmed, and the detail panel names the instance in full).
+- **Host icon**: a compact **emoji**. Per-host icons are configured in the panel
+  exactly like the workdir marks, with a deterministic FNV-derived fallback so a
+  host always has one. An icon rather than a name because it is a glance-level
+  "which box is this?", and a name either truncates to noise or eats six cells.
+  It shares the **workdir-icon column** rather than holding one of its own —
+  `<host><workdir>`, the two glyphs adjacent — because both answer "where is
+  this?" and read better as one glyph pair than as two columns a table apart;
+  the freed width goes to the elastic last-prompt column. A local row that lives
+  in another terminal instance takes `⧉` in the host half (the row is already
+  dimmed, and the detail panel names the instance in full).
+
+  Its half of the column is **reserved by the layout, not by the content**: the
+  wide layout always holds it, whether or not any host is federated and whether
+  or not any row is foreign. Showing it only when something needed it made the
+  column — and every column right of it — move the moment a host connected or a
+  foreign row scrolled into view. Both halves are a fixed `ICON_SLOT_WIDTH`, and
+  that same constant is the cap the icon editors enforce, so a legal icon always
+  fits the column it is drawn in.
   A host carries no configurable **colour**: it said the same thing the emoji
   says, less well, so the field is gone from the panel and ignored in
   `hosts.json`.

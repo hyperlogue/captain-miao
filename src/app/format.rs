@@ -450,12 +450,27 @@ pub(super) fn dir_color_index(name: &str) -> Option<usize> {
     DIR_COLORS.iter().position(|(n, _)| *n == name)
 }
 
-/// Past ~4 cells icons stop reading as marks and start eating row width.
-pub(super) const DIR_ICON_MAX_CHARS: usize = 4;
+/// One icon slot — and, because the two must agree, the cap the host and
+/// directory-mark editors enforce on a typed icon. Two cells is exactly one
+/// emoji, or a 2-char text mark (`py`, `TS`).
+///
+/// Slot width and input cap are deliberately the same number. The icon column is
+/// a constant [`ICON_COL_WIDTH`] so that nothing to its right moves as hosts
+/// connect, foreign rows appear, the list scrolls or a mark changes — and a cap
+/// wider than the slot would mean a legal icon that cannot fit the column it is
+/// drawn in, which is how a fixed column starts clipping instead of shifting.
+/// Raising this widens every row by twice the increase; it does not make the
+/// column elastic again.
+pub(super) const ICON_SLOT_WIDTH: usize = 2;
+
+/// The icon column: the host slot then the workdir slot, adjacent, no divider.
+/// Constant by design — see [`ICON_SLOT_WIDTH`]. The narrow layout carries the
+/// workdir slot alone and so is one slot wide.
+pub(super) const ICON_COL_WIDTH: u16 = 2 * ICON_SLOT_WIDTH as u16;
 
 pub(super) fn dir_icon_width(icon: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
-    icon.width().clamp(1, DIR_ICON_MAX_CHARS)
+    icon.width().clamp(1, ICON_SLOT_WIDTH)
 }
 
 /// Whether `icon` is an emoji, which is what decides whether a directory mark's

@@ -6,7 +6,7 @@ use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::{HostId, SessionStatus};
 use crate::terminal::TabTarget;
 
-use super::format::{DIR_COLORS, DIR_ICON_MAX_CHARS};
+use super::format::{DIR_COLORS, ICON_SLOT_WIDTH};
 use super::keymap::{Chord, Command};
 use super::picker::{PickerEvent, TextInputEvent};
 use super::{
@@ -1219,7 +1219,7 @@ impl App {
                     use unicode_width::UnicodeWidthStr;
                     let prev = r.icon.text().to_string();
                     if matches!(r.icon.handle_key(key), TextInputEvent::Changed)
-                        && r.icon.text().width() > DIR_ICON_MAX_CHARS
+                        && r.icon.text().width() > ICON_SLOT_WIDTH
                     {
                         r.icon.set_text(prev);
                     }
@@ -1439,7 +1439,7 @@ impl App {
                 let evt = s.custom.handle_key(key);
                 if matches!(evt, TextInputEvent::Changed) {
                     use unicode_width::UnicodeWidthStr;
-                    if s.custom.text().width() > DIR_ICON_MAX_CHARS {
+                    if s.custom.text().width() > ICON_SLOT_WIDTH {
                         s.custom.set_text(prev);
                     }
                 }

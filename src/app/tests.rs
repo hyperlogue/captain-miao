@@ -1046,7 +1046,10 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
 }
 
 /// The host glyph shares the workdir-icon column rather than holding a Host
-/// column of its own — `<host>│<workdir>`, and no `Host` header anywhere.
+/// column of its own — `<host><workdir>`, and no `Host` header anywhere. Both
+/// halves are fixed slots, so the column is the same width whether or not a row
+/// has a host glyph: nothing to its right may move as hosts connect or foreign
+/// rows scroll into view.
 #[test]
 fn the_host_glyph_shares_the_workdir_icon_column() {
     let mut d = TestDashboard::new(140, 12);
@@ -1061,10 +1064,11 @@ fn the_host_glyph_shares_the_workdir_icon_column() {
         !out.contains("Host"),
         "the Host column should be gone:\n{out}"
     );
-    // The foreign row wears the "lives elsewhere" glyph, divided from its
-    // workdir icon; the same-terminal row pads the divider away.
+    // The foreign row wears the "lives elsewhere" glyph in the host slot; the
+    // same-terminal row leaves that slot blank. No divider between the halves.
     // Everything left of the name is the row's icon cell — the detail panel's
     // own border lives well to the right of it.
+    use unicode_width::UnicodeWidthStr;
     let icons = |name: &str| {
         let line = out
             .lines()
@@ -1074,9 +1078,21 @@ fn the_host_glyph_shares_the_workdir_icon_column() {
     };
     let foreign_icons = icons("session-1");
     assert!(foreign_icons.contains('\u{29C9}'), "{foreign_icons:?}");
-    assert!(foreign_icons.contains('\u{2502}'), "{foreign_icons:?}");
     let plain_icons = icons("session-2");
-    assert!(!plain_icons.contains('\u{2502}'), "{plain_icons:?}");
+    for cell in [&foreign_icons, &plain_icons] {
+        assert!(
+            !cell.contains('\u{2502}'),
+            "the halves are adjacent, no divider: {cell:?}"
+        );
+    }
+    // The blank host slot is reserved, not closed up: both rows put their
+    // workdir icon at the same column, which is the whole point of the fixed
+    // slots. Measured in cells, since the glyphs either side differ in width.
+    assert_eq!(
+        foreign_icons.width(),
+        plain_icons.width(),
+        "a row with no host glyph must still reserve its slot:\n{out}"
+    );
 }
 
 #[test]
@@ -3652,12 +3668,21 @@ fn dir_edit_custom_text_capped_at_max_chars() {
     let mut d = TestDashboard::new(120, 22);
     d.set_sessions(vec![session(1, "/home/test/proj", SessionStatus::Active)]);
     d.app.open_dir_edit();
-    // Push 6 ASCII chars; only the first DIR_ICON_MAX_CHARS (4 cells) survive.
+    // Push 6 ASCII chars; only the first ICON_SLOT_WIDTH (2 cells) survive — the
+    // cap is the slot the icon column reserves, so what the editor accepts is
+    // exactly what fits without clipping.
     for c in ['a', 'b', 'c', 'd', 'e', 'f'] {
         d.press(KeyCode::Char(c));
     }
+    use unicode_width::UnicodeWidthStr;
     let custom = d.app.dir_edit.as_ref().unwrap().custom.text();
-    assert_eq!(custom, "abcd");
+    assert_eq!(custom, "ab");
+    assert_eq!(
+        custom.width(),
+        super::format::ICON_SLOT_WIDTH,
+        "the editor's cap must be the icon slot, or a legal mark won't fit its \
+         own fixed-width column"
+    );
 }
 
 /// ^n/^p switch rows alongside Tab and the arrows. They are what the pickers
