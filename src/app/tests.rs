@@ -6271,7 +6271,7 @@ fn override_glyphs_measure_what_they_paint() {
     // `•`) is the same bug on a terminal configured ambiguous-as-wide.
     use unicode_width::UnicodeWidthStr;
     let pin = "\u{1F4CC}";
-    let dot = "\u{25C9}";
+    let dot = "\u{2022}";
     // Every secondary, not just the one rendered below: the slot is sized for
     // the class, so a 1-cell replacement would pass the render assertions (the
     // pad simply absorbs it) while breaking measure==paint.
@@ -6283,17 +6283,18 @@ fn override_glyphs_measure_what_they_paint() {
         assert_eq!(glyph.width(), 2, "{name} secondary must measure two cells");
     }
     assert_eq!(dot.width(), 1, "follow-up dot must measure one cell");
-    // `width()` alone cannot tell the legal dot from the illegal class the
-    // comment above names: `●` U+25CF and `•` U+2022 also measure 1, and swapping
-    // either in would leave every other assertion here green while an
-    // ambiguous-as-wide terminal painted them 2. East-Asian-Width Ambiguous is
-    // precisely what `width_cjk` resolves the other way, so this is the
-    // assertion that actually pins the glyph's class.
+    // ...and `•` is East-Asian-Width Ambiguous, so on a terminal configured
+    // ambiguous-as-wide it paints two. That is a chosen tradeoff, documented on
+    // `override_indicator_spans`: such a terminal slides a flagged row's status
+    // label one column right. Asserted rather than dropped so the exception stays
+    // on the record — a swap to a *different* ambiguous glyph trips nothing, but
+    // one to an unambiguous glyph (`◉` U+25C9) fails here and sends whoever did it
+    // to the note saying that is the fix, not the regression.
     assert_eq!(
         dot.width_cjk(),
-        1,
-        "follow-up dot must not be East-Asian-Width Ambiguous — a CJK-configured \
-         terminal paints those two cells wide while `width()` still says one"
+        2,
+        "known: the follow-up dot is ambiguous-width — see the layout note on \
+         `override_indicator_spans` before changing this"
     );
     // The indent is sized for the worst case: both slots occupied at once.
     assert_eq!(

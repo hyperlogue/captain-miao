@@ -526,13 +526,21 @@ pub(super) const OVERRIDE_COL_WIDTH: u16 = SECONDARY_SLOT_WIDTH + 1;
 /// they measure 1 and paint 2, so ratatui's diff never skipped the following
 /// cell and a neighbouring column's update clipped the glyph's right half —
 /// which needed a post-render buffer fix-up in `draw_table` to undo. The
-/// secondaries are emoji-presentation by default (measure 2, paint 2); the dot
-/// is East-Asian-Width **N**, so it measures 1 and paints 1 everywhere. Keep any
-/// replacement in one of those two classes. In particular a 1-cell dot must not
-/// be East-Asian-Width *Ambiguous* — `●` U+25CF and `•` U+2022 both are, and a
-/// terminal configured ambiguous-as-wide paints them 2 while `unicode-width`
-/// still says 1, which is the half-painted bug all over again. Nothing here may
-/// need a VS16 to reach its presentation, for the same reason.
+/// secondaries are emoji-presentation by default (measure 2, paint 2), so they
+/// hold everywhere. Nothing here may need a VS16 to reach its presentation, for
+/// the same reason.
+///
+/// The dot is a **knowing exception**, not a third safe class. `•` U+2022 is
+/// East-Asian-Width *Ambiguous*: `unicode-width` measures it 1, and a terminal
+/// configured ambiguous-as-wide paints it 2. Where that holds, the dot's cell
+/// eats the one after it and everything right of it on that row — status label
+/// included — slides a column, on flagged rows only. Kitty and Ghostty treat
+/// ambiguous as narrow by default, which is why this is liveable; a CJK-locale
+/// terminal is where it shows. `◉` U+25C9 is the nearest glyph that is
+/// unambiguously narrow if that ever needs undoing. The test pins
+/// `width_cjk() == 2` so this stays a decision on the record rather than a
+/// surprise, and so a swap to some *other* ambiguous glyph still has to come
+/// here and read this first.
 pub(super) fn override_indicator_spans(
     follow_up: bool,
     pinned: bool,
@@ -547,7 +555,7 @@ pub(super) fn override_indicator_spans(
     // paints its own hues and ignores the fg. Kept anyway so such a terminal
     // still gets the accent.
     let dot = Span::styled(
-        "\u{25C9}", // ◉ fisheye — see the layout note above before swapping it
+        "\u{2022}", // • bullet — ambiguous-width; read the layout note above
         Style::default().fg(crate::config::get().colors.ui.attention_fg),
     );
     let pin = Span::styled("\u{1F4CC}", Style::default().fg(Color::Blue)); // 📌 pushpin
