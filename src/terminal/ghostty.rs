@@ -20,12 +20,14 @@
 //! building, snapshot parsing, id validation, shell quoting, the startup
 //! diagnosis); driving a real Ghostty needs a Mac with a GUI session and a
 //! hand-clicked Automation grant, which no CI can supply, so nothing below runs
-//! in the suite. The **spawn** path has been driven by hand against Ghostty
-//! 1.3.1, which contradicted the dictionary reading twice — the `command`
-//! property does not parse the `shell:` prefix the config file accepts
-//! ([`spawn_config_script`]), and `new tab` must name its window or it creates
-//! the tab and *then* fails the event ([`CREATE_TAB_SCRIPT`]). Both corrections
-//! are documented where they live.
+//! in the suite. The **spawn** and **own-surface** paths have been driven by
+//! hand against Ghostty 1.3.1, which contradicted the dictionary reading three
+//! times — the `command` property does not parse the `shell:` prefix the config
+//! file accepts ([`spawn_config_script`]), `new tab` must name its window or it
+//! creates the tab and *then* fails the event ([`CREATE_TAB_SCRIPT`]), and there
+//! is no `tty` on a `terminal` to find yourself by
+//! ([`GhosttyTerminal::resolve_own_surface`]). All three are documented where
+//! they live.
 //!
 //! Backend properties this module encodes, read off the shipped `Ghostty.sdef`
 //! and the Swift behind it — so, per the above, what the dictionary says rather
@@ -37,12 +39,13 @@
 //!   [`script_id`] validates the union instead.
 //! - **Surface ids never recycle**, being UUIDs, which is what makes the
 //!   speculative `close_window` the restart/kill paths rely on safe.
-//! - **A process cannot learn which surface it is in.** There is no
-//!   `KITTY_WINDOW_ID` analog in the environment, and — measured, unlike the
-//!   rest of this list — no `tty` on the `terminal` class to match `ttyname(0)`
-//!   against either, so [`GhosttyTerminal::resolve_own_surface`] settles on
-//!   `None` and `miao focus` has no dashboard window to raise. Its doc carries
-//!   what was tried.
+//! - **A process cannot ask which surface it is in, so it says.** There is no
+//!   `KITTY_WINDOW_ID` analog in the environment and no `tty` on the `terminal`
+//!   class to match `ttyname(0)` against (both measured). The one property a
+//!   process can set from inside is its title, so `current_window` writes a
+//!   nonce one and looks for the surface wearing it —
+//!   [`GhosttyTerminal::resolve_own_surface`] carries the rest, including why
+//!   nothing has to put the title back.
 //! - **Creation always activates Ghostty** (upstream ghostty#11457:
 //!   `new window` / `new tab` bring the app forward with no way to opt out), so
 //!   `SpawnSpec::take_focus` cannot be honoured in its `false` direction. Left
@@ -130,12 +133,22 @@ const SEP: char = '\u{1f}';
 /// both.
 const SEP_PREAMBLE: &str = "set sep to character id 31\nset lf to character id 10\n";
 
+/// How long [`GhosttyTerminal::resolve_own_surface`] waits for the title it just
+/// wrote to reach Ghostty's model, as `(tries, seconds between)` — the two halves
+/// of one AppleScript `repeat`, so the whole wait costs a single `osascript`.
+///
+/// Measured at well under one round on 1.3.1 (the escape is parsed by the same
+/// process that answers the query, and there is nothing between them), so this
+/// bound exists for the case where the title *never* lands — the one where a
+/// tight retry would spin and a generous one would hold up startup for nothing.
+const OWN_SURFACE_SETTLE: (u32, f32) = (10, 0.05);
+
 pub struct GhosttyTerminal {
-    /// The surface the dashboard itself runs in, resolved lazily from
-    /// `ttyname` on first use and then cached. `Some(None)` is a *settled*
-    /// failure (no tty, or Ghostty named no surface for it) and is not retried:
-    /// the answer can't change for the life of the process, and the caller
-    /// (`write_dashboard_pid_and_window`) treats it as best-effort.
+    /// The surface the dashboard itself runs in, resolved lazily on first use
+    /// and then cached. `Some(None)` is a *settled* failure (no tty, or Ghostty
+    /// named no surface) and is not retried: the answer can't change for the
+    /// life of the process, and the caller (`write_dashboard_pid_and_window`)
+    /// treats it as best-effort.
     own_surface: OnceLock<Option<WindowId>>,
 }
 
@@ -165,19 +178,27 @@ impl GhosttyTerminal {
         }
     }
 
-    /// The dashboard's own surface id, resolved once.
+    /// The dashboard's own surface id, resolved once — by **saying** which
+    /// surface it is in, because nothing lets it ask.
     ///
-    /// **Answers `None` on every Ghostty shipping today**, and is kept anyway.
-    /// `tty of terminal` is not in 1.3.1's dictionary — the `terminal` class
-    /// carries `id`, `name` and `working directory`, nothing else — so the
-    /// script fails to compile (-1700) and this settles on `None`. Kept rather
-    /// than deleted because the code is right the moment the property exists,
-    /// and because there is no second way to ask: no surface id in the
-    /// environment either (measured — 1.3.1 exports `GHOSTTY_RESOURCES_DIR`,
-    /// `GHOSTTY_BIN_DIR` and `GHOSTTY_SHELL_FEATURES`, and no `KITTY_WINDOW_ID`
-    /// analog), and nothing else on a surface distinguishes it from its
-    /// neighbours. The cost is `miao focus`: it has no dashboard window to raise
-    /// on Ghostty.
+    /// Ghostty tells a process nothing about its surface: no `KITTY_WINDOW_ID`
+    /// analog in the environment (1.3.1 exports `GHOSTTY_RESOURCES_DIR`,
+    /// `GHOSTTY_BIN_DIR` and `GHOSTTY_SHELL_FEATURES`, and that is all), and no
+    /// `tty` on the `terminal` class to match `ttyname(0)` against — the class
+    /// carries `id`, `name` and `working directory`, so asking for `tty of s`
+    /// fails to compile the script at all (-1700). Both measured on 1.3.1.
+    ///
+    /// So the one property a process *can* set from inside is the one used:
+    /// write a nonce title to the tty, then look for the surface wearing it.
+    /// `working directory` was the other candidate and is not an identifier —
+    /// it is empty without shell integration, and shared by every surface in the
+    /// same project when there is.
+    ///
+    /// Nothing has to put the title back. The run loop labels this tab `miao`
+    /// (with the attention count) on its first frame, moments later and every
+    /// time the count moves, so the nonce is overwritten by the mechanism that
+    /// owns the title anyway — leaving one frame of a stray title in the worst
+    /// case, and none in the ordinary one.
     ///
     /// Blocking on purpose: this is one `osascript` at most per process, and
     /// [`Terminal::current_window`] is sync on every backend because every other
@@ -186,15 +207,19 @@ impl GhosttyTerminal {
     /// one blocking subprocess, once, at dashboard startup, is not.
     fn resolve_own_surface(&self) -> Option<WindowId> {
         let tty = own_tty()?;
-        let script = format!(
-            "tell application \"Ghostty\"\n\
-             \x20 repeat with s in terminals\n\
-             \x20   if (tty of s) is {} then return (id of s)\n\
-             \x20 end repeat\n\
-             end tell\n\
-             return \"\"",
-            applescript_string(&tty)
-        );
+        let nonce = surface_nonce();
+        // Straight to the tty rather than to stdout, which is where the trait's
+        // own `set_own_tab_title` puts it: this runs before the render backend
+        // takes stdout over, but it is the *terminal* that must see the escape,
+        // and a dashboard started with its output redirected still has one.
+        {
+            use std::io::Write;
+            let mut dev = std::fs::OpenOptions::new().write(true).open(&tty).ok()?;
+            dev.write_all(format!("\x1b]2;{nonce}\x07").as_bytes())
+                .ok()?;
+            dev.flush().ok()?;
+        }
+        let script = own_surface_script(&nonce);
         let out = std::process::Command::new("osascript")
             .arg("-")
             .stdin(std::process::Stdio::piped())
@@ -213,7 +238,7 @@ impl GhosttyTerminal {
             .ok()?;
         if !out.status.success() {
             tracing::debug!(
-                "ghostty: could not resolve own surface from tty {tty}: {}",
+                "ghostty: could not resolve own surface from the title on {tty}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
             return None;
@@ -224,10 +249,50 @@ impl GhosttyTerminal {
     }
 }
 
-/// The controlling terminal's device path (`/dev/ttys004`), for the surface
-/// lookup above. Tries stdin, stdout, then stderr: the dashboard's stdin is
-/// normally the tty, but a `miao` invoked with stdin redirected still has one on
-/// another descriptor.
+/// The lookup half of [`GhosttyTerminal::resolve_own_surface`]: the surface
+/// wearing `nonce`, or `""`.
+///
+/// The wait is a `repeat` *inside* the script rather than a retry around it, so
+/// the whole settle costs one `osascript` process and one Apple-event connection
+/// instead of [`OWN_SURFACE_SETTLE`]`.0` of each. `delay` is Standard Additions
+/// terminology, which resolves inside a `tell` block for any term the
+/// application's own dictionary doesn't claim — and Ghostty's doesn't.
+fn own_surface_script(nonce: &str) -> String {
+    let (tries, delay) = OWN_SURFACE_SETTLE;
+    format!(
+        "tell application \"Ghostty\"\n\
+         \x20 repeat {tries} times\n\
+         \x20   repeat with s in terminals\n\
+         \x20     if (name of s) is {} then return (id of s)\n\
+         \x20   end repeat\n\
+         \x20   delay {delay}\n\
+         \x20 end repeat\n\
+         end tell\n\
+         return \"\"",
+        applescript_string(nonce)
+    )
+}
+
+/// A title no other surface can be wearing, for the lookup above.
+///
+/// The pid alone would do among *live* surfaces, but the thing being matched is
+/// a title, and a title outlives the process that wrote it: a surface left
+/// showing an older dashboard's nonce, under a pid the OS has since recycled,
+/// would answer for a window this process is not in. The clock settles that.
+///
+/// Shaped like what replaces it a moment later (`miao`, `miao (2)`) so the one
+/// frame it may be visible for reads as this program rather than as garbage.
+fn surface_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("miao [{}.{nanos}]", std::process::id())
+}
+
+/// The controlling terminal's device path (`/dev/ttys004`), which the surface
+/// lookup above writes its nonce title to. Tries stdin, stdout, then stderr: the
+/// dashboard's stdin is normally the tty, but a `miao` invoked with stdin
+/// redirected still has one on another descriptor.
 fn own_tty() -> Option<String> {
     for fd in [0, 1, 2] {
         let mut buf = [0u8; 256];
@@ -989,6 +1054,42 @@ mod tests {
         for target in [SpawnTarget::Floating, SpawnTarget::SharedStackTab] {
             assert!(spawn_script(&spec(target)).is_err());
         }
+    }
+
+    #[test]
+    fn the_own_surface_lookup_waits_inside_one_script() {
+        let script = own_surface_script("miao [1.2]");
+        // The nonce is matched on `name`, the only property a process can set
+        // from inside — `tty` isn't on the class at all.
+        assert!(
+            script.contains("if (name of s) is \"miao [1.2]\" then return (id of s)"),
+            "{script}"
+        );
+        // The settle is a `repeat`/`delay` pair in the script, so waiting costs
+        // one osascript rather than one per try.
+        let (tries, delay) = OWN_SURFACE_SETTLE;
+        assert!(
+            script.contains(&format!("repeat {tries} times")),
+            "{script}"
+        );
+        assert!(script.contains(&format!("delay {delay}")), "{script}");
+        // Finding nothing is an empty answer, not a failure: the caller has to
+        // tell "not in a Ghostty surface" from "Ghostty refused the request".
+        assert!(script.ends_with("return \"\""), "{script}");
+    }
+
+    #[test]
+    fn a_surface_nonce_names_this_process_and_needs_no_escaping() {
+        let nonce = surface_nonce();
+        assert!(nonce.contains(&std::process::id().to_string()), "{nonce}");
+        // Shaped like the `miao (2)` label that replaces it, so the one frame it
+        // can be visible for reads as this program rather than as garbage.
+        assert!(nonce.starts_with("miao "), "{nonce}");
+        // It reaches the script through `applescript_string`. Nothing in it may
+        // need escaping — the escaped literal has to still spell the title that
+        // went out to the tty verbatim, or the lookup asks for a name no surface
+        // wears.
+        assert_eq!(applescript_string(&nonce), format!("\"{nonce}\""));
     }
 
     #[test]

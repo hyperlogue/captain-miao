@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named `shell:/bin/sh`. And `new tab` was asked for without naming a window,
   which Ghostty answers by creating the tab and *then* failing the event
   (`-1708`), so the spawn reported failure while leaving a live agent behind.
+- **`miao focus` works on Ghostty**, where the dashboard had no idea which
+  surface it was in: Ghostty exports no window id to a process and its
+  dictionary has no `tty` to match one against, so no window was ever recorded
+  and `focus` took its no-dashboard path — printing `No dashboard running`,
+  exiting 1 and deleting the pid sentinel of a dashboard that was in fact
+  running. The dashboard now names its own surface by writing a nonce title and
+  looking for it (the tab label it sets a moment later is what puts the title
+  back), and `focus` tells a dashboard whose window is unknown from one that
+  isn't there.
 - **opencode sessions stuck reading as "working" forever.** The generated plugin
   registered six handler keys that opencode never looks for — including the
   turn-end signal — because they are event names on its bus rather than keys on
