@@ -639,11 +639,20 @@ fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMess
 
     // Input-side only, matching `agents::claude`'s fold: this column is "how
     // full is the context window", and completion tokens are not in the next
-    // request. Cache reads and writes are, so both are counted.
-    let context_tokens = assistant.then(|| {
-        let t = |k: &[&str]| u64_at(&info, k).unwrap_or(0);
-        t(&["tokens", "input"]) + t(&["tokens", "cache", "read"]) + t(&["tokens", "cache", "write"])
-    });
+    // request. Cache reads and writes are, so both are counted. Keyed on
+    // `tokens.input` being present at all: an assistant message in a shape
+    // this doesn't recognize must report *nothing*, never a fabricated
+    // `Some(0)` that `adopt_session_facts`'s last-write-wins would stamp over
+    // a real number.
+    let context_tokens = assistant
+        .then(|| {
+            u64_at(&info, &["tokens", "input"]).map(|input| {
+                input
+                    + u64_at(&info, &["tokens", "cache", "read"]).unwrap_or(0)
+                    + u64_at(&info, &["tokens", "cache", "write"]).unwrap_or(0)
+            })
+        })
+        .flatten();
 
     let model = model_ref(&first, &["model"]).or_else(|| model_ref(&info, &[]));
 
@@ -1074,6 +1083,22 @@ mod tests {
         assert_eq!(msg.session_id.as_deref(), Some("ses_1"));
         // Not an assistant message, so no token total is invented for it.
         assert_eq!(msg.context_tokens, None);
+    }
+
+    /// An assistant message whose `tokens` is missing or reshaped reports no
+    /// token count at all — never `Some(0)`, which `adopt_session_facts`'s
+    /// last-write-wins would stamp over a real number on the row.
+    #[test]
+    fn an_assistant_message_without_tokens_reports_none_not_zero() {
+        let stdin = bus(
+            "cwd-changed",
+            "message.updated",
+            r#"{"info":{"id":"msg_1","sessionID":"ses_1","role":"assistant",
+                "time":{"created":1,"completed":2}}}"#,
+        );
+        let msg = parse_hook_payload(HookEvent::CwdChanged, &stdin).expect("parses");
+        assert_eq!(msg.context_tokens, None);
+        assert_eq!(msg.session_id.as_deref(), Some("ses_1"));
     }
 
     /// The picker's rows, in the shape `formatSessionJSON` prints them.
