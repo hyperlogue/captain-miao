@@ -2,14 +2,18 @@
 //! payload shape; the dashboard reaches all of it only via
 //! `crate::agent::AgentControl::Kimi`'s match arms.
 //!
-//! **Documented, never run, never source-read.** No `kimi` binary and no vendor
-//! checkout were available when this was written, so every claim below comes
-//! from MoonshotAI/kimi-code's published CLI and hooks documentation as recorded
-//! in this project's design note (§7). That is a weaker footing than the other
-//! three backends have — Claude and Codex were built against running binaries,
-//! Reasonix against its source — so each claim is marked **documented** or
-//! **assumed** where it matters, and everything a probe must settle is listed at
-//! the bottom of this doc. Nothing here has been observed.
+//! **Source-read, never run.** First written from MoonshotAI/kimi-code's
+//! published documentation alone (design note §7); since re-read against the
+//! source itself — `apps/kimi-code` for the CLI surface and
+//! `packages/agent-core-v2` for the engine (bootstrap, config, hooks runner,
+//! session store). The read verified nearly every assumption the first cut
+//! marked — payload field spellings, env passthrough into hooks, the
+//! `session_index.jsonl` and `wire.jsonl` layouts, `TurnStarted`'s per-turn
+//! granularity, the absence of a fork flag — and found one it had wrong, the
+//! `matcher` grammar (see [`build_hooks_settings`]). Beware the sibling repo:
+//! `MoonshotAI/kimi-cli` is a wound-down *predecessor* whose facts (data dir,
+//! env vars, hook events, flags) do not transfer. Still not run against a
+//! binary; what remains for a probe is listed at the bottom of this doc.
 //!
 //! **`Interrupt` is a first-class hook, and that is the interesting fact about
 //! this backend.** Codex has to scan its rollout for `turn_aborted` and Claude
@@ -35,11 +39,13 @@
 //! `[[hooks]]` entries. Copy rather than symlink is the lesson Codex already
 //! paid for (AGENTS.md; a symlinked config gave a split-brain database), and it
 //! buys a second thing here: the config we edit is *ours*, so a `[[hooks]]`
-//! block Kimi refuses can only break a captain-miao session's config, never the
-//! user's real one. That matters more than usual, because a Kimi hook table
-//! carrying **any fifth key fails the whole config load** rather than that one
-//! entry — see [`build_hooks_settings`], which emits exactly `event`, `matcher`,
-//! `command`, `timeout` for that reason.
+//! block Kimi rejects can only break a captain-miao session's config, never the
+//! user's real one. That matters more than usual, because Kimi validates the
+//! hook table as **one array under a strict schema**: a single entry with an
+//! unknown key drops the whole `hooks` section — every hook in the file — with
+//! only a warning diagnostic. See [`build_hooks_settings`], which emits exactly
+//! `event`, `command`, `timeout` for that reason (and no `matcher`, for a
+//! sharper one documented there).
 //!
 //! Two risks carried over from Codex:
 //!
@@ -74,44 +80,19 @@
 //! outright), and [`wire_log_for`] walks the buckets to find a session by id,
 //! which is what Kimi's own readers do.
 //!
-//! What a probe against a real binary must settle, in the order the failures
-//! hurt:
-//! - **that a copied `config.toml` with our appended `[[hooks]]` loads at all**,
-//!   and specifically that `matcher = "*"` is accepted. The matcher's grammar is
-//!   undocumented; `"*"` is what Claude, Codex and Reasonix all spell "every
-//!   tool", and it is an *assumption* here. If Kimi validates it as a regex, or
-//!   requires the key absent rather than wildcarded, the whole config fails to
-//!   load and every row sits at `Starting`.
-//! - **whether Kimi content-hashes `config.toml` for trust** the way Codex does.
-//!   If it does, an equivalent of Codex's `seed_hook_trust` is needed, and the
-//!   regression test pinning the hash must land with it. [`merge_hooks`] already
-//!   keeps the file byte-stable across launches, which is the precondition.
-//! - **whether `CAPTAIN_MIAO_SOCK` survives into the hook subprocess.** The
-//!   socket rides the environment rather than the command (the config is shared
-//!   by every session), so an agent that scrubs its hook env would leave every
-//!   hook unable to find its launcher — silently, since a hook that cannot
-//!   connect is not an error Kimi reports.
-//! - **the per-event field names** `tool_name`, `prompt` and `hook_event_name`.
-//!   Only the session-wide fields are documented; these three are assumed from
-//!   the payload being snake_case and the event vocabulary being Claude's. A
-//!   wrong guess costs the Tool column and the prompt preview, never a wrong
-//!   value (see [`HookPayload`]).
-//! - **that `session_index.jsonl` is written for every session**, not only for
-//!   ones opened a particular way. It is the sole record of a session's working
-//!   directory, so a session missing from it never reaches the picker.
-//! - **that there is genuinely no fork** (`kimi --help | grep -i fork`). If one
-//!   appears, [`crate::agent::AgentControl::resume_args`] grows a flag under
-//!   `fork` and `supports_fork()` flips itself — nothing else changes.
-//! - **what `TurnStarted`'s granularity actually is.** It is registered as a
-//!   second `prompt-submit` so that a turn beginning without a user prompt still
-//!   moves the row, on the assumption that a "turn" is a user-visible one. Pi is
-//!   the warning: *its* `turn_*` events fire per **LLM call**, which is why
-//!   `agents::pi` declines them outright. If Kimi's mean the same, this
-//!   registration spawns one `miao hook` per model call inside the user's
-//!   session — the one load this design must never impose — and the shared
-//!   `PromptSubmit` arm clears `last_tool` mid-run, blanking the Tool column
-//!   between tools. Count the hook invocations across one multi-tool turn;
-//!   unregistering is a one-line fix.
+//! What the source read settled, so a probe need not (each was on this list):
+//! the hook schema and the `matcher` grammar (strict, regex — see
+//! [`build_hooks_settings`]); no content-keyed trust gate exists, so
+//! [`merge_hooks`]'s byte-stability now buys only race-freedom across
+//! concurrent launches; hooks inherit the full process environment, so
+//! `CAPTAIN_MIAO_SOCK` survives; the per-event field names `tool_name`,
+//! `prompt`, `hook_event_name` are the runner's own camel→snake spellings;
+//! `session_index.jsonl` is appended on every session create; there is no fork
+//! flag on the whole CLI option list; and `TurnStarted` fires per user-visible
+//! turn (its matcher value is the origin kind), not per LLM call — the Pi
+//! worry was unfounded.
+//!
+//! What a probe against a real binary must still settle:
 //! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
 //!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
 //!   this works if the agent reads the clipboard by shelling out to
@@ -531,13 +512,15 @@ fn is_ours(hook: &toml::Value) -> bool {
 
 /// Build the `[[hooks]]` block merged into the synth home's `config.toml`.
 ///
-/// **Exactly four keys per entry — `event`, `matcher`, `command`, `timeout`.**
-/// A fifth fails Kimi's *entire* config load, not just that entry, so this is
-/// pinned by a test rather than left to review. `timeout` is seconds, range
-/// 1–600, default 30; it is set explicitly and small because three of the events
-/// we register (`UserPromptSubmit`, `PreToolUse`, `Stop`) are blockable, so a
-/// timeout there stalls the turn for its full duration. A socket write needs
-/// none of 30s.
+/// **Exactly three keys per entry — `event`, `command`, `timeout`.** The
+/// schema is strict and validated as one array, so a single entry with an
+/// unknown key drops the whole `hooks` section — ours *and the user's* — with
+/// only a warning diagnostic; this is pinned by a test rather than left to
+/// review. `matcher` is deliberately absent (see the closure below). `timeout`
+/// is seconds, range 1–600, default 30; it is set explicitly and small because
+/// three of the events we register (`UserPromptSubmit`, `PreToolUse`, `Stop`)
+/// are blockable, so a timeout there stalls the turn for its full duration. A
+/// socket write needs none of 30s.
 ///
 /// The **native event name → our [`HookEvent`] mapping happens here**, in the
 /// config, not in the parser: the command already names the event it forwards,
@@ -579,9 +562,13 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
     let hook = |event: &str, forwarded: HookEvent| -> toml::Value {
         let mut t = toml::map::Map::new();
         t.insert("event".to_string(), toml::Value::String(event.to_string()));
-        // Assumed, not documented — see the module doc's probe list. "*" is what
-        // all three shipping backends spell "every tool".
-        t.insert("matcher".to_string(), toml::Value::String("*".to_string()));
+        // **No `matcher` key: "match everything" is the matcher's absence.**
+        // Kimi compiles the matcher as a JS regex and treats one that fails to
+        // compile as matching *nothing* (`runner.ts`'s `matches` catches the
+        // throw and returns false) — and `new RegExp("*")` throws. So the `"*"`
+        // every other backend spells "every tool" here silently disarms the
+        // hook it is on. The key is `.optional()` and an absent matcher reads
+        // as `""`, whose `RegExp` matches everything.
         t.insert(
             "command".to_string(),
             toml::Value::String(format!(
@@ -1044,11 +1031,15 @@ mod tests {
         assert_eq!(state.last_error, None);
     }
 
-    /// The constraint that would take a whole config down: a Kimi hook table
-    /// accepts **exactly** `event`, `matcher`, `command`, `timeout`, and a fifth
-    /// key fails the entire load rather than that one entry.
+    /// The constraint that would disarm every hook in the file: Kimi's hook
+    /// schema is strict and validated as one array, so a single entry with an
+    /// unknown key drops the **whole `hooks` section** — ours and the user's —
+    /// with only a warning diagnostic. And `matcher` must be absent: Kimi
+    /// compiles it as a JS regex and a failed compile matches *nothing*, so
+    /// the `"*"` every other backend spells "every tool" silently disarms the
+    /// hook it is on (see [`build_hooks_settings`]).
     #[test]
-    fn every_hook_entry_has_exactly_the_four_documented_keys() {
+    fn every_hook_entry_has_exactly_the_three_emitted_keys() {
         let entries = hook_entries(&build_hooks_settings("/run/x.sock"));
         assert!(!entries.is_empty());
         for entry in &entries {
@@ -1056,8 +1047,8 @@ mod tests {
             keys.sort_unstable();
             assert_eq!(
                 keys,
-                ["command", "event", "matcher", "timeout"],
-                "a fifth key fails Kimi's whole config load: {entry:?}"
+                ["command", "event", "timeout"],
+                "an unknown key drops Kimi's whole hooks section: {entry:?}"
             );
             // Documented range 1–600s. Ours is small because three of the
             // registered events block the turn while a hook runs.
