@@ -4345,6 +4345,7 @@ mod tests {
             agent: AgentControl::Claude,
             launcher_pid: pid,
             session_id: Some(format!("sess-{pid}")),
+            child_session_ids: Vec::new(),
             window_id: None,
             tab_id: None,
             cwd: "/tmp".to_string(),

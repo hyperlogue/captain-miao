@@ -308,6 +308,7 @@ mod tests {
             model: None,
             transcript_path: None,
             raw: None,
+            session_is_child: None,
         }
     }
 

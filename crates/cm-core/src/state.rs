@@ -642,6 +642,22 @@ pub struct HookMessage {
     /// verbatim.
     #[serde(default)]
     pub raw: Option<String>,
+    /// What the payload itself proves about [`Self::session_id`]'s lineage, for
+    /// a backend whose event stream is process-wide rather than per-session
+    /// (opencode: one bus serves every session in the process, subagent
+    /// children included).
+    ///
+    /// - `Some(true)` — the payload names a parent session: this event is a
+    ///   **child** session's, and the row must ignore it.
+    /// - `Some(false)` — the payload carries full session info with no parent:
+    ///   proven **root**, the one id worth adopting.
+    /// - `None` — the payload names a bare session id (or none) and proves
+    ///   nothing either way.
+    ///
+    /// `None` for every backend whose hooks are already session-scoped; only
+    /// the dispatch of a backend that sets it reads it.
+    #[serde(default)]
+    pub session_is_child: Option<bool>,
 }
 
 // -- Launcher state file --
@@ -674,6 +690,14 @@ pub struct LauncherState {
     pub child_pid: Option<u32>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Session ids this launcher has seen proven to be **subagent children** of
+    /// another session ([`HookMessage::session_is_child`]), so later events
+    /// naming one by bare id can be ignored. Only a backend whose event stream
+    /// is process-wide (opencode) feeds this; empty for every other backend.
+    /// Never pruned: a session accumulates a handful of these per subagent
+    /// task, and a stale entry costs one `contains` miss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_session_ids: Vec<String>,
     /// Transcript-derived facts the launcher folds and stamps so the dashboard
     /// (and, later, a remote server) reads only this file — never a transcript.
     /// Latest context-window token total.
@@ -770,6 +794,7 @@ impl LauncherState {
             agent,
             launcher_pid: 0,
             session_id: None,
+            child_session_ids: Vec::new(),
             window_id: None,
             tab_id: None,
             cwd: String::new(),
@@ -1177,6 +1202,7 @@ mod tests {
             agent: crate::agent::AgentControl::Claude,
             launcher_pid: pid,
             session_id: None,
+            child_session_ids: Vec::new(),
             window_id: None,
             tab_id: None,
             cwd: String::new(),

@@ -174,6 +174,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         agent: crate::agent::AgentControl::Claude,
         launcher_pid: pid,
         session_id: Some(format!("sess-{pid}")),
+        child_session_ids: Vec::new(),
         window_id: Some(WindowId::from(pid as u64 * 100)),
         tab_id: Some(TabId::from(pid as u64)),
         cwd: cwd.to_string(),

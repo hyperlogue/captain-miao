@@ -654,6 +654,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // consistent rather than merely unimplemented.
         transcript_path: None,
         raw: Some(stdin.to_string()),
+        session_is_child: None,
     })
 }
 

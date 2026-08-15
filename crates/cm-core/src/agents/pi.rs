@@ -475,6 +475,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // runs on a path a hook supplied.
         transcript_path: None,
         raw: Some(stdin.to_string()),
+        session_is_child: None,
     })
 }
 

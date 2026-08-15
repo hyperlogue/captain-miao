@@ -59,6 +59,7 @@ pub async fn run(
         agent,
         launcher_pid,
         session_id: None,
+        child_session_ids: Vec::new(),
         window_id,
         tab_id: None,
         cwd: cwd.to_string(),

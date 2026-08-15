@@ -423,13 +423,16 @@ const BIN_FALLBACK: &str = "miao";
 /// - **it needs no shell quoting.** The argv is an array, so no metacharacter
 ///   in the `miao` path can word-split or inject. The path is embedded as a
 ///   JSON string literal, which is also a valid JS one.
-/// - **events arrive in order.** Every handler returns `send`'s promise, which
-///   settles when the child exits — so an opencode that awaits its hooks
-///   cannot deliver a turn's `session.idle` ahead of its last
-///   `tool.execute.after`, whose `PostToolUse` would re-mark the settled row
-///   working until the next prompt. An opencode that does *not* await loses
-///   nothing: the promise simply goes unobserved. The same shape as
-///   `agents::pi`'s forwarder, for the same reason.
+/// - **ordering is offered, not assumed.** Every handler returns `send`'s
+///   promise, which settles when the child exits. At 1.18.18 opencode awaits
+///   the **direct hooks** in registration order (`plugin/index.ts`), so those
+///   arrive serialized; the bus `event` hook's return is discarded (`void`),
+///   so bus events race each other and the direct hooks freely. Returning the
+///   promise costs nothing where it is dropped, keeps the direct hooks in
+///   order today, and means any future opencode that does await the bus gets
+///   ordering for free — but nothing downstream may *depend* on cross-event
+///   order, which is why the child-session gate in [`dispatch_hook`] is
+///   denylist-shaped rather than sequence-shaped.
 ///
 /// The export is emitted **twice**, named and default, because §9 states that a
 /// plugin "export[s] a function" without saying under which convention. Both
@@ -638,6 +641,13 @@ fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMess
         .or_else(|| str_at(&props, &["sessionID"]))
         .or_else(|| str_at(&first, &["sessionID"]));
 
+    // Only a `Session` proves lineage: `parentID` present means this event is a
+    // subagent child session's (the task tool sets it — `tool/task.ts`), absent
+    // on a full `Session.Info` proves the root. A bare `sessionID` proves
+    // nothing (`None`). `Assistant.parentID` is a *message* id, which is why
+    // this is gated on `info_is_session` rather than on the field existing.
+    let session_is_child = info_is_session.then(|| str_at(&info, &["parentID"]).is_some());
+
     // Only a `Session` has a session title. `UserMessage.summary.title`
     // summarises one message and is deliberately not taken for it.
     let session_title = info_is_session.then(|| str_at(&info, &["title"])).flatten();
@@ -684,6 +694,7 @@ fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMess
         // is explicit that a backend picks one source, not both).
         transcript_path: None,
         raw: None,
+        session_is_child,
     }
 }
 
@@ -796,15 +807,56 @@ fn parse_session_list(stdout: &str) -> Vec<ResumeCandidate> {
 // Hook event → status mapping
 // =============================================================================
 
-/// opencode departs from [`common::dispatch_default`] nowhere, and here that is
-/// a genuine fit rather than a shrug: every event in [`BUS_EVENTS`] and
-/// [`DIRECT_HOOKS`] is one of ours under a different spelling, and the two
-/// places another backend needed an arm — an interrupt arriving as something
-/// else (Reasonix), a session-end `Stop` to tell from a turn-end one (Grok) —
-/// are both handled upstream instead, in the plugin, by not forwarding the
-/// events that would need the distinction. The wrapper stays so the seam keeps
-/// one callee per backend.
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+/// [`common::dispatch_default`] behind one opencode-specific gate: **subagent
+/// child sessions**. The bus is process-wide — a child created by the task tool
+/// runs the identical lifecycle as the root through the same plugin — so
+/// without this gate a child's `session.idle` settles the row mid-turn, its
+/// `message.updated` stamps the child's tokens and model over the row's, and
+/// its id gets adopted as what `r` and `f` resume.
+///
+/// The gate is a **denylist of proven children**, not an allowlist of the root,
+/// because one opencode process holds many root sessions (`<leader>n` /
+/// `<leader>l`) and switching to one emits no `session.created` — an allowlist
+/// would go deaf on the first switch, while the denylist follows whatever root
+/// is active. Children are learned from the two payloads that carry lineage at
+/// all ([`HookMessage::session_is_child`]: `session.created` and
+/// `session.updated`, both of which a child emits on every prompt), so a child
+/// resumed from an earlier process re-teaches itself within one event.
+///
+/// Two deliberate asymmetries:
+///
+/// - **A child's approval request still blocks the row.** opencode stops the
+///   whole turn on a permission ask whichever session raised it, so the one
+///   pair of events a child can address to the *user* — `permission.asked` /
+///   `permission.replied` — passes the gate.
+/// - **A bare session id never displaces a known one.** Only a payload that
+///   proves rootness re-points `state.session_id`; a bare id is adopted only
+///   when none is known yet (first events of a fresh launch). This closes the
+///   window where a resumed child's first event arrives before the lineage
+///   that would condemn it — and the root's own `session.updated` re-proves
+///   the root id on every prompt regardless.
+pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+    let blocks_on_user = matches!(
+        msg.event,
+        HookEvent::PermissionRequest | HookEvent::ElicitationResult
+    );
+    if msg.session_is_child == Some(true) {
+        if let Some(id) = msg.session_id.take()
+            && !state.child_session_ids.contains(&id)
+        {
+            state.child_session_ids.push(id);
+        }
+        return;
+    }
+    if let Some(id) = &msg.session_id
+        && state.child_session_ids.contains(id)
+        && !blocks_on_user
+    {
+        return;
+    }
+    if msg.session_is_child != Some(false) && state.session_id.is_some() {
+        msg.session_id = None;
+    }
     common::dispatch_default(state, msg)
 }
 
@@ -991,10 +1043,142 @@ mod tests {
             &bus(
                 "elicitation-result",
                 "permission.replied",
-                r#"{"sessionID":"ses_1","permissionID":"per_1","response":"once"}"#,
+                r#"{"sessionID":"ses_1","requestID":"per_1","reply":"once"}"#,
             ),
         );
         assert_eq!(state.status, SessionStatus::Active);
+    }
+
+    /// The child-session gate in [`dispatch_hook`]: a subagent runs the
+    /// identical lifecycle through the same process-wide bus, and none of it is
+    /// the row's business — not the settle, not the tokens, not the title, not
+    /// the id `r` and `f` resume from.
+    #[test]
+    fn a_child_sessions_events_never_touch_the_row() {
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("ses_root".to_string());
+        state.context_tokens = Some(175);
+        state.model = Some("anthropic/some-model-1".to_string());
+        state.name = Some("the real work".to_string());
+
+        // The task tool creates the child: lineage arrives, the id is learned,
+        // and the event itself is dropped.
+        feed(
+            &mut state,
+            HookEvent::SessionStart,
+            &bus(
+                "session-start",
+                "session.created",
+                r#"{"info":{"id":"ses_child","parentID":"ses_root",
+                    "directory":"/home/miao/p","title":"probe (@scout subagent)"}}"#,
+            ),
+        );
+        assert!(state.child_session_ids.contains(&"ses_child".to_string()));
+
+        // The child's whole turn, by bare session id: prompt, completed
+        // assistant message, settle. Every one is ignored.
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload("prompt-submit", r#"{"sessionID":"ses_child"}"#),
+        );
+        feed(
+            &mut state,
+            HookEvent::CwdChanged,
+            &bus(
+                "cwd-changed",
+                "message.updated",
+                r#"{"info":{"id":"msg_c","sessionID":"ses_child","role":"assistant",
+                    "providerID":"anthropic","modelID":"cheap-model",
+                    "time":{"created":1,"completed":2},
+                    "tokens":{"input":9000,"cache":{"read":0,"write":0}}}}"#,
+            ),
+        );
+        feed(
+            &mut state,
+            HookEvent::Stop,
+            &bus("stop", "session.idle", r#"{"sessionID":"ses_child"}"#),
+        );
+
+        assert_eq!(state.status, SessionStatus::Active, "settled mid-turn");
+        assert_eq!(state.session_id.as_deref(), Some("ses_root"));
+        assert_eq!(state.context_tokens, Some(175));
+        assert_eq!(state.model.as_deref(), Some("anthropic/some-model-1"));
+        assert_eq!(state.name.as_deref(), Some("the real work"));
+    }
+
+    /// The one thing a child *can* address to the user: opencode stops the
+    /// whole turn on a permission ask whichever session raised it, so a child's
+    /// ask and its reply both pass the gate.
+    #[test]
+    fn a_childs_approval_request_still_blocks_the_row() {
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("ses_root".to_string());
+        state.child_session_ids = vec!["ses_child".to_string()];
+
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            &bus(
+                "permission-request",
+                "permission.asked",
+                r#"{"id":"per_9","sessionID":"ses_child","permission":"bash",
+                    "patterns":["rm *"],"metadata":{},"always":false}"#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+        assert_eq!(state.session_id.as_deref(), Some("ses_root"));
+
+        feed(
+            &mut state,
+            HookEvent::ElicitationResult,
+            &bus(
+                "elicitation-result",
+                "permission.replied",
+                r#"{"sessionID":"ses_child","requestID":"per_9","reply":"once"}"#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+    }
+
+    /// A bare session id never displaces a known one — only a payload proving
+    /// rootness re-points the row. This closes the window where a child
+    /// resumed from an earlier process (whose lineage this launcher never saw)
+    /// speaks before the `session.updated` that would condemn it; and an
+    /// in-process switch to another root still lands, because the root's own
+    /// `session.updated` re-proves its id on every prompt.
+    #[test]
+    fn only_a_rootness_proving_payload_repoints_the_session_id() {
+        let mut state = state_at(SessionStatus::Idle);
+        // Fresh launch: the first bare id is adopted — nothing is known yet.
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload("prompt-submit", r#"{"sessionID":"ses_root"}"#),
+        );
+        assert_eq!(state.session_id.as_deref(), Some("ses_root"));
+
+        // A resumed child's first event, by bare id: dispatched (the parent
+        // *is* mid-turn) but not adopted.
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload("prompt-submit", r#"{"sessionID":"ses_stale_child"}"#),
+        );
+        assert_eq!(state.session_id.as_deref(), Some("ses_root"));
+
+        // Switching to another root session: full info, no parent — adopted.
+        feed(
+            &mut state,
+            HookEvent::CwdChanged,
+            &bus(
+                "cwd-changed",
+                "session.updated",
+                r#"{"info":{"id":"ses_root2","title":"other work",
+                    "directory":"/home/miao/q"}}"#,
+            ),
+        );
+        assert_eq!(state.session_id.as_deref(), Some("ses_root2"));
     }
 
     /// Both compaction edges are registered, so a row leaves `Compacting` on

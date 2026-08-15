@@ -551,6 +551,7 @@ mod tests {
             agent: AgentControl::Codex,
             launcher_pid: 1,
             session_id: session_id.map(str::to_string),
+            child_session_ids: Vec::new(),
             window_id: None,
             tab_id: None,
             cwd: String::new(),
