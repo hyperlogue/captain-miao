@@ -1530,7 +1530,7 @@ fn a_row_held_by_another_client_reads_apart_from_a_free_one() {
     assert_eq!(kind(&d, 3), Some(Detached::Free), "unknown is not held");
     assert_eq!(kind(&d, 4), None, "a row with a window here isn't detached");
 
-    // Both glyphs actually reach the override column, and they differ.
+    // Both glyphs actually reach the override indicator, and they differ.
     let out = d.render();
     assert!(out.contains('\u{1F648}'), "the free row keeps 🙈");
     assert!(out.contains('\u{1F440}'), "the held row draws 👀");
@@ -6272,14 +6272,35 @@ fn override_glyphs_measure_what_they_paint() {
     use unicode_width::UnicodeWidthStr;
     let pin = "\u{1F4CC}";
     let dot = "\u{25C9}";
-    assert_eq!(pin.width(), 2, "pin glyph must measure two cells");
+    // Every secondary, not just the one rendered below: the slot is sized for
+    // the class, so a 1-cell replacement would pass the render assertions (the
+    // pad simply absorbs it) while breaking measure==paint.
+    for (name, glyph) in [
+        ("pin", pin),
+        ("out-of-sight", "\u{1F648}"),
+        ("held-elsewhere", "\u{1F440}"),
+    ] {
+        assert_eq!(glyph.width(), 2, "{name} secondary must measure two cells");
+    }
     assert_eq!(dot.width(), 1, "follow-up dot must measure one cell");
+    // `width()` alone cannot tell the legal dot from the illegal class the
+    // comment above names: `●` U+25CF and `•` U+2022 also measure 1, and swapping
+    // either in would leave every other assertion here green while an
+    // ambiguous-as-wide terminal painted them 2. East-Asian-Width Ambiguous is
+    // precisely what `width_cjk` resolves the other way, so this is the
+    // assertion that actually pins the glyph's class.
+    assert_eq!(
+        dot.width_cjk(),
+        1,
+        "follow-up dot must not be East-Asian-Width Ambiguous — a CJK-configured \
+         terminal paints those two cells wide while `width()` still says one"
+    );
     // The indent is sized for the worst case: both slots occupied at once.
     assert_eq!(
         dot.width() + pin.width(),
         super::format::OVERRIDE_COL_WIDTH as usize,
         "the indent must be exactly wide enough for both slots — narrower \
-         silently clips the dot the glyphs are right-packed against"
+         silently clips the dot in the cell before the status label"
     );
 
     let mut d = TestDashboard::new(120, 18);
