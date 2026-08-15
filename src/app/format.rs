@@ -484,14 +484,33 @@ pub(crate) enum Detached {
     HeldElsewhere,
 }
 
-/// Renders the override column. The follow-up dot sits on the left and a
+/// Width of the override indicator: the 1-cell follow-up dot plus one 2-cell
+/// emoji slot for the secondary. It is the *indent* on the status column rather
+/// than a column of its own — see [`override_indicator_spans`] for why — so the
+/// status column's constraint is this plus the widest status label.
+pub(super) const OVERRIDE_COL_WIDTH: u16 = 3;
+
+/// The override indicator, as the leading spans of the **status** cell: always
+/// exactly [`OVERRIDE_COL_WIDTH`] cells, blank-padded on the left so the glyphs
+/// sit right against the status label. The follow-up dot sits on the left and a
 /// secondary indicator (pin or detached) sits on the right; without a dot, the
 /// secondary occupies the left position alone.
 ///
+/// Why it rides *inside* the status cell instead of getting a column: ratatui's
+/// `column_spacing` is one table-wide value, so a column of its own can only be
+/// followed by the same gap every other column gets — a cell that is blank on
+/// every row that has no flag, on top of the padding this already emits. Folding
+/// it in drops that cell without touching the gap between any other pair. It
+/// reads as a status modifier anyway: follow-up already recolours the status
+/// label through [`status_fg`].
+///
+/// Padding here rather than at the call site is what keeps the constraint honest
+/// — the return value *is* the width the layout reserves, so the two can't drift.
+///
 /// Layout note: the invariant is **measured width == painted width**, not "emoji
-/// only". `OVERRIDE_COL_WIDTH` is the 1-cell dot plus the 2-cell secondary and
-/// the slots pack tight (`[L][R][R]`) with no separator between them, so any
-/// glyph whose paint disagrees with `unicode-width` shifts everything after it.
+/// only". The dot and the secondary pack tight (`[pad][L][R][R]`) with no
+/// separator between them, so any glyph whose paint disagrees with
+/// `unicode-width` shifts everything after it.
 /// That is what the Nerd Font PUA glyphs this column used to carry got wrong:
 /// they measure 1 and paint 2, so ratatui's diff never skipped the following
 /// cell and a neighbouring column's update clipped the glyph's right half —
@@ -503,11 +522,12 @@ pub(crate) enum Detached {
 /// terminal configured ambiguous-as-wide paints them 2 while `unicode-width`
 /// still says 1, which is the half-painted bug all over again. Nothing here may
 /// need a VS16 to reach its presentation, for the same reason.
-pub(super) fn override_indicator_cell(
+pub(super) fn override_indicator_spans(
     follow_up: bool,
     pinned: bool,
     detached: Option<Detached>,
-) -> Cell<'static> {
+) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthStr;
     // The dot is a *text* glyph, so unlike the emoji below it the fg actually
     // paints — which is why it reads from `attention_fg` rather than a hardcoded
     // yellow: it marks the same state `status_fg` recolours the status text for,
@@ -544,13 +564,18 @@ pub(super) fn override_indicator_cell(
         }
     };
 
-    let line = match (follow_up, secondary) {
-        (true, Some(s)) => Line::from(vec![dot, s]),
-        (true, None) => Line::from(vec![dot]),
-        (false, Some(s)) => Line::from(vec![s]),
-        (false, None) => Line::from(""),
+    let glyphs = match (follow_up, secondary) {
+        (true, Some(s)) => vec![dot, s],
+        (true, None) => vec![dot],
+        (false, Some(s)) => vec![s],
+        (false, None) => Vec::new(),
     };
-    Cell::from(line.alignment(Alignment::Right))
+    let used: usize = glyphs.iter().map(|s| s.content.width()).sum();
+    let mut spans = vec![Span::raw(
+        " ".repeat((OVERRIDE_COL_WIDTH as usize).saturating_sub(used)),
+    )];
+    spans.extend(glyphs);
+    spans
 }
 
 /// Display-cell budget for an auto-title folded from the first prompt. A

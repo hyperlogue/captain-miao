@@ -15,10 +15,10 @@ use crate::config;
 use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
-    DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, ansi_to_lines, bar_segments, bar_style,
-    centered_rect, context_pressure_style, dir_icon_width, elapsed_cell, fade_style,
-    format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
-    override_indicator_cell, pill, session_display_name, truncate_str,
+    DIR_COLORS, DIR_ICON_MAX_CHARS, ELAPSED_MAX_WIDTH, OVERRIDE_COL_WIDTH, ansi_to_lines,
+    bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width, elapsed_cell,
+    fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color, model_label,
+    override_indicator_spans, pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -1395,17 +1395,18 @@ impl App {
         let any_foreign = visible.iter().any(|s| self.foreign_terminal(s).is_some());
         let show_host = !narrow && (self.backends.len() > 1 || any_foreign);
 
+        // Indented past the override indicator the rows carry in this same cell,
+        // so the header sits over the status labels rather than over the glyphs.
+        let status_header = format!("{}Status", " ".repeat(OVERRIDE_COL_WIDTH as usize));
         let header_cells = if narrow {
             vec![
-                Cell::from(""),
-                Cell::from("Status"),
+                Cell::from(status_header),
                 Cell::from(""),
                 Cell::from("Name"),
             ]
         } else {
             vec![
-                Cell::from(""),
-                Cell::from("Status"),
+                Cell::from(status_header),
                 Cell::from(""),
                 Cell::from("Name"),
                 Cell::from(Line::from("Ctx").alignment(Alignment::Right)),
@@ -1498,9 +1499,14 @@ impl App {
                     name_col_max as usize,
                 );
 
-                let override_cell = override_indicator_cell(follow_up, important, detached_kind);
+                // The override indicator is the status cell's indent, not a
+                // column — see `override_indicator_spans`. It brings its own
+                // padding, so the status label always starts at the same offset.
                 let status_fg = super::format::status_fg(&s.status, follow_up);
-                let status_cell = Cell::from(status_text).style(Style::default().fg(status_fg));
+                let mut status_spans =
+                    override_indicator_spans(follow_up, important, detached_kind);
+                status_spans.push(Span::styled(status_text, Style::default().fg(status_fg)));
+                let status_cell = Cell::from(Line::from(status_spans));
                 let name_cell = if search_active {
                     // Cancel the row-level DIM so the name column stays bright.
                     Cell::from(name).style(Style::default().remove_modifier(Modifier::DIM))
@@ -1543,7 +1549,7 @@ impl App {
                 let icon_cell = Cell::from(Line::from(icon_spans));
                 // The narrow layout keeps only status / workdir icon / name; the
                 // context, last-prompt and updated columns are dropped.
-                let mut row_cells = vec![override_cell, status_cell, icon_cell, name_cell];
+                let mut row_cells = vec![status_cell, icon_cell, name_cell];
                 if !narrow {
                     let ctx_tokens = s.context_tokens;
                     // Blank is "no number yet". A backend that persists no
@@ -1595,7 +1601,6 @@ impl App {
                 Row::new(vec![
                     Cell::from(""),
                     Cell::from(""),
-                    Cell::from(""),
                     // The Name column: indented under the names it is standing
                     // in for. Trailing columns are simply absent — ratatui draws
                     // the cells a row has and leaves the rest blank.
@@ -1607,8 +1612,11 @@ impl App {
 
         // Status column fits the longest enum label (and the "Status" header
         // floor) — recomputed from `SessionStatus::ALL` so adding a variant
-        // automatically resizes the column.
-        let status_width = (SessionStatus::max_label_width() as u16).max("Status".len() as u16);
+        // automatically resizes the column — behind the override indicator it
+        // carries as an indent (`override_indicator_spans`, which emits exactly
+        // that many cells).
+        let status_width = (SessionStatus::max_label_width() as u16).max("Status".len() as u16)
+            + OVERRIDE_COL_WIDTH;
 
         // Status / context / elapsed are fixed-width (their content is
         // bounded), so they get hard `Length` constraints. Name and prompt
@@ -1619,14 +1627,12 @@ impl App {
             // Status / icon stay fixed-width; the name column fills the rest and
             // the ratatui table clips it when it doesn't fit.
             vec![
-                Constraint::Length(OVERRIDE_COL_WIDTH),
                 Constraint::Length(status_width),
                 Constraint::Length(icon_col_width),
                 Constraint::Min(10),
             ]
         } else {
             vec![
-                Constraint::Length(OVERRIDE_COL_WIDTH),
                 Constraint::Length(status_width),
                 Constraint::Length(icon_col_width),
                 // Name is a fixed max-width column (see `name_col_max`). Last
@@ -2205,13 +2211,6 @@ impl App {
 /// column of its own, which is exactly what merging into the icon column gave
 /// up.
 const FOREIGN_TERMINAL_GLYPH: &str = "\u{29C9}";
-
-/// Width of the leading override column: the 1-cell follow-up dot plus one
-/// 2-cell emoji slot for the secondary indicator. Sized here rather than inline
-/// because both the narrow and wide constraint lists have to agree with what
-/// `override_indicator_cell` builds — a column narrower than the line
-/// right-aligned into it silently clips the dot.
-pub(super) const OVERRIDE_COL_WIDTH: u16 = 3;
 
 /// One form field's spans, with the cursor drawn where it actually is.
 ///

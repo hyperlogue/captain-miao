@@ -6257,9 +6257,9 @@ fn snapshot_entry_flags_roundtrip_and_back_compat() {
 
 #[test]
 fn override_glyphs_measure_what_they_paint() {
-    // The override column's tight two-slot layout rests on every glyph measuring
-    // exactly what the terminal paints — the invariant is that agreement, not
-    // "emoji only". The secondaries are emoji-presentation codepoints, so
+    // The override indicator's tight two-slot layout rests on every glyph
+    // measuring exactly what the terminal paints — the invariant is that
+    // agreement, not "emoji only". The secondaries are emoji-presentation, so
     // `unicode-width` says 2 and ratatui parks the glyph in one buffer cell,
     // blanks the cell behind it, and its diff then skips that cell — which is
     // what keeps a neighbouring column's update from clipping the glyph's right
@@ -6274,12 +6274,12 @@ fn override_glyphs_measure_what_they_paint() {
     let dot = "\u{25C9}";
     assert_eq!(pin.width(), 2, "pin glyph must measure two cells");
     assert_eq!(dot.width(), 1, "follow-up dot must measure one cell");
-    // The column is sized for the worst case: both slots occupied at once.
+    // The indent is sized for the worst case: both slots occupied at once.
     assert_eq!(
         dot.width() + pin.width(),
-        super::draw::OVERRIDE_COL_WIDTH as usize,
-        "the column must be exactly wide enough for both slots — narrower \
-         silently clips the dot the line is right-aligned against"
+        super::format::OVERRIDE_COL_WIDTH as usize,
+        "the indent must be exactly wide enough for both slots — narrower \
+         silently clips the dot the glyphs are right-packed against"
     );
 
     let mut d = TestDashboard::new(120, 18);
@@ -6329,6 +6329,37 @@ fn override_glyphs_measure_what_they_paint() {
         (x - 1, y),
         "the dot must pack tight against the secondary, no separator"
     );
+}
+
+#[test]
+fn the_override_indent_is_the_width_the_status_column_reserves() {
+    // The indicator has no column of its own — it is the leading spans of the
+    // status cell, and `status_width` adds `OVERRIDE_COL_WIDTH` on the promise
+    // that those spans come out to exactly that. Nothing in the type system
+    // holds the two together, so an added glyph combination that overruns would
+    // simply push the status label right on that one row (or clip the last
+    // column). Every combination, including the empty one, must measure the
+    // same: the label starts at a fixed offset down the whole table.
+    use crate::app::format::{Detached, override_indicator_spans};
+    use unicode_width::UnicodeWidthStr;
+
+    let secondaries = [None, Some(Detached::Free), Some(Detached::HeldElsewhere)];
+    for follow_up in [false, true] {
+        for pinned in [false, true] {
+            for detached in secondaries {
+                let w: usize = override_indicator_spans(follow_up, pinned, detached)
+                    .iter()
+                    .map(|s| s.content.width())
+                    .sum();
+                assert_eq!(
+                    w,
+                    super::format::OVERRIDE_COL_WIDTH as usize,
+                    "follow_up={follow_up} pinned={pinned} detached={detached:?} \
+                     measured {w} cells"
+                );
+            }
+        }
+    }
 }
 
 #[test]
