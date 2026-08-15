@@ -237,6 +237,28 @@ pub fn current_window() -> Option<WindowId> {
     terminal_env().1
 }
 
+/// Whether this process sits in a Ghostty surface that nothing can name — the
+/// one place a hand-typed `miao <agent>` is refused rather than launched.
+///
+/// True exactly when [`resolve_terminal_env`] reached its Ghostty arm: no zellij
+/// pane, no tmux pane, no Kitty window, so there is no id to self-report and the
+/// session would reach the dashboard with no window to focus or close. Every
+/// other shape is false, including the two that look like this one and aren't: a
+/// multiplexer running *inside* Ghostty names its own pane and is claimed by an
+/// earlier arm, and a launch the dashboard or the pool spawned is bound from its
+/// `SpawnResult` and never consults this at all.
+pub fn is_unbindable_ghostty() -> bool {
+    let (identity, window) = terminal_env();
+    is_unbindable(identity.as_deref(), window.as_ref())
+}
+
+/// Pure core of [`is_unbindable_ghostty`], over a resolved
+/// [`resolve_terminal_env`] pair so the two are tested against each other rather
+/// than against a hand-built expectation of what the env resolves to.
+fn is_unbindable(identity: Option<&str>, window: Option<&WindowId>) -> bool {
+    window.is_none() && identity == Some(ghostty_identity().as_str())
+}
+
 /// This process's terminal *instance* identity — `zellij:<ZELLIJ_SESSION_NAME>`
 /// or `kitty:<KITTY_LISTEN_ON|KITTY_PID>`, `None` outside a managed terminal.
 /// Instance-granular so two zellij sessions (each numbering panes 1,2,3…) or two
@@ -571,5 +593,48 @@ mod tests {
     #[test]
     fn no_terminal_env_is_none() {
         assert_eq!(resolve_terminal_env(TerminalEnv::default()), (None, None));
+    }
+
+    #[test]
+    fn only_a_bare_ghostty_is_unbindable() {
+        // What the refusal in `run_launch_with` keys on. Fed from
+        // `resolve_terminal_env` rather than from hand-built pairs, so the two
+        // cannot drift: whatever the precedence decides is what this sees.
+        let unbindable = |env| {
+            let (id, win) = resolve_terminal_env(env);
+            is_unbindable(id.as_deref(), win.as_ref())
+        };
+        assert!(unbindable(TerminalEnv {
+            term_program: Some("ghostty".into()),
+            ..Default::default()
+        }));
+
+        // A multiplexer inside Ghostty names its own pane, so a hand launch
+        // there binds fine and must not be refused — the misfire this pins.
+        assert!(!unbindable(TerminalEnv {
+            tmux: Some("/tmp/s,4242,0".into()),
+            tmux_pane: Some("%5".into()),
+            term_program: Some("ghostty".into()),
+            ..Default::default()
+        }));
+        assert!(!unbindable(TerminalEnv {
+            zellij_pane: Some("3".into()),
+            zellij_session: Some("work".into()),
+            term_program: Some("ghostty".into()),
+            ..Default::default()
+        }));
+        assert!(!unbindable(TerminalEnv {
+            term_program: Some("ghostty".into()),
+            ..kitty_env()
+        }));
+
+        // Nor is a terminal we don't drive at all: those bind no window either,
+        // but captain-miao makes no claim about them, so refusing a launch there
+        // would be refusing on someone else's behalf.
+        assert!(!unbindable(TerminalEnv {
+            term_program: Some("iTerm.app".into()),
+            ..Default::default()
+        }));
+        assert!(!unbindable(TerminalEnv::default()));
     }
 }

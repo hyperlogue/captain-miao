@@ -142,6 +142,8 @@ Three things work differently here, all of them because the dictionary has no wa
 
 Sessions always get their own tab: Ghostty has neither a stack layout nor floating panes, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
 
+**Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij *inside* Ghostty the pane names itself, so hand launches work there exactly as they always have.
+
 ## Usage
 
 Run the dashboard inside a supported terminal (Kitty, Ghostty, zellij or tmux):
@@ -165,7 +167,7 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`.
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
 
 #### Reasonix support
 

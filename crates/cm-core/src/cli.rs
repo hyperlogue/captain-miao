@@ -105,6 +105,21 @@ async fn run_launch_with(
     // agent passthrough so neither reaches the agent.
     let (pool_session, args) = take_pool_session(args);
     let (launch_id, args) = take_launch_id(args);
+    // Refuse a hand launch that could never be bound to its window. Ghostty
+    // exports no per-surface id, so this session would reach the dashboard
+    // listed but inert — `Enter` unable to focus it, `D` unable to close it —
+    // and the failure would show up much later, on the row, rather than here
+    // where it can be explained. The two token-bearing launches are exempt
+    // because neither self-reports: both are bound from the spawn that made
+    // them, so this never fires on the path the message recommends.
+    if launch_id.is_none() && pool_session.is_none() && crate::terminal::is_unbindable_ghostty() {
+        anyhow::bail!(
+            "Ghostty exports no per-surface id, so a session started by hand here could not be \
+             bound to its window: the dashboard would list it but could not focus or close it.\n\n\
+             Start it from the dashboard instead — `o` for this directory, `O` to choose one — \
+             which records the window from the spawn itself."
+        );
+    }
     let (cwd, args) = split_cwd(args);
     let cwd = std::fs::canonicalize(&cwd)
         .map(|p| p.to_string_lossy().to_string())

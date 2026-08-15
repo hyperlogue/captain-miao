@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A hand-typed `miao <agent>` in a bare Ghostty window is refused**, naming
+  `o` / `O` instead. Ghostty exports no per-surface id, so such a session can
+  never be bound to its window: it would list in the dashboard but neither
+  focus nor close. Only that exact shape is refused — a dashboard or pool
+  launch is bound from its own spawn, and a tmux or zellij pane inside Ghostty
+  names itself, so both go through as before.
 - **The agent cycle key offers only backends that are installed**, instead of
   cycling through seven and failing at launch.
 - **`f` hides itself on a backend whose resume cannot branch**, rather than
