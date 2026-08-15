@@ -424,6 +424,22 @@ fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
 
 static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 
+/// Which backends the environment says are actually **live** — each one's own
+/// `from_env` having already vouched for it — as one snapshot.
+///
+/// A named struct rather than a positional bool list, for the reason
+/// [`cm_core::terminal::TerminalEnv`] is one: every field has the same type, so
+/// a mis-ordered call would type-check and then quietly pick a backend that
+/// cannot drive the terminal this process is in. Kitty has no field because it
+/// is the fallback rather than a positive signal — [`detect_backend`] reaches it
+/// when nothing else claims the process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LiveBackends {
+    pub zellij: bool,
+    pub tmux: bool,
+    pub ghostty: bool,
+}
+
 /// Which backend `get()` should build: a config override wins, then a live
 /// zellij session, then a live tmux server, then a Ghostty surface, then Kitty
 /// as the status-quo fallback. Pure (env reads stay at the `get()` edge) so the
@@ -446,17 +462,12 @@ static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 /// strictly weaker signal: `KITTY_WINDOW_ID` names a window, `TERM_PROGRAM` names
 /// only a vendor. The two never co-occur in practice, so the order between them
 /// is a tie-break rather than a policy.
-fn detect_backend(
-    over: Option<ConfiguredBackend>,
-    in_zellij: bool,
-    in_tmux: bool,
-    in_ghostty: bool,
-) -> ConfiguredBackend {
+fn detect_backend(over: Option<ConfiguredBackend>, live: LiveBackends) -> ConfiguredBackend {
     match over {
         Some(b) => b,
-        None if in_zellij => ConfiguredBackend::Zellij,
-        None if in_tmux => ConfiguredBackend::Tmux,
-        None if in_ghostty => ConfiguredBackend::Ghostty,
+        None if live.zellij => ConfiguredBackend::Zellij,
+        None if live.tmux => ConfiguredBackend::Tmux,
+        None if live.ghostty => ConfiguredBackend::Ghostty,
         None => ConfiguredBackend::Kitty,
     }
 }
@@ -470,22 +481,19 @@ fn detect_backend(
 /// `ZELLIJ_SESSION_NAME`/`KITTY_PID` presence check did. Kitty is "present" when
 /// it exported its process env (`KITTY_PID`).
 pub fn supported_terminal_present() -> bool {
-    let in_zellij = zellij::ZellijTerminal::from_env().is_some();
-    let in_tmux = tmux::TmuxTerminal::from_env().is_some();
-    let in_ghostty = ghostty::GhosttyTerminal::from_env().is_some();
-    match detect_backend(
-        config::get().terminal.backend,
-        in_zellij,
-        in_tmux,
-        in_ghostty,
-    ) {
+    let live = LiveBackends {
+        zellij: zellij::ZellijTerminal::from_env().is_some(),
+        tmux: tmux::TmuxTerminal::from_env().is_some(),
+        ghostty: ghostty::GhosttyTerminal::from_env().is_some(),
+    };
+    match detect_backend(config::get().terminal.backend, live) {
         // `get()` builds a non-Kitty backend only when one is actually live; when
         // it isn't (config pinned zellij/tmux/ghostty outside one, or pinned
         // ghostty off macOS) `get()` falls back to Kitty, so the gate then
         // requires Kitty like the Kitty arm.
-        ConfiguredBackend::Zellij if in_zellij => true,
-        ConfiguredBackend::Tmux if in_tmux => true,
-        ConfiguredBackend::Ghostty if in_ghostty => true,
+        ConfiguredBackend::Zellij if live.zellij => true,
+        ConfiguredBackend::Tmux if live.tmux => true,
+        ConfiguredBackend::Ghostty if live.ghostty => true,
         ConfiguredBackend::Zellij
         | ConfiguredBackend::Tmux
         | ConfiguredBackend::Ghostty
@@ -521,12 +529,12 @@ pub fn get() -> &'static dyn Terminal {
         let zellij = zellij::ZellijTerminal::from_env();
         let tmux = tmux::TmuxTerminal::from_env();
         let ghostty = ghostty::GhosttyTerminal::from_env();
-        match detect_backend(
-            config::get().terminal.backend,
-            zellij.is_some(),
-            tmux.is_some(),
-            ghostty.is_some(),
-        ) {
+        let live = LiveBackends {
+            zellij: zellij.is_some(),
+            tmux: tmux.is_some(),
+            ghostty: ghostty.is_some(),
+        };
+        match detect_backend(config::get().terminal.backend, live) {
             ConfiguredBackend::Zellij => match zellij {
                 Some(z) => Box::new(z) as Box<dyn Terminal>,
                 // Only reachable when the config forced zellij with no session

@@ -80,19 +80,21 @@ fn tail_lines_returns_last_n() {
 fn detect_backend_override_beats_env() {
     // An explicit `[terminal] backend` pins the backend regardless of env —
     // including forcing Kitty while inside a nested multiplexer (and vice versa).
-    for in_zellij in [true, false] {
-        for in_tmux in [true, false] {
-            for in_ghostty in [true, false] {
+    for zellij in [true, false] {
+        for tmux in [true, false] {
+            for ghostty in [true, false] {
                 for pinned in [
                     ConfiguredBackend::Kitty,
                     ConfiguredBackend::Tmux,
                     ConfiguredBackend::Zellij,
                     ConfiguredBackend::Ghostty,
                 ] {
-                    assert_eq!(
-                        detect_backend(Some(pinned), in_zellij, in_tmux, in_ghostty),
-                        pinned
-                    );
+                    let live = LiveBackends {
+                        zellij,
+                        tmux,
+                        ghostty,
+                    };
+                    assert_eq!(detect_backend(Some(pinned), live), pinned);
                 }
             }
         }
@@ -106,24 +108,29 @@ fn detect_backend_prefers_zellij_then_tmux_then_ghostty_then_kitty() {
     // TERM_PROGRAM), else Kitty is the status-quo fallback. Zellij stays ahead
     // of tmux when both are live — the env can't say which is inner, and this
     // order keeps existing zellij users unchanged.
+    let live = |zellij, tmux, ghostty| LiveBackends {
+        zellij,
+        tmux,
+        ghostty,
+    };
     assert_eq!(
-        detect_backend(None, true, true, true),
+        detect_backend(None, live(true, true, true)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, true, false, true),
+        detect_backend(None, live(true, false, true)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, false, true, true),
+        detect_backend(None, live(false, true, true)),
         ConfiguredBackend::Tmux
     );
     assert_eq!(
-        detect_backend(None, false, false, true),
+        detect_backend(None, live(false, false, true)),
         ConfiguredBackend::Ghostty
     );
     assert_eq!(
-        detect_backend(None, false, false, false),
+        detect_backend(None, LiveBackends::default()),
         ConfiguredBackend::Kitty
     );
 }
