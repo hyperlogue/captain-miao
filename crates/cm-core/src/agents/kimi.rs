@@ -33,10 +33,27 @@
 //! carrying a different title, and an empty one is already dropped by the shared
 //! adopter (it means "not titled yet", not "renamed to nothing").
 //!
-//! **Isolation is the Codex pattern, unchanged.** `KIMI_CODE_HOME` relocates the
-//! entire data dir, so `<state>/kimi-home/` is a symlink farm over the real
-//! `~/.kimi-code/` with `config.toml` a writable **copy** carrying our
-//! `[[hooks]]` entries. Copy rather than symlink is the lesson Codex already
+//! **Isolation is the Codex pattern, hardened.** `KIMI_CODE_HOME` relocates the
+//! entire data dir — config, `sessions/`, **credentials** — and kimi ships no
+//! narrower knob (no config flag, no config env var; the `configPath` seam in
+//! its bootstrap is SDK-only). So `<state>/kimi-home/` is a symlink farm over
+//! the real `~/.kimi-code/` with `config.toml` a writable **copy** carrying our
+//! `[[hooks]]` entries — and because the farm relocates *state*, the state
+//! entries must exist to be linked before the agent can mint them as shadows:
+//! [`ensure_synth_home`] seeds the real home's state dirs and dangling-links
+//! `session_index.jsonl` first, so a first-ever session's transcripts, index
+//! line and login all land in the real home rather than in a shadow the mirror
+//! later quarantines.
+//!
+//! The one divergence the copy cannot avoid: **kimi writes back to
+//! `config.toml`** (`/model`, OAuth token refresh, `/update-config`), and those
+//! writes land in the copy. They survive across launches (the reseed is keyed
+//! on the *real* file changing) but are clobbered the next time the user edits
+//! their real config, and never propagate back. The fix worth wanting is
+//! upstream — a `KIMI_CODE_CONFIG` wired to the `configPath` its bootstrap
+//! already takes would let the hooks travel without the copy at all.
+//!
+//! Copy rather than symlink is the lesson Codex already
 //! paid for (AGENTS.md; a symlinked config gave a split-brain database), and it
 //! buys a second thing here: the config we edit is *ours*, so a `[[hooks]]`
 //! block Kimi rejects can only break a captain-miao session's config, never the
@@ -51,17 +68,16 @@
 //!
 //! - **`sessions/` is reached through a symlink**, and on macOS the notify event
 //!   reports the resolved path while Linux echoes the registered one. Kimi's tree
-//!   has the same shape, so it inherits the same handling — inert today, since
-//!   nothing of ours watches a Kimi transcript (below).
+//!   has the same shape, so it inherits the same handling — live, since the
+//!   launcher watches the wire log named on every payload (below).
 //! - **`sessions/<workDirKey>/<sessionId>/agents/*/wire.jsonl` is almost
 //!   certainly appended through a long-held fd**, the condition that defeats
 //!   macOS FSEvents entirely, so [`crate::agent::AgentControl::transcript_poll_interval`]
 //!   answers `Some(2s)` there, matching Codex. **This machine is Linux and cannot
-//!   test it** — that is unverified, and no macOS support is claimed. It is also
-//!   *moot* today and set anyway: no hook payload names a transcript, so the
-//!   launcher starts no watch of either kind. It is set now so that whoever wires
-//!   a transcript path up does not silently inherit an event-driven watch macOS
-//!   cannot deliver.
+//!   test it** — that is unverified, and no macOS support is claimed. And it is
+//!   live, not precautionary: [`parse_hook_payload`] resolves the wire log from
+//!   the session id and names it on every payload, so the launcher does start
+//!   this watch.
 //!
 //! **The token and model columns come off `wire.jsonl`, and the schema is not
 //! guessed.** `agent-core-v2` ships a *generated* manifest of its whole wire
@@ -400,9 +416,22 @@ fn launch_args(extra: &[String]) -> Vec<String> {
 /// live inside the config, which is why this backend needs the copy mechanism
 /// that Reasonix did not.
 fn ensure_synth_home(hooks_toml: &str) -> Result<PathBuf> {
+    let real = kimi_home();
+    // Pre-seed the real home's state tree before mirroring, so every entry the
+    // agent writes state into exists to be linked **from the first launch**.
+    // Without this, a first-ever Kimi session mints `sessions/` (or, worse,
+    // `credentials/` during a first login) *inside* the synthetic home as a
+    // shadow: the dashboard, resolving the real home, never sees it, and the
+    // shadow is quarantined the moment the real home grows the name. The dirs
+    // and modes are exactly what kimi itself creates (0700; its storage
+    // service is seeded 0700/0600), so seeding them early changes nothing the
+    // agent would not have done.
+    if let Some(real) = &real {
+        seed_real_state(real);
+    }
     let home = SynthHome {
         dir: synth_home(),
-        real: kimi_home(),
+        real: real.clone(),
         owned: &[],
         copied: &[CopiedEntry {
             name: "config.toml",
@@ -411,8 +440,43 @@ fn ensure_synth_home(hooks_toml: &str) -> Result<PathBuf> {
         prune: false,
     };
     home.ensure()?;
+    // `session_index.jsonl` is a top-level *file* appended on every session
+    // create, so it can't be pre-created as a directory and pre-creating an
+    // empty file would be writing state kimi didn't. A **dangling** link is
+    // the right tool instead — `open(O_CREAT)` follows it, so the agent's
+    // first append lands the file in the real home (the property
+    // `super::synth_home` documents on its linking pass).
+    if let Some(real) = &real {
+        let link = home.dir.join(SESSION_INDEX);
+        if std::fs::symlink_metadata(&link).is_err() {
+            let _ = std::os::unix::fs::symlink(real.join(SESSION_INDEX), &link);
+        }
+    }
     merge_hooks(&home.dir.join("config.toml"), hooks_toml);
     Ok(home.dir)
+}
+
+/// The real-home state directories seeded by [`ensure_synth_home`] — the ones
+/// kimi is documented to write into (`data-locations.md`), each of which would
+/// otherwise be minted as a synthetic-home shadow on a machine where kimi has
+/// not created it yet. Config-shaped entries (`config.toml`, `tui.toml`,
+/// `mcp.json`, `AGENTS.md`) are deliberately absent: creating those speaks for
+/// the user.
+const SEEDED_STATE_DIRS: &[&str] = &["sessions", "credentials", "logs", "updates", "user-history"];
+
+/// Create the seeded dirs (and the real home itself) owner-only, matching the
+/// modes kimi mints. Only ever *creates* — an existing dir keeps whatever
+/// modes the user or agent gave it. Best-effort: a failure here reproduces the
+/// pre-seeding status quo rather than adding a new failure mode.
+fn seed_real_state(real: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in
+        std::iter::once(real.to_path_buf()).chain(SEEDED_STATE_DIRS.iter().map(|d| real.join(d)))
+    {
+        if std::fs::symlink_metadata(&dir).is_err() && std::fs::create_dir_all(&dir).is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
 }
 
 /// The substring that identifies a `[[hooks]]` entry as ours. Every command we
@@ -1145,6 +1209,38 @@ mod tests {
         feed(&mut state, HookEvent::StopFailure, &stdin);
         assert_eq!(state.status, SessionStatus::Idle);
         assert_eq!(state.last_error.as_deref(), Some(stdin.as_str()));
+    }
+
+    /// Seeding creates exactly the agent-written state dirs, owner-only, and
+    /// never touches one that already exists — the user's own modes stand.
+    #[test]
+    fn seeding_creates_missing_state_dirs_and_leaves_existing_ones_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("cm-kimi-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::set_permissions(
+            home.join("sessions"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        seed_real_state(&home);
+
+        for dir in SEEDED_STATE_DIRS {
+            let meta = std::fs::metadata(home.join(dir)).expect(dir);
+            assert!(meta.is_dir());
+        }
+        let mode = |p: &str| {
+            std::fs::metadata(home.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("credentials"), 0o700, "created owner-only");
+        assert_eq!(mode("sessions"), 0o755, "an existing dir keeps its mode");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn scratch_config(name: &str, body: &str) -> PathBuf {
