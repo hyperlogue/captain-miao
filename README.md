@@ -42,6 +42,8 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44    | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
 | **[tmux](https://github.com/tmux/tmux)** ≥ 3.2               | One window per session.                                                                                                                                                     |
 
+Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Everywhere else it's a `🐾` glyph and clicking it does nothing.
+
 ### Agents
 
 | Agent                                                         | Notes                                                                                                                                                                                                                                                           |
