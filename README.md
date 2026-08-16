@@ -311,7 +311,9 @@ sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle
 rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
 
 [launcher]
-default_agent = "claude"     # backend for new sessions: "claude" | "codex" (Space a overrides)
+default_agent = "claude"     # backend for new sessions: "claude" | "codex" | "reasonix" |
+                             # "kimi" | "grok" | "opencode" | "pi"; a name this build can't
+                             # drive falls back to Claude (Space a overrides)
 approval_grace_secs = 2      # grace window after a permission dialog before a transcript change reads as "dismissed"
 max_recent_cwds = 50         # entries kept in the workdir picker's recent list
 resume_list_limit = 50       # max sessions listed in the resume picker (most recent first)
