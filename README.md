@@ -143,6 +143,8 @@ Three things work differently here, all of them because the dictionary has no wa
 
 Sessions always get their own tab: Ghostty has neither a stack layout nor floating panes, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
 
+**Ending a session doesn't interrupt you.** Ghostty confirms before closing a surface whose command is still running (`confirm-close-surface`, on by default), and it asks *on that tab* — so a close arriving while the process was alive switched you away from the dashboard to answer a dialog. `D` and a restart signal the session and let it exit first; a Ghostty surface whose command has exited closes itself, so by then there is nothing left to confirm. The exception is a **pooled** session's attach window: the process in it is a local `ssh` that captain-miao holds no pid for, so closing that one still asks. Set `confirm-close-surface = false` if you would rather never be asked.
+
 **Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij *inside* Ghostty the pane names itself, so hand launches work there exactly as they always have.
 
 ## iTerm2 setup

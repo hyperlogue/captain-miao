@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ending or restarting a session closes its window *after* the process in it
+  exits**, instead of tearing the window down around a live process. On Ghostty
+  that showed as a dialog: it confirms before closing a surface whose command is
+  still running, and asks on the doomed tab, so `D` switched you away from the
+  dashboard to answer a prompt. The signalled session now gets a moment to go,
+  and since a surface whose command has exited closes itself, there is usually
+  nothing left to close. It also gives the launcher its own exit path back — it
+  removes its state file and tears down the per-session hooks. A pooled
+  session's attach window is unchanged: its local `ssh` is a process captain-miao
+  holds no pid for.
 - **A Claude session started from the dashboard no longer inherits the
   launching session's own environment.** A terminal hands its environment to
   everything it runs, so an emulator (or a tmux/zellij server) that was itself

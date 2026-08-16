@@ -385,10 +385,12 @@ impl App {
                 // `ssh attach` window, or `None` for a remote we aren't attached to
                 // (signal only) — §15.3.
                 let window_id = self.window_id_for_session(&s);
+                let window_pid = self.window_process_pid(&s);
                 Some(Action::KillSession {
                     key: s.key(),
                     host: s.host,
                     window_id,
+                    window_pid,
                 })
             }
             Command::DetachRemote => {

@@ -1045,6 +1045,33 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
     assert_eq!(d.app.selected_window_id(), Some(WindowId::from(900u64)));
 }
 
+/// The pid a teardown waits on before closing a window must be one *this*
+/// machine's process table can answer for, and only an unpooled session's is:
+/// such a session is its window, so `launcher_pid` is the process running in it.
+///
+/// The two `None` cases are the point. A pooled session's window runs an attach
+/// client and its `launcher_pid` lives in the pool's namespace — which under
+/// pooled-localhost is this very machine, so the number would resolve to a live
+/// local process that has nothing to do with the row. A row whose host has left
+/// the config resolves to no backend at all, and that must read as "no pid"
+/// rather than fall through to the unpooled answer, for exactly the same reason.
+#[test]
+fn only_an_unpooled_session_offers_a_pid_to_wait_on() {
+    let d = TestDashboard::new(100, 10);
+    let s = session(4242, "/tmp/p", SessionStatus::Idle);
+
+    // Local (unpooled): the window runs the launcher, so its pid is the answer.
+    assert_eq!(d.app.window_process_pid(&s), Some(4242));
+
+    // A host with no backend behind it yields nothing to wait on, so the caller
+    // closes the window the way it always did.
+    let orphan = LauncherState {
+        host: crate::state::HostId("since-removed".into()),
+        ..s.clone()
+    };
+    assert_eq!(d.app.window_process_pid(&orphan), None);
+}
+
 /// The host glyph shares the workdir-icon column rather than holding a Host
 /// column of its own — `<host><workdir>`, and no `Host` header anywhere. Both
 /// halves are fixed slots, so the column is the same width whether or not a row

@@ -126,6 +126,10 @@ pub(super) enum Action {
         /// at signal time, so a stale row can't make it kill a recycled pid.
         key: SessionKey,
         window_id: Option<WindowId>,
+        /// The local pid `window_id` is running, when we can see one
+        /// ([`App::window_process_pid`]) — waited on so the window closes after
+        /// its process rather than on top of it.
+        window_pid: Option<u32>,
     },
     /// Detach from a remote session: close its local `ssh attach` window but
     /// leave the pooled session running on the host (no kill). The binding is
@@ -205,6 +209,11 @@ pub(super) struct RestartSpec {
     /// The local window to close after relaunching, if the dashboard has one. A
     /// detached pooled session has none.
     pub(super) window_id: Option<WindowId>,
+    /// The local pid `window_id` is running ([`App::window_process_pid`]), so
+    /// the old window is closed after its process has gone rather than while it
+    /// is still there. Unused when `kill_old` is false — nothing is signalled,
+    /// so there is nothing to wait for.
+    pub(super) window_pid: Option<u32>,
     pub(super) cwd: String,
     pub(super) session_id: String,
     /// Status flags to re-apply once the relaunched session appears under its
@@ -4040,6 +4049,31 @@ impl App {
         s.host.is_local().then(|| s.window_id.clone()).flatten()
     }
 
+    /// The pid of the process this dashboard's window is actually running, when
+    /// that is a pid *this* machine can see — so a teardown can let it exit
+    /// before closing the window out from under it (`close_window_when_free`).
+    ///
+    /// Only an **unpooled** session qualifies, and the gate is the capability
+    /// rather than the host: such a session *is* its window, so the window runs
+    /// the launcher and `launcher_pid` names it. A pooled session's window runs
+    /// an attach client instead, and its `launcher_pid` belongs to the pool's
+    /// process namespace — which under pooled-localhost is this same machine, so
+    /// a locality test would hand back a live local pid belonging to something
+    /// else entirely.
+    ///
+    /// `None` therefore means "no pid to wait on", not "nothing is running": the
+    /// caller closes the window the old way, which is all it ever did.
+    ///
+    /// A backend must say so *positively*: a row whose host has since left the
+    /// config resolves to no backend at all, and reading that as "not pooled"
+    /// would hand back the very thing the capability gate exists to refuse — a
+    /// remote launcher's pid, tested against this machine's process table.
+    pub(super) fn window_process_pid(&self, s: &LauncherState) -> Option<u32> {
+        self.backend_for(&s.host)
+            .is_some_and(|b| !b.capabilities().pooled)
+            .then_some(s.launcher_pid)
+    }
+
     /// The terminal instance a *local* session lives in when it differs from the
     /// dashboard's own — `Some(identity)` marks a foreign, window-inert row (D6);
     /// `None` for a same-terminal, terminal-less, or remote session. Local rows
@@ -4723,6 +4757,7 @@ impl App {
             // `None` for a detached pooled session: there is no local window to
             // close, and the old pty is torn down by the kill on its own host.
             window_id: self.window_id_for_session(s),
+            window_pid: self.window_process_pid(s),
             cwd: s.cwd.clone(),
             session_id,
             flags: self.flags_of(&flag_key(s)),

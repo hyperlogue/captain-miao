@@ -351,6 +351,62 @@ fn apply_resume_load(app: &mut App, load: ResumeLoad) {
     app.set_status(msg, true);
 }
 
+/// How long a signalled process gets to exit on its own before its window is
+/// closed anyway. Long enough for an agent to finish flushing (a SIGTERM'd
+/// session is normally gone in well under a second, and the launcher's own exit
+/// follows immediately), short enough that a wedged one still leaves within a
+/// couple of heartbeats rather than parking a window forever.
+const WINDOW_EXIT_GRACE: Duration = Duration::from_secs(3);
+const WINDOW_EXIT_POLL: Duration = Duration::from_millis(25);
+
+/// Close a session's window once the process inside it has gone — in the
+/// background, so a keystroke never waits on it.
+///
+/// The close used to fire the instant the signal was sent, which asks a terminal
+/// to tear down a window whose process is still live. Two things come of that.
+/// The launcher loses the chance to run its own exit path (it removes its state
+/// file and tears down the per-session hooks `--settings` injected), and a
+/// terminal that *checks* refuses to do it quietly: Ghostty raises its
+/// close-confirmation dialog, switching to the doomed tab to ask — so ending a
+/// session put a prompt on screen instead of taking a row off it.
+///
+/// Waiting turns the close into a fallback rather than the mechanism. Every
+/// backend captain-miao drives runs a session's command directly with no hold,
+/// so a window whose process exits closes *itself*; by the time this fires there
+/// is usually nothing left to close and the id no longer resolves. That is why
+/// the close still happens unconditionally afterwards: it costs an ignored error
+/// in the ordinary case (surface ids never recycle, so it cannot hit anything
+/// else) and it is the only thing that clears the window in the two cases that
+/// matter — a process that ignored the signal, and a backend configured to hold
+/// its windows open.
+///
+/// `pid` is `None` whenever there is no local pid to watch (a pooled session's
+/// window runs an attach client, not the launcher — see
+/// [`App::window_process_pid`]), and then this is exactly the old behaviour.
+fn close_window_when_free(window_id: WindowId, pid: Option<u32>) {
+    tokio::spawn(async move {
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + WINDOW_EXIT_GRACE;
+            while process_is_alive(pid) && Instant::now() < deadline {
+                tokio::time::sleep(WINDOW_EXIT_POLL).await;
+            }
+        }
+        if let Err(e) = terminal::get().close_window(&window_id).await {
+            // Expected in the common case: the window closed with its process.
+            tracing::debug!("close of {window_id:?} after its process exited: {e}");
+        }
+    });
+}
+
+/// Whether `pid` still names a live process. `kill(pid, 0)` reports delivery
+/// permission without signalling, which is the cheapest liveness test there is —
+/// and the only failure mode that matters here (the pid having been recycled
+/// within the grace window) is one a `SIGTERM`'d launcher cannot produce fast
+/// enough to be worth guarding.
+fn process_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
 /// Ask `host` to end `key`, without making the user watch the round trip.
 ///
 /// The row goes **now**: `presume_killed` hides it before the request is even
@@ -531,6 +587,10 @@ fn take_missing_from_snapshot(alive_pids: &HashSet<u32>, host: HostId) -> Vec<Re
             host: host.clone(),
             key: cm_core::state::SessionKey::from_launcher_pid(e.launcher_pid),
             window_id: Some(e.window_id),
+            // Unread: `kill_old` is false below, so nothing is signalled and
+            // there is no exit to wait for. The pid in the snapshot is the dead
+            // launcher's anyway, and may since have been recycled.
+            window_pid: None,
             cwd: e.cwd,
             session_id: e.session_id,
             flags: e.flags,
@@ -1174,8 +1234,8 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
         if let Some(backend) = app.backend_for(&host) {
             let _ = tokio::task::block_in_place(|| backend.kill_session(&key));
         }
-        if let Some(window_id) = &window_id {
-            let _ = terminal::get().close_window(window_id).await;
+        if let Some(window_id) = window_id {
+            close_window_when_free(window_id, spec.window_pid);
         }
     }
     // A crash-recovery window is left untouched: the old child is dead and may
@@ -2020,6 +2080,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         host,
                         key,
                         window_id,
+                        window_pid,
                     } => {
                         // Route to the session's host, naming it by key: the host
                         // re-resolves that to a live pid immediately before
@@ -2029,7 +2090,10 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // in `apply_kill_result`.
                         start_kill(&mut app, host, key, KillOrigin::Asked);
                         if let Some(wid) = window_id {
-                            let _ = terminal::get().close_window(&wid).await;
+                            // The signal is on its way; let it land before the
+                            // window goes, so the launcher exits on its own and
+                            // takes its window with it.
+                            close_window_when_free(wid, window_pid);
                         }
                         arm_settle_reload(&mut settle_reload_at);
                     }
