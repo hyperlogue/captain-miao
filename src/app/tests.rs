@@ -7087,12 +7087,15 @@ fn sessions_layout_label_round_trips() {
     assert_eq!(SessionsLayout::default(), SessionsLayout::Stacked);
 }
 
-/// Committing a hosts-panel row used to rebuild every backend, so changing an
-/// emoji dropped and re-dialled every connection. The gate is what a backend is
-/// actually built from — label and target — so a cosmetic edit is free.
+/// Committing a hosts-panel row used to rebuild every backend, so changing one
+/// host's target dropped and re-dialled every *other* host too — and an emoji
+/// edit did the same. What a backend is built from is the label and the
+/// transport, so a cosmetic edit carries every connection across untouched.
 #[test]
 fn only_a_changed_connection_string_reconnects() {
     use super::hosts::HostConfig;
+    use crate::state::HostId;
+    use std::collections::HashSet;
     let host = |label: &str, ssh: &str, icon: &str| HostConfig {
         label: label.into(),
         ssh: Some(ssh.into()),
@@ -7102,25 +7105,18 @@ fn only_a_changed_connection_string_reconnects() {
         options: Vec::new(),
         clipboard: false,
     };
+    let none = HashSet::new();
+    let ids = |hosts: &[HostConfig]| App::dialled_identities(hosts, &none);
     let before = vec![host("box", "user@box", "🖥")];
 
-    // Icon-only: identical identities, so no rebuild.
-    assert_eq!(
-        App::conn_identities(&before),
-        App::conn_identities(&[host("box", "user@box", "🛰")])
-    );
+    // Icon-only: identical identities, so nothing re-dials.
+    assert_eq!(ids(&before), ids(&[host("box", "user@box", "🛰")]));
     // Target, label, and transport kind each move it.
+    assert_ne!(ids(&before), ids(&[host("box", "user@other", "🖥")]));
+    assert_ne!(ids(&before), ids(&[host("box2", "user@box", "🖥")]));
     assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[host("box", "user@other", "🖥")])
-    );
-    assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[host("box2", "user@box", "🖥")])
-    );
-    assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[HostConfig {
+        ids(&before),
+        ids(&[HostConfig {
             label: "box".into(),
             ssh: None,
             socket: Some("/run/x.sock".into()),
@@ -7131,39 +7127,98 @@ fn only_a_changed_connection_string_reconnects() {
         }])
     );
     // A port forward is part of the ssh child's argv, so changing the set has to
-    // reach `rebuild_remote_backends` — nothing else re-runs `setup_ssh`, and a
-    // forward that only takes effect after the next unrelated reconnect would
-    // read as the field simply not working.
+    // re-dial — nothing else re-runs `setup_ssh`, and a forward that only took
+    // effect after the next unrelated reconnect would read as the field simply
+    // not working.
     assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[HostConfig {
+        ids(&before),
+        ids(&[HostConfig {
             options: vec!["-C".into()],
             ..host("box", "user@box", "🖥")
         }])
     );
-    // Suspending a host moves it too — `disabled` decides whether a backend is
-    // built at all, so the toggle has to reach `rebuild_remote_backends` rather
-    // than being filed as another cosmetic edit.
+    // And so does the clipboard toggle: it is one more `-R` on the tunnel child.
+    // Turning it *off* is the direction that matters — a forward that lingered
+    // until the next unrelated reconnect would leave the host reading a
+    // clipboard the user had just revoked.
     assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[HostConfig {
-            disabled: true,
-            ..host("box", "user@box", "🖥")
-        }])
-    );
-    // …as does adding or dropping a host.
-    assert_ne!(App::conn_identities(&before), App::conn_identities(&[]));
-    // And so does the clipboard toggle: it is one more `-R` on the tunnel child,
-    // so it only takes effect on a reconnect. Turning it *off* is the direction
-    // that matters — a forward that lingered until the next unrelated reconnect
-    // would leave the host reading a clipboard the user had just revoked.
-    assert_ne!(
-        App::conn_identities(&before),
-        App::conn_identities(&[HostConfig {
+        ids(&before),
+        ids(&[HostConfig {
             clipboard: true,
             ..host("box", "user@box", "🖥")
         }])
     );
+    // A suspended host is absent rather than present-and-off, which is what
+    // makes `c` drop the connection and pressing it again dial a fresh one.
+    assert!(
+        ids(&[HostConfig {
+            disabled: true,
+            ..host("box", "user@box", "🖥")
+        }])
+        .is_empty()
+    );
+    // As is a host held down for an upgrade, and one with no target typed yet.
+    assert!(App::dialled_identities(&before, &HashSet::from([HostId("box".into())])).is_empty());
+    assert!(
+        ids(&[HostConfig {
+            ssh: None,
+            ..host("box", "", "🖥")
+        }])
+        .is_empty()
+    );
+    // A host aliasing the reserved local id never gets a backend — its sessions
+    // would be misclassified as local everywhere `(host, pid)` keying relies on
+    // `is_local()`.
+    assert!(ids(&[host("local", "user@box", "🖥")]).is_empty());
+}
+
+/// The reconcile is per host: an edit to one leaves every other connection —
+/// and so every other host's rows — exactly where it was. Before this, changing
+/// one host re-dialled all of them, so the table blanked every remote row and
+/// claimed to be loading from every box.
+#[test]
+fn reconciling_hosts_touches_only_the_hosts_that_changed() {
+    use super::hosts::HostConfig;
+    use std::collections::HashSet;
+    let host = |label: &str, ssh: &str| HostConfig {
+        label: label.into(),
+        ssh: Some(ssh.into()),
+        socket: None,
+        icon: None,
+        disabled: false,
+        options: Vec::new(),
+        clipboard: false,
+    };
+    let none = HashSet::new();
+    let live = App::dialled_identities(&[host("a", "user@a"), host("b", "user@b")], &none);
+
+    // Nothing changed: every wanted host claims the backend it already has.
+    assert_eq!(App::plan_reconcile(&live, &live), vec![Some(0), Some(1)]);
+    // `b` re-targeted: `a` is carried across, `b` is dialled anew, and the old
+    // `b` (index 1, claimed by nobody) is dropped.
+    let retargeted = App::dialled_identities(&[host("a", "user@a"), host("b", "user@b2")], &none);
+    assert_eq!(App::plan_reconcile(&live, &retargeted), vec![Some(0), None]);
+    // A host added in the middle shifts nothing: the plan is by identity, not by
+    // position, so `b` keeps its connection even though its index moved.
+    let inserted = App::dialled_identities(
+        &[
+            host("a", "user@a"),
+            host("c", "user@c"),
+            host("b", "user@b"),
+        ],
+        &none,
+    );
+    assert_eq!(
+        App::plan_reconcile(&live, &inserted),
+        vec![Some(0), None, Some(1)]
+    );
+    // Removing the first host leaves the second alone.
+    let removed = App::dialled_identities(&[host("b", "user@b")], &none);
+    assert_eq!(App::plan_reconcile(&live, &removed), vec![Some(1)]);
+    // Two rows that dial the same thing get one connection each, never the same
+    // one twice — the second is a fresh dial.
+    let twins = App::dialled_identities(&[host("a", "user@a"), host("a", "user@a")], &none);
+    assert_eq!(App::plan_reconcile(&live, &twins), vec![Some(0), None]);
 }
 
 /// The clipboard server runs only while some host is actually offered the

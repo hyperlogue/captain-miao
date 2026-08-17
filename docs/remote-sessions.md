@@ -619,7 +619,7 @@ different hosts indistinguishable to the app layer: `list_sessions`,
 **Feature gating:** the *remote-hosts* half ships **off by default** behind the
 `remote` cargo feature, whose runtime gate is the const `app::REMOTE_ENABLED` —
 deliberately not `#[cfg]` scattered across ~240 remote references. It closes the
-only two doors in: `build_backends_from_config` reading `hosts.json`, and the
+only two doors in: `App::dialled_identities` reading `hosts.json`, and the
 `Space h` hosts panel. Both configurations compile and are tested.
 Pooled-localhost is deliberately *not* behind it — it uses no ssh and has its
 own config flag.
@@ -1003,7 +1003,14 @@ decides what they mean**.
   **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
-  removes behind a `y/N` confirm. A `Failed` reason is **flattened and
+  removes behind a `y/N` confirm. **A commit reconnects only the hosts it
+  changed** (`App::reconcile_backends_from`): the panel's rows are matched
+  against the live connections by `ConnIdentity` — the label and the transport
+  argv, nothing else — so a host whose identity did not move keeps its
+  connection task, its mirror, its rows and its reconnect epoch. Rebuilding the
+  set wholesale, as this once did, meant one host's typo re-dialled every box
+  and blanked every remote row for the seconds that took; an icon edit did the
+  same. A `Failed` reason is **flattened and
   truncated** to its row (it quotes host output, so it carries newlines that
   would corrupt the row and a length no row can hold), with the whole text one
   key away.

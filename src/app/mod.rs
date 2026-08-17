@@ -781,26 +781,46 @@ impl HostField {
     }
 }
 
-/// What one configured host's backend is built *from* — see
-/// [`App::conn_identities`], which is the gate deciding whether committing a
-/// panel row reconnects anything. A named struct rather than a tuple because
-/// every field is either a `String` or an `Option<String>`: two of them being
-/// swapped at a call site would compile, and would then reconnect on the wrong
-/// edits forever.
+/// What one host's backend is built *from*, and the unit the reconcile in
+/// [`App::reconcile_backends_from`] matches on: two equal identities dial the
+/// same daemon the same way, so a live backend built from one can be carried
+/// across a hosts-panel edit with its task, its mirror and its rows untouched.
+///
+/// Only hosts that are actually dialled have one ([`App::dialled_identities`]),
+/// which is why there is no `disabled` field: a suspended host is *absent* from
+/// the list rather than present-and-off, so suspending it reads as a removal and
+/// un-suspending as an addition — which is exactly what each has to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::app) struct ConnIdentity {
+    /// The panel label, which becomes this host's `HostId`.
     label: String,
-    ssh: Option<String>,
-    socket: Option<String>,
-    disabled: bool,
-    /// The arguments as typed. Raw rather than split into options + forwards,
-    /// because a rebuild is what re-runs the split — gating on its *output*
-    /// would miss an edit that only moves a token between the two.
-    options: Vec<String>,
-    /// Part of the identity because the clipboard is one more `-R` on the tunnel
-    /// child: toggling it has to re-dial, or the forward would not appear (or
-    /// disappear) until the next reconnect for some other reason.
-    clipboard: bool,
+    target: HostTarget,
+}
+
+/// The transport half of a [`ConnIdentity`], with everything an argv is
+/// assembled from *inside* the variant that assembles one.
+///
+/// That placement is the point: `options` and `clipboard` reach ssh only as
+/// flags on the tunnel child, so an edit to either has to re-dial (nothing else
+/// re-runs `setup_ssh`, and a port forward that only took effect after some
+/// later unrelated reconnect would read as the field simply not working) — while
+/// on a socket host there is no ssh hop to carry them, and changing them must
+/// therefore drop nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::app) enum HostTarget {
+    /// A daemon socket on *this* machine: a manually-forwarded socket, or the
+    /// local daemon under pooled-localhost. See [`Transport::LocalSocket`].
+    Socket(String),
+    /// An ssh target the dashboard forwards the server socket over.
+    Ssh {
+        target: String,
+        /// The arguments as typed. Raw rather than split into options +
+        /// forwards, because the dial is what re-runs the split — matching on
+        /// its *output* would miss an edit that only moves a token between the
+        /// two.
+        options: Vec<String>,
+        clipboard: bool,
+    },
 }
 
 /// Supervision for the clipboard bridge's server child (`miao clipboard serve`).
@@ -1184,9 +1204,15 @@ pub(super) struct App {
     /// dedup). The rest are remote (SSH) hosts. Reload unions their sessions,
     /// tagging each with its host.
     pub(super) backends: Vec<Backend>,
+    /// What each *remote* backend was dialled from, parallel to `backends[1..]`
+    /// (this machine has no configured identity and never takes part). This is
+    /// the memory [`App::reconcile_backends_from`] needs to answer the only
+    /// question a host edit asks — which connections are still the ones the
+    /// config describes — so the rest can be carried across untouched.
+    pub(in crate::app) backend_identities: Vec<ConnIdentity>,
     /// One change-signal handle per entry of `backends`, in the same order.
-    /// Rebuilt whenever `backends` is — every backend, local included, now
-    /// reports its own changes (§5), so the run loop has no filesystem
+    /// Re-collected whenever `backends` changes — every backend, local included,
+    /// now reports its own changes (§5), so the run loop has no filesystem
     /// knowledge of its own.
     pub(super) backend_events: Vec<BackendEvents>,
     /// The clipboard bridge's server child — see [`ClipboardSupervisor`].
@@ -1611,14 +1637,6 @@ pub(super) fn plural_sessions(n: usize) -> &'static str {
     if n == 1 { "session" } else { "sessions" }
 }
 
-/// What [`App::build_backends_from_config`] produces: the backends plus the
-/// per-host display attributes the table reads. A named struct rather than a
-/// tuple so a second attribute can join without every call site shifting.
-pub(super) struct HostSetup {
-    pub backends: Vec<Backend>,
-    pub host_icons: HashMap<HostId, String>,
-}
-
 /// Start this host's daemon if it isn't already up, for pooled-localhost
 /// (§10.1). `daemon ensure` is idempotent and self-daemonizing, so this is safe
 /// to run on every dashboard start; it prints the socket path, which we ignore
@@ -1721,15 +1739,14 @@ impl App {
             messages.push(msg, status_is_error);
         }
 
-        let HostSetup {
-            mut backends,
-            host_icons,
-        } = Self::build_backends_from_config(&HashSet::new());
-        // Every backend reports its own changes now (§5), so the run loop needs
-        // no filesystem watcher of its own; subscribe once, here.
-        let backend_events = backends.iter_mut().map(Backend::subscribe).collect();
+        // Only this machine is built here; every configured host is dialled by
+        // the reconcile below, which is the same path a hosts-panel edit takes —
+        // startup is just the case where nothing is live yet. It also subscribes
+        // (every backend reports its own changes now, §5, so the run loop needs
+        // no filesystem watcher of its own).
+        let backends = vec![Self::this_machine_backend()];
 
-        Self {
+        let mut app = Self {
             sessions: Vec::new(),
             table_state: TableState::default(),
             should_quit: false,
@@ -1788,7 +1805,8 @@ impl App {
             work_tabs: HashMap::new(),
             session_indexes: HashMap::new(),
             backends,
-            backend_events,
+            backend_identities: Vec::new(),
+            backend_events: Vec::new(),
             clipboard_server: ClipboardSupervisor::default(),
             reconnect_epochs: HashMap::new(),
             pending_reattach: Vec::new(),
@@ -1800,7 +1818,7 @@ impl App {
                 .filter(|t| !t.is_empty()),
             foreign_bindings: Vec::new(),
             next_launch_id: 0,
-            host_icons,
+            host_icons: HashMap::new(),
             default_host: HostId::local(),
             recent_dirs_cache: HashMap::new(),
             last_table_rect: None,
@@ -1837,7 +1855,9 @@ impl App {
             prevent_sleep_enabled: crate::sleep::supported(),
             sleep_inhibitor: crate::sleep::SleepInhibitor::new(),
             dir_exists: path_is_dir,
-        }
+        };
+        app.reconcile_backends();
+        app
     }
 
     /// Invalidate the derived caches (visible order, dir labels) after a
@@ -2517,83 +2537,88 @@ impl App {
         self.input_mode = InputMode::DirEdit;
     }
 
-    /// Build the backend set: `backends[0]` is **this machine**, then one
-    /// `RemoteBackend` per configured host. Returns the backends plus the
-    /// per-host colors and icons.
+    /// One [`ConnIdentity`] per host that actually gets a backend, in config
+    /// order — the whole desired state the reconcile aims at. Pure, so the set
+    /// that dials (and, by its absence, the set that doesn't) is unit-testable
+    /// without a connection task.
     ///
-    /// `backends[0]` is normally the in-process [`Backend::local`]. Under
-    /// **pooled-localhost** (`[launcher] pooled = true`) it is instead a
-    /// `RemoteBackend` over a `LocalSocket` to this host's own daemon, which
-    /// **replaces** the local backend rather than joining it — both would read
-    /// the same `sessions/` dir and `collect_sessions` doesn't dedup, so every
-    /// row would appear twice. That one substitution is what closes the
-    /// on-server-zellij attach gap (§10.1): every session then starts in the
-    /// pool, so a zellij pane and a laptop dashboard are both just attach
-    /// clients, and a session survives the zellij server and the seat logout.
+    /// A host drops out here rather than being dialled and then ignored, because
+    /// "no identity" is what the reconcile reads as "drop that connection":
     ///
-    /// Without the `remote` feature ([`REMOTE_ENABLED`]) this stops at the local
-    /// backend: `hosts.json` is never read, so no remote connection task is ever
-    /// spawned and every row is local. Pooled-localhost is deliberately *not*
-    /// gated by it — it uses no ssh and is opt-in by its own config flag.
-    fn build_backends_from_config(suspended: &HashSet<HostId>) -> HostSetup {
-        let mut host_icons: HashMap<HostId, String> = HashMap::new();
-        let mut backends = vec![Self::this_machine_backend()];
+    /// - **`local`** is reserved for the in-process backend; a host aliasing it
+    ///   would have its sessions misclassified as local everywhere the
+    ///   `(host, pid)` keying relies on `is_local()`.
+    /// - **Suspended** (`disabled`, the panel's `c`) keeps its row, its target
+    ///   and its icon but gets no connection task, no ssh and no rows — the
+    ///   whole point of not making the user delete a host that is down today.
+    /// - **Held down for an upgrade** (`suspended`) is the same treatment from
+    ///   memory rather than from the config file, so a dashboard that dies
+    ///   mid-upgrade leaves nothing behind to un-suspend.
+    /// - **No target at all** is a half-typed row; there is nothing to dial.
+    ///
+    /// Without the `remote` feature ([`REMOTE_ENABLED`]) the list is empty: no
+    /// remote connection task is ever spawned and every row is local.
+    /// Pooled-localhost is deliberately *not* gated by it — it uses no ssh, is
+    /// opt-in by its own config flag, and rides `backends[0]` rather than this
+    /// list.
+    pub(in crate::app) fn dialled_identities(
+        hosts: &[hosts::HostConfig],
+        suspended: &HashSet<HostId>,
+    ) -> Vec<ConnIdentity> {
         if !REMOTE_ENABLED {
-            return HostSetup {
-                backends,
-                host_icons,
-            };
+            return Vec::new();
         }
-        for h in hosts::load_hosts() {
-            let host = HostId(h.label.clone());
-            // "local" is reserved for the in-process backend; a host that aliases
-            // it would have its sessions misclassified as local everywhere the
-            // `(host, pid)` keying relies on `is_local()`.
-            if host.is_local() {
-                continue;
-            }
-            if let Some(icon) = h.icon.filter(|i| !i.trim().is_empty()) {
-                host_icons.insert(host.clone(), icon);
-            }
-            // A suspended host keeps its row in the panel (and its icon above) but
-            // gets no backend at all: no connection task, no ssh, no rows, and
-            // nothing in the header tally to explain. `c` in the panel brings it
-            // back — which is the whole point of not making the user delete it.
-            if h.disabled {
-                continue;
-            }
-            // Held down for an upgrade. Same treatment as `disabled` — the row
-            // stays, reads "not connected", and gets no connection task — but
-            // from memory rather than from the config file, so a dashboard that
-            // dies here leaves nothing behind to un-suspend.
-            if suspended.contains(&host) {
-                continue;
-            }
-            if let Some(sock) = h.socket {
-                // A configured socket path is a daemon on *this* machine (a
-                // manual forward, or a test rig) — see `Transport::LocalSocket`.
-                let t = Transport::LocalSocket(std::path::PathBuf::from(sock));
-                backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
-            } else if let Some(target) = h.ssh {
+        hosts
+            .iter()
+            .filter_map(|h| {
+                let host = HostId(h.label.clone());
+                if host.is_local() || h.disabled || suspended.contains(&host) {
+                    return None;
+                }
+                // A configured socket path wins over an ssh target, as it always
+                // has: it names a daemon already reachable on this machine, so
+                // there is no hop to make.
+                let target = match (&h.socket, &h.ssh) {
+                    (Some(sock), _) => HostTarget::Socket(sock.clone()),
+                    (None, Some(ssh)) => HostTarget::Ssh {
+                        target: ssh.clone(),
+                        options: h.options.clone(),
+                        clipboard: h.clipboard,
+                    },
+                    (None, None) => return None,
+                };
+                Some(ConnIdentity {
+                    label: h.label.clone(),
+                    target,
+                })
+            })
+            .collect()
+    }
+
+    /// Start one host's connection task. The mirror fills when its snapshot
+    /// arrives; until then the host reads `Connecting` and contributes no rows,
+    /// which is what the table's trailing "loading" line stands in for.
+    fn dial(identity: &ConnIdentity) -> Backend {
+        let host = HostId(identity.label.clone());
+        let transport = match &identity.target {
+            HostTarget::Socket(sock) => Transport::LocalSocket(std::path::PathBuf::from(sock)),
+            HostTarget::Ssh {
+                target,
+                options,
+                clipboard,
+            } => Transport::Ssh {
+                target: target.clone(),
                 // One short, OS-limit-safe local socket per host; ssh forwards
                 // the remote server's socket onto it.
-                let local_sock = crate::state::remote_forward_sock(&host.0);
+                local_sock: crate::state::remote_forward_sock(&host.0),
                 // Verbatim: the transport splits the forwards out of them (they
                 // can ride only one of its calls), and everything else reaches
                 // every ssh this host takes.
-                let t = Transport::Ssh {
-                    target,
-                    local_sock,
-                    options: h.options,
-                    clipboard: h.clipboard,
-                };
-                backends.push(Backend::Remote(RemoteBackend::connect(t, host)));
-            }
-        }
-        HostSetup {
-            backends,
-            host_icons,
-        }
+                options: options.clone(),
+                clipboard: *clipboard,
+            },
+        };
+        Backend::Remote(RemoteBackend::connect(transport, host))
     }
 
     /// Whether any host that will actually be dialled wants the clipboard.
@@ -2613,9 +2638,18 @@ impl App {
             .set_wanted(Self::any_host_wants_clipboard(&hosts::load_hosts()));
     }
 
-    /// The backend for the machine the dashboard runs on: in-process by default,
-    /// or a client of this host's own daemon under pooled-localhost. See
-    /// [`App::build_backends_from_config`] for why the two never coexist.
+    /// The backend for the machine the dashboard runs on — `backends[0]`, and
+    /// the one entry no host edit ever rebuilds.
+    ///
+    /// Normally the in-process [`Backend::local`]. Under **pooled-localhost**
+    /// (`[launcher] pooled = true`) it is instead a `RemoteBackend` over a
+    /// `LocalSocket` to this host's own daemon, which **replaces** the local
+    /// backend rather than joining it — both would read the same `sessions/` dir
+    /// and `collect_sessions` doesn't dedup, so every row would appear twice.
+    /// That one substitution is what closes the on-server-zellij attach gap
+    /// (§10.1): every session then starts in the pool, so a zellij pane and a
+    /// laptop dashboard are both just attach clients, and a session survives the
+    /// zellij server and the seat logout.
     ///
     /// The pooled arm bootstraps the daemon first (`daemon ensure`, idempotent
     /// and self-daemonizing) so the very first connect finds it listening; if
@@ -2639,28 +2673,104 @@ impl App {
         ))
     }
 
-    /// Tear down the backends and rebuild from the current `hosts.json`
-    /// (dropping a `Backend::Remote` ends its connection task), then re-subscribe
-    /// to each one's change signal. Called after the hosts panel mutates.
-    fn rebuild_remote_backends(&mut self) {
-        // Before the rebuild, so the server is already listening when the first
-        // reconnect asks ssh to forward onto its socket. Order is not actually
+    /// Bring the live backends in line with the current `hosts.json`. Called
+    /// after the hosts panel mutates and around an upgrade's suspension.
+    fn reconcile_backends(&mut self) {
+        let hosts = hosts::load_hosts();
+        self.reconcile_backends_from(&hosts);
+    }
+
+    /// Bring the live backends in line with `hosts` **one host at a time**: dial
+    /// the hosts that are new or whose [`ConnIdentity`] moved, drop the ones that
+    /// left, and carry every other host's backend across untouched — its
+    /// connection task, its mirror, its rows, its reconnect epoch and all.
+    ///
+    /// This used to rebuild the whole set, which meant editing *one* host
+    /// dropped every connection and re-dialled every box: a multi-second storm
+    /// for a one-character change, during which the table lost every remote row
+    /// it had and said it was loading from all of them. The dashboard is a union
+    /// of independent per-host mirrors, so a host that was not edited has no
+    /// reason to take part — and one that reconnects alone leaves the others'
+    /// rows on screen, with the trailing "loading" line naming only the host
+    /// actually still dialing (`draw::connecting_row_label`).
+    ///
+    /// `backends[0]` is this machine and is never touched here: rebuilding it
+    /// would restart the local watcher (or, under pooled-localhost, re-`ensure`
+    /// the daemon and drop its socket) over an edit to some unrelated remote.
+    ///
+    /// Takes the configs rather than re-reading the file, so the caller that
+    /// just wrote them reconciles against exactly what it wrote.
+    fn reconcile_backends_from(&mut self, hosts: &[hosts::HostConfig]) {
+        // Before the dials, so the server is already listening when the first
+        // connect asks ssh to forward onto its socket. Order is not actually
         // load-bearing — ssh binds the remote end whether or not the local socket
         // exists yet, and a request arriving in a gap costs one delegated paste —
         // but there is no reason to leave the gap open.
-        self.refresh_clipboard_server();
-        let HostSetup {
-            mut backends,
-            host_icons,
-        } = Self::build_backends_from_config(&self.upgrading);
-        self.backend_events = backends.iter_mut().map(Backend::subscribe).collect();
-        self.backends = backends;
-        self.host_icons = host_icons;
-        // Stale per-host caches would otherwise outlive the host they describe.
-        self.recent_dirs_cache.clear();
-        self.reconnect_epochs.clear();
+        self.clipboard_server
+            .set_wanted(Self::any_host_wants_clipboard(hosts));
+        // Icons are display-only and belong to every configured host, suspended
+        // ones included, so they are re-derived wholesale rather than reconciled.
+        self.host_icons = Self::host_icons_from(hosts);
+        let want = Self::dialled_identities(hosts, &self.upgrading);
+        let plan = Self::plan_reconcile(&self.backend_identities, &want);
+        // Lift the live remotes out into claimable slots. Draining from index 1
+        // is what leaves this machine's backend in place.
+        let live_ids = std::mem::take(&mut self.backend_identities);
+        let mut live: Vec<Option<Backend>> = self.backends.drain(1..).map(Some).collect();
+        for (identity, slot) in want.iter().zip(&plan) {
+            let backend = slot
+                .and_then(|i| live[i].take())
+                .unwrap_or_else(|| Self::dial(identity));
+            self.backends.push(backend);
+        }
+        // Whatever no wanted host claimed is a connection that is going away:
+        // the host was deleted, suspended, or re-targeted. Its per-host caches go
+        // with it — a fresh backend for the same label starts its reconnect
+        // epoch back at 0, so a stale entry would swallow that host's next
+        // reconnect edge (and with it the auto-reattach sweep, §7), and a cached
+        // recent-dirs list describes the machine we were dialing before.
+        for (identity, backend) in live_ids.iter().zip(&live) {
+            if backend.is_some() {
+                let host = HostId(identity.label.clone());
+                self.recent_dirs_cache.remove(&host);
+                self.reconnect_epochs.remove(&host);
+            }
+        }
+        // Dropping the last `Arc` closes the connection task's request channel,
+        // which is how it learns to stop (and takes its ssh child with it).
+        drop(live);
+        self.backend_identities = want;
+        // Cheap and idempotent for a carried-over backend: `subscribe` hands back
+        // clones of the same signal handles it minted the first time.
+        self.backend_events = self.backends.iter_mut().map(Backend::subscribe).collect();
         // The rows themselves arrive on the next reload, which re-anchors then.
         self.mark_dirty(Cursor::HoldIndex);
+    }
+
+    /// For each wanted host, the index of the live backend that already dials it
+    /// — or `None` where one has to be dialled now. A live index that no wanted
+    /// host claims is a connection to drop.
+    ///
+    /// Matching is by identity rather than by label, so a re-targeted host is a
+    /// drop *and* a dial rather than a silent carry-over, and each live entry is
+    /// claimed at most once, so two rows sharing a label can't both inherit the
+    /// same connection. Pure, so the whole reconcile decision is unit-testable
+    /// without a connection task.
+    pub(in crate::app) fn plan_reconcile(
+        live: &[ConnIdentity],
+        want: &[ConnIdentity],
+    ) -> Vec<Option<usize>> {
+        let mut claimed = vec![false; live.len()];
+        want.iter()
+            .map(|w| {
+                let found = live
+                    .iter()
+                    .enumerate()
+                    .position(|(i, l)| !claimed[i] && l == w)?;
+                claimed[found] = true;
+                Some(found)
+            })
+            .collect()
     }
 
     pub(super) fn open_host_edit(&mut self) {
@@ -2716,7 +2826,7 @@ impl App {
     }
 
     /// Persist the panel's host rows **without closing the panel** (§9), and
-    /// reconnect only if the *connections* actually changed.
+    /// reconnect exactly the hosts whose connection actually changed.
     ///
     /// The old flow staged every edit behind a separate `s` Save, which was one
     /// more thing to forget — and, worse, meant a freshly added host showed no
@@ -2724,13 +2834,11 @@ impl App {
     /// persists as it happens (add, edit-commit, confirmed remove), so the
     /// panel's live conn-state column animates the new host connecting in place.
     ///
-    /// The catch that made that unpleasant: committing a row rebuilt *every*
-    /// backend, so opening the panel, changing an emoji, and pressing Enter
-    /// dropped every connection task and re-dialled every host — a multi-second
-    /// storm for a cosmetic edit, and one that reset the auto-reattach epochs
-    /// besides. So the rebuild is gated on [`Self::conn_identities`]: what a
-    /// backend is *built from* is the label and the target, and nothing else in
-    /// this panel touches those. An icon-only edit just re-reads the icon map.
+    /// What made that unpleasant was the blast radius: committing a row rebuilt
+    /// *every* backend, so changing one host's target — or an emoji — dropped
+    /// every connection task and re-dialled every box. The scope is now
+    /// per-host, in [`Self::reconcile_backends_from`], which is also what keeps
+    /// an edit to one host from blanking the rows of the others.
     pub(super) fn apply_host_edits(&mut self) {
         let Some(state) = self.host_edit.as_ref() else {
             return;
@@ -2759,21 +2867,16 @@ impl App {
                 }
             })
             .collect();
-        let before = Self::conn_identities(&hosts::load_hosts());
         hosts::save_hosts(&configs);
-        if before == Self::conn_identities(&configs) {
-            // An icon-only edit: rendering changed, the order did not.
-            self.refresh_host_icons(&configs);
-            self.mark_dirty(Cursor::HoldIndex);
-            return;
-        }
         // A host that just left the ssh set — deleted, suspended, renamed, or
         // switched to a socket — still holds its port forwards on the shared
         // ControlMaster, which outlives the backend about to be dropped (and
         // which an open attach window keeps alive indefinitely). Retire them
-        // before the rebuild, while there is still a record of what they were.
+        // before the reconcile, while there is still a record of what they were.
+        // A no-op when nothing left the set, which is the common case now that
+        // this runs on every commit rather than behind a changed-anything gate.
         crate::backend::retire_unlisted_forwards(&Self::forward_keys(&configs));
-        self.rebuild_remote_backends();
+        self.reconcile_backends_from(&configs);
     }
 
     /// `(label, ssh target)` for every host that will still get an ssh backend —
@@ -2788,38 +2891,18 @@ impl App {
             .collect()
     }
 
-    /// What each configured host's backend is *built from*, in order: the label
-    /// (which becomes its `HostId`), the transport it dials, and whether it is
-    /// dialled at all. Two host lists with equal identities produce
-    /// byte-identical backends, so a rebuild between them would only churn live
-    /// connections — see [`Self::apply_host_edits`]. Pure, so the gate is
-    /// unit-testable.
-    pub(in crate::app) fn conn_identities(hosts: &[hosts::HostConfig]) -> Vec<ConnIdentity> {
+    /// The per-host emoji for the icon column. A suspended host keeps its icon —
+    /// it keeps its panel row, and the icon is how that row is recognised — so
+    /// this reads every configured host, not just the dialled ones. Pure.
+    fn host_icons_from(hosts: &[hosts::HostConfig]) -> HashMap<HostId, String> {
         hosts
-            .iter()
-            .map(|h| ConnIdentity {
-                label: h.label.clone(),
-                ssh: h.ssh.clone(),
-                socket: h.socket.clone(),
-                disabled: h.disabled,
-                options: h.options.clone(),
-                clipboard: h.clipboard,
-            })
-            .collect()
-    }
-
-    /// Re-derive just the per-host emoji, leaving every connection task alone.
-    /// The cheap half of [`Self::rebuild_remote_backends`]. Takes the configs the
-    /// caller already holds rather than re-reading the file it just wrote.
-    fn refresh_host_icons(&mut self, hosts: &[hosts::HostConfig]) {
-        self.host_icons = hosts
             .iter()
             .filter_map(|h| {
                 let icon = h.icon.as_ref().filter(|i| !i.trim().is_empty())?;
                 let host = HostId(h.label.clone());
                 (!host.is_local()).then_some((host, icon.clone()))
             })
-            .collect();
+            .collect()
     }
 
     /// Close the hosts panel. Edits are already persisted (see
@@ -3439,10 +3522,15 @@ impl App {
     }
 
     /// Remote hosts whose first snapshot is still in flight, in `backends`
-    /// order. A dialing host mirrors no rows yet, so the session table looks
-    /// complete while sessions are still on their way — this is what the
-    /// table's trailing "loading" line (`draw::connecting_row_label`) and the
-    /// header's blinking cloud both hang off.
+    /// order. A dialing host mirrors no rows yet, so the session table would
+    /// look complete while sessions are still on their way — this is what the
+    /// table's trailing "loading" line (`draw::connecting_row_label`) hangs off.
+    ///
+    /// Per host, and only ever per host: every backend mirrors independently, so
+    /// one box still dialing says nothing about the rows of a box that has
+    /// already answered. A connected host's sessions are on screen while its
+    /// neighbours are still loading, and the line below them names only who is
+    /// actually being waited on.
     pub(super) fn connecting_hosts(&self) -> Vec<HostId> {
         self.backends
             .iter()
@@ -4355,7 +4443,7 @@ impl App {
     /// but the new binary is not yet published.
     pub(super) fn suspend_for_upgrade(&mut self, host: &HostId) {
         self.upgrading.insert(host.clone());
-        self.rebuild_remote_backends();
+        self.reconcile_backends();
     }
 
     /// Put `host` back on the air, whichever way its upgrade went. The fresh
@@ -4363,7 +4451,7 @@ impl App {
     /// daemon, so it resolves to `UseCache` and starts one.
     pub(super) fn resume_after_upgrade(&mut self, host: &HostId) {
         self.upgrading.remove(host);
-        self.rebuild_remote_backends();
+        self.reconcile_backends();
     }
 
     /// `Space A`: attach a window to every free detached session at once.
