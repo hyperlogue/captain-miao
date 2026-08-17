@@ -1179,6 +1179,18 @@ decides what they mean**.
   *and* default host) hides on, since naming a default is meaningless when
   localhost is the only host. All per-host detail lives one `Space h` away, so
   the header stays glanceable no matter how many hosts exist.
+- **The table's trailing `loading sessions from …` line**: dim, unselectable,
+  uncounted by the title, and present for exactly as long as some host has yet
+  to report. Its job is to separate "no sessions there" from "not asked yet" —
+  worst at startup, where an empty list looks like an answer — so it names the
+  host while there is one to name and counts them when there are more (a list
+  would outgrow the Name column). The wait it covers ends at the first
+  `Snapshot`, **not** at `Connected`: that state is stored the moment the socket
+  answers, a round trip before the handshake and subscribe actually fetch the
+  sessions (`Backend::awaiting_sessions`). A `Failed` or `Disconnected` host is
+  not loading — it has stopped, not started, and the header tally and panel are
+  where that is said. Per host throughout: a box that has answered shows its
+  rows while its neighbours are still dialing.
 - **Host icon**: a compact **emoji**. Per-host icons are configured in the panel
   exactly like the workdir marks, with a deterministic FNV-derived fallback so a
   host always has one. An icon rather than a name because it is a glance-level

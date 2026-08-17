@@ -446,6 +446,32 @@ impl Backend {
         }
     }
 
+    /// Whether this host's sessions are still on their way: it is dialing, or
+    /// the link is up but its first `Snapshot` has yet to land. Either way the
+    /// host contributes no rows *yet*, which is what the session table's
+    /// trailing "loading" line stands in for (`draw::connecting_row_label`).
+    ///
+    /// The second half is not a refinement but the larger half of the window:
+    /// `Connected` is stored the moment the socket answers, a full round trip
+    /// before the handshake and subscribe that actually fetch the sessions. Read
+    /// off `conn_state` alone, the line therefore vanished while the rows were
+    /// still in flight — briefly presenting a host with nothing to show as a
+    /// host with nothing on it.
+    ///
+    /// A `Failed` or `Disconnected` host is deliberately **not** loading: it has
+    /// stopped, not started, and the header tally plus the hosts panel are where
+    /// that is answered (§9). The in-process backend is never loading — it reads
+    /// its state files synchronously.
+    pub(crate) fn awaiting_sessions(&self) -> bool {
+        match self {
+            Backend::Local(_) => false,
+            Backend::Remote(b) => {
+                matches!(b.conn_state(), ConnState::Connecting | ConnState::Connected)
+                    && !b.mirrored.load(Ordering::Relaxed)
+            }
+        }
+    }
+
     /// What the connection task did and what came back, for the hosts panel's
     /// `l` view. Empty for the in-process backend, which never dials anything —
     /// the panel says so rather than showing a blank box.
@@ -1046,6 +1072,15 @@ pub(crate) struct RemoteBackend {
     /// Read through [`BackendEvents`], the same handle a local backend's fs
     /// watcher feeds — these off-thread updates fire no filesystem event.
     dirty: Arc<AtomicBool>,
+    /// Whether the mirror holds this host's *account of itself* — set when a
+    /// `Snapshot` lands, cleared with the mirror when the link drops.
+    ///
+    /// Distinct from `conn == Connected`, which is stored a full round trip
+    /// earlier (before the handshake, let alone the subscribe). In that window a
+    /// host has an empty mirror and nothing saying so, which is what the
+    /// dashboard's trailing "loading" line exists to prevent — see
+    /// [`Backend::awaiting_sessions`].
+    mirrored: Arc<AtomicBool>,
     /// Bumped on each `Disconnected → Connected` transition. The dashboard
     /// compares it against what it last saw to fire the auto-reattach sweep
     /// (§7) exactly once per reconnect.
@@ -1133,7 +1168,21 @@ impl RemoteBackend {
             mirror.insert(s.key(), s);
         }
         drop(mirror);
+        // The seed stands in for a delivered `Snapshot`, so the host counts as
+        // having reported — otherwise every test backend would read as still
+        // loading and sit under the table's "loading" line forever.
+        backend.mirrored.store(true, Ordering::Relaxed);
         backend
+    }
+
+    /// Put the two fields [`Backend::awaiting_sessions`] reads wherever a test
+    /// needs them. One knob rather than two, because they only mean anything
+    /// together: the connection task moves them in step, and a test that sets
+    /// one without the other is describing a state that cannot occur.
+    #[cfg(test)]
+    pub(crate) fn simulate_link_for_tests(&self, conn: ConnState, mirrored: bool) {
+        *self.conn.lock().unwrap() = conn;
+        self.mirrored.store(mirrored, Ordering::Relaxed);
     }
 
     /// Everything a [`RemoteBackend`] and its connection task share, built but
@@ -1166,6 +1215,7 @@ impl RemoteBackend {
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
         let dirty = Arc::new(AtomicBool::new(false));
+        let mirrored = Arc::new(AtomicBool::new(false));
         let server_version = Arc::new(Mutex::new(None));
         let upgrade = Arc::new(Mutex::new(None));
         let latency = Arc::new(Mutex::new(None));
@@ -1181,6 +1231,7 @@ impl RemoteBackend {
             remote_exe: remote_exe.clone(),
             conn: conn.clone(),
             dirty: dirty.clone(),
+            mirrored: mirrored.clone(),
             server_version: server_version.clone(),
             upgrade: upgrade.clone(),
             latency: latency.clone(),
@@ -1208,6 +1259,7 @@ impl RemoteBackend {
             latency,
             vitals,
             dirty,
+            mirrored,
             reconnect_epoch,
             log,
         });
@@ -3592,6 +3644,7 @@ struct ConnectionShared {
     remote_exe: Arc<Mutex<String>>,
     conn: Arc<Mutex<ConnState>>,
     dirty: Arc<AtomicBool>,
+    mirrored: Arc<AtomicBool>,
     server_version: Arc<Mutex<Option<String>>>,
     upgrade: Arc<Mutex<Option<UpgradeOffer>>>,
     latency: Arc<Mutex<Option<Duration>>>,
@@ -3619,6 +3672,7 @@ async fn connection_task(
         remote_exe,
         conn,
         dirty,
+        mirrored,
         server_version,
         upgrade,
         latency,
@@ -3755,11 +3809,14 @@ async fn connection_task(
         let connected_at = Instant::now();
         let outcome = serve(
             stream,
-            &mirror,
-            &presumed_dead,
-            &presumed_attached,
-            &dirty,
-            &server_version,
+            MirrorCells {
+                mirror: &mirror,
+                presumed_dead: &presumed_dead,
+                presumed_attached: &presumed_attached,
+                dirty: &dirty,
+                mirrored: &mirrored,
+                server_version: &server_version,
+            },
             &mut requests,
         )
         .await;
@@ -3777,6 +3834,10 @@ async fn connection_task(
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
         mirror.lock().unwrap().clear();
+        // Cleared *with* the mirror, always: the two answer the same question,
+        // and a `mirrored` left standing over an empty mirror is a host claiming
+        // to have reported no sessions when it has reported nothing at all.
+        mirrored.store(false, Ordering::Relaxed);
         // And with it every presumption: each one says "this row is on its way
         // out", which only means anything against rows we still have. Carrying
         // them across the gap would let one hide a session the reconnect's
@@ -4316,18 +4377,36 @@ async fn cancel_forwards(target: &str, opts: &[String], forwards: &[Forward]) {
     }
 }
 
+/// The cells [`serve`] writes as frames arrive, borrowed as a group. Grouped for
+/// the same reason as [`SshLink`]: they would otherwise be six more positional
+/// parameters, four of them `&Arc<Mutex<…>>` and two `&Arc<AtomicBool>` — types
+/// that say nothing at a call site about which is which.
+struct MirrorCells<'a> {
+    mirror: &'a Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
+    presumed_dead: &'a Arc<Mutex<HashMap<SessionKey, Instant>>>,
+    presumed_attached: &'a Arc<Mutex<HashMap<SessionKey, bool>>>,
+    dirty: &'a Arc<AtomicBool>,
+    /// Set by the first `Snapshot` — see [`Backend::awaiting_sessions`].
+    mirrored: &'a Arc<AtomicBool>,
+    server_version: &'a Arc<Mutex<Option<String>>>,
+}
+
 /// Handshake, subscribe, then multiplex the pushed session stream into the
 /// mirror with request/response, until the peer hangs up or the backend drops.
 /// The [`ServeOutcome`] tells the caller whether to reconnect and how fast.
 async fn serve(
     stream: UnixStream,
-    mirror: &Arc<Mutex<HashMap<SessionKey, LauncherState>>>,
-    presumed_dead: &Arc<Mutex<HashMap<SessionKey, Instant>>>,
-    presumed_attached: &Arc<Mutex<HashMap<SessionKey, bool>>>,
-    dirty: &Arc<AtomicBool>,
-    server_version: &Arc<Mutex<Option<String>>>,
+    cells: MirrorCells<'_>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
 ) -> ServeOutcome {
+    let MirrorCells {
+        mirror,
+        presumed_dead,
+        presumed_attached,
+        dirty,
+        mirrored,
+        server_version,
+    } = cells;
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
 
@@ -4393,6 +4472,9 @@ async fn serve(
                         // were making about it (see `presumed_dead`).
                         presumed_dead.lock().unwrap().clear();
                         presumed_attached.lock().unwrap().clear();
+                        // The mirror now *is* the host's account of itself, so
+                        // the dashboard can stop saying rows are on their way.
+                        mirrored.store(true, Ordering::Relaxed);
                         // The mirror changed off-thread; wake the dashboard loop.
                         dirty.store(true, Ordering::Relaxed);
                     }
@@ -4464,6 +4546,41 @@ mod tests {
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
+
+    /// The session table's "loading" line has to cover the *whole* window in
+    /// which a host has yet to report, not just the dial. `Connected` is stored
+    /// the moment the socket answers — a full round trip before the handshake
+    /// and subscribe that fetch the sessions — so keying the line on connection
+    /// state alone dropped it while the rows were still in flight, briefly
+    /// presenting a host that had said nothing as a host with nothing on it.
+    #[test]
+    fn a_host_is_loading_until_its_first_snapshot_lands() {
+        let backend = Backend::Remote(RemoteBackend::unconnected_for_tests(
+            HostId("box".into()),
+            Vec::new(),
+        ));
+        let Backend::Remote(remote) = &backend else {
+            unreachable!("built as a remote")
+        };
+        // Dialing: nothing mirrored, nothing to show.
+        remote.simulate_link_for_tests(ConnState::Connecting, false);
+        assert!(backend.awaiting_sessions());
+        // The socket answered, but the subscribe has yet to come back.
+        remote.simulate_link_for_tests(ConnState::Connected, false);
+        assert!(backend.awaiting_sessions());
+        // Snapshot in. An *empty* one still ends the wait: the host has now
+        // answered, and "no sessions" is an answer.
+        remote.simulate_link_for_tests(ConnState::Connected, true);
+        assert!(!backend.awaiting_sessions());
+        // A host that has stopped is not loading — it has failed, not started,
+        // and the header tally plus the hosts panel are where that is said.
+        remote.simulate_link_for_tests(ConnState::Disconnected, false);
+        assert!(!backend.awaiting_sessions());
+        remote.simulate_link_for_tests(ConnState::Failed("no miao-server".into()), false);
+        assert!(!backend.awaiting_sessions());
+        // This machine reads its state files synchronously; it is never loading.
+        assert!(!Backend::local().awaiting_sessions());
+    }
 
     fn test_state(pid: u32) -> LauncherState {
         LauncherState {

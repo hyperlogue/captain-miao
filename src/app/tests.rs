@@ -5654,6 +5654,37 @@ fn the_loading_line_names_one_host_and_counts_several() {
     );
 }
 
+/// One host's connection says nothing about another's rows. A box that has
+/// answered shows its sessions immediately, while the trailing line names only
+/// the box still being waited on — the whole point of mirroring per host.
+#[test]
+fn a_connected_host_shows_its_sessions_while_another_still_loads() {
+    use crate::backend::{Backend, ConnState, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 12);
+    let quick = HostId("quick".into());
+    let slow = HostId("slow".into());
+    let mut there = session(1, "/srv/there", SessionStatus::Idle);
+    there.host = quick.clone();
+    d.set_sessions(vec![there.clone()]);
+    d.app
+        .backends
+        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+            quick.clone(),
+            vec![there],
+        )));
+    let dialing = RemoteBackend::unconnected_for_tests(slow.clone(), Vec::new());
+    dialing.simulate_link_for_tests(ConnState::Connecting, false);
+    d.app.backends.push(Backend::Remote(dialing));
+
+    assert_eq!(d.app.connecting_hosts(), vec![slow]);
+    let out = d.render();
+    // The answered host's row is on screen…
+    assert!(out.contains("session-1"), "{out}");
+    // …under a line naming only the host still to answer.
+    assert!(out.contains("loading sessions from slow…"), "{out}");
+}
+
 #[test]
 fn leader_v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);

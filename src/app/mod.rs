@@ -3522,20 +3522,23 @@ impl App {
     }
 
     /// Remote hosts whose first snapshot is still in flight, in `backends`
-    /// order. A dialing host mirrors no rows yet, so the session table would
-    /// look complete while sessions are still on their way — this is what the
-    /// table's trailing "loading" line (`draw::connecting_row_label`) hangs off.
+    /// order. Such a host mirrors no rows yet, so the session table would look
+    /// complete while sessions are still on their way — this is what the table's
+    /// trailing "loading" line (`draw::connecting_row_label`) hangs off.
     ///
     /// Per host, and only ever per host: every backend mirrors independently, so
     /// one box still dialing says nothing about the rows of a box that has
     /// already answered. A connected host's sessions are on screen while its
     /// neighbours are still loading, and the line below them names only who is
     /// actually being waited on.
+    ///
+    /// See [`Backend::awaiting_sessions`] for why this is not simply
+    /// `ConnState::Connecting`.
     pub(super) fn connecting_hosts(&self) -> Vec<HostId> {
         self.backends
             .iter()
             .skip(1)
-            .filter(|b| matches!(b.conn_state(), ConnState::Connecting))
+            .filter(|b| b.awaiting_sessions())
             .map(|b| b.host_id())
             .collect()
     }
