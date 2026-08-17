@@ -763,10 +763,105 @@ impl App {
             // exactly as wide lands its own border on the same columns, and the
             // two then look like one panel with a divider drawn across it.
             let width = (hint_w + 6).min(host_popup.width.saturating_sub(4));
-            // One row per field, a blank, the hint line — held whether this field
-            // has a hint or not, for the same reason the width is — and the two
-            // borders.
-            let height = (HostField::ORDER.len() as u16 + 4).min(host_popup.height);
+            // What a field's text has to fit in: the card's inner width — the
+            // frame and its padding are two cells a side — less the fixed
+            // columns ahead of the value, less one cell for the end-of-text
+            // cursor, which needs somewhere to sit on an otherwise full line.
+            let value_w = (width as usize).saturating_sub(4 + HOST_VALUE_COL + 1);
+            // A field's rows: the mark and label on the first, continuation lines
+            // indented to the value column so a value that wrapped still reads as
+            // one field rather than as a nameless new one.
+            let field_rows = |focused: bool, label: &str, values: Vec<Vec<Span<'static>>>| {
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        let mut spans = if i == 0 {
+                            vec![
+                                if focused {
+                                    Span::styled("\u{276F} ", Style::default().bold())
+                                } else {
+                                    Span::raw("  ")
+                                },
+                                // 10, not 9: `Clipboard` is exactly nine cells,
+                                // and a label that fills its own column runs into
+                                // the value.
+                                Span::styled(
+                                    format!("{label:<10}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ]
+                        } else {
+                            vec![Span::raw(" ".repeat(HOST_VALUE_COL))]
+                        };
+                        spans.extend(value);
+                        Line::from(spans)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let label_lines = text_field_lines(&r.label, focus == HostField::Label, value_w);
+            let kind = if r.is_socket { "socket" } else { "ssh" };
+            let prefix = format!("[{kind}] ");
+            // The kind sits ahead of the target on its first line, so that line
+            // has that much less room — and every line of the field is wrapped to
+            // it, rather than the continuation lines silently running wider than
+            // the one above them.
+            let mut target_lines = text_field_lines(
+                &r.target,
+                focus == HostField::Target,
+                value_w.saturating_sub(prefix.chars().count()),
+            );
+            target_lines[0].insert(
+                0,
+                Span::styled(prefix, Style::default().add_modifier(Modifier::DIM)),
+            );
+            let options_lines = text_field_lines(&r.options, focus == HostField::Options, value_w);
+            // The derived emoji stands where the field's text would be, dim, so
+            // an empty field says what it will *do* rather than reading as one
+            // the user forgot. It follows the cursor rather than replacing it.
+            let mut icon_lines = text_field_lines(&r.icon, focus == HostField::Icon, value_w);
+            if r.icon.text().trim().is_empty()
+                && let Some(last) = icon_lines.last_mut()
+            {
+                last.push(Span::styled(
+                    format!("{} (auto)", self.host_icon(&r.host())),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            // The one field with no cursor, so it has to say its state in words:
+            // `[off]` on an untouched row is what tells you the setting is here at
+            // all. The marker doubles as the tie to the row's own `📋`.
+            let clipboard_line = vec![
+                Span::styled(
+                    if r.clipboard { "[on] " } else { "[off]" },
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::raw(if r.clipboard { "\u{1f4cb}" } else { "" }),
+            ];
+            let mut form_lines = field_rows(focus == HostField::Label, "Label", label_lines);
+            form_lines.extend(field_rows(
+                focus == HostField::Target,
+                "Target",
+                target_lines,
+            ));
+            form_lines.extend(field_rows(
+                focus == HostField::Options,
+                "Options",
+                options_lines,
+            ));
+            form_lines.extend(field_rows(focus == HostField::Icon, "Icon", icon_lines));
+            form_lines.extend(field_rows(
+                focus == HostField::Clipboard,
+                "Clipboard",
+                vec![clipboard_line],
+            ));
+            // The field rows — one per field until a value wraps — a blank, the
+            // hint line (held whether this field has a hint or not, for the same
+            // reason the width is), and the two borders. The card grows down as a
+            // value wraps rather than the value being cut off at the frame: this
+            // is text being *edited*, and what you cannot see you cannot tell you
+            // typed twice.
+            let height = (form_lines.len() as u16 + 4).min(host_popup.height);
             // A terminal too small to draw a frame around anything. The dashboard
             // as a whole is unusable well before this, so it is a guard against a
             // degenerate `Rect`, not a layout for a narrow screen.
@@ -801,62 +896,6 @@ impl App {
             let inner = block.inner(popup);
             frame.render_widget(block, popup);
 
-            let field_row = |focused: bool, label: &str, value: Line<'static>| {
-                let mark = if focused {
-                    Span::styled("\u{276F} ", Style::default().bold())
-                } else {
-                    Span::raw("  ")
-                };
-                let mut spans = vec![
-                    mark,
-                    // 10, not 9: `Clipboard` is exactly nine cells, and a label
-                    // that fills its own column runs into the value.
-                    Span::styled(
-                        format!("{label:<10}"),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                ];
-                spans.extend(value.spans);
-                Line::from(spans)
-            };
-            let label_line = Line::from(text_field_spans(&r.label, focus == HostField::Label));
-            let kind = if r.is_socket { "socket" } else { "ssh" };
-            let mut target_spans = vec![Span::styled(
-                format!("[{kind}] "),
-                Style::default().add_modifier(Modifier::DIM),
-            )];
-            target_spans.extend(text_field_spans(&r.target, focus == HostField::Target));
-            let target_line = Line::from(target_spans);
-            let options_line =
-                Line::from(text_field_spans(&r.options, focus == HostField::Options));
-            // The derived emoji stands where the field's text would be, dim, so
-            // an empty field says what it will *do* rather than reading as one
-            // the user forgot. It follows the cursor rather than replacing it.
-            let mut icon_spans = text_field_spans(&r.icon, focus == HostField::Icon);
-            if r.icon.text().trim().is_empty() {
-                icon_spans.push(Span::styled(
-                    format!("{} (auto)", self.host_icon(&r.host())),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-            }
-            let icon_line = Line::from(icon_spans);
-            // The one field with no cursor, so it has to say its state in words:
-            // `[off]` on an untouched row is what tells you the setting is here at
-            // all. The marker doubles as the tie to the row's own `📋`.
-            let clipboard_line = Line::from(vec![
-                Span::styled(
-                    if r.clipboard { "[on] " } else { "[off]" },
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::raw(if r.clipboard { "\u{1f4cb}" } else { "" }),
-            ]);
-            let mut form_lines = vec![
-                field_row(focus == HostField::Label, "Label", label_line),
-                field_row(focus == HostField::Target, "Target", target_line),
-                field_row(focus == HostField::Options, "Options", options_line),
-                field_row(focus == HostField::Icon, "Icon", icon_line),
-                field_row(focus == HostField::Clipboard, "Clipboard", clipboard_line),
-            ];
             // The blank goes in whether or not this field has a hint, so the one
             // line the card reserves for it doesn't shunt the fields up and down.
             form_lines.push(Line::from(""));
@@ -2178,14 +2217,6 @@ impl App {
     }
 }
 
-/// One form field's spans, with the cursor drawn where it actually is.
-///
-/// A block parked after the text was honest while a field could only be appended
-/// to. Now that the hosts panel's fields are [`TextInput`]s, the cursor is the
-/// only thing on screen saying where the next character lands — so the cell
-/// under it is reversed, with a reversed space standing in at end-of-text. An
-/// unfocused field renders as plain text: two cursors in one form would be a
-/// lie about which one the keyboard is in. Pure.
 /// The hosts row-editor hint for one field, or `None` for a field that speaks for
 /// itself. Indented to the label column, so it reads as belonging to the form
 /// rather than to the card's frame.
@@ -2215,21 +2246,96 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
     }
 }
 
-fn text_field_spans(input: &TextInput, focused: bool) -> Vec<Span<'static>> {
+/// Where a hosts-editor field's value starts: the focus mark (2) and the label
+/// column (10). Continuation lines indent to it, and it is what the wrap width
+/// is measured back from.
+const HOST_VALUE_COL: usize = 12;
+
+/// One form field's value, wrapped to `width` cells, with the cursor drawn where
+/// it actually is.
+///
+/// A block parked after the text was honest while a field could only be appended
+/// to. Now that the hosts panel's fields are [`TextInput`]s, the cursor is the
+/// only thing on screen saying where the next character lands — so the cell
+/// under it is reversed, with a reversed space standing in at end-of-text. An
+/// unfocused field renders as plain text: two cursors in one form would be a
+/// lie about which one the keyboard is in.
+///
+/// Wrapped rather than truncated because the value is one being *edited*: three
+/// `-L` forwards outrun the card, and the tail the frame cut off was still there
+/// on save, editable by a cursor nothing on screen could show. Always yields at
+/// least one line, so an empty field still has a row. Pure.
+fn text_field_lines(input: &TextInput, focused: bool, width: usize) -> Vec<Vec<Span<'static>>> {
     let text = input.text();
-    if !focused {
-        return vec![Span::raw(text.to_string())];
+    // `TextInput` keeps the cursor on a char boundary, so no split below can cut
+    // a multi-byte glyph.
+    let cursor = focused.then(|| input.cursor().min(text.len()));
+    let ranges = wrap_ranges(text, width);
+    let last = ranges.len() - 1;
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let seg = &text[r.start..r.end];
+            // The cursor belongs to the line holding its byte, so at a wrap point
+            // it draws at the head of the *next* line — which is where the
+            // character it is about to insert would be pushed anyway. End-of-text
+            // has no next line, so the last one carries it as a reversed space.
+            match cursor {
+                Some(c) if c >= r.start && (c < r.end || i == last) => {
+                    let (head, rest) = seg.split_at(c - r.start);
+                    let mut chars = rest.chars();
+                    let under = chars.next().map(String::from).unwrap_or_else(|| " ".into());
+                    vec![
+                        Span::raw(head.to_string()),
+                        Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
+                        Span::raw(chars.as_str().to_string()),
+                    ]
+                }
+                _ => vec![Span::raw(seg.to_string())],
+            }
+        })
+        .collect()
+}
+
+/// Break `text` into byte ranges of at most `width` display cells each,
+/// preferring a break just past a space and hard-breaking a token that wouldn't
+/// fit on a line of its own.
+///
+/// Ranges rather than [`super::messages`]'s strings, and they tile the text
+/// exactly rather than collapsing the whitespace between them: this wraps a
+/// value under a cursor, so every byte offset has to keep pointing at the
+/// character it did, and the double space a user typed has to still be one they
+/// can delete. Pure.
+pub(super) fn wrap_ranges(text: &str, width: usize) -> Vec<std::ops::Range<usize>> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    // This line's last break opportunity — the byte just past a space.
+    let mut brk: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        // `i > start` so a single over-wide glyph still lands somewhere rather
+        // than looping on a line it can never fit.
+        if used + w > width && i > start {
+            let cut = brk.filter(|b| *b > start).unwrap_or(i);
+            out.push(start..cut);
+            // What the break left behind rides on the new line with `c`.
+            used = text[cut..i].width();
+            start = cut;
+            brk = None;
+        }
+        used += w;
+        if c == ' ' {
+            brk = Some(i + c.len_utf8());
+        }
     }
-    // `TextInput` keeps the cursor on a char boundary, so this can't split a
-    // multi-byte glyph.
-    let (head, rest) = text.split_at(input.cursor().min(text.len()));
-    let mut chars = rest.chars();
-    let under = chars.next().map(String::from).unwrap_or_else(|| " ".into());
-    vec![
-        Span::raw(head.to_string()),
-        Span::styled(under, Style::default().add_modifier(Modifier::REVERSED)),
-        Span::raw(chars.as_str().to_string()),
-    ]
+    // Pushed even when empty: an empty field is still a row, and a text ending
+    // exactly on a break has a (blank) line after it that the cursor can sit on.
+    out.push(start..text.len());
+    out
 }
 
 /// Squeeze arbitrary text — up to and including a host's multi-line refusal —

@@ -5206,6 +5206,97 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     assert!(out.contains("Add Host"), "{out}");
 }
 
+/// A value too long for the card **wraps**; the card grows to hold it.
+///
+/// Three `-L` forwards is an ordinary set and already outruns the card's width.
+/// Truncating at the frame was worse here than in the panel's own read-only
+/// rows: the hidden tail was still in the field, saved on `Enter` and editable by
+/// a cursor nothing on screen could place — so the fix is more lines, not an `…`.
+#[test]
+fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let opts = "-L 8010:localhost:8010 -L 8089:localhost:8089 -L 7891:localhost:7891";
+    let state = d.app.host_edit.as_mut().unwrap();
+    state.rows.push(super::HostRow {
+        label: super::picker::TextInput::with_text("polaris"),
+        target: super::picker::TextInput::with_text("polaris"),
+        options: super::picker::TextInput::with_text(opts),
+        ..Default::default()
+    });
+    state.cursor = 0;
+    d.press(KeyCode::Char('e'));
+
+    let out = d.render();
+    let lines: Vec<&str> = out.lines().collect();
+    let row_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not drawn: {out}"))
+    };
+    let opts_row = row_of("Options");
+    let cont = lines[opts_row + 1];
+    assert!(
+        cont.contains("7891:localhost:7891"),
+        "the tail wraps onto the next line instead of being cut off: {out}"
+    );
+    // Indented to the value column, so the second line reads as more of the same
+    // field rather than as a nameless one of its own.
+    assert_eq!(
+        cont.find("7891:localhost:7891"),
+        lines[opts_row].find("-L 8010"),
+        "the continuation lines up under the value: {out}"
+    );
+    // And the fields below it move down rather than being written over: the card
+    // is sized from the lines it actually draws.
+    assert_eq!(row_of("Icon"), opts_row + 2, "{out}");
+    assert!(out.contains("Clipboard"), "the card still closes: {out}");
+}
+
+/// Wrapping a field under a cursor is not the same problem as wrapping a log
+/// line: the offsets have to survive it.
+#[test]
+fn wrapping_a_field_value_tiles_the_text_exactly() {
+    use super::draw::wrap_ranges;
+    use unicode_width::UnicodeWidthStr;
+
+    let text = "-L 8010:localhost:8010 -L 8089:localhost:8089";
+    let seg = |r: &std::ops::Range<usize>| text[r.start..r.end].to_string();
+    let ranges = wrap_ranges(text, 25);
+    // Nothing dropped and nothing collapsed — the cursor's byte offset has to
+    // keep pointing at the character it did.
+    assert_eq!(ranges.iter().map(seg).collect::<String>(), text);
+    assert!(ranges.iter().all(|r| seg(r).width() <= 25), "{ranges:?}");
+    // Broken past a space rather than mid-argument.
+    assert_eq!(seg(&ranges[0]), "-L 8010:localhost:8010 ");
+
+    // A token with no break in it is hard-broken rather than left to run off the
+    // card — an ssh option can be one long word.
+    let long = "8010:localhost:8010";
+    assert_eq!(
+        wrap_ranges(long, 8)
+            .iter()
+            .map(|r| &long[r.start..r.end])
+            .collect::<Vec<_>>(),
+        vec!["8010:loc", "alhost:8", "010"]
+    );
+
+    // A run of spaces is text the user typed and can delete, not layout.
+    let spaced = "a  b";
+    assert_eq!(wrap_ranges(spaced, 10).len(), 1);
+    assert_eq!(
+        wrap_ranges(spaced, 10)
+            .iter()
+            .map(|r| &spaced[r.start..r.end])
+            .collect::<String>(),
+        spaced
+    );
+
+    // An empty field still gets a line, so it still gets a row — and a cursor.
+    assert_eq!(wrap_ranges("", 10), vec![0..0]);
+}
+
 /// The row editor's four fields walk by every idiom the dashboard binds
 /// elsewhere, and — the point — they walk **backwards** too. `Tab`-only meant
 /// overshooting Options cost three more presses.
