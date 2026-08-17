@@ -4,7 +4,8 @@
 
 <h1 align="center">captain-miao</h1>
 
-<p align="center"><b>Know which coding agent needs you — without checking every terminal.</b></p>
+<p align="center"><b>Know which coding agent needs you, without checking all
+  terminal windows.</b></p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@hyperlogue/captain-miao"><img src="https://img.shields.io/npm/v/@hyperlogue/captain-miao?color=cb3837&amp;logo=npm&amp;label=%40hyperlogue%2Fcaptain-miao" alt="npm version"></a>
@@ -14,7 +15,7 @@
 
 Picture a normal afternoon. Six agent sessions open: four still thinking, one that finished ten minutes ago and is waiting on your follow-up, one stopped on a decision it won't make without you. You can't tell which is which without tabbing through all six.
 
-**captain-miao is a TUI dashboard for every coding agent you have running** — Claude Code, Codex and others. Each session gets a row that says what it's doing right now.
+**captain-miao is a TUI dashboard for every coding agent you have running**, Claude Code, Codex and others. Each session gets a row that says what it's doing right now.
 
 - **Stop tab-hunting.** Every session in one table: status, working directory, model, context usage, git branch, and a live transcript preview.
 - **Never leave an agent waiting.** Sessions blocked on an approval or a question are flagged, and `s` jumps to the next one.
@@ -51,11 +52,11 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 
 | Terminal                                                    | Notes                                                                                                                                                                       |
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Kitty](https://github.com/kovidgoyal/kitty)**             | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                                                     |
-| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3  | **macOS only**, driven through Ghostty's AppleScript dictionary ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**. |
-| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0       | **macOS only**, driven through iTerm2's AppleScript dictionary ([iTerm2 setup](#iterm2-setup)). Previews are plain text — iTerm2 returns no colour.                          |
-| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44    | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
-| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2               | One window per session.                                                                                                                                                     |
+| **[Kitty](https://github.com/kovidgoyal/kitty)**            | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                                                     |
+| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**. |
+| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0      | **macOS only**, driven through iTerm2's AppleScript dictionary ([iTerm2 setup](#iterm2-setup)). Previews are plain text — iTerm2 returns no colour.                         |
+| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44   | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
+| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2              | One window per session.                                                                                                                                                     |
 
 Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Everywhere else it's a `🐾` glyph and clicking it does nothing.
 
@@ -65,11 +66,11 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **[Claude Code](https://claude.com/claude-code)**             |                                                                                                                                                                                                                                                                 |
 | **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
-| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                        |
-| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                  |
-| **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                               |
-| **[opencode](https://github.com/anomalyco/opencode)**               | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                       |
-| **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                        |
+| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                               |
+| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                    |
+| **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                                             |
+| **[opencode](https://github.com/anomalyco/opencode)**         | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                   |
+| **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                         |
 
 ## Installation
 
@@ -160,9 +161,11 @@ Three things work differently here, all of them because the dictionary has no wa
 
 Sessions always get their own tab: Ghostty has neither a stack layout nor floating panes, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
 
-**Ending a session doesn't interrupt you.** Ghostty confirms before closing a surface whose command is still running (`confirm-close-surface`, on by default), and it asks *on that tab* — so a close arriving while the process was alive switched you away from the dashboard to answer a dialog. `D` and a restart signal the session and let it exit first; a Ghostty surface whose command has exited closes itself, so by then there is nothing left to confirm. The exception is a **pooled** session's attach window: the process in it is a local `ssh` that captain-miao holds no pid for, so closing that one still asks. Set `confirm-close-surface = false` if you would rather never be asked.
+**Ending a session doesn't interrupt you.** Ghostty confirms before closing a surface whose command is still running (`confirm-close-surface`, on by default), and it asks _on that tab_ — so a close arriving while the process was alive switched you away from the dashboard to answer a dialog. `D` and a restart signal the session and let it exit first; a Ghostty surface whose command has exited closes itself, so by then there is nothing left to confirm. The exception is a **pooled** session's attach window: the process in it is a local `ssh` that captain-miao holds no pid for, so closing that one still asks. Set `confirm-close-surface = false` if you would rather never be asked.
 
-**Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij *inside* Ghostty the pane names itself, so hand launches work there exactly as they always have.
+**Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij _inside_ Ghostty the pane names itself, so hand launches work there exactly as they always have.
+
+**Only partly confirmed against a live Ghostty.** Spawning and dashboard-window discovery have been driven by hand against Ghostty 1.3.1; the rest of the backend is unit-tested only, because CI can't supply a Mac with a GUI session and a hand-clicked Automation grant. Report anything that looks wrong rather than assuming it's expected.
 
 ## iTerm2 setup
 
@@ -175,6 +178,8 @@ Unlike Ghostty, iTerm2 tells a process which session it is in, so nothing here i
 - **Sessions always get their own tab**, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
 
 One iTerm2 bug is worth knowing about: after any window or tab is created with a command that exits immediately, iTerm2 stops answering "create tab" altogether — later spawns hang even when their command is long-lived, until iTerm2 is restarted. captain-miao bounds the wait and says so rather than hanging, and the sessions it starts hold themselves open on failure, so this is hard to reach in normal use.
+
+**Only partly confirmed against a live iTerm2.** Spawn, snapshot, focus, capture and close have each been driven by hand against iTerm2 3.6.11; a full session lifecycle (resume, restart, kill, detach) has not, and CI can't drive one. Report anything that looks wrong rather than assuming it's expected.
 
 ## Usage
 
@@ -276,7 +281,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
 | `Space a` / `Space H` | Set the default backend / default host for new sessions                                                                                                                    |
-| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                                  |
+| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                          |
 | `Space h` / `Space s` | Hosts panel (add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — the footer's status messages, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
@@ -456,14 +461,6 @@ captain-miao is built around a strict unidirectional data flow:
 - The **dashboard** is a pure viewer. It watches the session state directory and per-backend transcript dirs with `notify` (FSEvents on macOS, inotify on Linux) and re-reads files when they change. It performs no IPC of its own.
 
 State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For a deeper tour of the architecture, module layout, hook wiring, and data files, see [AGENTS.md](AGENTS.md).
-
-## Roadmap
-
-- [ ] **tmux**: its live-server test now runs in CI on both Linux and macOS (tmux is the one backend that _can_ be tested headlessly — a server on a private socket is the whole dependency), but only against the one version the flake pins. The claimed ≥ 3.2 floor is still unverified; testing a matrix of versions down to it is what graduates this.
-- [ ] **More agent backends**: the per-session backend is an abstraction, so other coding agents can slot in alongside Claude Code and Codex. Reasonix, Kimi Code, Grok Build, opencode and Pi have all slotted in and are every one of them still unproven against a released build ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)) — running the probe each one's module doc lists is what graduates them.
-- [ ] **Ghostty**: spawning and dashboard-window discovery have now been driven by hand against a live Ghostty 1.3.1 — and needed three fixes to work at all — but the rest of the AppleScript backend is still unit-tested only, since driving one needs a Mac with a GUI session and a hand-clicked Automation grant that CI can't supply. First-hand confirmation of a full session lifecycle (resume, restart, kill, detach) on a real Mac is what graduates it.
-- [ ] **iTerm2**: spawn, snapshot, focus, capture and close have each been driven by hand against a live iTerm2 3.6.11, including that a spawn's reported id matches what the process inside reports for itself. Like Ghostty it can't be tested in CI, so a full session lifecycle (resume, restart, kill, detach) on a real Mac is what graduates it.
-- [ ] **More terminal backends**: the terminal layer is an abstraction (Kitty, Ghostty, iTerm2, zellij and tmux today), so other terminals and multiplexers (WezTerm, …) can slot in.
 
 ## License
 
