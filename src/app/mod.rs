@@ -1150,6 +1150,9 @@ pub(super) struct App {
     /// remote kill is a blocking round trip, and `apply_detach_reports` runs on
     /// the UI thread outside `block_in_place`. The *delay* on top is what makes
     /// a terminal quitting non-destructive — see the constant.
+    ///
+    /// Each entry's row is already presumed dead, so the queue is a list of
+    /// signals still owed, not of rows still shown.
     pub(super) pending_session_close: Vec<PendingClose>,
     /// Cached window→tab map for resolving local sessions' (display-only)
     /// `tab_id`. The launcher no longer snapshots the terminal for this (window
@@ -1515,6 +1518,11 @@ pub(crate) const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
 /// left running, which `x` fixes in a keystroke; the cost of the reverse is a
 /// terminal quit that ends every session on the host — the exact thing pooling
 /// exists to prevent.
+///
+/// None of it is on screen. The row is presumed dead when the close is *queued*
+/// (`apply_detach_reports`), not when it fires, so this second is a delay on the
+/// signal alone — a guard the user waits out is indistinguishable from a slow
+/// dashboard, and the row it leaves behind is a misleading one at that.
 const CLOSE_ON_WINDOW_CLOSE_DELAY: Duration = Duration::from_secs(1);
 
 /// One session waiting out [`CLOSE_ON_WINDOW_CLOSE_DELAY`] before it is ended.
@@ -3577,6 +3585,21 @@ impl App {
                 && self.on_window_close == config::OnWindowClose::Close
                 && let Some(key) = self.pooled_session_key(&host, &report.token)
             {
+                // The row goes **now**, on the strength of a close that is
+                // decided but not yet due — the same optimism `run::start_kill`
+                // applies to `x`, moved from when the request goes out to when
+                // it is settled. What the wait below guards against is a
+                // *quitting terminal*, not a user who might change their mind,
+                // so nothing about it belongs on screen: left visible, the row
+                // spends that second in the detached tier wearing the pool's
+                // stale attached bit, which reads as "someone else has this" —
+                // an offer to steal a session nobody holds and this dashboard
+                // is about to end. A dashboard that dies inside the wait takes
+                // the presumption with it exactly as it takes the queued close,
+                // so the two can't disagree.
+                if let Some(backend) = self.backend_for(&host) {
+                    backend.presume_killed(&key);
+                }
                 self.pending_session_close.push(PendingClose {
                     host: host.clone(),
                     key,

@@ -1095,6 +1095,42 @@ impl RemoteBackend {
     /// sessions); the task then retries with backoff, re-snapshotting on each
     /// reconnect, until the backend is dropped.
     pub(crate) fn connect(transport: Transport, host: HostId) -> Arc<Self> {
+        let (backend, shared, requests) = Self::build(&transport, host);
+        tokio::spawn(connection_task(transport, shared, requests));
+        backend
+    }
+
+    /// A backend for a host that never answers — the same construction
+    /// [`connect`] does, minus the connection task, with `sessions` seeded into
+    /// the mirror as if a `Snapshot` had brought them.
+    ///
+    /// Dropping the task's half of the handles is the point: nothing arrives to
+    /// confirm or refute what the dashboard presumes, so a test of a presumption
+    /// observes it alone. Requests fail fast against the closed channel, as they
+    /// do for any host that is down.
+    #[cfg(test)]
+    pub(crate) fn unconnected_for_tests(host: HostId, sessions: Vec<LauncherState>) -> Arc<Self> {
+        let (backend, _shared, _requests) =
+            Self::build(&Transport::LocalSocket(PathBuf::new()), host);
+        let mut mirror = backend.mirror.lock().unwrap();
+        for s in sessions {
+            mirror.insert(s.key(), s);
+        }
+        drop(mirror);
+        backend
+    }
+
+    /// Everything a [`RemoteBackend`] and its connection task share, built but
+    /// not yet wired to one. Split out of [`connect`] so a test can hold the
+    /// task's half instead of running one.
+    fn build(
+        transport: &Transport,
+        host: HostId,
+    ) -> (
+        Arc<Self>,
+        ConnectionShared,
+        mpsc::UnboundedReceiver<PendingRequest>,
+    ) {
         // Capture the ssh target before the transport is moved into the task —
         // `open_session` needs it to build the attach window's argv.
         let attach_target = match &transport {
@@ -1121,29 +1157,25 @@ impl RemoteBackend {
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
         let log = Arc::new(ConnLog::default());
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(connection_task(
-            transport,
-            ConnectionShared {
-                host: host.clone(),
-                mirror: mirror.clone(),
-                presumed_dead: presumed_dead.clone(),
-                presumed_attached: presumed_attached.clone(),
-                remote_exe: remote_exe.clone(),
-                conn: conn.clone(),
-                dirty: dirty.clone(),
-                server_version: server_version.clone(),
-                upgrade: upgrade.clone(),
-                latency: latency.clone(),
-                vitals: vitals.clone(),
-                reconnect_epoch: reconnect_epoch.clone(),
-                log: log.clone(),
-            },
-            rx,
-        ));
+        let shared = ConnectionShared {
+            host: host.clone(),
+            mirror: mirror.clone(),
+            presumed_dead: presumed_dead.clone(),
+            presumed_attached: presumed_attached.clone(),
+            remote_exe: remote_exe.clone(),
+            conn: conn.clone(),
+            dirty: dirty.clone(),
+            server_version: server_version.clone(),
+            upgrade: upgrade.clone(),
+            latency: latency.clone(),
+            vitals: vitals.clone(),
+            reconnect_epoch: reconnect_epoch.clone(),
+            log: log.clone(),
+        };
         // `Arc` because the dashboard hands clones to background tasks: a
         // blocking round trip (the resume list) must not be made from the UI
         // thread, and a task can't borrow the `App` that owns the backend.
-        Arc::new(Self {
+        let backend = Arc::new(Self {
             host,
             attach_target,
             ssh_options,
@@ -1162,7 +1194,8 @@ impl RemoteBackend {
             dirty,
             reconnect_epoch,
             log,
-        })
+        });
+        (backend, shared, rx)
     }
 
     /// Current connection health, for the header surface.

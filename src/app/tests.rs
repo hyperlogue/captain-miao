@@ -2122,6 +2122,80 @@ fn a_queued_close_waits_out_its_delay_before_going_anywhere() {
     assert!(d.app.next_session_close_due().is_none());
 }
 
+/// …and none of that wait is on screen. The row goes when the close is *queued*,
+/// a second before the kill it is waiting for.
+///
+/// Left visible, that second was the whole of what closing a remote window
+/// looked like: the binding is retired, so the row drops to the detached tier
+/// still carrying the pool's `attached = true` — the bit *our own* attach set —
+/// and reads as "another terminal has this", offering a steal for a session
+/// nobody holds and this dashboard has already decided to end. Hiding it here
+/// costs nothing the queue doesn't already cost: a dashboard that dies inside
+/// the delay drops the close and the presumption together.
+#[test]
+fn a_queued_close_takes_its_row_with_it_immediately() {
+    use super::ReportOrigin;
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::{DetachReport, HostId, SessionKey};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    // The host mirrors the session as attached — which it is, to the window
+    // about to be closed. Nothing will arrive to correct that: this backend has
+    // no connection, so what the row does next is the dashboard's own doing.
+    away.attached = Some(true);
+    d.set_sessions(vec![away.clone()]);
+    d.app
+        .backends
+        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+            host.clone(),
+            vec![away],
+        )));
+    d.app.on_window_close = crate::config::OnWindowClose::Close;
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    let rows = |d: &TestDashboard| {
+        d.app
+            .backend_for(&host)
+            .expect("the host's backend")
+            .list_sessions()
+            .len()
+    };
+    assert_eq!(rows(&d), 1);
+
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(129),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
+
+    assert_eq!(
+        rows(&d),
+        0,
+        "the row must go with the window, not with the kill a second later"
+    );
+    // And the kill is still owed: hiding the row is a presumption about a
+    // request that has yet to go out, never a substitute for making it.
+    assert_eq!(
+        d.app
+            .pending_session_close
+            .iter()
+            .map(|p| p.key.clone())
+            .collect::<Vec<_>>(),
+        vec![SessionKey::from_launcher_pid(1)]
+    );
+}
+
 /// A detach report is the *event* that replaces polling the window tree: the
 /// attach window tells us its session ended, and the row must go detached (and
 /// re-sort) without waiting for a snapshot. Crucially it behaves like
