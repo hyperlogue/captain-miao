@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launches bind to their window, `Enter` focuses, `D` closes and `miao focus`
   works; previews come back as plain text, since iTerm2 returns no colour.
   Auto-detected, or pinned with `[terminal] backend = "iterm"`.
+- **Google's Antigravity CLI as an agent backend**: `miao antigravity`. Status,
+  launch, resume and the model column work, verified against `agy` 1.1.11. A
+  session runs under a synthetic `$HOME` that symlinks your real one, because
+  `agy` discovers hooks only from `~/.gemini/config/`; your own hooks there are
+  merged rather than replaced. Its five-event hook vocabulary is what costs it
+  the approval state, the fork key and a settled row after Esc — the README has
+  the full list.
 - **Four more agent backends**: `miao kimi`, `miao grok`, `miao opencode` and
   `miao pi`. Each tracks status and launches, resumes and (where the agent can)
   forks; each carries its own known limits in the README.
