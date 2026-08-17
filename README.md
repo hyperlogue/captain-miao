@@ -1,27 +1,42 @@
 <p align="center">
-  <img src="assets/logo.jpg" alt="captain-miao logo" width="320">
+  <img src="assets/logo.jpg" alt="captain-miao logo" width="280">
 </p>
 
-# captain-miao
+<h1 align="center">captain-miao</h1>
 
-<img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
+<p align="center"><b>Know which coding agent needs you — without checking every terminal.</b></p>
 
-A TUI dashboard for managing multiple AI coding sessions running in the terminal emulator or multiplexer of your choice, such as [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [iTerm2](https://iterm2.com/), [zellij](https://zellij.dev/) and [tmux](https://github.com/tmux/tmux).
+<p align="center">
+  <a href="https://www.npmjs.com/package/@hyperlogue/captain-miao"><img src="https://img.shields.io/npm/v/@hyperlogue/captain-miao?color=cb3837&amp;logo=npm&amp;label=%40hyperlogue%2Fcaptain-miao" alt="npm version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platforms: macOS, Linux">
+</p>
+
+Picture a normal afternoon. Six agent sessions open: four still thinking, one that finished ten minutes ago and is waiting on your follow-up, one stopped on a decision it won't make without you. You can't tell which is which without tabbing through all six.
+
+**captain-miao is a TUI dashboard for every coding agent you have running** — Claude Code, Codex and others. Each session gets a row that says what it's doing right now.
+
+- **Stop tab-hunting.** Every session in one table: status, working directory, model, context usage, git branch, and a live transcript preview.
+- **Never leave an agent waiting.** Sessions blocked on an approval or a question are flagged, and `s` jumps to the next one.
+- **Drive the whole fleet from one place.** Launch, resume, fork and kill sessions from the dashboard, on this machine or on a remote server.
 
 https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
 
-When you run several agent sessions at once, it's hard to tell which is working, which is waiting on you, and which has already finished. captain-miao watches every session and shows the whole fleet at a glance (status, working directory, context usage, and a live preview), and lets you start, focus, fork, or kill any of them without leaving the dashboard.
+```sh
+npx @hyperlogue/captain-miao
+```
+
+Runs in the terminal you already use: [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [iTerm2](https://iterm2.com/), [zellij](https://zellij.dev/) or [tmux](https://github.com/tmux/tmux). See [Installation](#installation) for Cargo, Nix and prebuilt binaries.
+
+## Highlights
+
+<img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
 
 Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
 Kitty, Ghostty, iTerm2, zellij or tmux you already run (every session is a native window
 or pane, controlled through the terminal's own protocol), so it stays one small,
 focused tool and the rest of your workflow is yours to compose.
 
-## Highlights
-
-- **The whole fleet at a glance:** every session in one table, with status, working directory, model, context usage, git branch, and a live transcript preview.
-- **Never miss a prompt:** sessions waiting on your approval or an answer are flagged.
-- **Full session lifecycle:** launch, resume, fork, and kill sessions from the dashboard.
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without touching the sessions.
 - **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode) and [Pi](https://github.com/earendil-works/pi) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
