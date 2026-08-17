@@ -39,7 +39,7 @@ or pane, controlled through the terminal's own protocol), so it stays one small,
 focused tool and the rest of your workflow is yours to compose.
 
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without killing the sessions. A host can also borrow this machine's clipboard, so `Ctrl+V` in an agent running there attaches a screenshot you just took locally ([details](#pasting-a-screenshot-into-a-remote-session)).
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode) and [Pi](https://github.com/earendil-works/pi) ship too, each with [known limits](#per-agent-limits).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode), [Pi](https://github.com/earendil-works/pi) and [Antigravity](https://github.com/google-antigravity/antigravity-cli) ship too, each with [known limits](#per-agent-limits).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -71,6 +71,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                                             |
 | **[opencode](https://github.com/anomalyco/opencode)**         | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                   |
 | **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                         |
+| **[Antigravity](https://github.com/google-antigravity/antigravity-cli)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
 
 ## Installation
 
@@ -201,14 +202,15 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao grok [dir] [args…]`       | Launch Grok Build in `dir` with tracking hooks; extra args are forwarded to `grok`. See [known limits](#grok-build-support).                |
 | `miao opencode [dir] [args…]`   | Launch opencode in `dir` with a tracking plugin; extra args are forwarded to `opencode`. See [known limits](#opencode-support).             |
 | `miao pi [dir] [args…]`         | Launch Pi in `dir` with tracking hooks; extra args are forwarded to `pi`. See [known limits](#pi-support).                                  |
+| `miao antigravity [dir] [args…]` | Launch Google's Antigravity CLI in `dir` with tracking hooks; extra args are forwarded to `agy`. See [known limits](#antigravity-support). |
 | `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
 | `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
 
-Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
+Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` / `antigravity` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
 
 ### Per-agent limits
 
-Claude Code and Codex are the proven backends. The five below all ship and track status, but **none has been run against a released build** — report anything that looks wrong. A row stuck at `Starting` usually means the agent rejected our hook config.
+Claude Code and Codex are the proven backends. The six below all ship and track status; Antigravity is the only one of them probed against a released binary, and the other five have **not been run against one** — report anything that looks wrong. A row stuck at `Starting` usually means the agent rejected our hook config.
 
 #### Reasonix support
 
@@ -250,6 +252,36 @@ Status, launch, resume, fork and the **token, model and title columns** all work
 - **No resume-picker entries** — Pi's sessions are trees rather than logs. `pi -r` opens Pi's own picker meanwhile.
 - **No worktrees, no background-task tiers.**
 - **A row stuck at `Starting` is usually Pi's project-trust prompt** — answer it in the session window.
+
+#### Antigravity support
+
+Status, launch, resume and the **model column** work, verified against `agy`
+1.1.11. Antigravity's whole hook vocabulary is five events and none of them
+fires at startup, on compaction, or while it waits on you, so most of what's
+missing below is missing from the agent rather than from captain-miao.
+
+- **An interrupted turn keeps reading as working** until you send the next
+  prompt — Esc fires no hook and leaves no mark in the transcript. The limit
+  most likely to bite day to day.
+- **No "waiting for approval" state.** Antigravity blocks on its permission
+  prompt without firing a hook. Its one pre-tool hook is a *gate* rather than an
+  observer — every answer it can give changes what the agent does, and an
+  incomplete one denies the tool call — so captain-miao doesn't register it.
+- **A row sits at `Starting` until your first prompt.** Nothing fires when `agy`
+  starts, so that is the first moment a session can be identified.
+- **No fork** (`f` hides itself) — conversations fork from inside Antigravity's
+  own TUI, and no flag does it at launch.
+- **No token column, no worktrees, no background-task tiers.**
+- **The resume picker lists a conversation only if a directory was recorded for
+  it.** Antigravity stores conversations flat with no project nesting; the cwd
+  comes from its prompt history, so a conversation older than that record is
+  skipped rather than offered against the wrong repo.
+- **A session runs under a synthetic `$HOME`** that symlinks your real one, and
+  that applies to the commands the agent runs too. Existing paths resolve
+  through the links as usual; a brand-new top-level dotfile written inside a
+  session lands in the synthetic home and is set aside as `.shadow-…` on the
+  next launch rather than deleted. Your own `~/.gemini/config/hooks.json` is
+  merged, not replaced.
 
 ### Key bindings
 
@@ -324,8 +356,9 @@ rc_password = "i-am-the-captain-miao"   # the built-in default, and a published 
 
 [launcher]
 default_agent = "claude"     # backend for new sessions: "claude" | "codex" | "reasonix" |
-                             # "kimi" | "grok" | "opencode" | "pi"; a name this build can't
-                             # drive falls back to Claude (Space a overrides)
+                             # "kimi" | "grok" | "opencode" | "pi" | "antigravity";
+                             # a name this build can't drive falls back to Claude
+                             # (Space a overrides)
 approval_grace_secs = 2      # grace window after a permission dialog before a transcript change reads as "dismissed"
 max_recent_cwds = 50         # entries kept in the workdir picker's recent list
 resume_list_limit = 50       # max sessions listed in the resume picker (most recent first)
@@ -437,8 +470,8 @@ Sharp edges worth knowing:
   can serve it. Run `clipboard-paste` in the session instead — it writes the image
   beside the agent and prints the path to hand it.
 - **Only Claude Code is confirmed to work through the shim**, and only Codex is
-  confirmed not to. Reasonix, Kimi Code, Grok Build, opencode and Pi are all
-  shimmed identically but none has been tested: each works if it shells out to
+  confirmed not to. Reasonix, Kimi Code, Grok Build, opencode, Pi and
+  Antigravity are all shimmed identically but none has been tested: each works if it shells out to
   `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
   in-process the way Codex does. `clipboard-paste` works on all of them
   regardless, so treat it as the reliable route until one is confirmed.

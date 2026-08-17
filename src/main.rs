@@ -126,6 +126,19 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Launch Google's Antigravity CLI with hooks injected for session
+    /// tracking. Argument handling matches the `claude` subcommand.
+    ///
+    /// Named for the product, not for the `agy` binary it installs as — the
+    /// subcommand has to match `cli_subcommand()`, which is also the name a
+    /// session carries on disk.
+    Antigravity {
+        /// Working directory (first positional, unless it starts with `-`)
+        /// followed by any extra arguments passed straight to agy.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Handle an agent hook event (called by hook scripts)
     Hook {
         /// Hook event type
@@ -207,6 +220,7 @@ impl Commands {
             Commands::Grok { args } => Some((agent::AgentControl::Grok, args)),
             Commands::OpenCode { args } => Some((agent::AgentControl::OpenCode, args)),
             Commands::Pi { args } => Some((agent::AgentControl::Pi, args)),
+            Commands::Antigravity { args } => Some((agent::AgentControl::Antigravity, args)),
             _ => None,
         }
     }
@@ -408,7 +422,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Commands::Kimi { .. }
             | Commands::Grok { .. }
             | Commands::OpenCode { .. }
-            | Commands::Pi { .. }),
+            | Commands::Pi { .. }
+            | Commands::Antigravity { .. }),
         ) => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             cm_core::cli::run_launch(agent, args.to_vec()).await

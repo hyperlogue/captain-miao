@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{claude, codex, grok, kimi, opencode, pi, reasonix};
+use crate::agents::{antigravity, claude, codex, grok, kimi, opencode, pi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -66,6 +66,10 @@ pub enum AgentControl {
     /// [`Self::label`] — it is the project's own styling, not a typo.
     OpenCode,
     Pi,
+    /// Google's Antigravity CLI. The variant, the on-disk name and the
+    /// subcommand are all the product's name; `agy` is only what it installs
+    /// as, and is spelled that way in one place ([`agents::antigravity::BIN`]).
+    Antigravity,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -111,6 +115,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "grok" => AgentControl::Grok,
                     "opencode" => AgentControl::OpenCode,
                     "pi" => AgentControl::Pi,
+                    "antigravity" => AgentControl::Antigravity,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -134,6 +139,7 @@ impl AgentControl {
         AgentControl::Grok,
         AgentControl::OpenCode,
         AgentControl::Pi,
+        AgentControl::Antigravity,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -147,6 +153,7 @@ impl AgentControl {
             AgentControl::Grok => "grok",
             AgentControl::OpenCode => "opencode",
             AgentControl::Pi => "pi",
+            AgentControl::Antigravity => "antigravity",
             AgentControl::Unknown => "",
         }
     }
@@ -164,6 +171,7 @@ impl AgentControl {
             "grok" => Some(AgentControl::Grok),
             "opencode" => Some(AgentControl::OpenCode),
             "pi" => Some(AgentControl::Pi),
+            "antigravity" => Some(AgentControl::Antigravity),
             _ => None,
         }
     }
@@ -189,6 +197,7 @@ impl AgentControl {
             AgentControl::Grok => agents::binary_available(grok::BIN),
             AgentControl::OpenCode => agents::binary_available(opencode::BIN),
             AgentControl::Pi => agents::binary_available(pi::BIN),
+            AgentControl::Antigravity => agents::binary_available(antigravity::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -206,6 +215,7 @@ impl AgentControl {
             // Lowercase on purpose: sst styles the project `opencode`.
             AgentControl::OpenCode => "opencode",
             AgentControl::Pi => "Pi",
+            AgentControl::Antigravity => "Antigravity",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
             AgentControl::Unknown => "Agent",
@@ -285,6 +295,16 @@ impl AgentControl {
                 let flag = if fork { "--fork" } else { "--session" };
                 vec![flag.to_string(), session_id.to_string()]
             }
+            // **`fork` is ignored**, the Kimi shape: `--conversation <id>`
+            // resumes, and `agy`'s flag list offers nothing that branches one —
+            // Antigravity forks a conversation from inside its own TUI, which is
+            // not an argv this seam can reach. So the two argvs come out equal,
+            // `supports_fork` reads that off, and `f` hides itself rather than
+            // silently resuming in place. Probed against `agy` 1.1.11: the
+            // resumed session reports the id it was given on its next hook.
+            AgentControl::Antigravity => {
+                vec!["--conversation".to_string(), session_id.to_string()]
+            }
             AgentControl::Unknown => vec![],
         }
     }
@@ -351,6 +371,11 @@ impl AgentControl {
             // derived from this, so `Ctrl-g` hides itself with nothing else to
             // change.
             AgentControl::Pi => None,
+            // `agy` has no worktree flag. Its isolation story is `--sandbox`,
+            // which is the agent sandboxing the dashboard deliberately stays out
+            // of, so there is nothing to spend a worktree request on and
+            // `Ctrl-g` hides itself.
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -421,6 +446,13 @@ impl AgentControl {
             // The one backend with no approval gate — see
             // [`AgentCapabilities::approval_gate`].
             AgentControl::Pi => caps(true, false, false, true),
+            // Every field false, and every one of them the *agent's* limit
+            // rather than an unfinished wiring: no argv forks a conversation, no
+            // flag opens a worktree, no hook fires while Antigravity blocks on
+            // its own approval prompt, and neither a payload nor anything on
+            // disk carries a token total. `agents::antigravity` has the evidence
+            // for each.
+            AgentControl::Antigravity => caps(false, false, false, false),
             // Nothing may be claimed for a backend this build can't drive: it
             // launches nothing, writes no hook config and fills no column.
             AgentControl::Unknown => caps(false, false, false, false),
@@ -476,6 +508,7 @@ impl AgentControl {
             | AgentControl::Kimi
             | AgentControl::OpenCode
             | AgentControl::Pi
+            | AgentControl::Antigravity
             | AgentControl::Unknown => vec![],
         }
     }
@@ -518,6 +551,10 @@ impl AgentControl {
             // payload, and nothing of ours reads a Pi file at all. There is no
             // file whose change could make a Pi row stale.
             AgentControl::Pi => vec![],
+            // Nothing, on the same footing: an Antigravity row's id, model and
+            // status all ride hook payloads. Its conversation store *does*
+            // change constantly, and holds nothing the dashboard reads.
+            AgentControl::Antigravity => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -573,6 +610,9 @@ impl AgentControl {
             // write the host already watches. Codex needs one only because its
             // rename lands in sqlite with no hook at all.
             AgentControl::Pi => vec![],
+            // Nothing: Antigravity has no session rename at all, so no fact of
+            // a row's can change without a hook firing.
+            AgentControl::Antigravity => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -601,6 +641,10 @@ impl AgentControl {
             // No per-pid manifest: a Pi session's id (and name) arrive on every
             // hook payload, which is what this index is a fallback for.
             AgentControl::Pi => SessionIndex::default(),
+            // No per-pid manifest. An Antigravity session's id arrives on its
+            // first hook — which is the *first prompt*, not the launch, since
+            // nothing fires at startup (`agents::antigravity`).
+            AgentControl::Antigravity => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -668,6 +712,12 @@ impl AgentControl {
             // path, which is what makes this consistent rather than merely
             // unimplemented: one fact, one source.
             AgentControl::Pi => TranscriptStats::default(),
+            // Nothing to fold: Antigravity's transcript records steps, not
+            // usage, and its per-conversation store is protobuf blobs in SQLite
+            // with no published schema. `agents::antigravity` supplies no
+            // transcript path either, so this is consistent rather than merely
+            // unimplemented.
+            AgentControl::Antigravity => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -696,6 +746,7 @@ impl AgentControl {
             // picker in the meantime, which is the usable answer until this and
             // that fold land together.
             AgentControl::Pi => Ok(vec![]),
+            AgentControl::Antigravity => antigravity::list_resumable(limit),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -742,6 +793,13 @@ impl AgentControl {
             AgentControl::Pi => {
                 pi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Antigravity => antigravity::build_launch_command(
+                cwd,
+                sock_path,
+                settings_path,
+                extra_args,
+                shim_dir,
+            ),
             // One of the two places `Unknown` must be loud: there is no argv to
             // guess, and guessing Claude's would run the wrong agent in the
             // user's cwd. The other is `LocalBackend::open_session`, which
@@ -779,6 +837,7 @@ impl AgentControl {
             // transport, the contents are opaque to the launcher, and each
             // backend puts its own format through it.
             AgentControl::Pi => pi::build_hooks_settings(sock_path),
+            AgentControl::Antigravity => antigravity::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
     }
@@ -795,6 +854,7 @@ impl AgentControl {
             AgentControl::Grok => grok::dispatch_hook(state, msg).await,
             AgentControl::OpenCode => opencode::dispatch_hook(state, msg).await,
             AgentControl::Pi => pi::dispatch_hook(state, msg).await,
+            AgentControl::Antigravity => antigravity::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -810,6 +870,7 @@ impl AgentControl {
             AgentControl::Grok => grok::parse_hook_payload(event, stdin),
             AgentControl::OpenCode => opencode::parse_hook_payload(event, stdin),
             AgentControl::Pi => pi::parse_hook_payload(event, stdin),
+            AgentControl::Antigravity => antigravity::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -864,6 +925,12 @@ impl AgentControl {
             // transcript of Pi's is read for any purpose (`agents::pi` names
             // none).
             AgentControl::Pi => TranscriptScan::default(),
+            // Empty for the reason Codex's is not: the one signal worth
+            // reading a transcript for is an interrupt, and Antigravity's
+            // records none — a cancelled turn is an ordinary `DONE` step. So
+            // `agents::antigravity` supplies no transcript path, and there is
+            // no file here to scan.
+            AgentControl::Antigravity => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -899,6 +966,12 @@ impl AgentControl {
             // catch for Claude is covered by `agent_settled`, which fires when
             // Pi will not continue running — a cancelled run included.
             AgentControl::Pi => None,
+            // No status file, and the gap one would cover is real: an
+            // interrupted Antigravity turn fires no hook, so the row reads
+            // `Active` until the next prompt. Nothing in the process tree
+            // distinguishes that from a model call in flight, so nothing is
+            // claimed here rather than something being guessed.
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -946,6 +1019,10 @@ impl AgentControl {
             // this would be asked — the Kimi standing, reached from an
             // extension call rather than a documented payload field.
             AgentControl::Pi => None,
+            // Antigravity has no session title of any kind — no rename command,
+            // nothing on a payload, nothing in the store. The resume picker
+            // shows a session's opening request instead.
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -964,6 +1041,7 @@ impl AgentControl {
             AgentControl::OpenCode => None,
             // No status file to watch — see `agent_activity`.
             AgentControl::Pi => None,
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1032,6 +1110,9 @@ impl AgentControl {
             // want of one, so the launcher starts no watch of either kind for a
             // Pi session and there is no poll for this to configure.
             AgentControl::Pi => None,
+            // Moot for the same reason, and by the same decision: no transcript
+            // path reaches the launcher, so neither watch starts.
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1089,6 +1170,13 @@ impl AgentControl {
             // never reaches `BackgroundActive`, `BackgroundServer` or
             // `ReviewPending`. An absence, with nothing to wire up later.
             AgentControl::Pi => None,
+            // Antigravity *does* background long commands — every `run_command`
+            // carries a `WaitMsBeforeAsync` — and `Stop` even reports whether
+            // they have all finished (`fullyIdle`). What is missing is the list:
+            // nothing enumerates the running ones, so there is no shell to name
+            // and no tier to put the row in. Unlike Pi's, this one has something
+            // to wire up if that list ever appears.
+            AgentControl::Antigravity => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1136,12 +1224,13 @@ pub struct AgentCapabilities {
 
 /// Whether `config` names `kebab` as a **whole** event token.
 ///
-/// Every generated hook config renders an event one of two ways — as the last
-/// word of a `miao hook …` command, or as a bare JSON/JS string — so an event is
-/// present exactly when its name sits between a space-or-quote and either a
-/// closing quote or the end of the input. (The end case is where an
-/// [`AgentControl::extra_hook_registrations`] command stops, since that one is
-/// appended raw rather than embedded in a document.)
+/// Every generated hook config renders an event as the last word of a `miao hook
+/// …` command or as a bare JSON/JS string, so the name always *opens* on a space
+/// or a quote. What may follow it is open-ended: a closing quote, the end of the
+/// input (where an [`AgentControl::extra_hook_registrations`] command stops), or
+/// more shell — Antigravity's commands continue `>/dev/null; echo …` because that
+/// agent requires JSON on a hook's stdout. So the trailing side admits anything
+/// that could not be part of the name itself.
 ///
 /// The boundary check is load-bearing, not decoration: `stop` is a prefix of
 /// `stop-failure`, `elicitation` of `elicitation-result` and `post-tool-use` of
@@ -1151,7 +1240,11 @@ fn mentions_event(config: &str, kebab: &str) -> bool {
     config.match_indices(kebab).any(|(at, _)| {
         let before = config[..at].chars().next_back();
         let after = config[at + kebab.len()..].chars().next();
-        matches!(before, Some(' ' | '"')) && matches!(after, Some('"') | None)
+        // Opening side stays exact rather than "not a name char": an agent
+        // binary living under a path segment that happens to *be* an event name
+        // would otherwise register every backend for it.
+        matches!(before, Some(' ' | '"'))
+            && after.is_none_or(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
     })
 }
 
@@ -1499,7 +1592,8 @@ mod tests {
                 AgentControl::Kimi,
                 AgentControl::Grok,
                 AgentControl::OpenCode,
-                AgentControl::Pi
+                AgentControl::Pi,
+                AgentControl::Antigravity
             ]
         );
     }
@@ -1718,7 +1812,23 @@ mod tests {
                     PostCompact,
                 ],
             ),
+            // Shorter still, and none of the three absences is a gap of ours:
+            // Antigravity's entire vocabulary is five events, it fires none at
+            // session start or on compaction, and its one pre-tool event is a
+            // permission *gate* that cannot be observed without answering
+            // (`agents::antigravity`). `PostToolUseFailure` and `StopFailure`
+            // are absent here for the opposite reason to Codex's — the
+            // dispatcher does produce them, out of the `error` field on these.
+            (
+                AgentControl::Antigravity,
+                &[PromptSubmit, PostToolUse, Stop],
+            ),
         ];
+        assert_eq!(
+            expected.len(),
+            AgentControl::ALL.len(),
+            "a backend without a row here would be pinned by nothing at all"
+        );
         for (agent, events) in expected {
             assert_eq!(
                 &agent.forwarded_events(),
@@ -1756,6 +1866,17 @@ mod tests {
         // in the config puts a `"` straight after it.
         assert!(!mentions_event(
             r#"{"c":"/opt/stop/miao hook stop-failure"}"#,
+            "stop"
+        ));
+        // A command that keeps going after the event name is still a
+        // subscription — Antigravity's commands end in a stdout contract, and
+        // the prefix guard has to survive that too.
+        assert!(mentions_event(
+            r#"{"c":"miao hook stop >/dev/null; echo {}"}"#,
+            "stop"
+        ));
+        assert!(!mentions_event(
+            r#"{"c":"miao hook stop-failure >/dev/null; echo {}"}"#,
             "stop"
         ));
     }
@@ -1810,13 +1931,24 @@ mod tests {
             let c = a.capabilities();
             (c.fork, c.worktrees, c.approval_gate, c.context_tokens)
         };
-        //                                        fork   tree   appr   ctx
-        assert_eq!(row(AgentControl::Claude), (true, true, true, true));
-        assert_eq!(row(AgentControl::Codex), (true, false, true, true));
-        assert_eq!(row(AgentControl::Reasonix), (true, false, true, false));
-        assert_eq!(row(AgentControl::Kimi), (false, false, true, true));
-        assert_eq!(row(AgentControl::Grok), (true, true, true, false));
-        assert_eq!(row(AgentControl::OpenCode), (true, false, true, true));
-        assert_eq!(row(AgentControl::Pi), (true, false, false, true));
+        //                                       fork   tree   appr   ctx
+        let promised: &[(AgentControl, _)] = &[
+            (AgentControl::Claude, (true, true, true, true)),
+            (AgentControl::Codex, (true, false, true, true)),
+            (AgentControl::Reasonix, (true, false, true, false)),
+            (AgentControl::Kimi, (false, false, true, true)),
+            (AgentControl::Grok, (true, true, true, false)),
+            (AgentControl::OpenCode, (true, false, true, true)),
+            (AgentControl::Pi, (true, false, false, true)),
+            (AgentControl::Antigravity, (false, false, false, false)),
+        ];
+        assert_eq!(
+            promised.len(),
+            AgentControl::ALL.len(),
+            "a backend missing here is a backend the README never promised anything about"
+        );
+        for &(agent, want) in promised {
+            assert_eq!(row(agent), want, "{agent:?}");
+        }
     }
 }

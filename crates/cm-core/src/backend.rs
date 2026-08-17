@@ -656,6 +656,13 @@ mod tests {
         // *prompts*, so `build_launch_command` sets the process cwd and passes
         // nothing positional. Ours is the only positional here too.
         assert_eq!(open_argv(AgentControl::Pi, None), ["pi", "/work"]);
+        // Antigravity takes no directory argument either — `agy` reads its
+        // workspace from the process cwd, and its `--add-dir` *adds* one rather
+        // than choosing it. Ours is the only positional here too.
+        assert_eq!(
+            open_argv(AgentControl::Antigravity, None),
+            ["antigravity", "/work"]
+        );
     }
 
     /// A spec crosses the wire, so a **newer dashboard** can name a backend this
@@ -803,6 +810,19 @@ mod tests {
         assert!(
             !open_argv(AgentControl::Pi, Some(("s5", true))).contains(&"--session".to_string()),
             "a Pi fork resumes through --fork alone"
+        );
+        // Antigravity resumes with `--conversation <id>` and cannot branch, so
+        // the fork request is dropped rather than turned into a second flag —
+        // the Kimi mechanism, pinned here because a silently-ignored argument
+        // is exactly the kind that grows one by accident.
+        assert_eq!(
+            open_argv(AgentControl::Antigravity, Some(("s5", false))),
+            ["antigravity", "/work", "--conversation", "s5"]
+        );
+        assert_eq!(
+            open_argv(AgentControl::Antigravity, Some(("s5", true))),
+            open_argv(AgentControl::Antigravity, Some(("s5", false))),
+            "a fork request must leave an Antigravity argv unchanged"
         );
     }
 
