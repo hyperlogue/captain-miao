@@ -38,7 +38,7 @@ or pane, controlled through the terminal's own protocol), so it stays one small,
 focused tool and the rest of your workflow is yours to compose.
 
 - **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without killing the sessions. A host can also borrow this machine's clipboard, so `Ctrl+V` in an agent running there attaches a screenshot you just took locally ([details](#pasting-a-screenshot-into-a-remote-session)).
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode) and [Pi](https://github.com/earendil-works/pi) ship too, each with known limits ([Reasonix](#reasonix-support), [Kimi Code](#kimi-code-support), [Grok](#grok-build-support), [opencode](#opencode-support), [Pi](#pi-support)).
+- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode) and [Pi](https://github.com/earendil-works/pi) ship too, each with [known limits](#per-agent-limits).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
 - **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
@@ -201,58 +201,50 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 
 Sessions launched via `claude` / `codex` / `reasonix` / `kimi` / `grok` / `opencode` / `pi` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
 
+### Per-agent limits
+
+Claude Code and Codex are the proven backends. The five below all ship and track status, but **none has been run against a released build** — report anything that looks wrong. A row stuck at `Starting` usually means the agent rejected our hook config.
+
 #### Reasonix support
 
-Reasonix rows track status — working, idle, waiting for approval, compacting — and launch, resume and fork all work. It is newer than the other two backends and does less:
+Status, launch, resume and fork work.
 
-- **No token or model columns.** Reasonix computes its context gauge in memory and never writes it down — its own source argues that deriving one from the last turn's recorded usage reads wrong during a compaction — and the usage it *does* persist is aggregated per day, not per session. So this would have to come over a hook.
-- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a background task runs reads as `Idle`.
-- **Run `reasonix setup` outside captain-miao once first.** A session runs under a synthetic config home that mirrors your real one; a first-time setup performed _inside_ a session lands in that mirror and is cleared on a later launch.
-
-It also hasn't yet been exercised against a released `reasonix` build end to end, so please report anything that looks wrong rather than assuming it's expected.
+- **No token or model columns** — Reasonix persists usage per day, not per session.
+- **No worktrees, no background-task tiers.**
+- **Run `reasonix setup` outside captain-miao once first**, or it lands in the synthetic config home and is lost.
 
 #### Kimi Code support
 
-Kimi rows track status — working, idle, waiting for approval, compacting — and launch and resume both work, as do the **title, token and model columns**. Kimi reports an **interrupt** as a real hook, so pressing Esc mid-turn settles the row immediately, which is something no other backend here manages. What it doesn't do:
+Status, launch, resume and the **title, token and model columns** work. Esc mid-turn settles the row immediately, because Kimi reports an interrupt as a real hook. Written from Kimi's docs alone, so the least verified here.
 
-- **No fork** (`f` hides itself on a Kimi row). Kimi documents no flag to branch a resume, and offering the key would silently resume in place — the one outcome someone pressing fork is trying to avoid.
-- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a `Stop` while a subagent or task runs reads as `Idle`.
-- **A session runs under a synthetic `KIMI_CODE_HOME`** that symlinks your real `~/.kimi-code/`, with `config.toml` a writable **copy** carrying our `[[hooks]]` entries. Your real config is never written to. Your own `[[hooks]]` in it are preserved; anything else in that copy (comments, key order) is rewritten, and refreshed from the real file whenever you change it.
+- **No fork** (`f` hides itself) — Kimi documents no flag to branch a resume, so the key would silently resume in place.
+- **No worktrees, no background-task tiers.**
 
-It is also the **least verified backend here**: it was written from Kimi's published documentation alone, against no running binary. Please report anything that looks wrong rather than assuming it's expected — especially a session where every row sits at "Starting", which is what a hook block Kimi rejects would look like.
 #### Grok Build support
 
-Grok rows track status — working, idle, waiting for approval, compacting — and launch, resume, fork and worktrees (`Ctrl-g`) all work. What it does less of, and why:
+Status, launch, resume, fork and worktrees all work.
 
-- **An interrupted turn (Esc / Ctrl-C) keeps reading as working** until you send the next prompt. Grok fires no hook at all for one, and the marker it writes to its session log instead hasn't been identified yet. This is the limit most likely to bite day to day.
-- **No token column**, and this one is Grok's own design rather than something waiting to be built: Grok deliberately doesn't persist its token ledgers, so there is no number on disk to read. It would have to come over a hook.
-- **No background-task tiers** — a `Stop` while a background task runs reads as `Idle`. Grok reports its background tasks better than any other backend here (they ride the `Stop` payload), so this one is wiring, not a gap.
-- **The worktree name isn't shown** on a row that has one. Grok keeps its worktrees in its own registry rather than beside the repo, which is where the dashboard looks.
-- **A session runs under a synthetic `GROK_HOME`** that symlinks your real one, with two exceptions: our own file in `hooks/` (your global hooks still run), and a writable copy of `config.toml`, which is where the approval-notification hook is registered. Authenticate with `grok` outside captain-miao once first — a first-time setup performed _inside_ a session lands in that copy, and the copy is refreshed from your real config whenever you edit it.
-
-None of this has been exercised against a released `grok` build end to end — in particular, if every row sticks at "starting", the hook file's format is the first thing to suspect. Please report anything that looks wrong rather than assuming it's expected.
+- **An interrupted turn keeps reading as working** until you send the next prompt — Grok fires no hook for one. The limit most likely to bite day to day.
+- **No token column** — Grok deliberately doesn't persist its token ledgers.
+- **No background-task tiers**, and **the worktree name isn't shown** (Grok keeps worktrees in its own registry, not beside the repo).
+- **Authenticate with `grok` outside captain-miao once first.**
 
 #### opencode support
 
-opencode rows track status — working, waiting on an approval, compacting, idle — and launch, resume and fork all work, as do the **title, tool, token and model columns**. opencode has no shell-command hooks at all; its only extension point is a JavaScript plugin, so captain-miao generates one and drops it into a synthetic config dir. What it doesn't do:
+Status, launch, resume, fork and the **title, tool, token and model columns** all work. opencode has no shell-command hooks, so captain-miao generates a JavaScript plugin for it.
 
-- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — a settled turn reads as `Idle` whatever else is still running.
-- **A session runs under a synthetic `OPENCODE_CONFIG_DIR`** that symlinks your real one, with `plugins/` the single exception: that directory is ours, and it is rebuilt to symlink each of your own plugins beside our generated `captain-miao.js`, so your plugins keep loading. Nothing of yours is written to. If you've moved your config with `$XDG_CONFIG_HOME`, captain-miao follows it; if your agents and commands go missing inside a session, that's the thing to check.
-
-Two things worth knowing about how the plugin behaves inside your session. It subscribes opencode's event bus but forwards only the events the dashboard uses, because the bus also carries per-chunk and per-file events that would otherwise start hundreds of processes a turn. And it deliberately stays out of `permission.ask`, the hook that could answer an approval prompt for you — captain-miao only watches the matching bus event, so nothing it does can delay a decision you're being asked to make.
-
-This backend is written against opencode's own source but has still **not been run against a released binary**. If every row sits at "Starting", the generated plugin is the first thing to suspect: it's a plain file at `~/.local/state/captain-miao/opencode-config/plugins/captain-miao.js`, and whether opencode loads a plugin from that directory and under that name is unconfirmed. Please report anything that looks wrong rather than assuming it's expected.
+- **No worktrees, no background-task tiers** — a settled turn reads as `Idle` whatever else is still running.
+- Your own plugins keep loading: `plugins/` is rebuilt to symlink each of them beside our generated `captain-miao.js`.
+- The plugin stays out of `permission.ask`, so nothing it does can delay a decision you're being asked to make.
 
 #### Pi support
 
-Pi rows track status — working, idle, compacting — and launch, resume and fork all work, as do the **token, model and title columns**, which no other new backend here manages. Pi is also the only agent whose hooks need nothing of yours: they arrive as a generated extension passed on the command line (`pi -e`), so there is no synthetic home, no copied config and no trust prompt to seed. What it doesn't do:
+Status, launch, resume, fork and the **token, model and title columns** all work.
 
-- **No "waiting for approval" state.** Pi has no per-tool approval gate at all — its trust machinery guards loading settings and extensions, not running tools — so there is no prompt for the dashboard to reflect. This is an absence in Pi, not a gap in captain-miao.
-- **No resume picker entries.** Pi's sessions are readable JSONL, but each is a **tree** rather than a log, so listing them correctly means walking back from the active branch; that is deferred rather than guessed. `pi -r` opens Pi's own session picker in the meantime.
-- **No worktrees** (`Ctrl-g` hides itself) and **no background-task tiers** — Pi has neither a worktree flag nor a background-shell concept.
-- **A row stuck at "Starting" is usually Pi's project-trust prompt**, not a broken hook. Pi asks before it loads a project's own config, and that happens before the first event we see, so the two look identical from the dashboard — answer it in the session window.
-
-Everything above was written from Pi's published documentation and source, against no running binary. The one behaviour worth reporting if it looks wrong: pressing Esc mid-turn should settle the row immediately (captain-miao takes Pi's `agent_settled` as the end of a turn, and expects a cancelled run to settle too).
+- **No "waiting for approval" state** — Pi has no per-tool gate, so there is no prompt to reflect. An absence in Pi, not a gap here.
+- **No resume-picker entries** — Pi's sessions are trees rather than logs. `pi -r` opens Pi's own picker meanwhile.
+- **No worktrees, no background-task tiers.**
+- **A row stuck at `Starting` is usually Pi's project-trust prompt** — answer it in the session window.
 
 ### Key bindings
 
