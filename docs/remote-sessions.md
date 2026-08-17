@@ -781,6 +781,26 @@ Within those, closing a *tab* still closes the windows in it, so under `stacked`
 one gesture ends every session sharing `miao:sessions`. That is the policy
 working, not a bug, and the run loop says how many it closed.
 
+**None of that second is on screen.** The row is presumed dead where the close is
+*decided* — `apply_detach_reports`, as the kill is queued — not where the request
+finally goes out, so `presume_killed` moves one step earlier than `x` makes it.
+The guard is against a quitting terminal, not against a user who might change
+their mind, and a dashboard that dies inside the delay drops the presumption and
+the queued close together. Left visible instead, that second was the whole of
+what closing a remote window looked like: the binding is retired at the report,
+so the row sank into the detached tier still wearing the pool's `attached = true`
+— and detached-plus-attached is this dashboard's spelling of *another terminal
+has this*, so a session on its way out spent its last second offering a steal.
+
+**A detach lowers the bit its own attach raised**, for the same reason and by the
+same seam (`Backend::presume_detached`). Where the session *stays* — `D`, or a
+closed window under `on_window_close = "detach"` — there is no kill to hide the
+row behind, so the stale bit is all the row has until the pool's
+`on_client_disconnect` hook has crossed the link. The evidence is symmetric with
+the refusal above: the pool is one client at a time, an attach is the only
+operation that takes the pty's lock, and the client that just let go was ours. A
+129 in particular is the terminal tearing our own window down, never a steal.
+
 **The duration is the wrapper's, not the binding's.** The report carries
 `held_secs`, measured in wall clock (`date`) around the attach, and the dashboard
 prefers it to how long the binding lived — which is an `Instant`, i.e.
@@ -1357,7 +1377,10 @@ wrong "busy" costs a retry, and a wrong "free" falls through to libshpool's own
 refusal. What makes that acceptable is that the attach attempt is the only
 operation that actually takes the lock — it is a transaction, not an
 observation — so its answer is authoritative, and §6 spends it: `ATTACH_EXIT_BUSY`
-names the reason in the dashboard and corrects the row it came from.
+names the reason in the dashboard and corrects the row it came from. An attach of
+*ours* that ends is the same evidence read the other way, and corrects the row the
+same way (`presume_detached`): the lock it was holding is free until someone takes
+it again, whatever the bit the host is still serving says.
 
 **Still open: which pool engine.** The adjudication asked to price **tmux**
 (`tmux -S`, private socket) and **zellij** behind the existing

@@ -3493,8 +3493,21 @@ impl App {
     /// The row stays; it just sinks into the detached tier, so this goes through
     /// the same invalidate-and-follow dance as every other binding change rather
     /// than poking `window_bindings` directly.
+    ///
+    /// The pool's attached bit goes with it (`Backend::presume_detached`). It is
+    /// *our* attach that set it, and the host won't know it ended until its own
+    /// hook fires a round trip later — during which a detached row still calling
+    /// itself attached is drawn as held by another terminal, offering a steal of
+    /// the session `D` just handed back. Presuming here rather than leaving it to
+    /// the reload is the same trade the kill makes: a guess the host is about to
+    /// confirm, made where the user can see the answer.
     pub(super) fn retire_window_binding(&mut self, host: &HostId, token: &str) {
         self.window_bindings.remove(host, token);
+        if let Some(key) = self.pooled_session_key(host, token)
+            && let Some(backend) = self.backend_for(host)
+        {
+            backend.presume_detached(&key);
+        }
         self.mark_dirty(Cursor::FollowSession);
     }
 
@@ -3577,34 +3590,46 @@ impl App {
                 continue;
             };
             changed = true;
-            // Closing the window is a request to end the session, unless the
-            // user asked otherwise — but only when it was the *user* who closed
-            // it, and only for a report we saw arrive (§`ReportOrigin`).
+            // A window the *user* closed, seen while we were running
+            // (§`ReportOrigin`): a request to end the session, unless they asked
+            // otherwise. Either way the client that held the pty was ours and is
+            // gone, which is the one thing the host cannot know yet.
             if origin == ReportOrigin::Live
                 && closed_by_the_user(report.status)
-                && self.on_window_close == config::OnWindowClose::Close
                 && let Some(key) = self.pooled_session_key(&host, &report.token)
             {
-                // The row goes **now**, on the strength of a close that is
-                // decided but not yet due — the same optimism `run::start_kill`
-                // applies to `x`, moved from when the request goes out to when
-                // it is settled. What the wait below guards against is a
-                // *quitting terminal*, not a user who might change their mind,
-                // so nothing about it belongs on screen: left visible, the row
-                // spends that second in the detached tier wearing the pool's
-                // stale attached bit, which reads as "someone else has this" —
-                // an offer to steal a session nobody holds and this dashboard
-                // is about to end. A dashboard that dies inside the wait takes
-                // the presumption with it exactly as it takes the queued close,
-                // so the two can't disagree.
-                if let Some(backend) = self.backend_for(&host) {
-                    backend.presume_killed(&key);
+                match self.on_window_close {
+                    config::OnWindowClose::Close => {
+                        // The row goes **now**, on the strength of a close that
+                        // is decided but not yet due — the same optimism
+                        // `run::start_kill` applies to `x`, moved from when the
+                        // request goes out to when it is settled. What the wait
+                        // below guards against is a *quitting terminal*, not a
+                        // user who might change their mind, so nothing about it
+                        // belongs on screen. A dashboard that dies inside the
+                        // wait takes the presumption with it exactly as it takes
+                        // the queued close, so the two can't disagree.
+                        if let Some(backend) = self.backend_for(&host) {
+                            backend.presume_killed(&key);
+                        }
+                        self.pending_session_close.push(PendingClose {
+                            host: host.clone(),
+                            key,
+                            due: Instant::now() + CLOSE_ON_WINDOW_CLOSE_DELAY,
+                        });
+                    }
+                    // The session stays, so the row does too — and it must not
+                    // spend the round trip until the host's own `Delta` reading
+                    // as held by another terminal, which is what the pool's
+                    // still-true attached bit makes of a row with no window
+                    // here. Nobody took the pty from us: a 129 is the terminal
+                    // tearing our window down, never a steal.
+                    config::OnWindowClose::Detach => {
+                        if let Some(backend) = self.backend_for(&host) {
+                            backend.presume_detached(&key);
+                        }
+                    }
                 }
-                self.pending_session_close.push(PendingClose {
-                    host: host.clone(),
-                    key,
-                    due: Instant::now() + CLOSE_ON_WINDOW_CLOSE_DELAY,
-                });
             }
             // The wrapper's own wall-clock measurement wins over the binding's
             // age, which is an `Instant` and so does not advance while the

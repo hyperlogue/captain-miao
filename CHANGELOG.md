@@ -126,6 +126,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A plugin or hook deleted from the real config dir no longer leaves a
   dangling symlink** in the opencode/Grok mirrors for the agent's loader to
   trip on.
+- **Closing a remote session's window takes its row with it.** The row used to
+  linger for the second the kill waits out, and spent it reading as *attached in
+  another terminal* — the pool's attached bit is one this dashboard's own attach
+  set, and the host cannot know it ended until a round trip later. The row now
+  goes when the close is decided; the delay still guards against a quitting
+  terminal, it just isn't on screen.
+- **`D`, and a closed window under `on_window_close = "detach"`, no longer offer
+  to steal the session they just put down** — same stale bit, and the row stays
+  in those cases, so it is corrected rather than hidden.
 
 ## [0.4.0] - 2026-08-14
 

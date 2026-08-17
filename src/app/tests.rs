@@ -2196,6 +2196,80 @@ fn a_queued_close_takes_its_row_with_it_immediately() {
     );
 }
 
+/// Where the session *stays* — `D`, or a closed window under
+/// `on_window_close = "detach"` — the row has to lose the attached bit with its
+/// window, because the bit is one our own attach set and the host won't know
+/// otherwise until its pool hook has crossed the link.
+///
+/// Left alone for that round trip, the row is detached *and* attached, which is
+/// the dashboard's spelling of "another terminal has this": 👀 instead of 🙈,
+/// and `Enter` offering to steal a session the user has just put down.
+#[test]
+fn a_detach_lowers_the_bit_its_own_attach_raised() {
+    use super::ReportOrigin;
+    use super::format::Detached;
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let pooled = |pid: u32, token: &str| {
+        let mut s = session(pid, "/srv/work", SessionStatus::Idle);
+        s.host = host.clone();
+        s.pool_session = Some(token.to_string());
+        s.window_id = None;
+        // Attached — to the window this dashboard is about to give up.
+        s.attached = Some(true);
+        s
+    };
+    let (detached_by_key, closed_by_hand) = (pooled(1, "cm-one"), pooled(2, "cm-two"));
+    d.set_sessions(vec![detached_by_key.clone(), closed_by_hand.clone()]);
+    d.app
+        .backends
+        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+            host.clone(),
+            vec![detached_by_key, closed_by_hand],
+        )));
+    for (token, wid) in [("cm-one", 901u64), ("cm-two", 902)] {
+        d.app
+            .record_window_binding(host.clone(), token.into(), WindowId::from(wid));
+    }
+
+    // `D` on the first row.
+    d.app.retire_window_binding(&host, "cm-one");
+    // A hand-closed window on the second, with the policy that keeps the
+    // session: no kill, so the row stays and its bit is all it has.
+    d.app.on_window_close = crate::config::OnWindowClose::Detach;
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-two".into(),
+            status: Some(129),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
+
+    // What the next reload will carry — both rows still there, neither attached.
+    let mut rows = d
+        .app
+        .backend_for(&host)
+        .expect("the host's backend")
+        .list_sessions();
+    rows.sort_by_key(|s| s.launcher_pid);
+    assert_eq!(rows.len(), 2, "a detach ends no session");
+    assert_eq!(
+        rows.iter().map(|s| s.attached).collect::<Vec<_>>(),
+        vec![Some(false), Some(false)]
+    );
+    // …and that is what turns 👀 back into 🙈: free to take, no steal implied.
+    d.set_sessions(rows);
+    for s in d.app.sessions.clone() {
+        assert_eq!(d.app.detached_kind(&s), Some(Detached::Free));
+    }
+}
+
 /// A detach report is the *event* that replaces polling the window tree: the
 /// attach window tells us its session ended, and the row must go detached (and
 /// re-sort) without waiting for a snapshot. Crucially it behaves like
