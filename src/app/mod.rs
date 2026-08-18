@@ -4364,16 +4364,12 @@ impl App {
     /// session another terminal is attached to would be taken from whoever is
     /// using it rather than restored to them.
     ///
-    /// "Resting" is the restart-all whitelist (`Idle | Compacted`), deliberately
-    /// not [`SessionStatus::is_busy`] — `Starting`, `WaitingForApproval` and
-    /// `ReviewPending` all read as at-rest by that narrower test, and all three
-    /// are states you would hate to have silently restarted.
+    /// "Resting" is [`SessionStatus::is_restartable`] — the same predicate the
+    /// restart commands gate on, since an upgrade *is* a restart of every
+    /// session on the host and the two must agree on what may be torn down.
     pub(super) fn upgrade_blocker(&self, host: &HostId) -> Option<String> {
         let mine: Vec<&LauncherState> = self.sessions.iter().filter(|s| &s.host == host).collect();
-        let busy = mine
-            .iter()
-            .filter(|s| !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted))
-            .count();
+        let busy = mine.iter().filter(|s| !s.status.is_restartable()).count();
         if busy > 0 {
             return Some(format!("{busy} {} not idle", plural_sessions(busy)));
         }
@@ -4866,21 +4862,21 @@ impl App {
         self.focus_selected()
     }
 
-    /// Build a `RestartSpec` for a session, or return None if it lacks the
-    /// pieces we need to relaunch it (window id, live session id). Sessions
-    /// that are still busy are also filtered out — restarting in the middle
-    /// of a tool call would interrupt work the user hasn't reviewed.
-    /// Build the spec to restart `s`, or the user-facing reason it can't be:
-    /// a remote session, a non-idle one, or one missing the window/session id.
+    /// Build the spec to restart `s`, or the user-facing reason it can't be: a
+    /// session that isn't at rest, or one missing the window/session id.
     /// `request_restart_selected` surfaces the `Err` verbatim; the restart-all
     /// path just filters on `.ok()`.
+    ///
+    /// "At rest" is [`SessionStatus::is_restartable`], shared with
+    /// `upgrade_blocker`: an upgrade is a restart of every session on the host,
+    /// so the two must agree on what a restart is allowed to take.
     pub(super) fn restart_spec_for(&self, s: &LauncherState) -> Result<RestartSpec, &'static str> {
         // Restart is kill + reopen **on the row's own host** — the seam already
         // carries `resume: (session_id, fork)`, so the old local-only gate was
         // never a limitation of the design, just a gap in the plumbing (§9).
         // A remote restart lands in that host's pool and auto-attaches like any
         // open.
-        if !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted) {
+        if !s.status.is_restartable() {
             return Err("Cannot restart: session must be idle (not active or waiting)");
         }
         let Some(session_id) = self.index_of(s).live_session_id(s).map(str::to_string) else {
@@ -4947,11 +4943,7 @@ impl App {
         }
         // Restart-all exists to get every agent onto a new binary at once, so a
         // partial run defeats the point: refuse while anything is busy.
-        if self
-            .sessions
-            .iter()
-            .any(|s| !matches!(s.status, SessionStatus::Idle | SessionStatus::Compacted))
-        {
+        if self.sessions.iter().any(|s| !s.status.is_restartable()) {
             self.set_status(
                 "Cannot restart all: every session must be idle".to_string(),
                 true,

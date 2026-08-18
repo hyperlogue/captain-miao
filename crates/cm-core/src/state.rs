@@ -509,6 +509,29 @@ impl SessionStatus {
             Self::Active | Self::Compacting | Self::BackgroundActive
         )
     }
+
+    /// Whether the session is at rest **enough to be torn down and brought
+    /// back**: the whitelist both the restart commands and a server upgrade
+    /// gate on, so the two can't drift apart on which states they'll act over.
+    ///
+    /// Deliberately not `!is_busy()`. That split only asks whether the agent is
+    /// mid-turn, so `Starting` and both `Waiting*` states pass it while being
+    /// exactly the ones a silent restart ruins — a launch cut off before it
+    /// produced a session id, a permission prompt thrown away unanswered.
+    ///
+    /// `BackgroundServer` and `ReviewPending` *are* here, though, because in
+    /// both the agent's turn has genuinely ended: what is still running is a
+    /// parked dev server / file watcher or an r3 review-watch, neither of which
+    /// is work the agent is waiting on and neither of which holds state the
+    /// restart would lose. Blocking on them only made a session
+    /// un-restartable until the user hunted down a shell they had already
+    /// walked away from.
+    pub fn is_restartable(&self) -> bool {
+        matches!(
+            self,
+            Self::Idle | Self::Compacted | Self::BackgroundServer | Self::ReviewPending
+        )
+    }
 }
 
 // -- Hook events --
@@ -1454,6 +1477,36 @@ mod tests {
         assert!(!SessionStatus::BackgroundServer.needs_attention());
         assert_eq!(SessionStatus::BackgroundServer.label(), "Server");
         assert!(SessionStatus::ALL.contains(&SessionStatus::BackgroundServer));
+    }
+
+    /// `is_restartable` is neither `!is_busy()` nor "idle or compacted", and the
+    /// gap on each side is the point. Both restart commands and the server
+    /// upgrade share it, so a variant sliding across this line changes what
+    /// those will tear down.
+    #[test]
+    fn restartable_is_at_rest_without_being_the_inverse_of_busy() {
+        use SessionStatus as S;
+        // The agent has stopped and nothing it is waiting on is in flight —
+        // including a parked server / review-watch, whose shells are not work
+        // the restart would interrupt.
+        for st in [S::Idle, S::Compacted, S::BackgroundServer, S::ReviewPending] {
+            assert!(st.is_restartable(), "{st:?} must be restartable");
+        }
+        // `Starting` and the Waiting* states pass `!is_busy()` and must still
+        // be refused: a launch cut off before it has a session id, a permission
+        // prompt silently thrown away.
+        for st in [S::Starting, S::WaitingForApproval, S::WaitingForDecision] {
+            assert!(!st.is_busy(), "{st:?} should be at rest by the busy test");
+            assert!(!st.is_restartable(), "{st:?} must not be restartable");
+        }
+        for st in [
+            S::Active,
+            S::Compacting,
+            S::BackgroundActive,
+            S::FailedToStart,
+        ] {
+            assert!(!st.is_restartable(), "{st:?} must not be restartable");
+        }
     }
 
     #[test]

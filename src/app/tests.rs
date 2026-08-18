@@ -1528,8 +1528,6 @@ fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
         SessionStatus::Active,
         SessionStatus::Starting,
         SessionStatus::WaitingForApproval,
-        SessionStatus::ReviewPending,
-        SessionStatus::BackgroundServer,
     ] {
         let mut d = TestDashboard::new(120, 12);
         d.set_sessions(vec![
@@ -1541,6 +1539,29 @@ fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
             .upgrade_blocker(&host)
             .unwrap_or_else(|| panic!("{status:?} must block"));
         assert!(why.contains("not idle"), "{status:?} said: {why}");
+    }
+
+    // A parked server and a session blocked on a human review do *not*: the
+    // agent's turn ended in both, so there is no work in flight to lose, and
+    // refusing left a host un-upgradeable over a shell the user had already
+    // walked away from. Same whitelist the restart commands use
+    // (`SessionStatus::is_restartable`).
+    for status in [
+        SessionStatus::BackgroundServer,
+        SessionStatus::ReviewPending,
+    ] {
+        let mut d = TestDashboard::new(120, 12);
+        d.set_sessions(vec![
+            pooled(1, SessionStatus::Idle, Some(false)),
+            pooled(2, status.clone(), Some(false)),
+        ]);
+        assert_eq!(
+            d.app.upgrade_blocker(&host),
+            None,
+            "{status:?} must not block an upgrade"
+        );
+        // …and both still come back afterwards.
+        assert_eq!(d.app.upgrade_restore_list(&host).len(), 2);
     }
 
     // A session another terminal is attached to blocks it too, even idle.
@@ -6435,6 +6456,52 @@ fn space_shift_e_rejects_when_any_session_busy() {
     assert_eq!(d.app.input_mode, InputMode::Normal);
     assert!(d.app.pending_confirm.is_none());
     assert!(d.app.status_is_error);
+}
+
+/// A parked server (`Server`) and a session blocked on a human review
+/// (`Review`) restart like an idle one, singly and in bulk.
+///
+/// Both are at rest — the agent's turn ended and what's left running is a dev
+/// server / watcher it walked away from, or an r3 review-watch waiting on a
+/// human. There is no in-flight work to lose, so the gate
+/// (`SessionStatus::is_restartable`, shared with `upgrade_blocker`) lets them
+/// through; refusing only stranded the row until the user hunted the shell down.
+#[test]
+fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
+    for status in [
+        SessionStatus::BackgroundServer,
+        SessionStatus::ReviewPending,
+    ] {
+        let mut d = TestDashboard::new(120, 20);
+        d.set_sessions(vec![session(1, "/home/test/proj", status.clone())]);
+        d.press(KeyCode::Char(' '));
+        d.press(KeyCode::Char('e'));
+        assert_eq!(
+            d.app.input_mode,
+            InputMode::Confirm,
+            "{status:?} should confirm, not refuse"
+        );
+        assert!(matches!(
+            d.press(KeyCode::Char('y')),
+            Some(Action::RestartSession(_))
+        ));
+    }
+
+    // …and neither holds up a restart-all, which refuses on *any* non-resting
+    // row.
+    let mut d = TestDashboard::new(120, 20);
+    d.set_sessions(vec![
+        session(1, "/home/test/a", SessionStatus::Idle),
+        session(2, "/home/test/b", SessionStatus::BackgroundServer),
+        session(3, "/home/test/c", SessionStatus::ReviewPending),
+    ]);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('E'));
+    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    match d.press(KeyCode::Enter) {
+        Some(Action::RestartAll { sessions }) => assert_eq!(sessions.len(), 3),
+        other => panic!("expected RestartAll over all three, got {other:?}"),
+    }
 }
 
 #[test]
