@@ -685,12 +685,10 @@ impl Picker {
         };
         // Painted now rather than after the list, so the `visible == 0` early
         // return below can't drop it.
+        // No background of its own: the line reads as part of the popup, not as
+        // a selected row, so it inherits whatever the popup sits on.
         if let (Some(area), Some(line)) = (status_area, &self.status_bar) {
-            let bg = crate::config::get().colors.picker.highlight_bg;
-            frame.render_widget(
-                Paragraph::new(line.clone()).style(Style::default().bg(bg)),
-                area,
-            );
+            frame.render_widget(Paragraph::new(line.clone()), area);
         }
 
         let chunks = Layout::default()
