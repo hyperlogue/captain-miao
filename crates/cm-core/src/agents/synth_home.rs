@@ -12,6 +12,16 @@
 //! copies, and any `.shadow-*` quarantine a past launch set aside — everything
 //! else in it belongs to the real home by construction. That invariant is what
 //! makes the shadow-replacement below safe.
+//!
+//! One thing moves the *other* way. An entry the **agent** created in here
+//! because the real home had no such name to mirror — a credential file written
+//! by a first login inside a session — is moved back out on the next launch
+//! ([`SynthHome::adopt_agent_writes`]), so the agent's own state never ends up
+//! stranded behind a mirror it cannot see out of. Nothing captain-miao writes
+//! is eligible, and that is enforced by the code rather than left to whoever
+//! adds the next backend: an entry named in `owned` or `copied` carries our
+//! hook config, and installing that in the real home would fire our hooks in
+//! every session the user runs *outside* captain-miao.
 
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
@@ -52,6 +62,17 @@ pub(super) struct SynthHome<'a> {
     pub owned: &'a [&'a str],
     /// Entries copied writable rather than symlinked (see [`CopiedEntry`]).
     pub copied: &'a [CopiedEntry],
+    /// Entries the **agent** owns outright, moved back into the real home if a
+    /// session created them here — see [`SynthHome::adopt_agent_writes`].
+    ///
+    /// **Nothing captain-miao injects or updates may appear here.** An entry
+    /// listed in `owned` or `copied` carries our hook config, and moving one
+    /// into the real home would install our hooks globally: every session the
+    /// user runs *outside* captain-miao would then shell out to `miao hook`
+    /// with no launcher socket, on every event. The rule is enforced rather
+    /// than remembered — [`SynthHome::adopt_agent_writes`] skips any name
+    /// [`SynthHome::is_ours`] claims.
+    pub adopted: &'a [&'a str],
     /// Remove links we minted whose real-home entry has since been deleted.
     ///
     /// Set it on a mirror of a **loader-scanned collection** — opencode's
@@ -77,6 +98,11 @@ impl SynthHome<'_> {
         // the directory to the owner (0700) — best-effort, an older 0755 dir from
         // a previous build gets tightened here too.
         let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+
+        // Before the linking pass, not after: an adopted entry lands in the real
+        // home, so the loop below then finds the name in `read_dir(real)` and
+        // links it with no special case of its own.
+        self.adopt_agent_writes();
 
         if let Some(real) = &self.real
             && let Ok(entries) = std::fs::read_dir(real)
@@ -205,6 +231,79 @@ impl SynthHome<'_> {
         Ok(())
     }
 
+    /// Move entries the agent minted **here** into the real home, so its own
+    /// state stops living behind a mirror it cannot see out of.
+    ///
+    /// The case this exists for is a first-ever login. The linking pass walks
+    /// `read_dir(real)`, so it only ever considers names the real home already
+    /// has; a credential file that has never existed there gets no link, the
+    /// agent's `open`/`rename` therefore creates a *real* file inside the
+    /// synthetic home, and the user's credentials stay invisible to a bare
+    /// `codex` / `grok` run outside captain-miao. Worse, the moment they log in
+    /// outside, that file becomes a shadow the mirror quarantines.
+    ///
+    /// Every write here is the **agent's own**, never ours: `adopted` may not
+    /// name anything in [`SynthHome::owned`] or [`SynthHome::copied`], and the
+    /// skip below is what enforces it rather than a comment asking nicely.
+    ///
+    /// Torn state is not a hazard: these agents write credentials by staging a
+    /// temporary file and renaming it, so anything found at the synthetic path
+    /// is a complete file. That is also why this can run at *launch* — a moment
+    /// another session of the same agent may be mid-flight, since the synthetic
+    /// home is shared per agent — rather than needing a session to end.
+    ///
+    /// Rules, in the order they are checked:
+    /// - a symlink is already pointing at the real home; nothing to do;
+    /// - the real home lacking the name is the whole point — move it, whether
+    ///   it is a file or a directory;
+    /// - the real home *having* it means the agent replaced a link of ours by
+    ///   rename, so the newer of the two wins and only for a plain file. An
+    ///   older one is left for the linking pass to quarantine, which keeps it
+    ///   recoverable instead of overwriting a login made outside since.
+    fn adopt_agent_writes(&self) {
+        let Some(real) = &self.real else {
+            return;
+        };
+        for name in self.adopted {
+            if self.is_ours(OsStr::new(name)) {
+                tracing::error!(
+                    "refusing to adopt {name}: captain-miao writes it, and moving it into the \
+                     real home would install our hooks globally"
+                );
+                continue;
+            }
+            let synth = self.dir.join(name);
+            let Ok(meta) = std::fs::symlink_metadata(&synth) else {
+                continue; // the agent never wrote here
+            };
+            if meta.file_type().is_symlink() {
+                continue; // already resolves into the real home
+            }
+            let dest = real.join(name);
+            let adopt = match std::fs::symlink_metadata(&dest) {
+                Err(_) => true,
+                Ok(_) => meta.is_file() && is_newer(&meta, &dest),
+            };
+            if !adopt {
+                continue;
+            }
+            // The real home may not exist at all yet — a directory-only
+            // creation, and only ever on the path where we have the agent's own
+            // state to put in it.
+            let _ = std::fs::create_dir_all(real);
+            match std::fs::rename(&synth, &dest) {
+                Ok(()) => tracing::info!(
+                    "adopted {} into {}: the agent created it inside the synthetic home",
+                    name,
+                    dest.display()
+                ),
+                // Nothing is lost by failing: the entry stays where the agent
+                // put it and the next launch tries again.
+                Err(e) => tracing::warn!("could not adopt {} into {}: {e}", name, dest.display()),
+            }
+        }
+    }
+
     /// Is `name` an entry we own or copy (and therefore never symlink)?
     fn is_ours(&self, name: &OsStr) -> bool {
         self.owned.iter().any(|o| name == OsStr::new(o))
@@ -265,6 +364,19 @@ fn atomic_symlink(target: &Path, link: &Path) {
 /// writes copy files out of the user's real agent home (often 0600), and going
 /// through the default umask (typically 0644) would silently downgrade a private
 /// config to world/group-readable.
+/// Whether `meta` is strictly newer than whatever is at `other`. Conservative
+/// on any unreadable timestamp: "not newer" leaves the real home's copy alone,
+/// and the entry stays recoverable.
+fn is_newer(meta: &std::fs::Metadata, other: &Path) -> bool {
+    let Ok(ours) = meta.modified() else {
+        return false;
+    };
+    let Ok(theirs) = std::fs::metadata(other).and_then(|m| m.modified()) else {
+        return false;
+    };
+    ours > theirs
+}
+
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -319,14 +431,35 @@ mod tests {
             self.root.join("synth")
         }
         fn home(&self, prune: bool) -> SynthHome<'static> {
+            self.adopting(prune, &[])
+        }
+        fn adopting(&self, prune: bool, adopted: &'static [&'static str]) -> SynthHome<'static> {
             SynthHome {
                 dir: self.synth(),
                 real: Some(self.real()),
                 owned: &["captain-miao.js"],
                 copied: &[],
+                adopted,
                 prune,
             }
         }
+        /// Write `body` into the synthetic home as a **real** entry, the way an
+        /// agent that found no symlink there would.
+        fn agent_wrote(&self, name: &str, body: &str) -> PathBuf {
+            std::fs::create_dir_all(self.synth()).unwrap();
+            let path = self.synth().join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+    }
+
+    /// Stamp an explicit mtime, so the newer-wins rule is tested by intent
+    /// rather than by how fast two writes happened to land.
+    fn set_mtime(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
     }
 
     impl Drop for Scratch {
@@ -415,6 +548,120 @@ mod tests {
 
     /// The state-mirror case ([`SynthHome::prune`] off): a dangling link stays,
     /// so an agent recreating the file writes through it into the real home.
+    /// The first-login case. The real home never had the file, so the linking
+    /// pass — which walks the *real* home — could not have mirrored it, and the
+    /// agent's own write landed here. It has to end up where a bare run of that
+    /// agent will find it.
+    #[test]
+    fn an_agent_file_the_real_home_never_had_is_adopted_into_it() {
+        let s = Scratch::new("adopt-new");
+        s.agent_wrote("auth.json", "token-1");
+
+        s.adopting(false, &["auth.json"]).ensure().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(s.real().join("auth.json")).unwrap(),
+            "token-1",
+            "the agent's credentials belong in the real home"
+        );
+        assert_eq!(
+            std::fs::read_link(s.synth().join("auth.json")).unwrap(),
+            s.real().join("auth.json"),
+            "and the mirror must point at them, so the next session writes through"
+        );
+    }
+
+    /// A token refreshed inside a session is the newer one, and the real home's
+    /// copy is stale by definition — the agent replaced our symlink by rename.
+    #[test]
+    fn a_newer_agent_write_replaces_the_real_one() {
+        let s = Scratch::new("adopt-newer");
+        std::fs::write(s.real().join("auth.json"), "old").unwrap();
+        set_mtime(&s.real().join("auth.json"), 1_000);
+        let synth = s.agent_wrote("auth.json", "refreshed");
+        set_mtime(&synth, 2_000);
+
+        s.adopting(false, &["auth.json"]).ensure().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(s.real().join("auth.json")).unwrap(),
+            "refreshed"
+        );
+    }
+
+    /// The other order, which is a login made *outside* captain-miao since. The
+    /// real home wins and the stale entry is left to the quarantine pass, so it
+    /// is recoverable rather than overwritten.
+    #[test]
+    fn an_older_agent_write_never_overwrites_a_newer_real_one() {
+        let s = Scratch::new("adopt-older");
+        std::fs::write(s.real().join("auth.json"), "logged-in-outside").unwrap();
+        set_mtime(&s.real().join("auth.json"), 2_000);
+        let synth = s.agent_wrote("auth.json", "stale");
+        set_mtime(&synth, 1_000);
+
+        s.adopting(false, &["auth.json"]).ensure().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(s.real().join("auth.json")).unwrap(),
+            "logged-in-outside"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(s.synth())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".shadow-auth.json")
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the stale copy is set aside, not deleted"
+        );
+    }
+
+    /// Antigravity's shape: the agent's whole state tree, minted here because
+    /// the real home had no such directory to mirror.
+    #[test]
+    fn a_directory_the_real_home_lacks_is_adopted_whole() {
+        let s = Scratch::new("adopt-dir");
+        std::fs::create_dir_all(s.synth().join("state/logs")).unwrap();
+        std::fs::write(s.synth().join("state/logs/a.log"), "entry").unwrap();
+
+        s.adopting(false, &["state"]).ensure().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(s.real().join("state/logs/a.log")).unwrap(),
+            "entry"
+        );
+        assert!(s.synth().join("state").is_symlink());
+    }
+
+    /// The rule, enforced rather than documented: a backend that lists one of
+    /// *our* files as adopted must not get it, because moving it would install
+    /// captain-miao's hooks into the user's real home — where every session run
+    /// outside captain-miao would then fire them at a socket that isn't there.
+    #[test]
+    fn a_file_captain_miao_writes_is_never_adopted() {
+        let s = Scratch::new("adopt-ours");
+        // `captain-miao.js` is this fixture's `owned` entry.
+        s.agent_wrote("captain-miao.js", "our plugin");
+
+        s.adopting(false, &["captain-miao.js"]).ensure().unwrap();
+
+        assert!(
+            !s.real().join("captain-miao.js").exists(),
+            "an entry captain-miao owns must never reach the real home"
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.synth().join("captain-miao.js")).unwrap(),
+            "our plugin",
+            "and it stays where it was"
+        );
+    }
+
     #[test]
     fn a_state_mirror_keeps_dangling_links() {
         let s = Scratch::new("state");

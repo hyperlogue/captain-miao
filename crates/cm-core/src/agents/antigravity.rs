@@ -258,6 +258,9 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
         real: dirs::home_dir(),
         owned: &[".gemini"],
         copied: &[],
+        // Nothing at this level is Antigravity's alone — every file it writes
+        // lives under `.gemini`, which the next mirror down handles.
+        adopted: &[],
         prune: false,
     };
     home.ensure()?;
@@ -267,6 +270,11 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
         real: gemini_dir(),
         owned: &["config"],
         copied: &[],
+        // The agent's entire state tree — conversations, transcripts and the
+        // OAuth token — and ours by nothing. On a machine where `agy` has never
+        // run, `~/.gemini/antigravity-cli` does not exist, so the linking pass
+        // cannot mirror it and a first session would strand all of that here.
+        adopted: &["antigravity-cli"],
         prune: false,
     };
     gemini.ensure()?;
@@ -276,6 +284,9 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
         real: config_dir(),
         owned: &[HOOKS_FILE],
         copied: &[],
+        // `hooks.json` is ours and the rest of this directory is configuration
+        // the user writes, never the agent.
+        adopted: &[],
         prune: false,
     };
     config.ensure()?;

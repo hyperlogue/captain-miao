@@ -263,14 +263,21 @@ fn launch_args(cwd: &str, extra: &[String]) -> Vec<String> {
 ///
 /// A home that doesn't exist yet yields a synthetic home holding only our
 /// `settings.json` — and under `REASONIX_HOME` every credential fallback is
-/// skipped, so that session won't start. Run `reasonix setup` outside
-/// captain-miao once first; the mirror picks its files up on the next launch.
+/// skipped, so that session won't start. `reasonix setup` run *inside* a
+/// session then writes `.env` and `config.toml` here rather than to the real
+/// home, which is why both are `adopted`: the next launch moves them out, and
+/// the one after that mirrors them like any other entry.
 fn ensure_synth_home(settings_json: &str) -> Result<PathBuf> {
     let home = SynthHome {
         dir: synth_home(),
         real: reasonix_home(),
         owned: &["settings.json"],
         copied: &[],
+        // Reasonix keeps its credentials in `.env` (module doc). Under
+        // `REASONIX_HOME` every credential fallback is skipped, so a session
+        // whose `.env` stranded in the synthetic home would not merely lose the
+        // login — it would fail to start.
+        adopted: &[".env", "config.toml"],
         prune: false,
     };
     home.ensure()?;

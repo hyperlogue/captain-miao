@@ -363,9 +363,12 @@ pub fn build_launch_command(
 /// survives; the reseed is why the merge below re-runs on every launch instead
 /// of once.
 ///
-/// The cost of the copy is the same one Codex pays: a first-run `grok` setup
-/// performed *inside* a captain-miao session lands in the copy and is cleared
-/// the next time the user edits their real config. Authenticate outside once.
+/// The cost of the copy is the same one Codex pays, and it is now limited to
+/// *configuration*: a `/model` change made inside a captain-miao session lands
+/// in the copy and is cleared the next time the user edits their real config.
+/// Credentials are not affected — `auth.json` is linked rather than copied, and
+/// a first login, which has no real file to link to yet, is moved back out by
+/// [`SynthHome::adopt_agent_writes`].
 fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
     let real = grok_home();
     let home = SynthHome {
@@ -376,6 +379,10 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        // Auto-managed credentials, which the module doc already says must be
+        // linked and never copied. Linking only works once the file exists, so
+        // a first login inside a session is adopted back out.
+        adopted: &["auth.json"],
         prune: false,
     };
     home.ensure()?;
@@ -385,6 +392,8 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
         real: real.map(|r| r.join("hooks")),
         owned: &[HOOKS_FILE],
         copied: &[],
+        // Hooks are configuration, never agent state.
+        adopted: &[],
         // A loader-scanned collection: a hook the user deletes must not leave
         // a dangling import behind (see [`SynthHome::prune`]).
         prune: true,

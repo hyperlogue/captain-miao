@@ -218,7 +218,7 @@ Status, launch, resume and fork work.
 
 - **No token or model columns** — Reasonix persists usage per day, not per session.
 - **No worktrees, no background-task tiers.**
-- **Run `reasonix setup` outside captain-miao once first**, or it lands in the synthetic config home and is lost.
+- **`reasonix setup` works inside a session** — its `.env` and `config.toml` are written into the synthetic home and moved back to your real `~/.reasonix` on the next launch.
 
 #### Kimi Code support
 
@@ -234,7 +234,7 @@ Status, launch, resume, fork and worktrees all work.
 - **An interrupted turn keeps reading as working** until you send the next prompt — Grok fires no hook for one. The limit most likely to bite day to day.
 - **No token column** — Grok deliberately doesn't persist its token ledgers.
 - **No background-task tiers**, and **the worktree name isn't shown** (Grok keeps worktrees in its own registry, not beside the repo).
-- **Authenticate with `grok` outside captain-miao once first.**
+- **A `/model` change made inside a session doesn't reach your real config** — Grok's `config.toml` is a writable copy, so it's reset the next time you edit the real one. Logging in *is* safe: credentials are moved back to your real `~/.grok` on the next launch.
 
 #### opencode support
 

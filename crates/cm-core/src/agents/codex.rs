@@ -493,6 +493,12 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        // `codex login` writes its credentials here. On a machine that has never
+        // logged in, the file does not exist to be mirrored, so a login *inside*
+        // a captain-miao session would leave the credentials in the synthetic
+        // home where a bare `codex` can't see them. This is the documented
+        // location rather than one verified against a login here.
+        adopted: &["auth.json"],
         prune: false,
     };
     home.ensure()?;

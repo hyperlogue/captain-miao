@@ -381,6 +381,9 @@ fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
         real: real.clone(),
         owned: &[PLUGINS_DIR],
         copied: &[],
+        // opencode keeps its credentials outside the config dir entirely, so
+        // nothing the agent owns is reachable through this mirror.
+        adopted: &[],
         prune: false,
     };
     config.ensure()?;
@@ -390,6 +393,8 @@ fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
         real: real.map(|r| r.join(PLUGINS_DIR)),
         owned: &[PLUGIN_FILE],
         copied: &[],
+        // Plugins are configuration; the agent writes none of its own here.
+        adopted: &[],
         // A loader-scanned collection: a plugin the user deletes must not
         // leave a dangling import behind for opencode's loader to trip on
         // (see [`SynthHome::prune`]).

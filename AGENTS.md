@@ -164,6 +164,16 @@ Anything local to one module is in that module's doc instead.
   cleans up nothing: `worktree_args` contributes `--worktree [name]` and the
   agent owns the branch, base ref, enforcement and cleanup. Resume and restart
   never pass the flag — the agent re-enters the session's own worktree.
+- **Never let a file captain-miao writes reach the agent's real home.** A
+  synthetic home mirrors the user's, and one thing travels back out of it:
+  an entry the *agent* minted there because the real home had no such name to
+  mirror (a first login's credentials). `SynthHome::adopted` names those, and
+  anything in `owned` or `copied` is refused — those carry our hook config, and
+  installing it in the real home would fire our hooks in every session the user
+  runs *outside* captain-miao, against a socket that isn't there. Where the
+  agent's state is a **directory**, seed it in the real home instead (Kimi's
+  `credentials/`): the agent's temp file and its rename both land inside the
+  real directory, so no shadow can form at all.
 - **Let per-session flags be host-owned** for a pooled host (`session-flags.json`
   sidecar, never the launcher's state file — single-writer rule).
 - **Keep `CM_SERVER_PAYLOAD_MANIFEST` the only switch for embedded servers.**

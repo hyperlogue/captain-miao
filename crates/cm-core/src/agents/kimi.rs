@@ -437,6 +437,12 @@ fn ensure_synth_home(hooks_toml: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
+        // Nothing to adopt: `credentials/` is a *directory*, and `seed_real_state`
+        // above has already created it in the real home — so a login writes
+        // through the link rather than into a shadow. A seeded directory is the
+        // stronger fix wherever it is available, because the agent's temporary
+        // file and its rename both land inside the real directory.
+        adopted: &[],
         prune: false,
     };
     home.ensure()?;
