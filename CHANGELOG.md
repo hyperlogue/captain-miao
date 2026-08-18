@@ -5,155 +5,102 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-18
 
 ### Added
 
-- **An iTerm2 terminal backend** (macOS, iTerm2 ≥ 3.0), driven through its
-  AppleScript dictionary. Unlike Ghostty it exports a per-session id, so hand
-  launches bind to their window, `Enter` focuses, `D` closes and `miao focus`
-  works; previews come back as plain text, since iTerm2 returns no colour.
-  Auto-detected, or pinned with `[terminal] backend = "iterm"`.
-- **Google's Antigravity CLI as an agent backend**: `miao antigravity`. Status,
-  launch, resume and the model column work, verified against `agy` 1.1.11. A
-  session runs under a synthetic `$HOME` that symlinks your real one, because
-  `agy` discovers hooks only from `~/.gemini/config/`; your own hooks there are
-  merged rather than replaced. Its five-event hook vocabulary is what costs it
-  the approval state, the fork key and a settled row after Esc — the README has
-  the full list.
-- **Four more agent backends**: `miao kimi`, `miao grok`, `miao opencode` and
-  `miao pi`. Each tracks status and launches, resumes and (where the agent can)
-  forks; each carries its own known limits in the README.
-- **The resume picker (`r`) works on Reasonix, Kimi, Grok and opencode.** Pi's
-  is still empty — its sessions are a tree, so listing them correctly means
-  walking back from the active branch.
-- **Token and model columns for Kimi, opencode and Pi.** Grok and Reasonix stay
-  empty and now say why: neither persists a per-session context number, by
-  design, so it could only come over a hook.
+- **Five more agent backends** — `kimi`, `grok`, `opencode`, `pi` and Google's
+  Antigravity — each tracking status and launching, resuming and (where the
+  agent can) forking, with its own known limits listed in the README.
+- **An iTerm2 terminal backend** (macOS, iTerm2 ≥ 3.0): hand launches bind to
+  their window, `Enter` focuses, `D` closes and `miao focus` works, and previews
+  come back as plain text since iTerm2 reports no colour.
+- **The resume picker (`r`) works on Reasonix, Kimi, Grok and opencode.**
+- **Token and model columns for Kimi, opencode, Pi and Antigravity**, taken
+  straight off the hook payload where the agent knows the numbers.
 - **`Space m` opens a log of the footer's status messages** (last 200, in
   memory), so a message that scrolled past is still readable.
 - **The detail panel names a session's worktree** when it has one.
 
 ### Changed
 
-- **Agents launch through one subcommand: `miao launch <agent> [dir]`**, where it
-  used to be `miao claude`, `miao codex` and one more per backend. The old
-  spellings are gone rather than aliased — the top-level CLI was mostly launcher
-  names, and `AgentControl::from_cli` is now the only place a backend name is
-  parsed, so adding a backend costs no CLI change at all. `miao-server` moved
-  with it.
+- **Agents launch through one subcommand, `miao launch <agent> [dir]`** — the
+  per-agent spellings (`miao claude`, `miao codex`, …) are gone rather than
+  aliased.
 - **An agent that logs in for the first time inside a captain-miao session keeps
-  its credentials.** They used to land in the synthetic home and stay invisible
-  to a bare `codex` / `grok` run outside; they are now moved into your real agent
-  home on the next launch. Nothing captain-miao writes is ever moved there — only
-  files the agent owns outright.
-
+  its credentials**, which move into your real agent home on the next launch
+  instead of staying invisible in the synthetic one.
+- **The columns ahead of Status are four cells tighter**: the follow-up bell is
+  now a one-cell dot, the override indicator folds into the status cell, and the
+  icon column is fixed-width, so nothing shifts when a host connects or a wider
+  mark scrolls into view.
 - **A session running in another terminal instance no longer gets a glyph in the
-  icon column.** Two dashboards in two terminals at once is rare enough not to
-  earn a slot in every row, and the marker was the column's one non-emoji
-  (`U+29C9` ⧉) — a character monospace fonts routinely skip, so on Ghostty it
-  drew as a missing-glyph box beside every session. The row still dims, and both
-  the preview and the detail panel name the instance it lives in.
-- **A hand-typed `miao <agent>` in a bare Ghostty window is refused**, naming
-  `o` / `O` instead. Ghostty exports no per-surface id, so such a session can
-  never be bound to its window: it would list in the dashboard but neither
-  focus nor close. Only that exact shape is refused — a dashboard or pool
-  launch is bound from its own spawn, and a tmux or zellij pane inside Ghostty
-  names itself, so both go through as before.
+  icon column** — the row still dims, and the preview and detail panel both name
+  the instance it lives in.
+- **A hand-typed `miao launch <agent>` in a bare Ghostty window is refused**,
+  naming `o` / `O` instead, since Ghostty exports no per-surface id to bind such
+  a session to its window.
 - **The agent cycle key offers only backends that are installed**, instead of
   cycling through seven and failing at launch.
-- **`f` hides itself on a backend whose resume cannot branch**, rather than
-  offering a key that silently resumes in place.
-- **The hosts row editor draws as a card over the list**, and offering a host
-  the clipboard is a field in it rather than a separate key.
+- **`f` hides itself on a backend whose resume cannot branch**, and says why on a
+  session with no known id, rather than offering a key that does nothing.
+- **The hosts row editor draws as a card over the list**, wraps long values
+  instead of truncating them, and carries the clipboard offer as a field rather
+  than a separate key.
+- **The dashboard no longer implies a signal its backend cannot send** — `s`
+  names the backend that has no approval prompt to report, and a context column
+  with no number reads `n/a` rather than blank.
 
 ### Fixed
 
-- **Ending or restarting a session closes its window *after* the process in it
-  exits**, instead of tearing the window down around a live process. On Ghostty
-  that showed as a dialog: it confirms before closing a surface whose command is
-  still running, and asks on the doomed tab, so `D` switched you away from the
-  dashboard to answer a prompt. The signalled session now gets a moment to go,
-  and since a surface whose command has exited closes itself, there is usually
-  nothing left to close. It also gives the launcher its own exit path back — it
-  removes its state file and tears down the per-session hooks. A pooled
-  session's attach window is unchanged: its local `ssh` is a process captain-miao
-  holds no pid for.
-- **A Claude session started from the dashboard no longer inherits the
-  launching session's own environment.** A terminal hands its environment to
-  everything it runs, so an emulator (or a tmux/zellij server) that was itself
-  started from inside an agent session exported that session's variables into
-  every window the dashboard opened in it. Claude Code read the inherited
-  `CLAUDE_CODE_CHILD_SESSION` marker as "already being recorded elsewhere" and
-  turned transcript saving off — which also cost captain-miao the transcript it
-  folds for status, title and context tokens, so the row never filled in. The
-  five variables scoped to one session's run are now cleared at launch; the
-  user's own settings are inherited as before.
-- **The header paw and its cat no longer draw on iTerm2**, where they came out
-  as a still image and a cat stuck mid-stride at the wrong size. Kitty's
-  `KITTY_PID`/`KITTY_WINDOW_ID` are inherited by anything a kitty shell
-  launches, so an iTerm2 started that way carried them into every session it
-  opened and the dashboard believed kitty was drawing its cells. Whether the
-  graphics protocol is spoken is now the resolved backend's answer, not an env
-  probe, so it follows the same detection (and the same `[terminal] backend`
-  override) as everything else.
-- **Ghostty could not launch a session at all.** Two independent faults, both
-  found by driving a real Ghostty 1.3.1 for the first time. The command was sent
-  with the `shell:` prefix Ghostty's *config file* accepts, but the AppleScript
-  property does not parse it — so Ghostty tried to execute a program literally
-  named `shell:/bin/sh`. And `new tab` was asked for without naming a window,
-  which Ghostty answers by creating the tab and *then* failing the event
-  (`-1708`), so the spawn reported failure while leaving a live agent behind.
-- **`miao focus` works on Ghostty**, where the dashboard had no idea which
-  surface it was in: Ghostty exports no window id to a process and its
-  dictionary has no `tty` to match one against, so no window was ever recorded
-  and `focus` took its no-dashboard path — printing `No dashboard running`,
-  exiting 1 and deleting the pid sentinel of a dashboard that was in fact
-  running. The dashboard now names its own surface by writing a nonce title and
-  looking for it (the tab label it sets a moment later is what puts the title
-  back), and `focus` tells a dashboard whose window is unknown from one that
-  isn't there.
-- **opencode sessions stuck reading as "working" forever.** The generated plugin
-  registered six handler keys that opencode never looks for — including the
-  turn-end signal — because they are event names on its bus rather than keys on
-  its hook interface. Fixing that also turned on the session id (so `r` and `f`
-  work), the title, the tool name, and the token and model columns.
-- **`direnv`'s allow-status is now checked on every backend**, not only Claude.
-  Everywhere else a blocked `.envrc` produced no agent, no state file and no
-  visible reason.
-- **opencode is no longer launched with a flag its root command rejects**, which
-  killed the window before any hook could fire.
-- **`f` on a session with no known id says so** instead of doing nothing.
-- **Kimi hooks never fired at all.** Kimi compiles a hook's matcher as a JS
-  regex, and the `matcher = "*"` every other backend spells "every tool" fails
-  to compile — which Kimi reads as matching *nothing*. The matcher is now
-  omitted, whose absence matches everything.
-- **An opencode approval prompt now reaches the dashboard.** The plugin
-  subscribed `permission.updated`, an event that exists only in opencode's
-  drifted SDK types; the runtime publishes `permission.asked`.
-- **An opencode subagent no longer wears the parent's row.** The bus carries
-  every session in the process, so a task-tool child's idle settled the row
-  mid-turn, its tokens and model overwrote the columns, and its id became what
-  `r` and `f` resumed. Proven-child events are now dropped — except a child's
-  approval ask, which blocks the whole turn and still stops the row.
-- **Pressing Esc in opencode no longer parks an error on the row.** The abort
-  it publishes beside the idle events is the turn ending, not failing.
+- **Ending or restarting a session closes its window after the process in it
+  exits**, instead of tearing the window down around a live process — which on
+  Ghostty raised a confirmation dialog on the doomed tab.
+- **A Claude session started from the dashboard no longer inherits the launching
+  session's environment**, whose `CLAUDE_CODE_CHILD_SESSION` marker turned off
+  the transcript captain-miao folds for status, title and context tokens.
+- **Ghostty could not launch a session at all**, from two faults found driving a
+  real Ghostty 1.3.1: the command carried a `shell:` prefix only the config file
+  accepts, and `new tab` was asked for without naming a window.
+- **`miao focus` works on Ghostty**, where the dashboard could not tell which
+  surface it was in and so printed `No dashboard running` while one was.
+- **The header paw and its cat no longer draw on iTerm2**, where inherited
+  `KITTY_*` variables had the dashboard believe kitty was painting its cells.
+- **opencode sessions no longer read as "working" forever** — the generated
+  plugin registered six handler keys opencode never looks for, and fixing that
+  also turned on the session id, title, tool name, and token and model columns.
+- **Kimi hooks never fired at all**, because the `matcher = "*"` every other
+  backend spells "every tool" fails to compile as the JS regex Kimi expects.
+- **An opencode approval prompt now reaches the dashboard**, which had subscribed
+  an event that exists only in opencode's drifted SDK types.
+- **An opencode subagent no longer wears the parent's row**, whose status,
+  tokens, model and resume id it used to overwrite mid-turn.
+- **Pressing Esc in opencode no longer parks an error on the row** — the abort it
+  publishes beside the idle events is the turn ending, not failing.
 - **A first-ever Kimi session's transcripts and login land in the real
   `~/.kimi-code`**, not inside the synthetic home where the dashboard never saw
-  them; and a shadow the mirror replaces is now set aside under a `.shadow-*`
-  name instead of destroyed.
-- **A plugin or hook deleted from the real config dir no longer leaves a
-  dangling symlink** in the opencode/Grok mirrors for the agent's loader to
-  trip on.
-- **Closing a remote session's window takes its row with it.** The row used to
-  linger for the second the kill waits out, and spent it reading as *attached in
-  another terminal* — the pool's attached bit is one this dashboard's own attach
-  set, and the host cannot know it ended until a round trip later. The row now
-  goes when the close is decided; the delay still guards against a quitting
-  terminal, it just isn't on screen.
+  them.
+- **A plugin or hook deleted from the real config dir no longer leaves a dangling
+  symlink** in the opencode and Grok mirrors for the agent's loader to trip on.
+- **`direnv`'s allow-status is checked on every backend**, not only Claude, where
+  a blocked `.envrc` elsewhere produced no agent and no visible reason.
+- **The resume picker no longer answers `opencode not found in PATH`** in place
+  of "No resumable sessions" on a machine that never installed it.
+- **Closing a remote session's window takes its row with it**, instead of leaving
+  it up for a second reading as attached in another terminal and offering to
+  steal a session nobody holds.
 - **`D`, and a closed window under `on_window_close = "detach"`, no longer offer
-  to steal the session they just put down** — same stale bit, and the row stays
-  in those cases, so it is corrected rather than hidden.
+  to steal the session they just put down.**
+- **Editing one row in the hosts panel reconnects only that host**, instead of
+  re-dialling every box and losing every remote row for the multi-second storm.
+- **A host still fetching its sessions keeps its loading line**, instead of
+  briefly presenting a host that had told us nothing as a host with nothing on
+  it.
+- **A host that settled on a musl server is offered musl again** after the
+  dashboard's version moves, and a refused deploy retries rather than leaving the
+  host on its old server.
+- **A background shell that outlives a compaction shows through `Compacted`**,
+  instead of parking the row there for as long as the shell runs.
 
 ## [0.4.0] - 2026-08-14
 
@@ -431,6 +378,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hyperlogue/captain-miao/compare/v0.2.0...v0.2.1
