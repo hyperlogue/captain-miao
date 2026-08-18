@@ -22,7 +22,7 @@
 //!   is `w<win>t<tab>p<pane>:<UUID>`, and that UUID *is* `id of session` —
 //!   verified by reading both for the same session. This is the whole reason
 //!   iTerm2 is a cheaper backend than Ghostty: `current_window` is an env read,
-//!   so a hand-typed `miao claude .` binds to its window like a Kitty one, and
+//!   so a hand-typed `miao launch claude .` binds to its window like a Kitty one, and
 //!   nothing has to write a nonce title to find itself.
 //! - **Session ids are UUIDs, so they never recycle** — which is what makes the
 //!   speculative `close_window` the restart/kill paths rely on safe, and what

@@ -20,6 +20,14 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCache};
+
+/// The subcommand every launcher argv goes through: `miao launch <agent> <cwd>`.
+///
+/// One verb rather than one subcommand per backend, so the top-level CLI doesn't
+/// grow with the agent list and `AgentControl::from_cli` stays the single
+/// authority on the names. Both binaries' clap enums must spell it the same way;
+/// each has a test that parses an argv built here to make sure they do.
+pub const LAUNCH_VERB: &str = "launch";
 use crate::agents::codex;
 use crate::paths;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey};
@@ -367,7 +375,8 @@ impl LocalBackend {
 
     /// Build the argv for a local launcher window:
     /// `miao <agent> <cwd> [resume args]`. Pure metadata — the client spawns it
-    /// into a Kitty window; nothing runs here. argv[0] is the running
+    /// into a Kitty window; nothing runs here. argv[1] is [`LAUNCH_VERB`] and
+    /// argv[0] is the running
     /// captain-miao exe so the launched launcher is the same build as the
     /// dashboard (falls back to a bare `miao` on PATH if unresolvable — the
     /// dashboard binary's name, since that is what a local install puts there).
@@ -392,7 +401,12 @@ impl LocalBackend {
             .into_owned();
         // The spec's cwd arrives host-canonical; a process needs the real path.
         let cwd = paths::expand_home(&spec.cwd, &self.home);
-        let mut argv = vec![exe, spec.agent.cli_subcommand().to_string(), cwd];
+        let mut argv = vec![
+            exe,
+            LAUNCH_VERB.to_string(),
+            spec.agent.cli_subcommand().to_string(),
+            cwd,
+        ];
         if let Some((session_id, fork)) = &spec.resume {
             argv.extend(spec.agent.resume_args(session_id, *fork));
         }
@@ -602,6 +616,9 @@ mod tests {
 
     /// `open_session` argv[0] is the resolved exe path (varies by environment),
     /// so the tests assert on the agent-facing tail.
+    /// The launcher argv **after** the exe and the `launch` verb, so each case
+    /// below reads as the agent name and its arguments. The verb itself is
+    /// pinned once, in `the_launcher_argv_goes_through_the_launch_verb`.
     fn open_argv(agent: AgentControl, resume: Option<(&str, bool)>) -> Vec<String> {
         open_argv_worktree(agent, resume, None)
     }
@@ -619,7 +636,27 @@ mod tests {
                 worktree: worktree.map(str::to_string),
             })
             .expect("a known agent always plans");
-        plan.argv()[1..].to_vec()
+        plan.argv()[2..].to_vec()
+    }
+
+    /// Every launch goes through one subcommand, and the backend is its first
+    /// argument. Pinned here because both binaries' clap enums parse this argv
+    /// back — a verb that drifted would open a window that dies on a clap error,
+    /// and on a remote host nobody would be watching.
+    #[test]
+    fn the_launcher_argv_goes_through_the_launch_verb() {
+        for &agent in AgentControl::ALL {
+            let plan = LocalBackend::default()
+                .open_session(&OpenSpec {
+                    agent,
+                    cwd: "/work".to_string(),
+                    resume: None,
+                    worktree: None,
+                })
+                .expect("a known agent always plans");
+            assert_eq!(plan.argv()[1], LAUNCH_VERB, "{agent:?}");
+            assert_eq!(plan.argv()[2], agent.cli_subcommand(), "{agent:?}");
+        }
     }
 
     /// Also the happy-path guard for the `Result` signature: a known agent must
@@ -894,7 +931,7 @@ mod tests {
                 worktree: None,
             })
             .expect("plans");
-        assert_eq!(plan.argv()[2], root.join("proj").display().to_string());
+        assert_eq!(plan.argv()[3], root.join("proj").display().to_string());
 
         let _ = std::fs::remove_dir_all(&root);
     }

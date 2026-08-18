@@ -55,86 +55,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launch Claude Code with hooks injected for session tracking.
+    /// Launch a coding agent with hooks injected for session tracking.
     ///
-    /// The first positional is the working directory (defaults to `.`) unless
-    /// it begins with `-`, in which case it (and everything after) is forwarded
-    /// to `claude` — so `miao claude --resume` works. See `cli::split_cwd`.
-    Claude {
+    /// The first positional after the backend name is the working directory
+    /// (defaults to `.`) unless it begins with `-`, in which case it — and
+    /// everything after it — is forwarded to the agent, so `miao launch claude
+    /// --resume` works. See `cli::split_cwd`.
+    Launch {
+        /// Which backend to run: `claude`, `codex`, `reasonix`, `kimi`, `grok`,
+        /// `opencode`, `pi` or `antigravity`.
+        ///
+        /// A free-form string resolved by `AgentControl::from_cli` rather than a
+        /// clap subcommand per backend: that keeps one authority over the names,
+        /// and a new backend then costs nothing here at all.
+        agent: String,
         /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to claude.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Codex with hooks injected for session tracking. Argument handling
-    /// matches the `claude` subcommand.
-    Codex {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to codex.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Reasonix with hooks injected for session tracking. Argument
-    /// handling matches the `claude` subcommand.
-    Reasonix {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to reasonix.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Kimi Code with hooks injected for session tracking. Argument
-    /// handling matches the `claude` subcommand.
-    Kimi {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to kimi.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Grok Build with hooks injected for session tracking. Argument
-    /// handling matches the `claude` subcommand.
-    Grok {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to grok.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch opencode with a tracking plugin injected. Argument handling
-    /// matches the `claude` subcommand.
-    ///
-    /// `name` is spelled explicitly: clap would derive `open-code` from the
-    /// variant, and `cli_subcommand()` — which is what the dashboard puts on
-    /// an argv — says `opencode`.
-    #[command(name = "opencode")]
-    OpenCode {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to opencode.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Pi with hooks injected for session tracking. Argument handling
-    /// matches the `claude` subcommand.
-    Pi {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to pi.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Google's Antigravity CLI with hooks injected for session
-    /// tracking. Argument handling matches the `claude` subcommand.
-    ///
-    /// Named for the product, not for the `agy` binary it installs as — the
-    /// subcommand has to match `cli_subcommand()`, which is also the name a
-    /// session carries on disk.
-    Antigravity {
-        /// Working directory (first positional, unless it starts with `-`)
-        /// followed by any extra arguments passed straight to agy.
+        /// followed by any extra arguments passed straight to the agent.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -203,24 +139,16 @@ enum Commands {
 }
 
 impl Commands {
-    /// `Some((agent, args))` for the launcher subcommands, `None` for everything
-    /// else — the single place a clap variant maps to an [`agent::AgentControl`].
+    /// The passthrough args of a launch, or `None` for every other subcommand —
+    /// what the terminal gate keys on.
     ///
-    /// Every consumer of that mapping goes through here (the terminal gate and
-    /// the dispatch in `async_main`), so a new backend is a new clap variant plus
-    /// one arm below and nothing else. Routing the *gate* through it matters
-    /// most: a variant missing from `requires_terminal` fails silently and
-    /// specifically on headless pool hosts — the one place nobody is watching.
-    fn launcher(&self) -> Option<(agent::AgentControl, &[String])> {
+    /// Deliberately keyed on the *variant* and not on a resolved backend: an
+    /// agent name this build can't parse is still a launch, and the gate must
+    /// not mistake it for the dashboard on a headless pool host. Resolving the
+    /// name is the dispatch's job, where a bad one can be reported.
+    fn launch_args(&self) -> Option<&[String]> {
         match self {
-            Commands::Claude { args } => Some((agent::AgentControl::Claude, args)),
-            Commands::Codex { args } => Some((agent::AgentControl::Codex, args)),
-            Commands::Reasonix { args } => Some((agent::AgentControl::Reasonix, args)),
-            Commands::Kimi { args } => Some((agent::AgentControl::Kimi, args)),
-            Commands::Grok { args } => Some((agent::AgentControl::Grok, args)),
-            Commands::OpenCode { args } => Some((agent::AgentControl::OpenCode, args)),
-            Commands::Pi { args } => Some((agent::AgentControl::Pi, args)),
-            Commands::Antigravity { args } => Some((agent::AgentControl::Antigravity, args)),
+            Commands::Launch { args, .. } => Some(args),
             _ => None,
         }
     }
@@ -275,10 +203,8 @@ fn main() -> Result<()> {
 /// `--pool-session`. Everything else drives a local Kitty/zellij window.
 fn requires_terminal(command: &Option<Commands>) -> bool {
     // A pooled launcher carries `--pool-session` in its passthrough args here
-    // (stripped later); it runs on a headless pool host, not in a terminal. Asked
-    // through `launcher` rather than matched per backend, so a new one can't be
-    // left out of the exemption.
-    if let Some((_, args)) = command.as_ref().and_then(Commands::launcher) {
+    // (stripped later); it runs on a headless pool host, not in a terminal.
+    if let Some(args) = command.as_ref().and_then(Commands::launch_args) {
         return !args.iter().any(|a| a == "--pool-session");
     }
     match command {
@@ -408,25 +334,22 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Commands::Clipboard { .. }) => {
             unreachable!("clipboard is dispatched in main() before the runtime")
         }
-        // Every launcher subcommand, dispatched through `Commands::launcher` so
-        // the variant→`AgentControl` mapping stays in that one place. The
-        // variants are still *named* here rather than swept up by a catch-all,
-        // which keeps the match exhaustive: a new backend then costs one name in
-        // this pattern, and the compiler asks for it, while a non-launcher
-        // subcommand added without a dispatch arm still fails to build instead
-        // of reaching a runtime panic.
-        Some(
-            cmd @ (Commands::Claude { .. }
-            | Commands::Codex { .. }
-            | Commands::Reasonix { .. }
-            | Commands::Kimi { .. }
-            | Commands::Grok { .. }
-            | Commands::OpenCode { .. }
-            | Commands::Pi { .. }
-            | Commands::Antigravity { .. }),
-        ) => {
-            let (agent, args) = cmd.launcher().expect("the launcher variants");
-            cm_core::cli::run_launch(agent, args.to_vec()).await
+        // The one launcher subcommand. `from_cli` is the single authority on
+        // backend names, so an unknown one is reported here — with the list —
+        // rather than becoming a clap error about a subcommand that never
+        // existed.
+        Some(Commands::Launch { agent, args }) => {
+            let backend = agent::AgentControl::from_cli(&agent).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown agent backend `{agent}`; this build launches: {}",
+                    agent::AgentControl::ALL
+                        .iter()
+                        .map(|a| a.cli_subcommand())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            cm_core::cli::run_launch(backend, args).await
         }
         None => app::run().await,
     }
@@ -455,7 +378,8 @@ mod tests {
 
     #[test]
     fn requires_terminal_plain_launcher_needs_terminal() {
-        let cmd = Some(Commands::Claude {
+        let cmd = Some(Commands::Launch {
+            agent: "claude".into(),
             args: vec!["/work".into(), "--resume".into(), "sid".into()],
         });
         assert!(requires_terminal(&cmd));
@@ -477,37 +401,57 @@ mod tests {
         assert!(parse(&["miao", "clipboard"]).is_err());
     }
 
-    /// Every backend's `cli_subcommand()` must be a subcommand this binary
-    /// actually has, and must parse back to the same backend — the dashboard
-    /// spawns `miao <cli_subcommand()> <cwd>`, so a name that doesn't resolve
-    /// opens a window that dies on a clap error.
-    ///
-    /// It is a *derive* trap rather than a typo one: clap kebab-cases a variant
-    /// name, so a two-word backend (`OpenCode` → `open-code`) silently gets a
-    /// subcommand nobody names anywhere else. Hence the explicit
-    /// `#[command(name = …)]` on that variant, and hence this test — which
-    /// covers every backend added later for free.
+    /// Every backend must survive the round trip the dashboard actually makes:
+    /// `open_session` builds an argv, a window runs it, and *this* binary's clap
+    /// has to parse it back into the same backend. Built from `open_session`
+    /// rather than from a literal, so the verb it emits and the verb clap
+    /// accepts cannot drift apart — a launch that doesn't parse opens a window
+    /// that dies on a clap error.
     #[test]
     fn every_backend_launches_under_the_name_it_advertises() {
         for &want in agent::AgentControl::ALL {
             let name = want.cli_subcommand();
-            let cli = Cli::try_parse_from(["miao", name, "/work"])
-                .unwrap_or_else(|e| panic!("`miao {name}` must parse: {e}"));
+            let plan = cm_core::backend::LocalBackend::default()
+                .open_session(&cm_core::backend::OpenSpec {
+                    agent: want,
+                    cwd: "/work".to_string(),
+                    resume: None,
+                    worktree: None,
+                })
+                .expect("a known agent always plans");
+            let cli = Cli::try_parse_from(plan.argv())
+                .unwrap_or_else(|e| panic!("the argv for {name} must parse: {e}"));
             let cmd = cli.command.expect("a subcommand");
-            let (got, args) = cmd
-                .launcher()
-                .unwrap_or_else(|| panic!("`miao {name}` must map to a backend"));
-            assert_eq!(got, want, "`miao {name}` launched the wrong backend");
-            assert_eq!(args, ["/work"]);
-            // …and it drives a terminal, which is the gate a new variant is
-            // most easily left out of.
+            let Commands::Launch { agent, args } = &cmd else {
+                panic!("`miao launch {name}` must be a launch");
+            };
+            assert_eq!(
+                agent::AgentControl::from_cli(agent),
+                Some(want),
+                "`miao launch {name}` resolved to the wrong backend"
+            );
+            assert_eq!(args, &["/work"]);
+            // …and it drives a terminal, which is the gate most easily missed.
             assert!(requires_terminal(&Some(cmd)));
         }
     }
 
+    /// A name this build can't drive still parses as a *launch*, so the terminal
+    /// gate treats it as one and the dispatch gets to report it. Reversing that
+    /// would send it down the dashboard path on a headless pool host.
+    #[test]
+    fn an_unknown_backend_name_is_still_a_launch() {
+        let cli = Cli::try_parse_from(["miao", "launch", "nosuchagent", "/work"])
+            .expect("clap validates the verb, not the backend name");
+        let cmd = cli.command.expect("a subcommand");
+        assert!(cmd.launch_args().is_some());
+        assert!(agent::AgentControl::from_cli("nosuchagent").is_none());
+    }
+
     #[test]
     fn requires_terminal_pooled_claude_is_exempt() {
-        let cmd = Some(Commands::Claude {
+        let cmd = Some(Commands::Launch {
+            agent: "claude".into(),
             args: vec![
                 "/work".into(),
                 "--pool-session".into(),

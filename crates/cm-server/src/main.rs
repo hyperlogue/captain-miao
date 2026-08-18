@@ -56,54 +56,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launch Claude Code with hooks injected, inside the pty pool (headless).
-    Claude {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Codex with hooks injected, inside the pty pool (headless).
-    Codex {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Reasonix with hooks injected, inside the pty pool (headless).
-    Reasonix {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Kimi Code with hooks injected, inside the pty pool (headless).
-    Kimi {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Grok Build with hooks injected, inside the pty pool (headless).
-    Grok {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch opencode with a tracking plugin injected, inside the pty pool
-    /// (headless). `name` is explicit because clap would derive `open-code`.
-    #[command(name = "opencode")]
-    OpenCode {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Pi with hooks injected, inside the pty pool (headless).
-    Pi {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Launch Google's Antigravity CLI with hooks injected, inside the pty
-    /// pool (headless). Named for the product, not for its `agy` binary — the
-    /// subcommand has to match `cli_subcommand()`.
-    Antigravity {
+    /// Launch a coding agent with hooks injected, inside the pty pool
+    /// (headless). Argument handling matches the dashboard's `miao launch`.
+    Launch {
+        /// Which backend to run — resolved by `AgentControl::from_cli`, the one
+        /// authority on the names.
+        agent: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -199,14 +157,7 @@ impl Commands {
     /// rather than hoisted into `cm-core`.
     fn launcher(&self) -> Option<(AgentControl, &[String])> {
         match self {
-            Commands::Claude { args } => Some((AgentControl::Claude, args)),
-            Commands::Codex { args } => Some((AgentControl::Codex, args)),
-            Commands::Reasonix { args } => Some((AgentControl::Reasonix, args)),
-            Commands::Kimi { args } => Some((AgentControl::Kimi, args)),
-            Commands::Grok { args } => Some((AgentControl::Grok, args)),
-            Commands::OpenCode { args } => Some((AgentControl::OpenCode, args)),
-            Commands::Pi { args } => Some((AgentControl::Pi, args)),
-            Commands::Antigravity { args } => Some((AgentControl::Antigravity, args)),
+            Commands::Launch { agent, args } => Some((AgentControl::from_cli(agent)?, args)),
             _ => None,
         }
     }
@@ -361,21 +312,14 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::PtyDaemon | Commands::Attach { .. } => {
             unreachable!("pty-pool commands are dispatched in main() before the runtime")
         }
-        // Every launcher subcommand, dispatched through `Commands::launcher` so
+        // The one launcher subcommand, dispatched through `Commands::launcher` so
         // the variant→`AgentControl` mapping stays in that one place. Named here
         // rather than swept up by a catch-all so the match stays exhaustive —
         // see the twin in the dashboard's `main.rs`.
         Commands::Clipboard {
             action: ClipboardAction::Paste,
         } => cm_core::clipboard::shim::paste().await,
-        cmd @ (Commands::Claude { .. }
-        | Commands::Codex { .. }
-        | Commands::Reasonix { .. }
-        | Commands::Kimi { .. }
-        | Commands::Grok { .. }
-        | Commands::OpenCode { .. }
-        | Commands::Pi { .. }
-        | Commands::Antigravity { .. }) => {
+        cmd @ Commands::Launch { .. } => {
             let (agent, args) = cmd.launcher().expect("the launcher variants");
             // `run_launch_pooled`, not `run_launch`: every `miao-server` launcher
             // runs inside the pty pool, so its agent gets the clipboard shims on
@@ -426,24 +370,34 @@ mod tests {
         assert!(parse(&["miao-server", "daemon", "frobnicate"]).is_err());
     }
 
-    /// The twin of the dashboard's own check: every backend's
-    /// `cli_subcommand()` must name a subcommand *this* binary has too, because
-    /// a pooled launch spawns `miao-server <cli_subcommand()> <cwd>` on the
-    /// host. The two clap enums are separate on purpose, which is exactly why
-    /// each needs its own guard — clap kebab-cases a two-word variant
-    /// (`OpenCode` → `open-code`), and a name that diverges here fails only on
-    /// a *remote* launch, where nobody is watching.
+    /// The twin of the dashboard's own check, and the argv comes from the same
+    /// builder: a pooled launch runs `open_session`'s plan on the host, so this
+    /// binary's clap has to parse what that emits. The two clap enums are
+    /// separate on purpose, which is exactly why each needs its own guard — a
+    /// divergence here fails only on a *remote* launch, where nobody is
+    /// watching.
     #[test]
     fn every_backend_launches_under_the_name_it_advertises() {
         for &want in AgentControl::ALL {
             let name = want.cli_subcommand();
-            let cli = Cli::try_parse_from(["miao-server", name, "/work"])
-                .unwrap_or_else(|e| panic!("`miao-server {name}` must parse: {e}"));
+            let plan = cm_core::backend::LocalBackend::default()
+                .open_session(&cm_core::backend::OpenSpec {
+                    agent: want,
+                    cwd: "/work".to_string(),
+                    resume: None,
+                    worktree: None,
+                })
+                .expect("a known agent always plans");
+            let cli = Cli::try_parse_from(plan.argv())
+                .unwrap_or_else(|e| panic!("the argv for {name} must parse: {e}"));
             let (got, args) = cli
                 .command
                 .launcher()
-                .unwrap_or_else(|| panic!("`miao-server {name}` must map to a backend"));
-            assert_eq!(got, want, "`miao-server {name}` launched the wrong backend");
+                .unwrap_or_else(|| panic!("`miao-server launch {name}` must map to a backend"));
+            assert_eq!(
+                got, want,
+                "`miao-server launch {name}` launched the wrong backend"
+            );
             assert_eq!(args, ["/work"]);
         }
     }

@@ -4163,7 +4163,7 @@ impl App {
     /// owns the binding for any session it spawned: it resolves the session's
     /// **token** (a local session's `launch_id`, a remote one's `pool_session`,
     /// §15.2) to the window it opened. A token-less local session — hand-launched
-    /// `miao claude`, or a launcher predating `launch_id` — self-reported
+    /// `miao launch claude`, or a launcher predating `launch_id` — self-reported
     /// `window_id`, so fall back to that. Returns `None` for a remote session we
     /// aren't attached to (no local window); preview / focus / move-to-tab then
     /// no-op rather than target a phantom.

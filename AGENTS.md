@@ -25,7 +25,7 @@ Claude/Codex hook → miao hook → launcher (Unix socket)
 | Crate | Binary | What |
 | --- | --- | --- |
 | `crates/cm-core` | — | Shared logic + data. No ratatui, no libshpool, so it cross-compiles into the server. |
-| `.` (root) | **`miao`** | The TUI (`src/app/`, `src/terminal/`), plus `claude`/`codex`/`hook`/`focus`. No pty pool. |
+| `.` (root) | **`miao`** | The TUI (`src/app/`, `src/terminal/`), plus `launch`/`hook`/`focus`. No pty pool. |
 | `crates/cm-server` | **`miao-server`** | Headless per-host daemon + pty pool. Cross-compiled to Linux and deployed to remotes. |
 | `crates/cm-client` | **`miao-client`** | Thin CLI over the *local* pool socket: `list`, `attach`. |
 | `xtask` | — | `prepare-servers` (obtain) and `dist` (build variants). |
@@ -251,7 +251,7 @@ with a short verification note when you ran one. **No `Co-Authored-By` trailer**
 
 ```sh
 cargo run                    # run TUI dashboard
-cargo run -- claude .        # launch Claude in current dir with hooks
+cargo run -- launch claude . # launch Claude in current dir with hooks
 cargo run -- focus --window-id $KITTY_WINDOW_ID
                              # focus dashboard AND ring this window's bell
 cargo build --workspace

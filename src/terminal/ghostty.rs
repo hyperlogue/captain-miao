@@ -839,6 +839,7 @@ mod tests {
             target: SpawnTarget::NewTab,
             command: SpawnCommand::Exec(vec![
                 "miao".into(),
+                "launch".into(),
                 "claude".into(),
                 "/home/miao/my code".into(),
                 "--settings".into(),
@@ -853,7 +854,7 @@ mod tests {
         // Quoted, so the `/bin/sh -c` Ghostty runs a multi-argument command
         // through cannot tear the cwd or the JSON blob into separate elements…
         assert!(
-            script.contains("set command of cfg to \"miao claude '/home/miao/my code'"),
+            script.contains("set command of cfg to \"miao launch claude '/home/miao/my code'"),
             "{script}"
         );
         assert!(script.contains(r#"--settings '{\"a\":1}'"#), "{script}");
