@@ -5079,7 +5079,7 @@ impl App {
             kind: PickerKind::Resume { host, candidates },
         });
         self.input_mode = InputMode::Picker;
-        self.refresh_picker_footer();
+        self.refresh_picker_status_bar();
     }
 
     /// Repopulate the open resume picker for a different host — the `Ctrl-h`
@@ -5097,7 +5097,7 @@ impl App {
             active.picker.set_text("");
             active.kind = PickerKind::Resume { host, candidates };
         }
-        self.refresh_picker_footer();
+        self.refresh_picker_status_bar();
     }
 
     /// Mark the open picker as still fetching its items (or done). Only affects
@@ -5108,16 +5108,16 @@ impl App {
         if let Some(active) = self.picker.as_mut() {
             active.picker.loading = loading;
         }
-        self.refresh_picker_footer();
+        self.refresh_picker_status_bar();
     }
 
-    /// Rebuild the open picker's bottom status line from its kind. Called
+    /// Rebuild the open picker's top status line from its kind. Called
     /// wherever the values it shows can change: opening, `Ctrl-t`, `Ctrl-h`, and
     /// the arrival of an async item list.
     ///
     /// Only the two pickers that carry per-launch settings get one — the rest
     /// have nothing to say that their title doesn't already.
-    pub(super) fn refresh_picker_footer(&mut self) {
+    pub(super) fn refresh_picker_status_bar(&mut self) {
         let ui = &crate::config::get().colors.ui;
         let dim = Style::default().add_modifier(Modifier::DIM);
         let value = Style::default().fg(ui.title_fg).bold();
@@ -5150,7 +5150,7 @@ impl App {
                     let name = arm.name.text();
                     if arm.naming {
                         // A block cursor, since the real one sits in the path
-                        // input above and can't be in two places.
+                        // input below and can't be in two places.
                         spans.push(Span::styled(name.to_string(), value));
                         spans.push(Span::styled("▏", value));
                         spans.push(Span::styled(" Enter done  Esc cancel", dim));
@@ -5173,7 +5173,7 @@ impl App {
             _ => Vec::new(),
         };
         if let Some(active) = self.picker.as_mut() {
-            active.picker.footer = (!spans.is_empty()).then(|| Line::from(spans));
+            active.picker.status_bar = (!spans.is_empty()).then(|| Line::from(spans));
         }
     }
 
@@ -5366,7 +5366,7 @@ impl App {
             },
         });
         self.input_mode = InputMode::Picker;
-        self.refresh_picker_footer();
+        self.refresh_picker_status_bar();
     }
 
     /// Build picker items for a list of cwds shown against `host`'s home. Only a

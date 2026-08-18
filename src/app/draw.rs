@@ -2107,9 +2107,10 @@ impl App {
             }
             InputMode::Picker => {
                 // Static labels only. The *values* these keys change — the
-                // agent, the host — live on the popup's own bottom line now
-                // (`App::refresh_picker_footer`), where they sit beside the list
-                // they govern instead of down here among fixed hint text.
+                // agent, the host — live on the popup's own top line now
+                // (`App::refresh_picker_status_bar`), right under the title and
+                // above the input they govern, instead of down here among fixed
+                // hint text.
                 let mut spans = hint_pair("type", "filter");
                 spans.extend(hint_pair("↑/↓", "navigate"));
                 spans.extend(hint_pair("Enter", "select"));

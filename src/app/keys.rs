@@ -808,17 +808,17 @@ impl App {
             match key.code {
                 KeyCode::Enter => {
                     arm.naming = false;
-                    self.refresh_picker_footer();
+                    self.refresh_picker_status_bar();
                 }
                 KeyCode::Esc => {
                     if let PickerKind::Workdir { worktree, .. } = &mut active.kind {
                         *worktree = None;
                     }
-                    self.refresh_picker_footer();
+                    self.refresh_picker_status_bar();
                 }
                 _ => {
                     arm.name.handle_key(key);
-                    self.refresh_picker_footer();
+                    self.refresh_picker_status_bar();
                 }
             }
             return None;
@@ -865,7 +865,7 @@ impl App {
             active.picker.title = super::format::workdir_picker_title(*agent, host);
             // The popup's own status line carries the chosen agent (§9), so it
             // has to be rebuilt with it.
-            self.refresh_picker_footer();
+            self.refresh_picker_status_bar();
             return None;
         }
         // Ctrl-G in the workdir picker arms an isolated **g**it worktree for
@@ -903,7 +903,7 @@ impl App {
                     ..Default::default()
                 }),
             };
-            self.refresh_picker_footer();
+            self.refresh_picker_status_bar();
             return None;
         }
         // Ctrl-H in the workdir picker cycles the host this launch opens on —
@@ -921,7 +921,7 @@ impl App {
             active.picker.title = super::format::workdir_picker_title(*agent, host);
             // Drop the `active` borrow before the reseed (it re-borrows self).
             self.reseed_workdir_for_host();
-            self.refresh_picker_footer();
+            self.refresh_picker_status_bar();
             return None;
         }
         // The same `Ctrl-h` in the *resume* picker re-scopes it to the next

@@ -461,17 +461,23 @@ pub(in crate::app) struct Picker {
     /// Transient error shown under the search line (e.g. "not a directory").
     /// Cleared on the next edit. Set by the caller via `set_error`.
     pub error: Option<String>,
-    /// A status line pinned to the **bottom of the popup**, on a lifted
-    /// background so it reads as chrome rather than as another list row.
+    /// A status line pinned to the **top of the popup**, above the search
+    /// input, on a lifted background so it reads as chrome rather than as
+    /// another list row.
     ///
     /// This is where a picker's live *settings* live — the agent and host a new
     /// session will open on, the host a resume list is scoped to. They used to
     /// ride the dashboard's footer ribbon beside the key hints, which put a
     /// changing value inside a strip of fixed labels: the eye had to leave the
     /// popup to find what the popup was about, and `Ctrl-t` appeared to do
-    /// nothing until you looked away from it. The bottom bar keeps only the
-    /// static hints now.
-    pub footer: Option<Line<'static>>,
+    /// nothing until you looked away from it. The dashboard's bar keeps only
+    /// the static hints now.
+    ///
+    /// It sits at the *top* rather than the bottom because on a tall popup the
+    /// two things that decide what Enter does — the settings and the path being
+    /// typed — were a whole screen apart, with an empty list between them. The
+    /// title, the settings and the input now read as one block.
+    pub status_bar: Option<Line<'static>>,
     /// The items are still being fetched (a remote `ListResumable` round trip).
     /// Only changes the empty-list message — the picker is fully interactive
     /// meanwhile, so a slow host can't hold the UI.
@@ -491,7 +497,7 @@ impl Picker {
             free_input: false,
             handles_tab: false,
             error: None,
-            footer: None,
+            status_bar: None,
             loading: false,
         }
     }
@@ -665,16 +671,13 @@ impl Picker {
         let mut inner = block.inner(popup);
         frame.render_widget(block, popup);
 
-        // Carve the status line off the bottom before the list is laid out, so
-        // it never overlaps a row. Skipped on a popup too short to spare the row
-        // — the list is the point.
-        let footer_area = match &self.footer {
+        // Carve the status line off the top before the list is laid out, so it
+        // never overlaps a row. Skipped on a popup too short to spare the row —
+        // the list is the point.
+        let status_area = match &self.status_bar {
             Some(_) if inner.height >= 4 => {
-                let area = Rect {
-                    y: inner.bottom() - 1,
-                    height: 1,
-                    ..inner
-                };
+                let area = Rect { height: 1, ..inner };
+                inner.y += 1;
                 inner.height -= 1;
                 Some(area)
             }
@@ -682,7 +685,7 @@ impl Picker {
         };
         // Painted now rather than after the list, so the `visible == 0` early
         // return below can't drop it.
-        if let (Some(area), Some(line)) = (footer_area, &self.footer) {
+        if let (Some(area), Some(line)) = (status_area, &self.status_bar) {
             let bg = crate::config::get().colors.picker.highlight_bg;
             frame.render_widget(
                 Paragraph::new(line.clone()).style(Style::default().bg(bg)),

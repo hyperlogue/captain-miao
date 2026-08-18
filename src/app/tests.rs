@@ -864,16 +864,29 @@ fn resume_picker_names_the_host_it_lists() {
 /// The picker's live settings belong to the picker, not to the dashboard's
 /// footer ribbon: `Ctrl-t` has to visibly do something *inside* the popup the
 /// user is looking at. The ribbon keeps the static labels only.
+///
+/// And they sit *above* the input, not below the list: title, settings and the
+/// path being typed are the three things that decide what Enter does, so they
+/// read as one block rather than being separated by a screen of list.
 #[test]
 fn the_workdir_picker_carries_its_agent_on_its_own_status_line() {
     let mut d = TestDashboard::new(120, 20);
     d.press(KeyCode::Char('O'));
     let out = d.render();
-    let footer_line = out
-        .lines()
-        .find(|l| l.contains("Agent"))
-        .unwrap_or_else(|| panic!("no agent status line in the popup:\n{out}"));
-    assert!(footer_line.contains("Claude"), "{footer_line}");
+    let line_of = |needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} line in the popup:\n{out}"))
+    };
+    let settings = line_of("Agent");
+    assert!(
+        out.lines().nth(settings).unwrap().contains("Claude"),
+        "{out}"
+    );
+    assert!(
+        settings < line_of("Type a path"),
+        "settings belong above the input:\n{out}"
+    );
     // The value moved off the bottom bar; only the key label is left there.
     let bar = out.lines().last().unwrap();
     assert!(bar.contains("Ctrl-t"), "{bar}");
