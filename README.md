@@ -467,9 +467,9 @@ Sharp edges worth knowing:
 - **Codex has no `Ctrl+V`** here: it reads the clipboard in-process, so no shim
   can serve it. Run `clipboard-paste` in the session instead — it writes the image
   beside the agent and prints the path to hand it.
-- **Only Claude Code is confirmed to work through the shim**, and only Codex is
-  confirmed not to. Reasonix, Kimi Code, Grok Build, opencode, Pi and
-  Antigravity are all shimmed identically but none has been tested: each works if it shells out to
+- **Claude Code and Antigravity are confirmed to work through the shim**, and
+  only Codex is confirmed not to. Reasonix, Kimi Code, Grok Build, opencode and
+  Pi are shimmed identically but untested: each works if it shells out to
   `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
   in-process the way Codex does. `clipboard-paste` works on all of them
   regardless, so treat it as the reliable route until one is confirmed.

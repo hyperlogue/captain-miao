@@ -118,6 +118,20 @@
 //! the file for it to fold yet. [`list_resumable`] reads the same transcripts
 //! directly, which keeps the one thing we do want out of a per-event path.
 //!
+//! # `Ctrl+V` reaches the dashboard's clipboard
+//!
+//! Confirmed against 1.1.11 rather than assumed, which for a shimmed backend is
+//! the whole difference between working and silently doing nothing: `agy` reads
+//! pasted media by *shelling out*, issuing
+//! `xclip -selection clipboard -t TARGETS -o` and then, off that answer,
+//! `xclip -selection clipboard -t image/png -o` — the two calls
+//! [`crate::clipboard::classify`] recognizes, argument for argument. It does
+//! **not** gate them on `DISPLAY`, which is what makes the bridge work in a
+//! pooled session at all: neither `DISPLAY` nor `WAYLAND_DISPLAY` is set there,
+//! and a tool that checked first would never reach the shim. Probed with a
+//! logging `xclip` ahead of the real one on `PATH`, with both unset — the
+//! prompt came back `1 media attached (clipboard, image/png)`.
+//!
 //! # An interrupted turn keeps reading as working
 //!
 //! Esc ends the turn without firing `Stop` — probed, and the row sat at
