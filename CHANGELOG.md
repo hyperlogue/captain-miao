@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Agents launch through one subcommand: `miao launch <agent> [dir]`**, where it
+  used to be `miao claude`, `miao codex` and one more per backend. The old
+  spellings are gone rather than aliased — the top-level CLI was mostly launcher
+  names, and `AgentControl::from_cli` is now the only place a backend name is
+  parsed, so adding a backend costs no CLI change at all. `miao-server` moved
+  with it.
+- **An agent that logs in for the first time inside a captain-miao session keeps
+  its credentials.** They used to land in the synthetic home and stay invisible
+  to a bare `codex` / `grok` run outside; they are now moved into your real agent
+  home on the next launch. Nothing captain-miao writes is ever moved there — only
+  files the agent owns outright.
+
 - **A session running in another terminal instance no longer gets a glyph in the
   icon column.** Two dashboards in two terminals at once is rare enough not to
   earn a slot in every row, and the marker was the column's one non-emoji
