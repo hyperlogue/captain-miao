@@ -62,16 +62,21 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 
 ### Agents
 
-| Agent                                                         | Notes                                                                                                                                                                                                                                                           |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Claude Code](https://claude.com/claude-code)**             |                                                                                                                                                                                                                                                                 |
-| **[Codex](https://github.com/openai/codex)**                  | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
-| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)** | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                               |
-| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**      | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                    |
-| **[Grok Build](https://github.com/xai-org/grok-build)**       | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                                             |
-| **[opencode](https://github.com/anomalyco/opencode)**         | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                   |
-| **[Pi](https://github.com/earendil-works/pi)**                | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                         |
+| Agent                                                            | Notes                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Claude Code](https://claude.com/claude-code)**                |                                                                                                                                                                                                                                                                        |
+| **[Codex](https://github.com/openai/codex)**                     | Hooks can't be injected per-invocation, so a session runs under a synthetic `CODEX_HOME` that symlinks your real one. No support for pasting in remote sessions, as it reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)).        |
+| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
+| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
+| **[Grok Build](https://github.com/xai-org/grok-build)**          | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                                                    |
+| **[opencode](https://github.com/anomalyco/opencode)**            | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                          |
+| **[Pi](https://github.com/earendil-works/pi)**                   | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                                |
 | **[Antigravity](https://antigravity.google/docs/cli/reference)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
+
+> [!NOTE]
+> The Kitty/zellij + Claude Code/Codex have the best level of support and
+> features. Other terminals and agents are either in experimental stage or
+> feature incomplete due to the lack of API to customize their behavior.
 
 ## Installation
 
@@ -192,12 +197,12 @@ miao
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-| Command                         | What it does                                                                                                                                |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `miao`                          | Run the TUI dashboard (the default).                                                                                                        |
+| Command                             | What it does                                                                                                                                                                                                                                                                               |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `miao`                              | Run the TUI dashboard (the default).                                                                                                                                                                                                                                                       |
 | `miao launch <agent> [dir] [args…]` | Launch `<agent>` in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to the agent. `<agent>` is one of `claude`, `codex`, `reasonix`, `kimi`, `grok`, `opencode`, `pi`, `antigravity` — see [per-agent limits](#per-agent-limits). |
-| `miao focus [--window-id <id>]` | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                 |
-| `miao hook <event>`             | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                           |
+| `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                |
+| `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                          |
 
 Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
 
@@ -227,7 +232,7 @@ Status, launch, resume, fork and worktrees all work.
 - **An interrupted turn keeps reading as working** until you send the next prompt — Grok fires no hook for one. The limit most likely to bite day to day.
 - **No token column** — Grok deliberately doesn't persist its token ledgers.
 - **No background-task tiers**, and **the worktree name isn't shown** (Grok keeps worktrees in its own registry, not beside the repo).
-- **A `/model` change made inside a session doesn't reach your real config** — Grok's `config.toml` is a writable copy, so it's reset the next time you edit the real one. Logging in *is* safe: credentials are moved back to your real `~/.grok` on the next launch.
+- **A `/model` change made inside a session doesn't reach your real config** — Grok's `config.toml` is a writable copy, so it's reset the next time you edit the real one. Logging in _is_ safe: credentials are moved back to your real `~/.grok` on the next launch.
 
 #### opencode support
 
@@ -257,7 +262,7 @@ missing below is missing from the agent rather than from captain-miao.
   prompt — Esc fires no hook and leaves no mark in the transcript. The limit
   most likely to bite day to day.
 - **No "waiting for approval" state.** Antigravity blocks on its permission
-  prompt without firing a hook. Its one pre-tool hook is a *gate* rather than an
+  prompt without firing a hook. Its one pre-tool hook is a _gate_ rather than an
   observer — every answer it can give changes what the agent does, and an
   incomplete one denies the tool call — so captain-miao doesn't register it.
 - **A row sits at `Starting` until your first prompt.** Nothing fires when `agy`
