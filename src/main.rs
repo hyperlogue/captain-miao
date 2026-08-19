@@ -63,7 +63,7 @@ enum Commands {
     /// --resume` works. See `cli::split_cwd`.
     Launch {
         /// Which backend to run: `claude`, `codex`, `reasonix`, `kimi`, `grok`,
-        /// `opencode`, `pi` or `antigravity`.
+        /// `opencode`, `pi`, `antigravity` or `omp`.
         ///
         /// A free-form string resolved by `AgentControl::from_cli` rather than a
         /// clap subcommand per backend: that keeps one authority over the names,

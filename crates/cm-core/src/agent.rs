@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{antigravity, claude, codex, grok, kimi, opencode, pi, reasonix};
+use crate::agents::{antigravity, claude, codex, grok, kimi, omp, opencode, pi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
@@ -70,6 +70,11 @@ pub enum AgentControl {
     /// subcommand are all the product's name; `agy` is only what it installs
     /// as, and is spelled that way in one place ([`agents::antigravity::BIN`]).
     Antigravity,
+    /// `can1357/oh-my-pi` ("omp"), a heavily-evolved fork of pi. Hooked with a
+    /// generated extension passed as `omp -e`; nothing of yours is touched.
+    /// omp's event surface has diverged from pi's in four load-bearing ways —
+    /// see `agents::omp`'s module doc.
+    Omp,
     /// A backend name this build doesn't know — a newer host's session seen by
     /// an older dashboard. Read-side only: produced by `Deserialize` alone,
     /// never by `from_cli`, never in `ALL`, never written by a launcher. Every
@@ -116,6 +121,7 @@ impl<'de> Deserialize<'de> for AgentControl {
                     "opencode" => AgentControl::OpenCode,
                     "pi" => AgentControl::Pi,
                     "antigravity" => AgentControl::Antigravity,
+                    "omp" => AgentControl::Omp,
                     _ => AgentControl::Unknown,
                 })
             }
@@ -140,6 +146,7 @@ impl AgentControl {
         AgentControl::OpenCode,
         AgentControl::Pi,
         AgentControl::Antigravity,
+        AgentControl::Omp,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
@@ -154,6 +161,7 @@ impl AgentControl {
             AgentControl::OpenCode => "opencode",
             AgentControl::Pi => "pi",
             AgentControl::Antigravity => "antigravity",
+            AgentControl::Omp => "omp",
             AgentControl::Unknown => "",
         }
     }
@@ -172,6 +180,7 @@ impl AgentControl {
             "opencode" => Some(AgentControl::OpenCode),
             "pi" => Some(AgentControl::Pi),
             "antigravity" => Some(AgentControl::Antigravity),
+            "omp" => Some(AgentControl::Omp),
             _ => None,
         }
     }
@@ -198,6 +207,7 @@ impl AgentControl {
             AgentControl::OpenCode => agents::binary_available(opencode::BIN),
             AgentControl::Pi => agents::binary_available(pi::BIN),
             AgentControl::Antigravity => agents::binary_available(antigravity::BIN),
+            AgentControl::Omp => agents::binary_available(omp::BIN),
             // Not a backend this build can launch at all, so no binary could
             // make it available. It is absent from `ALL` besides.
             AgentControl::Unknown => false,
@@ -215,6 +225,7 @@ impl AgentControl {
             // Lowercase on purpose: sst styles the project `opencode`.
             AgentControl::OpenCode => "opencode",
             AgentControl::Pi => "Pi",
+            AgentControl::Omp => "Oh My Pi (OMP)",
             AgentControl::Antigravity => "Antigravity",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.
@@ -295,6 +306,17 @@ impl AgentControl {
                 let flag = if fork { "--fork" } else { "--session" };
                 vec![flag.to_string(), session_id.to_string()]
             }
+            // omp's fork **replaces** the resume rather than decorating it, the
+            // Pi/Codex shape: `--resume <id>` opens that session, `--fork <id>`
+            // forks it into a new one, and they are alternative entry points
+            // rather than a flag and its modifier. `--resume` is in the public
+            // flag schema and `--help`; `--fork` is in the argv map and
+            // documented in `omp://session-operations-export-share-fork-resume.md`.
+            // The undocumented `--session` alias is deliberately not used.
+            AgentControl::Omp => {
+                let flag = if fork { "--fork" } else { "--resume" };
+                vec![flag.to_string(), session_id.to_string()]
+            }
             // **`fork` is ignored**, the Kimi shape: `--conversation <id>`
             // resumes, and `agy`'s flag list offers nothing that branches one —
             // Antigravity forks a conversation from inside its own TUI, which is
@@ -371,6 +393,12 @@ impl AgentControl {
             // derived from this, so `Ctrl-g` hides itself with nothing else to
             // change.
             AgentControl::Pi => None,
+            // No `--worktree` launch flag exists (the single `--worktree` string
+            // in the binary is `git restore --worktree`). omp's `omp worktree`
+            // subcommand only lists/clears worktrees the agent made itself, so
+            // there is nothing to pass at launch. `supports_worktrees()` is
+            // derived from this, so `Ctrl-g` hides itself.
+            AgentControl::Omp => None,
             // `agy` has no worktree flag. Its isolation story is `--sandbox`,
             // which is the agent sandboxing the dashboard deliberately stays out
             // of, so there is nothing to spend a worktree request on and
@@ -446,6 +474,11 @@ impl AgentControl {
             // The one backend with no approval gate — see
             // [`AgentCapabilities::approval_gate`].
             AgentControl::Pi => caps(true, false, false, true),
+            // The one capability row that inverts pi's: omp has a per-tool
+            // approval gate (`tool_approval_requested` / `tool_approval_resolved`),
+            // so `approval_gate` is `true`. Fork via `--fork`, no worktree flag,
+            // and tokens/model come off the hook — the opencode row.
+            AgentControl::Omp => caps(true, false, true, true),
             // Every field false, and every one of them the *agent's* limit
             // rather than an unfinished wiring: no argv forks a conversation, no
             // flag opens a worktree, no hook fires while Antigravity blocks on
@@ -509,6 +542,7 @@ impl AgentControl {
             | AgentControl::OpenCode
             | AgentControl::Pi
             | AgentControl::Antigravity
+            | AgentControl::Omp
             | AgentControl::Unknown => vec![],
         }
     }
@@ -555,6 +589,11 @@ impl AgentControl {
             // status all ride hook payloads. Its conversation store *does*
             // change constantly, and holds nothing the dashboard reads.
             AgentControl::Antigravity => vec![],
+            // Nothing, and for the strongest reason of any backend, the same as
+            // pi's: every fact an omp row carries — status, title, tokens,
+            // model — rides a hook payload, and nothing of ours reads an omp
+            // file at all. There is no file whose change could make a row stale.
+            AgentControl::Omp => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -613,6 +652,11 @@ impl AgentControl {
             // Nothing: Antigravity has no session rename at all, so no fact of
             // a row's can change without a hook firing.
             AgentControl::Antigravity => vec![],
+            // Nothing, for pi's reason: the title arrives on the *next hook
+            // payload* — a `sessions/` write the host already watches. Codex
+            // needs an entry here only because its rename lands in sqlite with
+            // no hook at all.
+            AgentControl::Omp => vec![],
             AgentControl::Unknown => vec![],
         }
     }
@@ -645,6 +689,10 @@ impl AgentControl {
             // first hook — which is the *first prompt*, not the launch, since
             // nothing fires at startup (`agents::antigravity`).
             AgentControl::Antigravity => SessionIndex::default(),
+            // No per-pid manifest, for pi's reason: an omp session's id (and
+            // name) arrive on every hook payload, which is what this index is a
+            // fallback for.
+            AgentControl::Omp => SessionIndex::default(),
             AgentControl::Unknown => SessionIndex::default(),
         }
     }
@@ -718,6 +766,12 @@ impl AgentControl {
             // transcript path either, so this is consistent rather than merely
             // unimplemented.
             AgentControl::Antigravity => TranscriptStats::default(),
+            // Unreachable, for pi's decision rather than his schema: omp's
+            // session file is a tree, not a log (the same `id`/`parentId` shape
+            // pi's docs describe), so a correct fold would walk back from the
+            // active leaf. The tokens and model come off the hook instead, and
+            // `agents::omp` supplies no transcript path — one fact, one source.
+            AgentControl::Omp => TranscriptStats::default(),
             AgentControl::Unknown => TranscriptStats::default(),
         }
     }
@@ -747,6 +801,15 @@ impl AgentControl {
             // that fold land together.
             AgentControl::Pi => Ok(vec![]),
             AgentControl::Antigravity => antigravity::list_resumable(limit),
+            // Empty, and unlike pi's it is not blocked on an active-branch walk:
+            // `omp -r` opens omp's own picker with a current-folder / all-projects
+            // scope toggle, and sessions live at
+            // `~/.omp/agent/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`
+            // (overridable by `PI_CODING_AGENT_DIR`, and per-profile under
+            // `~/.omp/profiles/<name>/agent`). Reading them means committing to
+            // the same `parentId` walk `read_transcript_stats` declines, so both
+            // stay unimplemented together.
+            AgentControl::Omp => Ok(vec![]),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -793,6 +856,9 @@ impl AgentControl {
             AgentControl::Pi => {
                 pi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
             }
+            AgentControl::Omp => {
+                omp::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+            }
             AgentControl::Antigravity => antigravity::build_launch_command(
                 cwd,
                 sock_path,
@@ -837,6 +903,12 @@ impl AgentControl {
             // transport, the contents are opaque to the launcher, and each
             // backend puts its own format through it.
             AgentControl::Pi => pi::build_hooks_settings(sock_path),
+            // **TypeScript**, not JSON — omp has no shell-command hooks at all,
+            // so what the launcher writes here is the extension module `omp -e`
+            // loads. Same argument as Kimi's TOML and pi's TypeScript: the path
+            // is generic transport, the contents are opaque to the launcher, and
+            // each backend puts its own format through it.
+            AgentControl::Omp => omp::build_hooks_settings(sock_path),
             AgentControl::Antigravity => antigravity::build_hooks_settings(sock_path),
             AgentControl::Unknown => String::new(),
         }
@@ -855,6 +927,7 @@ impl AgentControl {
             AgentControl::OpenCode => opencode::dispatch_hook(state, msg).await,
             AgentControl::Pi => pi::dispatch_hook(state, msg).await,
             AgentControl::Antigravity => antigravity::dispatch_hook(state, msg).await,
+            AgentControl::Omp => omp::dispatch_hook(state, msg).await,
             AgentControl::Unknown => {}
         }
     }
@@ -871,6 +944,7 @@ impl AgentControl {
             AgentControl::OpenCode => opencode::parse_hook_payload(event, stdin),
             AgentControl::Pi => pi::parse_hook_payload(event, stdin),
             AgentControl::Antigravity => antigravity::parse_hook_payload(event, stdin),
+            AgentControl::Omp => omp::parse_hook_payload(event, stdin),
             AgentControl::Unknown => Err(anyhow!(
                 "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
@@ -931,6 +1005,12 @@ impl AgentControl {
             // `agents::antigravity` supplies no transcript path, and there is
             // no file here to scan.
             AgentControl::Antigravity => TranscriptScan::default(),
+            // Empty, for pi's reason reached via `agent_end`: omp's turn-end
+            // event fires on an abort too (`stopReason === "aborted"` calls the
+            // same emitter), so the case that forced Codex to read its rollout —
+            // Esc firing nothing — cannot arise. No transcript of omp's is read
+            // for any purpose (`agents::omp` names none).
+            AgentControl::Omp => TranscriptScan::default(),
             AgentControl::Unknown => TranscriptScan::default(),
         }
     }
@@ -972,6 +1052,10 @@ impl AgentControl {
             // distinguishes that from a model call in flight, so nothing is
             // claimed here rather than something being guessed.
             AgentControl::Antigravity => None,
+            // No status file, and none needed: the interrupt this exists to
+            // catch for Claude is covered by `agent_end`, which fires on an
+            // aborted run too — pi's reason, reached via omp's emitter.
+            AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1023,6 +1107,11 @@ impl AgentControl {
             // nothing on a payload, nothing in the store. The resume picker
             // shows a session's opening request instead.
             AgentControl::Antigravity => None,
+            // `None` for pi's reason: `pi.getSessionName()` rides every hook
+            // payload as `session_title` and is already on `LauncherState.name`
+            // by the time this would be asked — the Kimi standing, reached from
+            // the same extension call pi uses.
+            AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1042,6 +1131,8 @@ impl AgentControl {
             // No status file to watch — see `agent_activity`.
             AgentControl::Pi => None,
             AgentControl::Antigravity => None,
+            // No status file to watch — see `agent_activity`.
+            AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1113,6 +1204,10 @@ impl AgentControl {
             // Moot for the same reason, and by the same decision: no transcript
             // path reaches the launcher, so neither watch starts.
             AgentControl::Antigravity => None,
+            // Moot, and by the same decision as pi's: `agents::omp` supplies no
+            // transcript path, so the launcher starts no watch of either kind
+            // for an omp session and there is no poll for this to configure.
+            AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1177,6 +1272,12 @@ impl AgentControl {
             // and no tier to put the row in. Unlike Pi's, this one has something
             // to wire up if that list ever appears.
             AgentControl::Antigravity => None,
+            // `None` for a sharper reason than pi's: omp *does* run background
+            // work (async bash jobs, `task` spawns) and `session_stop` is even
+            // deferred until they are idle — but nothing enumerates them on any
+            // payload we receive, so there is no shell to name and no tier to
+            // put the row in.
+            AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }
     }
@@ -1593,7 +1694,8 @@ mod tests {
                 AgentControl::Grok,
                 AgentControl::OpenCode,
                 AgentControl::Pi,
-                AgentControl::Antigravity
+                AgentControl::Antigravity,
+                AgentControl::Omp
             ]
         );
     }
@@ -1671,6 +1773,10 @@ mod tests {
         assert!(
             AgentControl::OpenCode.supports_fork(),
             "opencode has --fork"
+        );
+        assert!(
+            AgentControl::Omp.supports_fork(),
+            "omp forks with --fork where it resumes with --resume"
         );
 
         // A backend this build can't drive contributes no argv either way, so
@@ -1823,6 +1929,25 @@ mod tests {
                 AgentControl::Antigravity,
                 &[PromptSubmit, PostToolUse, Stop],
             ),
+            // No `Elicitation`: omp's `tool_approval_requested` is the gate and
+            // `tool_approval_resolved` releases it, so the approval pair carries
+            // what a separate decision prompt would. `PostToolUseFailure` is
+            // absent (derived in Rust from `is_error`, never registered) — the
+            // same shape opencode already has.
+            (
+                AgentControl::Omp,
+                &[
+                    SessionStart,
+                    PromptSubmit,
+                    PreToolUse,
+                    PostToolUse,
+                    PermissionRequest,
+                    ElicitationResult,
+                    Stop,
+                    PreCompact,
+                    PostCompact,
+                ],
+            ),
         ];
         assert_eq!(
             expected.len(),
@@ -1941,6 +2066,7 @@ mod tests {
             (AgentControl::OpenCode, (true, false, true, true)),
             (AgentControl::Pi, (true, false, false, true)),
             (AgentControl::Antigravity, (false, false, false, false)),
+            (AgentControl::Omp, (true, false, true, true)),
         ];
         assert_eq!(
             promised.len(),
