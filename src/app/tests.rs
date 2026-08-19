@@ -906,6 +906,32 @@ fn the_workdir_picker_carries_its_agent_on_its_own_status_line() {
     );
 }
 
+/// The settings line and the path input are two different kinds of thing — one
+/// is toggled with chords, the other typed into — so a rule divides them. It
+/// spans the popup's full width and meets the side borders, which is what keeps
+/// it reading as part of the frame instead of a stray dash.
+#[test]
+fn a_rule_divides_the_pickers_settings_from_its_input() {
+    let mut d = TestDashboard::new(120, 20);
+    d.press(KeyCode::Char('O'));
+    let out = d.render();
+    let line_of = |needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} line in the popup:\n{out}"))
+    };
+    let rule = line_of("\u{251c}");
+    assert!(
+        line_of("Agent") < rule && rule < line_of("Type a path"),
+        "the rule belongs between the settings and the input:\n{out}"
+    );
+    let row = out.lines().nth(rule).unwrap();
+    assert!(
+        row.contains("\u{2524}") && row.contains("\u{2500}\u{2500}"),
+        "the rule should run edge to edge with tees:\n{row}"
+    );
+}
+
 /// A remote resume list is an ssh round trip, so the popup opens before it and
 /// says so. Without this the whole UI froze until the host answered — worst on
 /// the `Ctrl-h` host switch, which read as a hang.

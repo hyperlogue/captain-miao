@@ -672,16 +672,24 @@ impl Picker {
         frame.render_widget(block, popup);
 
         // Carve the status line off the top before the list is laid out, so it
-        // never overlaps a row. Skipped on a popup too short to spare the row —
-        // the list is the point.
-        let status_area = match &self.status_bar {
+        // never overlaps a row, then a rule under it separating the per-launch
+        // settings from the input they govern. Both are skipped on a popup too
+        // short to spare the row — the list is the point — and the rule goes
+        // first, since it carries no information of its own.
+        let (status_area, rule_area) = match &self.status_bar {
             Some(_) if inner.height >= 4 => {
-                let area = Rect { height: 1, ..inner };
+                let status = Rect { height: 1, ..inner };
                 inner.y += 1;
                 inner.height -= 1;
-                Some(area)
+                let rule = (inner.height >= 4).then(|| {
+                    let area = Rect { height: 1, ..inner };
+                    inner.y += 1;
+                    inner.height -= 1;
+                    area
+                });
+                (Some(status), rule)
             }
-            _ => None,
+            _ => (None, None),
         };
         // Painted now rather than after the list, so the `visible == 0` early
         // return below can't drop it.
@@ -689,6 +697,22 @@ impl Picker {
         // a selected row, so it inherits whatever the popup sits on.
         if let (Some(area), Some(line)) = (status_area, &self.status_bar) {
             frame.render_widget(Paragraph::new(line.clone()), area);
+        }
+        if let Some(area) = rule_area {
+            // Drawn across the popup's *full* width, tees included, so it lands
+            // on the side border cells and reads as part of the frame rather
+            // than a dash floating inside it — which also means it must not be
+            // dimmed, or the border would show a faded break at this row.
+            let w = popup.width as usize;
+            let rule = format!("\u{251c}{}\u{2524}", "\u{2500}".repeat(w.saturating_sub(2)));
+            frame.render_widget(
+                Paragraph::new(Span::raw(rule)),
+                Rect {
+                    x: popup.x,
+                    width: popup.width,
+                    ..area
+                },
+            );
         }
 
         let chunks = Layout::default()
