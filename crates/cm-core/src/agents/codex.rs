@@ -220,22 +220,43 @@ fn query_thread_titles(conn: &Connection, ids: &[String]) -> HashMap<String, Str
         .collect()
 }
 
+/// A rename and an auto-title are **two different columns**, and the rename is
+/// the later addition: `threads.title` is Codex's own — seeded from the first
+/// user message and refined by its titler — while `/rename` writes
+/// `threads.name`, added by a migration alongside `is_pinned` and
+/// `thread_section_id`. Reading `title` alone therefore shows the auto-title
+/// forever, however many times the user renames.
+///
+/// `COALESCE(NULLIF(TRIM(name), ''), title)` prefers the rename and keeps the
+/// auto-title as the fallback, which is what the dashboard wants either way:
+/// a session the user has not named still reads better as Codex's summary than
+/// as nothing. The SQL `TRIM` only guards the NULLIF — the real cleaning is
+/// [`collapse_whitespace`] below.
+const THREAD_TITLE_SQL: &str =
+    "SELECT COALESCE(NULLIF(TRIM(name), ''), title) FROM threads WHERE id = ?1 LIMIT 1";
+
+/// The same lookup against a Codex predating the `name` column. Tried only when
+/// the query above fails to prepare, so an older install degrades to
+/// auto-titles instead of to no titles at all.
+const THREAD_TITLE_SQL_LEGACY: &str = "SELECT title FROM threads WHERE id = ?1 LIMIT 1";
+
 /// Run the title lookup against an open connection and clean the result. Split
 /// out so the cleaning/empty-handling logic is testable against an in-memory DB
 /// without touching the real `state_5.sqlite`. The id is passed as a bound
 /// parameter, so it can never alter the query regardless of its contents (no
-/// shape validation needed). Returns None when the row is missing, the title is
-/// SQL NULL, or it collapses to empty whitespace.
+/// shape validation needed). Returns None when the row is missing, both columns
+/// are SQL NULL, or the value collapses to empty whitespace.
 fn query_thread_title(conn: &Connection, session_id: &str) -> Option<String> {
-    let title: Option<String> = conn
-        .query_row(
-            "SELECT title FROM threads WHERE id = ?1 LIMIT 1",
-            [session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .ok()?
-        .flatten();
+    let lookup = |sql: &str| {
+        conn.query_row(sql, [session_id], |row| row.get::<_, Option<String>>(0))
+            .optional()
+    };
+    let title: Option<String> = match lookup(THREAD_TITLE_SQL) {
+        Ok(found) => found,
+        // No `name` column — this database is older than the rename feature.
+        Err(_) => lookup(THREAD_TITLE_SQL_LEGACY).ok()?,
+    }
+    .flatten();
     let clean = collapse_whitespace(title?.trim());
     if clean.is_empty() {
         return None;
@@ -983,16 +1004,32 @@ mod tests {
     }
 
     /// Build an in-memory `threads` table mirroring Codex's `state_5.sqlite`
-    /// schema for the cases we care about: a user rename, an un-renamed
-    /// (whitespace-y first-message) auto-title, an empty title, and a NULL.
+    /// schema for the cases we care about. Both title columns are present, as
+    /// they are in a current Codex: `name` is the `/rename`, `title` the
+    /// auto-title it has to beat.
     fn titles_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT);
+             -- renamed: `name` wins over the auto-title beside it
+             INSERT INTO threads VALUES ('019e5252-aaa', 'Do a deep review of x', 'test');
+             -- never renamed: the whitespace-y auto-title stands in
+             INSERT INTO threads VALUES ('019e5024-bbb', '  Please   do  analysis  ', NULL);
+             INSERT INTO threads VALUES ('019e0000-ccc', '', NULL);
+             INSERT INTO threads VALUES ('019e1111-ddd', NULL, NULL);
+             -- renamed to blank: not a name, so the auto-title stands
+             INSERT INTO threads VALUES ('019e2222-eee', 'Auto title', '   ');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The `name` column exists only on a Codex new enough to have `/rename`.
+    fn legacy_titles_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);
-             INSERT INTO threads VALUES ('019e5252-aaa', 'test');
-             INSERT INTO threads VALUES ('019e5024-bbb', '  Please   do  analysis  ');
-             INSERT INTO threads VALUES ('019e0000-ccc', '');
-             INSERT INTO threads VALUES ('019e1111-ddd', NULL);",
+             INSERT INTO threads VALUES ('019e5252-aaa', 'Auto title');",
         )
         .unwrap();
         conn
@@ -1001,21 +1038,39 @@ mod tests {
     #[test]
     fn thread_title_reads_rename_and_autotitle() {
         let conn = titles_db();
-        // user rename
+        // `/rename` lands in `name`, which beats the auto-title in `title`.
         assert_eq!(
             query_thread_title(&conn, "019e5252-aaa").as_deref(),
             Some("test")
         );
-        // whitespace collapsed
+        // Un-renamed: the auto-title stands, whitespace collapsed.
         assert_eq!(
             query_thread_title(&conn, "019e5024-bbb").as_deref(),
             Some("Please do analysis")
         );
+        // A blank rename is not a name; the auto-title stands.
+        assert_eq!(
+            query_thread_title(&conn, "019e2222-eee").as_deref(),
+            Some("Auto title")
+        );
         // empty title → None (falls back to the rollout first-prompt auto-title)
         assert_eq!(query_thread_title(&conn, "019e0000-ccc"), None);
-        // SQL NULL title → None
+        // SQL NULL in both columns → None
         assert_eq!(query_thread_title(&conn, "019e1111-ddd"), None);
         // missing row → None
+        assert_eq!(query_thread_title(&conn, "no-such-id"), None);
+    }
+
+    /// A database with no `name` column must degrade to the auto-title, not to
+    /// nothing: the failing query is a prepare error, which `.optional()` does
+    /// not absorb.
+    #[test]
+    fn a_database_without_the_name_column_still_reads_auto_titles() {
+        let conn = legacy_titles_db();
+        assert_eq!(
+            query_thread_title(&conn, "019e5252-aaa").as_deref(),
+            Some("Auto title")
+        );
         assert_eq!(query_thread_title(&conn, "no-such-id"), None);
     }
 
