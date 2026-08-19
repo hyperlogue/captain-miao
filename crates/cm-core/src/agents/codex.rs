@@ -38,8 +38,10 @@ pub(crate) const BIN: &str = "codex";
 // =============================================================================
 
 /// The real Codex home — `$CODEX_HOME` if the user set one globally, else
-/// `~/.codex`. This is where rollouts are read from; it is *not* the synthetic
-/// home we hand the launched agent (see `synth_home`).
+/// `~/.codex`. This is what the synthetic home mirrors; it is *not* what the
+/// launched agent is handed (see `synth_home`), and it is not where a session's
+/// state is read from either — that goes through [`read_path`], which knows the
+/// mirror can be one-sided.
 fn codex_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME") {
         let p = PathBuf::from(h);
@@ -50,8 +52,48 @@ fn codex_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex"))
 }
 
+/// Resolve `name` in the home that actually holds it — **the synthetic one
+/// first**, the real one as a fallback.
+///
+/// Reading the real home is only right while the mirror holds, and it does not
+/// hold for a state file the *agent* minted. `SynthHome::ensure` links what the
+/// real home already has; a name it has never had gets no link, so Codex
+/// creates the file inside the synthetic home and the real one never grows it.
+/// On a machine where `~/.codex` is managed (home-manager ships a `config.toml`
+/// symlink and nothing else) and `codex` has never been run bare, *every* state
+/// file is in that position — `state_5.sqlite` and the whole `sessions/` tree
+/// included. Reading the real home there finds nothing at all, which is how a
+/// `/rename` could land in sqlite and never reach a row.
+///
+/// The synthetic path is the safe one to prefer because it is the *same file*
+/// wherever the mirror did hold: an entry the real home has is reached through
+/// the link. The fallback covers the one case the synthetic home can't answer —
+/// a host where captain-miao has never launched Codex, whose bare sessions
+/// [`list_resumable`] should still offer.
+///
+/// Resolved per call rather than cached: the first launch on a fresh host
+/// creates these entries *after* the dashboard is already running.
+fn read_path(name: &str) -> Option<PathBuf> {
+    resolve_read_path(&synth_home(), codex_home(), name)
+}
+
+/// The resolution itself, split from home discovery so a test can point it at
+/// fixture trees without touching the environment.
+///
+/// `exists()` follows links, which is what makes the one rule cover both
+/// mirrored and agent-minted entries — and a *dangling* link (the real entry
+/// deleted since the last launch) correctly falls through to the real path,
+/// where the agent's next write will land through that same link.
+fn resolve_read_path(synth: &Path, real: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    let candidate = synth.join(name);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    Some(real?.join(name))
+}
+
 fn sessions_root() -> Option<PathBuf> {
-    Some(codex_home()?.join("sessions"))
+    read_path("sessions")
 }
 
 /// Paths whose changes should wake the host process (a dashboard reload / a
@@ -66,7 +108,22 @@ fn sessions_root() -> Option<PathBuf> {
 /// checkpointed) the watch fails silently and the overlay's refresh piggybacks
 /// on the next session event instead.
 pub fn watch_paths() -> Vec<PathBuf> {
-    title_watch_path().into_iter().collect()
+    // Both homes' wal, not just the one [`title_watch_path`] resolves to now.
+    // This runs once, at watcher setup, while the resolution can still move —
+    // a host whose first Codex session starts later mints the db in the
+    // synthetic home, and a watcher latched onto the real home's path would
+    // never wake again. Watching a path that never materializes costs nothing
+    // (the registration just fails), and the duplicate collapses to one entry
+    // on a host where the mirror does hold.
+    let mut paths: Vec<PathBuf> = [
+        Some(synth_home().join("state_5.sqlite-wal")),
+        codex_home().map(|h| h.join("state_5.sqlite-wal")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    paths.dedup();
+    paths
 }
 
 fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -103,7 +160,7 @@ pub fn read_session_index(_cache: &mut SessionIndexCache) -> SessionIndex {
 // =============================================================================
 
 fn state_db_path() -> Option<PathBuf> {
-    Some(codex_home()?.join("state_5.sqlite"))
+    read_path("state_5.sqlite")
 }
 
 /// The title store's WAL sidecar — the file whose change means "a title may
@@ -112,7 +169,10 @@ fn state_db_path() -> Option<PathBuf> {
 /// the host-process wake. Watching just this file, not `~/.codex`, keeps the
 /// churny `logs_2.sqlite-wal` telemetry sibling from waking anything.
 pub fn title_watch_path() -> Option<PathBuf> {
-    Some(codex_home()?.join("state_5.sqlite-wal"))
+    // Beside whichever `state_5.sqlite` [`read_path`] resolved to, rather than
+    // resolved on its own: a checkpoint deletes the wal, so it is regularly
+    // absent from *both* homes and can't point at its own.
+    Some(state_db_path()?.with_file_name("state_5.sqlite-wal"))
 }
 
 /// Stat stamp of the title store — `(main db mtime, wal mtime)` — the cheap
@@ -1007,6 +1067,101 @@ mod tests {
             command_hook_hash("permission_request", "*", cmd),
             "sha256:ede30d21fa951d0bb9bc60a12e12755ee1a789566aab412f398596e0f2d6302b",
         );
+    }
+
+    /// A pair of throwaway homes — `(synth, real)`, both created.
+    fn home_pair(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "captain-miao-codex-homes-{}-{tag}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let (synth, real) = (base.join("synth"), base.join("real"));
+        std::fs::create_dir_all(&synth).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        (synth, real)
+    }
+
+    /// The case that broke renames: `~/.codex` is managed and holds nothing but
+    /// a config, so Codex minted `state_5.sqlite` inside the synthetic home and
+    /// the mirror never linked it. Reading the real home finds no file at all.
+    #[test]
+    fn an_agent_minted_entry_is_read_from_the_synthetic_home() {
+        let (synth, real) = home_pair("minted");
+        std::fs::write(synth.join("state_5.sqlite"), b"db").unwrap();
+
+        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite");
+        assert_eq!(got, Some(synth.join("state_5.sqlite")));
+        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
+    }
+
+    /// Where the mirror *did* hold, the synthetic path is a link onto the real
+    /// file — the same bytes, so preferring it is never the wrong answer.
+    #[test]
+    fn a_mirrored_entry_resolves_through_its_link() {
+        let (synth, real) = home_pair("mirrored");
+        std::fs::write(real.join("state_5.sqlite"), b"db").unwrap();
+        std::os::unix::fs::symlink(real.join("state_5.sqlite"), synth.join("state_5.sqlite"))
+            .unwrap();
+
+        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite").unwrap();
+        assert_eq!(got, synth.join("state_5.sqlite"));
+        assert_eq!(std::fs::read(&got).unwrap(), b"db");
+        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
+    }
+
+    /// A host where captain-miao has never launched Codex: nothing is in the
+    /// synthetic home, and the real home's bare sessions must still be found.
+    #[test]
+    fn an_unmirrored_entry_falls_back_to_the_real_home() {
+        let (synth, real) = home_pair("bare");
+        std::fs::create_dir_all(real.join("sessions")).unwrap();
+
+        let got = resolve_read_path(&synth, Some(real.clone()), "sessions");
+        assert_eq!(got, Some(real.join("sessions")));
+        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
+    }
+
+    /// A dangling link is not a hit: the real entry was deleted since the last
+    /// launch, and the agent's next write goes *through* the link into the real
+    /// home — so the real path is where to look.
+    #[test]
+    fn a_dangling_link_falls_back_to_the_real_home() {
+        let (synth, real) = home_pair("dangling");
+        std::os::unix::fs::symlink(real.join("state_5.sqlite"), synth.join("state_5.sqlite"))
+            .unwrap();
+
+        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite");
+        assert_eq!(got, Some(real.join("state_5.sqlite")));
+        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
+    }
+
+    /// No real home resolves at all (no `$HOME`): the synthetic one still
+    /// answers for anything it holds, and nothing else has a path.
+    #[test]
+    fn without_a_real_home_only_the_synthetic_one_answers() {
+        let (synth, _real) = home_pair("nohome");
+        std::fs::write(synth.join("state_5.sqlite"), b"db").unwrap();
+
+        assert_eq!(
+            resolve_read_path(&synth, None, "state_5.sqlite"),
+            Some(synth.join("state_5.sqlite"))
+        );
+        assert_eq!(resolve_read_path(&synth, None, "sessions"), None);
+        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
+    }
+
+    /// Both homes' wal are watched: this runs once, at watcher setup, and the
+    /// first Codex launch on a fresh host can still move which home holds the
+    /// db. A watcher latched onto one path would then never wake.
+    #[test]
+    fn both_homes_wal_are_watched() {
+        let paths = watch_paths();
+        assert!(
+            paths.iter().any(|p| p.starts_with(synth_home())),
+            "synthetic home's wal is watched: {paths:?}"
+        );
+        assert!(paths.iter().all(|p| p.ends_with("state_5.sqlite-wal")));
     }
 
     #[test]
