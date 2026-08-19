@@ -78,6 +78,11 @@ pub enum ClientFrame {
     /// The host's recent working dirs, for the workdir picker when it targets
     /// this host. Reply: `RecentDirs`.
     ListRecentDirs { req_id: u64 },
+    /// Drop `cwd` (host-canonical) from the host's recent working dirs — the
+    /// workdir picker's `Ctrl-d`. The list lives on the machine that launched
+    /// into it, so forgetting an entry is the owning host's write to make, the
+    /// same way `ListRecentDirs` is its read. Reply: `RecentDirForgotten`.
+    ForgetRecentDir { req_id: u64, cwd: String },
     /// Directory completions on the host's filesystem for `prefix` (in the
     /// host-canonical form). Reply: `PathCompletions`.
     CompletePath { req_id: u64, prefix: String },
@@ -146,6 +151,11 @@ pub enum ServerFrame {
     /// first), host-canonical. Carries no `$HOME` — deliberately: the client is
     /// home-ignorant and displays the wire string verbatim (§3).
     RecentDirs { req_id: u64, cwds: Vec<String> },
+    /// Reply to `ForgetRecentDir`: whether an entry actually went. The client
+    /// drops the row on the keystroke rather than on this, so the answer is
+    /// only ever a log line — but a request frame gets a reply frame, and a
+    /// daemon too old to know the request is then distinguishable by silence.
+    RecentDirForgotten { req_id: u64, ok: bool },
     /// Reply to `CompletePath`: matching directories on the host fs (trailing
     /// `/`), host-canonical, sorted.
     PathCompletions { req_id: u64, matches: Vec<String> },
@@ -168,6 +178,7 @@ impl ServerFrame {
             | ServerFrame::Opened { req_id, .. }
             | ServerFrame::FlagsSet { req_id, .. }
             | ServerFrame::RecentDirs { req_id, .. }
+            | ServerFrame::RecentDirForgotten { req_id, .. }
             | ServerFrame::PathCompletions { req_id, .. }
             | ServerFrame::DirChecked { req_id, .. }
             | ServerFrame::Vitals { req_id, .. } => Some(*req_id),

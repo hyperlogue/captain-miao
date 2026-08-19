@@ -5510,23 +5510,21 @@ impl App {
     /// user can keep deleting without reopening. No-op if the picker isn't a
     /// Workdir picker, the highlighted item has no cwd payload, or the
     /// filtered list is empty.
+    ///
+    /// The list belongs to the host the picker is targeting, so where the write
+    /// lands follows the host and not locality: the in-process list for a
+    /// direct-local backend, and for anything else — a remote box, or this
+    /// machine under pooled-localhost — a `ForgetRecentDir` to the daemon that
+    /// owns the file, mirrored into the per-host cache so the row goes on the
+    /// keystroke rather than on the round trip.
     pub(super) fn delete_selected_recent_cwd_in_picker(&mut self) {
         let Some(active) = self.picker.as_mut() else {
             return;
         };
-        // Only the in-process list is the dashboard's to edit; any other host's
-        // lives on that machine (deleting there would need an RPC — out of
-        // scope), so Ctrl-D is a no-op while the picker targets one.
         let PickerKind::Workdir { host, .. } = &active.kind else {
             return;
         };
         let host = host.clone();
-        if !self.is_direct_local(&host) {
-            return;
-        }
-        let Some(active) = self.picker.as_mut() else {
-            return;
-        };
         let filtered = active.picker.filtered();
         if filtered.is_empty() {
             return;
@@ -5538,12 +5536,9 @@ impl App {
         };
 
         let key = payload.trim_end_matches('/').to_string();
-        let before = self.recent_cwds.len();
-        self.recent_cwds.retain(|c| c.trim_end_matches('/') != key);
-        if self.recent_cwds.len() == before {
+        if !self.forget_recent_dir_on_host(&host, &key) {
             return;
         }
-        self.save_recent_cwds();
 
         let active = self.picker.as_mut().expect("checked above");
         active.picker.items.remove(item_idx);
@@ -5555,6 +5550,38 @@ impl App {
         } else {
             active.picker.cursor = cursor;
         }
+    }
+
+    /// Forget `key` from `host`'s recent working dirs, wherever that list lives.
+    /// Returns whether the caller should now take the row off the picker.
+    ///
+    /// A direct-local backend's list is held in memory and written here. Any
+    /// other host owns its own file, so the request goes over the wire and the
+    /// cached copy is edited to match — the picker is drawn from that cache, so
+    /// editing it *is* what makes the deletion visible. A host we can't reach
+    /// refuses instead: dropping the row would be a promise the next re-seed
+    /// takes straight back.
+    fn forget_recent_dir_on_host(&mut self, host: &HostId, key: &str) -> bool {
+        if self.is_direct_local(host) {
+            let before = self.recent_cwds.len();
+            self.recent_cwds.retain(|c| c.trim_end_matches('/') != key);
+            if self.recent_cwds.len() == before {
+                return false;
+            }
+            self.save_recent_cwds();
+            return true;
+        }
+        let Some(backend) = self.backend_for(host) else {
+            return false;
+        };
+        if !backend.conn_state().is_connected() {
+            return false;
+        }
+        backend.forget_recent_dir(key);
+        if let Some(cached) = self.recent_dirs_cache.get_mut(host) {
+            cached.retain(|c| c.trim_end_matches('/') != key);
+        }
+        true
     }
 
     /// Tab-complete the workdir picker's input against the *selected host's*

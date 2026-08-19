@@ -276,6 +276,10 @@ const VITALS_POLL: Duration = Duration::from_secs(15);
 /// host that never answers can't stack requests, and long enough that a slow
 /// link (or a daemon priming its CPU counters) still lands.
 const VITALS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `ForgetRecentDir` waits for its acknowledgement before giving up.
+/// Nothing is displayed either way — the deadline exists only so the task ends
+/// against a daemon too old to answer the frame at all.
+const FORGET_RECENT_DIR_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where a host's utilisation figures stand: on their way, here, or not
 /// coming.
@@ -812,6 +816,24 @@ impl Backend {
         match self {
             Backend::Local(h) => h.inner.recent_dirs(),
             Backend::Remote(b) => b.recent_dirs(),
+        }
+    }
+
+    /// Drop `cwd` from this host's recent working dirs — the picker's `Ctrl-d`.
+    ///
+    /// **Fire-and-forget, unlike every other query here.** The caller has
+    /// already taken the row off the list it is drawing, because the one rule
+    /// the picker holds to is that no round trip sits between a keystroke and
+    /// its echo (§9); waiting on a distant box to confirm a deletion the user
+    /// can see would trade that for nothing they'd read. What comes back is a
+    /// log line, and a daemon too old to know the frame answers with silence
+    /// the deadline ends.
+    pub(crate) fn forget_recent_dir(&self, cwd: &str) {
+        match self {
+            Backend::Local(h) => {
+                h.inner.forget_recent_cwd(cwd);
+            }
+            Backend::Remote(b) => b.forget_recent_dir(cwd),
         }
     }
 
@@ -1492,6 +1514,34 @@ impl RemoteBackend {
             Some(ServerFrame::RecentDirs { cwds, .. }) => cwds,
             _ => Vec::new(),
         }
+    }
+
+    /// Ask the remote host to forget `cwd`. Returns at once: the round trip runs
+    /// on a background task, because the caller is the UI thread mid-keystroke
+    /// and the far end is across an ssh link. See [`Backend::forget_recent_dir`]
+    /// for why nothing waits on the answer.
+    fn forget_recent_dir(self: &Arc<Self>, cwd: &str) {
+        let backend = self.clone();
+        let cwd = cwd.to_string();
+        tokio::spawn(async move {
+            let host = backend.host.0.clone();
+            match backend
+                .request_within(FORGET_RECENT_DIR_TIMEOUT, |req_id| {
+                    ClientFrame::ForgetRecentDir { req_id, cwd }
+                })
+                .await
+            {
+                Some(ServerFrame::RecentDirForgotten { ok: true, .. }) => {}
+                Some(ServerFrame::RecentDirForgotten { ok: false, .. }) => {
+                    tracing::debug!("{host} had no such recent dir to forget");
+                }
+                // Unreachable, or a daemon too old to know the frame — it
+                // ignores what it can't decode, so the answer is silence and
+                // the deadline is what ends the wait. The entry is already off
+                // this dashboard's list and comes back on the next re-seed.
+                _ => tracing::debug!("{host} did not confirm forgetting a recent dir"),
+            }
+        });
     }
 
     /// Directory completions on the remote fs. Blocks; empty if unreachable.
@@ -6900,6 +6950,10 @@ mod tests {
         write_frame(&mut wr, &ServerFrame::Snapshot { sessions })
             .await
             .unwrap();
+        // The host's recent-dirs list, which `ForgetRecentDir` actually edits —
+        // so a later `ListRecentDirs` shows whether the delete landed on the
+        // *host's* list rather than only on the client's copy of it.
+        let mut recent: Vec<String> = vec!["~/proj".into(), "~/other".into()];
         while let Ok(Some(frame)) = read_frame::<_, ClientFrame>(&mut rd).await {
             match frame {
                 ClientFrame::ListResumable { req_id, .. } => write_frame(
@@ -6957,11 +7011,24 @@ mod tests {
                         req_id,
                         // Host-canonical: the wire form IS the display form,
                         // and no `$HOME` rides along (§3).
-                        cwds: vec!["~/proj".into(), "~/other".into()],
+                        cwds: recent.clone(),
                     },
                 )
                 .await
                 .unwrap(),
+                ClientFrame::ForgetRecentDir { req_id, cwd } => {
+                    let before = recent.len();
+                    recent.retain(|c| c != &cwd);
+                    write_frame(
+                        &mut wr,
+                        &ServerFrame::RecentDirForgotten {
+                            req_id,
+                            ok: recent.len() != before,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                }
                 ClientFrame::CompletePath { req_id, prefix } => write_frame(
                     &mut wr,
                     // Echo the prefix back so the test confirms it rode the wire.
@@ -7138,6 +7205,21 @@ mod tests {
         assert!(!tokio::task::block_in_place(
             || backend.dir_exists("/home/u/nope")
         ));
+
+        // forget_recent_dir: the delete lands on the *host's* list, so the next
+        // read no longer serves it. Fire-and-forget, so the assertion has to
+        // wait for the round trip the keystroke deliberately doesn't.
+        backend.forget_recent_dir("~/proj");
+        let mut tries = 0;
+        loop {
+            let cwds = tokio::task::block_in_place(|| backend.recent_dirs());
+            if cwds == ["~/other"] {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 100, "the host never forgot the dir (have {cwds:?})");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let _ = std::fs::remove_file(&sock);
     }

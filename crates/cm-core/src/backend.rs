@@ -461,6 +461,20 @@ impl LocalBackend {
     pub fn record_recent_cwd(&self, cwd: &str) {
         record_recent_dir(&paths::collapse_home(cwd, &self.home));
     }
+
+    /// Drop `cwd` from this host's recent-dirs list — the picker's `Ctrl-d`,
+    /// reaching a remote host through `ForgetRecentDir`. The counterpart to
+    /// [`record_recent_cwd`], and the write side of [`recent_dirs`]: an entry
+    /// the user forgets has to go where the list actually lives, or the next
+    /// re-seed serves it straight back.
+    ///
+    /// Returns whether an entry went, which is `false` for one already gone.
+    ///
+    /// [`record_recent_cwd`]: Self::record_recent_cwd
+    /// [`recent_dirs`]: Self::recent_dirs
+    pub fn forget_recent_cwd(&self, cwd: &str) -> bool {
+        forget_recent_dir(&paths::collapse_home(cwd, &self.home), &self.home)
+    }
 }
 
 /// The recent-dirs list from `recent_cwds_path`, most-recent first. Stored
@@ -487,6 +501,31 @@ fn record_recent_dir(cwd: &str) {
     let max = crate::config::get().launcher.max_recent_cwds;
     cwds.truncate(max);
     let _ = state::write_json_atomic(&state::recent_cwds_path(), &state::RecentCwds { cwds });
+}
+
+/// Drop `cwd` from `cwds`, reporting whether anything went. Both sides are
+/// compared **collapsed**: the caller's key arrives host-canonical while the
+/// file may still hold a legacy absolute entry from an older build, and
+/// matching only the stored spelling would make `Ctrl-d` a silent no-op on
+/// exactly the entries old enough to be worth forgetting. Pure, so that rule is
+/// pinned by a test rather than by a state file.
+fn without_recent_dir(cwds: &mut Vec<String>, cwd: &str, home: &str) -> bool {
+    let key = cwd.trim_end_matches('/');
+    if key.is_empty() {
+        return false;
+    }
+    let before = cwds.len();
+    cwds.retain(|c| paths::collapse_home(c.trim_end_matches('/'), home) != key);
+    cwds.len() != before
+}
+
+/// Remove `cwd` from the recent-dirs list, persisting the shorter one.
+fn forget_recent_dir(cwd: &str, home: &str) -> bool {
+    let mut cwds = read_recent_dirs();
+    if !without_recent_dir(&mut cwds, cwd, home) {
+        return false;
+    }
+    state::write_json_atomic(&state::recent_cwds_path(), &state::RecentCwds { cwds }).is_ok()
 }
 
 /// The host's per-session flags sidecar. Missing/unreadable → empty, so a
@@ -535,6 +574,31 @@ fn split_for_completion(path: &str) -> (String, String) {
 mod tests {
     use super::*;
     use crate::state::{HostId, SessionStatus};
+
+    /// The picker sends back what it was shown, and what it was shown came out
+    /// of `recent_dirs` — i.e. collapsed. So the match has to be made in that
+    /// form, or a list still holding an older build's absolute entries answers
+    /// every `Ctrl-d` by leaving them exactly where they were.
+    #[test]
+    fn forgetting_a_recent_dir_matches_the_form_the_picker_was_shown() {
+        let home = "/home/miao";
+        let mut cwds = vec![
+            "/home/miao/proj".to_string(),
+            "~/other".to_string(),
+            "/srv/shared/".to_string(),
+        ];
+        // A legacy absolute entry, forgotten by the `~` form the picker showed.
+        assert!(without_recent_dir(&mut cwds, "~/proj", home));
+        assert_eq!(cwds, ["~/other", "/srv/shared/"]);
+        // An entry outside `$HOME` has no collapsed form; a trailing slash on
+        // either side is still the same directory.
+        assert!(without_recent_dir(&mut cwds, "/srv/shared", home));
+        assert_eq!(cwds, ["~/other"]);
+        // Nothing to forget, and nothing worth writing the file for.
+        assert!(!without_recent_dir(&mut cwds, "~/gone", home));
+        assert!(!without_recent_dir(&mut cwds, "", home));
+        assert_eq!(cwds, ["~/other"]);
+    }
 
     #[test]
     fn title_refresh_policy_throttles_heavily() {

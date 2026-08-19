@@ -308,6 +308,7 @@ KillSession{req_id, key}               Killed{req_id, ok}
 OpenSession{req_id, spec}              Opened{req_id, session_name? | error?}
 SetSessionFlags{req_id, key, flags}    FlagsSet{req_id, ok}
 ListRecentDirs{req_id}                 RecentDirs{req_id, cwds}
+ForgetRecentDir{req_id, cwd}           RecentDirForgotten{req_id, ok}
 CompletePath{req_id, prefix}           PathCompletions{req_id, matches}
 CheckDir{req_id, path}                 DirChecked{req_id, exists}
 GetVitals{req_id}                      Vitals{req_id, vitals}

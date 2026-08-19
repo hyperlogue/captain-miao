@@ -6256,6 +6256,81 @@ fn workdir_picker_ctrl_d_deletes_highlighted_recent() {
     assert_eq!(picker.cursor, 1);
 }
 
+/// `Ctrl-d` follows the host the picker is targeting, not the machine the
+/// dashboard runs on. The list belongs to whoever launched into those dirs, so
+/// a remote (or pooled-localhost) host is told to forget the entry and the
+/// cached copy the picker draws from is edited to match — the row goes on the
+/// keystroke, never on the round trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workdir_picker_ctrl_d_forgets_on_the_targeted_host() {
+    use crate::backend::{Backend, ConnState, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 15);
+    let host = HostId("box".into());
+    let remote = RemoteBackend::unconnected_for_tests(host.clone(), Vec::new());
+    // Connected, so the delete has somewhere to land. The backend has no live
+    // connection task, so the request itself is dropped on the floor — what is
+    // under test is that the dashboard *sends* it and stops drawing the row.
+    remote.simulate_link_for_tests(ConnState::Connected, true);
+    d.app.backends.push(Backend::Remote(remote));
+    d.app.default_host = host.clone();
+    // Seed the per-host cache the picker renders from, standing in for a
+    // `ListRecentDirs` that has already come back.
+    d.app.recent_dirs_cache.insert(
+        host.clone(),
+        vec!["~/alpha".to_string(), "~/beta".to_string()],
+    );
+    // The local list is untouched throughout: it is a different host's.
+    d.app.recent_cwds = vec!["/home/test/alpha".to_string()];
+
+    d.press(KeyCode::Char('O'));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    let picker = &d.app.picker.as_ref().unwrap().picker;
+    assert_eq!(picker.items.len(), 1);
+    assert_eq!(picker.items[0].payload.as_deref(), Some("~/beta"));
+    // And the cache agrees, so reopening the picker doesn't resurrect it.
+    assert_eq!(d.app.recent_dirs_cache[&host], vec!["~/beta".to_string()]);
+    assert_eq!(d.app.recent_cwds, vec!["/home/test/alpha".to_string()]);
+}
+
+/// A host we can't reach can't be told, and dropping the row anyway would be a
+/// promise the next re-seed takes straight back. So the row stays.
+#[test]
+fn workdir_picker_ctrl_d_holds_when_the_host_is_unreachable() {
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 15);
+    let host = HostId("box".into());
+    d.app
+        .backends
+        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+            host.clone(),
+            Vec::new(),
+        )));
+    d.app.default_host = host.clone();
+    d.app.recent_dirs_cache.insert(
+        host.clone(),
+        vec!["~/alpha".to_string(), "~/beta".to_string()],
+    );
+
+    d.press(KeyCode::Char('O'));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+
+    let picker = &d.app.picker.as_ref().unwrap().picker;
+    assert_eq!(picker.items.len(), 2);
+    assert_eq!(
+        d.app.recent_dirs_cache[&host],
+        vec!["~/alpha".to_string(), "~/beta".to_string()]
+    );
+}
+
 #[test]
 fn workdir_picker_ctrl_d_with_empty_list_is_noop() {
     let mut d = TestDashboard::new(120, 15);

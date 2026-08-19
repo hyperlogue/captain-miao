@@ -751,6 +751,11 @@ async fn handle_conn(
                         let cwds = backend.recent_dirs();
                         write_frame(&mut wr, &ServerFrame::RecentDirs { req_id, cwds }).await?;
                     }
+                    ClientFrame::ForgetRecentDir { req_id, cwd } => {
+                        let ok = backend.forget_recent_cwd(&cwd);
+                        write_frame(&mut wr, &ServerFrame::RecentDirForgotten { req_id, ok })
+                            .await?;
+                    }
                     ClientFrame::CompletePath { req_id, prefix } => {
                         let matches = backend.complete_path(&prefix);
                         write_frame(&mut wr, &ServerFrame::PathCompletions { req_id, matches }).await?;
