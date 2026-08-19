@@ -41,6 +41,14 @@ alongside.
    then:
    - Insert a new `## [X.Y.Z] - YYYY-MM-DD` section directly under the intro
      block, above the previous version. Use the release date.
+   - **Open it with a short paragraph thanking this release's contributors**,
+     above the first `###` group so it leads the GitHub release rather than
+     trailing it. One or two sentences in the project's voice — each person as
+     their `@handle`, and what they did where that is short enough to say.
+     Credit commit authors, issue and PR commenters, and whoever opened them;
+     leave the maintainer out (`rickye26` / `Rick Ye <l@hyperlogue.tech>`), and
+     drop the paragraph rather than ship an empty pleasantry when nobody else
+     contributed.
    - Group bullets under `### Added` / `### Changed` / `### Fixed` / `### Removed`
      / `### Security` — only the groups that apply, in that order.
    - Write from the **user's** vantage point: what they can now do, or no longer
@@ -57,6 +65,25 @@ alongside.
      which the entry says by not claiming otherwise.
    - Add the compare link at the bottom, with the others:
      `[X.Y.Z]: https://github.com/hyperlogue/captain-miao/compare/v<prev>...vX.Y.Z`
+
+   Contributor names for that opening paragraph, all scoped to the window since
+   the previous tag. Source 1 is the authoritative one — commits you haven't
+   pushed yet are invisible to the API — and the only one that works offline:
+   ```sh
+   R=hyperlogue/captain-miao; A=https://api.github.com/repos/$R
+   SINCE=$(git log -1 --format=%aI v<prev>)                                        # the previous tag's own date
+   git log v<prev>..HEAD --format='%an <%ae>'                                       # 1. commit authors
+   curl -s "$A/issues/comments?since=$SINCE&per_page=100" | jq -r '.[].user.login'  # 2. issue + PR comments
+   curl -s "$A/pulls/comments?since=$SINCE&per_page=100" | jq -r '.[].user.login'   # 3. PR review comments
+   curl -s "$A/issues?state=all&since=$SINCE&per_page=100" | jq -r '.[].user.login' # 4. issue/PR openers
+   ```
+   3 is a separate endpoint from 2, and 4 catches a reporter who never followed
+   up, since an opening body is not a "comment". `gh api` needs a token this
+   environment usually lacks; the repo is public, so anonymous curl works at 60
+   requests an hour. Drop `web-flow` — GitHub's web-UI merge committer, which
+   comes back from 1 looking exactly like a person — along with `[bot]`
+   accounts, then dedupe 1's git identities against 2–4's handles: a
+   `1234+Name@users.noreply.github.com` address carries the handle after the `+`.
 
    This entry is the release's public face — the workflow extracts exactly this
    section and makes it the GitHub release description. **Show the draft to the
