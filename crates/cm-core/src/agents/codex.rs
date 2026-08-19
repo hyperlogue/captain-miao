@@ -5,11 +5,31 @@
 //! Codex's hook system is a near-clone of Claude Code's: the same event names
 //! (minus a few) and an identical snake_case stdin payload, so the launcher
 //! loop and `HookMessage` are reused unchanged. The two genuine differences
-//! are (1) hooks can't be injected per-invocation — they're discovered from
-//! `$CODEX_HOME/hooks.json` — so we point the agent at a synthetic, shared
-//! `CODEX_HOME` that symlinks the real one and adds our `hooks.json`; and
-//! (2) Codex records a far richer rollout JSONL than Claude's transcript, so
-//! context tokens and lifecycle signals come straight from typed events.
+//! are (1) a hook has to be **trusted** from a file, so we point the agent at a
+//! synthetic, shared `CODEX_HOME` that symlinks the real one and adds our
+//! `hooks.json`; and (2) Codex records a far richer rollout JSONL than Claude's
+//! transcript, so context tokens and lifecycle signals come straight from typed
+//! events.
+//!
+//! **The synthetic home is for the trust file, not for discovery** — worth
+//! stating because the obvious simplification looks like it should work and
+//! silently does not. `-c hooks.<Event>=[…]` *does* inject a hook definition
+//! per invocation: Codex registers it under its own `HookSource::sessionFlags`,
+//! keyed `/<session-flags>/config.toml:<event>:<group>:<handler>`, and it fires
+//! with the payload this module already parses. What cannot ride along is its
+//! trust. `hooks.state.…trusted_hash` passed by `-c` is ignored — trust is read
+//! only from a real config.toml layer — and an **untrusted hook is dropped in
+//! silence**: no warning, no stderr, nothing in any log, just rows that never
+//! leave `Starting`. So dropping the synthetic home would cost either
+//! `--dangerously-bypass-hook-trust` on every launch (which disables the gate
+//! for the user's own hooks too, and is exactly what `seed_hook_trust` exists
+//! to avoid) or a write into the real `~/.codex/config.toml`, routinely a
+//! read-only nix / home-manager symlink — the same fact that makes
+//! `config.toml` a `CopiedEntry` rather than a link.
+//!
+//! Probed against Codex 0.147.0 with `hooks/list` over `codex app-server`, and
+//! confirmed end to end: the same `-c` hook fires with a trust entry present or
+//! under the bypass flag, and is dropped without one.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
