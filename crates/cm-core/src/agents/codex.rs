@@ -823,7 +823,9 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 
 /// Codex has no session-status file we read, so it never reports a coarse
 /// working/idle/background-shell activity — its `Active`↔`Idle` transitions ride
-/// hooks (plus the rollout's `turn_aborted` for interrupts), and its sessions are
+/// hooks (plus the rollout's own turn lifecycle, which settles both the
+/// interrupt the Stop hook never reports and the goal continuation no prompt
+/// hook announces — see [`scan_transcript_signals`]), and its sessions are
 /// never refined into `BackgroundActive`.
 pub fn session_activity(_agent_pid: u32) -> Option<AgentActivity> {
     None
@@ -865,25 +867,102 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 }
 
 // =============================================================================
-// Transcript signal scan (interrupt detection)
+// Transcript signal scan (turn lifecycle)
 // =============================================================================
 
-/// Read new bytes from the rollout starting at `offset` and flag a user
-/// interrupt. Codex writes a `turn_aborted` event when the user hits Esc; it
-/// fires no Stop hook in that case, so without this the session would stay
-/// Active. Compaction is event-driven (PostCompact) so there is no
+/// Read new bytes from the rollout starting at `offset` and settle the turn
+/// lifecycle the hooks alone get wrong at both ends.
+///
+/// Codex brackets every turn with typed `event_msg`es — `task_started`,
+/// `task_complete`, `turn_aborted` — and the hooks track only the middle of
+/// that. An **interrupt** (Esc) writes `turn_aborted` and fires no Stop hook,
+/// so without this the row would stay Active forever. A **goal continuation**
+/// is the mirror image: a thread carrying a goal (`/goal`, recorded as
+/// `thread_goal_updated`) starts its own next turn the moment the last one
+/// ends — `task_complete`, then `task_started` ~10ms later, with no
+/// `UserPromptSubmit` in between because no user prompted. The Stop hook has
+/// already parked the row at Idle by then, and nothing un-parks it until the
+/// new turn happens to call a tool, so a session working flat out reads Idle
+/// for seconds at a stretch. `task_started` is Codex's own record that a turn
+/// is running, which is what makes it evidence enough to promote on.
+///
+/// The lifecycle markers are read as the **last one wins**, not as independent
+/// flags: one delta routinely carries the end of one turn and the start of the
+/// next, and an interrupt is regularly followed by the resubmit that answers
+/// it. Compaction stays event-driven (PostCompact), so there is no
 /// `compact_aborted` analog.
 pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
     let delta = crate::agent::read_transcript_delta(path, offset);
-    let interrupted = delta
-        .text
-        .lines()
-        .any(|line| line.contains("\"turn_aborted\""));
+    let mut interrupted = false;
+    let mut turn_open = false;
+    let mut self_continuing = None;
+    for line in delta.text.lines() {
+        // Reject on the cheap substring before parsing: a delta can carry
+        // megabytes of tool output, and these four markers are short and rare.
+        // The parse is not belt-and-braces — a rollout line *quoting* a marker
+        // (an agent reading its own transcript, or this file) is exactly the
+        // shape that would otherwise strand a working session at Idle.
+        if !MARKERS.iter().any(|m| line.contains(m)) {
+            continue;
+        }
+        match event_msg_kind(line) {
+            Some("task_started") => turn_open = true,
+            Some("task_complete") => turn_open = false,
+            Some("turn_aborted") => {
+                interrupted = true;
+                turn_open = false;
+            }
+            Some("thread_goal_updated") => self_continuing = Some(goal_is_active(line)),
+            _ => {}
+        }
+    }
     TranscriptScan {
         new_offset: delta.new_offset,
         interrupted,
         compact_aborted: false,
+        turn_started: turn_open,
+        self_continuing,
     }
+}
+
+/// The rollout markers [`scan_transcript_signals`] cares about, as they appear
+/// in the raw line — the substring prefilter ahead of the parse.
+const MARKERS: [&str; 4] = [
+    "task_started",
+    "task_complete",
+    "turn_aborted",
+    "thread_goal_updated",
+];
+
+/// The `payload.type` of one rollout line, if it is an `event_msg` at all.
+fn event_msg_kind(line: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let kind = value.get("payload")?.get("type")?.as_str()?;
+    // Borrowed back out of the table so the caller can match on `&'static str`
+    // rather than juggle the parsed value's lifetime.
+    MARKERS.into_iter().find(|m| *m == kind)
+}
+
+/// Whether a `thread_goal_updated` line reports a goal that is still driving
+/// the thread. Codex sends the same event when a goal is completed or cleared
+/// (`status` moves off `active`), which is what lets the launcher stop
+/// treating the session as self-continuing again.
+fn goal_is_active(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            Some(
+                v.get("payload")?
+                    .get("goal")?
+                    .get("status")?
+                    .as_str()?
+                    .to_string(),
+            )
+        })
+        .is_some_and(|status| status == "active")
 }
 
 // =============================================================================
@@ -1000,7 +1079,122 @@ mod tests {
         let scan = scan_transcript_signals(&path, 0);
         assert!(scan.interrupted);
         assert!(!scan.compact_aborted);
+        // The abort closed the turn it opened — nothing left running to promote.
+        assert!(!scan.turn_started);
         assert_eq!(scan.new_offset, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The goal continuation this whole signal exists for: the turn ends and
+    /// the next one starts in the same breath, with no hook between them. The
+    /// Stop hook has parked the row at Idle by the time these bytes land, so
+    /// reading the delta as "a turn is running" is the only thing that keeps a
+    /// working session off Idle.
+    #[test]
+    fn scan_flags_a_turn_that_reopened_after_it_closed() {
+        let body = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"a","last_agent_message":"done"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"b","started_at":1}}"#,
+            "\n",
+        );
+        let path = write_tmp("continuation", body);
+        let scan = scan_transcript_signals(&path, 0);
+        assert!(scan.turn_started);
+        assert!(!scan.interrupted);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// …and the same two lines the other way round is an ordinary end of turn,
+    /// which the Stop hook already settled. Last marker wins, not any marker.
+    #[test]
+    fn scan_holds_when_the_turn_ended_last() {
+        let body = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"a"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"a"}}"#,
+            "\n",
+        );
+        let path = write_tmp("ended", body);
+        let scan = scan_transcript_signals(&path, 0);
+        assert!(!scan.turn_started);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An interrupt answered by a fresh turn (the user hits Esc, then
+    /// resubmits) settles Active: the launcher applies the interrupt first and
+    /// the reopened turn last, in that order.
+    #[test]
+    fn scan_reports_both_when_an_abort_is_followed_by_a_new_turn() {
+        let body = concat!(
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"b"}}"#,
+            "\n",
+        );
+        let path = write_tmp("abort-then-start", body);
+        let scan = scan_transcript_signals(&path, 0);
+        assert!(scan.interrupted);
+        assert!(scan.turn_started);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A rollout line that merely *quotes* a marker is not that marker — an
+    /// agent reading its own rollout (or this file) writes exactly this, and a
+    /// substring match on it would strand a working session at Idle.
+    #[test]
+    fn scan_ignores_a_marker_quoted_inside_a_tool_output() {
+        let quoted = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "output": "grep: {\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}} and task_started",
+            },
+        })
+        .to_string();
+        let path = write_tmp("quoted", &format!("{quoted}\n"));
+        let scan = scan_transcript_signals(&path, 0);
+        assert!(!scan.interrupted);
+        assert!(!scan.turn_started);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The self-continuing latch tracks the goal's own status, and says
+    /// nothing (`None`) when the bytes carry no goal event at all — which is
+    /// what leaves the launcher's latch where it was.
+    #[test]
+    fn scan_latches_a_goal_while_it_is_active() {
+        let goal = |status: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "threadId": "01a0-uuid",
+                    "goal": {"objective": "keep going", "status": status},
+                },
+            })
+            .to_string()
+        };
+
+        let path = write_tmp("goal-active", &format!("{}\n", goal("active")));
+        assert_eq!(
+            scan_transcript_signals(&path, 0).self_continuing,
+            Some(true)
+        );
+        let _ = std::fs::remove_file(path);
+
+        let path = write_tmp("goal-done", &format!("{}\n", goal("completed")));
+        assert_eq!(
+            scan_transcript_signals(&path, 0).self_continuing,
+            Some(false)
+        );
+        let _ = std::fs::remove_file(path);
+
+        let path = write_tmp(
+            "goal-silent",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+        );
+        assert_eq!(scan_transcript_signals(&path, 0).self_continuing, None);
         let _ = std::fs::remove_file(path);
     }
 

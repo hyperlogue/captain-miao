@@ -464,6 +464,12 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     // None on a path change so a resumed session's new transcript is folded from
     // the top.
     let mut transcript_data: Option<TranscriptStats> = None;
+    // Whether the session is under a standing instruction to keep starting its
+    // own turns (Codex's `/goal`), latched from the transcript scan. Read only
+    // by the poll-backed watch's lifecycle gate at the bottom of the loop,
+    // whose whole premise — an idle session's transcript doesn't move until a
+    // hook wakes us — is exactly what such a session breaks.
+    let mut self_continuing = false;
     // Also watch the agent's own session-status file (Claude:
     // `~/.claude/sessions/<pid>.json`). Its `status` reads `"shell"` exactly when
     // the turn has ended but a `run_in_background` shell is still running, and a
@@ -622,9 +628,14 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                             transcript_path = Some(path.clone());
                             // Seed the offset to the new transcript's end so
                             // historical interrupt/compact signals from a
-                            // resumed session aren't replayed as fresh.
+                            // resumed session aren't replayed as fresh. The
+                            // standing-instruction latch is the exception, and
+                            // not an inconsistent one: it is current *state*
+                            // rather than an event to replay, and a resumed
+                            // session's goal is still driving it.
                             let scan = agent.scan_transcript_signals(&path, 0);
                             transcript_offset = scan.new_offset;
+                            self_continuing = scan.self_continuing.unwrap_or(false);
                             // Fold the derived fields from the top so a
                             // resumed/idle session shows context, model,
                             // title, and first prompt before its next write.
@@ -658,6 +669,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         path,
                         &mut transcript_offset,
                         &mut transcript_data,
+                        &mut self_continuing,
                         state,
                     )
                     .await;
@@ -701,6 +713,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         path,
                         &mut transcript_offset,
                         &mut transcript_data,
+                        &mut self_continuing,
                         state,
                     )
                     .await
@@ -905,13 +918,18 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         }
         // Lifecycle of the poll-backed transcript watch (Codex on macOS — see
         // `AgentControl::transcript_poll_interval`): it runs only while the
-        // session is off Idle. An idle session's rollout doesn't change without
-        // a hook firing first (`UserPromptSubmit` wakes this loop and the next
-        // pass lands here with the status already Active), so parking the
-        // watcher at Idle makes an at-rest session cost nothing — no 2s stat
-        // cadence while a session sits parked for hours. Idle is deliberately
-        // the *only* at-rest state: WaitingForApproval/WaitingForDecision need
-        // the rollout wake (approval-granted fast path; an Esc there writes
+        // session is off Idle *and* is not self-continuing. An idle session's
+        // rollout normally doesn't change without a hook firing first
+        // (`UserPromptSubmit` wakes this loop and the next pass lands here with
+        // the status already Active), so parking the watcher at Idle makes an
+        // at-rest session cost nothing — no 2s stat cadence while a session
+        // sits parked for hours. A session under a goal is the one thing that
+        // breaks that premise: it opens its own next turn with no hook at all,
+        // and parking the only watch that could see it would leave the row Idle
+        // for the rest of the goal. It pays the stat cadence for as long as the
+        // goal lasts, and no other session pays anything. Idle is deliberately
+        // the *only* at-rest status here: WaitingForApproval/WaitingForDecision
+        // need the rollout wake (approval-granted fast path; an Esc there writes
         // `turn_aborted` with no hook), and a Compacted row can still take that
         // same hookless Esc. Dropping the watcher on the way to rest fires one
         // synthetic fs wake so the next iteration folds whatever the last tick
@@ -926,7 +944,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         // reads nothing; it exists for that racing-write window and for any
         // future off-Idle path that doesn't come through a hook.)
         if let Some(interval) = agent.transcript_poll_interval() {
-            let engaged = state.status != SessionStatus::Idle;
+            let engaged = state.status != SessionStatus::Idle || self_continuing;
             if engaged && transcript_watcher.is_none() {
                 if let Some(path) = &transcript_path {
                     transcript_watcher = Some(TranscriptWatch::Poll(start_stat_poll(
@@ -1029,6 +1047,7 @@ async fn rescan_transcript(
     path: &Path,
     offset: &mut u64,
     data: &mut Option<TranscriptStats>,
+    self_continuing: &mut bool,
     state: &mut LauncherState,
 ) -> bool {
     let scan_path = path.to_path_buf();
@@ -1050,6 +1069,9 @@ async fn rescan_transcript(
         )
     });
     *offset = scan.new_offset;
+    if let Some(latched) = scan.self_continuing {
+        *self_continuing = latched;
+    }
     if scan.interrupted {
         // Some agents (Claude) fire no hook on Esc/interrupt — without this,
         // the session stays Active forever. (Codex writes `turn_aborted`.)
@@ -1061,6 +1083,15 @@ async fn rescan_transcript(
         // transcript-side stderr is the only signal the user is back at
         // the prompt.
         state.status = SessionStatus::Idle;
+        state.last_tool = None;
+    }
+    // …and last, because the same delta that closed a turn can open the next
+    // one: the agent started a turn nothing will fire a hook for (a Codex goal
+    // continuation). Only the two at-rest states promote — `Waiting*` is the
+    // user's own turn to act and outranks a transcript read, and every busy
+    // state already says what this would.
+    if scan.turn_started && matches!(state.status, SessionStatus::Idle | SessionStatus::Compacted) {
+        state.status = SessionStatus::Active;
         state.last_tool = None;
     }
     let changed = apply_transcript_data(state, &fresh);
@@ -1562,12 +1593,14 @@ mod tests {
             let mut state = state_with(SessionStatus::Active);
             let mut offset = 0u64;
             let mut data: Option<TranscriptStats> = None;
+            let mut self_continuing = false;
 
             rescan_transcript(
                 AgentControl::Codex,
                 &path,
                 &mut offset,
                 &mut data,
+                &mut self_continuing,
                 &mut state,
             )
             .await;
@@ -1587,6 +1620,7 @@ mod tests {
                 &path,
                 &mut offset,
                 &mut data,
+                &mut self_continuing,
                 &mut state,
             )
             .await;
@@ -1595,6 +1629,60 @@ mod tests {
                 SessionStatus::Active,
                 "a consumed signal never re-settles a later turn"
             );
+        });
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hookless turn start, end to end through the launcher: a Codex goal
+    /// re-opens the turn the Stop hook just parked, and the row has to leave
+    /// Idle on the transcript alone — no hook is coming. A row waiting on the
+    /// *user* is the one thing that outranks the read.
+    #[test]
+    fn rescan_promotes_a_hookless_turn_but_never_over_a_waiting_row() {
+        let base = std::env::temp_dir().join(format!("cm-rescan-goal-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",",
+                "\"goal\":{\"objective\":\"keep going\",\"status\":\"active\"}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (before, after) in [
+                (SessionStatus::Idle, SessionStatus::Active),
+                (SessionStatus::Compacted, SessionStatus::Active),
+                (
+                    SessionStatus::WaitingForApproval,
+                    SessionStatus::WaitingForApproval,
+                ),
+            ] {
+                let mut state = state_with(before.clone());
+                let mut offset = 0u64;
+                let mut data: Option<TranscriptStats> = None;
+                let mut self_continuing = false;
+                rescan_transcript(
+                    AgentControl::Codex,
+                    &path,
+                    &mut offset,
+                    &mut data,
+                    &mut self_continuing,
+                    &mut state,
+                )
+                .await;
+                assert_eq!(state.status, after, "{before:?} settled wrong");
+                // The goal is what keeps the poll-backed watch off its park.
+                assert!(self_continuing, "an active goal latches");
+            }
         });
 
         let _ = std::fs::remove_dir_all(&base);

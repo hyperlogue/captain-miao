@@ -1523,6 +1523,20 @@ pub struct TranscriptScan {
     /// messages to compact"), so without this the launcher would stay in
     /// `Compacting` forever.
     pub compact_aborted: bool,
+    /// True if the new bytes *end* with a turn the agent opened on its own —
+    /// no `UserPromptSubmit`, no tool hook, nothing the hook arm will ever see
+    /// (Codex's goal continuations; see `codex::scan_transcript_signals`).
+    /// The one signal here that **promotes**: the other two settle a turn the
+    /// launcher already believes is running, this one starts one it doesn't
+    /// know about. Ends-with, not contains-any, so a delta that both closes a
+    /// turn and opens the next settles on whichever came last.
+    pub turn_started: bool,
+    /// Whether the session is under a standing instruction that makes the
+    /// agent start those hookless turns — `Some(false)` when the bytes show it
+    /// ended, `None` when they say nothing and the launcher's latch holds.
+    /// Only the poll-backed watch reads it, to decide whether an idle session
+    /// can still be parked (see the lifecycle gate in `launcher::process_hooks`).
+    pub self_continuing: Option<bool>,
 }
 
 /// The transcript bytes appended since `offset`, decoded lossily, plus the

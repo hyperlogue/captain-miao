@@ -1453,6 +1453,9 @@ pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
         new_offset: delta.new_offset,
         interrupted,
         compact_aborted,
+        // Claude opens every turn with a `UserPromptSubmit` hook, so there is
+        // no hookless turn start to report and nothing that would make one.
+        ..TranscriptScan::default()
     }
 }
 
