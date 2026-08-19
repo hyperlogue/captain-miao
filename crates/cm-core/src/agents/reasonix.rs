@@ -2,23 +2,25 @@
 //! payload shape; the dashboard reaches all of it only via
 //! `crate::agent::AgentControl::Reasonix`'s match arms.
 //!
-//! **Source-verified, never run.** No `reasonix` binary was available when this
-//! was written, so every claim below comes from reading
+//! **Source-verified.** No `reasonix` binary was available when this was
+//! written, so every claim below comes from reading
 //! `esengine/DeepSeek-Reasonix@main-v2` — `internal/hook/{hook,runner}.go`,
 //! `internal/config/{paths,path_access}.go`, `docs/CLI.md`. Each is cited where
 //! it matters so a later probe knows which file to re-read rather than which
 //! guess to re-derive. What a probe still has to settle is listed at the bottom
-//! of this doc.
+//! of this doc; the one thing since settled against a live 1.25.2 is the `ask`
+//! tool's hook trace, which [`dispatch_hook`] now keys on.
 //!
 //! **The event vocabulary is a 1:1 fit**, closer than Claude's. Reasonix defines
 //! 13 events; nine map straight onto a [`HookEvent`] and are the nine we
-//! register, so the whole dispatcher is [`common::dispatch_default`] with no
-//! per-agent arm at all. Two consequences are worth stating because they are
+//! register, so the dispatcher is [`common::dispatch_default`] plus a single
+//! arm for the `ask` tool. Two consequences are worth stating because they are
 //! *absences*:
 //!
 //! - **`PermissionRequest` is native**, so `WaitingForApproval` needs no second
 //!   mechanism (Grok reaches the same state only through a separate notify
-//!   system).
+//!   system). It does **not** cover the `ask` tool, which is a question rather
+//!   than a permission gate and fires no such event — see [`dispatch_hook`].
 //! - **`isInterrupt` is a payload field**, so an Esc-interrupted turn *is* a
 //!   hook — Codex's transcript sentinel has no counterpart here and
 //!   `scan_transcript_signals` stays the empty default. Reasonix reports an
@@ -113,7 +115,7 @@ use super::common;
 use super::shell_quote;
 use super::synth_home::SynthHome;
 use crate::agent::ResumeCandidate;
-use crate::state::{HookEvent, HookMessage, LauncherState};
+use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "reasonix";
@@ -515,15 +517,32 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 // Hook event → status mapping
 // =============================================================================
 
-/// Reasonix departs from [`common::dispatch_default`] nowhere: its nine
+/// Reasonix departs from [`common::dispatch_default`] in one place: the `ask`
+/// tool. Everything else maps the way every backend maps it — its nine
 /// registered events are nine of ours under different spellings, the one case
-/// that would have needed an arm (an interrupt arriving as a failure) is
-/// normalized in [`parse_hook_payload`], and the missing `PostCompact` is
-/// handled by every other arm assigning a status unconditionally. The wrapper
-/// stays so the seam keeps one callee per backend — and so the day Reasonix
-/// grows a case of its own, it has a place to land.
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
-    common::dispatch_default(state, msg)
+/// that would otherwise have needed an arm (an interrupt arriving as a failure)
+/// is normalized in [`parse_hook_payload`], and the missing `PostCompact` is
+/// handled by every other arm assigning a status unconditionally.
+pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+    common::adopt_session_facts(state, &mut msg);
+
+    match msg.event {
+        // `ask` is Reasonix's AskUserQuestion analog — a tool that renders a
+        // multiple-choice prompt and blocks until the user picks. It is not
+        // gated, so no `PermissionRequest` fires for it; this `PreToolUse` is
+        // the only signal the session is waiting, and without an arm here the
+        // row sits at plain `Active` for as long as the question is up. Surface
+        // it as `WaitingForDecision` ("Decision"), the same bucket as Claude's
+        // `AskUserQuestion` and Codex's `request_user_input`; the paired
+        // `PostToolUse` that fires once the user answers resets it to `Active`
+        // through the shared mapping. Any other tool takes that shared mapping
+        // too (`Active` + `last_tool`).
+        HookEvent::PreToolUse if msg.tool_name.as_deref() == Some("ask") => {
+            state.status = SessionStatus::WaitingForDecision;
+            state.last_tool = msg.tool_name;
+        }
+        _ => common::dispatch_default(state, msg),
+    }
 }
 
 // =============================================================================
@@ -534,7 +553,6 @@ pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
 mod tests {
     use super::*;
     use crate::agent::AgentControl;
-    use crate::state::SessionStatus;
 
     /// A `<state>/sessions/` directory: transcripts and whichever sidecars the
     /// case needs.
@@ -695,6 +713,48 @@ mod tests {
             &payload("PermissionRequest", r#","toolName":"bash""#),
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
+    }
+
+    /// `ask` renders a multiple-choice question and blocks on the answer, and
+    /// Reasonix fires no `PermissionRequest` for it — so this `PreToolUse` is the
+    /// only evidence the session is waiting, and it must not read as `Active`.
+    /// Captured from a live session: the launcher logged
+    /// `PreToolUse tool=Some("ask")` and then nothing while the prompt was up.
+    #[test]
+    fn the_ask_tool_is_a_decision_not_plain_work() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("PreToolUse", r#","toolName":"ask""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.last_tool.as_deref(), Some("ask"));
+
+        // The answer arrives as the paired PostToolUse, which settles the row
+        // back to Active through the shared mapping.
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload("PostToolUse", r#","toolName":"ask""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool, None);
+    }
+
+    /// The arm is keyed on the tool name alone, so every other tool — including
+    /// the `use_capability` wrapper Reasonix resolves to a real name before it
+    /// reaches us — keeps the shared `PreToolUse` mapping.
+    #[test]
+    fn every_other_tool_stays_active() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("PreToolUse", r#","toolName":"move_file""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool.as_deref(), Some("move_file"));
     }
 
     /// Esc arrives as `StopFailure` + `isInterrupt`. It must end the turn like
