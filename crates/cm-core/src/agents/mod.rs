@@ -8,6 +8,7 @@ pub mod claude;
 pub mod codex;
 pub mod grok;
 pub mod kimi;
+pub mod omp;
 pub mod opencode;
 pub mod pi;
 pub mod reasonix;
