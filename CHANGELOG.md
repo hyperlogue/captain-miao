@@ -5,6 +5,17 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Managed Codex sessions now use an owned profile in the real Codex home**
+  instead of a synthetic `CODEX_HOME`. The former synthetic home at
+  `$XDG_STATE_HOME/captain-miao/codex-home` (normally
+  `~/.local/state/captain-miao/codex-home`) is ignored: captain-miao neither
+  migrates nor deletes it. After exiting sessions launched by an older version,
+  remove that directory manually if you no longer need its state.
+
 ## [0.6.0] - 2026-08-19
 
 🙏 Thanks to [@TomGrozev](https://github.com/TomGrozev), who contributed the omp
@@ -407,6 +418,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0

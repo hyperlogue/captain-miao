@@ -1155,12 +1155,10 @@ fn start_file_watcher(
     let target = path.to_path_buf();
     // The path we register and the path the backend reports back are not always
     // the same string: macOS FSEvents resolves symlinks (and `/var` → `/private/var`)
-    // before reporting, while Linux inotify echoes the path as registered. Codex's
-    // `transcript_path` points into the *synthetic* `$CODEX_HOME`, whose `sessions`
-    // entry is a symlink to the real `~/.codex/sessions`, so on macOS every event
-    // arrives under the real path and a raw-string filter drops all of them —
-    // silently freezing the transcript fold (no context tokens, no interrupt scan).
-    // Accept either spelling.
+    // before reporting, while Linux inotify echoes the path as registered. An
+    // agent can report a transcript through any symlinked config/session tree;
+    // on macOS the event then arrives under the real path and a raw-string
+    // filter silently freezes the transcript fold. Accept either spelling.
     let real = canonical_watch_target(path).filter(|p| *p != target);
     let handler = move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
@@ -1518,11 +1516,10 @@ mod tests {
     use super::*;
     use crate::agent::AgentControl;
 
-    /// A transcript reached through a symlinked directory — Codex's rollout under
-    /// the synthetic `$CODEX_HOME`, whose `sessions` entry links to `~/.codex/sessions`
-    /// — must resolve to the real path, because that is the spelling macOS FSEvents
-    /// reports and the watch filter compares against. Covers both the file-exists
-    /// case and the parent-directory fallback (file not created yet).
+    /// A transcript reached through a symlinked directory must resolve to the
+    /// real path, because that is the spelling macOS FSEvents reports and the
+    /// watch filter compares against. Covers both the file-exists case and the
+    /// parent-directory fallback (file not created yet).
     #[test]
     fn canonical_watch_target_resolves_symlinked_dirs() {
         let base = std::env::temp_dir().join(format!("cm-watch-target-{}", std::process::id()));

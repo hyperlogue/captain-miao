@@ -405,16 +405,15 @@ fn launch_args(extra: &[String]) -> Vec<String> {
 /// copy. The mirroring — dangling links, shadowing entries, file modes — lives
 /// in [`super::synth_home`].
 ///
-/// `config.toml` is **copied, not symlinked**, for the reason Codex established:
-/// the real file is frequently read-only (a nix-store / home-manager symlink),
-/// and an agent that writes back into its own home then fails on that write. It
-/// also has to be a copy here for a second reason — we *edit* it, and editing
-/// the user's real config to inject our hooks is not ours to do.
+/// `config.toml` is **copied, not symlinked** because the real file is frequently
+/// read-only (a nix-store / home-manager symlink), and an agent that writes back
+/// into its own home then fails on that write. It also has to be a copy here for
+/// a second reason — we *edit* it, and editing the user's real config to inject
+/// our hooks is not ours to do.
 ///
-/// `owned` is empty: unlike Claude's `settings.json`, Codex's `hooks.json` and
-/// Reasonix's `settings.json`, Kimi has no separate hooks file to own. The hooks
-/// live inside the config, which is why this backend needs the copy mechanism
-/// that Reasonix did not.
+/// `owned` is empty: unlike Claude's and Reasonix's separate settings files,
+/// Kimi has no hooks file to own. The hooks live inside the config, which is why
+/// this backend needs the copy mechanism that Reasonix did not.
 fn ensure_synth_home(hooks_toml: &str) -> Result<PathBuf> {
     let real = kimi_home();
     // Pre-seed the real home's state tree before mirroring, so every entry the
@@ -506,13 +505,13 @@ const HOOK_TIMEOUT_SECS: i64 = 5;
 /// check (if Kimi has one) must see a stable file, and concurrent launches must
 /// not race a rewrite.
 ///
-/// Best-effort, like Codex's trust seeding, and asymmetric on purpose: a config
-/// that is merely **absent** is created, but one that is present and doesn't
-/// parse — or whose `hooks` key holds something that isn't an array of tables —
-/// is left byte-for-byte alone. Treating an unparseable config as an empty one
-/// would replace the user's file with nothing but our hooks, and the file we
-/// hold is their whole configuration mirrored. Losing the hooks (the session
-/// runs untracked) is the cheaper failure by a wide margin.
+/// Best-effort, like Codex's profile trust generation, and asymmetric on
+/// purpose: a config that is merely **absent** is created, but one that is
+/// present and doesn't parse — or whose `hooks` key holds something that isn't
+/// an array of tables — is left byte-for-byte alone. Treating an unparseable
+/// config as an empty one would replace the user's file with nothing but our
+/// hooks, and the file we hold is their whole configuration mirrored. Losing
+/// the hooks (the session runs untracked) is the cheaper failure by a wide margin.
 ///
 /// The rewrite is a full TOML re-serialization, so the copy loses the real
 /// file's comments and key order. That is confined to the copy: the user's real

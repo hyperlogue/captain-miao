@@ -5,44 +5,41 @@
 //! Codex's hook system is a near-clone of Claude Code's: the same event names
 //! (minus a few) and an identical snake_case stdin payload, so the launcher
 //! loop and `HookMessage` are reused unchanged. The two genuine differences
-//! are (1) a hook has to be **trusted** from a file, so we point the agent at a
-//! synthetic, shared `CODEX_HOME` that symlinks the real one and adds our
-//! `hooks.json`; and (2) Codex records a far richer rollout JSONL than Claude's
-//! transcript, so context tokens and lifecycle signals come straight from typed
-//! events.
+//! are (1) a command hook has to be **trusted** from a real config layer, so we
+//! install one owned `captain-miao` profile in the user's real `CODEX_HOME` and
+//! select it on every managed launch; and (2) Codex records a far richer rollout
+//! JSONL than Claude's transcript, so context tokens and lifecycle signals come
+//! straight from typed events.
 //!
-//! **The synthetic home is for the trust file, not for discovery** — worth
-//! stating because the obvious simplification looks like it should work and
-//! silently does not. `-c hooks.<Event>=[…]` *does* inject a hook definition
-//! per invocation: Codex registers it under its own `HookSource::sessionFlags`,
-//! keyed `/<session-flags>/config.toml:<event>:<group>:<handler>`, and it fires
-//! with the payload this module already parses. What cannot ride along is its
-//! trust. `hooks.state.…trusted_hash` passed by `-c` is ignored — trust is read
-//! only from a real config.toml layer — and an **untrusted hook is dropped in
-//! silence**: no warning, no stderr, nothing in any log, just rows that never
-//! leave `Starting`. So dropping the synthetic home would cost either
-//! `--dangerously-bypass-hook-trust` on every launch (which disables the gate
-//! for the user's own hooks too, and is exactly what `seed_hook_trust` exists
-//! to avoid) or a write into the real `~/.codex/config.toml`, routinely a
-//! read-only nix / home-manager symlink — the same fact that makes
-//! `config.toml` a `CopiedEntry` rather than a link.
+//! The profile carries only our inline hooks and their trust hashes; the user's
+//! `config.toml` and global `hooks.json` are never parsed or changed, and bare
+//! Codex runs never load the profile. This became possible when Codex 0.134
+//! moved named profiles into separate `<name>.config.toml` layers. A profile
+//! does not compose with another named profile, so `--profile` / `-p` is
+//! deliberately reserved on a captain-miao launch and rejected before Codex
+//! starts.
 //!
-//! Probed against Codex 0.147.0 with `hooks/list` over `codex app-server`, and
-//! confirmed end to end: the same `-c` hook fires with a trust entry present or
-//! under the bypass flag, and is dropped without one.
+//! Trust cannot be moved to `-c` beside an injected hook. Codex registers that
+//! definition under `HookSource::sessionFlags`, but ignores a trust entry passed
+//! through the same ephemeral layer; an untrusted hook is skipped and the row
+//! never leaves `Starting`. Nor do we use `--dangerously-bypass-hook-trust`,
+//! because that would disable the gate for the user's own hooks too. The owned
+//! profile instead gives both the hook and its precomputed trust hash one real,
+//! writable config layer without touching the base config.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::process::Command;
 
 use super::common;
-use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
+use super::synth_home::atomic_write;
 use super::{collapse_whitespace, shell_quote};
 use crate::agent::{
     AgentActivity, ResumeCandidate, SessionIndex, SessionIndexCache, TranscriptScan,
@@ -53,97 +50,53 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "codex";
 
+/// The one named-profile slot captain-miao reserves on managed Codex launches.
+const PROFILE_NAME: &str = "captain-miao";
+const PROFILE_FILE: &str = "captain-miao.config.toml";
+const PROFILE_MARKER: &str = "# Managed by captain-miao; changes are overwritten.\n";
+
 // =============================================================================
 // Filesystem locations
 // =============================================================================
 
 /// The real Codex home — `$CODEX_HOME` if the user set one globally, else
-/// `~/.codex`. This is what the synthetic home mirrors; it is *not* what the
-/// launched agent is handed (see `synth_home`), and it is not where a session's
-/// state is read from either — that goes through [`read_path`], which knows the
-/// mirror can be one-sided.
+/// `~/.codex`. Resolve a relative override now and hand the same absolute path
+/// back to Codex at launch, so creating the profile and loading it cannot
+/// disagree when the agent's cwd differs from the launcher's.
 fn codex_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("CODEX_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".codex"))
+    resolve_codex_home(
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+        std::env::current_dir().ok(),
+    )
 }
 
-/// Resolve `name` in the home that actually holds it — **the synthetic one
-/// first**, the real one as a fallback.
-///
-/// Reading the real home is only right while the mirror holds, and it does not
-/// hold for a state file the *agent* minted. `SynthHome::ensure` links what the
-/// real home already has; a name it has never had gets no link, so Codex
-/// creates the file inside the synthetic home and the real one never grows it.
-/// On a machine where `~/.codex` is managed (home-manager ships a `config.toml`
-/// symlink and nothing else) and `codex` has never been run bare, *every* state
-/// file is in that position — `state_5.sqlite` and the whole `sessions/` tree
-/// included. Reading the real home there finds nothing at all, which is how a
-/// `/rename` could land in sqlite and never reach a row.
-///
-/// The synthetic path is the safe one to prefer because it is the *same file*
-/// wherever the mirror did hold: an entry the real home has is reached through
-/// the link. The fallback covers the one case the synthetic home can't answer —
-/// a host where captain-miao has never launched Codex, whose bare sessions
-/// [`list_resumable`] should still offer.
-///
-/// Resolved per call rather than cached: the first launch on a fresh host
-/// creates these entries *after* the dashboard is already running.
-fn read_path(name: &str) -> Option<PathBuf> {
-    resolve_read_path(&synth_home(), codex_home(), name)
+/// Home resolution split from environment reads so it is testable without
+/// mutating process-global variables. Empty overrides are unset; relative ones
+/// resolve against the launcher's cwd and require that cwd to be available.
+fn resolve_codex_home(
+    configured: Option<PathBuf>,
+    home: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = configured
+        && !path.as_os_str().is_empty()
+    {
+        return if path.is_absolute() {
+            Some(path)
+        } else {
+            Some(cwd?.join(path))
+        };
+    }
+    home.map(|h| h.join(".codex"))
 }
 
-/// The resolution itself, split from home discovery so a test can point it at
-/// fixture trees without touching the environment.
-///
-/// `exists()` follows links, which is what makes the one rule cover both
-/// mirrored and agent-minted entries — and a *dangling* link (the real entry
-/// deleted since the last launch) correctly falls through to the real path,
-/// where the agent's next write will land through that same link.
-fn resolve_read_path(synth: &Path, real: Option<PathBuf>, name: &str) -> Option<PathBuf> {
-    let candidate = synth.join(name);
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    Some(real?.join(name))
+fn codex_path(name: &str) -> Option<PathBuf> {
+    Some(codex_home()?.join(name))
 }
 
 fn sessions_root() -> Option<PathBuf> {
-    read_path("sessions")
-}
-
-/// Paths whose changes should wake the host process (a dashboard reload / a
-/// server re-push). Only the title store's WAL sidecar: a `/rename` (or Codex's
-/// own auto-title) lands in `state_5.sqlite` alone — no hook, no rollout line,
-/// no state-file write — so this wake is what lets the per-host title overlay
-/// ([`crate::backend::LocalBackend`]'s throttled sqlite read) surface it while
-/// the sessions are otherwise idle. The rollout tree is folded by the launcher
-/// and arrives via the state file, so it's deliberately not watched; nor is
-/// `~/.codex` itself (its `logs_2.sqlite-wal` telemetry churns far too much).
-/// Best-effort: if the wal is momentarily absent (pre-first-write / just
-/// checkpointed) the watch fails silently and the overlay's refresh piggybacks
-/// on the next session event instead.
-pub fn watch_paths() -> Vec<PathBuf> {
-    // Both homes' wal, not just the one [`title_watch_path`] resolves to now.
-    // This runs once, at watcher setup, while the resolution can still move —
-    // a host whose first Codex session starts later mints the db in the
-    // synthetic home, and a watcher latched onto the real home's path would
-    // never wake again. Watching a path that never materializes costs nothing
-    // (the registration just fails), and the duplicate collapses to one entry
-    // on a host where the mirror does hold.
-    let mut paths: Vec<PathBuf> = [
-        Some(synth_home().join("state_5.sqlite-wal")),
-        codex_home().map(|h| h.join("state_5.sqlite-wal")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    paths.dedup();
-    paths
+    codex_path("sessions")
 }
 
 fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -180,30 +133,31 @@ pub fn read_session_index(_cache: &mut SessionIndexCache) -> SessionIndex {
 // =============================================================================
 
 fn state_db_path() -> Option<PathBuf> {
-    read_path("state_5.sqlite")
+    codex_path("state_5.sqlite")
 }
 
 /// The title store's WAL sidecar — the file whose change means "a title may
 /// have moved". `state_5` runs in WAL mode: writes land here (the main db
-/// updates only on checkpoint), so this is what [`watch_paths`] nominates for
-/// the host-process wake. Watching just this file, not `~/.codex`, keeps the
-/// churny `logs_2.sqlite-wal` telemetry sibling from waking anything.
+/// updates only on checkpoint), so this is what the host's out-of-band watcher
+/// registers. Watching just this file, not `~/.codex`, keeps the churny
+/// `logs_2.sqlite-wal` telemetry sibling from waking anything. If the WAL is
+/// momentarily absent (before the first write or just after a checkpoint), the
+/// watch fails silently and the title overlay refreshes on the next session
+/// event instead.
 pub fn title_watch_path() -> Option<PathBuf> {
-    // Beside whichever `state_5.sqlite` [`read_path`] resolved to, rather than
-    // resolved on its own: a checkpoint deletes the wal, so it is regularly
-    // absent from *both* homes and can't point at its own.
+    // Derive it beside `state_5.sqlite` rather than resolving the sidecar on its
+    // own: a checkpoint regularly deletes the wal, and an absent sidecar must
+    // still have a stable path for the watcher to register.
     Some(state_db_path()?.with_file_name("state_5.sqlite-wal"))
 }
 
 /// Stat stamp of the title store — `(main db mtime, wal mtime)` — the cheap
-/// change gate the per-host overlay checks before touching sqlite: if the stamp
-/// hasn't moved since the last read, no title can have changed and the read is
-/// skipped. Both files matter: writes land in the wal, and a checkpoint folds
-/// them into the main db (possibly deleting the wal). `None` per
-/// missing/unstattable file.
+/// change gate the per-host overlay checks before touching sqlite. Writes land
+/// in the WAL, and a checkpoint folds them into the main DB (possibly deleting
+/// it). `None` per missing/unstattable file.
 pub fn title_store_mtimes() -> (Option<SystemTime>, Option<SystemTime>) {
-    fn mtime(p: Option<PathBuf>) -> Option<SystemTime> {
-        std::fs::metadata(p?).ok()?.modified().ok()
+    fn mtime(path: Option<PathBuf>) -> Option<SystemTime> {
+        std::fs::metadata(path?).ok()?.modified().ok()
     }
     (mtime(state_db_path()), mtime(title_watch_path()))
 }
@@ -213,7 +167,7 @@ pub fn title_store_mtimes() -> (Option<SystemTime>, Option<SystemTime>) {
 /// [`crate::backend::LocalBackend`] — a single throttled reader serving every
 /// Codex session on the host. Returns only the ids that have a (non-empty)
 /// title; an absent id simply has no title row yet. Empty on any open failure
-/// (the overlay just tries again next pass).
+/// (the overlay tries again next pass).
 pub fn read_thread_titles(ids: &[String]) -> HashMap<String, String> {
     let Some(db) = state_db_path() else {
         return HashMap::new();
@@ -306,10 +260,9 @@ fn query_thread_title(conn: &Connection, session_id: &str) -> Option<String> {
 /// decides whether to continue *after* it runs the stop hooks — see
 /// `launcher`'s `confirm_hold_at`).
 ///
-/// The store is Codex's own `goals_1.sqlite`, read the way the title store is:
-/// read-only, and resolved through [`read_path`] because a goals db is exactly
-/// the agent-minted file the real home may never grow. A thread re-drives
-/// itself when its goal is `active` **and** its continuation isn't deferred —
+/// The store is Codex's own `goals_1.sqlite`, read-only from the real Codex
+/// home. A thread re-drives itself when its goal is `active` **and** its
+/// continuation isn't deferred —
 /// Codex's other statuses (`paused`, `blocked`, `usage_limited`,
 /// `budget_limited`, `complete`) all mean the next move is the user's.
 ///
@@ -337,7 +290,7 @@ pub fn thread_self_continues(session_id: &str) -> bool {
 }
 
 fn goals_db_path() -> Option<PathBuf> {
-    read_path("goals_1.sqlite")
+    codex_path("goals_1.sqlite")
 }
 
 /// The lookup against an open connection, split from the IO so it is testable
@@ -522,6 +475,9 @@ fn parse_user_message(line: &str) -> Option<String> {
 /// Scan `sessions/**/rollout-*.jsonl` for resumable Codex sessions. Returns up
 /// to `limit` candidates sorted by mtime (most recent first).
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no codex home"))?;
 
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
@@ -538,16 +494,17 @@ pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
                         continue;
                     }
                     let Ok(meta) = tr.metadata() else { continue };
-                    let Ok(mtime) = meta.modified() else { continue };
+                    let Ok(mtime) = meta.modified() else {
+                        continue;
+                    };
                     files.push((path, mtime));
                 }
             }
         }
     }
     files.sort_by_key(|b| std::cmp::Reverse(b.1));
-    files.truncate(limit);
 
-    let mut out = Vec::with_capacity(files.len());
+    let mut out = Vec::with_capacity(limit.min(files.len()));
     for (path, mtime) in files {
         let header = read_rollout_header(&path);
         let (Some(session_id), Some(cwd)) = (header.session_id, header.cwd) else {
@@ -562,6 +519,9 @@ pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
             git_branch: header.git_branch,
             mtime,
         });
+        if out.len() == limit {
+            break;
+        }
     }
     Ok(out)
 }
@@ -607,16 +567,8 @@ fn read_rollout_header(path: &Path) -> RolloutHeader {
 }
 
 // =============================================================================
-// Launcher: process spawn + synthetic CODEX_HOME
+// Launcher: process spawn + owned Codex profile
 // =============================================================================
-
-/// A single shared synthetic `$CODEX_HOME` used by every Codex session. It
-/// mirrors the real home via symlinks and adds our `hooks.json`. Keeping it a
-/// stable path with stable contents means Codex's hook-trust prompt fires at
-/// most once per machine (trust is keyed by content), instead of every launch.
-fn synth_home() -> PathBuf {
-    crate::state::state_dir().join("codex-home")
-}
 
 pub fn build_launch_command(
     cwd: &str,
@@ -625,67 +577,123 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    // The launcher already wrote our hooks.json contents to `settings_path`;
-    // relocate them into the synthetic home where Codex will discover them.
+    let args = managed_launch_args(extra_args)?;
+
+    // The generic launcher already wrote the backend's hook payload to this
+    // per-session path. Codex does not load that path directly: turn its JSON
+    // event table into the inline TOML carried by our named profile.
     let hooks_json =
         std::fs::read_to_string(settings_path).context("reading codex hooks settings")?;
-    let home = ensure_synth_home(&hooks_json)?;
+    let home = codex_home().context("could not resolve Codex home")?;
+    ensure_profile_at(&home, &hooks_json)?;
 
     // `agent_command` puts the shim farm on `PATH`, which for Codex buys only
     // `clipboard-paste`: it reads the clipboard in-process, so no shim can serve
     // its `Ctrl+V`.
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
+    // Set the real path explicitly. This is a no-op for the normal absolute
+    // `$CODEX_HOME`, and makes a relative override resolve the same way here as
+    // it did while writing the profile above.
     cmd.env("CODEX_HOME", &home);
     // The hook subprocess reads the launcher socket from here rather than from
-    // an argv flag — that keeps hooks.json byte-identical across sessions so
+    // an argv flag — that keeps the profile byte-identical across sessions so
     // its trust hash never changes.
     cmd.env("CAPTAIN_MIAO_SOCK", sock_path);
-    // Turn the lifecycle-hook feature on. We do NOT pass
-    // `--dangerously-bypass-hook-trust`: `seed_hook_trust` pre-writes the exact
-    // trust hash Codex would persist on approval into the synth home's
-    // config.toml, so our own hooks are already trusted and no interactive
-    // "Trust all and continue" prompt fires.
-    cmd.args(["-c", "features.hooks=true"]);
-    cmd.args(extra_args);
+    // Root options, so they must precede Codex's `resume` / `fork` subcommands
+    // in `extra_args`. The profile pre-trusts only our hooks; the CLI feature
+    // gate keeps a project config from disabling them for this managed launch.
+    // No bypass flag weakens the user's other hook sources.
+    cmd.args(args);
     Ok(cmd)
 }
 
-/// Create / refresh the synthetic home and return it: mirror the real Codex home
-/// (all but `hooks.json`, which is ours, and `config.toml`, which is copied
-/// writable because Codex persists hook trust into it), write our `hooks.json`,
-/// then pre-trust it. The mirroring itself — and the hard-won rules about
-/// dangling links, shadowing entries and file modes — lives in
-/// [`super::synth_home`].
-fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
-    let home = SynthHome {
-        dir: synth_home(),
-        real: codex_home(),
-        owned: &["hooks.json"],
-        copied: &[CopiedEntry {
-            name: "config.toml",
-            snapshot: ".config-source.toml",
-        }],
-        // `codex login` writes its credentials here. On a machine that has never
-        // logged in, the file does not exist to be mirrored, so a login *inside*
-        // a captain-miao session would leave the credentials in the synthetic
-        // home where a bare `codex` can't see them. This is the documented
-        // location rather than one verified against a login here.
-        adopted: &["auth.json"],
-        prune: false,
-    };
-    home.ensure()?;
-    home.write_owned("hooks.json", hooks_json)?;
-
-    // Pre-trust our own hooks: compute the hash Codex persists on interactive
-    // approval and write it into config.toml's [hooks.state]. Recomputed every
-    // launch so it tracks any change to hooks.json (e.g. the embedded exe path
-    // shifting on a rebuild) and never goes stale — which is what lets us drop
-    // `--dangerously-bypass-hook-trust`.
-    seed_hook_trust(&home.dir);
-    Ok(home.dir)
+fn managed_launch_args(extra_args: &[String]) -> Result<Vec<String>> {
+    reject_profile_arg(extra_args)?;
+    let mut args = Vec::with_capacity(extra_args.len() + 4);
+    args.push("--profile".to_string());
+    args.push(PROFILE_NAME.to_string());
+    args.push("--enable".to_string());
+    args.push("hooks".to_string());
+    args.extend_from_slice(extra_args);
+    Ok(args)
 }
 
-/// PascalCase Codex event key (as it appears in hooks.json) → the snake_case
+/// Reject the one Codex root option captain-miao consumes. Letting two
+/// `--profile` flags reach clap is version-dependent (error vs last-one-wins),
+/// and either answer is worse than naming the limitation before the agent
+/// starts. The attached long/short forms are included because clap accepts
+/// them too.
+fn reject_profile_arg(extra_args: &[String]) -> Result<()> {
+    if extra_args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            arg == "--profile"
+                || arg.starts_with("--profile=")
+                || arg == "-p"
+                || (arg.starts_with("-p") && arg.len() > 2)
+        })
+    {
+        anyhow::bail!(concat!(
+            "Codex --profile/-p is reserved by captain-miao; ",
+            "move those settings into the base config for managed sessions"
+        ));
+    }
+    Ok(())
+}
+
+/// Create or refresh the one captain-owned profile in the **real** Codex home.
+/// Existing real homes are left mode-for-mode alone; a missing one is created
+/// 0700, and the profile itself is written atomically 0600. Refuse every
+/// pre-existing non-owned entry, including a symlink, so a user profile can
+/// never be replaced merely because it chose the same name.
+fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
+    if !home.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(home)
+            .with_context(|| format!("creating Codex home {}", home.display()))?;
+    }
+
+    let path = home.join(PROFILE_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to replace non-owned Codex profile {}",
+                    path.display()
+                );
+            }
+            let current = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading Codex profile {}", path.display()))?;
+            if !current.starts_with(PROFILE_MARKER) {
+                anyhow::bail!(
+                    "Codex profile {} already exists and is not owned by captain-miao",
+                    path.display()
+                );
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("inspecting Codex profile {}", path.display()));
+        }
+    }
+
+    let contents = build_profile(&path, hooks_json)?;
+    let unchanged = std::fs::read_to_string(&path)
+        .map(|current| current == contents)
+        .unwrap_or(false);
+    if !unchanged {
+        atomic_write(&path, contents.as_bytes())
+            .with_context(|| format!("writing Codex profile {}", path.display()))?;
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("securing Codex profile {}", path.display()))?;
+    Ok(path)
+}
+
+/// PascalCase Codex event key (as it appears in hook config) → the snake_case
 /// label Codex uses inside its hook-trust key. None for keys we don't emit.
 /// Mirrors Codex's `hook_event_key_label`.
 fn codex_event_label(pascal: &str) -> Option<&'static str> {
@@ -748,102 +756,68 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Merge hook-trust entries into the synth home's config.toml so Codex runs our
-/// hooks without the interactive "Trust all and continue" prompt — and without
-/// `--dangerously-bypass-hook-trust`. We parse hooks.json, compute the trust
-/// hash for every command hook, and write them under `[hooks.state]` keyed
-/// `"<hooks.json path>:<label>:<group>:<handler>"` (Codex's `hook_key` format).
-///
-/// Best-effort: any failure (missing/garbled config or hooks, a `hooks` key
-/// that isn't a table) just leaves trust unseeded, which at worst restores the
-/// one-time prompt rather than breaking the launch. Re-runs each launch and is
-/// idempotent, so a config reseed (on real-config change) is immediately
-/// re-trusted.
-fn seed_hook_trust(home: &Path) {
-    let hooks_path = home.join("hooks.json");
-    let config_path = home.join("config.toml");
+/// Convert the launcher's JSON event table into a complete named profile:
+/// inline hooks and the exact trust hashes Codex would write after an
+/// interactive review. Inline hooks are keyed by the profile file path
+/// itself (`<profile>:<event>:<group>:<handler>`), so every byte that controls
+/// their identity and every byte that trusts it remain in the same owned file.
+fn build_profile(profile_path: &Path, hooks_json: &str) -> Result<String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(hooks_json).context("parsing Codex hooks settings")?;
+    let events = parsed
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .context("Codex hooks settings have no hooks object")?;
 
-    let Ok(hooks_text) = std::fs::read_to_string(&hooks_path) else {
-        return;
-    };
-    let Ok(hooks_json) = serde_json::from_str::<serde_json::Value>(&hooks_text) else {
-        return;
-    };
-    let Some(events) = hooks_json.get("hooks").and_then(|h| h.as_object()) else {
-        return;
-    };
-
-    let mut our_state = toml::map::Map::new();
+    let mut hooks = toml::map::Map::new();
+    let mut state = toml::map::Map::new();
     for (pascal, groups) in events {
-        let Some(label) = codex_event_label(pascal) else {
-            continue;
-        };
-        let Some(groups) = groups.as_array() else {
-            continue;
-        };
-        for (gi, group) in groups.iter().enumerate() {
+        let label = codex_event_label(pascal)
+            .with_context(|| format!("unknown Codex hook event {pascal}"))?;
+        let groups_array = groups
+            .as_array()
+            .with_context(|| format!("Codex hook event {pascal} is not an array"))?;
+        for (gi, group) in groups_array.iter().enumerate() {
             let matcher = group.get("matcher").and_then(|m| m.as_str()).unwrap_or("*");
-            let Some(handlers) = group.get("hooks").and_then(|h| h.as_array()) else {
-                continue;
-            };
+            let handlers = group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .with_context(|| format!("Codex hook event {pascal} group {gi} has no handlers"))?;
             for (hi, handler) in handlers.iter().enumerate() {
-                let Some(command) = handler.get("command").and_then(|c| c.as_str()) else {
-                    continue;
-                };
+                let command = handler
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .with_context(|| {
+                        format!("Codex hook event {pascal} handler {gi}:{hi} has no command")
+                    })?;
                 let hash = command_hook_hash(label, matcher, command);
-                let key = format!("{}:{label}:{gi}:{hi}", hooks_path.display());
+                let key = format!("{}:{label}:{gi}:{hi}", profile_path.display());
                 let mut entry = toml::map::Map::new();
                 entry.insert("trusted_hash".to_string(), toml::Value::String(hash));
-                our_state.insert(key, toml::Value::Table(entry));
+                state.insert(key, toml::Value::Table(entry));
             }
         }
+        hooks.insert(
+            pascal.clone(),
+            toml::Value::try_from(groups.clone())
+                .with_context(|| format!("converting Codex hook event {pascal} to TOML"))?,
+        );
     }
+    hooks.insert("state".to_string(), toml::Value::Table(state));
 
-    // Merge into [hooks][state], starting from the existing copy (or empty) so
-    // the user's own config settings survive the rewrite.
-    let mut doc = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok())
-        .unwrap_or_default();
-    let hooks_tbl = doc
-        .entry("hooks".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let toml::Value::Table(hooks_tbl) = hooks_tbl else {
-        return;
-    };
-    // Replace only entries for the hooks file we own. Codex persists trust for
-    // user and project hooks in this same table; replacing the whole table here
-    // made every approval for those hooks disappear on the next launch, so the
-    // user was asked to trust them again every time. Removing our prefix also
-    // retires stale entries if our emitted event set ever changes.
-    let prefix = format!("{}:", hooks_path.display());
-    let state = hooks_tbl
-        .entry("state".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let toml::Value::Table(state) = state else {
-        return;
-    };
-    let previous = state.clone();
-    state.retain(|key, _| !key.starts_with(&prefix));
-    state.extend(our_state);
-
-    // Avoid rewriting config.toml on every launch. Besides preserving the
-    // user's formatting, this narrows the window in which a concurrent Codex
-    // approval write and a second session launch could race each other.
-    if *state == previous {
-        return;
-    }
-
-    if let Ok(serialized) = toml::to_string(&doc) {
-        let _ = atomic_write(&config_path, serialized.as_bytes());
-    }
+    let mut profile = toml::map::Map::new();
+    profile.insert("hooks".to_string(), toml::Value::Table(hooks));
+    let serialized = toml::to_string(&profile).context("serializing Codex profile")?;
+    Ok(format!("{PROFILE_MARKER}{serialized}"))
 }
 
-/// Build the Codex `hooks.json`. The structure mirrors Claude's settings
+/// Build Codex's hook event table as JSON for the launcher's generic settings
+/// channel. [`build_profile`] converts it to inline TOML before Codex starts.
+/// The structure mirrors Claude's settings
 /// (`{event: [{matcher, hooks:[{type,command}]}]}`) but uses Codex's PascalCase
 /// event keys. The command is intentionally free of per-session data — the
-/// socket arrives via `$CAPTAIN_MIAO_SOCK` — so the file is identical for every
-/// session and Codex only ever asks to trust it once.
+/// socket arrives via `$CAPTAIN_MIAO_SOCK` — so the owned profile is identical
+/// for every session and its trust hashes stay stable.
 pub fn build_hooks_settings(_sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
@@ -961,7 +935,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             state.status = SessionStatus::Active;
             state.last_tool = None;
         }
-        // Events Codex never emits — no hooks.json entry registers them, so they
+        // Events Codex never emits — no profile hook registers them, so they
         // never reach this dispatcher. Ignored rather than mapped defensively,
         // which is why they're intercepted here instead of falling through to
         // the shared defaults. (The exhaustive match that forces a decision on a
@@ -1300,7 +1274,7 @@ mod tests {
     fn hooks_settings_is_stable_and_sockless() {
         let a = build_hooks_settings("/run/a.sock");
         let b = build_hooks_settings("/run/b.sock");
-        assert_eq!(a, b, "hooks.json must not embed the per-session socket");
+        assert_eq!(a, b, "hook config must not embed the per-session socket");
         assert!(a.contains("hook --agent codex"));
         assert!(a.contains("PreToolUse"));
         assert!(!a.contains(".sock"));
@@ -1313,7 +1287,11 @@ mod tests {
     fn titles_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT);
+            "CREATE TABLE threads (
+                 id TEXT PRIMARY KEY,
+                 title TEXT,
+                 name TEXT
+             );
              -- renamed: `name` wins over the auto-title beside it
              INSERT INTO threads VALUES ('019e5252-aaa', 'Do a deep review of x', 'test');
              -- never renamed: the whitespace-y auto-title stands in
@@ -1427,156 +1405,140 @@ mod tests {
         );
     }
 
-    /// A pair of throwaway homes — `(synth, real)`, both created.
-    fn home_pair(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!(
-            "captain-miao-codex-homes-{}-{tag}",
-            std::process::id(),
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        let (synth, real) = (base.join("synth"), base.join("real"));
-        std::fs::create_dir_all(&synth).unwrap();
-        std::fs::create_dir_all(&real).unwrap();
-        (synth, real)
-    }
-
-    /// The case that broke renames: `~/.codex` is managed and holds nothing but
-    /// a config, so Codex minted `state_5.sqlite` inside the synthetic home and
-    /// the mirror never linked it. Reading the real home finds no file at all.
-    #[test]
-    fn an_agent_minted_entry_is_read_from_the_synthetic_home() {
-        let (synth, real) = home_pair("minted");
-        std::fs::write(synth.join("state_5.sqlite"), b"db").unwrap();
-
-        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite");
-        assert_eq!(got, Some(synth.join("state_5.sqlite")));
-        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
-    }
-
-    /// Where the mirror *did* hold, the synthetic path is a link onto the real
-    /// file — the same bytes, so preferring it is never the wrong answer.
-    #[test]
-    fn a_mirrored_entry_resolves_through_its_link() {
-        let (synth, real) = home_pair("mirrored");
-        std::fs::write(real.join("state_5.sqlite"), b"db").unwrap();
-        std::os::unix::fs::symlink(real.join("state_5.sqlite"), synth.join("state_5.sqlite"))
-            .unwrap();
-
-        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite").unwrap();
-        assert_eq!(got, synth.join("state_5.sqlite"));
-        assert_eq!(std::fs::read(&got).unwrap(), b"db");
-        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
-    }
-
-    /// A host where captain-miao has never launched Codex: nothing is in the
-    /// synthetic home, and the real home's bare sessions must still be found.
-    #[test]
-    fn an_unmirrored_entry_falls_back_to_the_real_home() {
-        let (synth, real) = home_pair("bare");
-        std::fs::create_dir_all(real.join("sessions")).unwrap();
-
-        let got = resolve_read_path(&synth, Some(real.clone()), "sessions");
-        assert_eq!(got, Some(real.join("sessions")));
-        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
-    }
-
-    /// A dangling link is not a hit: the real entry was deleted since the last
-    /// launch, and the agent's next write goes *through* the link into the real
-    /// home — so the real path is where to look.
-    #[test]
-    fn a_dangling_link_falls_back_to_the_real_home() {
-        let (synth, real) = home_pair("dangling");
-        std::os::unix::fs::symlink(real.join("state_5.sqlite"), synth.join("state_5.sqlite"))
-            .unwrap();
-
-        let got = resolve_read_path(&synth, Some(real.clone()), "state_5.sqlite");
-        assert_eq!(got, Some(real.join("state_5.sqlite")));
-        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
-    }
-
-    /// No real home resolves at all (no `$HOME`): the synthetic one still
-    /// answers for anything it holds, and nothing else has a path.
-    #[test]
-    fn without_a_real_home_only_the_synthetic_one_answers() {
-        let (synth, _real) = home_pair("nohome");
-        std::fs::write(synth.join("state_5.sqlite"), b"db").unwrap();
-
-        assert_eq!(
-            resolve_read_path(&synth, None, "state_5.sqlite"),
-            Some(synth.join("state_5.sqlite"))
-        );
-        assert_eq!(resolve_read_path(&synth, None, "sessions"), None);
-        let _ = std::fs::remove_dir_all(synth.parent().unwrap());
-    }
-
-    /// Both homes' wal are watched: this runs once, at watcher setup, and the
-    /// first Codex launch on a fresh host can still move which home holds the
-    /// db. A watcher latched onto one path would then never wake.
-    #[test]
-    fn both_homes_wal_are_watched() {
-        let paths = watch_paths();
-        assert!(
-            paths.iter().any(|p| p.starts_with(synth_home())),
-            "synthetic home's wal is watched: {paths:?}"
-        );
-        assert!(paths.iter().all(|p| p.ends_with("state_5.sqlite-wal")));
-    }
-
-    #[test]
-    fn seed_hook_trust_preserves_config_and_other_hook_state() {
-        // Build a throwaway synth home with our real hooks.json + a user config.
+    fn scratch_home(tag: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let home = std::env::temp_dir().join(format!(
-            "captain-miao-seed-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .elapsed()
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
+            "captain-miao-codex-profile-{}-{tag}-{nonce}",
+            std::process::id()
         ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("hooks.json"), build_hooks_settings("/run/x.sock")).unwrap();
-        let stale_key = format!("{}:removed_event:0:0", home.join("hooks.json").display());
-        std::fs::write(
-            home.join("config.toml"),
-            format!(
-                "model = \"gpt-5.5\"\n\n\
-                 [projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n\n\
-                 [hooks.state.\"/tmp/x/.codex/hooks.json:stop:0:0\"]\n\
-                 trusted_hash = \"sha256:user-hook\"\n\n\
-                 [hooks.state.\"{stale_key}\"]\n\
-                 trusted_hash = \"sha256:stale-captain-miao-hook\"\n"
-            ),
-        )
-        .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        home
+    }
 
-        seed_hook_trust(&home);
-
-        let written = std::fs::read_to_string(home.join("config.toml")).unwrap();
-        let doc: toml::Table = written.parse().unwrap();
-        // User settings survive the rewrite.
-        assert_eq!(doc.get("model").and_then(|v| v.as_str()), Some("gpt-5.5"));
-        assert!(doc.get("projects").is_some(), "project trust preserved");
-        // One trust entry per emitted hook plus the user's project hook. A
-        // stale entry for our own hooks file is retired without touching it.
-        let state = doc["hooks"]["state"].as_table().unwrap();
-        assert_eq!(state.len(), 9);
+    #[test]
+    fn codex_home_resolves_overrides_without_global_env_mutation() {
+        let cwd = PathBuf::from("/work");
         assert_eq!(
-            state["/tmp/x/.codex/hooks.json:stop:0:0"]["trusted_hash"].as_str(),
-            Some("sha256:user-hook")
+            resolve_codex_home(
+                Some(PathBuf::from("relative-home")),
+                Some(PathBuf::from("/users/me")),
+                Some(cwd)
+            ),
+            Some(PathBuf::from("/work/relative-home"))
         );
-        assert!(!state.contains_key(&stale_key));
-        let hooks_path = home.join("hooks.json");
-        let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
+        assert_eq!(
+            resolve_codex_home(
+                Some(PathBuf::from("/custom/codex")),
+                Some(PathBuf::from("/users/me")),
+                None
+            ),
+            Some(PathBuf::from("/custom/codex"))
+        );
+        assert_eq!(
+            resolve_codex_home(Some(PathBuf::new()), Some(PathBuf::from("/users/me")), None),
+            Some(PathBuf::from("/users/me/.codex"))
+        );
+    }
+
+    #[test]
+    fn profile_contains_only_inline_hooks_and_own_trust() {
+        let path = PathBuf::from("/users/me/.codex/captain-miao.config.toml");
+        let profile = build_profile(&path, &build_hooks_settings("/run/x.sock")).unwrap();
+        assert!(profile.starts_with(PROFILE_MARKER));
+        let doc: toml::Table = profile.parse().unwrap();
+        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+
+        let state = doc["hooks"]["state"].as_table().unwrap();
+        assert_eq!(state.len(), 8);
+        let key = format!("{}:pre_tool_use:0:0", path.display());
         let hash = state[&key]["trusted_hash"].as_str().unwrap();
         assert!(hash.starts_with("sha256:") && hash.len() == 71);
+        assert!(doc.get("features").is_none());
+        assert!(doc.get("model").is_none());
+        assert!(doc.get("projects").is_none());
+    }
 
-        let _ = std::fs::remove_dir_all(&home);
+    #[test]
+    fn profile_write_is_private_owned_and_idempotent() {
+        let home = scratch_home("write");
+        let hooks = build_hooks_settings("/run/x.sock");
+        let path = ensure_profile_at(&home, &hooks).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_profile_at(&home, &hooks).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            first_mtime
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn profile_write_refuses_an_unowned_collision() {
+        let home = scratch_home("collision");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join(PROFILE_FILE);
+        std::fs::write(&path, "model = \"user-choice\"\n").unwrap();
+
+        let err = ensure_profile_at(&home, &build_hooks_settings("/run/x.sock")).unwrap_err();
+        assert!(format!("{err:#}").contains("is not owned by captain-miao"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"user-choice\"\n"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn user_profile_args_are_reserved() {
+        for args in [
+            vec!["--profile".to_string(), "review".to_string()],
+            vec!["--profile=review".to_string()],
+            vec!["-p".to_string(), "review".to_string()],
+            vec!["-preview".to_string()],
+        ] {
+            assert!(reject_profile_arg(&args).is_err(), "accepted {args:?}");
+        }
+        assert!(reject_profile_arg(&["resume".to_string(), "thread-id".to_string()]).is_ok());
+        assert!(
+            reject_profile_arg(&["--".to_string(), "--profile".to_string()]).is_ok(),
+            "a literal prompt after -- is not a profile selector"
+        );
+        assert_eq!(
+            managed_launch_args(&["resume".to_string(), "thread-id".to_string()]).unwrap(),
+            [
+                "--profile",
+                "captain-miao",
+                "--enable",
+                "hooks",
+                "resume",
+                "thread-id"
+            ]
+        );
     }
 
     #[test]
     fn codex_event_label_covers_emitted_hooks() {
         // Every event build_hooks_settings writes must map to a Codex label, or
-        // seed_hook_trust would skip it and that hook would prompt.
+        // build_profile would fail instead of producing a half-trusted profile.
         let json = build_hooks_settings("/run/x.sock");
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         for key in val["hooks"].as_object().unwrap().keys() {

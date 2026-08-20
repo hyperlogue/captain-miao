@@ -15,7 +15,7 @@
 //! there are more of them here than in any other backend, and three of them are
 //! why this module ships deliberately smaller than the agent can support.
 //!
-//! **Isolation is `GROK_HOME`, the Codex pattern with one extra wrinkle.**
+//! **Isolation is `GROK_HOME`, and it has one extra wrinkle.**
 //! `17-sessions.md`: *"Set `GROK_HOME` to override the base directory; when it
 //! is unset, Grok uses `~/.grok`"* — and it moves everything, not just config:
 //! sessions, auth, memory, skills, plugins, agents and logs. So the synthetic
@@ -23,16 +23,16 @@
 //! exactly two things:
 //!
 //! - **`hooks/captain-miao.json`.** `hooks/` is a *directory* of independent
-//!   files, so unlike Codex's single `hooks.json` there is no merge to get
-//!   right — but there is a nested mirror to get right, which is why
+//!   files, so unlike an agent with one global `hooks.json` there is no merge
+//!   to get right — but there is a nested mirror to get right, which is why
 //!   [`ensure_synth_home`] builds a second [`SynthHome`] *inside* the first. Own
 //!   the directory without it and the user's own global hooks stop firing in
 //!   every captain-miao session; leave the directory to the outer mirror and our
 //!   file would be written **through a symlink into the user's real `~/.grok`**,
 //!   which is the one thing a synthetic home exists to prevent.
-//! - **`config.toml`, a writable copy** rather than a symlink — Codex's
-//!   hard-won rule, and the *only* reason it is needed here is the approval hook
-//!   below. Drop approval state and `hooks/` alone would do.
+//! - **`config.toml`, a writable copy** rather than a symlink. The *only* reason
+//!   it is needed here is the approval hook below. Drop approval state and
+//!   `hooks/` alone would do.
 //!
 //! Everything else is a symlink, and that is the invariant rather than an
 //! enumeration: **`auth.json` in particular must be linked, never copied** — it
@@ -43,8 +43,8 @@
 //! `~/.grok/hooks/*.json` and config-file hooks are *always* trusted; only
 //! `<project>/.grok/hooks/` needs `/hooks-trust`. We inject at the global tier,
 //! so no prompt can fire and there is no hash to precompute — strictly simpler
-//! than Codex, whose `seed_hook_trust` exists because it has no always-trusted
-//! tier.
+//! than Codex, which pre-trusts its command hooks inside captain-miao's owned
+//! profile because it has no always-trusted user tier.
 //!
 //! **Approval arrives over a second, unrelated hook system.** Grok's lifecycle
 //! hooks have no approval event at all (the closest, `PermissionDenied`, fires
@@ -407,10 +407,11 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
 
 /// Merge our approval hook into the synthetic home's `config.toml`.
 ///
-/// Best-effort throughout, like Codex's trust seeding: a garbled or unreadable
-/// config leaves the file alone, which costs the `WaitingForApproval` state and
-/// nothing else. Re-run every launch (and idempotent) so it survives the
-/// [`CopiedEntry`] reseed that follows any edit to the user's real config.
+/// Best-effort throughout, like Codex's profile trust generation: a garbled or
+/// unreadable config leaves the file alone, which costs the
+/// `WaitingForApproval` state and nothing else. Re-run every launch (and
+/// idempotent) so it survives the [`CopiedEntry`] reseed that follows any edit
+/// to the user's real config.
 fn register_notification_hook(home: &Path) {
     let path = home.join("config.toml");
     // A missing file is not a failure: the user may have no config at all, and a

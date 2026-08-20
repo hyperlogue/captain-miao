@@ -555,7 +555,7 @@ impl AgentControl {
     pub fn watch_paths(self) -> Vec<PathBuf> {
         match self {
             AgentControl::Claude => claude::watch_paths(),
-            AgentControl::Codex => codex::watch_paths(),
+            AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
             // Nothing: the dashboard derives no Reasonix fact from disk — no
             // session-name manifest, no title store, no transcript read — so
             // there is no file whose change could make a row stale.
@@ -616,9 +616,8 @@ impl AgentControl {
             // stats via the transcript, both folded onto the state file by the
             // launcher — which is a `sessions/` write the host already watches.
             AgentControl::Claude => vec![],
-            // `state_5.sqlite`'s WAL. A `/rename` (or Codex's own auto-title)
-            // lands there alone — no hook, no rollout line, no state-file write —
-            // and is read back by the per-host title overlay, so this wake is the
+            // `state_5.sqlite`'s WAL. A `/rename` or auto-title lands there alone
+            // — no hook, rollout line, or state-file write — so this wake is the
             // only thing that gets a rename onto the wire.
             AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
             // Nothing, and for a stronger reason than Claude's: every fact a
@@ -818,8 +817,8 @@ impl AgentControl {
 
     /// Build the subprocess command that runs this agent in `cwd` with hook
     /// callbacks pointing at `sock_path`. The launcher writes any per-session
-    /// config files (Claude's `--settings` payload, Codex's synth `$CODEX_HOME`,
-    /// etc.) before spawning.
+    /// config files (Claude's `--settings` payload, Codex's owned profile, etc.)
+    /// before spawning.
     ///
     /// `shim_dir` is the clipboard shim farm to prepend to the agent's `PATH`, and
     /// it is `Some` only for a pooled session — see

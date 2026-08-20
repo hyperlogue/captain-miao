@@ -10,7 +10,7 @@ use crate::terminal::{TabId, WindowId};
 
 /// State files carry the user's own prompt text (`first_prompt`/`last_prompt`),
 /// working directories, and session ids, so they are owner-only — matching the
-/// launcher's 0700 socket dir and the synthetic `$CODEX_HOME`. Without this they
+/// launcher's 0700 socket dir and private agent config files. Without this they
 /// inherit the umask (0755/0644 under the common 022), leaving every prompt
 /// readable by any other local user on a shared machine.
 const OWNER_ONLY_DIR: u32 = 0o700;

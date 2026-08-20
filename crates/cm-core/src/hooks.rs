@@ -8,8 +8,8 @@ use crate::state::HookEvent;
 /// Parse hook payload from stdin and forward to the launcher socket. `agent`
 /// selects which backend's stdin parser to run (passed via `--agent`). The
 /// socket comes from `--sock` when given, else `$CAPTAIN_MIAO_SOCK` — Codex
-/// hooks rely on the env form so their `hooks.json` carries no per-session data
-/// and Codex's trust prompt fires at most once.
+/// hooks rely on the env form so their owned profile carries no per-session
+/// data and its trust hashes stay stable.
 pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&str>) -> Result<()> {
     let event = HookEvent::from_kebab(event)
         .ok_or_else(|| anyhow::anyhow!("Unknown hook event: {event}"))?;

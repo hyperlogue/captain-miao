@@ -5,8 +5,8 @@
 //!
 //! Agents whose hooks can't be injected per-invocation discover them from a file
 //! in their home directory, so the only way to hook them is to hand them a
-//! different home. Codex is the first backend that needs this; every comment
-//! below is a lesson paid for there, and a later backend gets it for free.
+//! different home. Several backends share this machinery; every comment below
+//! is a lesson paid for by one of them and inherited by the rest.
 //!
 //! The synthetic home holds **nothing of its own** but the owned files, the
 //! copies, and any `.shadow-*` quarantine a past launch set aside — everything
@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 ///
 /// It must not be a symlink: the real file is frequently read-only (e.g. a
 /// nix-store / home-manager symlink), and an agent that persists state into its
-/// own home — Codex writes hook trust into `$CODEX_HOME/config.toml` — fails on a
-/// write to a read-only target ("config/batchWrite failed while updating hook
-/// trust"). Copying lets that write land.
+/// own home — or whose captain-miao integration has to merge an owned hook into
+/// that config — fails on a write to a read-only target. Copying lets that write
+/// land without mutating the user's managed source.
 pub(super) struct CopiedEntry {
     /// File name, the same in both homes.
     pub name: &'static str,
@@ -49,9 +49,8 @@ pub(super) struct CopiedEntry {
 }
 
 /// Where a synthetic home lives, what it mirrors, and which entries we don't
-/// mirror. Keep `dir` a stable path with stable contents: an agent that gates on
-/// a content hash (Codex's hook-trust prompt) then asks at most once per machine
-/// rather than once per launch.
+/// mirror. Keep `dir` a stable path with stable contents so agents and their
+/// file watchers never observe a new config identity on every launch.
 pub(super) struct SynthHome<'a> {
     /// The synthetic home itself — what gets handed to the agent.
     pub dir: PathBuf,

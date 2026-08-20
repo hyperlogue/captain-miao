@@ -81,7 +81,7 @@ enum Commands {
         event: String,
 
         /// Launcher socket path. Falls back to $CAPTAIN_MIAO_SOCK when omitted
-        /// (Codex hooks read it from the environment to keep hooks.json stable).
+        /// (Codex hooks read it from the environment to keep its profile stable).
         #[arg(long)]
         sock: Option<String>,
 

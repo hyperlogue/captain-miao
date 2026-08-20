@@ -16,10 +16,10 @@
 //!
 //! `pi -e <path.ts>` loads an extension from an arbitrary path for that run
 //! (`usage.md`: *"`-e, --extension <source>` — Load an extension from path, npm,
-//! or git; repeatable"*). That is Claude's `--settings` shape, not Codex's
-//! `CODEX_HOME` one: per-run, torn down with the process, nothing of the user's
-//! touched. **Pi needs no [`super::synth_home::SynthHome`] at all** — the only
-//! backend of the five that doesn't.
+//! or git; repeatable"*). That is Claude's `--settings` shape, not a home
+//! override or persistent profile: per-run, torn down with the process, nothing
+//! of the user's touched. **Pi needs no [`super::synth_home::SynthHome`] at
+//! all** — the only backend of the five that doesn't.
 //!
 //! Trust is not in the way either, which is the fact that makes the flag usable
 //! rather than merely available. `project_trust` fires *before* project-local
@@ -27,8 +27,8 @@
 //! extensions and CLI `-e` extensions participate; project-local extensions are
 //! not loaded until after trust is resolved."* A `-e` extension is trusted by
 //! virtue of being on the command line, so there is **no seeding step** — no
-//! `seed_hook_trust`, no content hash to keep stable for its sake, none of what
-//! Codex pays for.
+//! trust-state builder, no content hash to keep stable for its sake, none of
+//! what Codex pays for.
 //!
 //! # The file is generated TypeScript, and it is contained on purpose
 //!

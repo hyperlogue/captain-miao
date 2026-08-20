@@ -81,10 +81,11 @@
 //! ([`super::synth_home`]), three levels deep: `$HOME` owns `.gemini`, which
 //! owns `config`, which owns `hooks.json`.
 //!
-//! That is one level wider than Codex's `$CODEX_HOME` and the extra width is
-//! the cost worth knowing: **every tool the agent runs inherits the synthetic
-//! `$HOME` too.** Everything in it resolves through a symlink to the real
-//! home, so reads and writes to existing paths land where they always did; a
+//! That is one level wider than the agent-directory homes used by the other
+//! synthetic backends, and the extra width is the cost worth knowing: **every
+//! tool the agent runs inherits the synthetic `$HOME` too.** Everything in it
+//! resolves through a symlink to the real home, so reads and writes to existing
+//! paths land where they always did; a
 //! brand-new top-level dotfile created inside a session lands in the synthetic
 //! home instead, and the next launch quarantines it as `.shadow-…` with a
 //! warning rather than deleting it.
@@ -318,12 +319,12 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
 /// Put our hook bundle into the user's `hooks.json` under [`HOOK_NAME`],
 /// replacing any previous copy of ours and leaving every other key alone.
 ///
-/// Best-effort in both directions, like Codex's trust seeding and Grok's config
-/// merge: if either side fails to parse as a JSON object we ship ours alone,
-/// because a session with no status is worth less than a session whose unrelated
-/// hooks are missing for one launch. `ours` failing to parse cannot happen —
-/// [`build_hooks_settings`] built it — and yields their file untouched if it
-/// somehow does.
+/// Best-effort in both directions, like Codex's profile generation and Grok's
+/// config merge: if either side fails to parse as a JSON object we ship ours
+/// alone, because a session with no status is worth less than a session whose
+/// unrelated hooks are missing for one launch. `ours` failing to parse cannot
+/// happen — [`build_hooks_settings`] built it — and yields their file untouched
+/// if it somehow does.
 fn merge_hooks(theirs: &str, ours: &str) -> String {
     let Ok(ours_val) = serde_json::from_str::<serde_json::Value>(ours) else {
         return theirs.to_string();
