@@ -17,9 +17,11 @@ Picture a normal afternoon. Six agent sessions open: four still thinking, one th
 
 **captain-miao is a TUI dashboard for every coding agent you have running**, Claude Code, Codex and others. Each session gets a row that says what it's doing right now.
 
-- **Stop tab-hunting.** Every session in one table: status, working directory, model, context usage, git branch, and a live transcript preview.
-- **Never leave an agent waiting.** Sessions blocked on an approval or a question are flagged, and `s` jumps to the next one.
-- **Drive the whole fleet from one place.** Launch, resume, fork and kill sessions from the dashboard, on this machine or on a remote server.
+- **Show key information about your session in a compact format** Every session in one table: status, working directory, model, context usage, git branch, and a live transcript preview. Sessions that need your attention are highlighted.
+- **Integrate with your existing workflow** Sessions stay in native
+  windows/tabs/panes of the terminal you choose. captain-miao is non-intrusive to
+  your existing workflow.
+- **Support sessions on remote servers.** Manage and view sessions on a remote server in the same way as local sessions. One dashboard to drive the whole fleet.
 
 https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
 
@@ -38,11 +40,12 @@ Kitty, Ghostty, iTerm2, zellij or tmux you already run (every session is a nativ
 or pane, controlled through the terminal's own protocol), so it stays one small,
 focused tool and the rest of your workflow is yours to compose.
 
-- **Sessions on remote servers:** federate several hosts into one dashboard, each running its sessions in its own pty pool ([shpool](https://github.com/shell-pool/shpool)), so a dropped connection or a slept laptop detaches windows without killing the sessions. A host can also borrow this machine's clipboard, so `Ctrl+V` in an agent running there attaches a screenshot you just took locally ([details](#pasting-a-screenshot-into-a-remote-session)).
-- **Support [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex)** today, behind a backend abstraction built to extend to other coding agents. [Reasonix](https://github.com/esengine/DeepSeek-Reasonix), [Kimi Code](https://github.com/MoonshotAI/kimi-code), [Grok Build](https://github.com/xai-org/grok-build), [opencode](https://github.com/anomalyco/opencode), [Pi](https://github.com/earendil-works/pi), [Antigravity](https://antigravity.google/docs/cli/reference) and [omp](https://github.com/can1357/oh-my-pi) ship too, each with [known limits](#per-agent-limits).
+- **Sessions on remote servers:**
+  - Remote sessions run in a pty pool on the server, powered by [shpool](https://github.com/shell-pool/shpool). These sessions keep running when your laptop lid is closed.
+  - An image in the local clipboard can be pasted directly into a remote session through Ctrl-V, the same way as if it was a local session ([details](#pasting-a-screenshot-into-a-remote-session)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
+- **Keep-awake:** prevents your machine from sleeping while any local session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
 - **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
-- **Keep-awake:** prevents your machine from sleeping while any session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
 
 ## Requirements
 
@@ -50,13 +53,13 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 
 ### Terminals
 
-| Terminal                                                    | Notes                                                                                                                                                                       |
-| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Kitty](https://github.com/kovidgoyal/kitty)**            | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                                                     |
-| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary ([Ghostty setup](#ghostty-setup)). Nothing in that API reads a window's screen, so there is **no preview**. |
-| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0      | **macOS only**, driven through iTerm2's AppleScript dictionary ([iTerm2 setup](#iterm2-setup)). Previews are plain text — iTerm2 returns no colour.                         |
-| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44   | Sessions live as full-size floating panes in one `miao:sessions` tab.                                                                                                       |
-| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2              | One window per session.                                                                                                                                                     |
+| Terminal                                                    | Notes                                                                                                                                     |
+| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Kitty](https://github.com/kovidgoyal/kitty)**            | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                   |
+| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary. Nothing in that API reads a window's screen, so there is **no preview**. |
+| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0      | **macOS only**, driven through iTerm2's AppleScript dictionary. Previews are plain text — iTerm2 returns no colour.                       |
+| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44   | The stack layout is simulated by full screen floating windows.                                                                            |
+| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2              | One window per session.                                                                                                                   |
 
 Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Everywhere else it's a `🐾` glyph and clicking it does nothing.
 
@@ -72,7 +75,8 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | **[opencode](https://github.com/anomalyco/opencode)**            | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                          |
 | **[Pi](https://github.com/earendil-works/pi)**                   | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                                |
 | **[Antigravity](https://antigravity.google/docs/cli/reference)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
-| **[omp](https://github.com/can1357/oh-my-pi)**                              | Hooked with a generated extension passed as `omp -e`; nothing of yours is touched. No resume-picker entries and no worktrees ([known limits](#omp-support)).            |
+| **[omp](https://github.com/can1357/oh-my-pi)**                   | Hooked with a generated extension passed as `omp -e`; nothing of yours is touched. No resume-picker entries and no worktrees ([known limits](#omp-support)).                                                                                                           |
+
 > [!NOTE]
 > The Kitty/zellij + Claude Code/Codex have the best level of support and
 > features. Other terminals and agents are either in experimental stage or
@@ -153,40 +157,6 @@ Looser alternatives: `allow_remote_control socket-only` (off the escape-code cha
 
 **Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
 
-## Ghostty setup
-
-**macOS only, Ghostty ≥ 1.3.** captain-miao drives Ghostty through its [AppleScript dictionary](https://ghostty.org/docs/features/applescript), which is enabled by default — there is no config file to edit. The one thing you must do is approve the Automation prompt macOS raises the first time captain-miao talks to Ghostty; if you dismissed it, re-enable it under **System Settings → Privacy & Security → Automation**, in the entry for whatever launched captain-miao. It verifies the channel at startup and exits with a diagnostic naming the fix if it can't get through.
-
-The Linux build of Ghostty exposes no equivalent control channel, so captain-miao does not claim it there — run it under zellij or tmux instead.
-
-Three things work differently here, all of them because the dictionary has no way to express them:
-
-- **No preview.** Nothing in Ghostty's automation API reads a window's screen or scrollback, so the preview pane says so instead of showing output. Everything else on the row — status, context usage, working directory — comes from the agent's own files and is unaffected.
-- **No move-to-tab.** `t` is hidden, as it is on zellij.
-- **New sessions bring Ghostty to the front.** Ghostty activates itself whenever a script creates a window or tab ([ghostty#11457](https://github.com/ghostty-org/ghostty/issues/11457)), with no way to opt out, so a spawn takes focus even when captain-miao asks it not to.
-
-Sessions always get their own tab: Ghostty has neither a stack layout nor floating panes, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
-
-**Ending a session doesn't interrupt you.** Ghostty confirms before closing a surface whose command is still running (`confirm-close-surface`, on by default), and it asks _on that tab_ — so a close arriving while the process was alive switched you away from the dashboard to answer a dialog. `D` and a restart signal the session and let it exit first; a Ghostty surface whose command has exited closes itself, so by then there is nothing left to confirm. The exception is a **pooled** session's attach window: the process in it is a local `ssh` that captain-miao holds no pid for, so closing that one still asks. Set `confirm-close-surface = false` if you would rather never be asked.
-
-**Start sessions from the dashboard here** — `o` for the current directory, `O` to choose one. A hand-typed `miao launch claude .` in a Ghostty window is refused, because Ghostty exports no per-surface id to the process running in it: such a session would appear in the dashboard but could not be focused with `Enter` or closed with `D`, and refusing at the prompt beats discovering that on the row an hour later. A dashboard-started session has no such gap — its window comes from the spawn itself. The refusal is narrow: under tmux or zellij _inside_ Ghostty the pane names itself, so hand launches work there exactly as they always have.
-
-**Only partly confirmed against a live Ghostty.** Spawning and dashboard-window discovery have been driven by hand against Ghostty 1.3.1; the rest of the backend is unit-tested only, because CI can't supply a Mac with a GUI session and a hand-clicked Automation grant. Report anything that looks wrong rather than assuming it's expected.
-
-## iTerm2 setup
-
-**macOS only, iTerm2 ≥ 3.0.** captain-miao drives iTerm2 through its [AppleScript dictionary](https://iterm2.com/documentation-scripting.html), which is on by default — there is nothing to enable. As with Ghostty, approve the Automation prompt macOS raises the first time captain-miao talks to iTerm2; if you dismissed it, re-enable it under **System Settings → Privacy & Security → Automation**, in the entry for whatever launched captain-miao. The channel is verified at startup, with a diagnostic naming the fix if it can't get through.
-
-Unlike Ghostty, iTerm2 tells a process which session it is in, so nothing here is second-class: hand-typed launches bind to their window, `Enter` focuses, `D` closes, and `miao focus` works. Three smaller differences:
-
-- **Previews are plain.** iTerm2 returns a session's visible screen without colour, so the preview shows the right text in the wrong palette. It also has no scrollback in the API, so the preview never reaches back further than the window itself.
-- **No move-to-tab.** `t` is hidden, as it is on zellij and Ghostty.
-- **Sessions always get their own tab**, so `Space l` has nothing to toggle and is hidden, exactly as on tmux.
-
-One iTerm2 bug is worth knowing about: after any window or tab is created with a command that exits immediately, iTerm2 stops answering "create tab" altogether — later spawns hang even when their command is long-lived, until iTerm2 is restarted. captain-miao bounds the wait and says so rather than hanging, and the sessions it starts hold themselves open on failure, so this is hard to reach in normal use.
-
-**Only partly confirmed against a live iTerm2.** Spawn, snapshot, focus, capture and close have each been driven by hand against iTerm2 3.6.11; a full session lifecycle (resume, restart, kill, detach) has not, and CI can't drive one. Report anything that looks wrong rather than assuming it's expected.
-
 ## Usage
 
 Run the dashboard inside a supported terminal (Kitty, Ghostty, iTerm2, zellij or tmux):
@@ -197,12 +167,12 @@ miao
 
 From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
 
-| Command                             | What it does                                                                                                                                                                                                                                                                               |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `miao`                              | Run the TUI dashboard (the default).                                                                                                                                                                                                                                                       |
+| Command                             | What it does                                                                                                                                                                                                                                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `miao`                              | Run the TUI dashboard (the default).                                                                                                                                                                                                                                                              |
 | `miao launch <agent> [dir] [args…]` | Launch `<agent>` in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to the agent. `<agent>` is one of `claude`, `codex`, `reasonix`, `kimi`, `grok`, `opencode`, `pi`, `antigravity`, `omp` — see [per-agent limits](#per-agent-limits). |
-| `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                |
-| `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                          |
+| `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                       |
+| `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                                 |
 
 Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Hooks are injected per-session and torn down on exit; nothing is written to your global `~/.claude/settings.json`. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
 
