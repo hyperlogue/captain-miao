@@ -11,7 +11,7 @@ use crate::agent::{
 };
 use crate::cli::ClipboardShims;
 use crate::learned;
-use crate::state::{self, HookMessage, HostId, LauncherState, SessionStatus};
+use crate::state::{self, HookEvent, HookMessage, HostId, LauncherState, SessionStatus};
 
 /// Run an agent under captain-miao supervision. The launcher is single-backend
 /// per process: it picks `agent` once, threads it through every hook dispatch
@@ -464,12 +464,25 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     // None on a path change so a resumed session's new transcript is folded from
     // the top.
     let mut transcript_data: Option<TranscriptStats> = None;
-    // Whether the session is under a standing instruction to keep starting its
-    // own turns (Codex's `/goal`), latched from the transcript scan. Read only
-    // by the poll-backed watch's lifecycle gate at the bottom of the loop,
-    // whose whole premise — an idle session's transcript doesn't move until a
-    // hook wakes us — is exactly what such a session breaks.
-    let mut self_continuing = false;
+    // Whether the last Stop was held off a rest state because the session
+    // re-drives itself (`AgentControl::self_continues` — a Codex goal). The
+    // hold is a bet that another turn is already starting, and this is the
+    // outstanding-bet flag: the turn's own `task_started` settles it, and
+    // `confirm_hold_at` is what settles it when that turn never comes.
+    let mut held_for_goal = false;
+    // How long a held Stop goes unconfirmed. Long enough that the continuation
+    // it is waiting for (Codex opens the next turn ~10ms after the Stop hook)
+    // has landed many times over, short enough that a goal which ended instead
+    // doesn't leave a finished session reading Active while the user looks at
+    // it.
+    const CONFIRM_HELD_STOP_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+    // When to confirm that hold, once. Codex decides whether to continue
+    // *after* it runs the stop hooks, so the answer we held on can already be
+    // stale by the time it lands — and if it turned out to be "no", nothing
+    // further is coming: no turn, no hook, no transcript byte. This deadline is
+    // that one missing edge, not a cadence — it is armed by a hold, disarmed by
+    // the turn that vindicates it, and never re-arms itself.
+    let mut confirm_hold_at: Option<tokio::time::Instant> = None;
     // Also watch the agent's own session-status file (Claude:
     // `~/.claude/sessions/<pid>.json`). Its `status` reads `"shell"` exactly when
     // the turn has ended but a `run_in_background` shell is still running, and a
@@ -628,14 +641,9 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                             transcript_path = Some(path.clone());
                             // Seed the offset to the new transcript's end so
                             // historical interrupt/compact signals from a
-                            // resumed session aren't replayed as fresh. The
-                            // standing-instruction latch is the exception, and
-                            // not an inconsistent one: it is current *state*
-                            // rather than an event to replay, and a resumed
-                            // session's goal is still driving it.
+                            // resumed session aren't replayed as fresh.
                             let scan = agent.scan_transcript_signals(&path, 0);
                             transcript_offset = scan.new_offset;
-                            self_continuing = scan.self_continuing.unwrap_or(false);
                             // Fold the derived fields from the top so a
                             // resumed/idle session shows context, model,
                             // title, and first prompt before its next write.
@@ -669,7 +677,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         path,
                         &mut transcript_offset,
                         &mut transcript_data,
-                        &mut self_continuing,
+                        &mut held_for_goal,
                         state,
                     )
                     .await;
@@ -685,6 +693,15 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                     dispatched_event,
                     state.status,
                 );
+                // A Stop that did *not* land on a rest state is a session
+                // that re-drives itself (only `codex::dispatch_hook` does
+                // this, and only under a goal). Note it, and arm the one
+                // confirmation the bet needs — see `confirm_hold_at`.
+                if dispatched_event == HookEvent::Stop {
+                    held_for_goal = state.status.is_busy();
+                    confirm_hold_at = held_for_goal
+                        .then(|| tokio::time::Instant::now() + CONFIRM_HELD_STOP_AFTER);
+                }
                 // Track when we first enter WaitingForApproval so we can
                 // ignore same-turn transcript noise.
                 if state.status == SessionStatus::WaitingForApproval && !was_approval {
@@ -713,7 +730,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         path,
                         &mut transcript_offset,
                         &mut transcript_data,
-                        &mut self_continuing,
+                        &mut held_for_goal,
                         state,
                     )
                     .await
@@ -738,6 +755,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             // Debounced-write deadline. Wakes the loop with no event so the flush
             // block below can persist a pending change once the burst has settled.
             _ = sleep_until_opt(flush_at) => {}
+            // Held-Stop confirmation deadline. The block below re-asks the
+            // agent whether the turn it promised is still coming; nothing else
+            // would ever wake a row holding Active on a promise that lapsed.
+            _ = sleep_until_opt(confirm_hold_at) => {}
             // Learn-long-running deadline. A parked session with an unrecognized
             // background command otherwise never wakes; this fires when the
             // oldest such command crosses the threshold so the classification
@@ -887,6 +908,28 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             learn_at = None;
         }
 
+        // Settle a held Stop, exactly once. Either the agent still means to
+        // re-drive the session — in which case the row is right where it should
+        // be and the bookkeeping is spent, the next Stop arming its own
+        // confirmation — or the objective ended with that turn and this is the
+        // only chance to park the row.
+        if held_for_goal && confirm_hold_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            confirm_hold_at = None;
+            held_for_goal = false;
+            let still_driving = state
+                .session_id
+                .as_deref()
+                .is_some_and(|id| agent.self_continues(id));
+            if !still_driving && state.status == SessionStatus::Active {
+                state.status = SessionStatus::Idle;
+                state.last_tool = None;
+                state_changed = true;
+            }
+        }
+        if !held_for_goal {
+            confirm_hold_at = None;
+        }
+
         let is_active = state.status.is_busy();
         if is_active && !was_active {
             state.active_since = Some(LauncherState::now());
@@ -918,18 +961,17 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         }
         // Lifecycle of the poll-backed transcript watch (Codex on macOS — see
         // `AgentControl::transcript_poll_interval`): it runs only while the
-        // session is off Idle *and* is not self-continuing. An idle session's
-        // rollout normally doesn't change without a hook firing first
-        // (`UserPromptSubmit` wakes this loop and the next pass lands here with
-        // the status already Active), so parking the watcher at Idle makes an
-        // at-rest session cost nothing — no 2s stat cadence while a session
-        // sits parked for hours. A session under a goal is the one thing that
-        // breaks that premise: it opens its own next turn with no hook at all,
-        // and parking the only watch that could see it would leave the row Idle
-        // for the rest of the goal. It pays the stat cadence for as long as the
-        // goal lasts, and no other session pays anything. Idle is deliberately
-        // the *only* at-rest status here: WaitingForApproval/WaitingForDecision
-        // need the rollout wake (approval-granted fast path; an Esc there writes
+        // session is off Idle. An idle session's rollout doesn't change without
+        // a hook firing first (`UserPromptSubmit` wakes this loop and the next
+        // pass lands here with the status already Active), so parking the
+        // watcher at Idle makes an at-rest session cost nothing — no 2s stat
+        // cadence while a session sits parked for hours. A session that
+        // re-drives itself does not weaken that premise, because it never
+        // reaches Idle to be parked at: its Stop is held Active by
+        // `AgentControl::self_continues` precisely so no watch has to stay
+        // awake waiting for the turn it starts next. Idle is deliberately the
+        // *only* at-rest state: WaitingForApproval/WaitingForDecision need the
+        // rollout wake (approval-granted fast path; an Esc there writes
         // `turn_aborted` with no hook), and a Compacted row can still take that
         // same hookless Esc. Dropping the watcher on the way to rest fires one
         // synthetic fs wake so the next iteration folds whatever the last tick
@@ -944,7 +986,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         // reads nothing; it exists for that racing-write window and for any
         // future off-Idle path that doesn't come through a hook.)
         if let Some(interval) = agent.transcript_poll_interval() {
-            let engaged = state.status != SessionStatus::Idle || self_continuing;
+            let engaged = state.status != SessionStatus::Idle;
             if engaged && transcript_watcher.is_none() {
                 if let Some(path) = &transcript_path {
                     transcript_watcher = Some(TranscriptWatch::Poll(start_stat_poll(
@@ -1047,7 +1089,7 @@ async fn rescan_transcript(
     path: &Path,
     offset: &mut u64,
     data: &mut Option<TranscriptStats>,
-    self_continuing: &mut bool,
+    held_for_goal: &mut bool,
     state: &mut LauncherState,
 ) -> bool {
     let scan_path = path.to_path_buf();
@@ -1069,9 +1111,6 @@ async fn rescan_transcript(
         )
     });
     *offset = scan.new_offset;
-    if let Some(latched) = scan.self_continuing {
-        *self_continuing = latched;
-    }
     if scan.interrupted {
         // Some agents (Claude) fire no hook on Esc/interrupt — without this,
         // the session stays Active forever. (Codex writes `turn_aborted`.)
@@ -1086,13 +1125,18 @@ async fn rescan_transcript(
         state.last_tool = None;
     }
     // …and last, because the same delta that closed a turn can open the next
-    // one: the agent started a turn nothing will fire a hook for (a Codex goal
-    // continuation). Only the two at-rest states promote — `Waiting*` is the
-    // user's own turn to act and outranks a transcript read, and every busy
-    // state already says what this would.
-    if scan.turn_started && matches!(state.status, SessionStatus::Idle | SessionStatus::Compacted) {
-        state.status = SessionStatus::Active;
-        state.last_tool = None;
+    // one: the agent started a turn nothing will fire a hook for.
+    if scan.turn_started {
+        // The turn a held Stop was betting on has arrived — the bet is settled
+        // and needs no confirming.
+        *held_for_goal = false;
+        // Only the two at-rest states promote: `Waiting*` is the user's own
+        // turn to act and outranks a transcript read, and every busy state
+        // already says what this would.
+        if matches!(state.status, SessionStatus::Idle | SessionStatus::Compacted) {
+            state.status = SessionStatus::Active;
+            state.last_tool = None;
+        }
     }
     let changed = apply_transcript_data(state, &fresh);
     *data = Some(fresh);
@@ -1593,14 +1637,14 @@ mod tests {
             let mut state = state_with(SessionStatus::Active);
             let mut offset = 0u64;
             let mut data: Option<TranscriptStats> = None;
-            let mut self_continuing = false;
+            let mut held_for_goal = false;
 
             rescan_transcript(
                 AgentControl::Codex,
                 &path,
                 &mut offset,
                 &mut data,
-                &mut self_continuing,
+                &mut held_for_goal,
                 &mut state,
             )
             .await;
@@ -1620,7 +1664,7 @@ mod tests {
                 &path,
                 &mut offset,
                 &mut data,
-                &mut self_continuing,
+                &mut held_for_goal,
                 &mut state,
             )
             .await;
@@ -1634,20 +1678,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The hookless turn start, end to end through the launcher: a Codex goal
-    /// re-opens the turn the Stop hook just parked, and the row has to leave
-    /// Idle on the transcript alone — no hook is coming. A row waiting on the
-    /// *user* is the one thing that outranks the read.
+    /// The hookless turn start, end to end through the launcher: a turn opened
+    /// that no hook will announce, so the row has to leave a rest state on the
+    /// transcript alone. A row waiting on the *user* is the one thing that
+    /// outranks the read.
     #[test]
     fn rescan_promotes_a_hookless_turn_but_never_over_a_waiting_row() {
-        let base = std::env::temp_dir().join(format!("cm-rescan-goal-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cm-rescan-open-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let path = base.join("rollout.jsonl");
         std::fs::write(
             &path,
             concat!(
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",",
-                "\"goal\":{\"objective\":\"keep going\",\"status\":\"active\"}}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
             ),
@@ -1669,23 +1711,67 @@ mod tests {
                 let mut state = state_with(before.clone());
                 let mut offset = 0u64;
                 let mut data: Option<TranscriptStats> = None;
-                let mut self_continuing = false;
+                let mut held_for_goal = false;
                 rescan_transcript(
                     AgentControl::Codex,
                     &path,
                     &mut offset,
                     &mut data,
-                    &mut self_continuing,
+                    &mut held_for_goal,
                     &mut state,
                 )
                 .await;
                 assert_eq!(state.status, after, "{before:?} settled wrong");
-                // The goal is what keeps the poll-backed watch off its park.
-                assert!(self_continuing, "an active goal latches");
             }
         });
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The turn a held Stop was waiting for arrives: the bet is settled, so the
+    /// hold is spent and nothing needs confirming.
+    #[test]
+    fn a_hookless_turn_settles_the_hold_that_predicted_it() {
+        let base = std::env::temp_dir().join(format!("cm-rescan-held-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut state = state_with(SessionStatus::Active);
+            let mut offset = 0u64;
+            let mut data: Option<TranscriptStats> = None;
+            let mut held_for_goal = true;
+            rescan_transcript(
+                AgentControl::Codex,
+                &path,
+                &mut offset,
+                &mut data,
+                &mut held_for_goal,
+                &mut state,
+            )
+            .await;
+            assert!(!held_for_goal, "the promised turn started");
+            assert_eq!(state.status, SessionStatus::Active);
+        });
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A session with no goal anywhere is not one that re-drives itself, so its
+    /// Stop is rest — the hold only ever exists for a backend whose store says
+    /// otherwise.
+    #[test]
+    fn a_session_without_a_goal_never_self_continues() {
+        assert!(!AgentControl::Codex.self_continues("no-goal-was-ever-set-for-this-id"));
+        assert!(!AgentControl::Claude.self_continues("no-goal-was-ever-set-for-this-id"));
     }
 
     fn state_with(status: SessionStatus) -> LauncherState {

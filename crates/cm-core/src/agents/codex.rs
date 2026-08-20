@@ -287,6 +287,77 @@ fn query_thread_title(conn: &Connection, session_id: &str) -> Option<String> {
 }
 
 // =============================================================================
+// Goal store (threads that re-drive themselves)
+// =============================================================================
+
+/// Whether this thread will open its **own** next turn once the current one
+/// ends — i.e. whether its `Stop` hook is a turn boundary rather than rest.
+///
+/// Codex's `/goal` puts a standing objective on a thread and re-drives it after
+/// every turn: `task_complete`, then a `<codex_internal_context source="goal">`
+/// user message and `task_started` ~10ms later. **No hook announces that
+/// turn** — Codex's hook set has no turn-start event at all (its app-server
+/// schema enumerates the eleven it does have: the tool pair, the compact pair,
+/// permission, session start/end, subagent start/stop, prompt submit and stop)
+/// — so a row the Stop hook parked at Idle sits there, mid-work, until the new
+/// turn happens to call a tool. Asking the store at the moment the launcher
+/// would park the row is what keeps it off Idle without anything having to
+/// watch a file at rest (the launcher confirms the hold once, since Codex
+/// decides whether to continue *after* it runs the stop hooks — see
+/// `launcher`'s `confirm_hold_at`).
+///
+/// The store is Codex's own `goals_1.sqlite`, read the way the title store is:
+/// read-only, and resolved through [`read_path`] because a goals db is exactly
+/// the agent-minted file the real home may never grow. A thread re-drives
+/// itself when its goal is `active` **and** its continuation isn't deferred —
+/// Codex's other statuses (`paused`, `blocked`, `usage_limited`,
+/// `budget_limited`, `complete`) all mean the next move is the user's.
+///
+/// Answers `false` to everything it cannot read: no store, no row, a table
+/// renamed under a later `goals_N`. That is exactly the pre-goal behaviour —
+/// the row parks at Idle and the rollout's own `task_started` promotes it back
+/// a beat later ([`scan_transcript_signals`]) — so drift here costs latency,
+/// never a wrong answer that sticks.
+pub fn thread_self_continues(session_id: &str) -> bool {
+    let Some(db) = goals_db_path() else {
+        return false;
+    };
+    // Read-only, matching `read_thread_titles`: the live WAL db is Codex's to
+    // write. Deliberately *not* `immutable`, which would skip the -wal and read
+    // a goal set minutes ago as absent.
+    let Ok(conn) = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    query_thread_self_continues(&conn, session_id)
+}
+
+fn goals_db_path() -> Option<PathBuf> {
+    read_path("goals_1.sqlite")
+}
+
+/// The lookup against an open connection, split from the IO so it is testable
+/// against an in-memory db. The id is a bound parameter, so it can never alter
+/// the query whatever it contains.
+fn query_thread_self_continues(conn: &Connection, session_id: &str) -> bool {
+    conn.query_row(SELF_CONTINUES_SQL, [session_id], |_| Ok(()))
+        .optional()
+        .unwrap_or(None)
+        .is_some()
+}
+
+/// A row comes back only for a thread that will re-drive itself: the goal is
+/// `active` and no continuation deferral is parked against it (Codex records
+/// "not this turn" as a row in the second table rather than as a status).
+const SELF_CONTINUES_SQL: &str = "SELECT 1 FROM thread_goals g \
+     LEFT JOIN thread_goal_continuation_deferrals d ON d.thread_id = g.thread_id \
+     WHERE g.thread_id = ?1 AND g.status = 'active' AND d.thread_id IS NULL LIMIT 1";
+
+// =============================================================================
 // Rollout reading
 // =============================================================================
 
@@ -853,6 +924,22 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             state.status = SessionStatus::WaitingForDecision;
             state.last_tool = msg.tool_name;
         }
+        // A thread under a goal re-drives itself, so this Stop is a turn
+        // boundary and not rest: Codex opens the next turn ~10ms later and
+        // fires no hook for it (see [`thread_self_continues`]). Holding the row
+        // Active is the whole fix for a goal run reading Idle between turns —
+        // and it holds *nothing* open, since the store answers `false` the
+        // moment the objective is met, paused or deferred. `last_tool` still
+        // clears: the turn's tools really are done.
+        HookEvent::Stop
+            if state
+                .session_id
+                .as_deref()
+                .is_some_and(thread_self_continues) =>
+        {
+            state.status = SessionStatus::Active;
+            state.last_tool = None;
+        }
         // Events Codex never emits — no hooks.json entry registers them, so they
         // never reach this dispatcher. Ignored rather than mapped defensively,
         // which is why they're intercepted here instead of falling through to
@@ -876,29 +963,25 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// Codex brackets every turn with typed `event_msg`es — `task_started`,
 /// `task_complete`, `turn_aborted` — and the hooks track only the middle of
 /// that. An **interrupt** (Esc) writes `turn_aborted` and fires no Stop hook,
-/// so without this the row would stay Active forever. A **goal continuation**
-/// is the mirror image: a thread carrying a goal (`/goal`, recorded as
-/// `thread_goal_updated`) starts its own next turn the moment the last one
-/// ends — `task_complete`, then `task_started` ~10ms later, with no
-/// `UserPromptSubmit` in between because no user prompted. The Stop hook has
-/// already parked the row at Idle by then, and nothing un-parks it until the
-/// new turn happens to call a tool, so a session working flat out reads Idle
-/// for seconds at a stretch. `task_started` is Codex's own record that a turn
-/// is running, which is what makes it evidence enough to promote on.
+/// so without this the row would stay Active forever. The other end is the
+/// hookless *start*: a thread under a goal opens its own next turn with
+/// nothing to announce it ([`thread_self_continues`] is what normally keeps
+/// such a row off Idle in the first place; `task_started` is the recovery when
+/// the store couldn't be read, and the general statement of the rule for any
+/// other hookless start). Compaction stays event-driven (PostCompact), so
+/// there is no `compact_aborted` analog.
 ///
-/// The lifecycle markers are read as the **last one wins**, not as independent
-/// flags: one delta routinely carries the end of one turn and the start of the
-/// next, and an interrupt is regularly followed by the resubmit that answers
-/// it. Compaction stays event-driven (PostCompact), so there is no
-/// `compact_aborted` analog.
+/// The start is reported as the **last** marker in the delta, not as any
+/// marker: one delta routinely carries the end of one turn and the start of
+/// the next, and an interrupt is regularly followed by the resubmit that
+/// answers it.
 pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
     let delta = crate::agent::read_transcript_delta(path, offset);
     let mut interrupted = false;
     let mut turn_open = false;
-    let mut self_continuing = None;
     for line in delta.text.lines() {
         // Reject on the cheap substring before parsing: a delta can carry
-        // megabytes of tool output, and these four markers are short and rare.
+        // megabytes of tool output, and these three markers are short and rare.
         // The parse is not belt-and-braces — a rollout line *quoting* a marker
         // (an agent reading its own transcript, or this file) is exactly the
         // shape that would otherwise strand a working session at Idle.
@@ -912,7 +995,6 @@ pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
                 interrupted = true;
                 turn_open = false;
             }
-            Some("thread_goal_updated") => self_continuing = Some(goal_is_active(line)),
             _ => {}
         }
     }
@@ -921,18 +1003,12 @@ pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
         interrupted,
         compact_aborted: false,
         turn_started: turn_open,
-        self_continuing,
     }
 }
 
 /// The rollout markers [`scan_transcript_signals`] cares about, as they appear
 /// in the raw line — the substring prefilter ahead of the parse.
-const MARKERS: [&str; 4] = [
-    "task_started",
-    "task_complete",
-    "turn_aborted",
-    "thread_goal_updated",
-];
+const MARKERS: [&str; 3] = ["task_started", "task_complete", "turn_aborted"];
 
 /// The `payload.type` of one rollout line, if it is an `event_msg` at all.
 fn event_msg_kind(line: &str) -> Option<&'static str> {
@@ -944,25 +1020,6 @@ fn event_msg_kind(line: &str) -> Option<&'static str> {
     // Borrowed back out of the table so the caller can match on `&'static str`
     // rather than juggle the parsed value's lifetime.
     MARKERS.into_iter().find(|m| *m == kind)
-}
-
-/// Whether a `thread_goal_updated` line reports a goal that is still driving
-/// the thread. Codex sends the same event when a goal is completed or cleared
-/// (`status` moves off `active`), which is what lets the launcher stop
-/// treating the session as self-continuing again.
-fn goal_is_active(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|v| {
-            Some(
-                v.get("payload")?
-                    .get("goal")?
-                    .get("status")?
-                    .as_str()?
-                    .to_string(),
-            )
-        })
-        .is_some_and(|status| status == "active")
 }
 
 // =============================================================================
@@ -1155,47 +1212,57 @@ mod tests {
         let path = write_tmp("quoted", &format!("{quoted}\n"));
         let scan = scan_transcript_signals(&path, 0);
         assert!(!scan.interrupted);
-        assert!(!scan.turn_started);
+        assert!(!scan.turn_started, "a quoted marker settles nothing");
         let _ = std::fs::remove_file(path);
     }
 
-    /// The self-continuing latch tracks the goal's own status, and says
-    /// nothing (`None`) when the bytes carry no goal event at all — which is
-    /// what leaves the launcher's latch where it was.
+    /// The goal store is what decides whether a Stop is rest, so it has to read
+    /// Codex's real schema — including the deferral table, which records "not
+    /// this turn" as a row rather than as a status.
     #[test]
-    fn scan_latches_a_goal_while_it_is_active() {
-        let goal = |status: &str| {
-            serde_json::json!({
-                "type": "event_msg",
-                "payload": {
-                    "type": "thread_goal_updated",
-                    "threadId": "01a0-uuid",
-                    "goal": {"objective": "keep going", "status": status},
-                },
-            })
-            .to_string()
-        };
+    fn a_thread_self_continues_only_while_its_goal_drives_it() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE thread_goals (
+                 thread_id TEXT PRIMARY KEY NOT NULL,
+                 goal_id TEXT NOT NULL,
+                 objective TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE thread_goal_continuation_deferrals (
+                 thread_id TEXT PRIMARY KEY NOT NULL
+                     REFERENCES thread_goals(thread_id) ON DELETE CASCADE
+             );
+             INSERT INTO thread_goals VALUES ('driving','g1','keep going','active',0,0);
+             INSERT INTO thread_goals VALUES ('done','g2','finished','complete',0,0);
+             INSERT INTO thread_goals VALUES ('paused','g3','held','paused',0,0);
+             INSERT INTO thread_goals VALUES ('deferred','g4','later','active',0,0);
+             INSERT INTO thread_goal_continuation_deferrals VALUES ('deferred');",
+        )
+        .expect("schema");
 
-        let path = write_tmp("goal-active", &format!("{}\n", goal("active")));
-        assert_eq!(
-            scan_transcript_signals(&path, 0).self_continuing,
-            Some(true)
+        assert!(query_thread_self_continues(&conn, "driving"));
+        assert!(!query_thread_self_continues(&conn, "done"));
+        assert!(!query_thread_self_continues(&conn, "paused"));
+        assert!(
+            !query_thread_self_continues(&conn, "deferred"),
+            "a deferred continuation is not one that is coming"
         );
-        let _ = std::fs::remove_file(path);
+        assert!(
+            !query_thread_self_continues(&conn, "never-had-a-goal"),
+            "the ordinary session: no row, no hold"
+        );
+    }
 
-        let path = write_tmp("goal-done", &format!("{}\n", goal("completed")));
-        assert_eq!(
-            scan_transcript_signals(&path, 0).self_continuing,
-            Some(false)
-        );
-        let _ = std::fs::remove_file(path);
-
-        let path = write_tmp(
-            "goal-silent",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-        );
-        assert_eq!(scan_transcript_signals(&path, 0).self_continuing, None);
-        let _ = std::fs::remove_file(path);
+    /// A store this build doesn't recognise — a later `goals_N` that renamed
+    /// the table — answers `false` rather than erroring, which parks the row
+    /// the way it did before goals existed.
+    #[test]
+    fn an_unrecognised_goal_store_holds_nothing() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        assert!(!query_thread_self_continues(&conn, "driving"));
     }
 
     #[test]
@@ -1204,6 +1271,7 @@ mod tests {
         let path = write_tmp("quiet", body);
         let scan = scan_transcript_signals(&path, 0);
         assert!(!scan.interrupted);
+        assert!(!scan.turn_started);
         let _ = std::fs::remove_file(path);
     }
 

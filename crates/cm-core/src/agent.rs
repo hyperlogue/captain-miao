@@ -952,6 +952,35 @@ impl AgentControl {
         }
     }
 
+    /// Whether a session that has just ended a turn will open its **own** next
+    /// one, with no hook to announce it — so its `Stop` is a turn boundary
+    /// rather than rest, and parking the row at Idle would be wrong.
+    ///
+    /// Asked at the moment the launcher would park a row, which is what keeps
+    /// this event-driven: nothing is watched, nothing is timed, the one backend
+    /// that can answer `true` reads its own store (see
+    /// [`codex::thread_self_continues`]) and every other one answers from the
+    /// shape of its turn model.
+    pub fn self_continues(self, session_id: &str) -> bool {
+        match self {
+            AgentControl::Codex => codex::thread_self_continues(session_id),
+            // Everything else: a turn ends at the user's next move. None of
+            // these backends carries a standing objective that re-drives the
+            // thread after its turn ends, so there is no store to ask and no
+            // hookless turn to miss — a Stop here is rest, full stop. A backend
+            // that grows one lands in this match and has to say so.
+            AgentControl::Claude
+            | AgentControl::Reasonix
+            | AgentControl::Kimi
+            | AgentControl::Grok
+            | AgentControl::OpenCode
+            | AgentControl::Pi
+            | AgentControl::Antigravity
+            | AgentControl::Omp
+            | AgentControl::Unknown => false,
+        }
+    }
+
     /// Scan new bytes of the transcript starting at `offset` for signals the
     /// launcher cares about (interrupt detection). Backends that don't expose
     /// such signals return an empty scan.
@@ -1523,20 +1552,15 @@ pub struct TranscriptScan {
     /// messages to compact"), so without this the launcher would stay in
     /// `Compacting` forever.
     pub compact_aborted: bool,
-    /// True if the new bytes *end* with a turn the agent opened on its own —
-    /// no `UserPromptSubmit`, no tool hook, nothing the hook arm will ever see
-    /// (Codex's goal continuations; see `codex::scan_transcript_signals`).
-    /// The one signal here that **promotes**: the other two settle a turn the
-    /// launcher already believes is running, this one starts one it doesn't
-    /// know about. Ends-with, not contains-any, so a delta that both closes a
-    /// turn and opens the next settles on whichever came last.
+    /// True if the new bytes *end* with a turn the agent opened itself — no
+    /// prompt hook, no tool hook, nothing the hook arm will ever see (Codex
+    /// under a goal). Ends-with rather than contains-any, because one delta
+    /// routinely carries the end of one turn and the start of the next.
+    ///
+    /// The only **promoting** signal here, and deliberately without a
+    /// demoting mirror: every ordinary turn *end* already arrives as a Stop
+    /// hook, so a closed turn tells the launcher nothing it wasn't told.
     pub turn_started: bool,
-    /// Whether the session is under a standing instruction that makes the
-    /// agent start those hookless turns — `Some(false)` when the bytes show it
-    /// ended, `None` when they say nothing and the launcher's latch holds.
-    /// Only the poll-backed watch reads it, to decide whether an idle session
-    /// can still be parked (see the lifecycle gate in `launcher::process_hooks`).
-    pub self_continuing: Option<bool>,
 }
 
 /// The transcript bytes appended since `offset`, decoded lossily, plus the
