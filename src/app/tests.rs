@@ -560,19 +560,20 @@ fn space_a_picker_sets_default_new_session_backend() {
 #[test]
 fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
     use crate::agent::AgentControl;
-    let mut d = TestDashboard::new(120, 10);
+    let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
-    // Default stays Claude; `O` opens the workdir picker titled for Claude.
+    // Default stays Claude; `O` opens the workdir picker on Claude, named by
+    // the popup's own settings line.
     d.press(KeyCode::Char('O'));
     assert_eq!(d.app.input_mode, InputMode::Picker);
-    assert!(d.render().contains("New Claude Session"));
+    assert!(d.render().contains("Agent Claude"));
 
-    // Ctrl-t flips the backend for this launch only — title follows, the
-    // persistent default does not.
+    // Ctrl-t flips the backend for this launch only — the settings line
+    // follows, the persistent default does not.
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-    assert!(d.render().contains("New Codex Session"));
+    assert!(d.render().contains("Agent Codex"));
     assert_eq!(d.app.new_session_agent, AgentControl::Claude);
 
     // Submitting a free-form path launches with the overridden backend.
@@ -719,7 +720,7 @@ fn workdir_picker_names_the_worktree() {
     let out = d.render();
     assert!(out.contains("feature-auth"), "{out}");
     assert!(
-        out.contains("New Claude Session"),
+        out.contains("Agent Claude"),
         "Ctrl-t must not switch agent mid-name: {out}"
     );
 
@@ -773,7 +774,7 @@ fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
     let out = d.render();
-    assert!(out.contains("New Codex Session"));
+    assert!(out.contains("Agent Codex"));
     assert!(!out.contains("Worktree"), "disarmed on switch: {out}");
     assert!(!out.contains("Ctrl-g"), "hint hidden for Codex: {out}");
 
@@ -799,16 +800,18 @@ fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
 
 #[test]
 fn workdir_picker_defaults_to_local_host() {
-    let mut d = TestDashboard::new(120, 10);
+    let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
     d.press(KeyCode::Char('O'));
-    assert!(d.render().contains("New Claude Session"));
+    assert!(d.render().contains("Agent Claude"));
     // With only the local host configured, Ctrl-h is a harmless no-op (no
-    // remote to cycle to) and the title carries no host suffix.
+    // remote to cycle to) and the settings line names no host at all.
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
-    assert!(d.render().contains("New Claude Session"));
+    let out = d.render();
+    assert!(out.contains("Agent Claude"), "{out}");
+    assert!(!out.contains("Host"), "single host is left unsaid: {out}");
 
     for c in "/tmp/x".chars() {
         d.press(KeyCode::Char(c));
@@ -817,6 +820,30 @@ fn workdir_picker_defaults_to_local_host() {
         Some(Action::NewSessionSplit { host, .. }) => assert!(host.is_local()),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
+}
+
+#[test]
+fn the_workdir_picker_wears_a_bare_border() {
+    // No heading and no position counter: the settings line names the agent
+    // and host a launch would use, and the list says the rest. Both halves go
+    // together — a lone "(1 of 12)" counts something nothing on the border
+    // names.
+    let mut d = TestDashboard::new(120, 30);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.press(KeyCode::Char('O'));
+    let out = d.render();
+    assert!(!out.contains("New Claude Session"), "{out}");
+    assert!(!out.contains(" of 0)"), "no counter either: {out}");
+    assert!(out.contains("Agent Claude"), "settings line stays: {out}");
+
+    // Other pickers keep both — this is the workdir one opting out, not the
+    // title going away everywhere.
+    d.press(KeyCode::Esc);
+    d.app
+        .open_resume_picker(crate::state::HostId::local(), Vec::new());
+    let out = d.render();
+    assert!(out.contains("Resume Session"), "{out}");
+    assert!(out.contains("(0 of 0)"), "counter kept where titled: {out}");
 }
 
 #[test]

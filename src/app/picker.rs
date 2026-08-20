@@ -666,8 +666,16 @@ impl Picker {
         } else {
             format!("{sel_display} of {visible} ({total} total)")
         };
-        let title = format!(" {} ({counter}) ", self.title);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        // An empty title takes the counter down with it: the border goes bare
+        // rather than carrying a stray "(1 of 12)" with nothing to name what it
+        // counts. The workdir picker is the one that asks for this — its
+        // settings line and its list already say everything a heading would.
+        let block = match self.title.is_empty() {
+            true => Block::default().borders(Borders::ALL),
+            false => Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ({counter}) ", self.title)),
+        };
         let mut inner = block.inner(popup);
         frame.render_widget(block, popup);
 
@@ -691,6 +699,7 @@ impl Picker {
             }
             _ => (None, None),
         };
+
         // Painted now rather than after the list, so the `visible == 0` early
         // return below can't drop it.
         // No background of its own: the line reads as part of the popup, not as

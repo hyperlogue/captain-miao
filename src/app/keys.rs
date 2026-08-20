@@ -835,14 +835,12 @@ impl App {
         }
         // Ctrl-T in the workdir picker cycles the backend this launch will use
         // — a per-launch override of the Space-a default — and updates the
-        // picker title in place. (Not Ctrl-A: that's readline beginning-of-line
-        // for the path input.)
+        // popup's status line in place. (Not Ctrl-A: that's readline
+        // beginning-of-line for the path input.)
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('t'))
             && let PickerKind::Workdir {
-                agent,
-                host,
-                worktree,
+                agent, worktree, ..
             } = &mut active.kind
         {
             // Cycle only the backends actually installed. At two this key was a
@@ -862,7 +860,6 @@ impl App {
             if !agent.capabilities().worktrees {
                 *worktree = None;
             }
-            active.picker.title = super::format::workdir_picker_title(*agent, host);
             // The popup's own status line carries the chosen agent (§9), so it
             // has to be rebuilt with it.
             self.refresh_picker_status_bar();
@@ -913,12 +910,11 @@ impl App {
         // that machine (`reseed_workdir_for_host`).
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('h'))
-            && let PickerKind::Workdir { agent, host, .. } = &mut active.kind
+            && let PickerKind::Workdir { host, .. } = &mut active.kind
         {
             let hosts: Vec<HostId> = self.backends.iter().map(|b| b.host_id()).collect();
             let cur = hosts.iter().position(|h| h == host).unwrap_or(0);
             *host = hosts[(cur + 1) % hosts.len()].clone();
-            active.picker.title = super::format::workdir_picker_title(*agent, host);
             // Drop the `active` borrow before the reseed (it re-borrows self).
             self.reseed_workdir_for_host();
             self.refresh_picker_status_bar();

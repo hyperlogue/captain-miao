@@ -5,8 +5,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Cell;
 
-use crate::agent::{AgentControl, SessionIndex};
-use crate::state::{HostId, LauncherState, SessionStatus};
+use crate::agent::SessionIndex;
+use crate::state::{LauncherState, SessionStatus};
 
 /// The foreground color for a status label. Presentation policy, so it lives in
 /// the dashboard rather than on `SessionStatus` in core (which stays ratatui-free).
@@ -847,17 +847,6 @@ pub(super) fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
-}
-
-/// Title for the new-session (workdir) picker, naming the backend the launch
-/// will use. Shared by the picker opener and the in-picker `Ctrl-t` toggle so
-/// the two never drift.
-pub(super) fn workdir_picker_title(agent: AgentControl, host: &HostId) -> String {
-    if host.is_local() {
-        format!("New {} Session — Directory", agent.label())
-    } else {
-        format!("New {} Session on {} — Directory", agent.label(), host.0)
-    }
 }
 
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

@@ -29,9 +29,7 @@ use crate::state::{
 };
 use crate::terminal::{Capabilities, SessionsLayout, Tab, TabId, TabInfo, TabTarget, WindowId};
 
-use self::format::{
-    contains_ci, format_coarse_age, format_relative_time, random_session_name, workdir_picker_title,
-};
+use self::format::{contains_ci, format_coarse_age, format_relative_time, random_session_name};
 use self::picker::{Picker, PickerItem};
 use crate::backend::{Backend, BackendEvents, ConnState, KillOutcome, RemoteBackend, Transport};
 use crate::config;
@@ -5336,10 +5334,11 @@ impl App {
         let items = self.workdir_items(&cwds, &host);
 
         // Seed the launch backend from the persistent default; `Ctrl-t` in the
-        // picker overrides it for this launch only. The title carries it so the
-        // backend is visible at the moment of launching.
+        // picker overrides it for this launch only. No title: the agent and
+        // host it would have named are the popup's own status line (§9), a row
+        // the eye is already on because `Ctrl-t`/`Ctrl-h` change it there.
         let agent = self.new_session_agent;
-        let picker = Picker::new(workdir_picker_title(agent, &host), items)
+        let picker = Picker::new("", items)
             .with_placeholder("Type a path or pick a recent one…")
             .with_size(70, 70)
             .with_free_input(true)
