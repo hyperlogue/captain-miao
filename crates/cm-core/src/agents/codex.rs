@@ -773,7 +773,7 @@ fn seed_hook_trust(home: &Path) {
         return;
     };
 
-    let mut state = toml::map::Map::new();
+    let mut our_state = toml::map::Map::new();
     for (pascal, groups) in events {
         let Some(label) = codex_event_label(pascal) else {
             continue;
@@ -794,7 +794,7 @@ fn seed_hook_trust(home: &Path) {
                 let key = format!("{}:{label}:{gi}:{hi}", hooks_path.display());
                 let mut entry = toml::map::Map::new();
                 entry.insert("trusted_hash".to_string(), toml::Value::String(hash));
-                state.insert(key, toml::Value::Table(entry));
+                our_state.insert(key, toml::Value::Table(entry));
             }
         }
     }
@@ -811,7 +811,28 @@ fn seed_hook_trust(home: &Path) {
     let toml::Value::Table(hooks_tbl) = hooks_tbl else {
         return;
     };
-    hooks_tbl.insert("state".to_string(), toml::Value::Table(state));
+    // Replace only entries for the hooks file we own. Codex persists trust for
+    // user and project hooks in this same table; replacing the whole table here
+    // made every approval for those hooks disappear on the next launch, so the
+    // user was asked to trust them again every time. Removing our prefix also
+    // retires stale entries if our emitted event set ever changes.
+    let prefix = format!("{}:", hooks_path.display());
+    let state = hooks_tbl
+        .entry("state".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(state) = state else {
+        return;
+    };
+    let previous = state.clone();
+    state.retain(|key, _| !key.starts_with(&prefix));
+    state.extend(our_state);
+
+    // Avoid rewriting config.toml on every launch. Besides preserving the
+    // user's formatting, this narrows the window in which a concurrent Codex
+    // approval write and a second session launch could race each other.
+    if *state == previous {
+        return;
+    }
 
     if let Ok(serialized) = toml::to_string(&doc) {
         let _ = atomic_write(&config_path, serialized.as_bytes());
@@ -1502,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_hook_trust_writes_state_and_preserves_config() {
+    fn seed_hook_trust_preserves_config_and_other_hook_state() {
         // Build a throwaway synth home with our real hooks.json + a user config.
         let home = std::env::temp_dir().join(format!(
             "captain-miao-seed-test-{}-{}",
@@ -1514,9 +1535,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("hooks.json"), build_hooks_settings("/run/x.sock")).unwrap();
+        let stale_key = format!("{}:removed_event:0:0", home.join("hooks.json").display());
         std::fs::write(
             home.join("config.toml"),
-            "model = \"gpt-5.5\"\n\n[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n",
+            format!(
+                "model = \"gpt-5.5\"\n\n\
+                 [projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n\n\
+                 [hooks.state.\"/tmp/x/.codex/hooks.json:stop:0:0\"]\n\
+                 trusted_hash = \"sha256:user-hook\"\n\n\
+                 [hooks.state.\"{stale_key}\"]\n\
+                 trusted_hash = \"sha256:stale-captain-miao-hook\"\n"
+            ),
         )
         .unwrap();
 
@@ -1527,10 +1556,15 @@ mod tests {
         // User settings survive the rewrite.
         assert_eq!(doc.get("model").and_then(|v| v.as_str()), Some("gpt-5.5"));
         assert!(doc.get("projects").is_some(), "project trust preserved");
-        // One trust entry per emitted hook, each a sha256, keyed by the
-        // hooks.json path + Codex label + group/handler indices.
+        // One trust entry per emitted hook plus the user's project hook. A
+        // stale entry for our own hooks file is retired without touching it.
         let state = doc["hooks"]["state"].as_table().unwrap();
-        assert_eq!(state.len(), 8);
+        assert_eq!(state.len(), 9);
+        assert_eq!(
+            state["/tmp/x/.codex/hooks.json:stop:0:0"]["trusted_hash"].as_str(),
+            Some("sha256:user-hook")
+        );
+        assert!(!state.contains_key(&stale_key));
         let hooks_path = home.join("hooks.json");
         let key = format!("{}:pre_tool_use:0:0", hooks_path.display());
         let hash = state[&key]["trusted_hash"].as_str().unwrap();
