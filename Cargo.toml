@@ -4,7 +4,7 @@ members = ["crates/cm-core", "crates/cm-server", "crates/cm-client", "xtask"]
 # Metadata every member inherits with `<key>.workspace = true`, so the version,
 # license, and repo URL can't drift between the four packages.
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyperlogue/captain-miao"

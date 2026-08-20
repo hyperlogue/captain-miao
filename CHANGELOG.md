@@ -5,6 +5,35 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-19
+
+🙏 Thanks to [@TomGrozev](https://github.com/TomGrozev), who contributed the omp
+backend in #2, and to [@juniperrrrr](https://github.com/juniperrrrr) for the agy
+request in #1.
+
+### Added
+
+- **[omp](https://github.com/can1357/oh-my-pi) joins the agent backends.**
+
+### Changed
+
+- **Restart (`Space e` / `Space E`) and host upgrades now accept a row parked on
+  a background server or an r3 review-watch**, so one such row no longer makes a
+  whole host un-upgradeable.
+- **The new-session popup rules its settings line off from the path you type
+  into**, and that line no longer paints as though it were a selected row.
+
+### Fixed
+
+- **Codex reads its state from the home its sessions actually write to**, so a
+  `/rename` reaches the row and the resume picker is no longer permanently empty.
+- **A Codex session driving its own goal stays `Active` between turns** instead
+  of reading `Idle` while it works flat out.
+- **A Reasonix session waiting on an `ask` question reads as a decision** and
+  rings for attention, rather than looking like one doing work.
+- **`Ctrl-d` in the workdir picker forgets a recent dir on the host that owns
+  it** — on a remote host or under pooled-localhost it previously did nothing.
+
 ## [0.5.0] - 2026-08-18
 
 ### Added
@@ -378,6 +407,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hyperlogue/captain-miao/compare/v0.2.1...v0.3.0
