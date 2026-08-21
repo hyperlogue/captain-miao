@@ -421,8 +421,8 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
                 .map(|p| p.to_string_lossy().into_owned())
         });
     // Same file the transcript fold reads. Putting the title on the payload
-    // means a later hook (the prompt after a `/rename`) stamps it even if the
-    // launcher's file-inode watch already died on the replace. An empty
+    // means a later hook (the prompt after a `/rename`) stamps it even if a
+    // replace landed before the launcher re-armed its file watch. An empty
     // summary is absent, not a rename to nothing — `adopt_session_facts`
     // already drops that.
     let session_title = transcript_path
@@ -567,10 +567,11 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 ///
 /// `path` is the `summary.json` [`parse_hook_payload`] rewrites `transcriptPath`
 /// to. The title is `generated_title` (auto or `/rename`); `/rename` fires no
-/// hook and replaces the file, so the launcher watches the parent directory (a
-/// file-inode watch dies on the first rewrite). The context gauge is sibling
-/// `signals.json`'s `contextTokensUsed` over `contextWindowTokens`.
-/// `prior` is unused: both files are small whole-JSON documents.
+/// hook and replaces the file, so the launcher re-arms its file watch after
+/// each wake rather than polling or watching the session directory. The
+/// context gauge is sibling `signals.json`'s `contextTokensUsed` over
+/// `contextWindowTokens`. `prior` is unused: both files are small whole-JSON
+/// documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
     let mut stats = TranscriptStats::default();

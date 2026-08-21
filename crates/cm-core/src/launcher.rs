@@ -738,6 +738,20 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 {
                     state_changed = true;
                 }
+                // Grok replaces `summary.json` (new inode). The wake above is
+                // the old inode's last event — re-arm on the path so the next
+                // `/rename` is seen too. Still event-driven: this runs only
+                // because notify just fired, never on a timer, and never by
+                // watching the session dir (`updates.jsonl` lives there).
+                if agent.transcript_path_is_replaced()
+                    && matches!(transcript_watcher, Some(TranscriptWatch::Event(_)))
+                    && let Some(path) = &transcript_path
+                {
+                    match start_file_watcher(path, fs_tx.clone()) {
+                        Ok(w) => transcript_watcher = Some(TranscriptWatch::Event(w)),
+                        Err(e) => tracing::debug!("transcript rewatch failed: {e}"),
+                    }
+                }
                 if state.status != prev_status
                     || state.last_tool != prev_last_tool
                 {
@@ -1161,6 +1175,12 @@ fn start_file_watcher(
     // on macOS the event then arrives under the real path and a raw-string
     // filter silently freezes the transcript fold. Accept either spelling.
     let real = canonical_watch_target(path).filter(|p| *p != target);
+    // MOVE_SELF on a file-inode watch often arrives with an empty `paths`
+    // vec. Dropping those is how a Grok `/rename` (atomic replace) silently
+    // killed the watch. Only a *file* watch may treat empty paths as ours —
+    // the parent fallback shares the watch with siblings (Grok's
+    // `updates.jsonl` is the long-held-fd stream we refuse to follow).
+    let file_present = path.is_file();
     let handler = move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Drop Access events (open/close/read). On Linux notify uses inotify
@@ -1173,34 +1193,25 @@ fn start_file_watcher(
         // When we fall back to watching the parent directory (because the file
         // doesn't exist yet), events will fire for sibling transcripts too —
         // filter to just our file.
-        if event
+        let ours = event
             .paths
             .iter()
-            .any(|p| p == &target || Some(p) == real.as_ref())
-        {
+            .any(|p| p == &target || Some(p) == real.as_ref());
+        if ours || (file_present && event.paths.is_empty()) {
             let _ = tx.send(());
         }
     };
     let mut w = notify::recommended_watcher(handler)?;
 
-    // Watch the parent directory *and* the file. A file-inode watch dies on
-    // atomic replace: Grok rewrites `summary.json` that way on `/rename` and
-    // at turn boundaries (the new file's birth time equals its mtime), so a
-    // file-only watch fires once, then never again — the dashboard title
-    // stuck on whatever the first fold saw. The parent watch sees the new
-    // inode; sibling events (Grok's `updates.jsonl` is chatty) are filtered
-    // to `target` above. The file watch still covers in-place appends on
-    // backends that never replace. If the file does not exist yet, the
-    // parent registration is the same fallback as before.
-    let file_ok = w.watch(path, notify::RecursiveMode::NonRecursive).is_ok();
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Err(e) = w.watch(parent, notify::RecursiveMode::NonRecursive)
-            && !file_ok
-        {
-            return Err(e);
-        }
-    } else if !file_ok {
-        w.watch(path, notify::RecursiveMode::NonRecursive)?;
+    // Try watching the file directly; fall back to its parent directory if
+    // the file doesn't exist yet (notify requires the path to exist on some
+    // platforms). Do *not* also watch the parent when the file exists: for
+    // Grok that directory holds `updates.jsonl`, the append stream a file
+    // watch exists to ignore.
+    if w.watch(path, notify::RecursiveMode::NonRecursive).is_err()
+        && let Some(parent) = path.parent()
+    {
+        w.watch(parent, notify::RecursiveMode::NonRecursive)?;
     }
     Ok(w)
 }
@@ -1604,12 +1615,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Grok rewrites `summary.json` by replace (new inode, birth == mtime). A
-    /// file-inode watch dies on the first one; `/rename` is a second replace
-    /// with no hook, so the watch has to still be alive. Watching the parent
-    /// directory is what keeps the second wake.
+    /// Grok rewrites `summary.json` by replace (new inode). The file watch
+    /// fires for that replace, then dies with the old inode; the launcher
+    /// re-arms it — still event-driven, not a poll, and not a watch on the
+    /// session directory (`updates.jsonl` lives there). A second replace is
+    /// visible only after that re-arm.
     #[test]
-    fn file_watcher_survives_an_atomic_replace() {
+    fn file_watcher_sees_a_replace_and_the_next_one_after_rewatch() {
         let base = std::env::temp_dir().join(format!("cm-watch-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1622,7 +1634,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let _w = start_file_watcher(&path, tx).expect("watch starts");
+            let mut _w = start_file_watcher(&path, tx.clone()).expect("watch starts");
             // Let the backend register before the first replace.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1637,12 +1649,13 @@ mod tests {
             assert!(woke.is_ok(), "first atomic replace never woke the watcher");
             while rx.try_recv().is_ok() {}
 
+            // Same contract as `process_hooks` after an fs wake for Grok.
+            _w = start_file_watcher(&path, tx.clone()).expect("rewatch");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
             replace(&path, b"{\"generated_title\":\"renamed again\"}\n");
             let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
-            assert!(
-                woke.is_ok(),
-                "second atomic replace never woke the watcher — the file-inode watch died"
-            );
+            assert!(woke.is_ok(), "replace after re-arm never woke the watcher");
         });
 
         let _ = std::fs::remove_dir_all(&base);

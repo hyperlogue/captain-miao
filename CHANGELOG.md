@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A Grok `/rename` reaches the dashboard row.** Grok rewrites `summary.json`
   as a new file (no hook), which killed the launcher's file-inode watch after
-  the first title; the parent-directory watch and the next hook's title stamp
-  both keep the new name.
+  the first title. The launcher re-arms that file watch after each replace
+  (still event-driven — not a poll, and not the session directory that also
+  holds `updates.jsonl`) and the next hook stamps the title as a backstop.
 
 ### Changed
 
