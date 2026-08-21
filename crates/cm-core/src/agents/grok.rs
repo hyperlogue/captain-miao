@@ -437,7 +437,12 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
             .filter(|s| !s.trim().is_empty())
             .or(payload.error.filter(|s| !s.trim().is_empty())),
         cwd: payload.cwd,
-        prompt: payload.prompt.filter(|s| !s.trim().is_empty()),
+        prompt: payload
+            .prompt
+            .as_deref()
+            .map(unwrap_user_query)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         session_title,
         context_tokens: None,
         model: payload.model_id.filter(|s| !s.trim().is_empty()),
@@ -457,6 +462,19 @@ fn summary_path_for(transcript: &str) -> String {
         .join("summary.json")
         .to_string_lossy()
         .into_owned()
+}
+
+/// Grok Build wraps `UserPromptSubmit`'s `prompt` in `<user_query>` …
+/// `</user_query>` (the same harness chrome the TUI injects). Those tags are
+/// not the prompt; strip them so the glance column shows what the user typed.
+/// A prompt that isn't wrapped is returned trimmed, unchanged. A truncated
+/// payload that still has the opener (no closer) loses the opener only.
+pub fn unwrap_user_query(prompt: &str) -> &str {
+    let s = prompt.trim();
+    let Some(inner) = s.strip_prefix("<user_query>") else {
+        return s;
+    };
+    inner.strip_suffix("</user_query>").unwrap_or(inner).trim()
 }
 
 /// `generated_title` (or the recap fallback) off a `summary.json`, or `None`
@@ -732,6 +750,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The glance column is the user's text, not the harness wrapper — including
+    /// a truncated payload that still has the opener, and a prompt that was
+    /// never wrapped.
+    #[test]
+    fn user_query_tags_are_not_the_prompt() {
+        assert_eq!(
+            unwrap_user_query("<user_query>\nlook at the last prompt\n</user_query>"),
+            "look at the last prompt"
+        );
+        assert_eq!(
+            unwrap_user_query("<user_query>\nlook at the last prompt"),
+            "look at the last prompt"
+        );
+        assert_eq!(
+            unwrap_user_query("wire up the parser"),
+            "wire up the parser"
+        );
+        assert_eq!(unwrap_user_query("  <user_query></user_query>  "), "");
+    }
+
     /// An empty or absent store is an empty picker, not an error.
     #[test]
     fn a_missing_sessions_root_is_empty_rather_than_an_error() {
@@ -783,6 +821,22 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::Active);
         assert_eq!(state.last_prompt.as_deref(), Some("wire up the parser"));
+
+        // Grok Build wraps the typed prompt in harness tags; those are not
+        // the prompt, and a later turn must replace the row with the inner
+        // text rather than showing `<user_query>` in the glance column.
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload(
+                "user_prompt_submit",
+                r#","prompt":"<user_query>\nlook at the last prompt\n</user_query>""#,
+            ),
+        );
+        assert_eq!(
+            state.last_prompt.as_deref(),
+            Some("look at the last prompt")
+        );
 
         feed(
             &mut state,

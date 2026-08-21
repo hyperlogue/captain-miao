@@ -29,7 +29,9 @@ use crate::state::{
 };
 use crate::terminal::{Capabilities, SessionsLayout, Tab, TabId, TabInfo, TabTarget, WindowId};
 
-use self::format::{contains_ci, format_coarse_age, format_relative_time, random_session_name};
+use self::format::{
+    contains_ci, format_coarse_age, format_relative_time, last_prompt_text, random_session_name,
+};
 use self::picker::{Picker, PickerItem};
 use crate::backend::{Backend, BackendEvents, ConnState, KillOutcome, RemoteBackend, Transport};
 use crate::config;
@@ -3394,7 +3396,9 @@ impl App {
                 None => true,
                 Some(q) => {
                     contains_ci(&s.cwd, q)
-                        || s.last_prompt.as_deref().is_some_and(|p| contains_ci(p, q))
+                        || s.last_prompt
+                            .as_deref()
+                            .is_some_and(|p| contains_ci(last_prompt_text(p), q))
                         || contains_ci(s.status.label(), q)
                         || self
                             .index_of(s)

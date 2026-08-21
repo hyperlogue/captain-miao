@@ -7,6 +7,7 @@ use ratatui::widgets::Cell;
 
 use crate::agent::SessionIndex;
 use crate::state::{LauncherState, SessionStatus};
+use cm_core::agents::grok::unwrap_user_query;
 
 /// The foreground color for a status label. Presentation policy, so it lives in
 /// the dashboard rather than on `SessionStatus` in core (which stays ratatui-free).
@@ -616,6 +617,13 @@ pub(super) fn override_indicator_spans(
 /// unbounded, so it's clipped to a title's worth even in the panels/pickers that
 /// otherwise show a name untruncated.
 const AUTO_TITLE_MAX: usize = 60;
+
+/// Glance-column / search text for a session's last prompt. Grok Build wraps
+/// the typed prompt in `<user_query>` tags; strip those so a row captured
+/// before the ingest unwrap still reads as what the user typed.
+pub(super) fn last_prompt_text(prompt: &str) -> &str {
+    unwrap_user_query(prompt)
+}
 
 /// Resolve a session's display name. Lookup order:
 /// 1. `LauncherState.name` — Claude's `/rename` (folded by its launcher from the

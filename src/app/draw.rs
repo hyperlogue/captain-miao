@@ -18,8 +18,8 @@ use super::format::{
     DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
     ansi_to_lines, bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width,
     elapsed_cell, fade_style, format_context_cell, format_context_detail, format_elapsed,
-    hint_badge, hint_pair, model_color, model_label, override_indicator_spans, pill,
-    session_display_name, truncate_str,
+    hint_badge, hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans,
+    pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -1276,7 +1276,11 @@ impl App {
                     ),
                 ])
             });
-        let prompt = s.last_prompt.as_deref().unwrap_or("—");
+        let prompt = s
+            .last_prompt
+            .as_deref()
+            .map(last_prompt_text)
+            .unwrap_or("—");
         // Truncate the first prompt to a single line so a long opener doesn't
         // wrap into a wall of text above the last prompt.
         let first_prompt = truncate_str(
@@ -1584,6 +1588,7 @@ impl App {
                     let last_prompt = s
                         .last_prompt
                         .as_deref()
+                        .map(last_prompt_text)
                         .map(|p| p.replace('\n', " "))
                         .unwrap_or_default();
                     let elapsed = elapsed_cell(now.saturating_sub(s.updated_at));

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Grok token counts follow a `signals.json` replace**, the same file-watch
   re-arm as `/rename` on `summary.json` — not a poll, and not a watch on the
   session directory.
+- **Grok's glance column drops the `<user_query>` harness wrapper** so the
+  row shows the typed prompt.
 
 ## [0.6.1] - 2026-08-21
 
