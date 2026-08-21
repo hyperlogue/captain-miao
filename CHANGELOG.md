@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session directory.
 - **Grok's glance column drops the `<user_query>` harness wrapper** so the
   row shows the typed prompt.
+- **Kitty's `miao:sessions` tab is created to the right of the dashboard tab**
+  rather than at the end of the tab bar.
 
 ## [0.6.1] - 2026-08-21
 

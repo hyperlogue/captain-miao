@@ -98,6 +98,103 @@ fn match_id(id: &str) -> Result<&str> {
     super::validate_id(id, "kitty")
 }
 
+/// `kitten @ launch …` argv for a spawn (the `kitten @` prefix is [`kitten_cmd`]'s).
+///
+/// Pure so the placement flags that keep `miao:sessions` next to the dashboard
+/// tab can be pinned without a live kitty. `join` is a window already in that
+/// shared tab (Stacked join); `dashboard` is this process's own window, used
+/// only when *creating* the shared tab so kitty puts it in the dashboard's OS
+/// window. `path` is the `--env=PATH=` value, threaded in so tests don't depend
+/// on the process environment.
+fn launch_argv(
+    spec: &SpawnSpec,
+    join: Option<&WindowId>,
+    dashboard: Option<&WindowId>,
+    path: Option<&str>,
+) -> Result<Vec<String>> {
+    let window_type = match &spec.target {
+        SpawnTarget::NewTab => "tab",
+        // Only produced when `floating_sessions` is set, which kitty never
+        // claims — reaching here is a policy bug upstream.
+        SpawnTarget::Floating => {
+            anyhow::bail!("floating session panes are not supported by the kitty backend")
+        }
+        // Join the shared tab as a window; create it as a tab if absent.
+        SpawnTarget::SharedStackTab => {
+            if join.is_some() {
+                "window"
+            } else {
+                "tab"
+            }
+        }
+    };
+    let mut args: Vec<String> = vec![
+        "launch".into(),
+        format!("--type={window_type}"),
+        format!("--cwd={}", spec.cwd),
+    ];
+    if spec.hold {
+        args.push("--hold".into());
+    }
+    // `--dont-take-focus` keeps the caller (the dashboard) focused; omit it
+    // when the spawn should pull focus (e.g. an interactive shell tab).
+    if !spec.take_focus {
+        args.push("--dont-take-focus".into());
+    }
+    match &spec.target {
+        SpawnTarget::NewTab => {
+            if let Some(title) = &spec.title {
+                args.push(format!("--tab-title={title}"));
+            }
+        }
+        SpawnTarget::SharedStackTab => {
+            // Label the window with the per-session title (the tab stays
+            // fixed-titled `miao:sessions`, unlike a per-project NewTab).
+            if let Some(title) = &spec.title {
+                args.push(format!("--window-title={title}"));
+            }
+            match join {
+                // Join the existing shared tab, selected by a window it
+                // contains (`-m window_id:` — kitty launches the new window
+                // in that window's tab). The tab is already a stack layout,
+                // so the new window stacks in.
+                Some(w) => {
+                    let w = match_id(w.as_str())?;
+                    args.push("-m".into());
+                    args.push(format!("window_id:{w}"));
+                }
+                // Create the shared tab, fixed-titled so it's found next time.
+                // Kitty's default `--type=tab` placement is the *end* of the
+                // tab bar; `--location=after` puts it next to the current tab
+                // instead. Matching the dashboard window (`-m window_id:`)
+                // selects that window's OS window, so "current tab" is the
+                // dashboard's — `miao` / `miao (N)` — rather than whichever
+                // OS window kitty considers active.
+                None => {
+                    args.push(format!("--tab-title={SESSIONS_TAB}"));
+                    args.push("--location=after".into());
+                    if let Some(w) = dashboard {
+                        let w = match_id(w.as_str())?;
+                        args.push("-m".into());
+                        args.push(format!("window_id:{w}"));
+                    }
+                }
+            }
+        }
+        SpawnTarget::Floating => unreachable!("rejected above"),
+    }
+    if let Some(path) = path {
+        args.push(format!("--env=PATH={path}"));
+    }
+    if let SpawnCommand::Exec(cmd) = &spec.command {
+        for c in cmd {
+            args.push(c.clone());
+        }
+    }
+    // SpawnCommand::Shell appends no argv — kitty launches the default shell.
+    Ok(args)
+}
+
 // ---- startup control check ----
 
 /// What the startup control probe observed. Split from the probe itself so the
@@ -273,74 +370,21 @@ impl Terminal for KittyTerminal {
                 None
             };
 
-        // `--type`, plus whether this spawn creates a fresh tab (which we then
-        // default to the stack layout).
-        let (window_type, creates_tab) = match &spec.target {
-            SpawnTarget::NewTab => ("tab", true),
-            // Only produced when `floating_sessions` is set, which kitty
-            // never claims — reaching here is a policy bug upstream.
+        let creates_tab = match &spec.target {
+            SpawnTarget::NewTab => true,
             SpawnTarget::Floating => {
                 anyhow::bail!("floating session panes are not supported by the kitty backend")
             }
-            // Join the shared tab as a window; create it as a tab if absent.
-            SpawnTarget::SharedStackTab => {
-                if shared_tab.is_some() {
-                    ("window", false)
-                } else {
-                    ("tab", true)
-                }
-            }
+            SpawnTarget::SharedStackTab => shared_tab.is_none(),
         };
-        let mut args: Vec<String> = vec![
-            "launch".into(),
-            format!("--type={window_type}"),
-            format!("--cwd={}", spec.cwd),
-        ];
-        if spec.hold {
-            args.push("--hold".into());
-        }
-        // `--dont-take-focus` keeps the caller (the dashboard) focused; omit it
-        // when the spawn should pull focus (e.g. an interactive shell tab).
-        if !spec.take_focus {
-            args.push("--dont-take-focus".into());
-        }
-        match &spec.target {
-            SpawnTarget::NewTab => {
-                if let Some(title) = &spec.title {
-                    args.push(format!("--tab-title={title}"));
-                }
-            }
-            SpawnTarget::SharedStackTab => {
-                // Label the window with the per-session title (the tab stays
-                // fixed-titled `miao:sessions`, unlike a per-project NewTab).
-                if let Some(title) = &spec.title {
-                    args.push(format!("--window-title={title}"));
-                }
-                match &shared_tab {
-                    // Join the existing shared tab, selected by a window it
-                    // contains (`-m window_id:` — kitty launches the new window
-                    // in that window's tab). The tab is already a stack layout,
-                    // so the new window stacks in.
-                    Some((_, w)) => {
-                        let w = match_id(w.as_str())?;
-                        args.push("-m".into());
-                        args.push(format!("window_id:{w}"));
-                    }
-                    // Create the shared tab, fixed-titled so it's found next time.
-                    None => args.push(format!("--tab-title={SESSIONS_TAB}")),
-                }
-            }
-            SpawnTarget::Floating => unreachable!("rejected above"),
-        }
-        if let Ok(path) = std::env::var("PATH") {
-            args.push(format!("--env=PATH={path}"));
-        }
-        if let SpawnCommand::Exec(cmd) = &spec.command {
-            for c in cmd {
-                args.push(c.clone());
-            }
-        }
-        // SpawnCommand::Shell appends no argv — kitty launches the default shell.
+        let dashboard = self.current_window();
+        let path = std::env::var("PATH").ok();
+        let args = launch_argv(
+            &spec,
+            shared_tab.as_ref().map(|(_, w)| w),
+            dashboard.as_ref(),
+            path.as_deref(),
+        )?;
 
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let stdout = kitten_cmd(&arg_refs).await?;
@@ -424,7 +468,22 @@ impl Terminal for KittyTerminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeOutcome, diagnose, match_id};
+    use super::{
+        ProbeOutcome, SpawnCommand, SpawnSpec, SpawnTarget, WindowId, diagnose, launch_argv,
+        match_id,
+    };
+
+    fn spec(target: SpawnTarget) -> SpawnSpec {
+        SpawnSpec {
+            cwd: "/tmp".into(),
+            target,
+            command: SpawnCommand::Shell,
+            title: Some("proj".into()),
+            hold: true,
+            take_focus: false,
+            stack: false,
+        }
+    }
 
     /// Every configuration failure has to name the config block that fixes it —
     /// the dashboard prints this once and exits, so a message that only says
@@ -490,5 +549,77 @@ mod tests {
         assert!(match_id("-1").is_err());
         assert!(match_id("12a").is_err());
         assert!(match_id("id:1").is_err());
+    }
+
+    fn contains(args: &[String], flag: &str) -> bool {
+        args.iter().any(|a| a == flag)
+    }
+
+    fn pair<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    }
+
+    /// First Stacked spawn: a new `miao:sessions` tab, parked immediately to
+    /// the right of the dashboard tab rather than at the end of the bar.
+    #[test]
+    fn creating_sessions_tab_sits_after_the_dashboard() {
+        let dash = WindowId::from(7);
+        let args =
+            launch_argv(&spec(SpawnTarget::SharedStackTab), None, Some(&dash), None).unwrap();
+        assert!(contains(&args, "--type=tab"), "{args:?}");
+        assert!(contains(&args, "--tab-title=miao:sessions"), "{args:?}");
+        assert!(contains(&args, "--location=after"), "{args:?}");
+        assert_eq!(pair(&args, "-m"), Some("window_id:7"));
+        // A join uses the same `-m` flag for a *sessions* window; creating
+        // must not confuse the two.
+        assert!(!contains(&args, "--type=window"), "{args:?}");
+    }
+
+    /// No dashboard window to match (no `KITTY_WINDOW_ID`): still `--location=after`
+    /// so the new tab sits next to whatever tab is current — the dashboard, when
+    /// the user is spawning from it — rather than falling back to the end of the
+    /// bar. The `-m` pin is what we lose, not the neighbor placement.
+    #[test]
+    fn creating_sessions_tab_without_dashboard_id_still_neighbors() {
+        let args = launch_argv(&spec(SpawnTarget::SharedStackTab), None, None, None).unwrap();
+        assert!(contains(&args, "--location=after"), "{args:?}");
+        assert!(contains(&args, "--tab-title=miao:sessions"), "{args:?}");
+        assert!(pair(&args, "-m").is_none(), "{args:?}");
+    }
+
+    /// Subsequent Stacked spawn: join the existing tab. Placement flags are
+    /// for tab creation, and a `--location=after` here would rearrange windows
+    /// inside the stack instead of leaving them stacked.
+    #[test]
+    fn joining_sessions_tab_does_not_reposition() {
+        let existing = WindowId::from(42);
+        let dash = WindowId::from(7);
+        let args = launch_argv(
+            &spec(SpawnTarget::SharedStackTab),
+            Some(&existing),
+            Some(&dash),
+            None,
+        )
+        .unwrap();
+        assert!(contains(&args, "--type=window"), "{args:?}");
+        assert_eq!(pair(&args, "-m"), Some("window_id:42"));
+        assert!(!contains(&args, "--location=after"), "{args:?}");
+        assert!(!contains(&args, "--tab-title=miao:sessions"), "{args:?}");
+        assert!(!contains(&args, "window_id:7"), "{args:?}");
+    }
+
+    /// Per-tab sessions are one tab each, not the shared stack — they keep
+    /// kitty's default end-of-bar placement and must not inherit the stacked
+    /// tab's neighbor flags.
+    #[test]
+    fn new_tab_spawn_is_not_forced_next_to_the_dashboard() {
+        let dash = WindowId::from(7);
+        let args = launch_argv(&spec(SpawnTarget::NewTab), None, Some(&dash), None).unwrap();
+        assert!(contains(&args, "--type=tab"), "{args:?}");
+        assert!(contains(&args, "--tab-title=proj"), "{args:?}");
+        assert!(!contains(&args, "--location=after"), "{args:?}");
+        assert!(pair(&args, "-m").is_none(), "{args:?}");
     }
 }
