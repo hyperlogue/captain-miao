@@ -1101,11 +1101,10 @@ impl AgentControl {
             // what makes this the one backend needing neither a session-file
             // fold (Claude) nor a sqlite overlay (Codex).
             AgentControl::Kimi => None,
-            // Grok titles its own sessions (`summary.json`'s `session_summary`),
-            // and `list_resumable` reads them — but keyed by session id, not by
-            // pid, so there is no per-pid file for *this* method to open. Same
-            // standing as Reasonix: the title surfaces in the picker, and a
-            // running row falls back to the first prompt.
+            // `None` because there is nothing left to read here: `summary.json`'s
+            // `generated_title` is folded onto `LauncherState.name` by the
+            // transcript watch (and by `list_resumable` for the picker). No
+            // per-pid file exists for this method to open.
             AgentControl::Grok => None,
             // `None` because there is nothing left to read, not because
             // opencode has no name: `session.updated` carries `info.title`, the
@@ -1516,6 +1515,12 @@ pub struct TranscriptStats {
     /// First real user prompt — the auto-title fallback shown before a rename
     /// (first-wins).
     pub first_prompt: Option<String>,
+    /// The agent's own session title, when the fold reads one (Grok's
+    /// `generated_title`). Stamped onto [`crate::state::LauncherState::name`]
+    /// last-write-wins, same rule as a hook's `session_title`. `None` for
+    /// backends whose title arrives some other way (Claude's session file,
+    /// Codex sqlite, a hook payload).
+    pub name: Option<String>,
     /// Claude-only incremental-parse cursor: the byte offset reached plus the
     /// running accumulators, so the next reload folds only the lines appended
     /// since — instead of rescanning a multi-MB transcript on every keystroke

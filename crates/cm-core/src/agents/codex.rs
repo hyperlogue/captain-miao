@@ -429,6 +429,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
         context_tokens: last_tokens,
         model: last_model,
         first_prompt,
+        name: None,
         // Codex recomputes from a bounded tail each refresh — no incremental
         // cursor to carry.
         cursor: None,

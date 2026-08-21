@@ -1279,6 +1279,19 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
         state.first_prompt = data.first_prompt.clone();
         changed = true;
     }
+    // Last-write-wins and Some-only, like the token count: an empty fold has
+    // not learned the session is untitled, and a `/rename` (or Grok's auto
+    // refresh) is a real new value.
+    if let Some(name) = data
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && state.name.as_deref() != Some(name)
+    {
+        state.name = Some(name.to_string());
+        changed = true;
+    }
     changed
 }
 
@@ -2186,5 +2199,17 @@ mod tests {
         assert!(apply_transcript_data(&mut state, &folded));
         assert_eq!(state.context_tokens, Some(12_000));
         assert_eq!(state.model.as_deref(), Some("some-model-2"));
+
+        let renamed = TranscriptStats {
+            name: Some("miao hooks".to_string()),
+            ..TranscriptStats::default()
+        };
+        assert!(apply_transcript_data(&mut state, &renamed));
+        assert_eq!(state.name.as_deref(), Some("miao hooks"));
+        assert!(!apply_transcript_data(
+            &mut state,
+            &TranscriptStats::default()
+        ));
+        assert_eq!(state.name.as_deref(), Some("miao hooks"));
     }
 }

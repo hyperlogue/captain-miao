@@ -8,7 +8,13 @@
 //! `StopCancelled` are no longer guesses. Remaining limits are named at the
 //! point they still bite.
 //!
-//! **Isolation is `GROK_HOME`, and it has one extra wrinkle.**
+//! **Isolation is `GROK_HOME`, and it cannot be dropped.** Interactive `grok`
+//! has no session-scoped hook injection (`--plugin-dir` exists only on
+//! `grok agent`). Writing `~/.grok/hooks/captain-miao.json` would fire in every
+//! grok the user runs *outside* captain-miao, against a socket that isn't
+//! there. Codex dropped its synth home because 0.134 grew named profiles;
+//! Grok's equivalent has not reached the TUI.
+//!
 //! `17-sessions.md`: *"Set `GROK_HOME` to override the base directory; when it
 //! is unset, Grok uses `~/.grok`"* — and it moves everything, not just config:
 //! sessions, auth, memory, skills, plugins, agents and logs. So the synthetic
@@ -151,19 +157,34 @@ fn synth_home() -> PathBuf {
 // Resume picker
 // =============================================================================
 
-/// Grok's `summary.json`, of which four fields are wanted here. Grok writes
+/// Grok's `summary.json`, of which the fields we act on are named. Grok writes
 /// more (`num_messages`, `parent_session_id`, `forked_at`, cwd-relocation
 /// bookkeeping); everything unnamed is ignored rather than refused, so a Grok
 /// that grows a field still parses.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SessionSummary {
     #[serde(default)]
     info: SummaryInfo,
-    /// Grok's own label for the session — what its `grok sessions` listing
-    /// shows and what its session search matches on. The dashboard treats it as
-    /// the row's title.
+    /// Longer recap of the session. Fallback title only when
+    /// [`Self::generated_title`] is empty.
     #[serde(default)]
     session_summary: String,
+    /// The session's display name: auto-generated, then overwritten by
+    /// `/rename`. `title_is_manual` records which, but both land here.
+    #[serde(default)]
+    generated_title: String,
+    #[serde(default)]
+    current_model_id: String,
+}
+
+impl SessionSummary {
+    /// Prefer the short title Grok shows in `grok sessions`; fall back to the
+    /// recap only when that is still empty (a brand-new session).
+    fn title(&self) -> Option<String> {
+        Some(self.generated_title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| Some(self.session_summary.clone()).filter(|t| !t.trim().is_empty()))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -229,9 +250,9 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         out.push(ResumeCandidate {
             agent: crate::agent::AgentControl::Grok,
             session_id: session_id.to_string(),
-            cwd: summary.info.cwd,
+            cwd: summary.info.cwd.clone(),
             first_prompt: None,
-            custom_title: Some(summary.session_summary).filter(|t| !t.trim().is_empty()),
+            custom_title: summary.title(),
             git_branch: Some(summary.info.head_branch).filter(|b| !b.trim().is_empty()),
             mtime,
         });
@@ -622,8 +643,9 @@ struct HookPayload {
     /// `UserPromptSubmit` only.
     prompt: Option<String>,
     /// Envelope field; the session directory's `updates.jsonl`, when Grok
-    /// names one. Rewritten to sibling `signals.json` so the launcher watches
-    /// the small stats file rather than every ACP append.
+    /// names one. Rewritten to sibling `summary.json` so the launcher watches
+    /// the title file (and folds sibling `signals.json` from the same dir)
+    /// rather than every ACP append.
     transcript_path: Option<String>,
     /// Present on events that fire inside a subagent. Those must not move the
     /// parent row — a child's `StopCancelled` is not the session going idle.
@@ -664,24 +686,24 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         transcript_path: payload
             .transcript_path
             .filter(|s| !s.trim().is_empty())
-            .map(|p| signals_path_for(&p)),
+            .map(|p| summary_path_for(&p)),
         raw: Some(stdin.to_string()),
         session_is_child,
     })
 }
 
-/// Point the launcher at `signals.json` in the same session directory as
+/// Point the launcher at `summary.json` in the same session directory as
 /// `transcript`. Grok's envelope names `updates.jsonl`, which appends on every
-/// ACP event; the context total and model live in the sibling sidecar and
-/// rewrite at turn boundaries.
-fn signals_path_for(transcript: &str) -> String {
+/// ACP event; the title, context total and model live in small sibling JSON
+/// files that rewrite at turn boundaries and on `/rename`.
+fn summary_path_for(transcript: &str) -> String {
     let path = Path::new(transcript);
     let dir = if path.is_dir() {
         path
     } else {
         path.parent().unwrap_or(path)
     };
-    dir.join("signals.json").to_string_lossy().into_owned()
+    dir.join("summary.json").to_string_lossy().into_owned()
 }
 
 /// Whether a `Stop` payload is the one Grok fires as the **session** ends rather
@@ -747,12 +769,13 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 // Transcript fold (signals.json + summary.json)
 // =============================================================================
 
-/// Context total and model from the session directory Grok names on the hook.
+/// Title, context total and model from the session directory Grok names on the
+/// hook.
 ///
-/// `path` is the `signals.json` [`parse_hook_payload`] rewrites `transcriptPath`
-/// to. The context gauge is `contextTokensUsed` — the in-memory billing ledgers
-/// still aren't serialized, but this sidecar is, and it is what `/session-info`
-/// shows. `prior` is unused: both files are small whole-JSON documents.
+/// `path` is the `summary.json` [`parse_hook_payload`] rewrites `transcriptPath`
+/// to. The title is `generated_title` (auto or `/rename`); the context gauge is
+/// sibling `signals.json`'s `contextTokensUsed`. `prior` is unused: both files
+/// are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = if path.is_dir() {
         path
@@ -776,16 +799,13 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         stats.model = signals.primary_model_id.filter(|m| !m.trim().is_empty());
     }
 
-    #[derive(Deserialize, Default)]
-    struct Summary {
-        #[serde(default)]
-        current_model_id: Option<String>,
-    }
-    if stats.model.is_none()
-        && let Ok(body) = std::fs::read_to_string(dir.join("summary.json"))
-        && let Ok(summary) = serde_json::from_str::<Summary>(&body)
+    if let Ok(body) = std::fs::read_to_string(dir.join("summary.json"))
+        && let Ok(summary) = serde_json::from_str::<SessionSummary>(&body)
     {
-        stats.model = summary.current_model_id.filter(|m| !m.trim().is_empty());
+        stats.name = summary.title();
+        if stats.model.is_none() {
+            stats.model = Some(summary.current_model_id).filter(|m| !m.trim().is_empty());
+        }
     }
     stats
 }
@@ -824,7 +844,8 @@ mod tests {
                 "cwd-key-1",
                 "abc123",
                 r#"{"info":{"cwd":"/home/miao/p","head_branch":"main"},
-                    "session_summary":"wire up the parser",
+                    "session_summary":"a longer recap of the work",
+                    "generated_title":"wire up the parser",
                     "num_messages":12,"current_model_id":"grok-build-0.1"}"#,
             )],
         );
@@ -1033,7 +1054,7 @@ mod tests {
         assert_eq!(msg.tool_name.as_deref(), Some("search_replace"));
         assert_eq!(
             msg.transcript_path.as_deref(),
-            Some("/home/miao/p/s1/signals.json")
+            Some("/home/miao/p/s1/summary.json")
         );
         // A snake_case reading would find none of the above; guard the one field
         // whose absence would otherwise look like "the agent didn't send it".
@@ -1078,10 +1099,11 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("parent"));
     }
 
-    /// `signals.json` is the context gauge `/session-info` shows; the model
-    /// falls through to `summary.json` when the sidecar has none.
+    /// `signals.json` is the context gauge `/session-info` shows; the title
+    /// and the model-fallback come off `summary.json`. `generated_title` is
+    /// the name, even when a longer `session_summary` recap is also present.
     #[test]
-    fn signals_json_folds_tokens_and_model() {
+    fn sidecars_fold_tokens_model_and_title() {
         let dir = std::env::temp_dir().join(format!("cm-grok-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1092,12 +1114,14 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("summary.json"),
-            r#"{"current_model_id":"ignored-when-signals-has-one"}"#,
+            r#"{"generated_title":"miao hooks","session_summary":"a longer recap",
+                "current_model_id":"ignored-when-signals-has-one"}"#,
         )
         .unwrap();
-        let stats = read_transcript_stats(&dir.join("signals.json"));
+        let stats = read_transcript_stats(&dir.join("summary.json"));
         assert_eq!(stats.context_tokens, Some(8929));
         assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(stats.name.as_deref(), Some("miao hooks"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

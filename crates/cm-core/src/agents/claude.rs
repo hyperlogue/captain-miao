@@ -401,6 +401,7 @@ impl StatsCursor {
             context_tokens,
             model,
             first_prompt,
+            name: None,
             cursor: Some(self),
         }
     }

@@ -11,10 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Grok Build tracking catches up to 1.0.4.** An interrupted turn settles
   instead of staying `Active`, the token and model columns fill from
-  `signals.json`, the prompt reaches the row, and the resume picker finds
-  sessions that lived only in the synthetic home. `StopCancelled` and the
-  lifecycle `Notification` hook are the new signals; older grok skips names it
-  does not know.
+  `signals.json`, the prompt reaches the row, the session title
+  (`generated_title`, including `/rename`) lands on the row, and the resume
+  picker finds sessions that lived only in the synthetic home. `StopCancelled`
+  and the lifecycle `Notification` hook are the new signals; older grok skips
+  names it does not know.
 - **Managed Codex sessions now use an owned profile in the real Codex home**
   instead of a synthetic `CODEX_HOME`. The former synthetic home at
   `$XDG_STATE_HOME/captain-miao/codex-home` (normally
