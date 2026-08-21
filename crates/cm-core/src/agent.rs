@@ -1510,6 +1510,11 @@ pub struct TranscriptStats {
     /// backends whose title arrives some other way (Claude's session file,
     /// Codex sqlite, a hook payload).
     pub name: Option<String>,
+    /// Fill for [`crate::state::LauncherState::last_prompt`] from a sidecar
+    /// recap (Grok's `last_turn_summary`). Applied only when the row is not
+    /// mid-turn, so a `PromptSubmit` value is left alone until the turn ends.
+    /// `None` for backends whose last prompt arrives only on the hook.
+    pub last_prompt: Option<String>,
     /// Claude-only incremental-parse cursor: the byte offset reached plus the
     /// running accumulators, so the next reload folds only the lines appended
     /// since — instead of rescanning a multi-MB transcript on every keystroke

@@ -28,9 +28,13 @@
 //!   but routing it to the dashboard needs a new `LauncherState` field, which
 //!   is seam work and belongs in its own commit.
 //!   [`crate::agent::AgentControl::bg_shells`] answers `None` until then.
-//! - **The worktree name isn't shown on the row.** Grok keeps worktrees in
-//!   `worktrees.db` rather than beside the repo; `summary.json`'s `head_branch`
-//!   is what the resume picker can show today.
+//! - **The worktree name isn't shown on the row.** `summary.json` has
+//!   `git_root_dir` (the repo) beside `info.cwd` (often a worktree under
+//!   `~/.grok/worktrees/`), which is enough to label one without opening
+//!   `worktrees.db` — but the dashboard's worktree split is a cwd-path parse
+//!   (Claude's `.claude/worktrees/<name>`), and putting `git_root_dir` on the
+//!   row needs a `LauncherState` field. `head_branch` is what the resume
+//!   picker can show today.
 //!
 //! Interrupt, prompt, tokens and the hook-file schema are settled as of 1.0.4:
 //! `StopCancelled` is a first-class observe hook (Kimi's `Interrupt` standing),
@@ -111,6 +115,11 @@ struct SessionSummary {
     /// so this is the only branch name the picker can show.
     #[serde(default)]
     head_branch: String,
+    /// One-line recap of the latest turn. The glance column on an idle / resumed
+    /// row, and the resume-picker search text — not the title (`generated_title`)
+    /// and not the user's prompt.
+    #[serde(default)]
+    last_turn_summary: String,
 }
 
 impl SessionSummary {
@@ -127,6 +136,10 @@ impl SessionSummary {
         Some(self.head_branch.clone())
             .filter(|b| !b.trim().is_empty())
             .or_else(|| Some(self.info.head_branch.clone()).filter(|b| !b.trim().is_empty()))
+    }
+
+    fn last_turn_summary(&self) -> Option<String> {
+        Some(self.last_turn_summary.clone()).filter(|t| !t.trim().is_empty())
     }
 }
 
@@ -151,7 +164,8 @@ struct SummaryInfo {
 /// could.
 ///
 /// The picker does not fold a token count: that lives on the running row via
-/// `signals.json`, not on a resume candidate.
+/// `signals.json`, not on a resume candidate. `last_turn_summary` rides
+/// `first_prompt` so a recap is searchable even when the title is already set.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
     let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
     Ok(list_resumable_in(&root, limit))
@@ -187,11 +201,12 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         }
         let custom_title = summary.title();
         let git_branch = summary.git_branch();
+        let first_prompt = summary.last_turn_summary();
         out.push(ResumeCandidate {
             agent: crate::agent::AgentControl::Grok,
             session_id: session_id.to_string(),
             cwd: summary.info.cwd,
-            first_prompt: None,
+            first_prompt,
             custom_title,
             git_branch,
             mtime,
@@ -522,6 +537,7 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         && let Ok(summary) = serde_json::from_str::<SessionSummary>(&body)
     {
         stats.name = summary.title();
+        stats.last_prompt = summary.last_turn_summary();
         if stats.model.is_none() {
             stats.model = Some(summary.current_model_id).filter(|m| !m.trim().is_empty());
         }
@@ -574,6 +590,7 @@ mod tests {
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(out[0].first_prompt, None);
         assert_eq!(out[0].agent, AgentControl::Grok);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -590,6 +607,7 @@ mod tests {
                 "01a02249-40a6-7301-b339-cad83f5046cd",
                 r#"{"info":{"id":"01a02249-40a6-7301-b339-cad83f5046cd","cwd":"/home/miao/p"},
                     "generated_title":"miao hooks","session_summary":"a longer recap",
+                    "last_turn_summary":"Resume/fork already work; picker now shows branch",
                     "head_branch":"main","current_model_id":"grok-4.6"}"#,
             )],
         );
@@ -598,6 +616,10 @@ mod tests {
         assert_eq!(out[0].session_id, "01a02249-40a6-7301-b339-cad83f5046cd");
         assert_eq!(out[0].custom_title.as_deref(), Some("miao hooks"));
         assert_eq!(out[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            out[0].first_prompt.as_deref(),
+            Some("Resume/fork already work; picker now shows branch")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -848,6 +870,7 @@ mod tests {
         std::fs::write(
             dir.join("summary.json"),
             r#"{"generated_title":"miao hooks","session_summary":"a longer recap",
+                "last_turn_summary":"Pinned GrokNight; no custom palettes",
                 "current_model_id":"ignored-when-signals-has-one"}"#,
         )
         .unwrap();
@@ -855,6 +878,10 @@ mod tests {
         assert_eq!(stats.context_tokens, Some(8929));
         assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
         assert_eq!(stats.name.as_deref(), Some("miao hooks"));
+        assert_eq!(
+            stats.last_prompt.as_deref(),
+            Some("Pinned GrokNight; no custom palettes")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

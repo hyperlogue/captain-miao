@@ -402,6 +402,7 @@ impl StatsCursor {
             model,
             first_prompt,
             name: None,
+            last_prompt: None,
             cursor: Some(self),
         }
     }

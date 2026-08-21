@@ -1279,6 +1279,28 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
         state.first_prompt = data.first_prompt.clone();
         changed = true;
     }
+    // Grok's `last_turn_summary`: the glance column on an idle/resumed row.
+    // Skip while the turn is in flight — `PromptSubmit` just wrote the user's
+    // question, and a sidecar rewrite from the *previous* turn must not
+    // clobber it. Waiting/compacting count as in-flight too.
+    if let Some(prompt) = data
+        .last_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && !matches!(
+            state.status,
+            SessionStatus::Active
+                | SessionStatus::Compacting
+                | SessionStatus::WaitingForApproval
+                | SessionStatus::WaitingForDecision
+                | SessionStatus::BackgroundActive
+        )
+        && state.last_prompt.as_deref() != Some(prompt)
+    {
+        state.last_prompt = Some(prompt.to_string());
+        changed = true;
+    }
     // Last-write-wins and Some-only, like the token count: an empty fold has
     // not learned the session is untitled, and a `/rename` (or Grok's auto
     // refresh) is a real new value.
@@ -2211,5 +2233,25 @@ mod tests {
             &TranscriptStats::default()
         ));
         assert_eq!(state.name.as_deref(), Some("miao hooks"));
+    }
+
+    /// Grok's `last_turn_summary` lands on `last_prompt` at rest (resume, idle)
+    /// and is left alone while the turn is in flight — `PromptSubmit` just
+    /// wrote the user's question.
+    #[test]
+    fn a_last_prompt_fold_writes_at_rest_and_spares_an_active_turn() {
+        let recap = TranscriptStats {
+            last_prompt: Some("Pinned GrokNight".to_string()),
+            ..TranscriptStats::default()
+        };
+
+        let mut idle = state_with(SessionStatus::Idle);
+        assert!(apply_transcript_data(&mut idle, &recap));
+        assert_eq!(idle.last_prompt.as_deref(), Some("Pinned GrokNight"));
+
+        let mut active = state_with(SessionStatus::Active);
+        active.last_prompt = Some("make it darker".into());
+        assert!(!apply_transcript_data(&mut active, &recap));
+        assert_eq!(active.last_prompt.as_deref(), Some("make it darker"));
     }
 }

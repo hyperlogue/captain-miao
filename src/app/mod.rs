@@ -5086,9 +5086,10 @@ impl App {
             filter_text.push(' ');
         }
         filter_text.push_str(&format!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             primary,
             saved_name.as_deref().unwrap_or(""),
+            c.first_prompt.as_deref().unwrap_or(""),
             c.cwd,
             c.git_branch.as_deref().unwrap_or(""),
             c.agent.label(),
