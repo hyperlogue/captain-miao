@@ -199,7 +199,7 @@ Status, launch, resume and the **title, token and model columns** work. Esc mid-
 
 Status, launch, resume, fork, worktrees, and the **title, token and model columns** all work. An interrupt (Esc / Ctrl+C) settles the row — Grok 1.0.4 fires `StopCancelled` for one.
 
-- **No background-task tiers**, and **the worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch.
+- **The worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch. A `Stop` with live background work (`backgroundTasks` / `/loop` crons) does land on Task / Server / Review — an `r3 watch` is Review.
 - **`~/.grok/hooks/captain-miao.json` is always loaded**, including in grok sessions you start yourself. `miao hook` exits immediately when it has no launcher socket, so those events are discarded.
 
 #### opencode support

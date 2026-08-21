@@ -1277,18 +1277,13 @@ impl AgentControl {
             // is still running means "the foreground turn ended" and the row
             // reads Idle — never `BackgroundServer` or `ReviewPending`.
             AgentControl::Kimi => None,
-            // `None` **for now, and the data is already in hand** — the one arm
-            // here that is deferred rather than absent. Grok reports its live
-            // background work on the `Stop` payload itself (`backgroundTasks`,
-            // each with an `id`, a `type` of `shell` / `monitor` / `subagent`, a
-            // status and its command text, plus `sessionCrons`), which is
-            // strictly better than Claude's process-tree walk: it comes from the
-            // agent that owns the tasks, at the moment it decides the turn is
-            // over, and a `monitor` is at-rest by construction rather than by
-            // command-text heuristic. Routing it here needs a new
-            // `LauncherState` field to carry the list from the launcher's hook
-            // arm, which is seam work and belongs in its own commit — so a `Stop`
-            // while a background task runs currently reads as `Idle`.
+            // The live list is applied at Stop in `grok::dispatch_hook` rather
+            // than here: Grok names its background work on the payload itself
+            // (`backgroundTasks` / `sessionCrons`), which a pid-only tree walk
+            // would miss (monitors, subagents, `/loop` crons) and would disagree
+            // with the agent that just decided the turn is over. A `Stop` with
+            // in-flight work therefore lands on `Task` / `Server` / `Review`
+            // without this method ever seeing the pid.
             AgentControl::Grok => None,
             // No background-shell concept in anything design §9 names, so a
             // `session.idle` while something else is still running means "the

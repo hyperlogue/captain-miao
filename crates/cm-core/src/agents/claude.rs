@@ -807,7 +807,7 @@ fn parse_ps_child_cmdlines(ps_output: &str, pid: u32) -> Vec<String> {
 /// invocations:
 ///   r3 watch <review-id>                        (alias / compiled binary)
 ///   bun <…>/r3/cli/index.ts watch <review-id>   (run from source)
-fn is_r3_watch_command(cmd: &str) -> bool {
+pub(crate) fn is_r3_watch_command(cmd: &str) -> bool {
     // The distinctive review-id form: `watch review_<hex>`.
     if cmd.contains("watch review_") {
         return true;

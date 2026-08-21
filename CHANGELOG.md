@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Grok session with live background work no longer reads as Idle.** `Stop`
+  carries `backgroundTasks` / `sessionCrons`; an `r3 watch` now lands on
+  Review, a parked server or `/loop` on Server, and a finite task on Task.
 - **A Grok background subagent no longer wears the parent's title.** Child
   sessions live as siblings under the same cwd-key and share the hook socket;
   the launcher was adopting their `summary.json` before dispatch could ignore
