@@ -523,10 +523,9 @@ impl AgentControl {
     /// [`Self::hooks_settings_json`] returns, so [`Self::forwarded_events`] can
     /// see the whole subscription rather than the largest part of it.
     ///
-    /// Empty for every backend today. Grok's approval used to live in a second
-    /// site (`[[ui.notifications.hooks]]` in `config.toml`); it now rides the
-    /// lifecycle `Notification` matcher in the settings file. The seam stays
-    /// so a future second site does not have to re-derive `forwarded_events`.
+    /// Currently empty: every backend's hooks live in the file
+    /// [`Self::hooks_settings_json`] returns. The seam stays so a second site
+    /// does not have to re-derive [`Self::forwarded_events`].
     fn extra_hook_registrations(self) -> Vec<String> {
         match self {
             AgentControl::Grok
@@ -559,14 +558,9 @@ impl AgentControl {
             // title store (the title rides the hook payload), no transcript
             // read. There is no file whose change could make a Kimi row stale.
             AgentControl::Kimi => vec![],
-            // Nothing *yet*, and the blocker has moved: `list_resumable` now
-            // reads `sessions/<cwd-key>/<id>/summary.json`, so both the cwd-key
-            // encoding (walk every key — Grok's own resolver does) and the JSON
-            // spellings are settled. What is left is a decision, not a schema
-            // question: `summary.json` holds the title, model and git head, and
-            // watching `sessions/` would mean folding a whole JSON file on every
-            // append rather than advancing a byte cursor. `miao-y5m.5` carries
-            // it; when that lands, `sessions/` is what belongs here.
+            // Nothing: title, tokens and model arrive on the hook / transcript
+            // fold and are written to the state file, which the host already
+            // watches.
             AgentControl::Grok => vec![],
             // Nothing: every fact an opencode row carries rides the plugin's
             // events. Its sessions do sit on disk — JSON blobs under

@@ -18,11 +18,6 @@
 //! Codex's equivalent is an owned profile selected with `--profile`; this is
 //! the same owned-file-in-the-real-home idea, without a selector.
 //!
-//! A previous revision relocated the whole tree with `GROK_HOME` pointing at a
-//! synthetic home. Sessions minted there are moved into the real home on the
-//! next launch ([`migrate_legacy_synth_home`]); the leftover synth dir is
-//! otherwise ignored and safe to delete.
-//!
 //! **Approval is the lifecycle `Notification` / `permission_prompt` matcher**
 //! in that same hooks file. There is no second site in `config.toml`.
 //!
@@ -66,8 +61,7 @@ const HOOKS_FILE: &str = "captain-miao.json";
 // Filesystem locations
 // =============================================================================
 
-/// The Grok home the launched agent will use — `$GROK_HOME` if the user set one
-/// globally, else `~/.grok` (`17-sessions.md`). We no longer override this.
+/// `$GROK_HOME` if set, else `~/.grok` (`17-sessions.md`).
 fn grok_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("GROK_HOME") {
         let p = PathBuf::from(h);
@@ -86,34 +80,8 @@ fn grok_home() -> Option<PathBuf> {
 /// an id (`resolve_local_session_any_cwd_in_root` walks every key), and the cwd
 /// we want is inside `summary.json` anyway. So the key is a directory to iterate,
 /// never a string to parse.
-///
-/// Session stores to walk: the real home, plus a leftover synthetic home from
-/// before hooks lived in `~/.grok`. Canonicalized so a leftover symlink at the
-/// synth path is not scanned twice.
-fn session_store_roots() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut push = |p: PathBuf| {
-        if !p.is_dir() {
-            return;
-        }
-        let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-        if seen.insert(key) {
-            out.push(p);
-        }
-    };
-    if let Some(home) = grok_home() {
-        push(home.join("sessions"));
-    }
-    push(legacy_synth_home().join("sessions"));
-    out
-}
-
-/// Previous revision's synthetic `$GROK_HOME`. Ignored after
-/// [`migrate_legacy_synth_home`] has run; kept so the resume picker still finds
-/// sessions that have not been moved yet, and so that move has a source.
-fn legacy_synth_home() -> PathBuf {
-    crate::state::state_dir().join("grok-home")
+fn sessions_root() -> Option<PathBuf> {
+    Some(grok_home()?.join("sessions"))
 }
 
 // =============================================================================
@@ -172,21 +140,11 @@ struct SummaryInfo {
 /// so it cannot disagree with the store the way a copied id inside the file
 /// could.
 ///
-/// No token count comes back with it, and that is Grok's design rather than a
-/// gap here: its usage ledgers are explicitly not serialized, so the only
-/// numbers on disk are per-request ones in `chat_history.jsonl` that would have
-/// to be re-folded into a context total. The model *is* on disk, and rides
-/// along.
+/// The picker does not fold a token count: that lives on the running row via
+/// `signals.json`, not on a resume candidate.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    let mut found = Vec::new();
-    for root in session_store_roots() {
-        found.extend(list_resumable_in(&root, usize::MAX));
-    }
-    found.sort_by_key(|c| std::cmp::Reverse(c.mtime));
-    let mut seen = std::collections::HashSet::new();
-    found.retain(|c| seen.insert(c.session_id.clone()));
-    found.truncate(limit);
-    Ok(found)
+    let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
+    Ok(list_resumable_in(&root, limit))
 }
 
 /// The scan itself, split from `$GROK_HOME` resolution so a test can point it
@@ -217,13 +175,15 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         if summary.info.cwd.trim().is_empty() {
             continue;
         }
+        let custom_title = summary.title();
+        let git_branch = Some(summary.info.head_branch).filter(|b| !b.trim().is_empty());
         out.push(ResumeCandidate {
             agent: crate::agent::AgentControl::Grok,
             session_id: session_id.to_string(),
-            cwd: summary.info.cwd.clone(),
+            cwd: summary.info.cwd,
             first_prompt: None,
-            custom_title: summary.title(),
-            git_branch: Some(summary.info.head_branch).filter(|b| !b.trim().is_empty()),
+            custom_title,
+            git_branch,
             mtime,
         });
     }
@@ -263,7 +223,6 @@ pub fn build_launch_command(
 /// launches never race a half-written hook file.
 fn install_hooks_file(contents: &str) -> Result<()> {
     let home = grok_home().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
-    migrate_legacy_synth_home(&home);
     let dir = home.join("hooks");
     crate::state::create_dir_all_private(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;
@@ -276,59 +235,6 @@ fn install_hooks_file(contents: &str) -> Result<()> {
             .with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
-}
-
-/// Names in the old synthetic home that are the agent's own state, moved into
-/// the real home so dropping `GROK_HOME` does not strand them. `hooks/` and
-/// `config.toml` stay behind: those were ours.
-const LEGACY_SYNTH_STATE: &[&str] = &[
-    "sessions",
-    "logs",
-    "relocations",
-    "worktrees.db",
-    "trusted_folders.toml",
-    "active_sessions.json",
-    "auth.json",
-];
-
-/// Best-effort move of leftover synthetic-home shadows into `real`. A symlink
-/// already points at the real home; a real file/dir is moved when `real` has
-/// no such name, or merged recursively when both sides are directories
-/// (session trees). Failures leave the source in place for the next launch.
-fn migrate_legacy_synth_home(real: &Path) {
-    let synth = legacy_synth_home();
-    if !synth.is_dir() {
-        return;
-    }
-    let _ = crate::state::create_dir_all_private(real);
-    for name in LEGACY_SYNTH_STATE {
-        relocate_entry(&synth.join(name), &real.join(name));
-    }
-}
-
-fn relocate_entry(src: &Path, dest: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(src) else {
-        return;
-    };
-    if meta.file_type().is_symlink() {
-        return;
-    }
-    if std::fs::symlink_metadata(dest).is_err() {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::rename(src, dest).is_ok() {
-            return;
-        }
-    }
-    if meta.is_dir()
-        && dest.is_dir()
-        && let Ok(entries) = std::fs::read_dir(src)
-    {
-        for entry in entries.flatten() {
-            relocate_entry(&entry.path(), &dest.join(entry.file_name()));
-        }
-    }
 }
 
 /// Build the contents of `$GROK_HOME/hooks/captain-miao.json`.
@@ -928,26 +834,6 @@ mod tests {
         assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
         assert_eq!(stats.name.as_deref(), Some("miao hooks"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A leftover synthetic-home session tree is merged into the real home
-    /// without clobbering a session that already exists there.
-    #[test]
-    fn leftover_synth_sessions_are_moved_into_the_real_home() {
-        let tag = std::process::id();
-        let synth = std::env::temp_dir().join(format!("cm-grok-mig-s-{tag}"));
-        let real = std::env::temp_dir().join(format!("cm-grok-mig-r-{tag}"));
-        let _ = std::fs::remove_dir_all(&synth);
-        let _ = std::fs::remove_dir_all(&real);
-        let src = synth.join("sessions").join("k").join("abc");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("summary.json"), "{}").unwrap();
-        std::fs::create_dir_all(real.join("sessions").join("k").join("keep")).unwrap();
-        relocate_entry(&synth.join("sessions"), &real.join("sessions"));
-        assert!(real.join("sessions/k/abc/summary.json").is_file());
-        assert!(real.join("sessions/k/keep").is_dir());
-        let _ = std::fs::remove_dir_all(&synth);
-        let _ = std::fs::remove_dir_all(&real);
     }
 
     /// One hooks file serves every session, so it must carry no per-session data;
