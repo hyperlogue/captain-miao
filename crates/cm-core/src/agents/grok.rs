@@ -38,9 +38,11 @@
 //!
 //! Interrupt, prompt, tokens and the hook-file schema are settled as of 1.0.4:
 //! `StopCancelled` is a first-class observe hook (Kimi's `Interrupt` standing),
-//! `UserPromptSubmit` carries `prompt`, the envelope carries `transcriptPath`,
-//! and `signals.json` persists `contextTokensUsed`. Unrecognized event names
-//! are still skipped, which is why `StopCancelled` is free on an older grok.
+//! `UserPromptSubmit` carries `prompt`, `summary.json` is resolved from the
+//! session id (1.0.4's documented common fields do not include `transcriptPath`),
+//! and `signals.json` persists `contextTokensUsed` / `contextWindowTokens`.
+//! Unrecognized event names are still skipped, which is why `StopCancelled` is
+//! free on an older grok.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -378,10 +380,10 @@ struct HookPayload {
     reason: Option<String>,
     /// `UserPromptSubmit` only.
     prompt: Option<String>,
-    /// Envelope field; the session directory's `updates.jsonl`, when Grok
-    /// names one. Rewritten to sibling `summary.json` so the launcher watches
-    /// the title file (and folds sibling `signals.json` from the same dir)
-    /// rather than every ACP append.
+    /// Optional. 1.0.4's documented common fields do not include it
+    /// (`sessionId`, `cwd`, …); when it is present it names `updates.jsonl`
+    /// and we rewrite it to sibling `summary.json`. When it is absent we
+    /// resolve the same file from `sessionId` — see [`summary_for`].
     transcript_path: Option<String>,
     /// Present on events that fire inside a subagent. Those must not move the
     /// parent row — a child's `StopCancelled` is not the session going idle.
@@ -401,11 +403,26 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .map(|_| true);
+    // Empty is *absent*, not a new identity — taking it would overwrite
+    // the id every later hook depends on.
+    let session_id = payload.session_id.filter(|s| !s.trim().is_empty());
+    // Prefer a named path (rewritten to `summary.json`); otherwise find the
+    // session dir from the id. 1.0.4's documented common fields do not include
+    // `transcriptPath`, and without a path the launcher never watches, so
+    // title / last-turn recap / tokens never leave the sidecars.
+    let transcript_path = payload
+        .transcript_path
+        .filter(|s| !s.trim().is_empty())
+        .map(|p| summary_path_for(&p))
+        .or_else(|| {
+            session_id
+                .as_deref()
+                .and_then(summary_for)
+                .map(|p| p.to_string_lossy().into_owned())
+        });
     Ok(HookMessage {
         event,
-        // Empty is *absent*, not a new identity — taking it would overwrite
-        // the id every later hook depends on.
-        session_id: payload.session_id.filter(|s| !s.trim().is_empty()),
+        session_id,
         tool_name: payload.tool_name,
         message: payload
             .error_details
@@ -416,24 +433,43 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         session_title: None,
         context_tokens: None,
         model: payload.model_id.filter(|s| !s.trim().is_empty()),
-        transcript_path: payload
-            .transcript_path
-            .filter(|s| !s.trim().is_empty())
-            .map(|p| summary_path_for(&p)),
+        transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child,
     })
 }
 
 /// Point the launcher at `summary.json` in the same session directory as
-/// `transcript`. Grok's envelope names `updates.jsonl`, which appends on every
-/// ACP event; the title, context total and model live in small sibling JSON
-/// files that rewrite at turn boundaries and on `/rename`.
+/// `transcript`. When Grok does name `transcriptPath` it is `updates.jsonl`,
+/// which appends on every ACP event; the title, recap, context total and model
+/// live in small sibling JSON files that rewrite at turn boundaries and on
+/// `/rename`.
 fn summary_path_for(transcript: &str) -> String {
     sidecar_dir(Path::new(transcript))
         .join("summary.json")
         .to_string_lossy()
         .into_owned()
+}
+
+/// `$GROK_HOME/sessions/<cwd-key>/<session_id>/summary.json`, or `None` if
+/// that directory isn't a persisted session. Same walk as [`list_resumable`]:
+/// the cwd-key is an encoding we never decode, and Grok's own id resolver
+/// walks every key when it has only an id.
+fn summary_for(session_id: &str) -> Option<PathBuf> {
+    summary_in(&sessions_root()?, session_id)
+}
+
+fn summary_in(root: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    for cwd_key in common::read_subdirs(root) {
+        let summary = cwd_key.join(session_id).join("summary.json");
+        if summary.is_file() {
+            return Some(summary);
+        }
+    }
+    None
 }
 
 fn sidecar_dir(path: &Path) -> &Path {
@@ -823,6 +859,34 @@ mod tests {
                 .tool_name
                 .is_none()
         );
+    }
+
+    /// 1.0.4's documented common fields omit `transcriptPath`. The session id
+    /// is enough: the summary sits at `sessions/<cwd-key>/<id>/summary.json`,
+    /// which is also how Grok itself resolves an id.
+    #[test]
+    fn the_session_id_finds_summary_json_when_the_envelope_names_no_transcript() {
+        let root = sessions_fixture(
+            "from-id",
+            &[("k", "abc123", r#"{"info":{"cwd":"/home/miao/p"}}"#)],
+        );
+        assert_eq!(
+            summary_in(&root, "abc123"),
+            Some(root.join("k").join("abc123").join("summary.json"))
+        );
+        assert!(summary_in(&root, "nope").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An id that matches nothing must not invent a path — the launcher would
+    /// watch a file that never appears and fold nothing, which looks the same
+    /// as "the agent sent no title" rather than "we guessed wrong".
+    #[test]
+    fn a_payload_without_transcript_path_leaves_the_path_unset_when_the_id_is_unknown() {
+        let msg = parse_hook_payload(HookEvent::Stop, r#"{"sessionId":"no-such-session"}"#)
+            .expect("parses");
+        assert_eq!(msg.session_id.as_deref(), Some("no-such-session"));
+        assert_eq!(msg.transcript_path, None);
     }
 
     /// `StopCancelled` is registered as `stop`, so an interrupt settles the row.

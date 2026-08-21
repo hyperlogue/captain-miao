@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`generated_title`, including `/rename`) lands on the row. The resume
   picker reads `head_branch` from the 1.0.4 summary shape, and
   `last_turn_summary` fills the last-prompt column on an idle or resumed
-  row. `StopCancelled` and the lifecycle `Notification` hook are the new
-  signals; older grok skips names it does not know.
+  row. `summary.json` is resolved from the session id so those folds run
+  even when the hook omits `transcriptPath` (1.0.4's documented common
+  fields do). `StopCancelled` and the lifecycle `Notification` hook are
+  the new signals; older grok skips names it does not know.
 - **Grok no longer uses a synthetic `GROK_HOME`.** Hooks go in
   `~/.grok/hooks/captain-miao.json`; `miao hook` is a no-op without a launcher
   socket, so sessions started outside captain-miao are unaffected.
