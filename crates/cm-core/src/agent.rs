@@ -991,7 +991,7 @@ impl AgentControl {
             // still unsettled — the plugin takes its turn-end from
             // `session.status`'s `idle` edge, and nothing source-read says
             // whether an Esc-interrupted turn reaches it. If it doesn't, this
-            // backend inherits Grok's stranded-`Active` row with nothing of the
+            // backend inherits a stranded-`Active` row with nothing of the
             // agent's to read instead; that is on the probe list in
             // `agents::opencode`.
             AgentControl::OpenCode => TranscriptScan::default(),

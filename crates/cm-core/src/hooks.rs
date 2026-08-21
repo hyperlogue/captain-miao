@@ -17,9 +17,6 @@ use crate::state::HookEvent;
 /// exit would only show up in the agent's hook scrollback. Exit 0 immediately
 /// so the spawn is a no-op rather than a failed turn.
 pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&str>) -> Result<()> {
-    let event = HookEvent::from_kebab(event)
-        .ok_or_else(|| anyhow::anyhow!("Unknown hook event: {event}"))?;
-
     let sock_owned;
     let sock_path = match resolve_sock(sock_path, std::env::var("CAPTAIN_MIAO_SOCK").ok()) {
         Some(s) => {
@@ -28,6 +25,9 @@ pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&s
         }
         None => return Ok(()),
     };
+
+    let event = HookEvent::from_kebab(event)
+        .ok_or_else(|| anyhow::anyhow!("Unknown hook event: {event}"))?;
 
     let mut buf = String::new();
     tokio::io::stdin().read_to_string(&mut buf).await?;
@@ -149,9 +149,6 @@ mod tests {
             resolve_sock(None, Some("/run/b.sock".into())),
             Some("/run/b.sock".into())
         );
-        // An empty --sock does not punch a hole through a real env var: the
-        // CLI omits the flag rather than passing empty, and an empty env is
-        // the outside-captain-miao case.
         assert_eq!(
             resolve_sock(Some(""), Some("/run/b.sock".into())),
             Some("/run/b.sock".into())

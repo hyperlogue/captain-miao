@@ -100,8 +100,7 @@ struct SessionSummary {
     /// [`Self::generated_title`] is empty.
     #[serde(default)]
     session_summary: String,
-    /// The session's display name: auto-generated, then overwritten by
-    /// `/rename`. `title_is_manual` records which, but both land here.
+    /// The session's display name: auto-generated, then overwritten by `/rename`.
     #[serde(default)]
     generated_title: String,
     #[serde(default)]
@@ -378,11 +377,8 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         .map(|_| true);
     Ok(HookMessage {
         event,
-        // Empty is *absent*, not a new identity. The approval hook synthesizes
-        // this field from `$GROK_SESSION_ID` in shell, so an unset variable would
-        // otherwise arrive as `""` and overwrite the launcher's real session id
-        // with nothing (`adopt_session_facts` takes the freshest id it is
-        // given).
+        // Empty is *absent*, not a new identity — taking it would overwrite
+        // the id every later hook depends on.
         session_id: payload.session_id.filter(|s| !s.trim().is_empty()),
         tool_name: payload.tool_name,
         message: payload
@@ -408,13 +404,18 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 /// ACP event; the title, context total and model live in small sibling JSON
 /// files that rewrite at turn boundaries and on `/rename`.
 fn summary_path_for(transcript: &str) -> String {
-    let path = Path::new(transcript);
-    let dir = if path.is_dir() {
+    sidecar_dir(Path::new(transcript))
+        .join("summary.json")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn sidecar_dir(path: &Path) -> &Path {
+    if path.is_dir() {
         path
     } else {
         path.parent().unwrap_or(path)
-    };
-    dir.join("summary.json").to_string_lossy().into_owned()
+    }
 }
 
 /// Whether a `Stop` payload is the one Grok fires as the **session** ends rather
@@ -488,11 +489,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// sibling `signals.json`'s `contextTokensUsed`. `prior` is unused: both files
 /// are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
-    let dir = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    let dir = sidecar_dir(path);
     let mut stats = TranscriptStats::default();
 
     #[derive(Deserialize, Default)]
@@ -625,10 +622,6 @@ mod tests {
         assert!(list_resumable_in(&root, 10).is_empty());
     }
 
-    /// **Hand-written from the payload documented in `10-hooks.md`, not captured
-    /// from a running binary** — no `grok` was installed when these were written.
-    /// A probe that captures real payloads (point a hook command at `tee`) should
-    /// diff them against these and correct them here first.
     fn payload(event: &str, extra: &str) -> String {
         format!(
             r#"{{"hookEventName":"{event}","sessionId":"s1","cwd":"/home/miao/p",
@@ -720,11 +713,9 @@ mod tests {
         }
     }
 
-    /// Approval is the one state that arrives from outside the lifecycle hooks,
-    /// carrying nothing but the session id the shell command synthesized. It must
-    /// still reach `WaitingForApproval`.
+    /// A `permission_prompt` Notification is forwarded as `PermissionRequest`.
     #[test]
-    fn the_notification_hooks_minimal_payload_reaches_waiting_for_approval() {
+    fn a_permission_request_reaches_waiting_for_approval() {
         let mut state = state_at(SessionStatus::Active);
         feed(
             &mut state,
@@ -735,9 +726,7 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("s1"));
     }
 
-    /// `$GROK_SESSION_ID` unset makes the approval hook print `"sessionId":""`.
-    /// An empty id is *absent*, never a rename of the session to nothing — taking
-    /// it would blank the id every hook after it depends on.
+    /// An empty id is *absent*, never a rename of the session to nothing.
     #[test]
     fn an_empty_session_id_never_clobbers_a_known_one() {
         let mut state = state_at(SessionStatus::Active);
@@ -777,8 +766,7 @@ mod tests {
         );
     }
 
-    /// `StopCancelled` is registered as `stop`, so an interrupt settles the row
-    /// the same way a genuine turn end does — the gap this backend used to ship.
+    /// `StopCancelled` is registered as `stop`, so an interrupt settles the row.
     #[test]
     fn an_interrupt_stop_cancelled_settles_the_row() {
         let mut state = state_at(SessionStatus::Active);

@@ -1255,8 +1255,8 @@ fn apply_session_name(state: &mut LauncherState, name: Option<String>) -> bool {
 /// track the fold (which may report None — matching the dashboard's old tail
 /// read), but `first_prompt` is only ever set *forward*: a fold that transiently
 /// lacks it must not clear a value we already have, since it's monotonic once found
-/// (first-wins prompt). The session *name* is not folded here — it comes from the
-/// agent's session file (`fold_session_name`), not the transcript.
+/// (first-wins prompt). `name` is Some-only too, but last-write-wins: a `/rename`
+/// is a real new value.
 fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> bool {
     let mut changed = false;
     // `Some`-only, like `first_prompt` below and for the same reason, now that a
