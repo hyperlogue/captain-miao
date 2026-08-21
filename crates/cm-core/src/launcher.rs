@@ -71,6 +71,7 @@ pub async fn run(
         child_pid: None,
         last_error: None,
         context_tokens: None,
+        context_window: None,
         model: None,
         name: None,
         first_prompt: None,
@@ -1271,6 +1272,10 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
         state.context_tokens = data.context_tokens;
         changed = true;
     }
+    if data.context_window.is_some() && state.context_window != data.context_window {
+        state.context_window = data.context_window;
+        changed = true;
+    }
     if data.model.is_some() && state.model != data.model {
         state.model = data.model.clone();
         changed = true;
@@ -2221,6 +2226,18 @@ mod tests {
         assert!(apply_transcript_data(&mut state, &folded));
         assert_eq!(state.context_tokens, Some(12_000));
         assert_eq!(state.model.as_deref(), Some("some-model-2"));
+
+        let windowed = TranscriptStats {
+            context_window: Some(500_000),
+            ..TranscriptStats::default()
+        };
+        assert!(apply_transcript_data(&mut state, &windowed));
+        assert_eq!(state.context_window, Some(500_000));
+        assert!(!apply_transcript_data(
+            &mut state,
+            &TranscriptStats::default()
+        ));
+        assert_eq!(state.context_window, Some(500_000));
 
         let renamed = TranscriptStats {
             name: Some("miao hooks".to_string()),

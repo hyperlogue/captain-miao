@@ -641,6 +641,7 @@ mod tests {
             child_pid: None,
             last_error: None,
             context_tokens: None,
+            context_window: None,
             model: None,
             name: None,
             first_prompt: Some("first prompt".into()),

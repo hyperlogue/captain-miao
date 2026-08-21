@@ -705,11 +705,20 @@ pub(super) fn format_relative_time(since: std::time::SystemTime) -> String {
 /// Color the context-length cell by pressure: warning (yellow) and critical
 /// (red) thresholds come from config — the yellow/red is semantic here, so it
 /// stays hardcoded rather than coming from colors.ui.
-pub(super) fn context_pressure_style(tokens: u64) -> Style {
+///
+/// When `window` is known (Grok's `contextWindowTokens`), pressure is a
+/// percentage of that window (70% warning, 90% critical) so a 500k-window
+/// row is not painted by Claude-sized absolute token cuts. Without a window
+/// the configured token thresholds apply, as they always have.
+pub(super) fn context_pressure_style(tokens: u64, window: Option<u64>) -> Style {
     let t = &crate::config::get().thresholds;
-    if tokens >= t.context_critical_tokens {
+    let (warn, crit) = match window.filter(|&w| w > 0) {
+        Some(w) => (w * 70 / 100, w * 90 / 100),
+        None => (t.context_warning_tokens, t.context_critical_tokens),
+    };
+    if tokens >= crit {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if tokens >= t.context_warning_tokens {
+    } else if tokens >= warn {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default()
@@ -793,6 +802,23 @@ pub(super) fn format_tokens(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         format!("{n}")
+    }
+}
+
+/// Table cell: a percentage of `window` when the agent reports one (`70%`,
+/// fits the 4-wide Ctx column), otherwise the used-token count.
+pub(super) fn format_context_cell(tokens: u64, window: Option<u64>) -> String {
+    match window.filter(|&w| w > 0) {
+        Some(w) => format!("{}%", (tokens.saturating_mul(100) / w).min(100)),
+        None => format_tokens(tokens),
+    }
+}
+
+/// Detail-panel Context line: `351k/500k` when the window is known.
+pub(super) fn format_context_detail(tokens: u64, window: Option<u64>) -> String {
+    match window.filter(|&w| w > 0) {
+        Some(w) => format!("{}/{}", format_tokens(tokens), format_tokens(w)),
+        None => format_tokens(tokens),
     }
 }
 
@@ -976,7 +1002,10 @@ pub(super) fn version_is_older(theirs: &str, ours: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_color, model_label, truncate_str, version_is_older};
+    use super::{
+        format_context_cell, format_context_detail, model_color, model_label, truncate_str,
+        version_is_older,
+    };
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
@@ -1048,5 +1077,14 @@ mod tests {
         assert!(!version_is_older("0.3.0-rc.1", "0.3.0"));
         assert!(!version_is_older("weird", "0.3.0"));
         assert!(!version_is_older("0.3.0", "weird"));
+    }
+
+    #[test]
+    fn context_cell_is_a_percentage_of_the_window_when_known() {
+        assert_eq!(format_context_cell(350_960, Some(500_000)), "70%");
+        assert_eq!(format_context_cell(500_000, Some(500_000)), "100%");
+        assert_eq!(format_context_cell(48_100, None), "48k");
+        assert_eq!(format_context_detail(350_960, Some(500_000)), "350k/500k");
+        assert_eq!(format_context_detail(48_100, None), "48k");
     }
 }

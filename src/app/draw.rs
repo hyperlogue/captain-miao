@@ -17,8 +17,9 @@ use crate::state::{HostId, LauncherState, SessionStatus};
 use super::format::{
     DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
     ansi_to_lines, bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width,
-    elapsed_cell, fade_style, format_elapsed, format_tokens, hint_badge, hint_pair, model_color,
-    model_label, override_indicator_spans, pill, session_display_name, truncate_str,
+    elapsed_cell, fade_style, format_context_cell, format_context_detail, format_elapsed,
+    hint_badge, hint_pair, model_color, model_label, override_indicator_spans, pill,
+    session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -1138,10 +1139,10 @@ impl App {
         let ctx_tokens = s.context_tokens;
         // `—` means "no number yet" — the first turn hasn't landed. A backend
         // that will never have one (`AgentCapabilities::context_tokens`:
-        // Reasonix and Grok persist no context total) says so instead, so the
-        // field stops reading as a session that stalled before its first reply.
+        // Reasonix) says so instead, so the field stops reading as a session
+        // that stalled before its first reply.
         let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
-            (Some(t), _) => format_tokens(t),
+            (Some(t), _) => format_context_detail(t, s.context_window),
             (None, true) => "—".to_string(),
             (None, false) => "n/a".to_string(),
         };
@@ -1155,7 +1156,9 @@ impl App {
             .as_deref()
             .map(|id| Style::default().fg(model_color(id)))
             .unwrap_or_default();
-        let ctx_style = ctx_tokens.map(context_pressure_style).unwrap_or_default();
+        let ctx_style = ctx_tokens
+            .map(|t| context_pressure_style(t, s.context_window))
+            .unwrap_or_default();
         let elapsed = format_elapsed(LauncherState::now().saturating_sub(s.updated_at));
 
         let label = |k: &'static str| {
@@ -1571,12 +1574,12 @@ impl App {
                     // indistinguishable from a session still on its first turn —
                     // so it says `n/a`, dimmed.
                     let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
-                        (Some(t), _) => format_tokens(t),
+                        (Some(t), _) => format_context_cell(t, s.context_window),
                         (None, true) => String::new(),
                         (None, false) => "n/a".to_string(),
                     };
                     let ctx_style = ctx_tokens
-                        .map(context_pressure_style)
+                        .map(|t| context_pressure_style(t, s.context_window))
                         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
                     let last_prompt = s
                         .last_prompt

@@ -726,6 +726,12 @@ pub struct LauncherState {
     /// Latest context-window token total.
     #[serde(default)]
     pub context_tokens: Option<u64>,
+    /// Size of the context window those tokens sit in, when the agent persists
+    /// one (Grok's `signals.json` `contextWindowTokens`). `None` from a backend
+    /// that only reports a used count, and from any host too old to send the
+    /// field. Skipped when empty so an old peer never sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Model id backing the latest turn (e.g. `claude-opus-4-8`, `gpt-5.5`).
     #[serde(default)]
     pub model: Option<String>,
@@ -829,6 +835,7 @@ impl LauncherState {
             child_pid: None,
             last_error: None,
             context_tokens: None,
+            context_window: None,
             model: None,
             name: None,
             first_prompt: None,
@@ -1237,6 +1244,7 @@ mod tests {
             child_pid: None,
             last_error: None,
             context_tokens: None,
+            context_window: None,
             model: None,
             name: None,
             first_prompt: None,

@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Grok Build tracking catches up to 1.0.4.** An interrupted turn settles
   instead of staying `Active`, the token and model columns fill from
-  `signals.json`, the prompt reaches the row, and the session title
+  `signals.json` (used tokens over `contextWindowTokens`, so the Ctx cell
+  is a percentage of Grok's window rather than Claude-sized absolute
+  cuts), the prompt reaches the row, and the session title
   (`generated_title`, including `/rename`) lands on the row. The resume
   picker reads `head_branch` from the 1.0.4 summary shape, and
   `last_turn_summary` fills the last-prompt column on an idle or resumed

@@ -512,8 +512,8 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 ///
 /// `path` is the `summary.json` [`parse_hook_payload`] rewrites `transcriptPath`
 /// to. The title is `generated_title` (auto or `/rename`); the context gauge is
-/// sibling `signals.json`'s `contextTokensUsed`. `prior` is unused: both files
-/// are small whole-JSON documents.
+/// sibling `signals.json`'s `contextTokensUsed` over `contextWindowTokens`.
+/// `prior` is unused: both files are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
     let mut stats = TranscriptStats::default();
@@ -524,12 +524,15 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         #[serde(default)]
         context_tokens_used: Option<u64>,
         #[serde(default)]
+        context_window_tokens: Option<u64>,
+        #[serde(default)]
         primary_model_id: Option<String>,
     }
     if let Ok(body) = std::fs::read_to_string(dir.join("signals.json"))
         && let Ok(signals) = serde_json::from_str::<Signals>(&body)
     {
         stats.context_tokens = signals.context_tokens_used.filter(|&n| n > 0);
+        stats.context_window = signals.context_window_tokens.filter(|&n| n > 0);
         stats.model = signals.primary_model_id.filter(|m| !m.trim().is_empty());
     }
 
@@ -864,7 +867,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("signals.json"),
-            r#"{"contextTokensUsed":8929,"primaryModelId":"grok-4.6"}"#,
+            r#"{"contextTokensUsed":8929,"contextWindowTokens":500000,"primaryModelId":"grok-4.6"}"#,
         )
         .unwrap();
         std::fs::write(
@@ -876,6 +879,7 @@ mod tests {
         .unwrap();
         let stats = read_transcript_stats(&dir.join("summary.json"));
         assert_eq!(stats.context_tokens, Some(8929));
+        assert_eq!(stats.context_window, Some(500_000));
         assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
         assert_eq!(stats.name.as_deref(), Some("miao hooks"));
         assert_eq!(

@@ -186,6 +186,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         child_pid: None,
         last_error: None,
         context_tokens: None,
+        context_window: None,
         model: None,
         name: None,
         first_prompt: None,

@@ -1499,6 +1499,11 @@ pub struct ResumeCandidate {
 pub struct TranscriptStats {
     /// Latest context-window token total, in tokens.
     pub context_tokens: Option<u64>,
+    /// The window those tokens sit in, when the agent persists one (Grok's
+    /// `contextWindowTokens`). `None` for backends that only report a used
+    /// count — the dashboard then colors against the configured absolute
+    /// thresholds rather than a percentage of this.
+    pub context_window: Option<u64>,
     /// Model id backing the latest turn (e.g. `claude-opus-4-8`, `gpt-5.5`).
     pub model: Option<String>,
     /// First real user prompt — the auto-title fallback shown before a rename

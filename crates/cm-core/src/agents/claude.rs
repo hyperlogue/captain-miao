@@ -403,6 +403,7 @@ impl StatsCursor {
             first_prompt,
             name: None,
             last_prompt: None,
+            context_window: None,
             cursor: Some(self),
         }
     }

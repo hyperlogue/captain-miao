@@ -431,6 +431,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
         first_prompt,
         name: None,
         last_prompt: None,
+        context_window: None,
         // Codex recomputes from a bounded tail each refresh — no incremental
         // cursor to carry.
         cursor: None,
