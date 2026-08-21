@@ -570,8 +570,9 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// hook and replaces the file, so the launcher re-arms its file watch after
 /// each wake rather than polling or watching the session directory. The
 /// context gauge is sibling `signals.json`'s `contextTokensUsed` over
-/// `contextWindowTokens`. `prior` is unused: both files are small whole-JSON
-/// documents.
+/// `contextWindowTokens` — that file is replaced independently, so it has the
+/// same file watch (started once it exists, never via the session dir).
+/// `prior` is unused: both files are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
     let mut stats = TranscriptStats::default();

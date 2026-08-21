@@ -1195,11 +1195,12 @@ impl AgentControl {
             AgentControl::Kimi => None,
             // Event-driven, and must stay that way: we watch sibling
             // `summary.json` (resolved from `transcriptPath` or the session
-            // id). Grok replaces that file whole on `/rename`, so the launcher
-            // re-arms the file watch after each wake (`transcript_path_is_replaced`)
-            // rather than polling or watching the session directory —
-            // `updates.jsonl` in that directory is the long-held-fd append
-            // stream we deliberately don't follow.
+            // id) and, once it exists, sibling `signals.json`. Grok replaces
+            // both whole, so the launcher re-arms those file watches after
+            // each wake (`transcript_path_is_replaced`) rather than polling
+            // or watching the session directory — `updates.jsonl` in that
+            // directory is the long-held-fd append stream we deliberately
+            // don't follow.
             AgentControl::Grok => None,
             // Moot, and structurally so rather than merely for now: opencode
             // keeps each message as its own JSON blob under `storage/`, so there
@@ -1230,6 +1231,21 @@ impl AgentControl {
     /// (Grok's `updates.jsonl`) would keep the loop spinning.
     pub fn transcript_path_is_replaced(self) -> bool {
         matches!(self, AgentControl::Grok)
+    }
+
+    /// Extra files rewritten the same way as the watched transcript path —
+    /// Grok's `signals.json` beside `summary.json`. The launcher watches each
+    /// only when it already exists: a missing sidecar must not fall back to
+    /// the session directory (`updates.jsonl` lives there). Empty for every
+    /// other backend.
+    pub fn replaced_sidecar_paths(self, transcript: &Path) -> Vec<PathBuf> {
+        match self {
+            AgentControl::Grok => {
+                let dir = transcript.parent().unwrap_or(transcript);
+                vec![dir.join("signals.json")]
+            }
+            _ => vec![],
+        }
     }
 
     /// The agent's currently-running `run_in_background` shells, read from the
@@ -2121,6 +2137,28 @@ mod tests {
         );
         for &(agent, want) in promised {
             assert_eq!(row(agent), want, "{agent:?}");
+        }
+    }
+
+    /// Grok rewrites `signals.json` independently of `summary.json` (also a
+    /// replace). Every other backend's tokens ride a hook or the watched
+    /// transcript itself, so they must not grow a sidecar watch — that watch
+    /// is how we'd accidentally sit on Grok's session dir.
+    #[test]
+    fn grok_replaced_sidecars_are_signals_json_beside_summary() {
+        let summary = PathBuf::from("/tmp/sess/summary.json");
+        assert_eq!(
+            AgentControl::Grok.replaced_sidecar_paths(&summary),
+            vec![PathBuf::from("/tmp/sess/signals.json")]
+        );
+        for &agent in AgentControl::ALL {
+            if agent == AgentControl::Grok {
+                continue;
+            }
+            assert!(
+                agent.replaced_sidecar_paths(&summary).is_empty(),
+                "{agent:?} must not watch Grok sidecars"
+            );
         }
     }
 }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Grok token counts follow a `signals.json` replace**, the same file-watch
+  re-arm as `/rename` on `summary.json` — not a poll, and not a watch on the
+  session directory.
+
 ## [0.6.1] - 2026-08-21
 
 ### Changed

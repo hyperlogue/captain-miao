@@ -455,6 +455,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     let (sess_tx, mut sess_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut transcript_watcher: Option<TranscriptWatch> = None;
     let mut transcript_path: Option<PathBuf> = None;
+    // Grok's `signals.json`: rewritten independently of `summary.json` (also
+    // a replace, not an in-place edit) and never named on the hook. Watched
+    // only once the file exists so we never fall back to the session dir.
+    let mut sidecar_watchers: Vec<TranscriptWatch> = Vec::new();
     // Byte offset into the transcript for incremental scanning. Reset to 0
     // whenever `transcript_path` changes so we pick up existing signals in
     // a resumed session.
@@ -640,6 +644,13 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         };
                         if adopted {
                             transcript_path = Some(path.clone());
+                            sidecar_watchers.clear();
+                            arm_replaced_sidecars(
+                                agent,
+                                &path,
+                                fs_tx.clone(),
+                                &mut sidecar_watchers,
+                            );
                             // Seed the offset to the new transcript's end so
                             // historical interrupt/compact signals from a
                             // resumed session aren't replayed as fresh.
@@ -654,6 +665,16 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                             apply_transcript_data(state, &data);
                             transcript_data = Some(data);
                         }
+                    } else if sidecar_watchers.is_empty() {
+                        // `signals.json` is often minted after the first
+                        // summary; a later hook is when we first see the file,
+                        // still event-driven (no poll, no parent-dir watch).
+                        arm_replaced_sidecars(
+                            agent,
+                            &path,
+                            fs_tx.clone(),
+                            &mut sidecar_watchers,
+                        );
                     }
                 }
 
@@ -738,11 +759,12 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 {
                     state_changed = true;
                 }
-                // Grok replaces `summary.json` (new inode). The wake above is
-                // the old inode's last event — re-arm on the path so the next
-                // `/rename` is seen too. Still event-driven: this runs only
-                // because notify just fired, never on a timer, and never by
-                // watching the session dir (`updates.jsonl` lives there).
+                // Grok replaces `summary.json` and `signals.json` (new inodes).
+                // The wake above is the old inode's last event — re-arm both
+                // so the next `/rename` or token rewrite is seen too. Still
+                // event-driven: this runs only because notify just fired,
+                // never on a timer, and never by watching the session dir
+                // (`updates.jsonl` lives there).
                 if agent.transcript_path_is_replaced()
                     && matches!(transcript_watcher, Some(TranscriptWatch::Event(_)))
                     && let Some(path) = &transcript_path
@@ -751,6 +773,8 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                         Ok(w) => transcript_watcher = Some(TranscriptWatch::Event(w)),
                         Err(e) => tracing::debug!("transcript rewatch failed: {e}"),
                     }
+                    sidecar_watchers.clear();
+                    arm_replaced_sidecars(agent, path, fs_tx.clone(), &mut sidecar_watchers);
                 }
                 if state.status != prev_status
                     || state.last_tool != prev_last_tool
@@ -1016,10 +1040,12 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 let _ = fs_tx.send(());
             }
         }
-        // `transcript_watcher` is otherwise held purely for its side effect — a
-        // live fs watch that stops when the value drops. The binding (not this
-        // line) is what keeps the watch alive until `run` returns.
+        // `transcript_watcher` / `sidecar_watchers` are otherwise held purely
+        // for their side effect — a live fs watch that stops when the value
+        // drops. The binding (not this line) is what keeps the watch alive
+        // until `run` returns.
         let _ = &transcript_watcher;
+        let _ = &sidecar_watchers;
     }
 }
 
@@ -1156,6 +1182,26 @@ async fn rescan_transcript(
     let changed = apply_transcript_data(state, &fresh);
     *data = Some(fresh);
     changed
+}
+
+/// Watch Grok's `signals.json` (and any later replaced sibling) only when the
+/// file already exists. [`start_file_watcher`] would otherwise fall back to the
+/// session directory, which also holds `updates.jsonl`.
+fn arm_replaced_sidecars(
+    agent: AgentControl,
+    transcript: &Path,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    dest: &mut Vec<TranscriptWatch>,
+) {
+    for path in agent.replaced_sidecar_paths(transcript) {
+        if !path.is_file() {
+            continue;
+        }
+        match start_file_watcher(&path, tx.clone()) {
+            Ok(w) => dest.push(TranscriptWatch::Event(w)),
+            Err(e) => tracing::debug!("sidecar watch failed: {e}"),
+        }
+    }
 }
 
 /// Watch a single file and signal `tx` on every non-Access change, via the
