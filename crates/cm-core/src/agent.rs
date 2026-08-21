@@ -466,10 +466,10 @@ impl AgentControl {
             AgentControl::Reasonix => caps(true, false, true, false),
             // No fork flag documented, so `f` hides itself.
             AgentControl::Kimi => caps(false, false, true, true),
-            // No context total: Grok keeps its token ledgers in memory rather
-            // than serializing them. `miao-y5m.4` holds the standing offer to
-            // revisit if that changes.
-            AgentControl::Grok => caps(true, true, true, false),
+            // Context total is `signals.json`'s `contextTokensUsed` — the
+            // in-memory billing ledgers still aren't serialized, but this
+            // sidecar is, and it is what `/session-info` shows.
+            AgentControl::Grok => caps(true, true, true, true),
             AgentControl::OpenCode => caps(true, false, true, true),
             // The one backend with no approval gate — see
             // [`AgentCapabilities::approval_gate`].
@@ -524,11 +524,11 @@ impl AgentControl {
     /// see the whole subscription rather than the largest part of it.
     ///
     /// Grok is the only backend with a second site and the reason this exists:
-    /// its approval signal is not a lifecycle hook at all but a
-    /// `[[ui.notifications.hooks]]` entry merged into the user's own
-    /// `~/.grok/config` at launch. Reading only the settings file would have
-    /// reported Grok as having no approval gate — the exact false negative that
-    /// would have hidden `WaitingForApproval` on the backend that has it.
+    /// its approval signal also lands as a `[[ui.notifications.hooks]]` entry
+    /// merged into the synthetic `config.toml` at launch, kept as a fallback
+    /// for grok versions whose lifecycle `Notification` event is missing. The
+    /// settings file now registers `permission_prompt` too, so this is
+    /// belt-and-braces rather than the only site.
     ///
     /// Still the real installed command, not a second declaration of it: this
     /// returns what the merge writes.
@@ -728,17 +728,11 @@ impl AgentControl {
             // cursor is Claude's, and this is a whole-file read of a log of
             // small records.
             AgentControl::Kimi => kimi::read_transcript_stats(transcript),
-            // Unreachable rather than unimplemented, the same shape as Reasonix
-            // but for a different reason: Grok's transcript path *is* derivable
-            // (cwd + session id), and `agents::grok` deliberately does not derive
-            // it. Of the two facts this would fold, one is gone and one is
-            // deferred — Grok serializes no context total at all
-            // (`AgentCapabilities::context_tokens` is `false`), and the model
-            // sits in `summary.json`, which is a whole-file JSON read rather than
-            // anything this byte-cursor fold could follow (`miao-y5m.5`). So a
-            // derived path today would only start a watch that folds nothing on
-            // every append.
-            AgentControl::Grok => TranscriptStats::default(),
+            // Reachable because the envelope names `transcriptPath`; the fold
+            // reads sibling `signals.json` / `summary.json` rather than the ACP
+            // stream. `prior` is unused: both files are small whole-JSON
+            // documents, not an appended log a byte cursor could follow.
+            AgentControl::Grok => grok::read_transcript_stats(transcript),
             // Unreachable **and settled**, which is the difference between this
             // arm and Reasonix's: opencode reports its tokens and model on the
             // hook itself. `message.updated` carries an `AssistantMessage` whose
@@ -997,16 +991,10 @@ impl AgentControl {
             // its rollout — Esc firing nothing — cannot arise. Nothing is
             // missing here, and nothing would be gained by adding it.
             AgentControl::Kimi => TranscriptScan::default(),
-            // Empty for the opposite reason to Reasonix's, and the honest gap in
-            // this backend: Grok *does* need a sentinel — `10-hooks.md` states
-            // that an interrupted (Esc / Ctrl-C) turn skips the Stop hooks
-            // entirely, exactly Codex's problem — but no source read named the
-            // line `updates.jsonl` gets on an abort. A guessed sentinel that
-            // never matches is indistinguishable from this, while looking like it
-            // works. The consequence is stated on the row's behalf in
-            // `agents::grok`: an interrupted turn stays `Active` until the next
-            // prompt. Moot until then anyway, since no Grok payload names a
-            // transcript for the launcher to watch.
+            // Empty for Kimi's reason: `StopCancelled` is a first-class observe
+            // hook (1.0.4), so the case that forced Codex to read its rollout —
+            // Esc firing nothing — cannot arise. Nothing would be gained by
+            // scanning `updates.jsonl` for a sentinel as well.
             AgentControl::Grok => TranscriptScan::default(),
             // Empty because there is no transcript to scan: opencode's sessions
             // are per-message JSON blobs under `storage/`, and no hook payload
@@ -1318,11 +1306,11 @@ impl AgentControl {
 /// mechanism for this at all*, never *we haven't wired it up yet*: the
 /// dashboard's answer to a missing capability is to stop offering the thing, and
 /// doing that to work that merely hasn't been done buries it as impossible.
-/// Pi's absent resume-picker entries and Grok's absent model column are both
-/// unfinished folds against data that exists, so neither is a field here — they
-/// are tracker items. Pi's missing approval gate is the opposite: `security.md`
-/// says the agent runs shell commands with its own permissions and has no
-/// per-tool prompt, so there is nothing to reflect however much code we write.
+/// Pi's absent resume-picker entries are an unfinished fold against data that
+/// exists, so they are not a field here — they are a tracker item. Pi's missing
+/// approval gate is the opposite: `security.md` says the agent runs shell
+/// commands with its own permissions and has no per-tool prompt, so there is
+/// nothing to reflect however much code we write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentCapabilities {
     /// A resume can **branch** rather than continue the session in place, so `f`
@@ -1345,7 +1333,7 @@ pub struct AgentCapabilities {
     /// only thing the dashboard owes the user is not to imply it looked.
     pub approval_gate: bool,
     /// A context-token total reaches the row at all, so an empty Context field
-    /// means "not yet" rather than "not ever". Reasonix and Grok answer `false`;
+    /// means "not yet" rather than "not ever". Reasonix answers `false`;
     /// see [`AgentControl::capabilities`] for why that is the agent's limit
     /// rather than ours.
     pub context_tokens: bool,
@@ -1907,9 +1895,11 @@ mod tests {
             // No `Elicitation`: opencode's `permission.updated` is the gate and
             // `permission.replied` releases it, so the approval pair carries
             // what a decision prompt would.
-            // `PermissionRequest` is here only because `extra_hook_registrations`
-            // contributes it: Grok's approval signal is a notification hook in
-            // the user's own config, not a lifecycle hook in the settings file.
+            // `PermissionRequest` is in the settings file via the lifecycle
+            // `Notification` / `permission_prompt` matcher, and again via
+            // `extra_hook_registrations` (the `[[ui.notifications.hooks]]`
+            // fallback). `StopCancelled` forwards as `Stop`, so it does not
+            // appear as its own variant.
             (
                 AgentControl::Grok,
                 &[
@@ -1917,6 +1907,7 @@ mod tests {
                     PromptSubmit,
                     PreToolUse,
                     PostToolUse,
+                    PostToolUseFailure,
                     PermissionRequest,
                     Stop,
                     StopFailure,
@@ -2099,7 +2090,7 @@ mod tests {
             (AgentControl::Codex, (true, false, true, true)),
             (AgentControl::Reasonix, (true, false, true, false)),
             (AgentControl::Kimi, (false, false, true, true)),
-            (AgentControl::Grok, (true, true, true, false)),
+            (AgentControl::Grok, (true, true, true, true)),
             (AgentControl::OpenCode, (true, false, true, true)),
             (AgentControl::Pi, (true, false, false, true)),
             (AgentControl::Antigravity, (false, false, false, false)),

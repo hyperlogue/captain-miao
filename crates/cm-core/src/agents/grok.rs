@@ -2,18 +2,11 @@
 //! payload shape; the dashboard reaches all of it only via
 //! `crate::agent::AgentControl::Grok`'s match arms.
 //!
-//! **Source-verified, never run.** No `grok` binary was available when this was
-//! written, so every claim below comes from reading `xai-org/grok-build@main` —
-//! the shipped user guide (`user-guide/{05-configuration,10-hooks,17-sessions,
-//! 22-permissions-and-safety}.md`, `custom-hooks.md`, `tutorial/06-worktrees.md`)
-//! and the sources `xai-grok-pager/src/notifications/{config,hooks}.rs`,
-//! `xai-grok-shell/src/session/storage/summary_write.rs`,
-//! `xai-grok-shell/src/extensions/notification.rs`. Each is cited where it
-//! matters so a later probe knows which file to re-read rather than which guess
-//! to re-derive. **Claims that source reading could not settle are marked
-//! _unverified_ at the point they are used and listed again at the bottom** —
-//! there are more of them here than in any other backend, and three of them are
-//! why this module ships deliberately smaller than the agent can support.
+//! Written from `xai-org/grok-build` (`10-hooks.md`, `17-sessions.md`,
+//! `crates/codegen/xai-grok-hooks/src/{event,matcher}.rs`) and checked against a
+//! live **1.0.4** binary: the hook JSON schema, the camelCase envelope, and
+//! `StopCancelled` are no longer guesses. Remaining limits are named at the
+//! point they still bite.
 //!
 //! **Isolation is `GROK_HOME`, and it has one extra wrinkle.**
 //! `17-sessions.md`: *"Set `GROK_HOME` to override the base directory; when it
@@ -30,9 +23,9 @@
 //!   every captain-miao session; leave the directory to the outer mirror and our
 //!   file would be written **through a symlink into the user's real `~/.grok`**,
 //!   which is the one thing a synthetic home exists to prevent.
-//! - **`config.toml`, a writable copy** rather than a symlink. The *only* reason
-//!   it is needed here is the approval hook below. Drop approval state and
-//!   `hooks/` alone would do.
+//! - **`config.toml`, a writable copy** rather than a symlink. Needed so the
+//!   pager-notify approval fallback can be merged in, and so Grok can persist
+//!   into a file that is frequently a read-only home-manager symlink.
 //!
 //! Everything else is a symlink, and that is the invariant rather than an
 //! enumeration: **`auth.json` in particular must be linked, never copied** — it
@@ -46,107 +39,32 @@
 //! than Codex, which pre-trusts its command hooks inside captain-miao's owned
 //! profile because it has no always-trusted user tier.
 //!
-//! **Approval arrives over a second, unrelated hook system.** Grok's lifecycle
-//! hooks have no approval event at all (the closest, `PermissionDenied`, fires
-//! *after* a refusal), so `WaitingForApproval` — the single most valuable state
-//! on the dashboard — would be unreachable. `notifications/config.rs` defines an
-//! independent mechanism whose `NotificationEventKind::ApprovalRequired` is
-//! exactly the missing signal, configured as `[[ui.notifications.hooks]]` in
-//! `config.toml`. Its contract differs from the lifecycle hooks in three ways
-//! that all bite (see [`notification_hook_command`] and
-//! [`with_notification_hook`]): stdin is `/dev/null` so there is no payload,
-//! everything arrives in the environment, and `only_unfocused` **defaults to
-//! `true`** — which would work in casual testing and silently stop working
-//! whenever the user was actually looking at the row.
+//! **Approval has two sites, on purpose.** The lifecycle `Notification` event
+//! with matcher `permission_prompt` is the 1.0.4 path (JSON on stdin, same
+//! hooks file as everything else). The pager's `[[ui.notifications.hooks]]`
+//! entry in `config.toml` is kept as a fallback for older grok, and is the
+//! reason `config.toml` is still a writable copy: drop that merge and `hooks/`
+//! alone would do. The pager path's contract still bites when it is the one
+//! that fires (see [`notification_hook_command`] and [`with_notification_hook`]):
+//! stdin is `/dev/null`, everything arrives in the environment, and
+//! `only_unfocused` **defaults to `true`**.
 //!
-//! **What this module deliberately does not do**, each because the shape of the
-//! data is unknown rather than because the feature is out of reach:
+//! **What this module still does not do**, and why:
 //!
-//! - **No transcript path, and so no transcript pipeline at all.** The path *is*
-//!   derivable — `$GROK_HOME/sessions/<url-encoded-cwd>/<session-id>/` per
-//!   `17-sessions.md` — but every consumer of it needs a line schema that source
-//!   reading did not settle: `updates.jsonl` is an ACP update stream carrying
-//!   `TurnCompleted.usage` and `AutoCompactStarted { tokens_used, context_window
-//!   }` (`extensions/notification.rs`) under an envelope nobody has seen.
-//!   Deriving the path now would start a watch that folds nothing on every
-//!   append. [`list_resumable`] does not need it — it walks the cwd-key
-//!   directories rather than encoding one, which is what Grok's own
-//!   `resolve_local_session_any_cwd_in_root` does when it has only an id.
-//! - **No token column, and this one is Grok's design rather than our gap.**
-//!   `xai-chat-state/src/usage.rs` opens with *"Per-prompt and per-session
-//!   billing ledgers (not serialized)"*, and the persisted `AssistantItem`
-//!   carries `model_id` but no usage — `TokenUsage` hangs off
-//!   `ConversationResponse`, which never reaches disk. So there is no number to
-//!   read, only per-request ones in `chat_history.jsonl` that would have to be
-//!   re-folded into a context total. If a token column is ever wanted here it
-//!   has to come over a hook, not off disk.
-//! - **No interrupt detection.** `10-hooks.md` is explicit that *"Interrupted
-//!   (Esc / Ctrl+C), refused, and max-turns turns skip Stop hooks entirely"*, so
-//!   Grok has Codex's problem — and Codex solves it by matching `turn_aborted`
-//!   in its rollout. The equivalent sentinel in `updates.jsonl` is **not named
-//!   in any source read**, and guessing one that never matches is
-//!   indistinguishable from not scanning while looking like it works. The
-//!   consequence is concrete and belongs on the row: **an interrupted turn stays
-//!   `Active` until the next prompt.** This is the top probe item.
 //! - **No background-task tiers.** `Stop` carries `backgroundTasks` and
-//!   `sessionCrons` — strictly better data than Claude's process-tree walk,
-//!   since it comes from the agent that owns the tasks at the moment the
-//!   decision is made — but routing it to the dashboard needs a new
-//!   `LauncherState` field, which is seam work and belongs in its own commit.
-//!   [`crate::agent::AgentControl::bg_shells`] answers `None` until then. The
-//!   payload already carries the data; nothing here has to be re-derived.
-//! - **No `prompt` on the row.** Every documented payload field is used, and
-//!   none of them is the user's prompt text (see [`HookPayload`]).
+//!   `sessionCrons` — strictly better data than Claude's process-tree walk —
+//!   but routing it to the dashboard needs a new `LauncherState` field, which
+//!   is seam work and belongs in its own commit.
+//!   [`crate::agent::AgentControl::bg_shells`] answers `None` until then.
+//! - **The worktree name isn't shown on the row.** Grok keeps worktrees in
+//!   `worktrees.db` rather than beside the repo; `summary.json`'s `head_branch`
+//!   is what the resume picker can show today.
 //!
-//! What a probe against a real binary must settle, worst-breakage first:
-//! - **the interrupt sentinel in `updates.jsonl`** — run a turn, hit Esc, diff
-//!   the appended lines. Blocks correct status;
-//! - **the schema of a `$GROK_HOME/hooks/*.json` file.** It is documented as a
-//!   *location*, never as a shape. [`build_hooks_settings`] writes Claude's,
-//!   inferred from Grok reading `~/.claude/settings.json` and `.cursor/hooks.json`
-//!   directly and from config-file hooks being spelled `[[hooks.<Event>]]`. If
-//!   that inference is wrong **no hook fires and every row sits at `Starting`**,
-//!   which is also what a typo looks like — check this before believing any
-//!   other symptom. **A second implementation exists to compare against**:
-//!   `manaflow-ai/cmux` ships a Grok adapter that writes
-//!   `~/.grok/hooks/cmux-session.json` and relocates the tree with `GROK_HOME`,
-//!   which independently corroborates the *location* and the one-JSON-file-per-
-//!   integration form — not the shape inside it, which is the part still
-//!   inferred. Read that adapter before running a probe; it is cheaper than a
-//!   capture and settles most of this item;
-//! - **which lifecycle events exist.** `PreToolUse`, `PostToolUse`, `Stop` and
-//!   `StopFailure` are named in the sources; `SessionStart`, `UserPromptSubmit`,
-//!   `PreCompact` and `PostCompact` are registered on the strength of
-//!   `10-hooks.md`'s *"unrecognized event names are skipped"*, which makes a
-//!   wrong name inert rather than fatal;
-//! - **the field carrying the user's prompt**, if there is one. One captured
-//!   `user_prompt_submit` payload settles it and is a one-line change here;
-//! - **whether the notification hook's `sh -c` inherits `$CAPTAIN_MIAO_SOCK`.**
-//!   It is `setsid`'d into its own process group and given three `GROK_*` vars;
-//!   whether it inherits the rest of the agent's environment is not stated. If
-//!   it does not, approval state silently never arrives and the fix is to embed
-//!   `--sock` — at the cost of a per-session `config.toml`;
-//! - **whether `only_unfocused = false` defeats the section-level
-//!   `condition = "unfocused"` / `idle_threshold_secs`** on `[ui.notifications]`.
-//!   Trigger an approval with the window focused;
-//! - **the session-directory layout end to end** — the cwd encoder byte-for-byte,
-//!   the `.cwd` fallback for names over 255 bytes, and the JSON key spellings in
-//!   `summary.json` / `updates.jsonl`. That one probe unlocks tokens, model,
-//!   titles and the resume picker together;
-//! - **cheap confirmations**: that `--worktree=<name>` launches into a worktree
-//!   from a non-TTY spawn, and that a `Stop` hook exiting 0 with empty stdout
-//!   never blocks the turn. Also that **`--resume <id>` is right for an
-//!   interactive spawn** — `10-hooks.md` gives `-r` as the *headless* spelling
-//!   and cmux's adapter uses `-r` even for a terminal pane, so the two forms may
-//!   simply be synonyms. If they are not, this arm is the one that has to move,
-//!   and it is shared with Claude.
-//! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
-//!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
-//!   this works if the agent reads the clipboard by shelling out to
-//!   `xclip`/`wl-paste`, and silently does nothing if it reads it in-process the
-//!   way Codex does — the one case no shim can serve. Untested either way, and
-//!   the only unknown here a *user* meets rather than a probe runner.
-//!   `clipboard-paste` in the session is the fallback that works regardless.
+//! Interrupt, prompt, tokens and the hook-file schema are settled as of 1.0.4:
+//! `StopCancelled` is a first-class observe hook (Kimi's `Interrupt` standing),
+//! `UserPromptSubmit` carries `prompt`, the envelope carries `transcriptPath`,
+//! and `signals.json` persists `contextTokensUsed`. Unrecognized event names
+//! are still skipped, which is why `StopCancelled` is free on an older grok.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -156,7 +74,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
-use crate::agent::ResumeCandidate;
+use crate::agent::{ResumeCandidate, TranscriptStats};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -205,7 +123,17 @@ fn grok_home() -> Option<PathBuf> {
 /// an id (`resolve_local_session_any_cwd_in_root` walks every key), and the cwd
 /// we want is inside `summary.json` anyway. So the key is a directory to iterate,
 /// never a string to parse.
+///
+/// Prefers the synthetic home's `sessions/` when that directory exists (a
+/// symlink to the real one after [`ensure_synth_home`] has run, or a leftover
+/// shadow from a launch that predates the seed). The dashboard process has no
+/// `GROK_HOME` of its own, so walking only `~/.grok/sessions` would miss every
+/// session minted inside captain-miao.
 fn sessions_root() -> Option<PathBuf> {
+    let synth = synth_home().join("sessions");
+    if synth.is_dir() {
+        return Some(synth);
+    }
     Some(grok_home()?.join("sessions"))
 }
 
@@ -244,6 +172,11 @@ struct SummaryInfo {
     /// a generation counter beside it; this is always the current one.
     #[serde(default)]
     cwd: String,
+    /// Branch checked out when the session last saved. Grok's worktrees live
+    /// in its own registry rather than beside the repo, so this is the only
+    /// branch name the picker can show.
+    #[serde(default)]
+    head_branch: String,
 }
 
 /// Every session under `$GROK_HOME/sessions/`, newest first.
@@ -299,10 +232,7 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
             cwd: summary.info.cwd,
             first_prompt: None,
             custom_title: Some(summary.session_summary).filter(|t| !t.trim().is_empty()),
-            // Grok keeps its worktrees in its own registry rather than beside
-            // the repo, and records no branch on the session, so there is
-            // nothing to show here.
-            git_branch: None,
+            git_branch: Some(summary.info.head_branch).filter(|b| !b.trim().is_empty()),
             mtime,
         });
     }
@@ -369,6 +299,44 @@ pub fn build_launch_command(
 /// Credentials are not affected — `auth.json` is linked rather than copied, and
 /// a first login, which has no real file to link to yet, is moved back out by
 /// [`SynthHome::adopt_agent_writes`].
+/// State directories Grok writes on first launch. Seeded in the *real* home
+/// so they exist to be linked — otherwise the agent mints them inside the
+/// synthetic home as a shadow the dashboard (which resolves `~/.grok`) never
+/// sees, and which [`SynthHome::ensure`] then quarantines the moment the real
+/// home grows the name. Same lesson as Kimi's `credentials/`.
+const SEEDED_STATE_DIRS: &[&str] = &["sessions", "logs", "relocations"];
+
+/// Top-level files Grok creates in its home. A dangling symlink lets
+/// `open(O_CREAT)` land the first write in the real home, the same trick
+/// Kimi uses for `session_index.jsonl`.
+const SEEDED_STATE_FILES: &[&str] = &[
+    "worktrees.db",
+    "trusted_folders.toml",
+    "active_sessions.json",
+];
+
+fn seed_real_state(real: &Path, synth: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::symlink_metadata(real).is_err() && std::fs::create_dir_all(real).is_ok() {
+        let _ = std::fs::set_permissions(real, std::fs::Permissions::from_mode(0o700));
+    }
+    for name in SEEDED_STATE_DIRS {
+        // A real directory already in the synthetic home is a shadow; seeding
+        // the real side first would make adopt skip it and the linking pass
+        // quarantine the live session tree.
+        let synth_p = synth.join(name);
+        if let Ok(meta) = std::fs::symlink_metadata(&synth_p)
+            && !meta.file_type().is_symlink()
+        {
+            continue;
+        }
+        let dest = real.join(name);
+        if std::fs::symlink_metadata(&dest).is_err() && std::fs::create_dir_all(&dest).is_ok() {
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
 fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
     let real = grok_home();
     let home = SynthHome {
@@ -379,13 +347,33 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
             name: "config.toml",
             snapshot: ".config-source.toml",
         }],
-        // Auto-managed credentials, which the module doc already says must be
-        // linked and never copied. Linking only works once the file exists, so
-        // a first login inside a session is adopted back out.
-        adopted: &["auth.json"],
+        // Auto-managed credentials plus the state trees that a first-ever
+        // captain-miao grok launch otherwise mints as shadows. Linking only
+        // works once the name exists in the real home, so anything already
+        // written into the synthetic copy is moved back out.
+        adopted: &[
+            "auth.json",
+            "sessions",
+            "logs",
+            "relocations",
+            "worktrees.db",
+            "trusted_folders.toml",
+            "active_sessions.json",
+        ],
         prune: false,
     };
+    if let Some(real) = &real {
+        seed_real_state(real, &home.dir);
+    }
     home.ensure()?;
+    if let Some(real) = &real {
+        for name in SEEDED_STATE_FILES {
+            let link = home.dir.join(name);
+            if std::fs::symlink_metadata(&link).is_err() {
+                let _ = std::os::unix::fs::symlink(real.join(name), &link);
+            }
+        }
+    }
 
     let hooks = SynthHome {
         dir: home.dir.join("hooks"),
@@ -517,29 +505,34 @@ fn with_notification_hook(config: &str, command: &str) -> Option<String> {
 
 /// Build the contents of `$GROK_HOME/hooks/captain-miao.json`.
 ///
-/// **The file's schema is the largest unverified thing in this module.** Grok
-/// documents the *location* of lifecycle hooks (`custom-hooks.md`) but no source
-/// read stated the JSON shape. This writes Claude's — `{"hooks": {<Event>:
-/// [{matcher, hooks: [{type, command}]}]}}` — on three pieces of evidence: Grok
-/// reads `~/.claude/settings.json` and `.cursor/hooks.json` directly, both of
-/// which are that shape under a top-level `hooks` key; its config-file hooks are
-/// spelled `[[hooks.<Event>]]`, i.e. an array of tables per PascalCase event;
-/// and its matchers are written in *Claude's* tool vocabulary (`Bash`, `Task`,
-/// `Edit`), which it rewrites to its own names internally.
+/// The schema is Claude's — `{"hooks": {<Event>: [{matcher, hooks: [{type,
+/// command}]}]}}` — which is what Grok loads from `~/.claude/settings.json` and
+/// from `~/.grok/hooks/*.json` (`xai-grok-hooks`, 1.0.4). Unrecognized event
+/// names are skipped, so a name an older grok lacks is inert.
 ///
-/// **Which events are registered**, and on what basis:
-/// - `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure` are named in the sources.
-/// - `SessionStart`, `UserPromptSubmit`, `PreCompact`, `PostCompact` are not, and
-///   are registered anyway because `10-hooks.md` states that **unrecognized
-///   event names are skipped** — so a name Grok lacks costs nothing, while
-///   omitting one it has costs a row that never settles.
-/// - `PermissionRequest` is deliberately absent: the lifecycle system has no
-///   approval event, and the state arrives over the notification hook instead
-///   ([`notification_hook_command`]). `PermissionDenied` exists but fires *after*
-///   a refusal, when there is no state of ours left to move.
-/// - `PostToolUseFailure`, `Elicitation`, `ElicitationResult` and `CwdChanged`
-///   are Claude affordances with no evidence behind them here; each either
-///   settles identically to an event we do register or moves nothing.
+/// **Which events are registered**, and as what:
+/// - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`,
+///   `SessionStart`, `UserPromptSubmit`, `PreCompact`, `PostCompact` forward
+///   under their own names.
+/// - **`StopCancelled` → `Stop`.** 1.0.4's observe hook for an interrupt,
+///   declined permission, max-turns or no-progress bail-out. A turn the user
+///   stopped is over, not failed — Kimi's `Interrupt` standing. The matcher is
+///   tested against `reason`; omitted, it fires for every cancel.
+/// - **`Notification` / `permission_prompt` → `PermissionRequest`.** The
+///   lifecycle hook that fires while a permission UI is waiting. The
+///   `[[ui.notifications.hooks]]` entry in `config.toml` is kept as a fallback
+///   for grok versions that only have the pager notify path.
+/// - **`Notification` / `idle_prompt` → `Stop`.** Grok's documented backstop
+///   for turns that report none of Stop / StopFailure / StopCancelled (bash
+///   mode, rewind, a superseded report). Delayed ~1 minute; cancelled if the
+///   next prompt arrives first.
+/// - `PermissionDenied` fires *after* a refusal, when there is no state of
+///   ours left to move. `Elicitation`, `ElicitationResult` and `CwdChanged`
+///   are Claude affordances Grok does not emit.
+///
+/// **No matcher on the match-all events.** Grok treats an omitted matcher as
+/// fire-all (`matcher_allows`); `"*"` also works (special-cased, not compiled
+/// as regex) but is the form that silently disarms Kimi, so we spell absence.
 ///
 /// **`Stop` carries an explicit `timeout` of 5 seconds.** It is the one event
 /// where the default is **600s** rather than 5 (Stop gates commonly run test
@@ -558,26 +551,23 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
 
-    let hook = |event: HookEvent| -> serde_json::Value {
-        serde_json::json!([{
-            "matcher": "*",
-            "hooks": [{
+    let group =
+        |forwarded: HookEvent, matcher: Option<&str>, timeout: Option<u64>| -> serde_json::Value {
+            let mut hook = serde_json::json!({
                 "type": "command",
-                "command": format!("{exe_q} hook --agent grok {}", event.as_kebab()),
-            }],
-        }])
-    };
-    // Same, plus the explicit timeout that only `Stop` needs.
-    let hook_with_timeout = |event: HookEvent, timeout: u64| -> serde_json::Value {
-        serde_json::json!([{
-            "matcher": "*",
-            "hooks": [{
-                "type": "command",
-                "command": format!("{exe_q} hook --agent grok {}", event.as_kebab()),
-                "timeout": timeout,
-            }],
-        }])
-    };
+                "command": format!("{exe_q} hook --agent grok {}", forwarded.as_kebab()),
+            });
+            if let Some(timeout) = timeout {
+                hook["timeout"] = serde_json::json!(timeout);
+            }
+            let mut group = serde_json::json!({ "hooks": [hook] });
+            if let Some(matcher) = matcher {
+                group["matcher"] = serde_json::json!(matcher);
+            }
+            group
+        };
+    let hook =
+        |event: HookEvent| -> serde_json::Value { serde_json::json!([group(event, None, None)]) };
 
     serde_json::json!({
         "hooks": {
@@ -585,10 +575,16 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
             "UserPromptSubmit": hook(HookEvent::PromptSubmit),
             "PreToolUse":       hook(HookEvent::PreToolUse),
             "PostToolUse":      hook(HookEvent::PostToolUse),
-            "Stop":             hook_with_timeout(HookEvent::Stop, 5),
+            "PostToolUseFailure": hook(HookEvent::PostToolUseFailure),
+            "Stop":             serde_json::json!([group(HookEvent::Stop, None, Some(5))]),
+            "StopCancelled":    hook(HookEvent::Stop),
             "StopFailure":      hook(HookEvent::StopFailure),
             "PreCompact":       hook(HookEvent::PreCompact),
             "PostCompact":      hook(HookEvent::PostCompact),
+            "Notification": serde_json::json!([
+                group(HookEvent::PermissionRequest, Some("permission_prompt"), None),
+                group(HookEvent::Stop, Some("idle_prompt"), None),
+            ]),
         }
     })
     .to_string()
@@ -603,21 +599,13 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
 /// **Field names are camelCase; the `hookEventName` *value* is snake_case**
 /// (`{"hookEventName": "pre_tool_use", …}`). We never read that value — the
 /// event rides our own argv, as it does for every backend — but the casing rule
-/// governs everything else here and is the single most likely thing to be
-/// silently wrong if the payload moves.
+/// governs everything else here. Confirmed against
+/// `xai-grok-hooks/src/event.rs` (1.0.4).
 ///
 /// Documented fields deliberately left out: `workspaceRoot` (the repo root;
-/// `cwd` is what the row shows), `timestamp`, `permissionMode` (`default` |
-/// `auto` | `plan` | `bypassPermissions` — free plan-mode detection, noted and
-/// not built), `toolInput`, `toolUseId`, `toolInputTruncated`, and `Stop`'s
-/// `backgroundTasks` / `sessionCrons` (see the module doc).
-///
-/// **No prompt field is read, because none is documented.** Every field above is
-/// accounted for and none of them carries the user's prompt text, so a Grok row
-/// shows no prompt until a real `user_prompt_submit` payload is captured. A
-/// plausible guess (`prompt`, Claude's spelling) would be indistinguishable from
-/// the agent not sending one, which is precisely the failure this module refuses
-/// to build in. The raw payload is forwarded regardless, so nothing is lost.
+/// `cwd` is what the row shows), `timestamp`, `permissionMode`, `toolInput`,
+/// `toolUseId`, `toolInputTruncated`, and `Stop`'s `backgroundTasks` /
+/// `sessionCrons` (see the module doc).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HookPayload {
@@ -631,11 +619,30 @@ struct HookPayload {
     /// `Stop` only: `end_turn` for a real turn end, `channel_closed` / `shutdown`
     /// for the one that fires as the session goes away. See [`is_session_end_stop`].
     reason: Option<String>,
+    /// `UserPromptSubmit` only.
+    prompt: Option<String>,
+    /// Envelope field; the session directory's `updates.jsonl`, when Grok
+    /// names one. Rewritten to sibling `signals.json` so the launcher watches
+    /// the small stats file rather than every ACP append.
+    transcript_path: Option<String>,
+    /// Present on events that fire inside a subagent. Those must not move the
+    /// parent row — a child's `StopCancelled` is not the session going idle.
+    subagent_type: Option<String>,
+    /// `SessionStart` only.
+    model_id: Option<String>,
+    /// `StopFailure` class (`rate_limit`, …) or `PostToolUseFailure` text.
+    error: Option<String>,
+    error_details: Option<String>,
 }
 
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse grok hook JSON from stdin")?;
+    let session_is_child = payload
+        .subagent_type
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|_| true);
     Ok(HookMessage {
         event,
         // Empty is *absent*, not a new identity. The approval hook synthesizes
@@ -645,27 +652,36 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // given).
         session_id: payload.session_id.filter(|s| !s.trim().is_empty()),
         tool_name: payload.tool_name,
-        // No documented error field on `StopFailure`; `dispatch_default` falls
-        // back to the raw payload for `last_error`, which is at least honest
-        // about what the agent actually said.
-        message: None,
+        message: payload
+            .error_details
+            .filter(|s| !s.trim().is_empty())
+            .or(payload.error.filter(|s| !s.trim().is_empty())),
         cwd: payload.cwd,
-        // Not in the payload — see [`HookPayload`].
-        prompt: None,
-        // Grok's title is per-session in `summary.json`, not on the hook.
+        prompt: payload.prompt.filter(|s| !s.trim().is_empty()),
         session_title: None,
-        // Grok records both per session, but on disk rather than on the
-        // payload; see the module doc's probe list.
         context_tokens: None,
-        model: None,
-        // Derivable but deliberately not derived — see the module doc. This is
-        // the field the launcher gates its entire transcript watch on, so `None`
-        // is what keeps the empty stats fold and the absent interrupt scan
-        // consistent rather than merely unimplemented.
-        transcript_path: None,
+        model: payload.model_id.filter(|s| !s.trim().is_empty()),
+        transcript_path: payload
+            .transcript_path
+            .filter(|s| !s.trim().is_empty())
+            .map(|p| signals_path_for(&p)),
         raw: Some(stdin.to_string()),
-        session_is_child: None,
+        session_is_child,
     })
+}
+
+/// Point the launcher at `signals.json` in the same session directory as
+/// `transcript`. Grok's envelope names `updates.jsonl`, which appends on every
+/// ACP event; the context total and model live in the sibling sidecar and
+/// rewrite at turn boundaries.
+fn signals_path_for(transcript: &str) -> String {
+    let path = Path::new(transcript);
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    dir.join("signals.json").to_string_lossy().into_owned()
 }
 
 /// Whether a `Stop` payload is the one Grok fires as the **session** ends rather
@@ -695,35 +711,83 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 // Hook event → status mapping
 // =============================================================================
 
-/// Grok's two departures from [`common::dispatch_default`]; everything else maps
+/// Grok's departures from [`common::dispatch_default`]; everything else maps
 /// the way every backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
-    // 1. A session-end `Stop` is not a turn end. Harmless for status either way
-    //    (the row is on its way out), but it is also the payload that will carry
-    //    `backgroundTasks` once those are wired, and reading *that* list from a
-    //    shutdown is how a session ends up looking like it has live background
-    //    work. Getting it right now costs one branch.
+    // A subagent's hooks share this process's socket. Adopting their session
+    // id would rename the parent row, and their Stop/StopCancelled would Idle
+    // a session that is still working. `10-hooks.md` is explicit: exit early
+    // when `subagentType` is present.
+    if msg.session_is_child == Some(true) {
+        return;
+    }
+
+    // A session-end `Stop` is not a turn end. Harmless for status either way
+    // (the row is on its way out), but it is also the payload that will carry
+    // `backgroundTasks` once those are wired, and reading *that* list from a
+    // shutdown is how a session ends up looking like it has live background
+    // work. Getting it right now costs one branch.
     if msg.event == HookEvent::Stop && is_session_end_stop(msg.raw.as_deref()) {
         common::adopt_session_facts(state, &mut msg);
         return;
     }
 
     match msg.event {
-        // 2. Events no hook of ours registers, so they never reach this
-        //    dispatcher (see `build_hooks_settings`). Ignored explicitly rather
-        //    than mapped defensively — the exhaustive match that forces a
-        //    decision on a newly-added `HookEvent` variant is
-        //    `common::dispatch_default`'s.
-        //
-        //    `PermissionRequest` is *not* in this list: it is the one event that
-        //    arrives from outside the lifecycle system, over the notification
-        //    hook, and it takes the shared arm.
-        HookEvent::PostToolUseFailure
-        | HookEvent::Elicitation
-        | HookEvent::ElicitationResult
-        | HookEvent::CwdChanged => {}
+        // Events no hook of ours registers, so they never reach this
+        // dispatcher (see `build_hooks_settings`). Ignored explicitly rather
+        // than mapped defensively — the exhaustive match that forces a
+        // decision on a newly-added `HookEvent` variant is
+        // `common::dispatch_default`'s.
+        HookEvent::Elicitation | HookEvent::ElicitationResult | HookEvent::CwdChanged => {}
         _ => common::dispatch_default(state, msg),
     }
+}
+
+// =============================================================================
+// Transcript fold (signals.json + summary.json)
+// =============================================================================
+
+/// Context total and model from the session directory Grok names on the hook.
+///
+/// `path` is the `signals.json` [`parse_hook_payload`] rewrites `transcriptPath`
+/// to. The context gauge is `contextTokensUsed` — the in-memory billing ledgers
+/// still aren't serialized, but this sidecar is, and it is what `/session-info`
+/// shows. `prior` is unused: both files are small whole-JSON documents.
+pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let mut stats = TranscriptStats::default();
+
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    struct Signals {
+        #[serde(default)]
+        context_tokens_used: Option<u64>,
+        #[serde(default)]
+        primary_model_id: Option<String>,
+    }
+    if let Ok(body) = std::fs::read_to_string(dir.join("signals.json"))
+        && let Ok(signals) = serde_json::from_str::<Signals>(&body)
+    {
+        stats.context_tokens = signals.context_tokens_used.filter(|&n| n > 0);
+        stats.model = signals.primary_model_id.filter(|m| !m.trim().is_empty());
+    }
+
+    #[derive(Deserialize, Default)]
+    struct Summary {
+        #[serde(default)]
+        current_model_id: Option<String>,
+    }
+    if stats.model.is_none()
+        && let Ok(body) = std::fs::read_to_string(dir.join("summary.json"))
+        && let Ok(summary) = serde_json::from_str::<Summary>(&body)
+    {
+        stats.model = summary.current_model_id.filter(|m| !m.trim().is_empty());
+    }
+    stats
 }
 
 // =============================================================================
@@ -759,7 +823,8 @@ mod tests {
             &[(
                 "cwd-key-1",
                 "abc123",
-                r#"{"info":{"cwd":"/home/miao/p"},"session_summary":"wire up the parser",
+                r#"{"info":{"cwd":"/home/miao/p","head_branch":"main"},
+                    "session_summary":"wire up the parser",
                     "num_messages":12,"current_model_id":"grok-build-0.1"}"#,
             )],
         );
@@ -768,6 +833,7 @@ mod tests {
         assert_eq!(out[0].session_id, "abc123");
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(out[0].git_branch.as_deref(), Some("main"));
         assert_eq!(out[0].agent, AgentControl::Grok);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -870,9 +936,10 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PromptSubmit,
-            &payload("user_prompt_submit", ""),
+            &payload("user_prompt_submit", r#","prompt":"wire up the parser""#),
         );
         assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_prompt.as_deref(), Some("wire up the parser"));
 
         feed(
             &mut state,
@@ -956,14 +1023,18 @@ mod tests {
     /// single most likely thing to be silently wrong if the source moves.
     #[test]
     fn the_payload_is_camel_case() {
-        let stdin = payload("post_tool_use", r#","toolName":"search_replace""#);
+        let stdin = payload(
+            "post_tool_use",
+            r#","toolName":"search_replace","transcriptPath":"/home/miao/p/s1/updates.jsonl""#,
+        );
         let msg = parse_hook_payload(HookEvent::PostToolUse, &stdin).expect("parses");
         assert_eq!(msg.session_id.as_deref(), Some("s1"));
         assert_eq!(msg.cwd.as_deref(), Some("/home/miao/p"));
         assert_eq!(msg.tool_name.as_deref(), Some("search_replace"));
-        // No transcript path is derived, which is what keeps the launcher's
-        // transcript machinery inert for Grok (see the module doc).
-        assert_eq!(msg.transcript_path, None);
+        assert_eq!(
+            msg.transcript_path.as_deref(),
+            Some("/home/miao/p/s1/signals.json")
+        );
         // A snake_case reading would find none of the above; guard the one field
         // whose absence would otherwise look like "the agent didn't send it".
         assert!(
@@ -972,6 +1043,62 @@ mod tests {
                 .tool_name
                 .is_none()
         );
+    }
+
+    /// `StopCancelled` is registered as `stop`, so an interrupt settles the row
+    /// the same way a genuine turn end does — the gap this backend used to ship.
+    #[test]
+    fn an_interrupt_stop_cancelled_settles_the_row() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::Stop,
+            &payload(
+                "stop_cancelled",
+                r#","reason":"user_interrupt","cancelledBy":"user""#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+    }
+
+    /// A subagent's turn-end must not Idle the parent or steal its session id.
+    #[test]
+    fn a_subagent_payload_is_ignored() {
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("parent".to_string());
+        feed(
+            &mut state,
+            HookEvent::Stop,
+            &payload(
+                "stop_cancelled",
+                r#","reason":"max_turns","subagentType":"explore""#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+    }
+
+    /// `signals.json` is the context gauge `/session-info` shows; the model
+    /// falls through to `summary.json` when the sidecar has none.
+    #[test]
+    fn signals_json_folds_tokens_and_model() {
+        let dir = std::env::temp_dir().join(format!("cm-grok-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("signals.json"),
+            r#"{"contextTokensUsed":8929,"primaryModelId":"grok-4.6"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"current_model_id":"ignored-when-signals-has-one"}"#,
+        )
+        .unwrap();
+        let stats = read_transcript_stats(&dir.join("signals.json"));
+        assert_eq!(stats.context_tokens, Some(8929));
+        assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One hooks file serves every session, so it must carry no per-session data;
@@ -991,17 +1118,18 @@ mod tests {
         assert_eq!(
             names,
             [
+                "Notification",
                 "PostCompact",
                 "PostToolUse",
+                "PostToolUseFailure",
                 "PreCompact",
                 "PreToolUse",
                 "SessionStart",
                 "Stop",
+                "StopCancelled",
                 "StopFailure",
                 "UserPromptSubmit",
-            ],
-            "approval is not a lifecycle event here — it arrives over the \
-             notification hook"
+            ]
         );
 
         let stop = &hooks["Stop"][0]["hooks"][0];
@@ -1015,7 +1143,34 @@ mod tests {
         );
         // Every other event takes the 5s default, so none of them says so.
         assert!(hooks["PreToolUse"][0]["hooks"][0].get("timeout").is_none());
-        assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
+        // Match-all is the matcher's absence — `"*"` is Grok-safe but the
+        // form that silently disarms Kimi, so we don't spell it.
+        assert!(hooks["PreToolUse"][0].get("matcher").is_none());
+        assert!(
+            hooks["StopCancelled"][0]["hooks"][0]["command"]
+                .as_str()
+                .expect("a command string")
+                .ends_with("hook --agent grok stop"),
+            "StopCancelled forwards as Stop"
+        );
+        let notify = hooks["Notification"]
+            .as_array()
+            .expect("notification groups");
+        assert_eq!(notify.len(), 2);
+        assert_eq!(notify[0]["matcher"], "permission_prompt");
+        assert!(
+            notify[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("hook --agent grok permission-request")
+        );
+        assert_eq!(notify[1]["matcher"], "idle_prompt");
+        assert!(
+            notify[1]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("hook --agent grok stop")
+        );
     }
 
     /// The approval hook's whole contract in one place: it synthesizes the JSON

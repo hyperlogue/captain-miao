@@ -71,7 +71,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. No support for pasting in remote sessions, as Codex reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
-| **[Grok Build](https://github.com/xai-org/grok-build)**          | Runs under a synthetic `GROK_HOME` that symlinks your real one. No token column (Grok doesn't persist one), and an interrupted turn keeps reading as working ([known limits](#grok-build-support)).                                                                    |
+| **[Grok Build](https://github.com/xai-org/grok-build)**          | Runs under a synthetic `GROK_HOME` that symlinks your real one. Token and model columns come off `signals.json`. Worktree name isn't shown on the row ([known limits](#grok-build-support)).                                                                          |
 | **[opencode](https://github.com/anomalyco/opencode)**            | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                          |
 | **[Pi](https://github.com/earendil-works/pi)**                   | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                                |
 | **[Antigravity](https://antigravity.google/docs/cli/reference)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
@@ -197,11 +197,9 @@ Status, launch, resume and the **title, token and model columns** work. Esc mid-
 
 #### Grok Build support
 
-Status, launch, resume, fork and worktrees all work.
+Status, launch, resume, fork, worktrees, and the **title, token and model columns** all work. An interrupt (Esc / Ctrl+C) settles the row — Grok 1.0.4 fires `StopCancelled` for one.
 
-- **An interrupted turn keeps reading as working** until you send the next prompt — Grok fires no hook for one. The limit most likely to bite day to day.
-- **No token column** — Grok deliberately doesn't persist its token ledgers.
-- **No background-task tiers**, and **the worktree name isn't shown** (Grok keeps worktrees in its own registry, not beside the repo).
+- **No background-task tiers**, and **the worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch.
 - **A `/model` change made inside a session doesn't reach your real config** — Grok's `config.toml` is a writable copy, so it's reset the next time you edit the real one. Logging in _is_ safe: credentials are moved back to your real `~/.grok` on the next launch.
 
 #### opencode support
@@ -262,8 +260,8 @@ heavily-evolved fork of pi, and is hooked with a generated extension passed as
   (`tool_approval_requested` / `tool_approval_resolved`), the one capability
   pi lacks. `s` jumps to a session blocked on one.
 - **Esc mid-turn settles the row immediately** — omp's `agent_end` fires on an
-  aborted run too, so the case that costs Grok and Antigravity a stranded
-  `Active` row cannot arise.
+  aborted run too, so the case that costs Antigravity a stranded `Active` row
+  cannot arise.
 - **No resume-picker entries** — omp's sessions are trees rather than logs
   (the same `parentId` shape pi's docs describe). `omp -r` opens omp's own
   picker meanwhile.
