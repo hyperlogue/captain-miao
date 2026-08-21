@@ -616,8 +616,10 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 // Hook event → status mapping
 // =============================================================================
 
-/// Grok's departures from [`common::dispatch_default`]; everything else maps
-/// the way every backend maps it.
+/// Grok's departures from [`common::dispatch_default`]: a session-end `Stop`,
+/// a `Stop` that names live background work, and `ask_user_question` (a
+/// blocking choice card, not work). Everything else maps the way every
+/// backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // A subagent's hooks share this process's socket. Adopting their session
     // id would rename the parent row, their Stop/StopCancelled would Idle a
@@ -672,6 +674,35 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
         // decision on a newly-added `HookEvent` variant is
         // `common::dispatch_default`'s.
         HookEvent::Elicitation | HookEvent::ElicitationResult | HookEvent::CwdChanged => {}
+        // `ask_user_question` is Grok's AskUserQuestion analog — a tool that
+        // renders a multiple-choice card and blocks until the user picks. It
+        // is auto-allowed (the permission_prompt Notification, when it fires
+        // at all, resolves in 0ms), so this `PreToolUse` is the only signal
+        // the session is waiting. Without an arm here the row sits at plain
+        // `Active` for as long as the card is up. Surface it as
+        // `WaitingForDecision` ("Decision"), the same bucket as Claude's
+        // `AskUserQuestion`, Codex's `request_user_input` and Reasonix's
+        // `ask`. A gated `ask_user_question` that does fire
+        // `PermissionRequest` lands here too, so it reads as a question
+        // rather than a tool-approval gate.
+        HookEvent::PreToolUse | HookEvent::PermissionRequest
+            if msg.tool_name.as_deref() == Some("ask_user_question") =>
+        {
+            common::adopt_session_facts(state, &mut msg);
+            state.status = SessionStatus::WaitingForDecision;
+            state.last_tool = msg.tool_name;
+        }
+        // Grok issues tools in parallel. A `search_replace` PostToolUse 35ms
+        // after `ask_user_question`'s PreToolUse is the shared mapping
+        // snapping Decision back to Active while the card is still up. Hold
+        // the row until the question tool itself completes — that
+        // PostToolUse takes the shared mapping through the catch-all.
+        HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            if state.status == SessionStatus::WaitingForDecision
+                && msg.tool_name.as_deref() != Some("ask_user_question") =>
+        {
+            common::adopt_session_facts(state, &mut msg);
+        }
         _ => common::dispatch_default(state, msg),
     }
 }
@@ -1158,6 +1189,91 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
         assert_eq!(state.session_id.as_deref(), Some("s1"));
+    }
+
+    /// `ask_user_question` renders a multiple-choice card and blocks on the
+    /// answer. Grok auto-allows it (no `PermissionRequest` in the launcher
+    /// log), so this `PreToolUse` is the only evidence the session is waiting,
+    /// and it must not read as `Active`. Captured from a live session: the
+    /// launcher logged `PreToolUse tool=Some("ask_user_question")` and the
+    /// row stayed Active while the card was up.
+    #[test]
+    fn the_ask_user_question_tool_is_a_decision_not_plain_work() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("pre_tool_use", r#","toolName":"ask_user_question""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.last_tool.as_deref(), Some("ask_user_question"));
+
+        // The answer arrives as the paired PostToolUse, which settles the row
+        // back to Active through the shared mapping.
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload("post_tool_use", r#","toolName":"ask_user_question""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool, None);
+    }
+
+    /// A gated `ask_user_question` that does fire `permission_prompt` is
+    /// still a question, not a tool-approval gate.
+    #[test]
+    fn a_permission_request_for_ask_user_question_is_decision() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            &payload("notification", r#","toolName":"ask_user_question""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.last_tool.as_deref(), Some("ask_user_question"));
+    }
+
+    /// Grok issued `search_replace` and `ask_user_question` in the same
+    /// burst; the edit's PostToolUse landed 35ms after the question's
+    /// PreToolUse. The shared mapping would have flashed Decision then
+    /// snapped back to Active while the card was still up.
+    #[test]
+    fn a_parallel_tool_does_not_clear_a_question_card() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("pre_tool_use", r#","toolName":"search_replace""#),
+        );
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("pre_tool_use", r#","toolName":"ask_user_question""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload("post_tool_use", r#","toolName":"search_replace""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.last_tool.as_deref(), Some("ask_user_question"));
+
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload("pre_tool_use", r#","toolName":"read_file""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload("post_tool_use", r#","toolName":"ask_user_question""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool, None);
     }
 
     /// An empty id is *absent*, never a rename of the session to nothing.
