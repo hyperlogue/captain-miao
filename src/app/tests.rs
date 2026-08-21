@@ -3414,6 +3414,14 @@ fn picker_input_text(app: &super::App) -> &str {
     app.picker.as_ref().expect("picker").picker.input.text()
 }
 
+fn workdir_visible_paths(app: &super::App) -> Vec<String> {
+    let p = &app.picker.as_ref().expect("picker").picker;
+    p.filtered()
+        .into_iter()
+        .map(|i| p.items[i].payload.clone().unwrap_or_default())
+        .collect()
+}
+
 #[test]
 fn shift_o_enters_workdir_picker() {
     let mut d = TestDashboard::new(120, 15);
@@ -3522,6 +3530,33 @@ fn workdir_picker_submits_the_canonical_form() {
 }
 
 #[test]
+fn canonicalize_typed_workdir_home_prefixes_a_bare_name() {
+    use super::canonicalize_typed_workdir;
+    assert_eq!(canonicalize_typed_workdir("sys"), "~/sys");
+    assert_eq!(canonicalize_typed_workdir("/var/log"), "/var/log");
+    assert_eq!(canonicalize_typed_workdir("~/foo"), "~/foo");
+    assert_eq!(canonicalize_typed_workdir("./src"), "./src");
+    assert_eq!(canonicalize_typed_workdir("foo/bar"), "foo/bar");
+    assert_eq!(canonicalize_typed_workdir("  src  "), "~/src");
+}
+
+#[test]
+fn workdir_match_quality_orders_exact_then_prefix_then_substring() {
+    use super::workdir_match_quality;
+    assert!(
+        workdir_match_quality("sys", "~/sys") > workdir_match_quality("sys", "~/.system-config")
+    );
+    assert!(
+        workdir_match_quality("/var/log", "/var/log")
+            > workdir_match_quality("/var/log", "/var/log/archive")
+    );
+    assert!(
+        workdir_match_quality("/var/log", "/var/log/archive")
+            > workdir_match_quality("sys", "~/.system-config")
+    );
+}
+
+#[test]
 fn workdir_picker_lists_recent_cwds() {
     let mut d = TestDashboard::new(120, 15);
     // The list arrives host-canonical from the backend, so what's stored, what's
@@ -3562,12 +3597,11 @@ fn workdir_picker_free_input_when_no_match() {
     d.press(KeyCode::Char('O'));
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-    // Type a path that matches no recent.
+    // Type a path that matches no recent — it becomes the only row.
     for c in "/var/log".chars() {
         d.press(KeyCode::Char(c));
     }
-    let picker = &d.app.picker.as_ref().unwrap().picker;
-    assert_eq!(picker.filtered().len(), 0);
+    assert_eq!(workdir_visible_paths(&d.app), vec!["/var/log"]);
 
     let action = d.press(KeyCode::Enter);
     match action {
@@ -3577,21 +3611,39 @@ fn workdir_picker_free_input_when_no_match() {
 }
 
 #[test]
-fn workdir_picker_bare_name_launches_when_no_match() {
-    // A bare name with no filter match is still free input (cwd-relative), so
-    // typing `src` in a tree that has that directory still launches there.
+fn workdir_picker_bare_name_launches_home_relative_when_no_match() {
+    // A bare name is `~/name`, not cwd-relative — that's how `sys` avoids
+    // Linux `/sys` when the dashboard's cwd is `/`.
     let mut d = TestDashboard::new(120, 15);
-    d.app.dir_exists = |p| p == "src";
+    d.app.dir_exists = |p| p == "/home/test/src";
     d.app.recent_cwds = vec!["/home/test/alpha".to_string()];
     d.press(KeyCode::Char('O'));
     for c in "src".chars() {
         d.press(KeyCode::Char(c));
     }
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 0);
+    assert_eq!(workdir_visible_paths(&d.app), vec!["~/src"]);
 
     let action = d.press(KeyCode::Enter);
     match action {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "src"),
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/src"),
+        _ => panic!("expected NewSessionSplit, got {:?}", action),
+    }
+}
+
+#[test]
+fn workdir_picker_dot_slash_launches_cwd_relative() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.dir_exists = |p| p == "./src";
+    d.app.recent_cwds = vec!["/home/test/alpha".to_string()];
+    d.press(KeyCode::Char('O'));
+    for c in "./src".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(workdir_visible_paths(&d.app), vec!["./src"]);
+
+    let action = d.press(KeyCode::Enter);
+    match action {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "./src"),
         _ => panic!("expected NewSessionSplit, got {:?}", action),
     }
 }
@@ -3600,9 +3652,9 @@ fn workdir_picker_bare_name_launches_when_no_match() {
 fn workdir_picker_filter_match_beats_raw_typed_text() {
     // Typing a filter fragment ("sys") must launch the highlighted recent
     // (~/.system-config), not the raw text — even when a directory named `sys`
-    // exists. The production hole is Linux `/sys` (a daemon whose cwd is `/`),
-    // or any leftover `sys/` next to the dashboard; the old "typed string that
-    // names a directory wins" rule then launched `sys` instead of the match.
+    // exists in the process cwd. A bare name is `~/sys`, so Linux `/sys` and
+    // a leftover `./sys` do not rank as candidates; the typed row still
+    // appears, last, so Enter takes the recent.
     let mut d = TestDashboard::new(120, 15);
     d.app.dir_exists = |p| p == "/home/test/.system-config" || p == "sys" || p == "/sys";
     d.app.recent_cwds = vec!["~/.system-config".to_string()];
@@ -3610,8 +3662,10 @@ fn workdir_picker_filter_match_beats_raw_typed_text() {
     for c in "sys".chars() {
         d.press(KeyCode::Char(c));
     }
-    // The recent matches the filter and is highlighted (cursor 0).
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 1);
+    assert_eq!(
+        workdir_visible_paths(&d.app),
+        vec!["~/.system-config", "~/sys"]
+    );
 
     let action = d.press(KeyCode::Enter);
     match action {
@@ -3619,12 +3673,56 @@ fn workdir_picker_filter_match_beats_raw_typed_text() {
         _ => panic!("expected NewSessionSplit, got {:?}", action),
     }
     assert_eq!(d.app.input_mode, InputMode::Normal);
+
+    // The typed row is still on the list; Down + Enter tries it and errors.
+    d.press(KeyCode::Char('O'));
+    for c in "sys".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Down);
+    assert!(d.press(KeyCode::Enter).is_none());
+    assert_eq!(d.app.input_mode, InputMode::Picker);
+    assert!(
+        d.app
+            .picker
+            .as_ref()
+            .unwrap()
+            .picker
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("~/sys")
+    );
+}
+
+#[test]
+fn workdir_picker_existing_typed_dir_ranks_with_recents() {
+    // The typed path is not in history but exists, and the query also
+    // substring-matches a recent: both rows show, the existing typed dir
+    // ranks first (basename exact), Enter takes it.
+    let mut d = TestDashboard::new(120, 15);
+    d.app.dir_exists = |p| p == "/home/test/sys" || p == "/home/test/.system-config";
+    d.app.recent_cwds = vec!["~/.system-config".to_string()];
+    d.press(KeyCode::Char('O'));
+    for c in "sys".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(
+        workdir_visible_paths(&d.app),
+        vec!["~/sys", "~/.system-config"]
+    );
+
+    let action = d.press(KeyCode::Enter);
+    match action {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/sys"),
+        _ => panic!("expected NewSessionSplit, got {:?}", action),
+    }
 }
 
 #[test]
 fn workdir_picker_literal_path_beats_substring_recent() {
-    // A typed string that already names a directory is taken literally even
-    // when it substrings a recent cwd (the old precedence bug, in reverse).
+    // A typed string that already names a directory ranks above a recent it
+    // merely prefixes (`/var/log` vs `/var/log/archive`).
     let mut d = TestDashboard::new(120, 15);
     d.app.dir_exists = |p| p == "/var/log";
     d.app.recent_cwds = vec!["/var/log/archive".to_string()];
@@ -3632,10 +3730,11 @@ fn workdir_picker_literal_path_beats_substring_recent() {
     for c in "/var/log".chars() {
         d.press(KeyCode::Char(c));
     }
-    // The recent substrings the typed path, so it's highlighted...
-    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 1);
+    assert_eq!(
+        workdir_visible_paths(&d.app),
+        vec!["/var/log", "/var/log/archive"]
+    );
 
-    // ...but the typed path is itself a directory, so it wins.
     let action = d.press(KeyCode::Enter);
     match action {
         Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/var/log"),
@@ -3678,7 +3777,13 @@ fn workdir_picker_navigation_overrides_literal_typed_path() {
     for c in "/home".chars() {
         d.press(KeyCode::Char(c));
     }
-    // Both recents match "/home"; arrow down to the second, then Enter.
+    // Typed `/home` exists, so it ranks first; then the two recents. Down
+    // twice to the second recent, then Enter.
+    assert_eq!(
+        workdir_visible_paths(&d.app),
+        vec!["/home", "/home/test/alpha", "/home/test/beta"]
+    );
+    d.press(KeyCode::Down);
     d.press(KeyCode::Down);
     let action = d.press(KeyCode::Enter);
     match action {

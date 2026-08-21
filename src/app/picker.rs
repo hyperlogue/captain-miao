@@ -377,6 +377,9 @@ pub(in crate::app) struct PickerItem {
     /// Colored glyph rendered before the primary line. Reserved-width across
     /// items: rows without a prefix get blank padding so titles stay aligned.
     pub prefix: Option<(String, Color)>,
+    /// Higher ranks first in the workdir picker (match quality + recency).
+    /// Other pickers leave this at 0, so `filtered` order is insertion order.
+    pub score: i32,
 }
 
 impl PickerItem {
@@ -389,6 +392,7 @@ impl PickerItem {
             filter_text,
             payload: None,
             prefix: None,
+            score: 0,
         }
     }
 
@@ -414,6 +418,11 @@ impl PickerItem {
 
     pub fn with_prefix(mut self, icon: impl Into<String>, color: Color) -> Self {
         self.prefix = Some((icon.into(), color));
+        self
+    }
+
+    pub fn with_score(mut self, score: i32) -> Self {
+        self.score = score;
         self
     }
 }
@@ -447,14 +456,11 @@ pub(in crate::app) struct Picker {
     pub items: Vec<PickerItem>,
     pub size_percent: (u16, u16),
     /// True once the user has explicitly moved the cursor (Up/Down/Ctrl-N/P).
-    /// Reset whenever the filter text changes. In free-input mode the caller
-    /// uses this to let explicit navigation always win over the typed text (see
-    /// `App::submit_workdir`).
+    /// Reset whenever the filter text changes.
     pub user_selected: bool,
-    /// If true, Enter reports the highlighted item via `Submit` (so the caller
-    /// can decide between it and the typed text) and falls back to `SubmitFree`
-    /// with the raw input only when nothing matches the filter. Used by the
-    /// workdir picker.
+    /// If true, Enter falls back to `SubmitFree` with the raw input only when
+    /// the filtered list is empty. Used by the workdir picker, which injects
+    /// the typed path as a ranked row so Enter is almost always `Submit`.
     pub free_input: bool,
     /// If true, Tab emits `PickerEvent::TabComplete` instead of being ignored.
     pub handles_tab: bool,
@@ -614,10 +620,9 @@ impl Picker {
                 // to the filtered range exactly as `draw` does, so the
                 // highlighted row and the submitted item can never disagree even
                 // if a future item-mutation path forgets to fix up the cursor.
-                // In free-input mode the caller decides between that item and the
-                // typed text (it can stat the filesystem, which the picker
-                // can't); the picker only falls back to `SubmitFree` with the raw
-                // text when the filtered list is empty.
+                // Free-input falls back to `SubmitFree` with the raw text only
+                // when the filtered list is empty (the workdir picker injects
+                // the typed path as a row, so this is the empty-input case).
                 if !filtered.is_empty() {
                     return PickerEvent::Submit(filtered[self.cursor.min(filtered.len() - 1)]);
                 }

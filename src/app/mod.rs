@@ -1388,6 +1388,53 @@ pub(super) fn cwd_basename(cwd: &str) -> &str {
         .unwrap_or(cwd)
 }
 
+/// A typed workdir query that already looks like a path rather than a filter
+/// fragment. Remote ranking uses this instead of a per-keystroke stat.
+fn typed_looks_like_path(typed: &str) -> bool {
+    typed.starts_with('~') || typed.starts_with('.') || typed.contains('/')
+}
+
+/// Host-canonical spelling of a workdir-picker query. A bare name becomes
+/// `~/name` so it never resolves through the process cwd (Linux `/sys` when a
+/// daemon's cwd is `/`).
+fn canonicalize_typed_workdir(typed: &str) -> String {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return String::new();
+    }
+    if typed_looks_like_path(typed) {
+        return typed.to_string();
+    }
+    format!("~/{typed}")
+}
+
+/// How well `path` matches a workdir-picker query. Higher is better: exact
+/// path, exact basename, path-prefix, basename-prefix, then substring.
+fn workdir_match_quality(query: &str, path: &str) -> i32 {
+    if query.is_empty() {
+        return 0;
+    }
+    let q = query.trim().trim_end_matches('/').to_lowercase();
+    let p = path.trim_end_matches('/').to_lowercase();
+    if p == q {
+        return 400;
+    }
+    let base = p.rsplit('/').next().unwrap_or(&p);
+    if base == q {
+        return 300;
+    }
+    if p.starts_with(&q) && p[q.len()..].starts_with('/') {
+        return 250;
+    }
+    if base.starts_with(&q) {
+        return 200;
+    }
+    if p.contains(&q) {
+        return 100;
+    }
+    0
+}
+
 /// Path segment the agent puts its worktrees under, relative to the repo root.
 const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
 
@@ -5323,22 +5370,21 @@ impl App {
     }
 
     /// Open the workdir picker: recent cwds as suggestions, free-form path
-    /// entry via the text input, Tab for filesystem completion. Where the new
-    /// session lands is decided at spawn time by the current [`SessionsLayout`]
-    /// (`resolve_spawn_target`), not by the selected window.
+    /// entry via the text input, Tab for filesystem completion. The typed path
+    /// is itself a ranked row (see [`App::sync_workdir_picker_list`]). Where the
+    /// new session lands is decided at spawn time by the current
+    /// [`SessionsLayout`] (`resolve_spawn_target`), not by the selected window.
     pub(super) fn open_workdir_picker(&mut self) {
         // New sessions target the persisted default host (`Space H`); `Ctrl-h`
         // cycles per-launch, re-seeding the list from that machine.
         let host = self.default_host_or_local();
-        let cwds = self.host_recent_dirs(&host);
-        let items = self.workdir_items(&cwds, &host);
 
         // Seed the launch backend from the persistent default; `Ctrl-t` in the
         // picker overrides it for this launch only. No title: the agent and
         // host it would have named are the popup's own status line (§9), a row
         // the eye is already on because `Ctrl-t`/`Ctrl-h` change it there.
         let agent = self.new_session_agent;
-        let picker = Picker::new("", items)
+        let picker = Picker::new("", Vec::new())
             .with_placeholder("Type a path or pick a recent one…")
             .with_size(70, 70)
             .with_free_input(true)
@@ -5356,31 +5402,105 @@ impl App {
                 worktree: None,
             },
         });
+        self.sync_workdir_picker_list();
         self.input_mode = InputMode::Picker;
         self.refresh_picker_status_bar();
     }
 
-    /// Build picker items for a list of cwds shown against `host`'s home. Only a
-    /// *local* dir gets a custom directory-mark icon (marks are a local concept,
-    /// keyed by local path); remote dirs render plain.
     /// Build picker items for a list of cwds. The strings are already in the
     /// host-canonical `~` form (§3) — the wire *is* the display form — so there
     /// is nothing to collapse and no host `$HOME` to know. Directory marks now
     /// key on that same form, which is why the same repo path on two machines
     /// shares its icon.
-    fn workdir_items(&self, cwds: &[String], _host: &HostId) -> Vec<PickerItem> {
-        cwds.iter()
-            .map(|cwd| {
-                let mut item = PickerItem::new(cwd.clone())
-                    .with_filter_text(cwd.clone())
-                    .with_payload(cwd.clone());
-                if self.directory_marks.contains_key(cwd.trim_end_matches('/')) {
-                    let (icon, color, _) = self.effective_dir_mark(cwd);
-                    item = item.with_prefix(icon, color);
-                }
-                item
+    fn workdir_item(&self, cwd: &str) -> PickerItem {
+        let mut item = PickerItem::new(cwd.to_string())
+            .with_filter_text(cwd.to_string())
+            .with_payload(cwd.to_string());
+        if self.directory_marks.contains_key(cwd.trim_end_matches('/')) {
+            let (icon, color, _) = self.effective_dir_mark(cwd);
+            item = item.with_prefix(icon, color);
+        }
+        item
+    }
+
+    /// Recents plus the typed path, ranked by match quality then recency.
+    ///
+    /// The typed path is always a row when the input is non-empty and isn't
+    /// already a recent, so Enter never submits something that isn't on the
+    /// list. Ranking is what disambiguates: a typed path that *is* a directory
+    /// (or looks like a path, on a remote we refuse to stat per keystroke)
+    /// ranks as an exact/basename candidate; a bare name we haven't confirmed
+    /// sits last, so typing `sys` still highlights `~/.system-config`.
+    fn ranked_workdir_items(
+        &self,
+        recents: &[String],
+        typed: &str,
+        host: &HostId,
+    ) -> Vec<PickerItem> {
+        let n = recents.len() as i32;
+        let mut items: Vec<PickerItem> = recents
+            .iter()
+            .enumerate()
+            .map(|(i, cwd)| {
+                let recency = n - i as i32;
+                let score = if typed.is_empty() {
+                    recency
+                } else {
+                    workdir_match_quality(typed, cwd) * 1000 + recency
+                };
+                self.workdir_item(cwd).with_score(score)
             })
-            .collect()
+            .collect();
+
+        if !typed.is_empty() {
+            let path = canonicalize_typed_workdir(typed);
+            let dup = recents
+                .iter()
+                .any(|r| r.trim_end_matches('/') == path.trim_end_matches('/'));
+            if !dup {
+                // Cheap local stat only — never an RTT on a keystroke (§9).
+                // Remote: a path-like query ranks as a candidate without
+                // asking the host; a bare name sits last.
+                let known_dir = self.is_direct_local(host)
+                    && (self.dir_exists)(&cm_core::paths::expand_home(&path, &self.home_dir));
+                let candidate =
+                    known_dir || (!self.is_direct_local(host) && typed_looks_like_path(typed));
+                let score = if candidate {
+                    workdir_match_quality(typed, &path) * 1000
+                } else {
+                    0
+                };
+                items.push(self.workdir_item(&path).with_score(score));
+            }
+        }
+
+        items.sort_by_key(|item| std::cmp::Reverse(item.score));
+        items
+    }
+
+    /// Rebuild the open workdir picker's rows from recents plus the typed path.
+    /// Cursor is only clamped, not reset — callers that change the text already
+    /// zero it, and `Ctrl-d` wants to keep its place.
+    pub(super) fn sync_workdir_picker_list(&mut self) {
+        let Some(active) = self.picker.as_ref() else {
+            return;
+        };
+        let PickerKind::Workdir { host, .. } = &active.kind else {
+            return;
+        };
+        let host = host.clone();
+        let typed = active.picker.input.text().to_string();
+        let recents = self.host_recent_dirs(&host);
+        let items = self.ranked_workdir_items(&recents, typed.trim(), &host);
+        if let Some(active) = self.picker.as_mut() {
+            active.picker.items = items;
+            let n = active.picker.filtered().len();
+            if n == 0 {
+                active.picker.cursor = 0;
+            } else if active.picker.cursor >= n {
+                active.picker.cursor = n - 1;
+            }
+        }
     }
 
     /// The default host for new-session operations, falling back to localhost
@@ -5478,30 +5598,22 @@ impl App {
     }
 
     /// Re-seed the open workdir picker for its currently-selected host: pull that
-    /// host's recent dirs + `$HOME` (local in-process, remote over RPC — blocks,
-    /// so wrap the call site in `block_in_place`), rebuild the item list, and
-    /// reset the input/cursor. Called after `Ctrl-h` changes the host so the
-    /// picker always reflects the machine the launch will land on.
+    /// host's recent dirs (cache-first, §9), rebuild the item list, and reset
+    /// the input/cursor. Called after `Ctrl-h` changes the host so the picker
+    /// always reflects the machine the launch will land on.
     pub(super) fn reseed_workdir_for_host(&mut self) {
-        let Some(active) = self.picker.as_ref() else {
+        if !matches!(
+            self.picker.as_ref().map(|a| &a.kind),
+            Some(PickerKind::Workdir { .. })
+        ) {
             return;
-        };
-        let PickerKind::Workdir { host, .. } = &active.kind else {
-            return;
-        };
-        let host = host.clone();
-        // Cache-first: a host switch renders from memory, so `Ctrl-h` is
-        // instant even against a distant box (§9). Only a host never seen this
-        // run pays a round-trip, and one that isn't connected yet yields an
-        // empty list rather than freezing the TUI through the connect attempt.
-        let cwds = self.host_recent_dirs(&host);
-        let items = self.workdir_items(&cwds, &host);
+        }
         self.workdir_completion = None;
         if let Some(active) = self.picker.as_mut() {
-            active.picker.items = items;
             // Clears the input, resets the item cursor, drops any stale error.
             active.picker.set_text("");
         }
+        self.sync_workdir_picker_list();
     }
 
     /// Drop the highlighted recent-cwd from the workdir picker. Persists the
@@ -5539,15 +5651,10 @@ impl App {
             return;
         }
 
-        let active = self.picker.as_mut().expect("checked above");
-        active.picker.items.remove(item_idx);
-        let new_total = active.picker.filtered().len();
-        if new_total == 0 {
-            active.picker.cursor = 0;
-        } else if cursor >= new_total {
-            active.picker.cursor = new_total - 1;
-        } else {
-            active.picker.cursor = cursor;
+        self.sync_workdir_picker_list();
+        if let Some(active) = self.picker.as_mut() {
+            let n = active.picker.filtered().len();
+            active.picker.cursor = if n == 0 { 0 } else { cursor.min(n - 1) };
         }
     }
 
@@ -5608,6 +5715,7 @@ impl App {
             if let Some(active) = self.picker.as_mut() {
                 active.picker.set_text(&next);
             }
+            self.sync_workdir_picker_list();
             return;
         }
 
@@ -5625,6 +5733,7 @@ impl App {
             active.picker.set_text(&matches[0]);
         }
         self.workdir_completion = Some(WorkdirCompletion { matches, index: 0 });
+        self.sync_workdir_picker_list();
     }
 
     /// A path as it should read on screen.
