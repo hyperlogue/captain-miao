@@ -654,6 +654,14 @@ impl App {
         (!self.search_input.is_empty()).then(|| self.search_input.text().to_string())
     }
 
+    /// Whether `typed` is the user specifying a path rather than filtering the
+    /// recent list. A bare name (`sys`) is a filter even when a directory of
+    /// that name exists in the process cwd — Linux `/sys` when a daemon's cwd
+    /// is `/` is the one that bit.
+    fn typed_looks_like_path(typed: &str) -> bool {
+        typed.starts_with('~') || typed.starts_with('.') || typed.contains('/')
+    }
+
     /// Whether `path` is a directory on `host`. Local uses the injected
     /// `dir_exists` (real fs in production, a stub in tests); remote makes a
     /// blocking RPC to the host's server (`false` if unreachable).
@@ -682,13 +690,15 @@ impl App {
     /// `idx` is the highlighted recent (`Some`, from `Submit`) or `None` when
     /// the user submitted raw text with no filter match (`SubmitFree`).
     ///
-    /// Disambiguation: a typed string that already names a directory is taken
-    /// literally (so a full path that merely substrings a recent cwd still
-    /// wins); otherwise the text is treated as a filter and the highlighted
-    /// recent is launched (so typing `sys` + Enter opens the matched
-    /// `~/.system-config`, not a bogus `sys`). Explicit Up/Down navigation
-    /// always honors the highlight. A path that doesn't resolve to a directory
-    /// is rejected: the picker stays open with an inline error.
+    /// Disambiguation: a typed string that already *looks like a path*
+    /// (absolute, `~`, `.`/`..`, or containing `/`) and names a directory is
+    /// taken literally (so `/var/log` still wins over a recent `/var/log/archive`).
+    /// A bare name is always a filter, even if a same-named directory exists in
+    /// the process cwd — that's how typing `sys` + Enter opens the matched
+    /// `~/.system-config` rather than Linux `/sys` (or a leftover `sys/` next
+    /// to the dashboard). Explicit Up/Down navigation always honors the
+    /// highlight. A path that doesn't resolve to a directory is rejected: the
+    /// picker stays open with an inline error.
     fn submit_workdir(&mut self, idx: Option<usize>) -> Option<Action> {
         let active = self.picker.as_ref()?;
         let PickerKind::Workdir {
@@ -730,15 +740,18 @@ impl App {
             return None;
         }
 
-        // Disambiguation: a typed string that already names a directory on the
-        // host is taken literally; otherwise it's a filter and the highlighted
-        // recent wins. We consult the host fs only when it can affect the choice —
-        // an explicit selection skips the typed check entirely — and remember when
-        // the typed path was confirmed a dir so we don't re-check it below.
+        // Disambiguation: a typed string that already looks like a path and
+        // names a directory on the host is taken literally; a bare name is a
+        // filter and the highlighted recent wins. We consult the host fs only
+        // when it can affect the choice — an explicit selection skips the typed
+        // check entirely — and remember when the typed path was confirmed a dir
+        // so we don't re-check it below.
         let (chosen_raw, typed_known_dir) = if user_selected && let Some(p) = &item_path {
             (p.clone(), false)
         } else {
-            let typed_is_dir = !typed.is_empty() && self.host_dir_exists(&host, &typed);
+            let typed_is_dir = !typed.is_empty()
+                && Self::typed_looks_like_path(&typed)
+                && self.host_dir_exists(&host, &typed);
             if typed_is_dir {
                 (typed.clone(), true)
             } else if let Some(p) = &item_path {

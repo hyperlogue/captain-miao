@@ -3577,12 +3577,35 @@ fn workdir_picker_free_input_when_no_match() {
 }
 
 #[test]
-fn workdir_picker_filter_match_beats_raw_typed_text() {
-    // Typing a filter fragment ("sys") that doesn't itself name a directory
-    // must launch the highlighted recent (~/.system-config), not the raw text.
+fn workdir_picker_bare_name_launches_when_no_match() {
+    // A bare name with no filter match is still free input (cwd-relative), so
+    // typing `src` in a tree that has that directory still launches there.
     let mut d = TestDashboard::new(120, 15);
-    d.app.dir_exists = |p| p == "/home/test/.system-config";
-    d.app.recent_cwds = vec!["/home/test/.system-config".to_string()];
+    d.app.dir_exists = |p| p == "src";
+    d.app.recent_cwds = vec!["/home/test/alpha".to_string()];
+    d.press(KeyCode::Char('O'));
+    for c in "src".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered().len(), 0);
+
+    let action = d.press(KeyCode::Enter);
+    match action {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "src"),
+        _ => panic!("expected NewSessionSplit, got {:?}", action),
+    }
+}
+
+#[test]
+fn workdir_picker_filter_match_beats_raw_typed_text() {
+    // Typing a filter fragment ("sys") must launch the highlighted recent
+    // (~/.system-config), not the raw text — even when a directory named `sys`
+    // exists. The production hole is Linux `/sys` (a daemon whose cwd is `/`),
+    // or any leftover `sys/` next to the dashboard; the old "typed string that
+    // names a directory wins" rule then launched `sys` instead of the match.
+    let mut d = TestDashboard::new(120, 15);
+    d.app.dir_exists = |p| p == "/home/test/.system-config" || p == "sys" || p == "/sys";
+    d.app.recent_cwds = vec!["~/.system-config".to_string()];
     d.press(KeyCode::Char('O'));
     for c in "sys".chars() {
         d.press(KeyCode::Char(c));
@@ -3592,7 +3615,7 @@ fn workdir_picker_filter_match_beats_raw_typed_text() {
 
     let action = d.press(KeyCode::Enter);
     match action {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/home/test/.system-config"),
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/.system-config"),
         _ => panic!("expected NewSessionSplit, got {:?}", action),
     }
     assert_eq!(d.app.input_mode, InputMode::Normal);
