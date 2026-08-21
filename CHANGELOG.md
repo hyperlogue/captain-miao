@@ -7,37 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A Grok `/rename` reaches the dashboard row.** Grok rewrites `summary.json`
-  as a new file (no hook), which killed the launcher's file-inode watch after
-  the first title. The launcher re-arms that file watch after each replace
-  (still event-driven — not a poll, and not the session directory that also
-  holds `updates.jsonl`) and the next hook stamps the title as a backstop.
+## [0.6.1] - 2026-08-21
 
 ### Changed
 
-- **Grok Build tracking catches up to 1.0.4.** An interrupted turn settles
-  instead of staying `Active`, the token and model columns fill from
-  `signals.json` (used tokens over `contextWindowTokens`, so the Ctx cell
-  is a percentage of Grok's window rather than Claude-sized absolute
-  cuts), the prompt reaches the row, and the session title
-  (`generated_title`, including `/rename`) lands on the row. The resume
-  picker reads `head_branch` from the 1.0.4 summary shape, and
-  `last_turn_summary` fills the last-prompt column on an idle or resumed
-  row. `summary.json` is resolved from the session id so those folds run
-  even when the hook omits `transcriptPath` (1.0.4's documented common
-  fields do). `StopCancelled` and the lifecycle `Notification` hook are
-  the new signals; older grok skips names it does not know.
-- **Grok no longer uses a synthetic `GROK_HOME`.** Hooks go in
-  `~/.grok/hooks/captain-miao.json`; `miao hook` is a no-op without a launcher
-  socket, so sessions started outside captain-miao are unaffected.
-- **Managed Codex sessions now use an owned profile in the real Codex home**
-  instead of a synthetic `CODEX_HOME`. The former synthetic home at
-  `$XDG_STATE_HOME/captain-miao/codex-home` (normally
-  `~/.local/state/captain-miao/codex-home`) is ignored: captain-miao neither
-  migrates nor deletes it. After exiting sessions launched by an older version,
-  remove that directory manually if you no longer need its state.
+- **Grok Build tracks 1.0.4** more information surfaced on the dashboard thanks
+  to the new API.
+- **Grok no longer uses a synthetic `GROK_HOME`** — hooks live in
+  `~/.grok/hooks/captain-miao.json`, `miao hook` is a no-op without a
+  launcher socket, and leftover `~/.local/state/captain-miao/grok-home` is
+  ignored (remove it yourself after old sessions exit).
+- **Managed Codex sessions use an owned profile in the real Codex home**
+  instead of a synthetic `CODEX_HOME` (leftover
+  `~/.local/state/captain-miao/codex-home` is ignored; remove it yourself
+  after old sessions exit).
+- **The new-session popup no longer titles itself with the agent and host**
+  the settings line already names.
+- **A typed workdir sits on the recents list as a ranked row**, so Enter
+  takes it when it beats a filter hit.
+
+### Fixed
+
+- **A bare name in the workdir picker is always a filter**, never a launch
+  of Linux `/sys` or any coincidental directory next to the dashboard.
+- **Codex trust survives a managed launch** instead of prompting again
+  every time.
+- **A Grok `/rename` reaches the dashboard row.**
 
 ## [0.6.0] - 2026-08-19
 
@@ -249,7 +244,6 @@ request in #1.
   one dashboard: each host runs its sessions in its own pty pool, so a dropped
   connection or a slept laptop detaches windows without touching the sessions,
   and reconnecting brings them back.
-
   - `Space h` opens a hosts panel showing each host's connection state, session
     counts, daemon version, latency, and CPU + memory, with `l` for its full
     connection log and `c` to suspend a host in place instead of deleting it.
@@ -263,7 +257,7 @@ request in #1.
   - Each host takes verbatim ssh `Options`, mostly for port forwards — they come
     up with the connection, come back after a reconnect, and go away with it.
   - `Space A` attaches a window to every detached session that is free to take.
-  - `[launcher] pooled = true` runs *this* machine's sessions in a pool too, so
+  - `[launcher] pooled = true` runs _this_ machine's sessions in a pool too, so
     they survive closing the window, a crashed multiplexer, and logging out.
   - `programs.captain-miao.server.enable = true` — a Home Manager module, and the
     whole setup a Nix host needs to be reachable from another machine's dashboard.
@@ -276,7 +270,6 @@ request in #1.
   picker starts the session in a fresh one, which the agent creates and owns.
 
 - **Misc**
-
   - `Space l` switches between one shared session tab and one tab per session.
   - The dashboard's own tab says how many sessions want you — `miao (2)`.
 
@@ -324,7 +317,7 @@ request in #1.
 
 ### Added
 
-- **Startup check for the terminal control channel.** Being *in* a supported
+- **Startup check for the terminal control channel.** Being _in_ a supported
   terminal is not the same as being able to drive it. On Kitty, a remote-control
   setup that is missing `listen_on` or carries a mismatched password used to
   surface one failed action at a time, with kitty's raw error in the status line;
@@ -441,7 +434,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0
