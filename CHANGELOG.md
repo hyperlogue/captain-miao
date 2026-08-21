@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Grok `/rename` reaches the dashboard row.** Grok rewrites `summary.json`
+  as a new file (no hook), which killed the launcher's file-inode watch after
+  the first title; the parent-directory watch and the next hook's title stamp
+  both keep the new name.
+
 ### Changed
 
 - **Grok Build tracking catches up to 1.0.4.** An interrupted turn settles

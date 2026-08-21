@@ -1183,13 +1183,24 @@ fn start_file_watcher(
     };
     let mut w = notify::recommended_watcher(handler)?;
 
-    // Try watching the file directly; fall back to its parent directory if
-    // the file doesn't exist yet (notify requires the path to exist on some
-    // platforms).
-    if w.watch(path, notify::RecursiveMode::NonRecursive).is_err()
-        && let Some(parent) = path.parent()
-    {
-        w.watch(parent, notify::RecursiveMode::NonRecursive)?;
+    // Watch the parent directory *and* the file. A file-inode watch dies on
+    // atomic replace: Grok rewrites `summary.json` that way on `/rename` and
+    // at turn boundaries (the new file's birth time equals its mtime), so a
+    // file-only watch fires once, then never again — the dashboard title
+    // stuck on whatever the first fold saw. The parent watch sees the new
+    // inode; sibling events (Grok's `updates.jsonl` is chatty) are filtered
+    // to `target` above. The file watch still covers in-place appends on
+    // backends that never replace. If the file does not exist yet, the
+    // parent registration is the same fallback as before.
+    let file_ok = w.watch(path, notify::RecursiveMode::NonRecursive).is_ok();
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Err(e) = w.watch(parent, notify::RecursiveMode::NonRecursive)
+            && !file_ok
+        {
+            return Err(e);
+        }
+    } else if !file_ok {
+        w.watch(path, notify::RecursiveMode::NonRecursive)?;
     }
     Ok(w)
 }
@@ -1589,6 +1600,50 @@ mod tests {
             canonical_watch_target(&base.join("gone").join("x.jsonl")),
             None
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Grok rewrites `summary.json` by replace (new inode, birth == mtime). A
+    /// file-inode watch dies on the first one; `/rename` is a second replace
+    /// with no hook, so the watch has to still be alive. Watching the parent
+    /// directory is what keeps the second wake.
+    #[test]
+    fn file_watcher_survives_an_atomic_replace() {
+        let base = std::env::temp_dir().join(format!("cm-watch-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("summary.json");
+        std::fs::write(&path, b"{\"generated_title\":\"first\"}\n").unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let _w = start_file_watcher(&path, tx).expect("watch starts");
+            // Let the backend register before the first replace.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            fn replace(path: &std::path::Path, body: &[u8]) {
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, body).unwrap();
+                std::fs::rename(&tmp, path).unwrap();
+            }
+
+            replace(&path, b"{\"generated_title\":\"renamed\"}\n");
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+            assert!(woke.is_ok(), "first atomic replace never woke the watcher");
+            while rx.try_recv().is_ok() {}
+
+            replace(&path, b"{\"generated_title\":\"renamed again\"}\n");
+            let woke = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+            assert!(
+                woke.is_ok(),
+                "second atomic replace never woke the watcher — the file-inode watch died"
+            );
+        });
 
         let _ = std::fs::remove_dir_all(&base);
     }

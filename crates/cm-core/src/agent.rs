@@ -558,9 +558,10 @@ impl AgentControl {
             // title store (the title rides the hook payload), no transcript
             // read. There is no file whose change could make a Kimi row stale.
             AgentControl::Kimi => vec![],
-            // Nothing: title, tokens and model arrive on the hook / transcript
-            // fold and are written to the state file, which the host already
-            // watches.
+            // Nothing: title, tokens and model are folded onto the state file
+            // by the launcher (which watches `summary.json`'s parent so a
+            // `/rename` replace still wakes it), and the host already watches
+            // that state file.
             AgentControl::Grok => vec![],
             // Nothing: every fact an opencode row carries rides the plugin's
             // events. Its sessions do sit on disk — JSON blobs under
@@ -622,9 +623,11 @@ impl AgentControl {
             // watches. Codex needs an entry here only because its rename lands
             // in sqlite with no hook at all.
             AgentControl::Kimi => vec![],
-            // Nothing: every fact a Grok row carries arrives over a hook and is
-            // written to the state file, which the host already watches. A wake
-            // here could only re-diff rows that hadn't changed.
+            // Nothing: a `/rename` rewrites `summary.json` with no hook, but
+            // the launcher watches that file's parent directory and folds the
+            // title onto the state file — a `sessions/` write the host already
+            // watches. Codex needs an entry here only because its rename lands
+            // in sqlite with no launcher fold at all.
             AgentControl::Grok => vec![],
             // Nothing, and now for Kimi's reason rather than for want of a
             // title: `session.updated` carries `info.title`, so a rename arrives
@@ -1092,8 +1095,9 @@ impl AgentControl {
             AgentControl::Kimi => None,
             // `None` because there is nothing left to read here: `summary.json`'s
             // `generated_title` is folded onto `LauncherState.name` by the
-            // transcript watch (and by `list_resumable` for the picker). No
-            // per-pid file exists for this method to open.
+            // transcript watch and by the hook's `session_title` (and by
+            // `list_resumable` for the picker). No per-pid file exists for this
+            // method to open.
             AgentControl::Grok => None,
             // `None` because there is nothing left to read, not because
             // opencode has no name: `session.updated` carries `info.title`, the
@@ -1189,11 +1193,13 @@ impl AgentControl {
             // the same defence Codex needed.
             AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Kimi => None,
-            // Event-driven is fine: the envelope names `transcriptPath`, we
-            // rewrite it to sibling `summary.json`, and Grok rewrites that file
-            // whole at turn boundaries (open/write/close). FSEvents sees the
-            // close. `updates.jsonl` *is* the long-held-fd append stream, and
-            // we deliberately don't watch it.
+            // Event-driven is fine: we rewrite `transcriptPath` to sibling
+            // `summary.json` (or find it from the session id) and watch that
+            // file's parent directory. Grok replaces `summary.json` whole on
+            // `/rename` and at turn boundaries — a file-inode watch dies with
+            // the old inode; the parent watch is what sees the new one.
+            // `updates.jsonl` *is* the long-held-fd append stream, and we
+            // deliberately don't watch it.
             AgentControl::Grok => None,
             // Moot, and structurally so rather than merely for now: opencode
             // keeps each message as its own JSON blob under `storage/`, so there

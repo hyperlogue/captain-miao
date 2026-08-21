@@ -420,6 +420,14 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
                 .and_then(summary_for)
                 .map(|p| p.to_string_lossy().into_owned())
         });
+    // Same file the transcript fold reads. Putting the title on the payload
+    // means a later hook (the prompt after a `/rename`) stamps it even if the
+    // launcher's file-inode watch already died on the replace. An empty
+    // summary is absent, not a rename to nothing — `adopt_session_facts`
+    // already drops that.
+    let session_title = transcript_path
+        .as_deref()
+        .and_then(|p| title_from_summary(Path::new(p)));
     Ok(HookMessage {
         event,
         session_id,
@@ -430,7 +438,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
             .or(payload.error.filter(|s| !s.trim().is_empty())),
         cwd: payload.cwd,
         prompt: payload.prompt.filter(|s| !s.trim().is_empty()),
-        session_title: None,
+        session_title,
         context_tokens: None,
         model: payload.model_id.filter(|s| !s.trim().is_empty()),
         transcript_path,
@@ -449,6 +457,17 @@ fn summary_path_for(transcript: &str) -> String {
         .join("summary.json")
         .to_string_lossy()
         .into_owned()
+}
+
+/// `generated_title` (or the recap fallback) off a `summary.json`, or `None`
+/// when the file is missing, unreadable, or still untitled. `/rename` writes
+/// that field and fires no hook, so the hook process re-reads it whenever it
+/// already knows the path.
+fn title_from_summary(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<SessionSummary>(&body)
+        .ok()
+        .and_then(|s| s.title())
 }
 
 /// `$GROK_HOME/sessions/<cwd-key>/<session_id>/summary.json`, or `None` if
@@ -547,8 +566,10 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// hook.
 ///
 /// `path` is the `summary.json` [`parse_hook_payload`] rewrites `transcriptPath`
-/// to. The title is `generated_title` (auto or `/rename`); the context gauge is
-/// sibling `signals.json`'s `contextTokensUsed` over `contextWindowTokens`.
+/// to. The title is `generated_title` (auto or `/rename`); `/rename` fires no
+/// hook and replaces the file, so the launcher watches the parent directory (a
+/// file-inode watch dies on the first rewrite). The context gauge is sibling
+/// `signals.json`'s `contextTokensUsed` over `contextWindowTokens`.
 /// `prior` is unused: both files are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
@@ -887,6 +908,37 @@ mod tests {
             .expect("parses");
         assert_eq!(msg.session_id.as_deref(), Some("no-such-session"));
         assert_eq!(msg.transcript_path, None);
+        assert_eq!(msg.session_title, None);
+    }
+
+    /// `/rename` writes `generated_title` (and `title_is_manual`) and fires no
+    /// hook. The next payload that names the session directory must carry that
+    /// title, or the row stays on whatever the first fold saw.
+    #[test]
+    fn a_rename_in_summary_json_arrives_on_the_hook_as_session_title() {
+        let dir = std::env::temp_dir().join(format!("cm-grok-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"generated_title":"fix session name grok","title_is_manual":true}"#,
+        )
+        .unwrap();
+        let transcript = dir.join("updates.jsonl");
+        let stdin = payload(
+            "user_prompt_submit",
+            &format!(
+                r#","transcriptPath":{}"#,
+                serde_json::to_string(&transcript.to_string_lossy()).unwrap()
+            ),
+        );
+        let msg = parse_hook_payload(HookEvent::PromptSubmit, &stdin).expect("parses");
+        assert_eq!(
+            msg.transcript_path.as_deref(),
+            Some(dir.join("summary.json").to_str().unwrap())
+        );
+        assert_eq!(msg.session_title.as_deref(), Some("fix session name grok"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `StopCancelled` is registered as `stop`, so an interrupt settles the row.
