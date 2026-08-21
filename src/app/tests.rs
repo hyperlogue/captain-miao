@@ -4607,8 +4607,8 @@ fn narrow_layout_stacks_panels_and_trims_columns() {
 
 /// An empty context reading means two different things, and both views that
 /// show one have to say which. On a backend that reports a total, empty is "the
-/// first turn hasn't landed" and a number is coming; on Reasonix or Grok — which
-/// persist no context total at all (`AgentCapabilities::context_tokens`) —
+/// first turn hasn't landed" and a number is coming; on Reasonix — which
+/// persists no context total at all (`AgentCapabilities::context_tokens`) —
 /// nothing is ever coming, and a cell that never fills reads as a session
 /// stalled before its first reply.
 #[test]
@@ -4628,10 +4628,10 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
         "a pending total leaves the column blank: {claude}"
     );
     // …and marked on the backend that will never report one.
-    let grok = render(crate::agent::AgentControl::Grok, 120);
+    let reasonix = render(crate::agent::AgentControl::Reasonix, 120);
     assert!(
-        grok.contains("n/a"),
-        "a backend with no context total to give must not read as pending: {grok}"
+        reasonix.contains("n/a"),
+        "a backend with no context total to give must not read as pending: {reasonix}"
     );
 
     // The narrow layout drops that column and shows a `Context` line instead,
@@ -4641,10 +4641,54 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
         claude_narrow.contains("Context") && !claude_narrow.contains("n/a"),
         "the compact detail pends with an em dash: {claude_narrow}"
     );
-    let grok_narrow = render(crate::agent::AgentControl::Grok, 60);
+    let reasonix_narrow = render(crate::agent::AgentControl::Reasonix, 60);
     assert!(
-        grok_narrow.contains("Context") && grok_narrow.contains("n/a"),
-        "…and says so when nothing is coming: {grok_narrow}"
+        reasonix_narrow.contains("Context") && reasonix_narrow.contains("n/a"),
+        "…and says so when nothing is coming: {reasonix_narrow}"
+    );
+}
+
+/// Grok (and any backend that persists a window) still shows the used-token
+/// count in the table, matching Claude. The window belongs in the detail
+/// panel as `used/window`, not as a percentage of the 4-wide Ctx cell.
+#[test]
+fn a_known_context_window_stays_an_absolute_count_in_the_table() {
+    let grok = || {
+        let mut s = session(1, "/home/test/proj", SessionStatus::Active);
+        s.agent = crate::agent::AgentControl::Grok;
+        s.context_tokens = Some(350_960);
+        s.context_window = Some(500_000);
+        s
+    };
+
+    // Tall enough that the wide detail's Context line (below Terminfo) is on
+    // screen; 20 rows clips it.
+    let mut wide = TestDashboard::new(160, 40);
+    wide.set_sessions(vec![grok()]);
+    let out = wide.render();
+    assert!(
+        !out.contains("70%"),
+        "a known window is not a percentage in the table: {out}"
+    );
+    assert!(
+        out.contains("350k"),
+        "the table cell is the used count, same as Claude: {out}"
+    );
+    assert!(
+        out.contains("350k/500k"),
+        "the detail panel shows used over the window: {out}"
+    );
+
+    let mut narrow = TestDashboard::new(60, 30);
+    narrow.set_sessions(vec![grok()]);
+    let narrow_out = narrow.render();
+    assert!(
+        narrow_out.contains("350k/500k"),
+        "the compact detail keeps used/window: {narrow_out}"
+    );
+    assert!(
+        !narrow_out.contains("70%"),
+        "nor does the compact detail fall back to a percentage: {narrow_out}"
     );
 }
 

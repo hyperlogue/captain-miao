@@ -17,9 +17,9 @@ use crate::state::{HostId, LauncherState, SessionStatus};
 use super::format::{
     DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
     ansi_to_lines, bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width,
-    elapsed_cell, fade_style, format_context_cell, format_context_detail, format_elapsed,
-    hint_badge, hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans,
-    pill, session_display_name, truncate_str,
+    elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
+    hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans, pill,
+    session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -1578,7 +1578,7 @@ impl App {
                     // indistinguishable from a session still on its first turn —
                     // so it says `n/a`, dimmed.
                     let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
-                        (Some(t), _) => format_context_cell(t, s.context_window),
+                        (Some(t), _) => format_tokens(t),
                         (None, true) => String::new(),
                         (None, false) => "n/a".to_string(),
                     };

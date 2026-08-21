@@ -813,16 +813,9 @@ pub(super) fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Table cell: a percentage of `window` when the agent reports one (`70%`,
-/// fits the 4-wide Ctx column), otherwise the used-token count.
-pub(super) fn format_context_cell(tokens: u64, window: Option<u64>) -> String {
-    match window.filter(|&w| w > 0) {
-        Some(w) => format!("{}%", (tokens.saturating_mul(100) / w).min(100)),
-        None => format_tokens(tokens),
-    }
-}
-
-/// Detail-panel Context line: `351k/500k` when the window is known.
+/// Detail-panel Context line: `351k/500k` when the window is known. The table
+/// cell is always the used-token count (`format_tokens`) so a Grok row is
+/// comparable to Claude's; the window belongs here, where there is room.
 pub(super) fn format_context_detail(tokens: u64, window: Option<u64>) -> String {
     match window.filter(|&w| w > 0) {
         Some(w) => format!("{}/{}", format_tokens(tokens), format_tokens(w)),
@@ -1010,10 +1003,7 @@ pub(super) fn version_is_older(theirs: &str, ours: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        format_context_cell, format_context_detail, model_color, model_label, truncate_str,
-        version_is_older,
-    };
+    use super::{format_context_detail, model_color, model_label, truncate_str, version_is_older};
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
@@ -1088,10 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn context_cell_is_a_percentage_of_the_window_when_known() {
-        assert_eq!(format_context_cell(350_960, Some(500_000)), "70%");
-        assert_eq!(format_context_cell(500_000, Some(500_000)), "100%");
-        assert_eq!(format_context_cell(48_100, None), "48k");
+    fn context_detail_shows_used_over_window_when_known() {
         assert_eq!(format_context_detail(350_960, Some(500_000)), "350k/500k");
         assert_eq!(format_context_detail(48_100, None), "48k");
     }
