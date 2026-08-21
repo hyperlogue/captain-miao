@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Grok background subagent no longer wears the parent's title.** Child
+  sessions live as siblings under the same cwd-key and share the hook socket;
+  the launcher was adopting their `summary.json` before dispatch could ignore
+  the payload, so the row flickered between the two `generated_title`s for as
+  long as the child was running.
 - **Grok token counts follow a `signals.json` replace**, the same file-watch
   re-arm as `/rename` on `summary.json` — not a poll, and not a watch on the
   session directory.

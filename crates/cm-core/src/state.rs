@@ -668,7 +668,7 @@ pub struct HookMessage {
     /// What the payload itself proves about [`Self::session_id`]'s lineage, for
     /// a backend whose event stream is process-wide rather than per-session
     /// (opencode: one bus serves every session in the process, subagent
-    /// children included).
+    /// children included; Grok: child sessions share the parent's hook socket).
     ///
     /// - `Some(true)` — the payload names a parent session: this event is a
     ///   **child** session's, and the row must ignore it.
@@ -677,8 +677,9 @@ pub struct HookMessage {
     /// - `None` — the payload names a bare session id (or none) and proves
     ///   nothing either way.
     ///
-    /// `None` for every backend whose hooks are already session-scoped; only
-    /// the dispatch of a backend that sets it reads it.
+    /// `None` for every backend whose hooks are already session-scoped. The
+    /// launcher also reads it: a child must not steal the transcript watch
+    /// (armed *before* dispatch), or its title lands on the parent row.
     #[serde(default)]
     pub session_is_child: Option<bool>,
 }

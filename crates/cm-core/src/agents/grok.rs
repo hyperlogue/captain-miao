@@ -122,6 +122,12 @@ struct SessionSummary {
     /// and not the user's prompt.
     #[serde(default)]
     last_turn_summary: String,
+    /// `"subagent"` on a child session. Grok stores those as siblings of the
+    /// parent under the same cwd-key (`16-subagents.md`); they share this
+    /// process's hook socket and must not become a picker row or a transcript
+    /// watch — their `generated_title` is a different session's name.
+    #[serde(default)]
+    session_kind: String,
 }
 
 impl SessionSummary {
@@ -131,6 +137,10 @@ impl SessionSummary {
         Some(self.generated_title.clone())
             .filter(|t| !t.trim().is_empty())
             .or_else(|| Some(self.session_summary.clone()).filter(|t| !t.trim().is_empty()))
+    }
+
+    fn is_subagent(&self) -> bool {
+        self.session_kind.eq_ignore_ascii_case("subagent")
     }
 
     /// 1.0.4's top-level field, then the older `info.head_branch` spelling.
@@ -198,7 +208,7 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         let Ok(summary) = serde_json::from_str::<SessionSummary>(&body) else {
             continue;
         };
-        if summary.info.cwd.trim().is_empty() {
+        if summary.info.cwd.trim().is_empty() || summary.is_subagent() {
             continue;
         }
         let custom_title = summary.title();
@@ -386,7 +396,8 @@ struct HookPayload {
     /// resolve the same file from `sessionId` — see [`summary_for`].
     transcript_path: Option<String>,
     /// Present on events that fire inside a subagent. Those must not move the
-    /// parent row — a child's `StopCancelled` is not the session going idle.
+    /// parent row — a child's `StopCancelled` is not the session going idle,
+    /// and a child's `generated_title` is not the session's name.
     subagent_type: Option<String>,
     /// `SessionStart` only.
     model_id: Option<String>,
@@ -398,7 +409,7 @@ struct HookPayload {
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse grok hook JSON from stdin")?;
-    let session_is_child = payload
+    let mut session_is_child = payload
         .subagent_type
         .as_deref()
         .filter(|s| !s.trim().is_empty())
@@ -410,7 +421,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
     // session dir from the id. 1.0.4's documented common fields do not include
     // `transcriptPath`, and without a path the launcher never watches, so
     // title / last-turn recap / tokens never leave the sidecars.
-    let transcript_path = payload
+    let mut transcript_path = payload
         .transcript_path
         .filter(|s| !s.trim().is_empty())
         .map(|p| summary_path_for(&p))
@@ -420,14 +431,34 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
                 .and_then(summary_for)
                 .map(|p| p.to_string_lossy().into_owned())
         });
-    // Same file the transcript fold reads. Putting the title on the payload
-    // means a later hook (the prompt after a `/rename`) stamps it even if a
-    // replace landed before the launcher re-armed its file watch. An empty
-    // summary is absent, not a rename to nothing — `adopt_session_facts`
-    // already drops that.
-    let session_title = transcript_path
+    // A child session is a sibling under the same cwd-key, with its own
+    // `summary.json` and `generated_title`. The launcher adopts
+    // `transcript_path` *before* `dispatch_hook` can ignore the payload, so a
+    // background explore's title would otherwise land on the parent row and
+    // flip back on the next parent hook. `subagentType` is the documented
+    // signal (`10-hooks.md`); `session_kind` is what the file itself says,
+    // for a payload that omitted the field.
+    if transcript_path
         .as_deref()
-        .and_then(|p| title_from_summary(Path::new(p)));
+        .is_some_and(|p| summary_is_subagent(Path::new(p)))
+    {
+        session_is_child = Some(true);
+    }
+    let session_title = if session_is_child == Some(true) {
+        // Drop the path too: otherwise the launcher still switches its watch
+        // to the child's sidecars, even after dispatch returns early.
+        transcript_path = None;
+        None
+    } else {
+        // Same file the transcript fold reads. Putting the title on the payload
+        // means a later hook (the prompt after a `/rename`) stamps it even if a
+        // replace landed before the launcher re-armed its file watch. An empty
+        // summary is absent, not a rename to nothing — `adopt_session_facts`
+        // already drops that.
+        transcript_path
+            .as_deref()
+            .and_then(|p| title_from_summary(Path::new(p)))
+    };
     Ok(HookMessage {
         event,
         session_id,
@@ -477,15 +508,21 @@ pub fn unwrap_user_query(prompt: &str) -> &str {
     inner.strip_suffix("</user_query>").unwrap_or(inner).trim()
 }
 
+fn read_summary(path: &Path) -> Option<SessionSummary> {
+    let body = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
 /// `generated_title` (or the recap fallback) off a `summary.json`, or `None`
 /// when the file is missing, unreadable, or still untitled. `/rename` writes
 /// that field and fires no hook, so the hook process re-reads it whenever it
 /// already knows the path.
 fn title_from_summary(path: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<SessionSummary>(&body)
-        .ok()
-        .and_then(|s| s.title())
+    read_summary(path).and_then(|s| s.title())
+}
+
+fn summary_is_subagent(path: &Path) -> bool {
+    read_summary(path).is_some_and(|s| s.is_subagent())
 }
 
 /// `$GROK_HOME/sessions/<cwd-key>/<session_id>/summary.json`, or `None` if
@@ -548,9 +585,11 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 /// the way every backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // A subagent's hooks share this process's socket. Adopting their session
-    // id would rename the parent row, and their Stop/StopCancelled would Idle
-    // a session that is still working. `10-hooks.md` is explicit: exit early
-    // when `subagentType` is present.
+    // id would rename the parent row, their Stop/StopCancelled would Idle a
+    // session that is still working, and their `generated_title` would wear
+    // the parent's name. `10-hooks.md` is explicit: exit early when
+    // `subagentType` is present. Parse also drops `transcript_path` on these
+    // so the launcher cannot switch its watch before we get here.
     if msg.session_is_child == Some(true) {
         return;
     }
@@ -593,6 +632,11 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// `prior` is unused: both files are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
+    // A child's sidecars must not fold onto the parent row. `apply_transcript_data`
+    // is Some-only, so an empty return leaves the parent's title and tokens.
+    if summary_is_subagent(&dir.join("summary.json")) {
+        return TranscriptStats::default();
+    }
     let mut stats = TranscriptStats::default();
 
     #[derive(Deserialize, Default)]
@@ -724,6 +768,33 @@ mod tests {
         let out = list_resumable_in(&root, 10);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session_id, "good");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Child sessions live as siblings under the same cwd-key. Offering one
+    /// from `r` would resume a subagent as a top-level grok, and its title is
+    /// what the parent row was flickering to.
+    #[test]
+    fn a_subagent_session_is_not_a_resume_candidate() {
+        let root = sessions_fixture(
+            "subagent-picker",
+            &[
+                (
+                    "k",
+                    "parent",
+                    r#"{"info":{"cwd":"/home/miao/p"},"generated_title":"the real work"}"#,
+                ),
+                (
+                    "k",
+                    "child",
+                    r#"{"info":{"cwd":"/home/miao/p"},"generated_title":"Catchlight Bevy editor review bugs","session_kind":"subagent"}"#,
+                ),
+            ],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "parent");
+        assert_eq!(out[0].custom_title.as_deref(), Some("the real work"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1017,6 +1088,7 @@ mod tests {
     fn a_subagent_payload_is_ignored() {
         let mut state = state_at(SessionStatus::Active);
         state.session_id = Some("parent".to_string());
+        state.name = Some("Resume Claude Session".to_string());
         feed(
             &mut state,
             HookEvent::Stop,
@@ -1027,6 +1099,61 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::Active);
         assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(state.name.as_deref(), Some("Resume Claude Session"));
+    }
+
+    /// A child's `transcriptPath` must not ride the hook. The launcher adopts
+    /// that path *before* dispatch, so a named child summary would stamp its
+    /// `generated_title` onto the parent row even though dispatch ignores the
+    /// event.
+    #[test]
+    fn a_subagent_hook_does_not_name_its_own_transcript() {
+        let dir = std::env::temp_dir().join(format!("cm-grok-child-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"generated_title":"Catchlight Bevy editor review bugs","session_kind":"subagent"}"#,
+        )
+        .unwrap();
+        let stdin = payload(
+            "pre_tool_use",
+            &format!(
+                r#","subagentType":"explore","transcriptPath":{}"#,
+                serde_json::to_string(&dir.join("updates.jsonl")).unwrap()
+            ),
+        );
+        let msg = parse_hook_payload(HookEvent::PreToolUse, &stdin).expect("parses");
+        assert_eq!(msg.session_is_child, Some(true));
+        assert_eq!(msg.transcript_path, None);
+        assert_eq!(msg.session_title, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `session_kind` on the file is enough when `subagentType` is missing —
+    /// a torn payload must not steal the row either.
+    #[test]
+    fn a_subagent_summary_without_subagent_type_is_still_a_child() {
+        let dir = std::env::temp_dir().join(format!("cm-grok-child-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"generated_title":"Catchlight Bevy editor review bugs","session_kind":"subagent"}"#,
+        )
+        .unwrap();
+        let stdin = payload(
+            "pre_tool_use",
+            &format!(
+                r#","transcriptPath":{}"#,
+                serde_json::to_string(&dir.join("updates.jsonl")).unwrap()
+            ),
+        );
+        let msg = parse_hook_payload(HookEvent::PreToolUse, &stdin).expect("parses");
+        assert_eq!(msg.session_is_child, Some(true));
+        assert_eq!(msg.transcript_path, None);
+        assert_eq!(msg.session_title, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `signals.json` is the context gauge `/session-info` shows; the title
@@ -1058,6 +1185,29 @@ mod tests {
             stats.last_prompt.as_deref(),
             Some("Pinned GrokNight; no custom palettes")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Folding a child's sidecars would stamp its title and tokens onto the
+    /// parent row. An empty fold is Some-only at apply time, so the parent
+    /// keeps what it already has.
+    #[test]
+    fn a_subagent_summary_does_not_fold_onto_the_row() {
+        let dir = std::env::temp_dir().join(format!("cm-grok-child-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("signals.json"),
+            r#"{"contextTokensUsed":111,"contextWindowTokens":500000,"primaryModelId":"grok-4.6"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"generated_title":"Catchlight Bevy editor review bugs","session_kind":"subagent","current_model_id":"grok-4.6"}"#,
+        )
+        .unwrap();
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats, TranscriptStats::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

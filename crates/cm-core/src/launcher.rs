@@ -624,7 +624,16 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 // bottom of the loop, running only while the session is off Idle,
                 // so the path is adopted here without a watcher (any stale
                 // old-path watcher is dropped).
-                if let Some(ref p) = msg.transcript_path {
+                //
+                // A child session's hook shares this socket and often names its
+                // own transcript. Adopting that path folds the child's title
+                // (and tokens) onto the parent row, then the parent's next hook
+                // folds them back — the dashboard flickering between the two.
+                // `dispatch_hook` is what ignores the child; this has to happen
+                // first because the watch is armed before dispatch.
+                if msg.session_is_child != Some(true)
+                    && let Some(ref p) = msg.transcript_path
+                {
                     let path = PathBuf::from(p);
                     if transcript_path.as_ref() != Some(&path) {
                         let adopted = if agent.transcript_poll_interval().is_some() {
