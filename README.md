@@ -99,15 +99,17 @@ Building needs a Rust toolchain and a C compiler (for the statically-bundled SQL
 No Rust toolchain, no build:
 
 ```sh
-npx @hyperlogue/captain-miao          # run it once
+npx @hyperlogue/captain-miao              # run it once
 npm install -g @hyperlogue/captain-miao   # or install the `miao` command
+bunx @hyperlogue/captain-miao             # same, with bun (no Node needed)
+bun add -g @hyperlogue/captain-miao
 ```
 
-`bunx @hyperlogue/captain-miao` works too. The npm package is a small launcher
-that execs a prebuilt native binary shipped as a per-platform optional
-dependency, so your package manager downloads only the one binary matching your
-machine; nothing is fetched at runtime. Prebuilt binaries cover **macOS** (Apple
-silicon + Intel) and **Linux** (x86-64 + arm64), and are also attached to every
+The npm package is a small launcher that execs a prebuilt native binary shipped
+as a per-platform optional dependency, so your package manager downloads only
+the one binary matching your machine; nothing is fetched at runtime. Prebuilt
+binaries cover **macOS** (Apple silicon + Intel) and **Linux** (x86-64 + arm64),
+and are also attached to every
 [GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as
 `miao-v<version>-<target>.tar.gz` if you'd rather download one directly.
 

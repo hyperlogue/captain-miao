@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The npm launcher runs on a bun-only machine.** `#!/usr/bin/env node` made
+  `miao` fail after `bun add -g` when no `node` binary was on PATH; the file
+  now starts with a `/bin/sh` polyglot that execs `node` or `bun`.
 - **A Grok session with live background work no longer reads as Idle.** `Stop`
   carries `backgroundTasks` / `sessionCrons`; an `r3 watch` now lands on
   Review, a parked server or `/loop` on Server, and a finite task on Task.

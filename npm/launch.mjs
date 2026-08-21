@@ -1,4 +1,5 @@
-#!/usr/bin/env node
+#!/bin/sh
+":" //# comment; r=$(command -v node || command -v bun) || { echo "miao: need node (>=18) or bun on PATH" >&2; exit 1; }; exec "$r" "$0" "$@"
 // captain-miao launcher — the npm package's only runtime file. It selects and
 // execs the prebuilt native `miao` binary that ships in a per-platform
 // optional-dependency package (`@hyperlogue/captain-miao-<os>-<arch>`). The
@@ -9,9 +10,12 @@
 // checksum dance. This file just resolves it and hands off, forwarding argv,
 // stdio, and the exit code/signal.
 //
-// Deliberately plain, dependency-free Node ESM using only cross-runtime APIs, so
-// the SAME file runs under `npx @hyperlogue/captain-miao` (Node >=18) and
-// `bunx @hyperlogue/captain-miao` (Bun). The binary is a static Rust build, so
+// Lines 1–2 are a POSIX polyglot (`":"` is a no-op in both sh and JS; the rest
+// of line 2 is a JS comment and an `exec` for sh). The kernel starts `/bin/sh`,
+// which re-execs `node` or `bun` — so `bun add -g` then `miao` works on a
+// machine with no `node` binary, and `bunx` does not need `--bun`. Node is
+// preferred when both are on PATH. The rest is dependency-free ESM using only
+// cross-runtime APIs (Node >=18 and Bun). The binary is a static Rust build, so
 // whichever runtime ran this launcher is irrelevant to how captain-miao runs.
 //
 // `stdio: "inherit"` is load-bearing here in a way it isn't for an ordinary CLI:
@@ -97,7 +101,8 @@ function resolveBinary() {
       `the ${pkg} package for your platform (${key}) is not installed.\n` +
         `  This is usually a stale lockfile (npm optional-dependencies bug). Try:\n` +
         `    • reinstall:  rm -rf node_modules package-lock.json && npm install\n` +
-        `    • clear the npx cache, then retry: npx --yes @hyperlogue/captain-miao …\n` +
+        `    • or with bun: rm -rf node_modules bun.lock bun.lockb && bun install\n` +
+        `    • clear the npx/bunx cache, then retry: npx --yes @hyperlogue/captain-miao …\n` +
         `    • download a prebuilt binary from ${REPO}/releases`,
     );
   }
