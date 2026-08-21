@@ -1189,11 +1189,11 @@ impl AgentControl {
             // the same defence Codex needed.
             AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Kimi => None,
-            // Moot for the same reason today — `agents::grok` supplies no
-            // transcript path. It will stop being moot the day it does: Grok's
-            // `updates.jsonl` is a long-lived append stream, which is exactly the
-            // shape that defeats macOS FSEvents, so whoever wires the fold should
-            // arrive back here before assuming an event-driven watch works.
+            // Event-driven is fine: the envelope names `transcriptPath`, we
+            // rewrite it to sibling `summary.json`, and Grok rewrites that file
+            // whole at turn boundaries (open/write/close). FSEvents sees the
+            // close. `updates.jsonl` *is* the long-held-fd append stream, and
+            // we deliberately don't watch it.
             AgentControl::Grok => None,
             // Moot, and structurally so rather than merely for now: opencode
             // keeps each message as its own JSON blob under `storage/`, so there

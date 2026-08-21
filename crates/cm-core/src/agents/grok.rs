@@ -105,6 +105,12 @@ struct SessionSummary {
     generated_title: String,
     #[serde(default)]
     current_model_id: String,
+    /// Branch checked out when the session last saved. 1.0.4 writes this at the
+    /// **top level**; older grok put it on [`SummaryInfo`]. Both are read.
+    /// Grok's worktrees live in its own registry rather than beside the repo,
+    /// so this is the only branch name the picker can show.
+    #[serde(default)]
+    head_branch: String,
 }
 
 impl SessionSummary {
@@ -115,6 +121,13 @@ impl SessionSummary {
             .filter(|t| !t.trim().is_empty())
             .or_else(|| Some(self.session_summary.clone()).filter(|t| !t.trim().is_empty()))
     }
+
+    /// 1.0.4's top-level field, then the older `info.head_branch` spelling.
+    fn git_branch(&self) -> Option<String> {
+        Some(self.head_branch.clone())
+            .filter(|b| !b.trim().is_empty())
+            .or_else(|| Some(self.info.head_branch.clone()).filter(|b| !b.trim().is_empty()))
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -123,9 +136,7 @@ struct SummaryInfo {
     /// a generation counter beside it; this is always the current one.
     #[serde(default)]
     cwd: String,
-    /// Branch checked out when the session last saved. Grok's worktrees live
-    /// in its own registry rather than beside the repo, so this is the only
-    /// branch name the picker can show.
+    /// Pre-1.0.4 location of [`SessionSummary::head_branch`].
     #[serde(default)]
     head_branch: String,
 }
@@ -175,7 +186,7 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
             continue;
         }
         let custom_title = summary.title();
-        let git_branch = Some(summary.info.head_branch).filter(|b| !b.trim().is_empty());
+        let git_branch = summary.git_branch();
         out.push(ResumeCandidate {
             agent: crate::agent::AgentControl::Grok,
             session_id: session_id.to_string(),
@@ -564,6 +575,29 @@ mod tests {
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].git_branch.as_deref(), Some("main"));
         assert_eq!(out[0].agent, AgentControl::Grok);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 1.0.4 writes `head_branch` at the top level and `info` as `{id, cwd}`
+    /// only. The picker has to follow that, or every live session shows no
+    /// branch even though the file has one.
+    #[test]
+    fn a_1_0_4_summary_puts_the_branch_at_the_top_level() {
+        let root = sessions_fixture(
+            "v104",
+            &[(
+                "cwd-key-1",
+                "01a02249-40a6-7301-b339-cad83f5046cd",
+                r#"{"info":{"id":"01a02249-40a6-7301-b339-cad83f5046cd","cwd":"/home/miao/p"},
+                    "generated_title":"miao hooks","session_summary":"a longer recap",
+                    "head_branch":"main","current_model_id":"grok-4.6"}"#,
+            )],
+        );
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "01a02249-40a6-7301-b339-cad83f5046cd");
+        assert_eq!(out[0].custom_title.as_deref(), Some("miao hooks"));
+        assert_eq!(out[0].git_branch.as_deref(), Some("main"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
