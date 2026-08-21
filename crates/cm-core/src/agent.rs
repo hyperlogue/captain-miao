@@ -523,19 +523,14 @@ impl AgentControl {
     /// [`Self::hooks_settings_json`] returns, so [`Self::forwarded_events`] can
     /// see the whole subscription rather than the largest part of it.
     ///
-    /// Grok is the only backend with a second site and the reason this exists:
-    /// its approval signal also lands as a `[[ui.notifications.hooks]]` entry
-    /// merged into the synthetic `config.toml` at launch, kept as a fallback
-    /// for grok versions whose lifecycle `Notification` event is missing. The
-    /// settings file now registers `permission_prompt` too, so this is
-    /// belt-and-braces rather than the only site.
-    ///
-    /// Still the real installed command, not a second declaration of it: this
-    /// returns what the merge writes.
+    /// Empty for every backend today. Grok's approval used to live in a second
+    /// site (`[[ui.notifications.hooks]]` in `config.toml`); it now rides the
+    /// lifecycle `Notification` matcher in the settings file. The seam stays
+    /// so a future second site does not have to re-derive `forwarded_events`.
     fn extra_hook_registrations(self) -> Vec<String> {
         match self {
-            AgentControl::Grok => vec![grok::notification_hook_command()],
-            AgentControl::Claude
+            AgentControl::Grok
+            | AgentControl::Claude
             | AgentControl::Codex
             | AgentControl::Reasonix
             | AgentControl::Kimi
@@ -1900,11 +1895,9 @@ mod tests {
             // No `Elicitation`: opencode's `permission.updated` is the gate and
             // `permission.replied` releases it, so the approval pair carries
             // what a decision prompt would.
-            // `PermissionRequest` is in the settings file via the lifecycle
-            // `Notification` / `permission_prompt` matcher, and again via
-            // `extra_hook_registrations` (the `[[ui.notifications.hooks]]`
-            // fallback). `StopCancelled` forwards as `Stop`, so it does not
-            // appear as its own variant.
+            // `PermissionRequest` is the lifecycle `Notification` /
+            // `permission_prompt` matcher. `StopCancelled` forwards as `Stop`,
+            // so it does not appear as its own variant.
             (
                 AgentControl::Grok,
                 &[

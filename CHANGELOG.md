@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picker finds sessions that lived only in the synthetic home. `StopCancelled`
   and the lifecycle `Notification` hook are the new signals; older grok skips
   names it does not know.
+- **Grok no longer uses a synthetic `GROK_HOME`.** Hooks go in
+  `~/.grok/hooks/captain-miao.json`; `miao hook` is a no-op without a launcher
+  socket, so sessions started outside captain-miao are unaffected. Sessions
+  minted under the old synthetic home move into `~/.grok` on the next launch.
 - **Managed Codex sessions now use an owned profile in the real Codex home**
   instead of a synthetic `CODEX_HOME`. The former synthetic home at
   `$XDG_STATE_HOME/captain-miao/codex-home` (normally

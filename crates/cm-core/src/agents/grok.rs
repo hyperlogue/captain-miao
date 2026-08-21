@@ -8,52 +8,23 @@
 //! `StopCancelled` are no longer guesses. Remaining limits are named at the
 //! point they still bite.
 //!
-//! **Isolation is `GROK_HOME`, and it cannot be dropped.** Interactive `grok`
-//! has no session-scoped hook injection (`--plugin-dir` exists only on
-//! `grok agent`). Writing `~/.grok/hooks/captain-miao.json` would fire in every
-//! grok the user runs *outside* captain-miao, against a socket that isn't
-//! there. Codex dropped its synth home because 0.134 grew named profiles;
-//! Grok's equivalent has not reached the TUI.
+//! **Hooks live in the real `~/.grok/hooks/captain-miao.json`.** Interactive
+//! `grok` has no per-invocation `--settings` (and `--plugin-dir` exists only on
+//! `grok agent`), so the file is always-on: it also fires in grok sessions the
+//! user starts outside captain-miao. That is fine — `miao hook` exits 0 when
+//! `$CAPTAIN_MIAO_SOCK` is unset, so those spawns are a no-op rather than a
+//! failed turn. Global `~/.grok/hooks/*.json` is always trusted
+//! (`custom-hooks.md`), so there is no prompt and no hash to precompute.
+//! Codex's equivalent is an owned profile selected with `--profile`; this is
+//! the same owned-file-in-the-real-home idea, without a selector.
 //!
-//! `17-sessions.md`: *"Set `GROK_HOME` to override the base directory; when it
-//! is unset, Grok uses `~/.grok`"* — and it moves everything, not just config:
-//! sessions, auth, memory, skills, plugins, agents and logs. So the synthetic
-//! home mirrors the real one through symlinks ([`super::synth_home`]) and we own
-//! exactly two things:
+//! A previous revision relocated the whole tree with `GROK_HOME` pointing at a
+//! synthetic home. Sessions minted there are moved into the real home on the
+//! next launch ([`migrate_legacy_synth_home`]); the leftover synth dir is
+//! otherwise ignored and safe to delete.
 //!
-//! - **`hooks/captain-miao.json`.** `hooks/` is a *directory* of independent
-//!   files, so unlike an agent with one global `hooks.json` there is no merge
-//!   to get right — but there is a nested mirror to get right, which is why
-//!   [`ensure_synth_home`] builds a second [`SynthHome`] *inside* the first. Own
-//!   the directory without it and the user's own global hooks stop firing in
-//!   every captain-miao session; leave the directory to the outer mirror and our
-//!   file would be written **through a symlink into the user's real `~/.grok`**,
-//!   which is the one thing a synthetic home exists to prevent.
-//! - **`config.toml`, a writable copy** rather than a symlink. Needed so the
-//!   pager-notify approval fallback can be merged in, and so Grok can persist
-//!   into a file that is frequently a read-only home-manager symlink.
-//!
-//! Everything else is a symlink, and that is the invariant rather than an
-//! enumeration: **`auth.json` in particular must be linked, never copied** — it
-//! is auto-managed, so a copy would strand a token refresh inside the synthetic
-//! home.
-//!
-//! **No trust seeding.** `custom-hooks.md`'s scope table is explicit: global
-//! `~/.grok/hooks/*.json` and config-file hooks are *always* trusted; only
-//! `<project>/.grok/hooks/` needs `/hooks-trust`. We inject at the global tier,
-//! so no prompt can fire and there is no hash to precompute — strictly simpler
-//! than Codex, which pre-trusts its command hooks inside captain-miao's owned
-//! profile because it has no always-trusted user tier.
-//!
-//! **Approval has two sites, on purpose.** The lifecycle `Notification` event
-//! with matcher `permission_prompt` is the 1.0.4 path (JSON on stdin, same
-//! hooks file as everything else). The pager's `[[ui.notifications.hooks]]`
-//! entry in `config.toml` is kept as a fallback for older grok, and is the
-//! reason `config.toml` is still a writable copy: drop that merge and `hooks/`
-//! alone would do. The pager path's contract still bites when it is the one
-//! that fires (see [`notification_hook_command`] and [`with_notification_hook`]):
-//! stdin is `/dev/null`, everything arrives in the environment, and
-//! `only_unfocused` **defaults to `true`**.
+//! **Approval is the lifecycle `Notification` / `permission_prompt` matcher**
+//! in that same hooks file. There is no second site in `config.toml`.
 //!
 //! **What this module still does not do**, and why:
 //!
@@ -79,38 +50,24 @@ use tokio::process::Command;
 
 use super::common;
 use super::shell_quote;
-use super::synth_home::{CopiedEntry, SynthHome, atomic_write};
+use super::synth_home::atomic_write;
 use crate::agent::{ResumeCandidate, TranscriptStats};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "grok";
 
-/// Our hook file inside `$GROK_HOME/hooks/`. A whole file of our own rather than
+/// Our hook file inside `~/.grok/hooks/`. A whole file of our own rather than
 /// a merged one, because `hooks/` is a directory of independent files that Grok
 /// globs — nothing of the user's is shadowed by it.
 const HOOKS_FILE: &str = "captain-miao.json";
-
-/// The substring that identifies *our* `[[ui.notifications.hooks]]` entry in a
-/// config we did not write alone. Keyed on the invocation rather than on the
-/// executable path, which moves between builds and installs — a marker that
-/// stopped matching would leave one stale entry per rebuild in the user's copy.
-const NOTIFY_HOOK_MARKER: &str = "hook --agent grok";
-
-/// The one notification event worth registering (`notifications/config.rs`'s
-/// `NotificationEventKind::ApprovalRequired`, spelled snake_case in config).
-/// `turn_complete`, `session_ready` and `task_complete` are redundant with the
-/// lifecycle hooks and would only spawn a second subprocess per turn to discard;
-/// `agent_error` duplicates `StopFailure`.
-const NOTIFY_EVENT_APPROVAL: &str = "approval_required";
 
 // =============================================================================
 // Filesystem locations
 // =============================================================================
 
-/// The real Grok home — `$GROK_HOME` if the user set one globally, else
-/// `~/.grok` (`17-sessions.md`). This is what the synthetic home mirrors; it is
-/// *not* what the launched agent is handed (see [`ensure_synth_home`]).
+/// The Grok home the launched agent will use — `$GROK_HOME` if the user set one
+/// globally, else `~/.grok` (`17-sessions.md`). We no longer override this.
 fn grok_home() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("GROK_HOME") {
         let p = PathBuf::from(h);
@@ -130,26 +87,32 @@ fn grok_home() -> Option<PathBuf> {
 /// we want is inside `summary.json` anyway. So the key is a directory to iterate,
 /// never a string to parse.
 ///
-/// Prefers the synthetic home's `sessions/` when that directory exists (a
-/// symlink to the real one after [`ensure_synth_home`] has run, or a leftover
-/// shadow from a launch that predates the seed). The dashboard process has no
-/// `GROK_HOME` of its own, so walking only `~/.grok/sessions` would miss every
-/// session minted inside captain-miao.
-fn sessions_root() -> Option<PathBuf> {
-    let synth = synth_home().join("sessions");
-    if synth.is_dir() {
-        return Some(synth);
+/// Session stores to walk: the real home, plus a leftover synthetic home from
+/// before hooks lived in `~/.grok`. Canonicalized so a leftover symlink at the
+/// synth path is not scanned twice.
+fn session_store_roots() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |p: PathBuf| {
+        if !p.is_dir() {
+            return;
+        }
+        let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if seen.insert(key) {
+            out.push(p);
+        }
+    };
+    if let Some(home) = grok_home() {
+        push(home.join("sessions"));
     }
-    Some(grok_home()?.join("sessions"))
+    push(legacy_synth_home().join("sessions"));
+    out
 }
 
-/// A single shared synthetic `$GROK_HOME` for every Grok session: the real home
-/// mirrored through symlinks, plus the two entries we own. Shared rather than
-/// per-session because it is a symlink farm over the user's home — one stable
-/// copy is cheaper to build and to reason about than one per launch — and that
-/// sharing is exactly why neither our hooks file nor our notification hook may
-/// carry per-session data (see [`build_hooks_settings`]).
-fn synth_home() -> PathBuf {
+/// Previous revision's synthetic `$GROK_HOME`. Ignored after
+/// [`migrate_legacy_synth_home`] has run; kept so the resume picker still finds
+/// sessions that have not been moved yet, and so that move has a source.
+fn legacy_synth_home() -> PathBuf {
     crate::state::state_dir().join("grok-home")
 }
 
@@ -215,8 +178,15 @@ struct SummaryInfo {
 /// to be re-folded into a context total. The model *is* on disk, and rides
 /// along.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
-    Ok(list_resumable_in(&root, limit))
+    let mut found = Vec::new();
+    for root in session_store_roots() {
+        found.extend(list_resumable_in(&root, usize::MAX));
+    }
+    found.sort_by_key(|c| std::cmp::Reverse(c.mtime));
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|c| seen.insert(c.session_id.clone()));
+    found.truncate(limit);
+    Ok(found)
 }
 
 /// The scan itself, split from `$GROK_HOME` resolution so a test can point it
@@ -261,7 +231,7 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
 }
 
 // =============================================================================
-// Launcher: process spawn + synthetic GROK_HOME
+// Launcher: process spawn + real ~/.grok hooks file
 // =============================================================================
 
 pub fn build_launch_command(
@@ -271,21 +241,13 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    // The launcher already wrote our hook-file contents to `settings_path`;
-    // relocate them into the synthetic home, which is where Grok discovers
-    // global hooks (there is no per-invocation `--settings` equivalent — that is
-    // the whole reason this backend needs a home at all).
     let hooks_json =
         std::fs::read_to_string(settings_path).context("reading grok hook settings")?;
-    let home = ensure_synth_home(&hooks_json)?;
+    install_hooks_file(&hooks_json)?;
 
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
-    cmd.env("GROK_HOME", &home);
-    // The hook subprocess reads the launcher socket from here rather than from an
-    // argv flag: the synthetic home is shared by every session, so neither the
-    // hooks file nor `config.toml` can carry a per-session path. The notification
-    // hook depends on the same variable surviving into a `setsid`'d `sh -c` —
-    // unverified, and the first thing to check if approval state never appears.
+    // Shared hooks file, so the socket cannot ride argv. Sessions the user
+    // starts outside captain-miao have this unset; `miao hook` then exits 0.
     cmd.env("CAPTAIN_MIAO_SOCK", sock_path);
     // Only what the launcher forwarded (`--resume <id>`, `--worktree=<name>`).
     // **No cwd positional**: nothing in the sources says `grok` takes a directory
@@ -296,232 +258,77 @@ pub fn build_launch_command(
     Ok(cmd)
 }
 
-/// Create / refresh the synthetic home and return it. Two owned entries, and the
-/// nesting between them is the whole subtlety:
-///
-/// - the **outer** mirror owns the `hooks` *directory*, so it is never replaced
-///   by a symlink to the real one (which would send [`SynthHome::write_owned`]'s
-///   write straight into the user's `~/.grok/hooks/`);
-/// - the **inner** mirror rebuilds that directory's contents as symlinks to the
-///   real `hooks/` entries, so the user's own global hooks keep firing inside a
-///   captain-miao session, and adds `captain-miao.json` beside them.
-///
-/// `config.toml` is copied writable rather than linked: the real file is
-/// frequently read-only (a nix-store / home-manager symlink), the agent persists
-/// its own state into it, and we have to write the approval hook into it
-/// ([`with_notification_hook`]). The copy is reseeded from the real file only
-/// when *that* changes ([`CopiedEntry`]), so a `/model` change inside a session
-/// survives; the reseed is why the merge below re-runs on every launch instead
-/// of once.
-///
-/// The cost of the copy is the same one Codex pays, and it is now limited to
-/// *configuration*: a `/model` change made inside a captain-miao session lands
-/// in the copy and is cleared the next time the user edits their real config.
-/// Credentials are not affected — `auth.json` is linked rather than copied, and
-/// a first login, which has no real file to link to yet, is moved back out by
-/// [`SynthHome::adopt_agent_writes`].
-/// State directories Grok writes on first launch. Seeded in the *real* home
-/// so they exist to be linked — otherwise the agent mints them inside the
-/// synthetic home as a shadow the dashboard (which resolves `~/.grok`) never
-/// sees, and which [`SynthHome::ensure`] then quarantines the moment the real
-/// home grows the name. Same lesson as Kimi's `credentials/`.
-const SEEDED_STATE_DIRS: &[&str] = &["sessions", "logs", "relocations"];
+/// Write `$GROK_HOME/hooks/captain-miao.json` (creating the directory). The
+/// file is rewritten only when its contents would change, so concurrent
+/// launches never race a half-written hook file.
+fn install_hooks_file(contents: &str) -> Result<()> {
+    let home = grok_home().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
+    migrate_legacy_synth_home(&home);
+    let dir = home.join("hooks");
+    crate::state::create_dir_all_private(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(HOOKS_FILE);
+    let unchanged = std::fs::read_to_string(&path)
+        .map(|cur| cur == contents)
+        .unwrap_or(false);
+    if !unchanged {
+        atomic_write(&path, contents.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
 
-/// Top-level files Grok creates in its home. A dangling symlink lets
-/// `open(O_CREAT)` land the first write in the real home, the same trick
-/// Kimi uses for `session_index.jsonl`.
-const SEEDED_STATE_FILES: &[&str] = &[
+/// Names in the old synthetic home that are the agent's own state, moved into
+/// the real home so dropping `GROK_HOME` does not strand them. `hooks/` and
+/// `config.toml` stay behind: those were ours.
+const LEGACY_SYNTH_STATE: &[&str] = &[
+    "sessions",
+    "logs",
+    "relocations",
     "worktrees.db",
     "trusted_folders.toml",
     "active_sessions.json",
+    "auth.json",
 ];
 
-fn seed_real_state(real: &Path, synth: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if std::fs::symlink_metadata(real).is_err() && std::fs::create_dir_all(real).is_ok() {
-        let _ = std::fs::set_permissions(real, std::fs::Permissions::from_mode(0o700));
+/// Best-effort move of leftover synthetic-home shadows into `real`. A symlink
+/// already points at the real home; a real file/dir is moved when `real` has
+/// no such name, or merged recursively when both sides are directories
+/// (session trees). Failures leave the source in place for the next launch.
+fn migrate_legacy_synth_home(real: &Path) {
+    let synth = legacy_synth_home();
+    if !synth.is_dir() {
+        return;
     }
-    for name in SEEDED_STATE_DIRS {
-        // A real directory already in the synthetic home is a shadow; seeding
-        // the real side first would make adopt skip it and the linking pass
-        // quarantine the live session tree.
-        let synth_p = synth.join(name);
-        if let Ok(meta) = std::fs::symlink_metadata(&synth_p)
-            && !meta.file_type().is_symlink()
-        {
-            continue;
-        }
-        let dest = real.join(name);
-        if std::fs::symlink_metadata(&dest).is_err() && std::fs::create_dir_all(&dest).is_ok() {
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
-        }
+    let _ = crate::state::create_dir_all_private(real);
+    for name in LEGACY_SYNTH_STATE {
+        relocate_entry(&synth.join(name), &real.join(name));
     }
 }
 
-fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
-    let real = grok_home();
-    let home = SynthHome {
-        dir: synth_home(),
-        real: real.clone(),
-        owned: &["hooks"],
-        copied: &[CopiedEntry {
-            name: "config.toml",
-            snapshot: ".config-source.toml",
-        }],
-        // Auto-managed credentials plus the state trees that a first-ever
-        // captain-miao grok launch otherwise mints as shadows. Linking only
-        // works once the name exists in the real home, so anything already
-        // written into the synthetic copy is moved back out.
-        adopted: &[
-            "auth.json",
-            "sessions",
-            "logs",
-            "relocations",
-            "worktrees.db",
-            "trusted_folders.toml",
-            "active_sessions.json",
-        ],
-        prune: false,
-    };
-    if let Some(real) = &real {
-        seed_real_state(real, &home.dir);
-    }
-    home.ensure()?;
-    if let Some(real) = &real {
-        for name in SEEDED_STATE_FILES {
-            let link = home.dir.join(name);
-            if std::fs::symlink_metadata(&link).is_err() {
-                let _ = std::os::unix::fs::symlink(real.join(name), &link);
-            }
-        }
-    }
-
-    let hooks = SynthHome {
-        dir: home.dir.join("hooks"),
-        real: real.map(|r| r.join("hooks")),
-        owned: &[HOOKS_FILE],
-        copied: &[],
-        // Hooks are configuration, never agent state.
-        adopted: &[],
-        // A loader-scanned collection: a hook the user deletes must not leave
-        // a dangling import behind (see [`SynthHome::prune`]).
-        prune: true,
-    };
-    hooks.ensure()?;
-    hooks.write_owned(HOOKS_FILE, hooks_json)?;
-
-    register_notification_hook(&home.dir);
-    Ok(home.dir)
-}
-
-/// Merge our approval hook into the synthetic home's `config.toml`.
-///
-/// Best-effort throughout, like Codex's profile trust generation: a garbled or
-/// unreadable config leaves the file alone, which costs the
-/// `WaitingForApproval` state and nothing else. Re-run every launch (and
-/// idempotent) so it survives the [`CopiedEntry`] reseed that follows any edit
-/// to the user's real config.
-fn register_notification_hook(home: &Path) {
-    let path = home.join("config.toml");
-    // A missing file is not a failure: the user may have no config at all, and a
-    // config holding only our hook is a valid one.
-    let current = std::fs::read_to_string(&path).unwrap_or_default();
-    let Some(updated) = with_notification_hook(&current, &notification_hook_command()) else {
-        tracing::warn!(
-            "grok config.toml could not be updated; approval state will not be reported"
-        );
+fn relocate_entry(src: &Path, dest: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(src) else {
         return;
     };
-    if updated != current {
-        let _ = atomic_write(&path, updated.as_bytes());
+    if meta.file_type().is_symlink() {
+        return;
     }
-}
-
-/// The shell command Grok runs when an approval is pending.
-///
-/// The notification system runs `sh -c "<command>"` with **stdin on
-/// `/dev/null`** — there is no JSON payload, and everything arrives in the
-/// environment (`GROK_EVENT`, a *display* string like `"Approval required"`;
-/// `GROK_MESSAGE`; `GROK_SESSION_ID`). Rather than teach `miao hook` a second
-/// stdin contract, the registered command synthesizes the one payload field we
-/// need and pipes it in — the shape [`parse_hook_payload`] already reads.
-///
-/// Output and exit status are discarded and the child is killed on timeout, so
-/// nothing here can affect the session.
-///
-/// Carries no `--sock`: the socket rides `$CAPTAIN_MIAO_SOCK`, because one
-/// `config.toml` serves every session (see [`synth_home`]).
-pub(crate) fn notification_hook_command() -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
-    let exe_q = shell_quote(&exe.to_string_lossy());
-    format!(
-        r#"printf '{{"sessionId":"%s"}}' "$GROK_SESSION_ID" | {exe_q} hook --agent grok {}"#,
-        HookEvent::PermissionRequest.as_kebab()
-    )
-}
-
-/// Insert (or replace) our `[[ui.notifications.hooks]]` entry in `config`,
-/// returning the new document — or `None` when the config can't be parsed or its
-/// `ui.notifications.hooks` isn't the shape Grok defines, in which case the
-/// caller leaves the file untouched.
-///
-/// Pure so the three things that are easy to get silently wrong are pinned by
-/// tests rather than by a live approval:
-///
-/// - **`only_unfocused = false`, set explicitly.** It defaults to `true`
-///   (`notifications/config.rs`), which is close to the worst possible failure
-///   mode for this feature: captain-miao would be told about a pending approval
-///   only while the user's terminal is unfocused, so it would work in casual
-///   testing and silently not work whenever they were watching the row.
-/// - **`timeout_secs = 5`, set explicitly** — a hung socket write must not hold
-///   a notification child open.
-/// - **idempotence.** The entry is keyed by [`NOTIFY_HOOK_MARKER`] and replaced
-///   in place, so relaunching (or rebuilding to a new exe path) can never
-///   accumulate duplicates in a file the user also owns.
-///
-/// Everything else in the document is carried through, including the user's own
-/// notification hooks. The round-trip through `toml::Table` does drop comments
-/// and reflow the file — acceptable only because this is *our copy*, never the
-/// user's real config.
-fn with_notification_hook(config: &str, command: &str) -> Option<String> {
-    use toml::Value;
-
-    let mut doc: toml::Table = config.parse().ok()?;
-    let ui = doc
-        .entry("ui".to_string())
-        .or_insert_with(|| Value::Table(toml::map::Map::new()));
-    let Value::Table(ui) = ui else { return None };
-    let notifications = ui
-        .entry("notifications".to_string())
-        .or_insert_with(|| Value::Table(toml::map::Map::new()));
-    let Value::Table(notifications) = notifications else {
-        return None;
-    };
-    let hooks = notifications
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Value::Array(hooks) = hooks else {
-        return None;
-    };
-
-    hooks.retain(|hook| {
-        !hook
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|c| c.contains(NOTIFY_HOOK_MARKER))
-    });
-
-    let mut entry = toml::map::Map::new();
-    entry.insert("command".to_string(), Value::String(command.to_string()));
-    entry.insert(
-        "events".to_string(),
-        Value::Array(vec![Value::String(NOTIFY_EVENT_APPROVAL.to_string())]),
-    );
-    entry.insert("only_unfocused".to_string(), Value::Boolean(false));
-    entry.insert("timeout_secs".to_string(), Value::Integer(5));
-    hooks.push(Value::Table(entry));
-
-    toml::to_string(&doc).ok()
+    if std::fs::symlink_metadata(dest).is_err() {
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::rename(src, dest).is_ok() {
+            return;
+        }
+    }
+    if meta.is_dir()
+        && dest.is_dir()
+        && let Ok(entries) = std::fs::read_dir(src)
+    {
+        for entry in entries.flatten() {
+            relocate_entry(&entry.path(), &dest.join(entry.file_name()));
+        }
+    }
 }
 
 /// Build the contents of `$GROK_HOME/hooks/captain-miao.json`.
@@ -540,9 +347,7 @@ fn with_notification_hook(config: &str, command: &str) -> Option<String> {
 ///   stopped is over, not failed — Kimi's `Interrupt` standing. The matcher is
 ///   tested against `reason`; omitted, it fires for every cancel.
 /// - **`Notification` / `permission_prompt` → `PermissionRequest`.** The
-///   lifecycle hook that fires while a permission UI is waiting. The
-///   `[[ui.notifications.hooks]]` entry in `config.toml` is kept as a fallback
-///   for grok versions that only have the pager notify path.
+///   lifecycle hook that fires while a permission UI is waiting.
 /// - **`Notification` / `idle_prompt` → `Stop`.** Grok's documented backstop
 ///   for turns that report none of Stop / StopFailure / StopCancelled (bash
 ///   mode, rewind, a superseded report). Delayed ~1 minute; cancelled if the
@@ -1125,6 +930,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A leftover synthetic-home session tree is merged into the real home
+    /// without clobbering a session that already exists there.
+    #[test]
+    fn leftover_synth_sessions_are_moved_into_the_real_home() {
+        let tag = std::process::id();
+        let synth = std::env::temp_dir().join(format!("cm-grok-mig-s-{tag}"));
+        let real = std::env::temp_dir().join(format!("cm-grok-mig-r-{tag}"));
+        let _ = std::fs::remove_dir_all(&synth);
+        let _ = std::fs::remove_dir_all(&real);
+        let src = synth.join("sessions").join("k").join("abc");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("summary.json"), "{}").unwrap();
+        std::fs::create_dir_all(real.join("sessions").join("k").join("keep")).unwrap();
+        relocate_entry(&synth.join("sessions"), &real.join("sessions"));
+        assert!(real.join("sessions/k/abc/summary.json").is_file());
+        assert!(real.join("sessions/k/keep").is_dir());
+        let _ = std::fs::remove_dir_all(&synth);
+        let _ = std::fs::remove_dir_all(&real);
+    }
+
     /// One hooks file serves every session, so it must carry no per-session data;
     /// and `Stop` must carry the explicit timeout, whose default there is 600s
     /// rather than 5 and would hold a turn end for ten minutes on a hung write.
@@ -1194,119 +1019,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .ends_with("hook --agent grok stop")
-        );
-    }
-
-    /// The approval hook's whole contract in one place: it synthesizes the JSON
-    /// `parse_hook_payload` reads (there is no stdin), names the event our
-    /// forwarder expects, and carries no socket — because `config.toml`, like the
-    /// hooks file, is shared by every session.
-    #[test]
-    fn the_notification_hook_command_synthesizes_a_payload_we_can_parse() {
-        let cmd = notification_hook_command();
-        assert!(
-            cmd.contains(r#"printf '{"sessionId":"%s"}' "$GROK_SESSION_ID""#),
-            "{cmd}"
-        );
-        assert!(
-            cmd.ends_with("hook --agent grok permission-request"),
-            "{cmd}"
-        );
-        assert!(!cmd.contains("--sock"), "{cmd}");
-        // The format string above, filled in, must be exactly what the parser
-        // accepts — the two halves of this mechanism live in different processes
-        // and nothing else pins them together.
-        let msg = parse_hook_payload(HookEvent::PermissionRequest, r#"{"sessionId":"abc-123"}"#)
-            .expect("the synthesized payload parses");
-        assert_eq!(msg.session_id.as_deref(), Some("abc-123"));
-    }
-
-    /// The three things about the config merge that are easy to get silently
-    /// wrong: the explicit `only_unfocused = false` (its default of `true` would
-    /// report approvals only while the user is looking away), the explicit
-    /// timeout, and the event list.
-    #[test]
-    fn the_approval_hook_is_registered_with_the_gates_set_explicitly() {
-        let merged = with_notification_hook("", "miao-cmd hook --agent grok permission-request")
-            .expect("an empty config merges");
-        let doc: toml::Table = merged.parse().expect("valid TOML");
-        let hooks = doc["ui"]["notifications"]["hooks"]
-            .as_array()
-            .expect("an array of hook tables");
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0]["only_unfocused"], toml::Value::Boolean(false));
-        assert_eq!(hooks[0]["timeout_secs"], toml::Value::Integer(5));
-        assert_eq!(
-            hooks[0]["events"].as_array().expect("an events array"),
-            &[toml::Value::String("approval_required".to_string())]
-        );
-    }
-
-    /// The merge runs on every launch and the copy it edits is reseeded whenever
-    /// the user's real config changes, so it has to be idempotent *and* has to
-    /// leave everything it didn't write alone — including the user's own
-    /// notification hooks, which live in the same array.
-    #[test]
-    fn the_merge_is_idempotent_and_keeps_the_users_config() {
-        // `zz_model` is deliberately a root-level scalar whose key sorts *after*
-        // every table's: TOML forbids a bare key following a table header, so a
-        // serializer that wrote this document in key order would fail on it and
-        // the merge would silently give up on precisely the configs that have
-        // one (`05-configuration.md` puts `model` at the root).
-        let user = r#"
-zz_model = "grok-build-0.1"
-
-[ui]
-theme = "dark"
-
-[ui.notifications]
-condition = "unfocused"
-
-[[ui.notifications.hooks]]
-command = "notify-send Grok"
-events = ["turn_complete"]
-
-[permissions]
-allow = ["read"]
-"#;
-        let once = with_notification_hook(user, "/old/miao hook --agent grok permission-request")
-            .expect("merges");
-        // A rebuild moves the exe path; the entry must be replaced, not doubled.
-        let twice = with_notification_hook(&once, "/new/miao hook --agent grok permission-request")
-            .expect("merges again");
-        let thrice =
-            with_notification_hook(&twice, "/new/miao hook --agent grok permission-request")
-                .expect("merges a third time");
-        assert_eq!(twice, thrice, "the merge must be idempotent");
-
-        let doc: toml::Table = twice.parse().expect("valid TOML");
-        assert_eq!(doc["zz_model"].as_str(), Some("grok-build-0.1"));
-        assert_eq!(doc["ui"]["theme"].as_str(), Some("dark"));
-        assert_eq!(doc["permissions"]["allow"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            doc["ui"]["notifications"]["condition"].as_str(),
-            Some("unfocused")
-        );
-        let hooks = doc["ui"]["notifications"]["hooks"].as_array().unwrap();
-        assert_eq!(hooks.len(), 2, "{twice}");
-        assert_eq!(hooks[0]["command"].as_str(), Some("notify-send Grok"));
-        assert_eq!(
-            hooks[1]["command"].as_str(),
-            Some("/new/miao hook --agent grok permission-request")
-        );
-    }
-
-    /// A config we can't read is left alone: losing approval state is a bad
-    /// afternoon, and rewriting the file the agent reads its model and
-    /// permissions from is a worse one.
-    #[test]
-    fn an_unparseable_config_is_left_untouched() {
-        assert!(with_notification_hook("this is not = = toml", "c").is_none());
-        // Same when the key exists but isn't the shape Grok defines.
-        assert!(with_notification_hook("[ui]\nnotifications = 3\n", "c").is_none());
-        assert!(
-            with_notification_hook("[ui.notifications]\nhooks = \"one\"\n", "c").is_none(),
-            "a scalar where the array of hook tables belongs"
         );
     }
 }

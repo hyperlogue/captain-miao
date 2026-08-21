@@ -10,18 +10,23 @@ use crate::state::HookEvent;
 /// socket comes from `--sock` when given, else `$CAPTAIN_MIAO_SOCK` — Codex
 /// hooks rely on the env form so their owned profile carries no per-session
 /// data and its trust hashes stay stable.
+///
+/// No socket is not an error. Grok's global `~/.grok/hooks/captain-miao.json`
+/// (and any other always-on hook file) also fires in sessions the user started
+/// outside captain-miao; those have no launcher to talk to, and a non-zero
+/// exit would only show up in the agent's hook scrollback. Exit 0 immediately
+/// so the spawn is a no-op rather than a failed turn.
 pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&str>) -> Result<()> {
     let event = HookEvent::from_kebab(event)
         .ok_or_else(|| anyhow::anyhow!("Unknown hook event: {event}"))?;
 
     let sock_owned;
-    let sock_path = match sock_path {
-        Some(s) => s,
-        None => {
-            sock_owned = std::env::var("CAPTAIN_MIAO_SOCK")
-                .map_err(|_| anyhow::anyhow!("no --sock and CAPTAIN_MIAO_SOCK unset"))?;
-            &sock_owned
+    let sock_path = match resolve_sock(sock_path, std::env::var("CAPTAIN_MIAO_SOCK").ok()) {
+        Some(s) => {
+            sock_owned = s;
+            sock_owned.as_str()
         }
+        None => return Ok(()),
     };
 
     let mut buf = String::new();
@@ -51,6 +56,14 @@ pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&s
     }
 
     Ok(())
+}
+
+/// `--sock` wins over the env var; an empty string in either is absent.
+fn resolve_sock(explicit: Option<&str>, env: Option<String>) -> Option<String> {
+    explicit
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env.filter(|s| !s.is_empty()))
 }
 
 /// Record a hook that couldn't reach its launcher.
@@ -108,4 +121,40 @@ fn report_unreachable_launcher(sock_path: &str, err: &std::io::Error) {
          is unreachable ({err}). Status updates are being dropped; this row's \
          state is stale from here on."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_socket_is_absent_not_an_error() {
+        assert_eq!(resolve_sock(None, None), None);
+        assert_eq!(resolve_sock(Some(""), None), None);
+        assert_eq!(resolve_sock(None, Some(String::new())), None);
+        assert_eq!(
+            resolve_sock(Some(""), Some(String::new())),
+            None,
+            "empty in both places is still absent"
+        );
+    }
+
+    #[test]
+    fn an_explicit_socket_wins_over_the_env() {
+        assert_eq!(
+            resolve_sock(Some("/run/a.sock"), Some("/run/b.sock".into())),
+            Some("/run/a.sock".into())
+        );
+        assert_eq!(
+            resolve_sock(None, Some("/run/b.sock".into())),
+            Some("/run/b.sock".into())
+        );
+        // An empty --sock does not punch a hole through a real env var: the
+        // CLI omits the flag rather than passing empty, and an empty env is
+        // the outside-captain-miao case.
+        assert_eq!(
+            resolve_sock(Some(""), Some("/run/b.sock".into())),
+            Some("/run/b.sock".into())
+        );
+    }
 }
