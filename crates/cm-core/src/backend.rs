@@ -650,6 +650,7 @@ mod tests {
             terminal: None,
             terminfo: None,
             alt_screen: false,
+            kitty_keyboard: false,
             flags: None,
             attached: None,
             host: HostId::local(),

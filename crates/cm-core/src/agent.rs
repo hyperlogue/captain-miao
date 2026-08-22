@@ -463,6 +463,31 @@ impl AgentControl {
         }
     }
 
+    /// Whether this launch will push the **kitty keyboard protocol**
+    /// (`ESC[>3u`), judged from the `TERM` the agent will see — the
+    /// companion to [`Self::uses_alt_screen`], and consumed in the same one
+    /// place ([`LauncherState::kitty_keyboard`]). Same bargain as there:
+    /// `false` for any backend nobody has probed, because a missed push
+    /// keeps reattach exactly as it is today while a wrong push feeds
+    /// CSI-u key encodings to a parser that never opted into them.
+    pub fn uses_kitty_keyboard(self, term: &str) -> bool {
+        match self {
+            // Probed on 1.0.5: the push is gated purely on `TERM` (it goes
+            // out before any terminal query could answer). The gate itself
+            // lives with the rest of Grok's knowledge.
+            AgentControl::Grok => grok::uses_kitty_keyboard(term),
+            AgentControl::Claude
+            | AgentControl::Codex
+            | AgentControl::Reasonix
+            | AgentControl::Kimi
+            | AgentControl::OpenCode
+            | AgentControl::Pi
+            | AgentControl::Omp
+            | AgentControl::Antigravity
+            | AgentControl::Unknown => false,
+        }
+    }
+
     /// Everything a backend may structurally lack, in one query — the
     /// `AgentControl` counterpart to [`crate::terminal::Capabilities`], and the
     /// same bargain: a limit the UI has to gate on is a *field* here, not a
@@ -2115,8 +2140,16 @@ mod tests {
                 "{agent:?} claims the alt screen; verify it on a pool pty and \
                  move it out of the unverified arm deliberately"
             );
+            // Same guard for the keyboard push, and for the same reason —
+            // even under the TERM that makes Grok push.
+            assert!(
+                !agent.uses_kitty_keyboard("xterm-kitty"),
+                "{agent:?} claims the kitty keyboard push; probe its startup \
+                 bytes and move it out of the unverified arm deliberately"
+            );
         }
         assert!(!AgentControl::Unknown.uses_alt_screen(&[]));
+        assert!(!AgentControl::Unknown.uses_kitty_keyboard("xterm-kitty"));
     }
 
     /// **The test the declared matrix is worth having.** `capabilities()` is a

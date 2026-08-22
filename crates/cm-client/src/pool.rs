@@ -155,7 +155,7 @@ pub fn attach(name: String, force: bool) -> Result<()> {
         );
         std::process::exit(cm_core::state::ATTACH_EXIT_STALE);
     };
-    let alt_screen = owner.alt_screen;
+    let prime = cm_core::state::ReattachPrime::of(owner);
     if matches!(session.status, SessionStatus::Attached) {
         if !force {
             eprintln!(
@@ -170,16 +170,13 @@ pub fn attach(name: String, force: bool) -> Result<()> {
     // and here is still caught by libshpool's own busy guard (which exits 0 —
     // acceptable for the residual race window).
     //
-    // An agent living on the alternate screen toggled it in a terminal long
-    // gone; prime this one to match before the relay, and restore it after —
-    // mirrors the server's attach (see `cm_core::state::ALT_SCREEN_ENTER`).
-    if alt_screen {
-        cm_core::state::prime_alt_screen(cm_core::state::ALT_SCREEN_ENTER);
-    }
+    // The agent set its terminal modes (alt screen, mouse tracking, a
+    // keyboard push) in a terminal long gone; prime this one to match before
+    // the relay, and restore it after — mirrors the server's attach (see
+    // `cm_core::state::ReattachPrime`).
+    prime.enter();
     let result = attach_pty(&name, force);
-    if alt_screen {
-        cm_core::state::prime_alt_screen(cm_core::state::ALT_SCREEN_LEAVE);
-    }
+    prime.leave();
     result
 }
 

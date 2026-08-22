@@ -200,6 +200,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         terminal: None,
         terminfo: None,
         alt_screen: false,
+        kitty_keyboard: false,
         flags: None,
         attached: None,
         host: crate::state::HostId::local(),

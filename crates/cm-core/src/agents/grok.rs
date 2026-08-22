@@ -311,6 +311,19 @@ fn uses_alt_screen_in(home: &Path, agent_args: &[String]) -> bool {
     )
 }
 
+/// Whether Grok pushes the **kitty keyboard protocol** (`ESC[>3u`) at
+/// startup, judged from the `TERM` it will see. Probed on 1.0.5 with a
+/// scripted pty answering the standard capability queries: the push is gated
+/// purely on `TERM` — it precedes Grok's one terminal query (XTVERSION), and
+/// impersonating kitty in that reply under `TERM=xterm-256color` did not
+/// produce it. Values containing `kitty` (`kitty`, `xterm-kitty`) or `foot`
+/// pushed; `xterm-256color`, `xterm-ghostty`, `wezterm`, `tmux-256color` and
+/// `screen-256color` did not — so a session from Ghostty never had the push
+/// and there is nothing to restore.
+pub fn uses_kitty_keyboard(term: &str) -> bool {
+    term.contains("kitty") || term.contains("foot")
+}
+
 // =============================================================================
 // Launcher: process spawn + real ~/.grok hooks file
 // =============================================================================
@@ -1274,6 +1287,29 @@ mod tests {
         // The argv opt-out beats everything, including an `always` policy.
         let home = home_fixture("argv", None, Some("[terminal]\nalt_screen = \"always\"\n"));
         assert!(!uses_alt_screen_in(&home, &["--no-alt-screen".to_string()]));
+    }
+
+    /// The kitty-keyboard gate pins the probed 1.0.5 behavior: `TERM` values
+    /// containing `kitty` or `foot` push, everything else — including
+    /// Ghostty, whose terminal *does* speak the protocol — does not.
+    #[test]
+    fn kitty_keyboard_gate_follows_groks_term_check() {
+        for term in ["xterm-kitty", "kitty", "foot"] {
+            assert!(uses_kitty_keyboard(term), "{term} pushed when probed");
+        }
+        for term in [
+            "xterm-256color",
+            "xterm-ghostty",
+            "wezterm",
+            "tmux-256color",
+            "screen-256color",
+            "",
+        ] {
+            assert!(
+                !uses_kitty_keyboard(term),
+                "{term} did not push when probed"
+            );
+        }
     }
 
     fn payload(event: &str, extra: &str) -> String {

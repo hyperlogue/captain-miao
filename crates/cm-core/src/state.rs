@@ -372,28 +372,87 @@ pub fn pooled_launcher_pids(states: &[LauncherState]) -> Vec<u32> {
         .collect()
 }
 
-/// DECSET/DECRST 1049: enter / leave the alternate screen.
+/// The terminal modes a *plain reattach*'s window is missing — every mode the
+/// agent set at startup went to whichever terminal was attached then, and the
+/// pool replays nothing. Composed from the flags the launcher stamped on
+/// [`LauncherState`] and written to the attach client's tty around libshpool's
+/// relay: enter *before* it (so the SIGWINCH repaint lands in a fully set-up
+/// terminal), leave after it returns — putting a CLI user's shell, or the
+/// attach wrapper's exit report, back on a terminal in its default modes.
+/// Never written on the create path, where the agent's own startup sets up
+/// this very terminal.
 ///
-/// Written to a *plain reattach*'s terminal when the owning session says its
-/// agent lives there ([`LauncherState::alt_screen`]) — the toggle the agent
-/// sent at startup went to whichever terminal was attached then, and the pool
-/// replays nothing. Never written on the create path, where the agent's own
-/// startup emits it into this very terminal. Enter goes out *before* libshpool
-/// relays (so the SIGWINCH repaint lands in the alt screen); leave goes out
-/// after it returns — a no-op when the agent already left the alt screen
-/// itself, and it puts a CLI user's shell (or the attach wrapper's exit
-/// report) back on the primary screen. A duplicate of either direction is
-/// harmless: terminals guard the switch on their current buffer.
-pub const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
-/// See [`ALT_SCREEN_ENTER`].
-pub const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+/// The sequences mirror what Grok 1.0.5 emits at startup (probed on a
+/// scripted pty), in its order:
+///
+/// * `alt_screen` — DECSET 1049 plus the input modes an alt-screen TUI runs
+///   with: mouse tracking in both grades and encodings (1000/1002/1003 +
+///   1015/1006 — without these the terminal turns a scrollwheel on the alt
+///   screen into arrow-key input), focus reporting (1004) and bracketed paste
+///   (2004). Leave resets them all, returns to the primary screen, and shows
+///   the cursor — DECTCEM is not in the 1049 save/restore, so a detach
+///   mid-frame would otherwise leave the shell's cursor hidden.
+/// * `kitty_keyboard` — the kitty keyboard protocol push (`ESC[>3u`:
+///   disambiguate escape codes + report event types), what lets Shift+Enter
+///   reach the agent as more than a bare CR. Pushed after the screen switch
+///   because kitty keeps a separate enhancement stack per screen; leave pops
+///   it from that same stack.
+///
+/// A duplicate of any of these is harmless: terminals guard the 1049 switch
+/// on their current buffer, DECSET/DECRST of a mode already in that state is
+/// a no-op, and a pop of an empty enhancement stack is ignored.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ReattachPrime {
+    pub alt_screen: bool,
+    pub kitty_keyboard: bool,
+}
 
-/// Write one of the alt-screen sequences to this process's stdout — the
-/// attach client's tty. Best-effort and tty-gated: a broken or redirected
-/// stdout gets nothing, and the attach itself is left to succeed or fail on
-/// its own terms.
-pub fn prime_alt_screen(seq: &[u8]) {
+impl ReattachPrime {
+    pub fn of(state: &LauncherState) -> Self {
+        Self {
+            alt_screen: state.alt_screen,
+            kitty_keyboard: state.kitty_keyboard,
+        }
+    }
+
+    /// Write the enter set to this process's stdout — the attach client's
+    /// tty. Best-effort and tty-gated: a redirected stdout gets nothing, and
+    /// the attach itself is left to succeed or fail on its own terms.
+    pub fn enter(self) {
+        let mut seq: Vec<u8> = Vec::new();
+        if self.alt_screen {
+            seq.extend_from_slice(
+                b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\
+                  \x1b[?1004h\x1b[?2004h",
+            );
+        }
+        if self.kitty_keyboard {
+            seq.extend_from_slice(b"\x1b[>3u");
+        }
+        write_to_tty(&seq);
+    }
+
+    /// Write the leave set: the enter set undone, in reverse.
+    pub fn leave(self) {
+        let mut seq: Vec<u8> = Vec::new();
+        if self.kitty_keyboard {
+            seq.extend_from_slice(b"\x1b[<u");
+        }
+        if self.alt_screen {
+            seq.extend_from_slice(
+                b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\
+                  \x1b[?1000l\x1b[?1049l\x1b[?25h",
+            );
+        }
+        write_to_tty(&seq);
+    }
+}
+
+fn write_to_tty(seq: &[u8]) {
     use std::io::{IsTerminal, Write};
+    if seq.is_empty() {
+        return;
+    }
     let mut out = std::io::stdout();
     if !out.is_terminal() {
         return;
@@ -879,8 +938,8 @@ pub struct LauncherState {
     /// Whether the agent's TUI occupies the terminal's **alternate screen**,
     /// resolved once at launch ([`crate::agent::AgentControl::uses_alt_screen`])
     /// and stamped for pooled sessions only. One reader: the attach guards,
-    /// which prime a plain reattach's terminal with the alt-screen toggle
-    /// ([`prime_alt_screen`]). The pool replays no bytes on reattach, so the
+    /// which prime a plain reattach's terminal with the alt-screen mode set
+    /// ([`ReattachPrime`]). The pool replays no bytes on reattach, so the
     /// `ESC[?1049h` the agent sent at startup never reaches a later window —
     /// which leaves that window on the primary screen while the agent repaints
     /// by cursor addressing, and every bottom-row scroll then leaks a stale
@@ -895,6 +954,19 @@ pub struct LauncherState {
     /// send the field; skipped when false so an old peer never sees it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub alt_screen: bool,
+    /// Whether the agent pushed the **kitty keyboard protocol** at startup
+    /// (`ESC[>3u` — what makes a modified key like Shift+Enter reach it as
+    /// more than a bare CR), resolved once at launch
+    /// ([`crate::agent::AgentControl::uses_kitty_keyboard`]) from the same
+    /// `TERM` the agent's own gate reads — the launcher shares the pool pty's
+    /// env, so this is the post-rewrite value [`Self::terminfo`] records.
+    /// Stamped only alongside [`Self::alt_screen`] (the probed evidence
+    /// covers the fullscreen TUI; an inline agent's push, if any, stays
+    /// unprimed), read by the same attach guards, and carries the same
+    /// launch-time-snapshot caveat. Skipped when false so an old peer never
+    /// sees it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kitty_keyboard: bool,
     /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
     /// served — never written by the launcher (single-writer rule). `None` from
@@ -953,6 +1025,7 @@ impl LauncherState {
             terminal: None,
             terminfo: None,
             alt_screen: false,
+            kitty_keyboard: false,
             flags: None,
             attached: None,
             host: HostId::local(),
@@ -1363,6 +1436,7 @@ mod tests {
             terminal: None,
             terminfo: None,
             alt_screen: false,
+            kitty_keyboard: false,
             flags: None,
             attached: None,
             host: HostId::default(),
@@ -1448,6 +1522,7 @@ mod tests {
             terminal: None,
             terminfo: None,
             alt_screen: false,
+            kitty_keyboard: false,
             flags: None,
             attached: None,
             host: HostId::default(),
@@ -1488,28 +1563,32 @@ mod tests {
         assert_eq!(round.terminfo.as_deref(), Some("xterm-kitty"));
     }
 
-    /// `alt_screen` is additive the same way: absent from an old writer it
-    /// decodes `false` (no priming — today's behavior), skipped when `false`
-    /// so an old peer never sees it, and a `true` survives the round trip.
+    /// `alt_screen` and `kitty_keyboard` are additive the same way: absent
+    /// from an old writer they decode `false` (no priming — today's
+    /// behavior), skipped when `false` so an old peer never sees them, and a
+    /// `true` survives the round trip.
     #[test]
     fn a_state_without_alt_screen_still_decodes() {
         let old = r#"{"agent":"grok","launcher_pid":7,"cwd":"/home/miao/p",
             "status":"idle","updated_at":0}"#;
         let s: LauncherState = serde_json::from_str(old).expect("old state decodes");
         assert!(!s.alt_screen, "an old writer must not imply a prime");
+        assert!(!s.kitty_keyboard, "an old writer must not imply a push");
         let encoded = serde_json::to_string(&s).expect("encodes");
         assert!(
-            !encoded.contains("alt_screen"),
+            !encoded.contains("alt_screen") && !encoded.contains("kitty_keyboard"),
             "a false must not go on the wire at all: {encoded}"
         );
 
         let on = LauncherState {
             alt_screen: true,
+            kitty_keyboard: true,
             ..s
         };
         let round: LauncherState =
             serde_json::from_str(&serde_json::to_string(&on).expect("encodes")).expect("decodes");
         assert!(round.alt_screen);
+        assert!(round.kitty_keyboard);
     }
 
     /// The detach sentinel is the whole event path's payload, so it has to

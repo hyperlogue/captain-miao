@@ -59,6 +59,14 @@ pub async fn run(
     // the alternate screen (see `LauncherState::alt_screen`). Pooled only —
     // nothing ever primes a non-pool window.
     let alt_screen = pool_session.is_some() && agent.uses_alt_screen(agent_args);
+    // …and whether it will push the kitty keyboard protocol, from the same
+    // `TERM` the agent's own gate is about to read. Only alongside the
+    // alt-screen flag: the probed evidence covers the fullscreen TUI, and the
+    // attach guards prime the two as one set.
+    let kitty_keyboard = alt_screen
+        && terminfo
+            .as_deref()
+            .is_some_and(|t| agent.uses_kitty_keyboard(t));
 
     let mut launcher_state = LauncherState {
         agent,
@@ -85,6 +93,7 @@ pub async fn run(
         terminal,
         terminfo,
         alt_screen,
+        kitty_keyboard,
         // Host-owned overlays: the server-core stamps these onto the rows it
         // serves. The launcher never writes them (single-writer rule).
         flags: None,

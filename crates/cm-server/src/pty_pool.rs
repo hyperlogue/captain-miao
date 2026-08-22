@@ -355,19 +355,19 @@ fn pool_session_attached(name: &str) -> Result<Option<bool>> {
 /// The **stale-name** half is never skipped: resurrecting a dead name as a bare
 /// login shell is not something a user can mean to force.
 ///
-/// Returns whether the owning session's agent occupies the alternate screen
-/// ([`cm_core::state::LauncherState::alt_screen`]), so the attach that passed
-/// the guards can prime this terminal before libshpool takes over.
-fn guard_plain_reattach(name: &str, force: bool) -> bool {
+/// Returns the terminal modes the owning session's agent set in a window long
+/// gone ([`cm_core::state::ReattachPrime`]), so the attach that passed the
+/// guards can prime this terminal before libshpool takes over.
+fn guard_plain_reattach(name: &str, force: bool) -> cm_core::state::ReattachPrime {
     let live = (0..10).find_map(|i| {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(250));
         }
         let states = crate::state::read_all_launcher_states();
         crate::state::find_live_pool_session(&states, name, crate::state::is_process_alive)
-            .map(|s| s.alt_screen)
+            .map(cm_core::state::ReattachPrime::of)
     });
-    let Some(alt_screen) = live else {
+    let Some(prime) = live else {
         eprintln!(
             "no live captain-miao session owns pool session {name:?} (it likely exited); \
              refusing to attach — attaching would resurrect the name as a bare shell. \
@@ -401,7 +401,7 @@ fn guard_plain_reattach(name: &str, force: bool) -> bool {
         }
         Ok(Some(false)) | Err(_) => {}
     }
-    alt_screen
+    prime
 }
 
 /// Attach to a pool session, proxying its pty to this terminal.
@@ -419,10 +419,11 @@ fn guard_plain_reattach(name: &str, force: bool) -> bool {
 ///   launcher owns the name yet.
 /// * **Plain interactive reattach** — every later window for that session
 ///   (`Enter` on a detached row, auto-reattach, a steal), pre-flighted by
-///   [`guard_plain_reattach`]. When the owning session's agent lives on the
-///   alternate screen, this path also primes the terminal into it around the
-///   relay (see [`cm_core::state::ALT_SCREEN_ENTER`]) — the create path never
-///   does, because there the agent's own startup toggles this very terminal.
+///   [`guard_plain_reattach`]. When the owning session's agent set terminal
+///   modes (the alt screen, mouse tracking, a keyboard push), this path also
+///   primes them into this terminal around the relay (see
+///   [`cm_core::state::ReattachPrime`]) — the create path never does, because
+///   there the agent's own startup sets up this very terminal.
 /// * **Explicit `--cmd`/`--background`** — kept for a caller that wants to
 ///   create a session directly. Nothing in captain-miao takes this path
 ///   any more; the reservation flow replaced it.
@@ -439,7 +440,7 @@ pub(crate) fn run_attach(
     log_file: Option<String>,
 ) -> Result<()> {
     let (mut cmd, mut dir, mut log_file) = (cmd, dir, log_file);
-    let mut prime_alt_screen = false;
+    let mut prime = cm_core::state::ReattachPrime::default();
     if cmd.is_none() && !background {
         match crate::server_pool::claim_pending(&name) {
             Some(pending) => {
@@ -470,7 +471,7 @@ pub(crate) fn run_attach(
                     path.display().to_string()
                 });
             }
-            None => prime_alt_screen = guard_plain_reattach(&name, force),
+            None => prime = guard_plain_reattach(&name, force),
         }
     }
     // `--log-file` is the only way to see the attach *client*'s logs: libshpool
@@ -501,17 +502,15 @@ pub(crate) fn run_attach(
         sub.push(d);
     }
     sub.push(&name);
-    // Enter before the relay so the SIGWINCH-triggered repaint lands in the
-    // alt screen; leave after it returns (a no-op if the agent already left)
-    // so the attach wrapper's exit report — or a CLI user's shell — is back on
-    // the primary screen. See `ALT_SCREEN_ENTER` for the whole story.
-    if prime_alt_screen {
-        crate::state::prime_alt_screen(crate::state::ALT_SCREEN_ENTER);
-    }
+    // Enter before the relay so the SIGWINCH-triggered repaint lands in a
+    // fully set-up terminal; leave after it returns (a no-op where the agent
+    // already undid a mode) so the attach wrapper's exit report — or a CLI
+    // user's shell — is back on a terminal in its default modes. See
+    // `ReattachPrime` for the whole story. Both writes gate themselves on
+    // having anything to say.
+    prime.enter();
     let result = run_shpool(&global, &sub);
-    if prime_alt_screen {
-        crate::state::prime_alt_screen(crate::state::ALT_SCREEN_LEAVE);
-    }
+    prime.leave();
     result
 }
 

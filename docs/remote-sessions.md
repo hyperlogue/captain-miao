@@ -199,24 +199,31 @@ library**.
   SIGWINCH, **no scrollback replay**. Fine for the *contents* of a full-screen
   agent TUI, which repaints on resize anyway — but replaying nothing also
   replays no terminal **modes**, and that part is not fine for an agent living
-  on the alternate screen. Grok toggles `ESC[?1049h` once at startup, into
-  whichever terminal was attached then; a later window never receives it, so
-  it stays on the primary screen while the agent repaints by cursor
-  addressing — and every bottom-row scroll leaks a stale line into the
-  terminal's *native* scrollback (native scroll working at all is the tell:
-  real alt-screen content can't be scrolled). Switching libshpool to `screen`
-  restore would not fix it — neither restore engine ever emits `?1049h`; the
-  vterm engine tracks the mode and defines the control code but its dump never
-  writes it, so it paints alt-screen cells onto whatever screen the client is
-  on. The stopgap: the launcher resolves at spawn whether the agent's TUI
-  occupies the alt screen (`LauncherState::alt_screen`, from Grok's own config
-  reads — `AgentControl::uses_alt_screen`), and both attach entrypoints
+  on the alternate screen. Grok sets its modes once at startup, into whichever
+  terminal was attached then — `ESC[?1049h`, the full mouse-tracking suite
+  (1000/1002/1003 + 1015/1006 encodings), focus (1004), bracketed paste
+  (2004), and under a kitty-ish `TERM` the kitty keyboard push (`ESC[>3u`). A
+  later window never receives any of it: it stays on the primary screen while
+  the agent repaints by cursor addressing (every bottom-row scroll leaking a
+  stale line into *native* scrollback — native scroll working at all is the
+  tell), the scrollwheel turns into arrow-key input (that translation is what
+  a terminal does on the alt screen with mouse tracking off), and Shift+Enter
+  collapses to a bare CR. Switching libshpool to `screen` restore would not
+  fix it — neither restore engine ever emits a mode; the vterm engine tracks
+  1049 and defines the control code but its dump never writes it, so it paints
+  alt-screen cells onto whatever screen the client is on. The stopgap: the
+  launcher resolves the agent's launch-time mode set at spawn
+  (`LauncherState::alt_screen` from Grok's own config reads —
+  `AgentControl::uses_alt_screen` — and `kitty_keyboard` from the same `TERM`
+  gate Grok reads, `uses_kitty_keyboard`), and both attach entrypoints
   (`run_attach`, `miao-client attach`) prime a **plain reattach**'s terminal
-  with the toggle around the relay (`cm_core::state::ALT_SCREEN_ENTER`). Never
-  on the create path, where the agent toggles this very terminal itself.
+  with that set around the relay (`cm_core::state::ReattachPrime`). Never on
+  the create path, where the agent sets up this very terminal itself.
   Accepted staleness: a mid-session mode switch (Grok's `/fullscreen` ↔
   minimal) is invisible to a launch-time read; the durable fix is a restore
-  buffer that re-emits modes from the pool's own byte stream.
+  buffer that re-emits modes from the pool's own byte stream — though the
+  keyboard push is outside even that, since the vterm engine doesn't track
+  CSI-u state.
 - **The pool has no keybindings** (`keybinding = []`, `pty_pool.rs`). libshpool
   scans every byte on the client→pty path for a chord and detaches on one,
   defaulting to `Ctrl-Space Ctrl-q`. captain-miao never chose that binding, it
