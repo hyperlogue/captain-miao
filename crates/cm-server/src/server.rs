@@ -399,9 +399,27 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-/// `daemon stop`: SIGTERM the running daemon. Since the daemon *is* the pool,
-/// this kills every *pooled* session on the host — so it's guarded unless
-/// `--force` when pool sessions are live.
+/// `daemon stop`: SIGTERM the running daemon and **wait for the host to be
+/// quiet again**. Since the daemon *is* the pool, this kills every *pooled*
+/// session on the host — so it's guarded unless `--force` when pool sessions
+/// are live.
+///
+/// The wait is the contract, not politeness. Sending the signal takes
+/// microseconds; the consequences take a beat — the daemon has to reach its
+/// SIGTERM arm and exit, only then do the pty masters close, only then does
+/// each pooled launcher take the SIGHUP that makes it clean up its state file.
+/// A `stop` that returned on the *signal* therefore handed its caller a host
+/// that still had a live daemon on the old inode and a full set of live
+/// sessions, and both callers are hurt by that: the hosts-panel upgrade
+/// publishes the new binary straight after (see `upgrade_script`, whose whole
+/// ordering argument assumes the daemon is gone by then), and the dashboard
+/// reconnects and resumes what it believes the stop ended — resuming, in that
+/// window, sessions that are still running, which is how one upgrade left the
+/// table holding two rows per session.
+///
+/// Two waits rather than one, because they are two different facts: the daemon
+/// is gone, then the pool it owned is gone. Neither is inferable from the
+/// other, and it is the second one the callers actually depend on.
 fn stop(force: bool) -> Result<()> {
     let Some(pid) = running_pid() else {
         println!("daemon: not running");
@@ -413,16 +431,68 @@ fn stop(force: bool) -> Result<()> {
             "daemon has {n} live pool session(s); stopping it kills them all. Re-run with --force."
         );
     }
-    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
-        println!("daemon (pid {pid}) stopped");
-        Ok(())
-    } else {
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
         bail!(
             "failed to signal daemon pid {pid}: {}",
             std::io::Error::last_os_error()
         );
     }
+    // A daemon that will not take SIGTERM is escalated rather than reported:
+    // the caller has already accepted losing every session on this host, and
+    // leaving a half-stopped daemon holding the singleton lock is worse than
+    // the SIGKILL — nothing else can start in its place.
+    if !wait_until(STOP_GRACE, || !state::is_process_alive(pid)) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        if !wait_until(STOP_GRACE, || !state::is_process_alive(pid)) {
+            bail!("daemon pid {pid} did not exit after SIGTERM and SIGKILL");
+        }
+    }
+    // The launchers die of the pty hangup the daemon's exit causes, so this is
+    // a wait on a consequence and not on anything we signalled. Anything still
+    // standing at the deadline missed that hangup, so it is signalled directly
+    // — the promise `--force` made was that stopping the daemon takes the pool
+    // with it, and a launcher that outlived it makes that promise false.
+    if !wait_until(STOP_GRACE, || pool_session_count() == 0) {
+        for s in state::read_all_launcher_states() {
+            if s.pool_session.is_some() {
+                unsafe { libc::kill(s.launcher_pid as i32, libc::SIGTERM) };
+            }
+        }
+        if !wait_until(STOP_GRACE, || pool_session_count() == 0) {
+            bail!(
+                "daemon (pid {pid}) stopped but {} pool session(s) are still running",
+                pool_session_count()
+            );
+        }
+    }
+    println!("daemon (pid {pid}) stopped");
+    Ok(())
 }
+
+/// Poll `done` until it holds or `grace` runs out; returns whether it held.
+/// Sleeps between polls rather than blocking on anything, because neither thing
+/// waited for here is a child of this process — the daemon was daemonized away
+/// from whoever calls `stop`, and the pooled launchers were the daemon's.
+fn wait_until(grace: Duration, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(STOP_POLL);
+    }
+}
+
+/// How long [`stop`] waits for each of its two facts before escalating.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Poll interval inside that wait. Short enough that the common case — a daemon
+/// that exits promptly — costs one interval rather than a visible pause on an
+/// upgrade the user is watching.
+const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// The one wake channel every subscribed connection's diff loop listens on.
 ///
@@ -894,5 +964,25 @@ mod tests {
         probe.last = Some((expired, first));
         let _ = probe.get().await;
         assert!(probe.last.unwrap().0 > expired);
+    }
+
+    /// What [`stop`] leans on: a condition already true costs no wait at all,
+    /// and one that never becomes true gives up at the deadline instead of
+    /// hanging. The first is why waiting for a daemon that exits promptly is
+    /// invisible on an upgrade; the second is why a wedged host still reaches
+    /// the escalation below it rather than pinning the ssh open.
+    #[test]
+    fn a_wait_returns_at_once_when_satisfied_and_gives_up_at_the_deadline() {
+        let started = Instant::now();
+        assert!(wait_until(Duration::from_secs(30), || true));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an already-true condition must not sleep"
+        );
+
+        let grace = Duration::from_millis(150);
+        let started = Instant::now();
+        assert!(!wait_until(grace, || false));
+        assert!(started.elapsed() >= grace, "it must wait out the grace");
     }
 }

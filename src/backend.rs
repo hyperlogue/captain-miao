@@ -2723,6 +2723,12 @@ fn publish_steps(sha256: &str, target: &str) -> String {
 /// cannot be executed. Stopping first makes that unreachable rather than
 /// unlikely.
 ///
+/// Which is load-bearing on `daemon stop` **waiting**, not merely signalling:
+/// it returns once the daemon has exited and its pool with it, so the `mv`
+/// below lands on a path nothing is running from, and this whole script only
+/// completes — releasing the dashboard to reconnect and resume — once the host
+/// has no sessions left to duplicate.
+///
 /// `stop_exe` is spelled `$HOME`-relative rather than passed as a resolved path:
 /// this string is wrapped by [`login_shell_safe`], which forbids a single quote
 /// anywhere in it, and a home directory is not ours to make promises about.
