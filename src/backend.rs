@@ -4657,6 +4657,7 @@ mod tests {
             launch_id: None,
             terminal: None,
             terminfo: None,
+            alt_screen: false,
             flags: None,
             attached: None,
             host: crate::state::HostId::local(),

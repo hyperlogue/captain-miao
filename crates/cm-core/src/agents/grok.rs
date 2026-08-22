@@ -225,6 +225,72 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
 }
 
 // =============================================================================
+// Alt-screen resolution (pool reattach priming)
+// =============================================================================
+
+/// Whether this launch will put Grok's TUI on the terminal's **alternate
+/// screen** — the same reads Grok itself makes at startup, judged for a
+/// *plain pty* (the pool's environment; `LauncherState::alt_screen` has what
+/// consumes the answer). Grok's decision tree, per `user-guide/05-configuration.md`
+/// and `06-theming.md` (1.0.4):
+///
+/// * `--no-alt-screen` on argv → inline, whatever config says.
+/// * `screen_mode` (`config.toml`, top level): `"minimal"` renders inline;
+///   any other explicit value is sticky non-minimal. *Unset* falls back to the
+///   legacy `[terminal] minimal = true` in `pager.toml`, which an explicit
+///   `screen_mode` overrides.
+/// * `[terminal] alt_screen` (`pager.toml`): `"never"` → inline; `"always"`
+///   → alt screen; `"auto"` — and no file, no key, or a value Grok wouldn't
+///   recognize either — lands on the default, which on a plain pty is the alt
+///   screen ("fullscreen in plain terminals and normal tmux; inline in tmux
+///   control mode and Zellij" — a pool pty is the plain case by construction).
+///
+/// A mid-session `/fullscreen` ↔ minimal switch is invisible to a launch-time
+/// read; that staleness is accepted where the answer is consumed.
+pub fn uses_alt_screen(agent_args: &[String]) -> bool {
+    match grok_home() {
+        Some(home) => uses_alt_screen_in(&home, agent_args),
+        // Nowhere to read config from — Grok in the same spot runs on
+        // defaults, and the default is the alt screen.
+        None => !agent_args.iter().any(|a| a == "--no-alt-screen"),
+    }
+}
+
+fn uses_alt_screen_in(home: &Path, agent_args: &[String]) -> bool {
+    if agent_args.iter().any(|a| a == "--no-alt-screen") {
+        return false;
+    }
+    let read = |name: &str| -> Option<toml::Table> {
+        std::fs::read_to_string(home.join(name))
+            .ok()?
+            .parse::<toml::Table>()
+            .ok()
+    };
+    let config = read("config.toml");
+    let pager = read("pager.toml");
+    let terminal_key = |t: &Option<toml::Table>, key: &str| -> Option<toml::Value> {
+        t.as_ref()?.get("terminal")?.get(key).cloned()
+    };
+    match config.as_ref().and_then(|c| c.get("screen_mode")) {
+        Some(toml::Value::String(mode)) if mode == "minimal" => return false,
+        // Any other explicit value: sticky non-minimal, fall through to the
+        // alt-screen policy.
+        Some(_) => {}
+        None => {
+            if terminal_key(&pager, "minimal").and_then(|v| v.as_bool()) == Some(true) {
+                return false;
+            }
+        }
+    }
+    // Only an explicit "never" opts out; "always", "auto", an unrecognized
+    // value and no key at all are Grok's default on a plain pty.
+    !matches!(
+        terminal_key(&pager, "alt_screen"),
+        Some(toml::Value::String(p)) if p == "never"
+    )
+}
+
+// =============================================================================
 // Launcher: process spawn + real ~/.grok hooks file
 // =============================================================================
 
@@ -1069,6 +1135,92 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-grok-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         assert!(list_resumable_in(&root, 10).is_empty());
+    }
+
+    /// A `$GROK_HOME` carrying the given `config.toml` / `pager.toml` bodies
+    /// (`None` = no such file).
+    fn home_fixture(tag: &str, config: Option<&str>, pager: Option<&str>) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("cm-grok-alt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        if let Some(c) = config {
+            std::fs::write(home.join("config.toml"), c).unwrap();
+        }
+        if let Some(p) = pager {
+            std::fs::write(home.join("pager.toml"), p).unwrap();
+        }
+        home
+    }
+
+    /// The launch-time mirror of Grok's own startup decision, over the config
+    /// surface `05-configuration.md` / `06-theming.md` document: the
+    /// `alt_screen` policy in `pager.toml`, `screen_mode` (and the legacy
+    /// `[terminal] minimal`) picking minimal-vs-fullscreen, `--no-alt-screen`
+    /// on argv. Only an explicit opt-out may yield `false`: a wrong `false`
+    /// keeps today's behavior, a wrong `true` breaks the window.
+    #[test]
+    fn alt_screen_resolution_follows_groks_config() {
+        let no_args: &[String] = &[];
+        let cases: &[(&str, Option<&str>, Option<&str>, bool)] = &[
+            ("defaults", None, None, true),
+            (
+                "auto",
+                None,
+                Some("[terminal]\nalt_screen = \"auto\"\n"),
+                true,
+            ),
+            (
+                "always",
+                None,
+                Some("[terminal]\nalt_screen = \"always\"\n"),
+                true,
+            ),
+            (
+                "never",
+                None,
+                Some("[terminal]\nalt_screen = \"never\"\n"),
+                false,
+            ),
+            // A value Grok wouldn't recognize lands on its default (auto).
+            (
+                "odd",
+                None,
+                Some("[terminal]\nalt_screen = \"sometimes\"\n"),
+                true,
+            ),
+            ("minimal", Some("screen_mode = \"minimal\"\n"), None, false),
+            // Minimal renders inline even when the policy says always.
+            (
+                "minimal-beats-always",
+                Some("screen_mode = \"minimal\"\n"),
+                Some("[terminal]\nalt_screen = \"always\"\n"),
+                false,
+            ),
+            // Legacy `[terminal] minimal` forces minimal only while
+            // `screen_mode` is unset…
+            (
+                "legacy-minimal",
+                None,
+                Some("[terminal]\nminimal = true\n"),
+                false,
+            ),
+            // …and an explicit `screen_mode` overrides it.
+            (
+                "fullscreen-overrides-legacy",
+                Some("screen_mode = \"fullscreen\"\n"),
+                Some("[terminal]\nminimal = true\n"),
+                true,
+            ),
+            // An unparseable file is not an opt-out.
+            ("mangled", Some("screen_mode = [not toml"), None, true),
+        ];
+        for (tag, config, pager, want) in cases {
+            let home = home_fixture(tag, *config, *pager);
+            assert_eq!(uses_alt_screen_in(&home, no_args), *want, "case {tag:?}");
+        }
+        // The argv opt-out beats everything, including an `always` policy.
+        let home = home_fixture("argv", None, Some("[terminal]\nalt_screen = \"always\"\n"));
+        assert!(!uses_alt_screen_in(&home, &["--no-alt-screen".to_string()]));
     }
 
     fn payload(event: &str, extra: &str) -> String {

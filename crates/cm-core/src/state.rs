@@ -313,6 +313,36 @@ pub fn find_live_pool_session<'a>(
         .find(|s| s.pool_session.as_deref() == Some(name) && alive(s.launcher_pid))
 }
 
+/// DECSET/DECRST 1049: enter / leave the alternate screen.
+///
+/// Written to a *plain reattach*'s terminal when the owning session says its
+/// agent lives there ([`LauncherState::alt_screen`]) — the toggle the agent
+/// sent at startup went to whichever terminal was attached then, and the pool
+/// replays nothing. Never written on the create path, where the agent's own
+/// startup emits it into this very terminal. Enter goes out *before* libshpool
+/// relays (so the SIGWINCH repaint lands in the alt screen); leave goes out
+/// after it returns — a no-op when the agent already left the alt screen
+/// itself, and it puts a CLI user's shell (or the attach wrapper's exit
+/// report) back on the primary screen. A duplicate of either direction is
+/// harmless: terminals guard the switch on their current buffer.
+pub const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+/// See [`ALT_SCREEN_ENTER`].
+pub const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+
+/// Write one of the alt-screen sequences to this process's stdout — the
+/// attach client's tty. Best-effort and tty-gated: a broken or redirected
+/// stdout gets nothing, and the attach itself is left to succeed or fail on
+/// its own terms.
+pub fn prime_alt_screen(seq: &[u8]) {
+    use std::io::{IsTerminal, Write};
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
+        return;
+    }
+    let _ = out.write_all(seq);
+    let _ = out.flush();
+}
+
 // -- JSON file helpers --
 
 /// Atomic write: serialize to pretty JSON, write to `<path>.tmp`, then rename.
@@ -787,6 +817,25 @@ pub struct LauncherState {
     /// to send the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminfo: Option<String>,
+    /// Whether the agent's TUI occupies the terminal's **alternate screen**,
+    /// resolved once at launch ([`crate::agent::AgentControl::uses_alt_screen`])
+    /// and stamped for pooled sessions only. One reader: the attach guards,
+    /// which prime a plain reattach's terminal with the alt-screen toggle
+    /// ([`prime_alt_screen`]). The pool replays no bytes on reattach, so the
+    /// `ESC[?1049h` the agent sent at startup never reaches a later window —
+    /// which leaves that window on the primary screen while the agent repaints
+    /// by cursor addressing, and every bottom-row scroll then leaks a stale
+    /// line into the terminal's *native* scrollback (native scroll working at
+    /// all is the tell: real alt-screen content can't be scrolled).
+    ///
+    /// A launch-time snapshot, deliberately conservative: an agent that
+    /// switches modes mid-session (Grok's `/fullscreen` ↔ minimal) flips
+    /// reality out from under this bit, and the durable fix is restoring modes
+    /// from the pool's own byte stream. `false` for non-pooled sessions, for
+    /// agents not verified to use the alt screen, and from any host too old to
+    /// send the field; skipped when false so an old peer never sees it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alt_screen: bool,
     /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
     /// served — never written by the launcher (single-writer rule). `None` from
@@ -844,6 +893,7 @@ impl LauncherState {
             launch_id: None,
             terminal: None,
             terminfo: None,
+            alt_screen: false,
             flags: None,
             attached: None,
             host: HostId::local(),
@@ -1253,6 +1303,7 @@ mod tests {
             launch_id: None,
             terminal: None,
             terminfo: None,
+            alt_screen: false,
             flags: None,
             attached: None,
             host: HostId::default(),
@@ -1299,6 +1350,30 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&with_term).expect("encodes"))
                 .expect("decodes");
         assert_eq!(round.terminfo.as_deref(), Some("xterm-kitty"));
+    }
+
+    /// `alt_screen` is additive the same way: absent from an old writer it
+    /// decodes `false` (no priming — today's behavior), skipped when `false`
+    /// so an old peer never sees it, and a `true` survives the round trip.
+    #[test]
+    fn a_state_without_alt_screen_still_decodes() {
+        let old = r#"{"agent":"grok","launcher_pid":7,"cwd":"/home/miao/p",
+            "status":"idle","updated_at":0}"#;
+        let s: LauncherState = serde_json::from_str(old).expect("old state decodes");
+        assert!(!s.alt_screen, "an old writer must not imply a prime");
+        let encoded = serde_json::to_string(&s).expect("encodes");
+        assert!(
+            !encoded.contains("alt_screen"),
+            "a false must not go on the wire at all: {encoded}"
+        );
+
+        let on = LauncherState {
+            alt_screen: true,
+            ..s
+        };
+        let round: LauncherState =
+            serde_json::from_str(&serde_json::to_string(&on).expect("encodes")).expect("decodes");
+        assert!(round.alt_screen);
     }
 
     /// The detach sentinel is the whole event path's payload, so it has to

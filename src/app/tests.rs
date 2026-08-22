@@ -199,6 +199,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         launch_id: Some(format!("launch-{pid}")),
         terminal: None,
         terminfo: None,
+        alt_screen: false,
         flags: None,
         attached: None,
         host: crate::state::HostId::local(),

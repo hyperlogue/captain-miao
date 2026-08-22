@@ -429,6 +429,40 @@ impl AgentControl {
         self.resume_args("id", true) != self.resume_args("id", false)
     }
 
+    /// Whether this launch will put the agent's TUI on the terminal's
+    /// **alternate screen**, judged for a *plain pty* — the pool's
+    /// environment, the only place the answer is consumed
+    /// ([`LauncherState::alt_screen`] has the full story).
+    ///
+    /// A method, not a [`Self::capabilities`] field, because it isn't
+    /// structural: Grok decides per process, from config and argv, and this is
+    /// the launch-time mirror of that decision. `false` is the safe answer for
+    /// a backend nobody has verified on a pool pty — a missed prime keeps the
+    /// terminal exactly as it is today, while a wrong prime strands an inline
+    /// TUI in a cleared alternate screen and the eventual leave-toggle then
+    /// discards everything on it.
+    pub fn uses_alt_screen(self, agent_args: &[String]) -> bool {
+        match self {
+            // Verified on 1.0.4: fullscreen Grok enters the alt screen on a
+            // plain terminal unless config or argv opt out. The resolution
+            // rules (pager.toml / config.toml / `--no-alt-screen`) live with
+            // the rest of Grok's config knowledge.
+            AgentControl::Grok => grok::uses_alt_screen(agent_args),
+            // Inline renderers — the primary screen is their whole model.
+            AgentControl::Claude | AgentControl::Codex => false,
+            // Not verified on a pool pty; false per the note above. A backend
+            // that turns out to be an alt-screen TUI moves up, with its own
+            // opt-out rules if it has any.
+            AgentControl::Reasonix
+            | AgentControl::Kimi
+            | AgentControl::OpenCode
+            | AgentControl::Pi
+            | AgentControl::Omp
+            | AgentControl::Antigravity
+            | AgentControl::Unknown => false,
+        }
+    }
+
     /// Everything a backend may structurally lack, in one query — the
     /// `AgentControl` counterpart to [`crate::terminal::Capabilities`], and the
     /// same bargain: a limit the UI has to gate on is a *field* here, not a
@@ -2061,6 +2095,28 @@ mod tests {
             r#"{"c":"miao hook stop-failure >/dev/null; echo {}"}"#,
             "stop"
         ));
+    }
+
+    /// Only Grok answers the alt-screen question with anything but `false`.
+    /// Every other backend is either verified inline (Claude, Codex) or
+    /// unverified — and unverified must stay `false`: a missed prime keeps the
+    /// reattached window exactly as it is today, while a wrong prime strands an
+    /// inline TUI in a cleared alternate screen. Grok's own resolution is
+    /// pinned in its module (`alt_screen_resolution_follows_groks_config`);
+    /// this guards the *default* for everyone else.
+    #[test]
+    fn no_backend_claims_the_alt_screen_without_verification() {
+        for &agent in AgentControl::ALL {
+            if agent == AgentControl::Grok {
+                continue;
+            }
+            assert!(
+                !agent.uses_alt_screen(&[]),
+                "{agent:?} claims the alt screen; verify it on a pool pty and \
+                 move it out of the unverified arm deliberately"
+            );
+        }
+        assert!(!AgentControl::Unknown.uses_alt_screen(&[]));
     }
 
     /// **The test the declared matrix is worth having.** `capabilities()` is a

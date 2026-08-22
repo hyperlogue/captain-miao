@@ -192,8 +192,27 @@ library**.
   terminal's own policy: kitty's `clipboard_control` (writes allowed by
   default), or zellij's own OSC 52 handling for an attach running in a pane.
 - **Restore mode is `simple`** (`pty_pool.rs`): reattach = reconnect +
-  SIGWINCH, **no scrollback replay**. Fine for full-screen agent TUIs, which
-  repaint on resize anyway.
+  SIGWINCH, **no scrollback replay**. Fine for the *contents* of a full-screen
+  agent TUI, which repaints on resize anyway — but replaying nothing also
+  replays no terminal **modes**, and that part is not fine for an agent living
+  on the alternate screen. Grok toggles `ESC[?1049h` once at startup, into
+  whichever terminal was attached then; a later window never receives it, so
+  it stays on the primary screen while the agent repaints by cursor
+  addressing — and every bottom-row scroll leaks a stale line into the
+  terminal's *native* scrollback (native scroll working at all is the tell:
+  real alt-screen content can't be scrolled). Switching libshpool to `screen`
+  restore would not fix it — neither restore engine ever emits `?1049h`; the
+  vterm engine tracks the mode and defines the control code but its dump never
+  writes it, so it paints alt-screen cells onto whatever screen the client is
+  on. The stopgap: the launcher resolves at spawn whether the agent's TUI
+  occupies the alt screen (`LauncherState::alt_screen`, from Grok's own config
+  reads — `AgentControl::uses_alt_screen`), and both attach entrypoints
+  (`run_attach`, `miao-client attach`) prime a **plain reattach**'s terminal
+  with the toggle around the relay (`cm_core::state::ALT_SCREEN_ENTER`). Never
+  on the create path, where the agent toggles this very terminal itself.
+  Accepted staleness: a mid-session mode switch (Grok's `/fullscreen` ↔
+  minimal) is invisible to a launch-time read; the durable fix is a restore
+  buffer that re-emits modes from the pool's own byte stream.
 - **The pool has no keybindings** (`keybinding = []`, `pty_pool.rs`). libshpool
   scans every byte on the client→pty path for a chord and detaches on one,
   defaulting to `Ctrl-Space Ctrl-q`. captain-miao never chose that binding, it

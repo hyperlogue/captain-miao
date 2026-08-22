@@ -146,15 +146,16 @@ pub fn attach(name: String, force: bool) -> Result<()> {
     // lists here (shpool never drops it from its table), and attaching would
     // silently respawn it as a bare login shell wearing the cm- name.
     let states = LocalBackend::new().list_sessions();
-    if cm_core::state::find_live_pool_session(&states, &name, cm_core::state::is_process_alive)
-        .is_none()
-    {
+    let Some(owner) =
+        cm_core::state::find_live_pool_session(&states, &name, cm_core::state::is_process_alive)
+    else {
         eprintln!(
             "no live captain-miao session owns pool session {name:?} (it likely exited); \
              not attaching — that would resurrect the name as a bare shell"
         );
         std::process::exit(cm_core::state::ATTACH_EXIT_STALE);
-    }
+    };
+    let alt_screen = owner.alt_screen;
     if matches!(session.status, SessionStatus::Attached) {
         if !force {
             eprintln!(
@@ -168,7 +169,18 @@ pub fn attach(name: String, force: bool) -> Result<()> {
     // Detached → plain interactive reattach. A racing attach between the list
     // and here is still caught by libshpool's own busy guard (which exits 0 —
     // acceptable for the residual race window).
-    attach_pty(&name, force)
+    //
+    // An agent living on the alternate screen toggled it in a terminal long
+    // gone; prime this one to match before the relay, and restore it after —
+    // mirrors the server's attach (see `cm_core::state::ALT_SCREEN_ENTER`).
+    if alt_screen {
+        cm_core::state::prime_alt_screen(cm_core::state::ALT_SCREEN_ENTER);
+    }
+    let result = attach_pty(&name, force);
+    if alt_screen {
+        cm_core::state::prime_alt_screen(cm_core::state::ALT_SCREEN_LEAVE);
+    }
+    result
 }
 
 /// Proxy the named session's pty to this terminal via libshpool. Mirrors the

@@ -54,6 +54,11 @@ pub async fn run(
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
+    // Resolved here because this is the same moment the agent makes the same
+    // reads: the flag is a launch-time snapshot of whether its TUI will occupy
+    // the alternate screen (see `LauncherState::alt_screen`). Pooled only —
+    // nothing ever primes a non-pool window.
+    let alt_screen = pool_session.is_some() && agent.uses_alt_screen(agent_args);
 
     let mut launcher_state = LauncherState {
         agent,
@@ -79,6 +84,7 @@ pub async fn run(
         launch_id,
         terminal,
         terminfo,
+        alt_screen,
         // Host-owned overlays: the server-core stamps these onto the rows it
         // serves. The launcher never writes them (single-writer rule).
         flags: None,
