@@ -4467,23 +4467,59 @@ impl App {
             .and_then(crate::backend::Backend::upgrade_offer)
     }
 
-    /// Hosts whose post-upgrade restore can run now: they owe sessions and they
-    /// are connected again.
+    /// Hosts whose post-upgrade restore can run now: they owe sessions, they are
+    /// connected again, **and** they have said what they are running.
     ///
-    /// Connected is a sufficient test here, with no need to inspect the mirror
-    /// first. A restore list only survives a *successful* upgrade, and success
-    /// means the daemon was stopped — so every pooled session this host had is
-    /// gone, and nothing that could be resumed twice is left to race.
+    /// Connected alone is not enough, and the gap is not a subtle one:
+    /// `ConnState::Connected` is stored the moment the socket answers, a full
+    /// round trip before the handshake and subscribe that fetch the sessions
+    /// (`awaiting_sessions` is that window, spelled once). A restore fired in
+    /// there judges the host by an empty mirror it has not filled yet, so it
+    /// resumes blind — and if anything the restart was supposed to end is still
+    /// running, the snapshot that lands a beat later carries it alongside the
+    /// duplicate we just launched.
     pub(super) fn hosts_ready_to_restore(&self) -> Vec<HostId> {
         self.upgrade_restores
             .keys()
             .filter(|h| {
-                self.backends
-                    .iter()
-                    .any(|b| &&b.host_id() == h && b.conn_state().is_connected())
+                self.backends.iter().any(|b| {
+                    &&b.host_id() == h && b.conn_state().is_connected() && !b.awaiting_sessions()
+                })
             })
             .cloned()
             .collect()
+    }
+
+    /// Claim `host`'s restore list, dropping every spec the host is *already*
+    /// reporting, and say how many that was.
+    ///
+    /// The drop is the invariant, not an optimisation. A resume points a second
+    /// launcher at a transcript by `session_id`, so a spec whose session the
+    /// host still lists would fork that session into two live agents writing the
+    /// same history — the exact duplicate the failure branch of
+    /// `finish_host_upgrade` refuses to risk, arrived at from the other side.
+    /// The upgrade is supposed to make this unreachable (`daemon stop` does not
+    /// return until the pool is actually gone), so a non-zero count means the
+    /// stop did not take and is worth saying out loud rather than papering over.
+    ///
+    /// Only ever called for a host `hosts_ready_to_restore` cleared, so the rows
+    /// consulted are a real account of the host and not a mirror still in
+    /// flight.
+    pub(super) fn take_upgrade_restores(&mut self, host: &HostId) -> (Vec<RestoreSpec>, usize) {
+        let specs = self.upgrade_restores.remove(host).unwrap_or_default();
+        let live: HashSet<&str> = self
+            .sessions
+            .iter()
+            .filter(|s| &s.host == host)
+            .filter_map(|s| s.session_id.as_deref())
+            .collect();
+        let before = specs.len();
+        let specs: Vec<RestoreSpec> = specs
+            .into_iter()
+            .filter(|spec| !live.contains(spec.session_id.as_str()))
+            .collect();
+        let survived = before - specs.len();
+        (specs, survived)
     }
 
     /// Take `host` off the air for the duration of its upgrade: no backend, no

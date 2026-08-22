@@ -1633,7 +1633,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             // gets a window, including sessions that were detached before, which
             // is why the gate refuses a host another terminal is attached to.
             for host in app.hosts_ready_to_restore() {
-                let specs = app.upgrade_restores.remove(&host).unwrap_or_default();
+                let (specs, survived) = app.take_upgrade_restores(&host);
                 let n = specs.len();
                 for spec in specs {
                     launch_agent(
@@ -1649,15 +1649,31 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     )
                     .await;
                 }
-                if n > 0 {
-                    app.set_status(
-                        format!(
-                            "{} upgraded — resumed {n} {}",
-                            host.0,
-                            super::plural_sessions(n)
-                        ),
-                        false,
-                    );
+                // A survivor is a session the stop was meant to end and did
+                // not, so the line says so: it is the difference between "we
+                // brought everything back" and "we left one alone rather than
+                // fork it", and only the second explains a row that never went
+                // away.
+                let status = match (n, survived) {
+                    (0, 0) => None,
+                    (0, k) => Some(format!(
+                        "{} upgraded — {k} {} still running, not resumed",
+                        host.0,
+                        super::plural_sessions(k)
+                    )),
+                    (n, 0) => Some(format!(
+                        "{} upgraded — resumed {n} {}",
+                        host.0,
+                        super::plural_sessions(n)
+                    )),
+                    (n, k) => Some(format!(
+                        "{} upgraded — resumed {n} {}; {k} still running, not resumed",
+                        host.0,
+                        super::plural_sessions(n)
+                    )),
+                };
+                if let Some(status) = status {
+                    app.set_status(status, survived > 0);
                 }
             }
             // Both consumers below want a terminal snapshot: the tab-cache

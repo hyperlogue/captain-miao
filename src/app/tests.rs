@@ -1640,6 +1640,66 @@ fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
     assert!(d.app.upgrade_restore_list(&host).is_empty());
 }
 
+/// The two things standing between a restore and a duplicated session, both
+/// arrived at from the same upgrade that showed them missing: a host is judged
+/// only once it has *said* what it is running, and a spec it is already running
+/// is dropped rather than resumed.
+///
+/// `Connected` is stored the moment the socket answers, a round trip before the
+/// snapshot — so the first assert is not a corner case but the ordinary shape of
+/// a reconnect, and a restore fired there resumes against an empty mirror. The
+/// second is the belt: a session the stop failed to end would otherwise be
+/// forked into two live agents writing one transcript.
+#[test]
+fn a_restore_waits_for_the_hosts_account_and_skips_what_survived() {
+    use super::RestoreSpec;
+    use crate::backend::{Backend, ConnState, RemoteBackend};
+    use crate::state::HostId;
+    let host = HostId("box".into());
+    let spec = |sid: &str| RestoreSpec {
+        agent: crate::agent::AgentControl::Claude,
+        cwd: "~/work".to_string(),
+        session_id: sid.to_string(),
+    };
+
+    let mut d = TestDashboard::new(120, 12);
+    let remote = RemoteBackend::unconnected_for_tests(host.clone(), Vec::new());
+    // The socket answered; the handshake and subscribe have not come back.
+    remote.simulate_link_for_tests(ConnState::Connected, false);
+    d.app.backends.push(Backend::Remote(remote));
+    d.app
+        .upgrade_restores
+        .insert(host.clone(), vec![spec("s1"), spec("s2")]);
+    assert!(
+        d.app.hosts_ready_to_restore().is_empty(),
+        "a host that has reported nothing yet is not ready"
+    );
+
+    // The snapshot lands, and it still carries one of the sessions the stop was
+    // supposed to end.
+    let Backend::Remote(b) = &d.app.backends[1] else {
+        unreachable!("just pushed a remote backend")
+    };
+    b.simulate_link_for_tests(ConnState::Connected, true);
+    assert_eq!(d.app.hosts_ready_to_restore(), vec![host.clone()]);
+
+    let mut survivor = session(1, "~/work", SessionStatus::Idle);
+    survivor.host = host.clone();
+    survivor.session_id = Some("s1".to_string());
+    survivor.pool_session = Some("cm-1".to_string());
+    d.set_sessions(vec![survivor]);
+
+    let (specs, survived) = d.app.take_upgrade_restores(&host);
+    assert_eq!(
+        specs,
+        vec![spec("s2")],
+        "the live session must not be forked"
+    );
+    assert_eq!(survived, 1);
+    // Claimed once: a second pass has nothing left to launch.
+    assert_eq!(d.app.take_upgrade_restores(&host), (Vec::new(), 0));
+}
+
 /// held by somebody else's terminal. `Enter` behaves differently on each (the
 /// second needs a steal), so they must not wear the same glyph. The host's
 /// attached-bit overlay is what separates them — and an *unknown* bit (an
