@@ -313,6 +313,65 @@ pub fn find_live_pool_session<'a>(
         .find(|s| s.pool_session.as_deref() == Some(name) && alive(s.launcher_pid))
 }
 
+/// The daemon pid encoded in a pool session name.
+///
+/// The server mints `cm-<agent>-<daemon-pid>-<seq>` so a name is unique to
+/// the process that owns the pty. The pool lives *in* that process: a later
+/// daemon has a new pid, the old names are unattachable, and any launcher
+/// still wearing one is an orphan. `None` for a name that isn't in that
+/// shape (tests, a hand-set `--pool-session`).
+pub fn pool_session_daemon_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("cm-")?;
+    let mut parts = rest.rsplitn(3, '-');
+    let seq = parts.next()?;
+    let pid = parts.next()?;
+    let agent = parts.next()?;
+    if seq.is_empty() || agent.is_empty() {
+        return None;
+    }
+    seq.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether the daemon that minted `minting` is gone, so a pooled launcher
+/// wearing that name should exit rather than sit around unattachable.
+///
+/// `alive` and `current_daemon` are injected so the policy is testable without
+/// `/proc`. Production passes [`is_process_alive`] and the pid in
+/// [`server_pid_path`].
+///
+/// Two independent facts, either enough:
+/// * the minting pid itself is dead (the usual daemon restart / crash);
+/// * a *different* live pid is recorded as the daemon — the minting number
+///   was reused by something that is not the pool.
+pub fn minting_pool_daemon_is_gone(
+    minting: u32,
+    alive: impl Fn(u32) -> bool,
+    current_daemon: Option<u32>,
+) -> bool {
+    !alive(minting) || matches!(current_daemon, Some(pid) if pid != minting && alive(pid))
+}
+
+/// Pid recorded in [`server_pid_path`], if the file is readable and numeric.
+/// Does not check liveness — the caller does, because a stale file naming a
+/// dead pid must not look like a replacement daemon.
+pub fn recorded_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(server_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Launcher pids that belong to the pty pool. Used by the daemon to SIGTERM
+/// leftovers: a process that is only now starting hosts no sessions, and
+/// `daemon stop` promises the pool goes with it.
+pub fn pooled_launcher_pids(states: &[LauncherState]) -> Vec<u32> {
+    states
+        .iter()
+        .filter(|s| s.pool_session.is_some())
+        .map(|s| s.launcher_pid)
+        .collect()
+}
+
 /// DECSET/DECRST 1049: enter / leave the alternate screen.
 ///
 /// Written to a *plain reattach*'s terminal when the owning session says its
@@ -1322,6 +1381,83 @@ mod tests {
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |pid| pid == 20).is_some());
         // The name exists but only on dead launchers → no hit (resurrection).
         assert!(find_live_pool_session(&states, "cm-claude-1-1", |_| false).is_none());
+    }
+
+    /// Pool names are `cm-<agent>-<daemon-pid>-<seq>`. The daemon pid is the
+    /// second-to-last component so a launcher can tell that its minting
+    /// process is gone without asking the (already dead) pool.
+    #[test]
+    fn pool_session_daemon_pid_reads_the_minting_pid() {
+        assert_eq!(pool_session_daemon_pid("cm-grok-3265089-1"), Some(3265089));
+        assert_eq!(pool_session_daemon_pid("cm-claude-1-1"), Some(1));
+        assert_eq!(pool_session_daemon_pid("cm-opencode-42-99"), Some(42));
+        // Agent names today have no hyphen; rsplitn(3) still leaves the agent
+        // as the remainder if one ever does.
+        assert_eq!(pool_session_daemon_pid("cm-open-code-7-3"), Some(7));
+        assert_eq!(pool_session_daemon_pid("cm-away"), None);
+        assert_eq!(pool_session_daemon_pid("cm-1"), None);
+        assert_eq!(pool_session_daemon_pid("cm-grok-abc-1"), None);
+        assert_eq!(pool_session_daemon_pid("not-a-pool"), None);
+        assert_eq!(pool_session_daemon_pid(""), None);
+    }
+
+    /// A pooled launcher should exit once the daemon that minted its name is
+    /// gone — otherwise the row stays on the dashboard and attach refuses.
+    #[test]
+    fn minting_pool_daemon_is_gone_when_the_pid_dies_or_is_replaced() {
+        let alive = |pid: u32| pid == 10 || pid == 20;
+        // Minting daemon still running, pid file agrees (or is missing).
+        assert!(!minting_pool_daemon_is_gone(10, alive, Some(10)));
+        assert!(!minting_pool_daemon_is_gone(10, alive, None));
+        // Minting pid is dead — the usual restart / crash.
+        assert!(minting_pool_daemon_is_gone(99, alive, None));
+        assert!(minting_pool_daemon_is_gone(99, alive, Some(10)));
+        // Minting pid still looks alive, but a different live process is the
+        // daemon (pid reused by something that is not the pool).
+        assert!(minting_pool_daemon_is_gone(10, alive, Some(20)));
+        // A stale pid file naming a dead process is not a replacement.
+        assert!(!minting_pool_daemon_is_gone(10, alive, Some(99)));
+    }
+
+    /// `daemon stop` and a freshly started daemon both SIGTERM every launcher
+    /// that still carries a pool name, and leave non-pool sessions alone.
+    #[test]
+    fn pooled_launcher_pids_skips_local_sessions() {
+        let mk = |pid: u32, pool: Option<&str>| LauncherState {
+            agent: crate::agent::AgentControl::Claude,
+            launcher_pid: pid,
+            session_id: None,
+            child_session_ids: Vec::new(),
+            window_id: None,
+            tab_id: None,
+            cwd: String::new(),
+            status: SessionStatus::Idle,
+            last_tool: None,
+            updated_at: 0,
+            active_since: None,
+            last_prompt: None,
+            child_pid: None,
+            last_error: None,
+            context_tokens: None,
+            context_window: None,
+            model: None,
+            name: None,
+            first_prompt: None,
+            pool_session: pool.map(str::to_string),
+            launch_id: None,
+            terminal: None,
+            terminfo: None,
+            alt_screen: false,
+            flags: None,
+            attached: None,
+            host: HostId::default(),
+        };
+        let pids = pooled_launcher_pids(&[
+            mk(1, None),
+            mk(2, Some("cm-grok-1-1")),
+            mk(3, Some("cm-claude-1-2")),
+        ]);
+        assert_eq!(pids, vec![2, 3]);
     }
 
     /// `term` was added late, so it has to be additive in both directions: a

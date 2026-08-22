@@ -254,6 +254,14 @@ fn run_daemon(lock: std::fs::File) -> Result<()> {
     #[cfg(feature = "pty-pool")]
     start_pool_thread();
 
+    // The pool lives in *this* process, so a daemon only now starting hosts
+    // none. Any launcher still carrying a `pool_session` belongs to a previous
+    // incarnation — unattachable, names carry that daemon's pid — and must
+    // not sit around looking like a row the dashboard can attach to. The
+    // launchers also watch the minting pid themselves; this is the backstop
+    // for a SIGKILL / libshpool `_exit` that never ran `stop`.
+    reap_previous_pool_launchers();
+
     // Build the runtime and serve until SIGTERM / idle-exit. `lock` stays bound
     // across the whole run so the flock is held until the daemon actually exits.
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -384,6 +392,32 @@ fn start_pool_thread() {
     tracing::warn!("pty pool socket did not bind in ~5s; open_session will retry");
 }
 
+/// SIGTERM every live pooled launcher. Returns how many were signalled.
+///
+/// The daemon *is* the pool, so anyone still wearing a `pool_session` after
+/// this process starts — or after it is asked to stop — is leftover. The
+/// launcher catches SIGTERM, kills its agent, and removes its state file.
+fn signal_pool_launchers() -> usize {
+    let pids = state::pooled_launcher_pids(&state::read_all_launcher_states());
+    for pid in &pids {
+        unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
+    }
+    pids.len()
+}
+
+/// Reap pooled launchers left by a previous daemon. Called at startup, before
+/// this process has minted any names of its own, so every `pool_session` we
+/// can see is foreign.
+fn reap_previous_pool_launchers() {
+    let n = signal_pool_launchers();
+    if n > 0 {
+        tracing::warn!(
+            "signalled {n} pooled launcher(s) left by a previous daemon; \
+             their pool names are unattachable in this process"
+        );
+    }
+}
+
 /// `daemon status`: report whether a daemon is running, its socket, and how many
 /// pool sessions it holds (read straight from the state files — no round-trip).
 fn status() -> Result<()> {
@@ -453,11 +487,7 @@ fn stop(force: bool) -> Result<()> {
     // — the promise `--force` made was that stopping the daemon takes the pool
     // with it, and a launcher that outlived it makes that promise false.
     if !wait_until(STOP_GRACE, || pool_session_count() == 0) {
-        for s in state::read_all_launcher_states() {
-            if s.pool_session.is_some() {
-                unsafe { libc::kill(s.launcher_pid as i32, libc::SIGTERM) };
-            }
-        }
+        signal_pool_launchers();
         if !wait_until(STOP_GRACE, || pool_session_count() == 0) {
             bail!(
                 "daemon (pid {pid}) stopped but {} pool session(s) are still running",
@@ -592,6 +622,10 @@ async fn serve() -> Result<()> {
             }
             _ = sigterm.recv() => {
                 tracing::info!("SIGTERM received; daemon shutting down");
+                // Best-effort: libshpool installs its own SIGTERM handler that
+                // `_exit`s, so this arm may never run. Launchers also watch
+                // the minting pid, and the next `ensure` reaps leftovers.
+                signal_pool_launchers();
                 return Ok(());
             }
             _ = socket_tick.tick() => {

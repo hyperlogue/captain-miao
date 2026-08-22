@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A daemon restart no longer leaves pooled sessions running but unattachable.**
+  The pool lives in the daemon process, so a SIGTERM / upgrade / crash cannot
+  keep the pty; leftover launchers used to survive anyway and attach then
+  refused (`cm-… not in the pool`). They now exit when the daemon that minted
+  their name is gone, and a freshly started daemon SIGTERMs any it still sees.
 - **The npm launcher runs on a bun-only machine.** `#!/usr/bin/env node` made
   `miao` fail after `bun add -g` when no `node` binary was on PATH; the file
   now starts with a `/bin/sh` polyglot that execs `node` or `bun`.

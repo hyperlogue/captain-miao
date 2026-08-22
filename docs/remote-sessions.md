@@ -122,10 +122,14 @@ library**.
     attach argv, which now creates), and a new dashboard against an old server
     finds no reservation and plainly reattaches the session that server created
     eagerly. No protocol bump.
-  * **Reservations are pruned when the daemon starts.** The pool lives *in* that
-    process, so records from a previous incarnation are unredeemable anyway
-    (names carry the minting daemon's pid). Inert litter; pruning just stops it
-    accumulating.
+  * **Reservations are pruned when the daemon starts**, and any live launcher
+    still carrying a `pool_session` is SIGTERM'd. The pool lives *in* that
+    process, so a previous incarnation's names are unattachable (they carry
+    the minting daemon's pid). Without the reap they keep running as orphans
+    the dashboard still offers to attach — attach then refuses with
+    `ATTACH_EXIT_STALE`. Launchers also watch the minting pid themselves and
+    exit if it dies, covering the window before a replacement daemon starts
+    and a SIGKILL that never ran `stop`.
 
   Two consequences. A window that never reaches its attach (ssh refused, the
   terminal failed to spawn it) now leaves **no session** rather than an agent

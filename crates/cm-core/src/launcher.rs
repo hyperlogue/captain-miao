@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use notify::Watcher;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 
@@ -200,6 +200,10 @@ pub async fn run(
         settings_path: settings_path.clone(),
     };
 
+    // Cloned off the state so the `select` can watch it without fighting
+    // `process_hooks` for `launcher_state`.
+    let pool_name = launcher_state.pool_session.clone();
+
     let exit_status = tokio::select! {
         status = child.wait() => match status {
             Ok(s) => s,
@@ -231,6 +235,21 @@ pub async fn run(
             let _ = child.start_kill();
             cleanup_launcher_files(launcher_pid, &sock_path, &settings_path);
             std::process::exit(143); // 128 + SIGTERM
+        }
+        // The pool lives in the daemon process. A restart closes the pty
+        // master, but SIGHUP often never reaches this process (libshpool's
+        // SIGTERM handler `_exit`s the daemon before the hangup is
+        // delivered, and this runtime catches SIGHUP anyway). Without this
+        // watch the agent keeps running under a name the new pool does not
+        // have, and attach refuses. Exit so the row disappears and resume
+        // is the recovery, which is the same contract as `daemon stop`.
+        _ = wait_until_minting_daemon_gone(pool_name.as_deref()) => {
+            tracing::info!(
+                "pty-pool daemon that minted this session is gone; cleaning up"
+            );
+            let _ = child.start_kill();
+            cleanup_launcher_files(launcher_pid, &sock_path, &settings_path);
+            std::process::exit(143);
         }
     };
 
@@ -267,6 +286,29 @@ async fn wait_for_termination_signal() {
     tokio::select! {
         _ = recv(&mut sigterm) => {}
         _ = recv(&mut sighup) => {}
+    }
+}
+
+/// Resolve when the daemon that minted this pooled session is gone.
+///
+/// A non-pooled launcher (or a name we cannot parse) waits forever — those
+/// sessions do not live in the pool, so a daemon restart is not their
+/// concern. Polled rather than watched: `server.pid` is a regular file and
+/// the minting process is not our child.
+async fn wait_until_minting_daemon_gone(pool_session: Option<&str>) {
+    let Some(minting) = pool_session.and_then(state::pool_session_daemon_pid) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if state::minting_pool_daemon_is_gone(
+            minting,
+            state::is_process_alive,
+            state::recorded_daemon_pid(),
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -414,9 +456,12 @@ async fn hold_failed_launch(
     state.active_since = None;
     state.updated_at = LauncherState::now();
     let _ = state.write();
-    // Idle until the window is closed or the row is killed; then clean up the
-    // state file, socket, and settings file so nothing is leaked.
-    wait_for_termination_signal().await;
+    // Idle until the window is closed, the row is killed, or (pooled) the
+    // daemon that reserved this name is gone; then clean up so nothing leaks.
+    tokio::select! {
+        _ = wait_for_termination_signal() => {}
+        _ = wait_until_minting_daemon_gone(state.pool_session.as_deref()) => {}
+    }
     cleanup_launcher_files(launcher_pid, sock_path, settings_path);
     std::process::exit(1);
 }
@@ -1674,6 +1719,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A local (non-pool) launcher must not exit because a daemon somewhere
+    /// restarted — that daemon never owned this process.
+    #[tokio::test]
+    async fn a_local_launcher_does_not_watch_the_pool_daemon() {
+        tokio::select! {
+            _ = wait_until_minting_daemon_gone(None) => {
+                panic!("a non-pooled launcher must not exit on daemon death")
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        tokio::select! {
+            _ = wait_until_minting_daemon_gone(Some("cm-away")) => {
+                panic!("an unparseable pool name must not look like a dead daemon")
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+
+    /// The minting pid is dead (a 2e9 pid is outside the usual allocation
+    /// range and fits in a positive `i32`, so `kill` is ESRCH rather than a
+    /// process-group broadcast), so the watch must resolve on the first check
+    /// rather than wait out a poll.
+    #[tokio::test]
+    async fn a_pooled_launcher_exits_once_its_minting_pid_is_dead() {
+        wait_until_minting_daemon_gone(Some("cm-grok-2000000000-1")).await;
     }
 
     /// Grok rewrites `summary.json` by replace (new inode). The file watch
