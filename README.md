@@ -203,6 +203,7 @@ Status, launch, resume, fork, worktrees, and the **title, token and model column
 
 - **The worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch. A `Stop` with live background work (`backgroundTasks` / `/loop` crons) does land on Task / Server / Review — an `r3 watch` is Review.
 - **`~/.grok/hooks/captain-miao.json` is always loaded**, including in grok sessions you start yourself. `miao hook` exits immediately when it has no launcher socket, so those events are discarded.
+- **`Ctrl+V` pastes a screenshot** on a Linux host offered the clipboard. Grok 1.0.5 otherwise never shells out to `wl-paste` in a displayless session, so a pooled launch sets the documented kill switch; a macOS host still needs `clipboard-paste`.
 
 #### opencode support
 
@@ -458,9 +459,12 @@ Sharp edges worth knowing:
   can serve it. Run `clipboard-paste` in the session instead — it writes the image
   beside the agent and prints the path to hand it.
 - **Claude Code and Antigravity are confirmed to work through the shim**, and
-  only Codex is confirmed not to. Reasonix, Kimi Code, Grok Build, opencode and
-  Pi are shimmed identically but untested: each works if it shells out to
-  `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
+  only Codex is confirmed not to. Grok Build 1.0.5 reads the clipboard
+  in-process (arboard) and only shells out to `wl-paste` when `WAYLAND_DISPLAY`
+  is set, so a pooled launch without a display sets Grok's documented kill
+  switch and a dummy value rather than waiting on arboard. Reasonix, Kimi Code,
+  opencode and Pi are shimmed identically but untested: each works if it shells
+  out to `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
   in-process the way Codex does. `clipboard-paste` works on all of them
   regardless, so treat it as the reliable route until one is confirmed.
 - **A macOS host** gets nothing: the agent's clipboard path there is `osascript`,

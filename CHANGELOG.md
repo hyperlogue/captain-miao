@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Grok Build `Ctrl+V` pastes a screenshot in a remote session**, the same
+  clipboard offer the other shimmable agents use. Grok 1.0.5 only shells out
+  to `wl-paste` when `WAYLAND_DISPLAY` is set, so a pooled launch without a
+  display sets the documented kill switch and a dummy value rather than
+  waiting on arboard.
+
 ### Fixed
 
 - **The npm launcher runs on a bun-only machine.** `#!/usr/bin/env node` made

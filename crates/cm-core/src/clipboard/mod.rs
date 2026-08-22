@@ -13,7 +13,7 @@
 //! A pooled agent has no clipboard: its `Ctrl+V` shells out to `xclip` or
 //! `wl-paste`, which on a remote either aren't installed or answer for the wrong
 //! machine. So the launcher prepends a dir of **symlinks back to `miao-server`**
-//! to the agent's `PATH` under those two names, and the shadow asks the
+//! to the agent's `PATH` under those names, and the shadow asks the
 //! dashboard's machine over a unix socket that `ssh -R` forwarded into place
 //! ([`paths`]).
 //!
@@ -346,11 +346,15 @@ fn err(kind: io::ErrorKind, msg: &str) -> io::Error {
 
 /// The names the shim farm mints, as symlinks to the binary that already ran.
 ///
-/// The third is deliberately **not** `paste`: that is a POSIX utility, and
-/// putting ours first on the agent's `PATH` would shadow it for the agent and
-/// anything it shells out to. Shadowing `xclip`/`wl-paste` *is* the mechanism;
-/// shadowing `paste` would be an accident.
-pub const SHIM_NAMES: [&str; 3] = ["xclip", "wl-paste", PASTE_HELPER_NAME];
+/// `xclip` and `wl-paste` are the reads we answer. `wl-copy` is Grok's
+/// availability probe (`wl-copy --version` is what it runs before it will ever
+/// call `wl-paste`); we never serve a copy, so every invocation under that
+/// name [delegates](ShimCall::Delegate). The last is deliberately **not**
+/// `paste`: that is a POSIX utility, and putting ours first on the agent's
+/// `PATH` would shadow it for the agent and anything it shells out to.
+/// Shadowing `xclip`/`wl-paste` *is* the mechanism; shadowing `paste` would be
+/// an accident.
+pub const SHIM_NAMES: [&str; 4] = ["xclip", "wl-paste", "wl-copy", PASTE_HELPER_NAME];
 
 /// The helper that prints a path to a written-out clipboard image, for an agent
 /// that reads the clipboard in-process and can't be shimmed at all.
@@ -361,6 +365,10 @@ pub const PASTE_HELPER_NAME: &str = "clipboard-paste";
 pub enum ShimTool {
     Xclip,
     WlPaste,
+    /// Write half of wl-clipboard. Grok's `probe_tool_spec` runs
+    /// `wl-copy --version` before it will call `wl-paste`; we never answer a
+    /// copy, so this variant only exists so that probe finds a binary.
+    WlCopy,
 }
 
 impl ShimTool {
@@ -370,6 +378,7 @@ impl ShimTool {
         match Path::new(argv0).file_name()?.to_str()? {
             "xclip" => Some(ShimTool::Xclip),
             "wl-paste" => Some(ShimTool::WlPaste),
+            "wl-copy" => Some(ShimTool::WlCopy),
             _ => None,
         }
     }
@@ -379,6 +388,7 @@ impl ShimTool {
         match self {
             ShimTool::Xclip => "xclip",
             ShimTool::WlPaste => "wl-paste",
+            ShimTool::WlCopy => "wl-copy",
         }
     }
 }
@@ -403,6 +413,10 @@ pub fn classify(tool: ShimTool, args: &[&str]) -> ShimCall {
     match tool {
         ShimTool::Xclip => classify_xclip(args),
         ShimTool::WlPaste => classify_wl_paste(args),
+        // A copy is never ours. Being on PATH at all is the whole point: Grok
+        // will not call `wl-paste` until `wl-copy --version` has exited, and
+        // any exit status counts.
+        ShimTool::WlCopy => ShimCall::Delegate,
     }
 }
 
@@ -875,6 +889,33 @@ mod tests {
         }
     }
 
+    /// Grok 1.0.5's Linux clipboard CLI, from `xai-grok-shared` `clipboard.rs`.
+    /// Availability is `wl-copy --version` / `xclip --version` (any exit), then
+    /// a typed image read — no `TARGETS` probe. Text is a separate argv we
+    /// must keep delegating.
+    #[test]
+    fn the_calls_grok_actually_makes() {
+        use Format::Png;
+        use ShimCall::{Delegate, Fetch};
+        use ShimTool::{WlCopy, WlPaste, Xclip};
+
+        let cases: &[(ShimTool, &[&str], ShimCall)] = &[
+            (WlCopy, &["--version"], Delegate),
+            (WlPaste, &["-t", "image/png"], Fetch(Png)),
+            (WlPaste, &["--no-newline", "-t", "text"], Delegate),
+            (Xclip, &["--version"], Delegate),
+            (
+                Xclip,
+                &["-selection", "clipboard", "-t", "image/png", "-o"],
+                Fetch(Png),
+            ),
+            (Xclip, &["-o", "-selection", "clipboard"], Delegate),
+        ];
+        for (tool, args, want) in cases {
+            assert_eq!(&classify(*tool, args), want, "{tool:?} {args:?}");
+        }
+    }
+
     #[test]
     fn anything_but_a_clipboard_image_read_delegates() {
         use ShimCall::{Delegate, Fetch, Targets};
@@ -967,6 +1008,10 @@ mod tests {
             ShimTool::from_argv0("/home/miao/.cache/captain-miao/shims/wl-paste"),
             Some(ShimTool::WlPaste)
         );
+        assert_eq!(
+            ShimTool::from_argv0("/home/miao/.cache/captain-miao/shims/wl-copy"),
+            Some(ShimTool::WlCopy)
+        );
         // Our own name, and the helper, are ordinary runs — not shimmed calls.
         assert_eq!(ShimTool::from_argv0("miao-server"), None);
         assert_eq!(ShimTool::from_argv0(PASTE_HELPER_NAME), None);
@@ -982,7 +1027,7 @@ mod tests {
             "`paste` merges lines of files"
         );
         assert!(SHIM_NAMES.contains(&PASTE_HELPER_NAME));
-        for t in [ShimTool::Xclip, ShimTool::WlPaste] {
+        for t in [ShimTool::Xclip, ShimTool::WlPaste, ShimTool::WlCopy] {
             assert!(SHIM_NAMES.contains(&t.binary()));
         }
     }

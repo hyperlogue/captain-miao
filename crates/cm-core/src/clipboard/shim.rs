@@ -457,7 +457,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["clipboard-paste", "wl-paste", "xclip"]);
+        assert_eq!(names, ["clipboard-paste", "wl-copy", "wl-paste", "xclip"]);
         for name in SHIM_NAMES {
             assert_eq!(std::fs::read_link(dir.join(name)).unwrap(), exe);
             // Following the link lands on the running binary, which is what makes

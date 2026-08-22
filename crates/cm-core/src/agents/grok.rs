@@ -40,9 +40,24 @@
 //! Task / Server / Review (an r3 watch is Review) rather than Idle.
 //! Unrecognized event names are still skipped, which is why `StopCancelled` is
 //! free on an older grok.
+//!
+//! # `Ctrl+V` reaches the dashboard's clipboard
+//!
+//! Grok 1.0.5 reads the clipboard in-process via arboard first, then falls
+//! through to `wl-paste`/`xclip` only when `WAYLAND_DISPLAY`/`DISPLAY` is set
+//! (`probe_tool_spec` in `xai-grok-shared`). A pooled session has neither, so
+//! putting the shim farm on `PATH` is not enough: Grok never asks. The
+//! documented kill switch `GROK_CLIPBOARD_NO_DATA_CONTROL` skips arboard, but
+//! only when `WAYLAND_DISPLAY` is set — a dummy value plus the kill switch is
+//! the whole trick, and is applied only on a shimmed launch that inherited
+//! neither display. Overriding a real compositor would take Grok off the
+//! native clipboard, and text paste (`wl-paste -t text`) would then miss it.
+//! Grok's availability probe is `wl-copy --version` (any exit), which is why
+//! the farm carries that name even though we never serve a copy.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -54,6 +69,12 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "grok";
+
+/// A pooled session has no compositor, but Grok's CLI clipboard fallback is
+/// gated on `WAYLAND_DISPLAY` being non-empty. This is deliberately not a
+/// real socket name (`wayland-0` and friends); Wayland clients that honour
+/// the variable will fail to connect rather than talk to something of ours.
+const CLIPBOARD_BRIDGE_WAYLAND_DISPLAY: &str = "captain-miao-clipboard";
 
 /// Our hook file inside `~/.grok/hooks/`. A whole file of our own rather than
 /// a merged one, because `hooks/` is a directory of independent files that Grok
@@ -309,6 +330,15 @@ pub fn build_launch_command(
     // Shared hooks file, so the socket cannot ride argv. Sessions the user
     // starts outside captain-miao have this unset; `miao hook` then exits 0.
     cmd.env("CAPTAIN_MIAO_SOCK", sock_path);
+    if let Some(pairs) = clipboard_bridge_env(
+        shim_dir,
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("DISPLAY").as_deref(),
+    ) {
+        for (k, v) in pairs {
+            cmd.env(k, v);
+        }
+    }
     // Only what the launcher forwarded (`--resume <id>`, `--worktree=<name>`).
     // **No cwd positional**: nothing in the sources says `grok` takes a directory
     // argument, and its optional positional is the kind a bare `--worktree` is
@@ -316,6 +346,29 @@ pub fn build_launch_command(
     // on the process and nowhere else.
     cmd.args(extra_args);
     Ok(cmd)
+}
+
+/// Env that makes Grok's `Ctrl+V` reach the clipboard shim in a pooled session.
+///
+/// `None` when there is no farm (a windowed local launch, which inherited a
+/// real display) or when the process already has `WAYLAND_DISPLAY`/`DISPLAY`:
+/// overriding those would take Grok off the native clipboard. The dummy
+/// `WAYLAND_DISPLAY` plus `GROK_CLIPBOARD_NO_DATA_CONTROL` is Grok 1.0.5's
+/// documented way to skip arboard and shell out to `wl-paste`.
+fn clipboard_bridge_env(
+    shim_dir: Option<&Path>,
+    wayland: Option<&OsStr>,
+    display: Option<&OsStr>,
+) -> Option<[(&'static str, &'static str); 2]> {
+    shim_dir?;
+    let present = |v: Option<&OsStr>| v.is_some_and(|v| !v.is_empty());
+    if present(wayland) || present(display) {
+        return None;
+    }
+    Some([
+        ("WAYLAND_DISPLAY", CLIPBOARD_BRIDGE_WAYLAND_DISPLAY),
+        ("GROK_CLIPBOARD_NO_DATA_CONTROL", "1"),
+    ])
 }
 
 /// Write `$GROK_HOME/hooks/captain-miao.json` (creating the directory). The
@@ -1861,5 +1914,37 @@ mod tests {
                 .unwrap()
                 .ends_with("hook --agent grok stop")
         );
+    }
+
+    /// A pooled launch with no compositor gets the dummy `WAYLAND_DISPLAY` and
+    /// the kill switch; a windowed one, or a pool that inherited a real
+    /// display, must not.
+    #[test]
+    fn clipboard_bridge_env_only_on_a_displayless_shimmed_launch() {
+        use std::ffi::OsStr;
+        let farm = Path::new("/home/miao/.cache/captain-miao/shims");
+        let dummy = CLIPBOARD_BRIDGE_WAYLAND_DISPLAY;
+        assert!(
+            !dummy.is_empty(),
+            "Grok treats an empty WAYLAND_DISPLAY as unset"
+        );
+
+        let on = clipboard_bridge_env(Some(farm), None, None).expect("displayless pooled");
+        assert_eq!(
+            on,
+            [
+                ("WAYLAND_DISPLAY", dummy),
+                ("GROK_CLIPBOARD_NO_DATA_CONTROL", "1"),
+            ]
+        );
+        // Empty is the same as unset — Grok's `env_present` requires a byte.
+        assert_eq!(
+            clipboard_bridge_env(Some(farm), Some(OsStr::new("")), Some(OsStr::new(""))),
+            Some(on)
+        );
+
+        assert!(clipboard_bridge_env(None, None, None).is_none());
+        assert!(clipboard_bridge_env(Some(farm), Some(OsStr::new("wayland-0")), None).is_none());
+        assert!(clipboard_bridge_env(Some(farm), None, Some(OsStr::new(":0"))).is_none());
     }
 }
