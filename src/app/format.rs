@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Cell;
+use ratatui::widgets::{Cell, Clear};
 
 use crate::agent::SessionIndex;
 use crate::state::{LauncherState, SessionStatus};
@@ -892,6 +894,40 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
     h_center
 }
 
+/// Clear `area` for an overlay, and blank any 2-cell glyph that starts in the
+/// column immediately to its left.
+///
+/// `Clear` only resets cells *inside* the overlay. A workdir (or host) emoji
+/// whose first cell sits at `x - 1` still occupies the overlay's left border:
+/// the buffer keeps the glyph at width 2, so the terminal paints it over
+/// whatever we then draw there. [`super::render_backend::WideGlyphBackend`]
+/// makes that worse — it emits the reserved column (the border) *before* the
+/// glyph, so the emoji is the last write and the frame's left edge vanishes.
+/// Resetting the straddling cell leaves a one-cell gap instead of a chopped
+/// glyph; the row's colours stay, so a highlighted table row doesn't notch.
+pub(super) fn clear_overlay(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    clip_wide_glyphs_left_of(frame.buffer_mut(), area);
+}
+
+fn clip_wide_glyphs_left_of(buf: &mut Buffer, area: Rect) {
+    use unicode_width::UnicodeWidthStr;
+    let area = area.intersection(buf.area);
+    let Some(x) = area.x.checked_sub(1) else {
+        return;
+    };
+    for y in area.y..area.bottom() {
+        let Some(cell) = buf.cell_mut((x, y)) else {
+            continue;
+        };
+        if cell.symbol().width() > 1 {
+            let style = cell.style();
+            cell.reset();
+            cell.set_style(style);
+        }
+    }
+}
+
 /// Worst-case width of `format_elapsed` output (`>99h00m` = 7 chars). Used by
 /// the dashboard to size the "Updated" column tightly — every other variant
 /// is shorter and right-aligns within this width.
@@ -1003,9 +1039,52 @@ pub(super) fn version_is_older(theirs: &str, ours: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_context_detail, model_color, model_label, truncate_str, version_is_older};
-    use ratatui::style::Color;
+    use super::{
+        clip_wide_glyphs_left_of, format_context_detail, model_color, model_label, truncate_str,
+        version_is_older,
+    };
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Style};
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clip_wide_glyphs_left_of_blanks_a_straddling_emoji() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        buf[(3, 1)].set_symbol("🐱");
+        buf[(3, 1)].set_style(Style::default().bg(Color::DarkGray));
+        buf[(4, 1)].reset();
+        clip_wide_glyphs_left_of(&mut buf, Rect::new(4, 0, 5, 3));
+        assert_eq!(buf[(3, 1)].symbol(), " ");
+        assert!(buf[(3, 1)].symbol().width() <= 1);
+        // The row's background stays, so a highlighted table row doesn't notch.
+        assert_eq!(buf[(3, 1)].bg, Color::DarkGray);
+    }
+
+    #[test]
+    fn clip_wide_glyphs_left_of_spares_narrow_neighbours() {
+        let mut buf = Buffer::with_lines(["abcdefghij", "abcdefghij", "abcdefghij"]);
+        clip_wide_glyphs_left_of(&mut buf, Rect::new(4, 0, 3, 3));
+        assert_eq!(buf[(3, 0)].symbol(), "d");
+        assert_eq!(buf[(3, 1)].symbol(), "d");
+    }
+
+    #[test]
+    fn clip_wide_glyphs_left_of_spares_a_glyph_wholly_left_of_the_overlay() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        buf[(2, 0)].set_symbol("🐱");
+        buf[(3, 0)].reset();
+        // Overlay starts at 5; the cat occupies 2–3, fully outside.
+        clip_wide_glyphs_left_of(&mut buf, Rect::new(5, 0, 4, 1));
+        assert_eq!(buf[(2, 0)].symbol(), "🐱");
+    }
+
+    #[test]
+    fn clip_wide_glyphs_left_of_is_a_no_op_on_the_left_edge() {
+        let mut buf = Buffer::with_lines(["abcdefghij"]);
+        clip_wide_glyphs_left_of(&mut buf, Rect::new(0, 0, 4, 1));
+        assert_eq!(buf[(0, 0)].symbol(), "a");
+    }
 
     #[test]
     fn truncate_str_is_width_aware() {

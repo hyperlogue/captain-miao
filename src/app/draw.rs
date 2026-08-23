@@ -5,8 +5,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table,
-        Wrap,
+        Block, BorderType, Borders, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, Wrap,
     },
 };
 
@@ -16,10 +15,10 @@ use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
     DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
-    ansi_to_lines, bar_segments, bar_style, centered_rect, context_pressure_style, dir_icon_width,
-    elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
-    hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans, pill,
-    session_display_name, truncate_str,
+    ansi_to_lines, bar_segments, bar_style, centered_rect, clear_overlay, context_pressure_style,
+    dir_icon_width, elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens,
+    hint_badge, hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans,
+    pill, session_display_name, truncate_str,
 };
 use super::keymap::Command;
 use super::picker::TextInput;
@@ -122,8 +121,9 @@ impl App {
             width,
             height,
         };
-        frame.render_widget(Clear, popup);
-        let ui = &config::get().colors.ui;
+        clear_overlay(frame, popup);
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -274,7 +274,7 @@ impl App {
         // 35% height accounts for the 16-name color palette wrapping onto a
         // second visual line on narrow popups.
         let popup = centered_rect(80, 35, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
 
         let preview_color = DIR_COLORS[state.color_idx].1;
         let custom = state.custom.text();
@@ -544,7 +544,7 @@ impl App {
         // Wider and taller than the list: these lines are quoted host output,
         // and wrapping a loader error at 72 cells helps nobody.
         let popup = centered_rect(88, 76, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
             format!(" {host} \u{00b7} connection log ", host = host.0),
             Style::default().bold(),
@@ -602,7 +602,7 @@ impl App {
             return;
         };
         let popup = centered_rect(Self::HOSTS_POPUP.0, Self::HOSTS_POPUP.1, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
         // No key hints on the border: the footer bar already renders this
         // mode's bindings, and two copies of the same list disagree eventually.
         let block = Block::default()
@@ -882,7 +882,7 @@ impl App {
             frame
                 .buffer_mut()
                 .set_style(host_popup, Style::default().add_modifier(Modifier::DIM));
-            frame.render_widget(Clear, popup);
+            clear_overlay(frame, popup);
             // Which of the two things Esc will do: put a row back, or drop one
             // that was never on disk. The old inline form couldn't say.
             let title = match state.edit.as_ref().map(|e| &e.origin) {
@@ -915,7 +915,7 @@ impl App {
             return;
         };
         let popup = centered_rect(60, 20, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
             " Confirm ",
             Style::default()
@@ -1798,7 +1798,7 @@ impl App {
 
     fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
         let popup = centered_rect(70, 90, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" Keybindings ", Style::default().bold()));
@@ -1961,7 +1961,7 @@ impl App {
         // Wide, like the connection log: these are sentences, and wrapping a
         // path-carrying failure at 60 cells helps nobody.
         let popup = centered_rect(80, 70, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)

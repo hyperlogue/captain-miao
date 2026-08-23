@@ -3,9 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use super::format::{centered_rect, truncate_str};
+use super::format::{centered_rect, clear_overlay, truncate_str};
 
 // -- TextInput: cursor-aware buffer with readline-style keybinds --
 
@@ -653,7 +653,7 @@ impl Picker {
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
         let (w, h) = self.size_percent;
         let popup = centered_rect(w, h, area);
-        frame.render_widget(Clear, popup);
+        clear_overlay(frame, popup);
 
         let filtered = self.filtered();
         let total = self.items.len();

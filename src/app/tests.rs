@@ -1003,6 +1003,67 @@ fn the_resume_picker_opens_before_its_list_arrives() {
     assert!(out.contains("fix the thing"), "{out}");
 }
 
+/// A 2-cell table emoji whose first cell sits just left of the resume picker
+/// still paints into the overlay's left border — the buffer keeps the glyph at
+/// width 2, and the terminal (plus `WideGlyphBackend`) draws it *after* the
+/// frame. Blanking that cell is what keeps the border intact.
+#[test]
+fn a_table_emoji_does_not_paint_over_the_resume_picker_border() {
+    use super::format::centered_rect;
+    use ratatui::layout::Rect;
+    use unicode_width::UnicodeWidthStr;
+
+    // Resume picker is 80% of the body. 190 cells puts its left edge on the
+    // second cell of the workdir slot — the geometry in the screenshot.
+    const WIDTH: u16 = 190;
+    let mut d = TestDashboard::new(WIDTH, 30);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = false;
+    d.set_sessions(vec![
+        session(1, "/home/test/alpha", SessionStatus::Idle),
+        session(2, "/home/test/beta", SessionStatus::Starting),
+        session(3, "/home/test/gamma", SessionStatus::Active),
+    ]);
+    for cwd in ["/home/test/alpha", "/home/test/beta", "/home/test/gamma"] {
+        d.app.directory_marks.insert(
+            cwd.to_string(),
+            super::DirectoryMark {
+                icon: "🐱".into(),
+                color: "red".into(),
+            },
+        );
+    }
+    d.render();
+
+    let body = Rect::new(0, 2, WIDTH, 27);
+    let popup = centered_rect(80, 80, body);
+    assert!(popup.x > 0, "picker must have a left neighbour: {popup:?}");
+    let buf = d.terminal.backend().buffer();
+    let straddled: Vec<u16> = (popup.y..popup.bottom())
+        .filter(|&y| buf[(popup.x - 1, y)].symbol().width() > 1)
+        .collect();
+    assert!(
+        !straddled.is_empty(),
+        "test geometry must place a table emoji under the overlay edge (popup.x={}):\n{}",
+        popup.x,
+        buffer_to_string(buf),
+    );
+
+    d.app
+        .open_resume_picker(crate::state::HostId::local(), Vec::new());
+    d.render();
+    let buf = d.terminal.backend().buffer();
+    for y in straddled {
+        let left = buf[(popup.x - 1, y)].symbol();
+        assert!(
+            left.width() <= 1,
+            "row {y}: {left:?} still straddles the picker border at x={}:\n{}",
+            popup.x,
+            buffer_to_string(buf),
+        );
+    }
+}
+
 #[test]
 fn enter_on_running_remote_session_emits_attach() {
     use crate::state::HostId;
