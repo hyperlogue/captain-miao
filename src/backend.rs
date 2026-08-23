@@ -5019,6 +5019,7 @@ mod tests {
             flags: None,
             attached: None,
             host: crate::state::HostId::local(),
+            child_pre_tool_at: None,
         }
     }
 

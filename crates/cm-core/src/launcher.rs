@@ -99,6 +99,7 @@ pub async fn run(
         flags: None,
         attached: None,
         host: HostId::local(),
+        child_pre_tool_at: None,
     };
     launcher_state.write()?;
 

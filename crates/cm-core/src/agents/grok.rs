@@ -19,7 +19,11 @@
 //! the same owned-file-in-the-real-home idea, without a selector.
 //!
 //! **Approval is the lifecycle `Notification` / `permission_prompt` matcher**
-//! in that same hooks file. There is no second site in `config.toml`.
+//! in that same hooks file. There is no second site in `config.toml`. 1.0.5
+//! also fires that Notification on the **parent** session id ~20ms after a
+//! subagent's auto-allowed `run_terminal_command` has already started
+//! (`wait_ms` 10–40, no parent UI). Those are dropped — see
+//! [`permission_prompt_already_resolved`].
 //!
 //! **What this module still does not do**, and why:
 //!
@@ -419,7 +423,9 @@ fn install_hooks_file(contents: &str) -> Result<()> {
 ///   stopped is over, not failed — Kimi's `Interrupt` standing. The matcher is
 ///   tested against `reason`; omitted, it fires for every cancel.
 /// - **`Notification` / `permission_prompt` → `PermissionRequest`.** The
-///   lifecycle hook that fires while a permission UI is waiting.
+///   lifecycle hook that fires while a permission UI is waiting. 1.0.5 also
+///   fires it on the parent session after a subagent bash auto-allow; those
+///   are not a waiting UI ([`permission_prompt_already_resolved`]).
 /// - **`Notification` / `idle_prompt` → `Stop`.** Grok's documented backstop
 ///   for turns that report none of Stop / StopFailure / StopCancelled (bash
 ///   mode, rewind, a superseded report). Delayed ~1 minute; cancelled if the
@@ -749,9 +755,10 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 // =============================================================================
 
 /// Grok's departures from [`common::dispatch_default`]: a session-end `Stop`,
-/// a `Stop` that names live background work, and `ask_user_question` (a
-/// blocking choice card, not work). Everything else maps the way every
-/// backend maps it.
+/// a `Stop` that names live background work, `ask_user_question` (a blocking
+/// choice card, not work), and a `permission_prompt` that is a subagent
+/// auto-allow echo rather than a waiting UI. Everything else maps the way
+/// every backend maps it.
 pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // A subagent's hooks share this process's socket. Adopting their session
     // id would rename the parent row, their Stop/StopCancelled would Idle a
@@ -759,7 +766,23 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // the parent's name. `10-hooks.md` is explicit: exit early when
     // `subagentType` is present. Parse also drops `transcript_path` on these
     // so the launcher cannot switch its watch before we get here.
+    //
+    // Child Pre/PostToolUse is still evidence: 1.0.5's `permission_prompt`
+    // Notification is parent-attributed and arrives *after* an auto-allowed
+    // child bash has started, so the child's tool event is what releases a
+    // stuck Approval (and stamps `child_pre_tool_at` so a Notification in
+    // the same second never enters it).
     if msg.session_is_child == Some(true) {
+        if msg.event == HookEvent::PreToolUse {
+            state.child_pre_tool_at = Some(LauncherState::now());
+        }
+        if matches!(
+            msg.event,
+            HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+        ) && state.status == SessionStatus::WaitingForApproval
+        {
+            state.status = SessionStatus::Active;
+        }
         return;
     }
 
@@ -824,6 +847,14 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             state.status = SessionStatus::WaitingForDecision;
             state.last_tool = msg.tool_name;
         }
+        // A `permission_prompt` that is not a waiting UI. 1.0.5 forwards
+        // subagent bash auto-allows on the parent session id after the
+        // child's PreToolUse; mapping those to Approval sticks the row
+        // there until the parent's own PostToolUse — minutes, when that
+        // tool is `get_command_or_subagent_output`.
+        HookEvent::PermissionRequest if permission_prompt_already_resolved(state) => {
+            common::adopt_session_facts(state, &mut msg);
+        }
         // Grok issues tools in parallel. A `search_replace` PostToolUse 35ms
         // after `ask_user_question`'s PreToolUse is the shared mapping
         // snapping Decision back to Active while the card is still up. Hold
@@ -836,6 +867,28 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             common::adopt_session_facts(state, &mut msg);
         }
         _ => common::dispatch_default(state, msg),
+    }
+}
+
+/// 1.0.5 fires `permission_prompt` on the **parent** session id after a
+/// subagent's auto-allowed `run_terminal_command` has already started
+/// (`wait_ms` 10–40; the Notification lands ~20ms after that child's
+/// PreToolUse). The parent row has no follow-up: child hooks used to be
+/// ignored entirely, and the parent's own PostToolUse may be minutes away
+/// (`get_command_or_subagent_output`). Captured from session `01a02efd`.
+///
+/// A parent tool already in flight (`last_tool`) has passed its own gate —
+/// that PreToolUse ran — so a later parent-attributed Notification is the
+/// same late echo, not a waiting UI. A genuine parent wait on 1.0.5 does
+/// not fire this hook at all (PreToolUse starts the wait; there is no
+/// matching PermissionRequest in the launcher log).
+fn permission_prompt_already_resolved(state: &LauncherState) -> bool {
+    if state.last_tool.is_some() {
+        return true;
+    }
+    match state.child_pre_tool_at {
+        Some(at) => LauncherState::now().saturating_sub(at) <= 1,
+        None => false,
     }
 }
 
@@ -1430,6 +1483,111 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
         assert_eq!(state.session_id.as_deref(), Some("s1"));
+    }
+
+    /// Session `01a02efd` at 20:02:52: parent already in
+    /// `get_command_or_subagent_output`, no child Pre in that second. The
+    /// Notification still must not enter Approval — the in-flight parent
+    /// tool has passed its own gate.
+    #[test]
+    fn a_parent_tool_in_flight_drops_a_late_permission_prompt() {
+        let mut state = state_at(SessionStatus::Active);
+        state.last_tool = Some("get_command_or_subagent_output".to_string());
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            r#"{"sessionId":"s1"}"#,
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(
+            state.last_tool.as_deref(),
+            Some("get_command_or_subagent_output")
+        );
+    }
+
+    /// Session `01a02efd`: parent `get_command_or_subagent_output` in flight,
+    /// subagent bash auto-allowed (`wait_ms` 13), then a parent-attributed
+    /// `permission_prompt` ~20ms later. The row sat at Approval until the
+    /// parent's poll returned, while the TUI showed no prompt.
+    #[test]
+    fn a_subagent_auto_allow_does_not_stick_the_parent_at_approval() {
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("parent".to_string());
+        state.last_tool = Some("get_command_or_subagent_output".to_string());
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(
+                "pre_tool_use",
+                r#","toolName":"run_terminal_command","subagentType":"explore""#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            state.last_tool.as_deref(),
+            Some("get_command_or_subagent_output")
+        );
+
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            r#"{"sessionId":"parent","notificationType":"permission_prompt"}"#,
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            state.last_tool.as_deref(),
+            Some("get_command_or_subagent_output")
+        );
+    }
+
+    /// Same echo when the parent's last tool has already cleared (PostToolUse
+    /// of a previous bash) but a child PreToolUse just ran.
+    #[test]
+    fn a_child_pre_tool_in_the_same_second_drops_the_permission_echo() {
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("parent".to_string());
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(
+                "pre_tool_use",
+                r#","toolName":"run_terminal_command","subagentType":"explore""#,
+            ),
+        );
+        assert!(state.last_tool.is_none(), "child must not stamp last_tool");
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            r#"{"sessionId":"parent"}"#,
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+    }
+
+    /// A child tool completing is enough to leave Approval even if the
+    /// Notification landed first (the 20:02:52 case: no child Pre in the
+    /// same second, last_tool already set so we never enter — this pins
+    /// the release path).
+    #[test]
+    fn a_child_tool_releases_a_stuck_approval() {
+        let mut state = state_at(SessionStatus::WaitingForApproval);
+        state.session_id = Some("parent".to_string());
+        state.last_tool = Some("get_command_or_subagent_output".to_string());
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload(
+                "post_tool_use",
+                r#","toolName":"run_terminal_command","subagentType":"explore""#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            state.last_tool.as_deref(),
+            Some("get_command_or_subagent_output")
+        );
     }
 
     /// `ask_user_question` renders a multiple-choice card and blocks on the
