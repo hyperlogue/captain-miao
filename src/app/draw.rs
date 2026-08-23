@@ -1877,11 +1877,12 @@ impl App {
             cmd(Command::RestartSelected),
             cmd(Command::RestartAll),
         ]);
-        // Detach and steal only mean anything once some host pools its sessions
-        // (a remote, or pooled-localhost) — otherwise a session *is* its window.
+        // Detach and steal only mean anything once something in front of us is
+        // pooled — a host that pools its sessions, or a pooled row this machine's
+        // daemon holds for a remote client. Otherwise a session *is* its window.
         // Hide them rather than list keys that only report they don't apply,
         // mirroring how the unsupported `t` is hidden on zellij.
-        if self.backends.iter().any(|b| b.capabilities().pooled) {
+        if self.pooling_in_play() {
             lines.push(cmd(Command::DetachRemote));
             lines.push(cmd(Command::StealAttach));
             lines.push(cmd(Command::AttachAll));

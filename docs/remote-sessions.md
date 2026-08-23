@@ -1396,6 +1396,92 @@ lands them in the pool.
 Costs, unchanged from the analysis: one extra process hop per pane, no
 scrollback replay on reattach, and single-attach until you steal.
 
+**The third case: a direct-local dashboard looking at pooled rows.** The two
+modes above are about how a machine's *own* dashboard launches sessions, and the
+laptop rationale assumed nobody remotes into a laptop. That assumption is not
+enforced: a machine running direct-local can still have a daemon, and the moment
+a remote client launches into it those sessions are pooled and their state files
+land in the same `sessions/` dir this dashboard reads. The rows therefore appear
+— `is_actionable_row` passes everything on this machine — and every attach
+affordance used to dead-end on them, because attachability was keyed on the
+*host's* `BackendCaps::pooled` rather than on the row's own `pool_session`.
+
+Pooled-ness is a property of the session, not of the host, and the seam now says
+so. `Backend::Local`'s `attach_plan` builds the same socket-shaped argv
+pooled-localhost uses (`<exe> attach [--force] <name>`, no ssh hop). `D`, the
+steal and the help list key on the row, and `window_process_pid` now requires the
+*row* to be unpooled as well as the host — a pooled launcher pid on this machine
+is live and local and belongs to something that is not the window.
+
+**Which binary runs the attach: ask the pool name.** A pool session is
+`cm-<agent>-<daemon-pid>-<seq>`, and that pid is not decoration — the pool lives
+*inside* that process, so the daemon it names is the one holding the pty,
+minting the names, and writing the state files the attach guards read back.
+`/proc/<pid>/exe` is therefore not a good guess at the right binary; it is the
+right binary, by construction. (Run through the same `(deleted)` strip
+`reporter_exe` uses: `/proc/<pid>/exe` names the running *inode*, and an upgrade
+lands on a fresh one by design.)
+
+Searching for `miao-client`/`miao-server` beside the dashboard and then on
+`PATH` remains as a fallback for the cases where nothing better exists — a
+hand-set `--pool-session` encodes no pid, and `/proc` is Linux's — and it is
+labelled a guess because a stale one is what put the resolution in this shape. A
+dev tree had a current `miao` and a nine-day-old `miao-server` beside it (cargo
+rebuilds what you ask for, not the workspace), so "the binaries install
+together" — true of an install, false of `target/` — ran a daemon predating an
+agent backend. Its `LauncherState` no longer parsed, and
+`read_all_launcher_states` **skips a row it cannot parse**, so every session
+vanished at once and the stale-name guard refused a live session while blaming
+the session. Nothing in the message pointed at the binary; reading the daemon's
+own `/proc` entry leaves nothing to point at.
+
+`BackendCaps::pooled` keeps its host-level meaning and its host-level callers:
+whether a kill is a round trip worth being optimistic about, whether the host
+serves the flags sidecar, whether `launcher_pid` names a process in *this*
+table. What it stopped being is the answer to "can I attach to this row".
+
+**The attached bit, for a backend that talks to no daemon.** Every other field
+on a row is written to a file by the launcher and read straight back; `attached`
+is written nowhere at all. It lives in the daemon's memory, maintained from the
+pool's hooks (§10.2), and reaches a dashboard only over the protocol — so a
+direct-local backend reading only files had to leave it `None`, and `None` means
+*unknown*, which the UI resolves to "free to take". Every pooled row on this
+machine looked available whether or not someone was working in it.
+
+`PoolWatch` closes that: the local backend holds a subscription to this
+machine's own daemon and overlays the bit onto the rows it reads, joining on
+`pool_session` — the one token both sides carry. Three properties are what make
+it the right shape rather than merely a working one:
+
+* **Subscribed, not sampled**, for the reason §10.2 already ruled on. libshpool
+  keeps no attached flag (its `List` reconstructs one by `try_lock`ing the
+  session mutex), so a poll both samples a lock that is only ever held in
+  passing and misses the transitions entirely — an attach or a detach touches
+  nothing under `sessions/`, so the notify watcher never fires for one. The
+  daemon's hooks push, and `wake_subscribers` is what carries them.
+* **Nothing but the bit.** The daemon's `Snapshot` is every state file, pooled
+  or not, and this backend already reads all of them itself; folding the rest of
+  the mirror in would be the row duplication that keeps pooled-localhost from
+  simply being *added* to a direct-local dashboard. Unpooled rows are dropped on
+  arrival, and a delta that moves nothing we track raises no wake.
+* **Started on first sight of a pooled row**, not at `subscribe`. A laptop —
+  the population direct-local exists for — never has one, so it never opens the
+  socket at all. The gate is also self-healing in the direction that matters: a
+  daemon that starts later announces itself through a state file, which the
+  notify watcher already wakes on.
+
+No daemon is a normal state rather than a failure. An empty map reads as
+*unknown* — never as free — which puts the UI exactly where it was before this
+existed, with `ATTACH_EXIT_BUSY` and `refused_attach` as the fallback. The watch
+retries with the same backoff a remote host gets.
+
+The one thing it deliberately does **not** carry is a presumption layer.
+`RemoteBackend::presumed_attached` exists to hold an answer the dashboard has
+already proved through the length of an ssh round trip; here the correcting
+`Delta` arrives on the same wake as the attach that provoked it, so
+`presume_attached` / `presume_detached` stay no-ops on this backend — a
+statement about distance, not about capability.
+
 ### 10.2 Steal-attach — implemented; the engine ruling is still open
 
 `--force` is threaded through `miao-server attach` (into libshpool's

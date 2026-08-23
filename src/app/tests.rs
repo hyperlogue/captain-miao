@@ -1118,12 +1118,16 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
 /// machine's process table can answer for, and only an unpooled session's is:
 /// such a session is its window, so `launcher_pid` is the process running in it.
 ///
-/// The two `None` cases are the point. A pooled session's window runs an attach
-/// client and its `launcher_pid` lives in the pool's namespace — which under
-/// pooled-localhost is this very machine, so the number would resolve to a live
-/// local process that has nothing to do with the row. A row whose host has left
-/// the config resolves to no backend at all, and that must read as "no pid"
-/// rather than fall through to the unpooled answer, for exactly the same reason.
+/// The three `None` cases are the point. A pooled session's window runs an attach
+/// client and its `launcher_pid` lives in the pool's namespace — which on this
+/// machine is this very process table, so the number would resolve to a live
+/// local process that has nothing to do with the row. That holds whether the
+/// *host* is pooled (pooled-localhost) or not: a direct-local dashboard lists
+/// the pooled sessions its own daemon holds for a remote client, and each of
+/// those carries a launcher pid this table can answer for and must not be asked
+/// about. A row whose host has left the config resolves to no backend at all,
+/// and that must read as "no pid" rather than fall through to the unpooled
+/// answer, for exactly the same reason.
 #[test]
 fn only_an_unpooled_session_offers_a_pid_to_wait_on() {
     let d = TestDashboard::new(100, 10);
@@ -1132,6 +1136,15 @@ fn only_an_unpooled_session_offers_a_pid_to_wait_on() {
     // Local (unpooled): the window runs the launcher, so its pid is the answer.
     assert_eq!(d.app.window_process_pid(&s), Some(4242));
 
+    // Same host, same unpooled backend — but the *row* is in this machine's
+    // pool, so its window runs an attach client and the pid names the pooled
+    // launcher instead.
+    let pooled = LauncherState {
+        pool_session: Some("cm-claude-9-1".into()),
+        ..s.clone()
+    };
+    assert_eq!(d.app.window_process_pid(&pooled), None);
+
     // A host with no backend behind it yields nothing to wait on, so the caller
     // closes the window the way it always did.
     let orphan = LauncherState {
@@ -1139,6 +1152,78 @@ fn only_an_unpooled_session_offers_a_pid_to_wait_on() {
         ..s.clone()
     };
     assert_eq!(d.app.window_process_pid(&orphan), None);
+}
+
+/// A pooled session on **this** machine is attachable from a dashboard whose own
+/// backend pools nothing — the case a laptop's remote client creates by
+/// launching into this host's daemon while the seat runs direct-local.
+///
+/// Nothing about the row is remote: `Enter` attaches it, `D` detaches it, and
+/// the help list offers both. All three used to key on the host's `pooled`
+/// capability, which for this backend is (correctly) `false` — the answer to a
+/// question about the *host*, wrongly spent on a question about the *row*.
+#[test]
+fn a_pooled_row_on_an_unpooled_host_still_attaches_and_detaches() {
+    use crate::state::HostId;
+    use crate::terminal::WindowId;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let mut s = session(7, "/home/miao/proj", SessionStatus::Idle);
+    s.pool_session = Some("cm-claude-9-1".into());
+    s.window_id = None;
+    d.set_sessions(vec![s]);
+    assert_eq!(d.app.backends[0].host_id(), HostId::local());
+    assert!(
+        !d.app.backends[0].capabilities().pooled,
+        "the point of the case: this host does not pool its own sessions"
+    );
+
+    // Detached tier, so `Enter` attaches rather than focusing nothing.
+    assert!(d.app.is_detached_row(&d.app.sessions[0]));
+    match d.press(KeyCode::Enter) {
+        Some(Action::AttachRemoteRunning {
+            host,
+            pool_session,
+            force,
+        }) => {
+            assert_eq!(host, HostId::local());
+            assert_eq!(pool_session, "cm-claude-9-1");
+            assert!(!force, "nobody is holding it, so this is not a steal");
+        }
+        other => panic!("expected AttachRemoteRunning, got {other:?}"),
+    }
+
+    // With a window bound, `D` gives the pooled session back instead of
+    // reporting that this host has nothing to detach.
+    d.app.record_window_binding(
+        HostId::local(),
+        "cm-claude-9-1".into(),
+        WindowId::from(900u64),
+    );
+    match d.press(KeyCode::Char('D')) {
+        Some(Action::DetachRemote {
+            host,
+            token,
+            window_id,
+        }) => {
+            assert_eq!(host, HostId::local());
+            assert_eq!(token, "cm-claude-9-1");
+            assert_eq!(window_id, WindowId::from(900u64));
+        }
+        other => panic!("expected DetachRemote, got {other:?}"),
+    }
+
+    // And the keys are listed, so they are discoverable at all.
+    assert!(d.app.pooling_in_play());
+}
+
+/// The other half of the same gate: with nothing pooled in sight the pool-only
+/// keys stay hidden, which is what `pooling_in_play` is asked for.
+#[test]
+fn an_all_unpooled_dashboard_offers_no_pool_keys() {
+    let mut d = TestDashboard::new(120, 12);
+    d.set_sessions(vec![session(7, "/home/miao/proj", SessionStatus::Idle)]);
+    assert!(!d.app.pooling_in_play());
 }
 
 /// The host glyph shares the workdir-icon column rather than holding a Host

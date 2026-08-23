@@ -4241,25 +4241,33 @@ impl App {
     /// that is a pid *this* machine can see — so a teardown can let it exit
     /// before closing the window out from under it (`close_window_when_free`).
     ///
-    /// Only an **unpooled** session qualifies, and the gate is the capability
-    /// rather than the host: such a session *is* its window, so the window runs
-    /// the launcher and `launcher_pid` names it. A pooled session's window runs
-    /// an attach client instead, and its `launcher_pid` belongs to the pool's
-    /// process namespace — which under pooled-localhost is this same machine, so
-    /// a locality test would hand back a live local pid belonging to something
-    /// else entirely.
+    /// Only an **unpooled** session qualifies: such a session *is* its window,
+    /// so the window runs the launcher and `launcher_pid` names it. A pooled
+    /// session's window runs an attach client instead, and its `launcher_pid`
+    /// belongs to the pool's process namespace — which on this machine is this
+    /// same process table, so the number would resolve to a live local process
+    /// that has nothing to do with the window.
+    ///
+    /// Two conditions, because either alone is a way to get a foreign pid. The
+    /// **host** must be unpooled, or the pid is a remote launcher's and belongs
+    /// to another machine's table entirely. And the **row** must be unpooled
+    /// too: a direct-local dashboard is an unpooled host that still lists the
+    /// pooled sessions its own daemon holds for a remote client, and each of
+    /// those carries a launcher pid this table can answer for and must not be
+    /// asked about.
     ///
     /// `None` therefore means "no pid to wait on", not "nothing is running": the
     /// caller closes the window the old way, which is all it ever did.
     ///
     /// A backend must say so *positively*: a row whose host has since left the
     /// config resolves to no backend at all, and reading that as "not pooled"
-    /// would hand back the very thing the capability gate exists to refuse — a
-    /// remote launcher's pid, tested against this machine's process table.
+    /// would hand back the very thing the gate exists to refuse.
     pub(super) fn window_process_pid(&self, s: &LauncherState) -> Option<u32> {
-        self.backend_for(&s.host)
+        (self
+            .backend_for(&s.host)
             .is_some_and(|b| !b.capabilities().pooled)
-            .then_some(s.launcher_pid)
+            && s.pool_session.is_none())
+        .then_some(s.launcher_pid)
     }
 
     /// The terminal instance a *local* session lives in when it differs from the
@@ -4360,6 +4368,22 @@ impl App {
     /// screen" reads differently from "idle in front of me" (§9).
     pub(super) fn is_detached_row(&self, s: &LauncherState) -> bool {
         s.pool_session.is_some() && self.window_id_for_session(s).is_none()
+    }
+
+    /// Whether the pool-only keys (`D`, the steal, `Space A`) can apply to
+    /// anything — which is what decides whether the help list mentions them at
+    /// all (an unsupported affordance is hidden, never offered as a key that
+    /// only errors).
+    ///
+    /// Two ways to be true, and the second is why this isn't just a capability
+    /// read. A host that pools its sessions makes them apply to every row it
+    /// serves, present or not. But a *direct-local* dashboard pools nothing and
+    /// can still be looking at pooled rows: the daemon on this machine holds
+    /// sessions launched by a remote client, and they arrive through the same
+    /// `sessions/` dir this backend reads. So the rows themselves get a say.
+    pub(super) fn pooling_in_play(&self) -> bool {
+        self.backends.iter().any(|b| b.capabilities().pooled)
+            || self.sessions.iter().any(|s| s.pool_session.is_some())
     }
 
     /// Which kind of detached a row is: free to take, or already held by another

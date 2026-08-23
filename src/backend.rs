@@ -235,6 +235,242 @@ pub(crate) struct LocalHost {
     /// [`BackendEvents`]. Held here so the watcher outlives `subscribe`.
     changed: Arc<AtomicBool>,
     watcher: Option<notify::RecommendedWatcher>,
+    /// The one fact about this machine's sessions that is *not* in a file: the
+    /// pool's attached bit. See [`PoolWatch`].
+    pool: PoolWatch,
+}
+
+impl LocalHost {
+    /// This host's sessions, with the pool's attached bit stamped onto the ones
+    /// that are in it.
+    ///
+    /// The overlay is the whole reason [`PoolWatch`] exists. Every other field
+    /// on a row is written to a file by the launcher and read straight back
+    /// here; `attached` is not written anywhere at all — it lives in the
+    /// daemon's memory, maintained from libshpool's hooks (§10.2), and reaches
+    /// a dashboard only over the protocol. A direct-local backend that read
+    /// only the files therefore had to leave it `None`, and `None` means
+    /// *unknown*, which the UI resolves to "free to take": every pooled row on
+    /// this machine looked available whether or not someone was working in it.
+    fn list_sessions(&self) -> Vec<LauncherState> {
+        let mut rows = self.inner.list_sessions();
+        // Nothing on this machine is pooled → nothing to ask the daemon, and no
+        // reason to have opened a socket to it. This is the gate that keeps the
+        // watch off a laptop entirely (§10.1): the default population never has
+        // a pooled row, so it never pays for one.
+        if !rows.iter().any(|s| s.pool_session.is_some()) {
+            return rows;
+        }
+        self.pool.ensure_started(&self.changed);
+        let attached = self.pool.attached_by_pool_session();
+        for row in &mut rows {
+            if let Some(pool) = row.pool_session.as_deref() {
+                row.attached = attached.get(pool).copied();
+            }
+        }
+        rows
+    }
+}
+
+/// A subscription to **this machine's own daemon**, held by the direct-local
+/// backend for exactly one field: [`LauncherState::attached`].
+///
+/// The case it serves is a machine running direct-local that nonetheless has a
+/// pool — a remote client launched into its daemon, so the sessions are pooled
+/// and their state files land in the same `sessions/` dir this backend reads
+/// (§10.1, "the third case"). Those rows are attachable, and the one thing
+/// their files cannot say is whether a terminal is already in them.
+///
+/// **Subscribed, not sampled**, and that is the same ruling §10.2 made for the
+/// daemon's own overlay. libshpool keeps no attached flag — its `List`
+/// reconstructs one by `try_lock`ing the session mutex — so every query is a
+/// sample that is stale the moment it is read. The daemon instead maintains the
+/// bit from the pool's hooks, in its own causal order, and *pushes* it: a hook
+/// wakes every subscriber, which is what makes an attach or a detach visible at
+/// all (neither touches anything under `sessions/`, so the notify watch never
+/// fires for one). Subscribing is therefore not merely cheaper than polling
+/// here; it is the only way to see the transitions.
+///
+/// It carries no presumption layer, unlike [`RemoteBackend::presumed_attached`].
+/// That layer exists to hold an answer the dashboard has already proved through
+/// the length of an ssh round trip; here the host is a unix socket away and its
+/// correcting `Delta` arrives on the same wake as the attach that caused it, so
+/// there is nothing to bridge.
+#[derive(Default)]
+struct PoolWatch {
+    /// The daemon's account of its pool, keyed the way its frames are.
+    ///
+    /// Keyed by [`SessionKey`] rather than by pool name because `Removed`
+    /// names a key, and a map that cannot answer that frame either leaks an
+    /// entry per ended session or has to be rebuilt by a scan. The pool name
+    /// rides along as the join column: it is what the *file* side of the
+    /// overlay carries, and the only token both sides of this join agree on.
+    rows: Arc<Mutex<HashMap<SessionKey, PoolRow>>>,
+    /// Whether the subscriber task has been spawned. Started on first sight of
+    /// a pooled row rather than at [`Backend::subscribe`], so a dashboard with
+    /// nothing pooled never dials anything.
+    started: AtomicBool,
+}
+
+/// One pooled session as the daemon describes it — the join column and the bit.
+struct PoolRow {
+    pool_session: String,
+    attached: Option<bool>,
+}
+
+impl PoolWatch {
+    /// `pool_session` → a client is attached, for the rows the daemon has told
+    /// us about. Absent means *unknown*, which is what a row with no answer must
+    /// keep reading as.
+    fn attached_by_pool_session(&self) -> HashMap<String, bool> {
+        self.rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|r| Some((r.pool_session.clone(), r.attached?)))
+            .collect()
+    }
+
+    /// Spawn the subscriber, once. `changed` is the local backend's own signal,
+    /// deliberately: the machine now has two things worth waking the dashboard
+    /// for — a state file moved, and a terminal attached or left — and the
+    /// backend answers [`Backend::subscribe`] with one flag either way (§5).
+    ///
+    /// A no-op outside a tokio runtime, which is what keeps this callable from
+    /// the synchronous read path it is called from: a test driving the backend
+    /// directly gets no watch and an empty overlay, exactly as if no daemon
+    /// were running.
+    fn ensure_started(&self, changed: &Arc<AtomicBool>) {
+        if self.started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(pool_watch_task(
+            state::server_sock_path(),
+            self.rows.clone(),
+            changed.clone(),
+        ));
+    }
+}
+
+/// Keep [`PoolWatch::rows`] current for as long as the dashboard runs,
+/// reconnecting on loss with the same backoff a remote host gets.
+///
+/// The connection is the ordinary protocol handshake — `Hello`, check the
+/// version floor, `Subscribe` — and then only the pushed stream matters: this
+/// client never sends a request, so there is nothing to multiplex and no
+/// `req_id` to route. Every other frame is ignored rather than refused, which is
+/// the same forward-tolerance the full client applies (§3).
+///
+/// **No daemon is a normal state, not a failure.** A machine that has never been
+/// remoted into has no socket to connect to, and one whose daemon stops has a
+/// pool that no longer exists; both leave the map empty, which reads as
+/// "unknown" and puts the UI back exactly where it was before this existed. So
+/// the loop announces itself once at `debug` and then retries quietly — it is
+/// reached only when the dashboard has already seen a pooled row, so a daemon
+/// really is expected to be there.
+async fn pool_watch_task(
+    sock: PathBuf,
+    rows: Arc<Mutex<HashMap<SessionKey, PoolRow>>>,
+    changed: Arc<AtomicBool>,
+) {
+    let mut backoff = RECONNECT_INITIAL;
+    loop {
+        match UnixStream::connect(&sock).await {
+            Ok(stream) => {
+                tracing::debug!("pool watch: subscribed to {}", sock.display());
+                backoff = RECONNECT_INITIAL;
+                pool_watch_serve(stream, &rows, &changed).await;
+            }
+            Err(e) => {
+                tracing::debug!("pool watch: {} unreachable ({e})", sock.display());
+            }
+        }
+        // Whatever ended it, the pool we were describing is no longer one we can
+        // see. Clearing is what takes the rows back to *unknown* rather than
+        // leaving them asserting a bit from before the daemon went away — and
+        // "unknown" is the one reading that is still true.
+        if !rows.lock().unwrap().is_empty() {
+            rows.lock().unwrap().clear();
+            changed.store(true, Ordering::Relaxed);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
+/// Handshake, subscribe, and fold the pushed stream into `rows` until the
+/// connection ends. Returns on EOF or any error — the caller retries.
+async fn pool_watch_serve(
+    stream: UnixStream,
+    rows: &Arc<Mutex<HashMap<SessionKey, PoolRow>>>,
+    changed: &Arc<AtomicBool>,
+) {
+    let (rd, mut wr) = stream.into_split();
+    let mut rd = BufReader::new(rd);
+    let hello = ClientFrame::Hello {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol: PROTOCOL_VERSION,
+    };
+    if write_frame(&mut wr, &hello).await.is_err() {
+        return;
+    }
+    match read_frame::<_, ServerFrame>(&mut rd).await {
+        Ok(Some(ServerFrame::Welcome { protocol, .. })) if protocol_compatible(protocol) => {}
+        other => {
+            tracing::debug!("pool watch: no usable Welcome ({other:?})");
+            return;
+        }
+    }
+    if write_frame(&mut wr, &ClientFrame::Subscribe).await.is_err() {
+        return;
+    }
+    while let Ok(Some(frame)) = read_frame::<_, ServerFrame>(&mut rd).await {
+        // A frame that changes nothing we track must not wake the dashboard: the
+        // daemon serves every state file, pooled or not, and a redraw per
+        // unpooled delta would spend the whole point of subscribing.
+        let touched = match frame {
+            ServerFrame::Snapshot { sessions } => {
+                let mut m = rows.lock().unwrap();
+                m.clear();
+                for s in sessions {
+                    if let Some(row) = PoolRow::of(&s) {
+                        m.insert(s.key(), row);
+                    }
+                }
+                true
+            }
+            ServerFrame::Delta { state } => match PoolRow::of(&state) {
+                Some(row) => {
+                    let mut m = rows.lock().unwrap();
+                    let before = m.get(&state.key()).and_then(|r| r.attached);
+                    let moved = before != row.attached;
+                    m.insert(state.key(), row);
+                    moved
+                }
+                None => false,
+            },
+            ServerFrame::Removed { key } => rows.lock().unwrap().remove(&key).is_some(),
+            _ => false,
+        };
+        if touched {
+            changed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl PoolRow {
+    /// The pooled half of a session the daemon described; `None` for a row that
+    /// isn't in the pool at all (the daemon serves every state file, and a
+    /// direct-local dashboard on the same machine already reads those itself).
+    fn of(s: &LauncherState) -> Option<Self> {
+        Some(Self {
+            pool_session: s.pool_session.clone()?,
+            attached: s.attached,
+        })
+    }
 }
 
 /// A backend's change signal, taken (and cleared) by the run loop. One handle
@@ -429,6 +665,7 @@ impl Backend {
             inner: LocalBackend::new(),
             changed: Arc::new(AtomicBool::new(false)),
             watcher: None,
+            pool: PoolWatch::default(),
         }))
     }
 
@@ -624,7 +861,7 @@ impl Backend {
     /// Live sessions on this host (those with a current state file).
     pub(crate) fn list_sessions(&self) -> Vec<LauncherState> {
         match self {
-            Backend::Local(h) => h.inner.list_sessions(),
+            Backend::Local(h) => h.list_sessions(),
             Backend::Remote(b) => b.list_sessions(),
         }
     }
@@ -700,10 +937,12 @@ impl Backend {
     /// just came back with. Corrects the row now rather than on the host's own
     /// account of the same fact, which follows a round trip behind it.
     ///
-    /// A no-op for a plain local backend, which serves no attached bit at all
-    /// (it has no pool). Under pooled-localhost the daemon *is* on the far side
-    /// of a socket and that backend is a `Remote` — the seam branches on the
-    /// backend, not on locality.
+    /// A no-op for a plain local backend, and that is a statement about
+    /// *distance*, not about capability: [`PoolWatch`] gives it a real attached
+    /// bit, but the daemon serving it is a unix socket away rather than an ssh
+    /// round trip, and its correcting `Delta` arrives on the same hook-driven
+    /// wake as the attach that provoked this. A presumption has nothing to
+    /// bridge there, so there is none to make.
     pub(crate) fn presume_attached(&self, key: &SessionKey) {
         if let Backend::Remote(b) = self {
             b.presume_attached(key);
@@ -764,10 +1003,16 @@ impl Backend {
         force: bool,
     ) -> anyhow::Result<AttachPlan> {
         match self {
-            Backend::Local(_) => anyhow::bail!(
-                "sessions on this host aren't pooled — they own their window, so there is \
-                 nothing to attach to"
-            ),
+            // A direct-local backend pools nothing *itself*, but the machine it
+            // runs on may still hold a pool — the daemon serving a laptop's
+            // dashboard puts every session it launches there, and those rows
+            // reach this dashboard through the same `sessions/` dir. So the
+            // question this arm answers is not "is this host pooled" (it isn't)
+            // but "can this machine reach its own pool", and the caller has
+            // already established that the row carries a `pool_session` at all.
+            Backend::Local(_) => Ok(AttachPlan {
+                argv: local_attach_argv(session_name, force)?,
+            }),
             Backend::Remote(b) => Ok(AttachPlan {
                 argv: attach_argv(
                     b.attach_target.as_deref(),
@@ -1728,6 +1973,112 @@ fn attach_argv(
     }
     argv.push(session_name.to_string());
     argv
+}
+
+/// Binaries able to attach a terminal to *this machine's* pty pool, best first.
+///
+/// Only ever a *fallback* — see [`local_attach_exe`], which normally names the
+/// binary exactly. They are interchangeable when it comes to that: `miao-client`
+/// exists for this, `miao-server attach` is the same primitive over the same
+/// socket, and both go through the same stale/busy pre-guards and exit with the
+/// same `ATTACH_EXIT_*` codes the dashboard reads back off the wrapper
+/// (`App::refused_attach`). `miao-client` is preferred only because it is the
+/// smaller thing to have installed.
+const LOCAL_ATTACH_EXES: [&str; 2] = ["miao-client", "miao-server"];
+
+/// The argv for a window that attaches to a pool session on **this** machine,
+/// for a dashboard whose own backend is the direct-local one.
+///
+/// Same shape as the pooled-localhost attach ([`attach_argv`] with no ssh
+/// target), because it is the same operation: the pool is a per-user,
+/// per-machine socket, so what reaches it is a question about the binaries on
+/// this box and not about which backend happens to be drawing the row.
+fn local_attach_argv(session_name: &str, force: bool) -> anyhow::Result<Vec<String>> {
+    let exe = local_attach_exe(session_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no pool client on this machine — install {} beside `miao` or on PATH",
+            LOCAL_ATTACH_EXES
+                .iter()
+                .map(|e| format!("`{e}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        )
+    })?;
+    Ok(attach_argv(None, &[], &exe, session_name, force))
+}
+
+/// The binary to run for an attach to `session_name` on this machine.
+///
+/// **Ask the pool name.** A pool session is `cm-<agent>-<daemon-pid>-<seq>`
+/// ([`state::pool_session_daemon_pid`]), and that pid is not decoration: the
+/// pool lives *inside* that process, so the daemon it names is the one holding
+/// the pty, minting the names, and writing the state files the attach guards
+/// read back. `/proc/<pid>/exe` is therefore not a good guess at the right
+/// binary — it *is* the right binary, by construction, and no search can be
+/// more authoritative than that.
+///
+/// The searched fallback below is a guess, and the bug that put this function
+/// in this shape is what a stale guess costs. A dev tree had a current `miao`
+/// and a nine-day-old `miao-server` beside it (cargo rebuilds what you ask for,
+/// not the workspace), so "the binaries install together" — true of an install,
+/// false of `target/` — picked a daemon that predated an agent backend. Its
+/// `LauncherState` no longer parsed, and `read_all_launcher_states` **skips a
+/// row it cannot parse**: every session vanished at once and the stale-name
+/// guard refused a perfectly live session, blaming the session. Reading the
+/// daemon's own `/proc` entry cannot go wrong that way, because there is
+/// nothing left to be wrong about.
+///
+/// The fallback still earns its place: a hand-set `--pool-session` encodes no
+/// pid, and `/proc` is Linux's. Both are cases where nothing better exists.
+fn local_attach_exe(session_name: &str) -> Option<String> {
+    daemon_exe_for_pool_session(session_name).or_else(search_local_attach_exe)
+}
+
+/// The executable behind the daemon whose pid `session_name` carries, via
+/// `/proc/<pid>/exe`.
+///
+/// Runs the answer through [`resolve_reporter_exe`] for the same `(deleted)`
+/// reason it exists: `/proc/<pid>/exe` resolves to the running *inode*, so a
+/// daemon whose binary has since been replaced (every upgrade, which lands on a
+/// fresh inode by design) reads back with a literal `" (deleted)"` appended.
+/// What is at that path *now* is what the window will execute, so the suffix is
+/// stripped and the path re-checked rather than handed on unusable.
+fn daemon_exe_for_pool_session(session_name: &str) -> Option<String> {
+    let pid = state::pool_session_daemon_pid(session_name)?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    resolve_reporter_exe(exe, |p| p.is_file())
+}
+
+/// Look for a [`LOCAL_ATTACH_EXES`] entry beside the dashboard, then on `PATH`.
+fn search_local_attach_exe() -> Option<String> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
+    let path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    resolve_local_attach_exe(sibling.iter().chain(path.iter()), |p| p.is_file())
+}
+
+/// The search, split out from the environment so it is testable.
+///
+/// The absolute path is returned rather than the bare name so the window's argv
+/// says which binary it ran — a `PATH` the terminal spawns with need not be the
+/// one the dashboard was started under, and when an attach does go wrong the
+/// first question is which binary answered.
+fn resolve_local_attach_exe<'a>(
+    dirs: impl IntoIterator<Item = &'a PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    for dir in dirs {
+        for name in LOCAL_ATTACH_EXES {
+            let candidate = dir.join(name);
+            if is_file(&candidate) {
+                return candidate.to_str().map(str::to_string);
+            }
+        }
+    }
+    None
 }
 
 /// The argv for a window that opens an interactive login shell on a remote host
@@ -4960,6 +5311,112 @@ mod tests {
         assert_eq!(ssh_tail(&ssh), ["user@box", cache, "attach", "s1"]);
     }
 
+    /// The searched *fallback* for the direct-local attach — reached only when
+    /// the pool name carries no daemon pid to ask (see `local_attach_exe`).
+    ///
+    /// Order is the assertion. The dashboard's own directory outranks `PATH`,
+    /// and within a directory `miao-client` outranks `miao-server` — they are
+    /// the same primitive over the same socket, so the tie is broken on which is
+    /// the smaller thing to have installed. Both preferences are guesses, which
+    /// is exactly why they are no longer the primary answer.
+    #[test]
+    fn local_attach_exe_prefers_the_dashboards_own_dir_then_path() {
+        let dirs = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let here = dirs(&["/opt/miao/bin", "/usr/bin"]);
+        let present = |set: &'static [&'static str]| {
+            move |p: &Path| set.contains(&p.to_str().unwrap_or_default())
+        };
+
+        // Both dirs stocked → the dashboard's own wins, `miao-client` first.
+        assert_eq!(
+            resolve_local_attach_exe(
+                &here,
+                present(&["/opt/miao/bin/miao-client", "/usr/bin/miao-client"]),
+            ),
+            Some("/opt/miao/bin/miao-client".to_string()),
+        );
+        // Only the daemon is installed beside us: same primitive, same socket.
+        assert_eq!(
+            resolve_local_attach_exe(
+                &here,
+                present(&["/opt/miao/bin/miao-server", "/usr/bin/miao-client"]),
+            ),
+            Some("/opt/miao/bin/miao-server".to_string()),
+        );
+        // Nothing beside us → fall through to PATH rather than give up.
+        assert_eq!(
+            resolve_local_attach_exe(&here, present(&["/usr/bin/miao-server"])),
+            Some("/usr/bin/miao-server".to_string()),
+        );
+        // Neither, anywhere: the caller turns this into an explained refusal.
+        assert_eq!(resolve_local_attach_exe(&here, present(&[])), None);
+    }
+
+    /// A local attach is the pooled-localhost attach with the exe resolved here:
+    /// no ssh hop, `--force` on the attach and never on the create path.
+    #[test]
+    fn local_attach_argv_is_the_socket_shape() {
+        let exe = "/opt/miao/bin/miao-client";
+        assert_eq!(
+            attach_argv(None, &[], exe, "cm-claude-9-1", false),
+            [exe, "attach", "cm-claude-9-1"]
+        );
+        assert_eq!(
+            attach_argv(None, &[], exe, "cm-claude-9-1", true),
+            [exe, "attach", "--force", "cm-claude-9-1"]
+        );
+    }
+
+    /// With no pool client anywhere the host explains itself rather than
+    /// spawning a window that opens onto a `command not found` — the whole
+    /// reason `attach_plan` returns a `Result` (§5).
+    #[test]
+    fn local_attach_names_what_is_missing() {
+        // Drive the pure resolver, since the real one reads this machine.
+        assert!(resolve_local_attach_exe(&[PathBuf::from("/nowhere")], |_| false).is_none());
+        let msg = local_attach_argv("cm-claude-9-1", false)
+            .err()
+            .map(|e| e.to_string());
+        // This machine may genuinely have one installed; only assert the text
+        // when it doesn't, so the test says the same thing on CI and a dev box.
+        if let Some(msg) = msg {
+            assert!(msg.contains("miao-client"), "{msg}");
+            assert!(msg.contains("miao-server"), "{msg}");
+        }
+    }
+
+    /// The attach runs the binary the *pool name names*, not one found by
+    /// searching. A pool session is `cm-<agent>-<daemon-pid>-<seq>` and the pool
+    /// lives inside that process, so `/proc/<pid>/exe` is the binary that owns
+    /// the pty by construction.
+    ///
+    /// The regression it closes: a dev tree with a current `miao` and a stale
+    /// `miao-server` beside it ran the stale one, which could no longer parse
+    /// the state files — and `read_all_launcher_states` skips what it cannot
+    /// parse, so the attach guard saw *no* sessions and refused a live one as a
+    /// dead name. Nothing in that failure pointed at the binary.
+    #[test]
+    fn the_attach_exe_comes_from_the_daemon_that_minted_the_name() {
+        // This test process stands in for a daemon: it is a live pid, and the
+        // name encodes it exactly as the server would have minted it.
+        let me = std::process::id();
+        let mine = daemon_exe_for_pool_session(&format!("cm-claude-{me}-1"));
+        if cfg!(target_os = "linux") {
+            let mine = mine.expect("/proc names this process's own executable");
+            assert_eq!(
+                mine,
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                "the daemon's own exe, not a search result"
+            );
+        }
+
+        // A name in no recognisable shape (a hand-set `--pool-session`) carries
+        // no pid to ask, so the search is all there is.
+        assert_eq!(daemon_exe_for_pool_session("hand-set"), None);
+        // Nor does a dead pid resolve — `/proc` simply has no entry.
+        assert_eq!(daemon_exe_for_pool_session("cm-claude-4294967294-1"), None);
+    }
+
     #[test]
     fn remote_shell_argv_cds_and_execs_login_shell() {
         let argv = remote_shell_argv("user@box", &[], "/home/u/proj");
@@ -6934,6 +7391,157 @@ mod tests {
             LaunchPlan::SpawnLocal { .. } => panic!("expected AttachRemote from a remote backend"),
         }
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// The attached bit a direct-local dashboard cannot read off a file: it is
+    /// maintained in the daemon's memory from libshpool's hooks and only ever
+    /// pushed, so the watch has to *subscribe* — a poll would both miss the
+    /// transitions and sample a lock that is only ever true in passing (§10.2).
+    ///
+    /// What is pinned here is the whole life of one bit: a snapshot brings it,
+    /// a delta moves it, a removal takes it away — and each of those wakes the
+    /// dashboard, because none of them touches anything under `sessions/` and
+    /// the notify watcher would therefore never fire for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pool_watch_subscribes_to_this_machines_attached_bit() {
+        let sock =
+            std::env::temp_dir().join(format!("cm-test-poolwatch-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let pooled = |pid: u32, attached: Option<bool>| LauncherState {
+            pool_session: Some(format!("cm-claude-1-{pid}")),
+            attached,
+            ..test_state(pid)
+        };
+        // The daemon serves every state file, pooled or not; an unpooled row has
+        // no bit to contribute and must not land in the map.
+        let unpooled = test_state(9);
+        let key = pooled(1, None).key();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = BufReader::new(rd);
+            let _hello: Option<ClientFrame> = read_frame(&mut rd).await.unwrap();
+            write_frame(
+                &mut wr,
+                &ServerFrame::Welcome {
+                    server_version: "test".into(),
+                    protocol: PROTOCOL_VERSION,
+                    host: "mock".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _sub: Option<ClientFrame> = read_frame(&mut rd).await.unwrap();
+            write_frame(
+                &mut wr,
+                &ServerFrame::Snapshot {
+                    sessions: vec![pooled(1, Some(true)), unpooled],
+                },
+            )
+            .await
+            .unwrap();
+            // Each push is spaced so the client observes the states in turn:
+            // back-to-back frames collapse into one reading and the middle of
+            // the sequence — the whole subject of the test — goes untested.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            // The detach hook's push: same session, bit flipped.
+            write_frame(
+                &mut wr,
+                &ServerFrame::Delta {
+                    state: Box::new(pooled(1, Some(false))),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            write_frame(&mut wr, &ServerFrame::Removed { key })
+                .await
+                .unwrap();
+            // Hold the connection open so the read loop ends on the test's terms.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let rows: Arc<Mutex<HashMap<SessionKey, PoolRow>>> = Arc::new(Mutex::new(HashMap::new()));
+        let changed = Arc::new(AtomicBool::new(false));
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        tokio::spawn({
+            let (rows, changed) = (rows.clone(), changed.clone());
+            async move { pool_watch_serve(stream, &rows, &changed).await }
+        });
+
+        // Wait for a reading rather than sleeping a fixed span: the assertion is
+        // about what arrives, not about how fast this machine is.
+        let settle = |want: Option<bool>| {
+            let rows = rows.clone();
+            async move {
+                for _ in 0..100 {
+                    let got = rows
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .find(|r| r.pool_session == "cm-claude-1-1")
+                        .and_then(|r| r.attached);
+                    if got == want {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                false
+            }
+        };
+
+        assert!(settle(Some(true)).await, "the snapshot's bit never landed");
+        assert_eq!(
+            rows.lock().unwrap().len(),
+            1,
+            "an unpooled row has no bit to contribute"
+        );
+        assert!(
+            changed.swap(false, Ordering::Relaxed),
+            "a snapshot must wake the dashboard — nothing under sessions/ moved"
+        );
+
+        assert!(settle(Some(false)).await, "the delta's flip never landed");
+        assert!(
+            changed.swap(false, Ordering::Relaxed),
+            "a detach must wake the dashboard for the same reason"
+        );
+
+        for _ in 0..100 {
+            if rows.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            rows.lock().unwrap().is_empty(),
+            "Removed must drop the row, not leave it asserting a stale bit"
+        );
+        assert!(changed.load(Ordering::Relaxed), "a removal wakes it too");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A pooled row with no daemon behind it reads *unknown*, not *free*. That
+    /// is the one thing the overlay must not get wrong: `Some(false)` invites
+    /// an attach the pool would refuse, and hides the steal that would work.
+    #[test]
+    fn an_unwatched_pool_leaves_the_bit_unknown() {
+        let watch = PoolWatch::default();
+        assert!(watch.attached_by_pool_session().is_empty());
+        // A daemon that has answered but knows nothing about this session is the
+        // same reading — the map is keyed by what it told us, so a miss is a
+        // miss either way.
+        watch.rows.lock().unwrap().insert(
+            test_state(1).key(),
+            PoolRow {
+                pool_session: "cm-claude-1-1".into(),
+                attached: None,
+            },
+        );
+        assert!(watch.attached_by_pool_session().is_empty());
     }
 
     /// A protocol-speaking stand-in for `miao-server`: one connection,

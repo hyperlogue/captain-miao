@@ -396,28 +396,29 @@ impl App {
             Command::DetachRemote => {
                 let s = self.selected_session()?;
                 // Detach only makes sense for a **pooled** session we're
-                // attached to: an unpooled local session *is* its window, so
-                // closing it would lose the session — that's `x`. Keyed on the
-                // capability, not on locality, so it works under
-                // pooled-localhost too. Closes the attach window and leaves the
-                // pooled session running; the row stays and Enter re-attaches.
-                let pooled = self
-                    .backend_for(&s.host)
-                    .is_some_and(|b| b.capabilities().pooled);
-                if !pooled {
+                // attached to: an unpooled session *is* its window, so closing
+                // it would lose the session — that's `x`. Keyed on the *row*
+                // rather than on its host's `pooled` capability, because those
+                // two answers come apart on this machine: a direct-local
+                // dashboard pools nothing itself, yet still lists the sessions
+                // its daemon holds for a remote client, and `D` on one of those
+                // is the ordinary detach. Closes the attach window and leaves
+                // the pooled session running; the row stays and Enter
+                // re-attaches.
+                let Some(token) = s.pool_session.clone() else {
                     self.set_status(
                         "Detach is for pooled sessions; use x to kill a local one".to_string(),
                         true,
                     );
                     return None;
-                }
-                match (self.window_id_for_session(&s), s.pool_session.clone()) {
-                    (Some(window_id), Some(token)) => Some(Action::DetachRemote {
+                };
+                match self.window_id_for_session(&s) {
+                    Some(window_id) => Some(Action::DetachRemote {
                         host: s.host,
                         token,
                         window_id,
                     }),
-                    _ => {
+                    None => {
                         self.set_status("Not attached to this session".to_string(), true);
                         None
                     }
