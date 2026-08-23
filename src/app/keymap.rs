@@ -267,6 +267,8 @@ pub(super) enum Command {
     AttachAll,
     /// Open the scrollback of footer status messages.
     MessageLog,
+    /// Open the preferences overlay.
+    Preferences,
 }
 
 impl Command {
@@ -311,6 +313,7 @@ impl Command {
             Command::SessionsLayout => "sessions_layout",
             Command::ManageHosts => "manage_hosts",
             Command::MessageLog => "messages",
+            Command::Preferences => "preferences",
         }
     }
 
@@ -366,6 +369,7 @@ impl Command {
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
             Command::MessageLog => "message log (status messages the footer showed)",
+            Command::Preferences => "open preferences",
         }
     }
 
@@ -410,6 +414,7 @@ impl Command {
             Command::SessionsLayout => "layout",
             Command::ManageHosts => "hosts",
             Command::MessageLog => "messages",
+            Command::Preferences => "prefs",
         }
     }
 }
@@ -449,14 +454,15 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::RestartSelected,    &["space e"]),
     (Command::RestartAll,         &["space E"]),
     (Command::EditDir,            &["space i"]),
-    (Command::ToggleKeepAwake,    &["space z"]),
-    (Command::DefaultAgent,       &["space a"]),
-    (Command::DefaultHost,        &["space H"]),
+    (Command::ToggleKeepAwake,    &[]),
+    (Command::DefaultAgent,       &[]),
+    (Command::DefaultHost,        &[]),
     (Command::StealAttach,        &["space s"]),
     (Command::AttachAll,          &["space A"]),
-    (Command::SessionsLayout,     &["space l"]),
+    (Command::SessionsLayout,     &[]),
     (Command::ManageHosts,        &["space h"]),
     (Command::MessageLog,         &["space m"]),
+    (Command::Preferences,        &[",", "space p"]),
 ];
 
 /// Resolved binding table: sequence → command, plus the set of prefix chords
@@ -770,7 +776,7 @@ mod tests {
         assert!(conts.contains(&("d".to_string(), Command::ToggleDetail)));
         assert!(conts.contains(&("i".to_string(), Command::EditDir)));
         // Every option is a real leader command; a non-prefix yields nothing.
-        assert!(conts.iter().any(|(_, c)| *c == Command::DefaultAgent));
+        assert!(conts.iter().any(|(_, c)| *c == Command::Preferences));
         assert!(km.continuations(chord("x")).is_empty());
     }
 

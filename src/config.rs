@@ -4,7 +4,10 @@
 //! loader — serde ignores the sections each side doesn't know about.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::path::Path;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 
 use ratatui::style::Color;
 use serde::{Deserialize, Deserializer};
@@ -14,20 +17,162 @@ use serde::{Deserialize, Deserializer};
 // / `config::debug_enabled()` resolve unchanged across the dashboard.
 pub use cm_core::config::{DebugConfig, LauncherConfig, config_path, debug_enabled};
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+static CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
 
-/// Lazily load the config from disk on first access, then reuse forever.
-/// Any module can reach the config via `config::get()` without the loader
-/// having to thread it through call sites.
-pub fn get() -> &'static Config {
-    CONFIG.get_or_init(Config::load)
+fn slot() -> &'static RwLock<Arc<Config>> {
+    CONFIG.get_or_init(|| RwLock::new(Arc::new(Config::load())))
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Read the in-memory config. Does not hit disk — call [`reload`] for that.
+pub fn get() -> Arc<Config> {
+    slot()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Re-read `config_path()` and merge `dashboard-overrides.json`.
+#[allow(dead_code)] // watchers call this once they land
+pub fn reload() -> Arc<Config> {
+    reload_from(&config_path())
+}
+
+/// Re-read `path` into the process slot. Tests pass a tempfile; production
+/// uses [`reload`].
+#[allow(dead_code)] // see [`reload`]
+pub fn reload_from(path: &Path) -> Arc<Config> {
+    let mut cfg = Config::from_path(path);
+    merge_dashboard_overrides(&mut cfg);
+    let cfg = Arc::new(cfg);
+    *slot().write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&cfg);
+    cfg
+}
+
+/// Overlay `dashboard-overrides.json` onto a TOML-loaded config. Unknown or
+/// missing files leave `cfg` unchanged.
+fn merge_dashboard_overrides(cfg: &mut Config) {
+    let path = cm_core::state::dashboard_overrides_path();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let prefs = v.get("prefs");
+    let layout = prefs
+        .and_then(|p| p.get("sessions_layout"))
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("sessions_layout").and_then(|x| x.as_str()));
+    if let Some(s) = layout
+        && let Some(l) = crate::terminal::SessionsLayout::from_label(s)
+    {
+        cfg.terminal.sessions_layout = Some(l);
+    }
+    if let Some(s) = prefs
+        .and_then(|p| p.get("on_window_close"))
+        .and_then(|x| x.as_str())
+    {
+        cfg.remote.on_window_close = match s {
+            "detach" => OnWindowClose::Detach,
+            _ => OnWindowClose::Close,
+        };
+    }
+    if let Some(b) = prefs
+        .and_then(|p| p.get("pooled"))
+        .and_then(|x| x.as_bool())
+    {
+        cfg.launcher.pooled = b;
+    }
+    if let Some(s) = prefs
+        .and_then(|p| p.get("kitty_rc_password"))
+        .and_then(|x| x.as_str())
+    {
+        cfg.kitty.rc_password = s.to_string();
+    }
+    if let Some(n) = prefs
+        .and_then(|p| p.get("context_warning_tokens"))
+        .and_then(|x| x.as_u64())
+    {
+        cfg.thresholds.context_warning_tokens = n;
+    }
+    if let Some(n) = prefs
+        .and_then(|p| p.get("context_critical_tokens"))
+        .and_then(|x| x.as_u64())
+    {
+        cfg.thresholds.context_critical_tokens = n;
+    }
+    if let Some(n) = prefs
+        .and_then(|p| p.get("preview_auto_refresh_secs"))
+        .and_then(|x| x.as_u64())
+    {
+        cfg.polling.preview_auto_refresh_secs = n;
+    }
+    if let Some(n) = prefs
+        .and_then(|p| p.get("preview_stale_secs"))
+        .and_then(|x| x.as_u64())
+    {
+        cfg.thresholds.preview_stale_secs = n;
+    }
+    let paint = |cfg: &mut Config, key: &str, set: fn(&mut Config, Color)| {
+        if let Some(s) = prefs.and_then(|p| p.get(key)).and_then(|x| x.as_str())
+            && let Some(c) = parse_color(s)
+        {
+            set(cfg, c);
+        }
+    };
+    paint(cfg, "highlight_bg", |c, v| c.colors.ui.highlight_bg = v);
+    paint(cfg, "selection_fg", |c, v| c.colors.ui.selection_fg = v);
+    paint(cfg, "attention_fg", |c, v| c.colors.ui.attention_fg = v);
+    paint(cfg, "error_fg", |c, v| c.colors.ui.error_fg = v);
+}
+
+/// Install an already-built Config (skips disk). Tests use [`ConfigSlotGuard`].
+#[allow(dead_code)] // tests + later pref writes
+pub fn replace(cfg: Config) -> Arc<Config> {
+    replace_arc(Arc::new(cfg))
+}
+
+/// Swap the process slot. Returns the previous `Arc` so a guard can restore it.
+#[allow(dead_code)] // [`ConfigSlotGuard`] and [`replace`]
+pub fn replace_arc(cfg: Arc<Config>) -> Arc<Config> {
+    let mut g = slot().write().unwrap_or_else(PoisonError::into_inner);
+    std::mem::replace(&mut *g, cfg)
+}
+
+#[cfg(test)]
+static CONFIG_SLOT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialises tests that mutate the process-global config slot and restores
+/// the previous `Arc` on drop.
+#[cfg(test)]
+pub(crate) struct ConfigSlotGuard {
+    prev: Arc<Config>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ConfigSlotGuard {
+    pub(crate) fn install(cfg: Config) -> Self {
+        let _lock = CONFIG_SLOT_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let prev = replace_arc(Arc::new(cfg));
+        Self { prev, _lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigSlotGuard {
+    fn drop(&mut self) {
+        let _ = replace_arc(Arc::clone(&self.prev));
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Terminal-backend selection. `backend` unset (the default) auto-detects;
-    /// set it to pin Kitty or zellij. See `terminal::get`.
+    /// Terminal-backend selection. `backend` is parsed for Home Manager
+    /// compatibility but ignored at runtime — auto-detect is the only mechanism.
     pub terminal: TerminalConfig,
     pub kitty: KittyConfig,
     pub colors: ColorsConfig,
@@ -80,8 +225,20 @@ const MIN_EVENT_POLL_MS: u64 = 10;
 
 impl Config {
     fn load() -> Self {
-        let path = config_path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let mut cfg = Self::from_path(&config_path());
+        merge_dashboard_overrides(&mut cfg);
+        cfg
+    }
+
+    /// Load TOML from disk without touching the process slot (and without
+    /// merging `dashboard-overrides.json` — callers that want the overlay
+    /// apply it themselves, or go through [`reload`]).
+    pub(crate) fn from_disk() -> Self {
+        Self::from_path(&config_path())
+    }
+
+    fn from_path(path: &Path) -> Self {
+        let Ok(content) = std::fs::read_to_string(path) else {
             return Self::default();
         };
         // Parse errors fall back to defaults rather than killing the dashboard;
@@ -122,18 +279,14 @@ impl Config {
 
 // -- terminal --
 
-/// Terminal-backend selection. `backend` unset (the default) auto-detects:
-/// zellij when `ZELLIJ_SESSION_NAME` is present, else Kitty. Pin it when the
-/// env heuristic guesses wrong. Kitty-specific knobs (the remote-control
-/// password) stay under `[kitty]`.
-#[derive(Debug, Default, Deserialize)]
+/// Terminal-backend selection. `backend` is ignored at runtime (auto-detect
+/// only). Kitty-specific knobs stay under `[kitty]`.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     pub backend: Option<ConfiguredBackend>,
-    /// Initial session layout: `"stacked"` (all sessions in the shared
-    /// `miao:sessions` tab) or `"per-tab"` (one tab per session). Unset ⇒ stacked.
-    /// Toggled at runtime with `Space l` and persisted in
-    /// `dashboard-overrides.json`, which then wins over this value.
+    /// Initial session layout: `"stacked"` or `"per-tab"`. Unset ⇒ stacked.
+    /// Dashboard overrides win over this value.
     pub sessions_layout: Option<crate::terminal::SessionsLayout>,
 }
 
@@ -149,15 +302,15 @@ pub enum ConfiguredBackend {
     Tmux,
     /// macOS only — the Linux Ghostty exposes no control channel at all.
     Ghostty,
-    /// macOS only, and the one worth pinning by hand: Kitty wins the tie when a
-    /// stale `KITTY_WINDOW_ID` is inherited into an iTerm2 session
-    /// (`cm_core::terminal::resolve_terminal_env`).
+    /// macOS only. Detection already prefers iTerm2 over Kitty when
+    /// `TERM_PROGRAM` says so, so a stale inherited `KITTY_WINDOW_ID` does not
+    /// win (`cm_core::terminal::resolve_terminal_env`).
     Iterm,
 }
 
 // -- remote --
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     /// What closing a pooled session's window means. See [`OnWindowClose`].
@@ -188,7 +341,7 @@ pub enum OnWindowClose {
 
 // -- kitty --
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct KittyConfig {
     pub rc_password: String,
@@ -204,14 +357,14 @@ impl Default for KittyConfig {
 
 // -- colors --
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ColorsConfig {
     pub ui: UiColors,
     pub picker: PickerColors,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct UiColors {
     #[serde(deserialize_with = "de_color")]
@@ -257,7 +410,7 @@ impl Default for UiColors {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PickerColors {
     #[serde(deserialize_with = "de_color")]
@@ -277,14 +430,14 @@ impl Default for PickerColors {
 
 // -- ui --
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub panels: PanelsConfig,
     pub table: TableConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PanelsConfig {
     pub preview_auto_min_height: u16,
@@ -307,7 +460,7 @@ impl Default for PanelsConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TableConfig {
     pub name_truncate: usize,
@@ -321,7 +474,7 @@ impl Default for TableConfig {
 
 // -- thresholds --
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ThresholdsConfig {
     pub context_warning_tokens: u64,
@@ -344,7 +497,7 @@ impl Default for ThresholdsConfig {
 
 // -- polling --
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PollingConfig {
     pub fs_reload_debounce_ms: u64,
@@ -409,6 +562,30 @@ pub(crate) fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
+pub(crate) fn format_color(c: Color) -> String {
+    match c {
+        Color::Reset => "reset".into(),
+        Color::Black => "black".into(),
+        Color::Red => "red".into(),
+        Color::Green => "green".into(),
+        Color::Yellow => "yellow".into(),
+        Color::Blue => "blue".into(),
+        Color::Magenta => "magenta".into(),
+        Color::Cyan => "cyan".into(),
+        Color::Gray => "gray".into(),
+        Color::DarkGray => "dark_gray".into(),
+        Color::LightRed => "light_red".into(),
+        Color::LightGreen => "light_green".into(),
+        Color::LightYellow => "light_yellow".into(),
+        Color::LightBlue => "light_blue".into(),
+        Color::LightMagenta => "light_magenta".into(),
+        Color::LightCyan => "light_cyan".into(),
+        Color::White => "white".into(),
+        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        Color::Indexed(i) => format!("{i}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,10 +612,10 @@ mod tests {
 
     #[test]
     fn terminal_backend_parses_and_defaults() {
-        // Unset → None (get() auto-detects from the environment).
+        // Unset → None. A set value is stored but ignored at runtime.
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.terminal.backend, None);
-        // Explicit lowercase values pin a backend.
+        // Explicit lowercase values still parse (Home Manager may write them).
         let cfg: Config = toml::from_str("[terminal]\nbackend = \"zellij\"").unwrap();
         assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Zellij));
         let cfg: Config = toml::from_str("[terminal]\nbackend = \"kitty\"").unwrap();
@@ -471,5 +648,33 @@ mod tests {
         assert_eq!(parse_color("#12345"), None);
         assert_eq!(parse_color("#aé234"), None);
         assert_eq!(parse_color("notacolor"), None);
+    }
+
+    #[test]
+    fn format_color_round_trips_named_and_rgb() {
+        use ratatui::style::Color;
+        assert_eq!(format_color(Color::DarkGray), "dark_gray");
+        assert_eq!(format_color(Color::Blue), "blue");
+        assert_eq!(format_color(Color::Rgb(0xff, 0x88, 0x00)), "#ff8800");
+        assert_eq!(
+            parse_color(&format_color(Color::DarkGray)),
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            parse_color(&format_color(Color::Rgb(0x0a, 0x0b, 0x0c))),
+            Some(Color::Rgb(0x0a, 0x0b, 0x0c))
+        );
+    }
+
+    #[test]
+    fn get_reads_the_slot_without_reload() {
+        let mut cfg = Config::default();
+        cfg.ui.table.name_truncate = 77;
+        let _guard = ConfigSlotGuard::install(cfg);
+        assert_eq!(get().ui.table.name_truncate, 77);
+        let mut other = Config::default();
+        other.ui.table.name_truncate = 12;
+        let _ = replace(other);
+        assert_eq!(get().ui.table.name_truncate, 12);
     }
 }

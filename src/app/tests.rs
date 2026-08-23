@@ -542,15 +542,12 @@ fn space_a_picker_sets_default_new_session_backend() {
         _ => panic!("expected NewSessionSplit"),
     }
 
-    // `Space a` opens the backend picker (cursor on the current default).
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('a'));
-    assert!(d.app.pending_prefix.is_none());
-    assert_eq!(d.app.input_mode, InputMode::Picker);
-
-    // Move onto Codex and select it: the default flips and the next `o` follows.
-    d.press(KeyCode::Down);
-    d.press(KeyCode::Enter);
+    // Agents live in the prefs overlay: disable Claude so Codex becomes first
+    // enabled (and thus the default).
+    d.press(KeyCode::Char(','));
+    assert_eq!(d.app.input_mode, InputMode::Prefs);
+    d.press(KeyCode::Char('x'));
+    d.press(KeyCode::Esc);
     assert_eq!(d.app.input_mode, InputMode::Normal);
     assert_eq!(d.app.new_session_agent, AgentControl::Codex);
     assert!(d.render().contains("Default agent: Codex"));
@@ -558,6 +555,93 @@ fn space_a_picker_sets_default_new_session_backend() {
         Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentControl::Codex),
         _ => panic!("expected NewSessionSplit"),
     }
+}
+
+#[test]
+fn prefs_hides_terminal_unless_this_dashboard_is_kitty() {
+    let mut d = TestDashboard::new(120, 24);
+    d.press(KeyCode::Char(','));
+    let out = d.render();
+    assert!(
+        !out.contains("Terminal"),
+        "identity None must hide the kitty password category:\n{out}"
+    );
+    d.press(KeyCode::Esc);
+
+    d.app.terminal_identity = Some("kitty:me".into());
+    d.press(KeyCode::Char(','));
+    let out = d.render();
+    assert!(
+        out.contains("Terminal"),
+        "a kitty identity must show the password category:\n{out}"
+    );
+}
+
+#[test]
+fn prefs_empty_kitty_password_submit_is_a_noop() {
+    let _guard = crate::config::ConfigSlotGuard::install((*crate::config::get()).clone());
+    let mut d = TestDashboard::new(120, 24);
+    d.app.terminal_identity = Some("kitty:me".into());
+    d.press(KeyCode::Char(','));
+    for _ in 0..4 {
+        d.press(KeyCode::Char('l'));
+    }
+    d.press(KeyCode::Enter);
+    d.press_ctrl(KeyCode::Char('u'));
+    for c in "secret".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(
+        d.app.extra_prefs.kitty_rc_password.as_deref(),
+        Some("secret")
+    );
+
+    d.press(KeyCode::Enter);
+    d.press_ctrl(KeyCode::Char('u'));
+    d.press(KeyCode::Enter);
+    assert_eq!(
+        d.app.extra_prefs.kitty_rc_password.as_deref(),
+        Some("secret"),
+        "empty Enter keeps the current override"
+    );
+}
+
+#[test]
+fn prefs_raising_warn_tokens_bumps_critical() {
+    let _guard = crate::config::ConfigSlotGuard::install((*crate::config::get()).clone());
+    let mut d = TestDashboard::new(120, 24);
+    let crit = crate::config::get().thresholds.context_critical_tokens;
+    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char('l'));
+    d.press(KeyCode::Char('l'));
+    d.press(KeyCode::Enter);
+    d.press_ctrl(KeyCode::Char('u'));
+    for c in crit.to_string().chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    let warn = crit.clamp(1_000, 2_000_000);
+    assert_eq!(d.app.extra_prefs.context_warning_tokens, Some(warn));
+    assert_eq!(
+        d.app.extra_prefs.context_critical_tokens,
+        Some((warn + 5_000).min(2_000_000))
+    );
+}
+
+#[test]
+fn prefs_r_on_layout_clears_the_override() {
+    let _guard = crate::config::ConfigSlotGuard::install((*crate::config::get()).clone());
+    let mut d = TestDashboard::new(120, 24);
+    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char('l'));
+    d.press(KeyCode::Enter);
+    assert!(d.app.extra_prefs.sessions_layout.is_some());
+    d.press(KeyCode::Char('r'));
+    assert!(
+        d.app.extra_prefs.sessions_layout.is_none(),
+        "r must delete the override so TOML wins, not write stacked"
+    );
 }
 
 #[test]
@@ -6270,7 +6354,7 @@ fn remapped_leader_completes_sequence() {
     use crate::config::KeyBinding;
     let mut cfg = std::collections::HashMap::new();
     // Move "restart selected" onto a custom `, r` prefix sequence.
-    cfg.insert("restart".to_string(), KeyBinding::One(", r".to_string()));
+    cfg.insert("restart".to_string(), KeyBinding::One("; r".to_string()));
     let (keymap, warnings) = super::keymap::Keymap::from_config(&cfg);
     assert!(warnings.is_empty(), "{warnings:?}");
 
@@ -6278,9 +6362,9 @@ fn remapped_leader_completes_sequence() {
     d.app.keymap = keymap;
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
-    // `,` is now a prefix; `r` completes it. (No assertion on the restart side
+    // `;` is now a prefix; `r` completes it. (No assertion on the restart side
     // effect — just that the sequence is recognized and consumed cleanly.)
-    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char(';'));
     assert!(d.app.pending_prefix.is_some());
     d.press(KeyCode::Char('r'));
     assert!(d.app.pending_prefix.is_none());
@@ -6296,16 +6380,12 @@ fn space_z_toggles_prevent_sleep() {
     assert!(d.app.prevent_sleep_enabled);
     assert!(!d.app.sleep_inhibitor.is_active());
 
-    // Toggle off.
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('z'));
-    assert!(d.app.pending_prefix.is_none());
+    // Toggle off. Keep-awake is unbound in DEFAULTS; the command still exists.
+    d.app.toggle_prevent_sleep();
     assert!(!d.app.prevent_sleep_enabled);
     assert!(!d.app.sleep_inhibitor.is_active());
 
-    // Toggle back on.
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('z'));
+    d.app.toggle_prevent_sleep();
     assert!(d.app.prevent_sleep_enabled);
 }
 
@@ -6427,8 +6507,7 @@ fn keep_awake_indicator_renders_in_header() {
     assert!(out.contains('\u{2615}'), "coffee icon when active: {out}");
 
     // Toggle the feature off → inhibitor released → icon disappears again.
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('z'));
+    d.app.toggle_prevent_sleep();
     let out = d.render();
     assert!(!out.contains('\u{2615}'), "no icon when disabled: {out}");
 
@@ -7684,8 +7763,9 @@ fn spawn_target_respects_capabilities_and_layout() {
         SpawnTarget::NewTab
     ));
 
-    // …which is exactly why `Space l` is not offered there: both layouts resolve
-    // to the same target, so the toggle would only flip a persisted label. The
+    // …which is exactly why the layout toggle is not offered there: both
+    // layouts resolve to the same target, so the toggle would only flip a
+    // persisted label. The
     // key, its `?`-help entry and the header indicator all hang off this.
     assert!(!bare.layout_is_a_choice());
     assert!(kitty.layout_is_a_choice());
@@ -7983,7 +8063,7 @@ fn the_backend_cycle_survives_an_agent_it_cannot_see() {
     use super::keys::cycle_agent;
     use crate::agent::AgentControl::{self, Claude, Codex, Reasonix};
 
-    // Selected deliberately (`Space a`, `--agent`, config) but not on `$PATH`.
+    // Selected deliberately (Preferences, `--agent`, config) but not on `$PATH`.
     // The first press must reach the first stop, not skip past it.
     assert_eq!(cycle_agent(Codex, &[Claude, Reasonix]), Claude);
 

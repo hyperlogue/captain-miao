@@ -40,7 +40,8 @@ pub(super) fn init() {
         if state::create_dir_all_private(&dir).is_err() {
             return None;
         }
-        let path = dir.join(&config::get().debug.keybind_log_file);
+        let cfg = config::get();
+        let path = dir.join(&cfg.debug.keybind_log_file);
         rotate_if_oversized(&path);
         std::fs::OpenOptions::new()
             .create(true)
@@ -123,6 +124,7 @@ fn mode_repr(mode: InputMode) -> &'static str {
         InputMode::DirEdit => "DirEdit",
         InputMode::HostEdit => "HostEdit",
         InputMode::Messages => "Messages",
+        InputMode::Prefs => "Prefs",
     }
 }
 

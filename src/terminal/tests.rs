@@ -77,32 +77,15 @@ fn tail_lines_returns_last_n() {
 }
 
 #[test]
-fn detect_backend_override_beats_env() {
-    // An explicit `[terminal] backend` pins the backend regardless of env —
-    // including forcing Kitty while inside a nested multiplexer (and vice versa).
-    for zellij in [true, false] {
-        for tmux in [true, false] {
-            for ghostty in [true, false] {
-                for iterm in [true, false] {
-                    for pinned in [
-                        ConfiguredBackend::Kitty,
-                        ConfiguredBackend::Tmux,
-                        ConfiguredBackend::Zellij,
-                        ConfiguredBackend::Ghostty,
-                        ConfiguredBackend::Iterm,
-                    ] {
-                        let live = LiveBackends {
-                            zellij,
-                            tmux,
-                            ghostty,
-                            iterm,
-                        };
-                        assert_eq!(detect_backend(Some(pinned), live), pinned);
-                    }
-                }
-            }
-        }
-    }
+fn detect_backend_ignores_config_pin() {
+    // `[terminal] backend` is not an input: auto-detect from the live env only.
+    let live = LiveBackends {
+        zellij: true,
+        tmux: false,
+        ghostty: false,
+        iterm: false,
+    };
+    assert_eq!(detect_backend(live), ConfiguredBackend::Zellij);
 }
 
 #[test]
@@ -119,33 +102,33 @@ fn detect_backend_prefers_a_multiplexer_then_a_macos_emulator_then_kitty() {
         iterm,
     };
     assert_eq!(
-        detect_backend(None, live(true, true, true, true)),
+        detect_backend(live(true, true, true, true)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, live(true, false, true, false)),
+        detect_backend(live(true, false, true, false)),
         ConfiguredBackend::Zellij
     );
     assert_eq!(
-        detect_backend(None, live(false, true, true, false)),
+        detect_backend(live(false, true, true, false)),
         ConfiguredBackend::Tmux
     );
     assert_eq!(
-        detect_backend(None, live(false, false, true, false)),
+        detect_backend(live(false, false, true, false)),
         ConfiguredBackend::Ghostty
     );
     assert_eq!(
-        detect_backend(None, live(false, false, false, true)),
+        detect_backend(live(false, false, false, true)),
         ConfiguredBackend::Iterm
     );
     // A multiplexer inside iTerm2 is the case that matters: `TERM_PROGRAM`
     // survives into every pane, so the pane must still win.
     assert_eq!(
-        detect_backend(None, live(false, true, false, true)),
+        detect_backend(live(false, true, false, true)),
         ConfiguredBackend::Tmux
     );
     assert_eq!(
-        detect_backend(None, LiveBackends::default()),
+        detect_backend(LiveBackends::default()),
         ConfiguredBackend::Kitty
     );
 }
@@ -161,7 +144,7 @@ fn iterm_capabilities_differ_from_ghostty_only_in_capture() {
     assert!(!caps.move_to_tab);
     assert!(
         !caps.layout_is_a_choice(),
-        "with neither stacked arrangement, `Space l` would toggle a label that changes nothing"
+        "with neither stacked arrangement, a layout toggle would change a label that changes nothing"
     );
     assert_eq!(
         caps,
@@ -174,14 +157,14 @@ fn iterm_capabilities_differ_from_ghostty_only_in_capture() {
 
 /// Ghostty is the one backend with no shared-tab arrangement *and* no capture,
 /// so both of the derived policies that key off `Capabilities` have to land the
-/// same way they do for the backends that share each trait: `Space l` is not a
+/// same way they do for the backends that share each trait: layout is not a
 /// choice (tmux's shape), and the preview declines up front.
 #[test]
 fn ghostty_capabilities_resolve_the_derived_policies() {
     let caps = ghostty::CAPABILITIES;
     assert!(
         !caps.layout_is_a_choice(),
-        "with neither stacked arrangement, `Space l` would toggle a label that changes nothing"
+        "with neither stacked arrangement, a layout toggle would change a label that changes nothing"
     );
     assert!(!caps.capture);
     assert!(!caps.move_to_tab);

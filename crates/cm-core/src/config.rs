@@ -4,17 +4,37 @@
 //! lives in the `captain-miao` crate and layers on top, parsing the *same*
 //! `config.toml` (serde ignores each side's unknown keys).
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use serde::Deserialize;
 
-static CONFIG: OnceLock<CoreConfig> = OnceLock::new();
+static CONFIG: OnceLock<RwLock<Arc<CoreConfig>>> = OnceLock::new();
 
-/// Lazily load the core config from disk on first access, then reuse forever.
-/// Any core module reaches it via `config::get()` without threading it through.
-pub fn get() -> &'static CoreConfig {
-    CONFIG.get_or_init(CoreConfig::load)
+fn slot() -> &'static RwLock<Arc<CoreConfig>> {
+    CONFIG.get_or_init(|| RwLock::new(Arc::new(CoreConfig::load())))
+}
+
+/// Read the in-memory core config. Does not hit disk — call [`reload`] for that.
+pub fn get() -> Arc<CoreConfig> {
+    slot()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Re-read `config_path()` into the process slot.
+#[allow(dead_code)] // dashboard watchers call this once prefs land
+pub fn reload() -> Arc<CoreConfig> {
+    reload_from(&config_path())
+}
+
+/// Re-read `path` into the process slot.
+#[allow(dead_code)] // see [`reload`]
+pub fn reload_from(path: &Path) -> Arc<CoreConfig> {
+    let cfg = Arc::new(CoreConfig::load_from(path));
+    *slot().write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&cfg);
+    cfg
 }
 
 /// Path to `config.toml`. Public so the dashboard's fuller loader reuses it
@@ -37,7 +57,7 @@ pub fn config_path() -> PathBuf {
 
 /// The launcher/daemon's view of `config.toml`: only the sections they read.
 /// The dashboard's `[colors]`/`[ui]`/… are unknown keys here and serde skips them.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct CoreConfig {
     pub launcher: LauncherConfig,
@@ -46,8 +66,11 @@ pub struct CoreConfig {
 
 impl CoreConfig {
     fn load() -> Self {
-        let path = config_path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        Self::load_from(&config_path())
+    }
+
+    fn load_from(path: &Path) -> Self {
+        let Ok(content) = std::fs::read_to_string(path) else {
             return Self::default();
         };
         // Parse errors fall back to defaults rather than killing the process;
@@ -86,7 +109,7 @@ const LEGACY_NEW_TAB_TITLE: &str = "Claude (new)";
 /// The pre-template shipped default `resume_tab_title` — a Claude-specific literal.
 const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LauncherConfig {
     pub approval_grace_secs: u64,
@@ -172,7 +195,7 @@ impl LauncherConfig {
 
 // -- debug --
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DebugConfig {
     /// Master switch for verbose debug logging. When on, the launcher,

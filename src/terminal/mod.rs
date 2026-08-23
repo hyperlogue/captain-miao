@@ -16,7 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, ConfiguredBackend};
+use crate::config::ConfiguredBackend;
 
 mod applescript;
 pub mod ghostty;
@@ -72,7 +72,7 @@ pub enum SpawnTarget {
     SharedStackTab,
 }
 
-/// Which arrangement new sessions spawn into, toggled at runtime (`Space l`) and
+/// Which arrangement new sessions spawn into, toggled from Preferences and
 /// persisted. A **spawn-time policy only** — switching does not relocate running
 /// sessions (zellij can't reparent a live pane across tabs, so the two backends
 /// stay symmetric), and the user migrates existing sessions by restarting them
@@ -110,7 +110,7 @@ impl SessionsLayout {
         }
     }
 
-    /// Flip to the other mode (the `Space l` toggle).
+    /// Flip to the other mode.
     pub fn toggled(self) -> Self {
         match self {
             SessionsLayout::Stacked => SessionsLayout::PerTab,
@@ -226,8 +226,7 @@ pub struct Capabilities {
     /// ignores the animation control, leaving the cat stuck mid-stride at the
     /// wrong size. Resolving it from the backend instead reuses the tie-break
     /// [`detect_backend`] already makes (`TERM_PROGRAM` beats a stale kitty
-    /// variable) and the one knob that corrects a wrong guess, `[terminal]
-    /// backend`.
+    /// variable). Auto-detect is the only mechanism.
     pub graphics: bool,
 }
 
@@ -250,10 +249,8 @@ impl Capabilities {
     /// question "does this backend have any shared-tab arrangement to offer?".
     ///
     /// A backend with neither ([`tmux`]) resolves *both* layouts to
-    /// [`SpawnTarget::NewTab`], so `Space l` would toggle a persisted label that
-    /// changes nothing. The dashboard reports that instead and hides the key's
-    /// `?`-help entry and the header indicator — the established pattern for the
-    /// unsupported `t` on zellij.
+    /// [`SpawnTarget::NewTab`], so a layout toggle would change a label and
+    /// nothing else. The dashboard hides the indicator in that case.
     pub fn layout_is_a_choice(self) -> bool {
         self.window_stacking || self.floating_sessions
     }
@@ -269,11 +266,9 @@ pub trait Terminal: Send + Sync {
 
     /// The instance identity of the terminal this backend *drives* (same
     /// `zellij:<session>` / `kitty:<socket>` forms launchers stamp via
-    /// cm-core). Deliberately not the ambient-env identity: under the
-    /// `[terminal] backend = "kitty"` override inside a nested zellij, the
-    /// process *sits* in a zellij pane but *drives* the outer Kitty — and the
-    /// windows it spawns (what identity scoping protects) live in the driven
-    /// terminal.
+    /// cm-core). Deliberately not the ambient-env identity: when zellij runs
+    /// nested in Kitty the process inherits `KITTY_WINDOW_ID`, but this backend
+    /// drives the inner session, and the windows it spawns live there.
     fn identity(&self) -> Option<String>;
 
     /// Prove this backend can actually *drive* its terminal instance — the
@@ -459,22 +454,19 @@ pub struct LiveBackends {
     pub iterm: bool,
 }
 
-/// Which backend `get()` should build: a config override wins, then a live
-/// zellij session, then a live tmux server, then a Ghostty surface, then Kitty
-/// as the status-quo fallback. Pure (env reads stay at the `get()` edge) so the
-/// precedence is unit-tested without touching the process-global env or the
-/// `OnceLock`.
+/// Which backend `get()` should build: a live zellij session, then a live tmux
+/// server, then a Ghostty surface, then Kitty as the status-quo fallback. Pure
+/// (env reads stay at the `get()` edge) so the precedence is unit-tested without
+/// touching the process-global env or the `OnceLock`.
 ///
 /// **Both multiplexers must beat the ambient Kitty env**: when either runs nested
 /// inside Kitty, every pane inherits the outer `KITTY_WINDOW_ID`, so a Kitty
-/// backend would drive the wrong (outer) window. Only an explicit override
-/// overrides that.
+/// backend would drive the wrong (outer) window.
 ///
 /// **Zellij stays ahead of tmux.** When both are live the two are nested and the
 /// env alone can't say which is inner; any fixed order is a guess for one of the
 /// two nestings, and keeping zellij first means adding tmux changes nothing for
-/// existing zellij users. The wrong guess is corrected the same way the
-/// nested-zellij-in-Kitty case already is: pin `[terminal] backend`.
+/// existing zellij users.
 ///
 /// **Both macOS backends sit below both multiplexers for the same reason Kitty
 /// does** — `TERM_PROGRAM` survives into every pane — and below Kitty, which
@@ -484,21 +476,23 @@ pub struct LiveBackends {
 /// argued where the id it costs is decided
 /// (`cm_core::terminal::resolve_terminal_env`). The order *between* Ghostty and
 /// iTerm2 carries no meaning: one `TERM_PROGRAM` cannot be both.
-fn detect_backend(over: Option<ConfiguredBackend>, live: LiveBackends) -> ConfiguredBackend {
-    match over {
-        Some(b) => b,
-        None if live.zellij => ConfiguredBackend::Zellij,
-        None if live.tmux => ConfiguredBackend::Tmux,
-        None if live.iterm => ConfiguredBackend::Iterm,
-        None if live.ghostty => ConfiguredBackend::Ghostty,
-        None => ConfiguredBackend::Kitty,
+fn detect_backend(live: LiveBackends) -> ConfiguredBackend {
+    if live.zellij {
+        ConfiguredBackend::Zellij
+    } else if live.tmux {
+        ConfiguredBackend::Tmux
+    } else if live.iterm {
+        ConfiguredBackend::Iterm
+    } else if live.ghostty {
+        ConfiguredBackend::Ghostty
+    } else {
+        ConfiguredBackend::Kitty
     }
 }
 
-/// Whether captain-miao is running inside a terminal it can actually drive,
-/// honoring the `[terminal] backend` override — the one detection owner for the
-/// startup gate. It mirrors what [`get`] resolves to (including `get`'s
-/// chosen-zellij-but-no-session fallback to Kitty), reusing
+/// Whether captain-miao is running inside a terminal it can actually drive —
+/// the one detection owner for the startup gate. It mirrors what [`get`]
+/// resolves to, reusing
 /// [`ZellijTerminal::from_env`](zellij::ZellijTerminal::from_env)'s trim/empty
 /// filter so the gate can't disagree with the runtime backend the way a raw
 /// `ZELLIJ_SESSION_NAME`/`KITTY_PID` presence check did. Kitty is "present" when
@@ -510,20 +504,12 @@ pub fn supported_terminal_present() -> bool {
         ghostty: ghostty::GhosttyTerminal::from_env().is_some(),
         iterm: iterm::ItermTerminal::from_env().is_some(),
     };
-    match detect_backend(config::get().terminal.backend, live) {
-        // `get()` builds a non-Kitty backend only when one is actually live; when
-        // it isn't (config pinned zellij/tmux/ghostty/iterm outside one, or
-        // pinned a macOS backend off macOS) `get()` falls back to Kitty, so the
-        // gate then requires Kitty like the Kitty arm.
-        ConfiguredBackend::Zellij if live.zellij => true,
-        ConfiguredBackend::Tmux if live.tmux => true,
-        ConfiguredBackend::Ghostty if live.ghostty => true,
-        ConfiguredBackend::Iterm if live.iterm => true,
+    match detect_backend(live) {
         ConfiguredBackend::Zellij
         | ConfiguredBackend::Tmux
         | ConfiguredBackend::Ghostty
-        | ConfiguredBackend::Iterm
-        | ConfiguredBackend::Kitty => std::env::var_os("KITTY_PID").is_some(),
+        | ConfiguredBackend::Iterm => true,
+        ConfiguredBackend::Kitty => std::env::var_os("KITTY_PID").is_some(),
     }
 }
 
@@ -544,9 +530,8 @@ pub async fn verify_control() -> Result<()> {
 }
 
 /// The process-wide terminal backend, constructed once on first use. Detection
-/// order is [`detect_backend`]; the `get()` edge supplies the env signal and
-/// falls back to Kitty if zellij is chosen but no zellij session is actually
-/// present (`get()` must always return a backend).
+/// order is [`detect_backend`]; the `get()` edge supplies the env signal
+/// (`get()` must always return a backend, so Kitty is the no-mux fallback).
 pub fn get() -> &'static dyn Terminal {
     &**BACKEND.get_or_init(|| {
         // Build each multiplexer backend up front so `is_some()` is the single
@@ -562,57 +547,15 @@ pub fn get() -> &'static dyn Terminal {
             ghostty: ghostty.is_some(),
             iterm: iterm.is_some(),
         };
-        match detect_backend(config::get().terminal.backend, live) {
-            ConfiguredBackend::Zellij => match zellij {
-                Some(z) => Box::new(z) as Box<dyn Terminal>,
-                // Only reachable when the config forced zellij with no session
-                // live; keep the process running by falling back to Kitty.
-                None => {
-                    tracing::warn!(
-                        "[terminal] backend = \"zellij\" but ZELLIJ_SESSION_NAME is unset; \
-                         falling back to Kitty"
-                    );
-                    Box::new(kitty::KittyTerminal)
-                }
-            },
-            ConfiguredBackend::Tmux => match tmux {
-                Some(t) => Box::new(t) as Box<dyn Terminal>,
-                // Same fallback as zellij's: the config pinned tmux with no
-                // server env to drive.
-                None => {
-                    tracing::warn!(
-                        "[terminal] backend = \"tmux\" but TMUX is unset or unparseable; \
-                         falling back to Kitty"
-                    );
-                    Box::new(kitty::KittyTerminal)
-                }
-            },
-            ConfiguredBackend::Ghostty => match ghostty {
-                Some(g) => Box::new(g) as Box<dyn Terminal>,
-                // Same fallback as the two above, plus one case they don't have:
-                // the config can pin ghostty on Linux, where `from_env` refuses
-                // regardless of `TERM_PROGRAM` because there is nothing to drive.
-                None => {
-                    tracing::warn!(
-                        "[terminal] backend = \"ghostty\" but this is not a macOS Ghostty \
-                         surface; falling back to Kitty"
-                    );
-                    Box::new(kitty::KittyTerminal)
-                }
-            },
-            ConfiguredBackend::Iterm => match iterm {
-                Some(i) => Box::new(i) as Box<dyn Terminal>,
-                // Same fallback as the three above: the config pinned iterm with
-                // no iTerm2 session to drive, or pinned it off macOS, where
-                // `from_env` refuses regardless of `TERM_PROGRAM`.
-                None => {
-                    tracing::warn!(
-                        "[terminal] backend = \"iterm\" but this is not a macOS iTerm2 session; \
-                         falling back to Kitty"
-                    );
-                    Box::new(kitty::KittyTerminal)
-                }
-            },
+        match detect_backend(live) {
+            ConfiguredBackend::Zellij => {
+                Box::new(zellij.expect("live.zellij")) as Box<dyn Terminal>
+            }
+            ConfiguredBackend::Tmux => Box::new(tmux.expect("live.tmux")) as Box<dyn Terminal>,
+            ConfiguredBackend::Ghostty => {
+                Box::new(ghostty.expect("live.ghostty")) as Box<dyn Terminal>
+            }
+            ConfiguredBackend::Iterm => Box::new(iterm.expect("live.iterm")) as Box<dyn Terminal>,
             ConfiguredBackend::Kitty => Box::new(kitty::KittyTerminal),
         }
     })

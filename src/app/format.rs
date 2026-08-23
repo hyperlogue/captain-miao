@@ -716,16 +716,13 @@ pub(super) fn format_relative_time(since: std::time::SystemTime) -> String {
 /// (red) thresholds come from config — the yellow/red is semantic here, so it
 /// stays hardcoded rather than coming from colors.ui.
 ///
-/// When `window` is known (Grok's `contextWindowTokens`), pressure is a
-/// percentage of that window (70% warning, 90% critical) so a 500k-window
-/// row is not painted by Claude-sized absolute token cuts. Without a window
-/// the configured token thresholds apply, as they always have.
+/// Pressure uses configured absolute token cuts whether or not a context
+/// window size is known.
 pub(super) fn context_pressure_style(tokens: u64, window: Option<u64>) -> Style {
-    let t = &crate::config::get().thresholds;
-    let (warn, crit) = match window.filter(|&w| w > 0) {
-        Some(w) => (w * 70 / 100, w * 90 / 100),
-        None => (t.context_warning_tokens, t.context_critical_tokens),
-    };
+    let _ = window;
+    let cfg = crate::config::get();
+    let t = &cfg.thresholds;
+    let (warn, crit) = (t.context_warning_tokens, t.context_critical_tokens);
     if tokens >= crit {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else if tokens >= warn {

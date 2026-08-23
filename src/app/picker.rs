@@ -841,7 +841,8 @@ impl Picker {
         // "slightly brighter than default" on dark themes and "slightly darker
         // than default" on light ones) plus a chevron on the left. No REVERSED
         // / BOLD so it stays calm.
-        let picker = &crate::config::get().colors.picker;
+        let cfg = crate::config::get();
+        let picker = &cfg.colors.picker;
         let sel_row_style = Style::default().bg(picker.highlight_bg);
         let chevron_style = Style::default()
             .fg(picker.chevron_fg)

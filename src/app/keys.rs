@@ -25,10 +25,8 @@ const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 /// - **`available` is empty** — nothing resolved on `$PATH`, which is as likely
 ///   to mean a `PATH` we can't see as an empty machine. Fall back to every
 ///   backend so the key still does something rather than silently going inert.
-/// - **`current` isn't in the list** — `Space a`, `--agent` and the config file
-///   all still name uninstalled backends deliberately, so this is a normal
-///   state, not a bug. Land on the *first* stop; advancing from a defaulted
-///   index would skip it and make the second press the one that reaches it.
+/// - **`current` isn't in the list** — a disabled or remapped default can
+///   sit outside the cycle. Land on the first stop rather than skipping it.
 pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> AgentControl {
     let all: &[AgentControl] = if available.is_empty() {
         AgentControl::ALL
@@ -60,6 +58,7 @@ impl App {
                 self.handle_message_log_key(key);
                 None
             }
+            InputMode::Prefs => self.handle_prefs_key(key),
         }
     }
 
@@ -322,8 +321,8 @@ impl App {
                 None
             }
             Command::ResumePicker => Some(Action::FetchResumeList {
-                // One host at a time, defaulting to the persisted default host
-                // (`Space H`); `Ctrl-h` in the picker switches (§9).
+                // One host at a time, defaulting to the persisted default host;
+                // `Ctrl-h` in the picker switches (§9).
                 host: self.default_host_or_local(),
             }),
             Command::ForkSession => {
@@ -519,6 +518,10 @@ impl App {
             }
             Command::MessageLog => {
                 self.open_message_log();
+                None
+            }
+            Command::Preferences => {
+                self.open_prefs();
                 None
             }
             Command::Quit => {
@@ -806,7 +809,7 @@ impl App {
             return None;
         }
         // Ctrl-T in the workdir picker cycles the backend this launch will use
-        // — a per-launch override of the Space-a default — and updates the
+        // — a per-launch override of the prefs default — and updates the
         // popup's status line in place. (Not Ctrl-A: that's readline
         // beginning-of-line for the path input.)
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -819,12 +822,25 @@ impl App {
             // toggle; every agent we add is another stop the user probably
             // doesn't have, so without the filter the key gets worse each time
             // we add one (see `AgentControl::is_available`).
-            let installed: Vec<AgentControl> = AgentControl::ALL
+            let enabled: Vec<AgentControl> = self
+                .agent_order
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(a, _)| *a)
+                .collect();
+            let installed: Vec<AgentControl> = enabled
                 .iter()
                 .copied()
                 .filter(|a| a.is_available())
                 .collect();
-            *agent = cycle_agent(*agent, &installed);
+            let cycle = if installed.is_empty() {
+                &enabled
+            } else {
+                &installed
+            };
+            if !cycle.is_empty() {
+                *agent = cycle_agent(*agent, cycle);
+            }
             // Switching onto an agent without worktrees disarms the request
             // rather than holding it: it would be dropped at launch, and the
             // footer hides it, so it would sit invisibly armed and then reappear
@@ -979,8 +995,12 @@ impl App {
                             .and_then(|it| it.payload.as_deref())
                             .and_then(AgentControl::from_cli);
                         if let Some(a) = chosen {
-                            self.new_session_agent = a;
-                            self.save_overrides();
+                            if let Some(i) = self.agent_order.iter().position(|(x, _)| *x == a) {
+                                self.agent_order[i].1 = true;
+                                let item = self.agent_order.remove(i);
+                                self.agent_order.insert(0, item);
+                            }
+                            self.persist_agent_order();
                             self.set_status(format!("Default backend: {}", a.label()), false);
                         }
                         None

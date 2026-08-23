@@ -66,8 +66,8 @@
 //!   sessions-as-splits is constructible, but iTerm2's splits are a binary tree,
 //!   so the Nth session in a shared tab resizes the N-1 already there, and the
 //!   dictionary exposes no "zoom this one" to switch between them with. Both
-//!   false makes `layout_is_a_choice()` false, which hides `Space l` and
-//!   resolves every spawn to `NewTab` — tmux's shape.
+//!   false makes `layout_is_a_choice()` false, which hides the layout
+//!   toggle and resolves every spawn to `NewTab` — tmux's shape.
 //!
 //! **The one defect worth knowing about.** A `create tab`/`create window` whose
 //! command exits immediately does not answer: the first such spawn takes ~4s,

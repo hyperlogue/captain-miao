@@ -87,8 +87,8 @@
 //!   viewer: captain-miao would have to track which surface it believes is
 //!   zoomed and would desync the moment the user hit the keybind themselves.
 //!
-//!   Both flags false makes `layout_is_a_choice()` false, which hides `Space l`
-//!   and resolves every spawn to `NewTab` — tmux's shape.
+//!   Both flags false makes `layout_is_a_choice()` false, which hides the
+//!   layout toggle and resolves every spawn to `NewTab` — tmux's shape.
 
 use std::sync::OnceLock;
 

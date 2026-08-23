@@ -52,6 +52,7 @@ fn listen_on() -> Option<String> {
 /// prompt. Every other call site awaits to completion, where it's inert.
 fn kitten_command(args: &[&str]) -> Result<Command> {
     let listen_on = listen_on().context("KITTY_LISTEN_ON not set")?;
+    let cfg = config::get();
 
     let mut cmd = Command::new("kitten");
     cmd.arg("@")
@@ -59,7 +60,7 @@ fn kitten_command(args: &[&str]) -> Result<Command> {
         .arg(&listen_on)
         .arg("--password-env")
         .arg(RC_PASSWORD_ENV)
-        .env(RC_PASSWORD_ENV, &config::get().kitty.rc_password)
+        .env(RC_PASSWORD_ENV, &cfg.kitty.rc_password)
         .args(args)
         .kill_on_drop(true);
     Ok(cmd)

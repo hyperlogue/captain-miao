@@ -8,6 +8,7 @@ mod keys;
 mod logo;
 mod messages;
 mod picker;
+mod prefs;
 mod render_backend;
 mod run;
 
@@ -70,6 +71,8 @@ pub(super) enum InputMode {
     HostEdit,
     /// Scrollback of the footer's status messages. See `messages`.
     Messages,
+    /// Preferences overlay. See `prefs`.
+    Prefs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -320,9 +323,9 @@ pub(super) enum PickerKind {
         /// dropped at launch.
         worktree: Option<WorktreeArm>,
     },
-    /// Set the persistent default backend for new sessions (`Space a`).
+    /// Set the persistent default backend for new sessions (Preferences).
     DefaultAgent,
-    /// Set the persistent default host for new sessions (`Space H`).
+    /// Set the persistent default host for new sessions (Preferences).
     DefaultHost,
     /// Pick an emoji to drop into the directory-mark editor's icon field.
     /// Opened with `Ctrl-E` from `Space i`; submit/cancel return to the editor
@@ -396,29 +399,31 @@ struct DashboardOverrides {
     pinned: Vec<u32>,
     #[serde(default)]
     follow_up: Vec<u32>,
-    /// Whether the OS-sleep inhibitor (Space z) is enabled. `None` for
-    /// overrides files written before this field existed; the dashboard
-    /// keeps its compiled-in default in that case.
+    /// Whether the OS-sleep inhibitor is enabled. `None` for overrides
+    /// files written before this field existed; the dashboard keeps its
+    /// compiled-in default in that case.
     #[serde(default)]
     prevent_sleep: Option<bool>,
-    /// Persisted default backend for new sessions (Space a), stored as the
-    /// CLI subcommand (`"claude"` / `"codex"`). `None` for overrides written
+    /// Persisted default backend for new sessions, stored as the CLI
+    /// subcommand (`"claude"` / `"codex"`). `None` for overrides written
     /// before this field existed; the `[launcher] default_agent` config value
     /// is kept in that case.
     #[serde(default)]
     default_agent: Option<String>,
-    /// Persisted session layout (Space l), stored as its label (`"stacked"` /
+    /// Persisted session layout, stored as its label (`"stacked"` /
     /// `"per-tab"`). `None` for overrides written before this field existed; the
     /// `[terminal] sessions_layout` config value is kept in that case.
     #[serde(default)]
     sessions_layout: Option<String>,
-    /// Persisted default host for new-session operations (`Space H`), stored as
-    /// the host label. The exact analog of `default_agent`: `O`, a bare `o`, and
-    /// `r` all target it, so every picker's scope is explicit instead of an
-    /// implicit cross-host union (§9). `None` (or a label no longer configured)
-    /// falls back to localhost.
+    /// Persisted default host for new-session operations, stored as the host
+    /// label. The exact analog of `default_agent`: `O`, a bare `o`, and `r` all
+    /// target it, so every picker's scope is explicit instead of an implicit
+    /// cross-host union (§9). `None` (or a label no longer configured) falls
+    /// back to localhost.
     #[serde(default)]
     default_host: Option<String>,
+    #[serde(default, skip_serializing_if = "prefs::PrefsOverrides::is_empty")]
+    prefs: prefs::PrefsOverrides,
 }
 
 /// One row of the dashboard's session snapshot — everything `restart_one`
@@ -1020,12 +1025,12 @@ pub(super) struct App {
     /// whether a session spawn anchors next to a window or gets its own tab;
     /// `capture` gates the preview fetch and its auto-refresh timer.
     pub(super) capabilities: Capabilities,
-    /// Backend used when starting a new session (`o` / `O`). Seeded from
-    /// `launcher.default_agent`, cycled with `Space a`.
+    /// Backend used when starting a new session (`o` / `O`). First enabled
+    /// agent in the prefs list.
     pub(super) new_session_agent: AgentControl,
     /// How new sessions are arranged (`resolve_spawn_target`): the shared
-    /// `miao:sessions` tab (Stacked) or one tab per session (Per-tab). Seeded from
-    /// `[terminal] sessions_layout`, toggled with `Space l`, persisted. A
+    /// `miao:sessions` tab (Stacked) or one tab per session (Per-tab). Seeded
+    /// from `[terminal] sessions_layout`, overridable from Preferences. A
     /// spawn-time policy only — existing sessions migrate via `Space e`/`Space E`.
     pub(super) sessions_layout: SessionsLayout,
     pub(super) preview_text: Option<String>,
@@ -1111,6 +1116,12 @@ pub(super) struct App {
     pub(super) dir_edit: Option<DirEditState>,
     /// Active hosts popup. `Some` iff `input_mode == InputMode::HostEdit`.
     pub(super) host_edit: Option<HostEditState>,
+    /// Active preferences overlay. `Some` iff `input_mode == InputMode::Prefs`.
+    pub(super) prefs: Option<prefs::PrefsState>,
+    /// Overlay fields persisted under `dashboard-overrides.json` `prefs`.
+    pub(super) extra_prefs: prefs::PrefsOverrides,
+    /// Ordered agent list (enabled flag). First enabled is the launch default.
+    pub(super) agent_order: Vec<(AgentControl, bool)>,
     /// Persisted (icon, color) overrides keyed by canonicalized cwd. Loaded
     /// once at startup and saved on every popup confirmation.
     pub(super) directory_marks: HashMap<String, DirectoryMark>,
@@ -1233,9 +1244,8 @@ pub(super) struct App {
     /// `kitty:<socket|pid>`, from the active backend's
     /// [`Terminal::identity`](crate::terminal::Terminal::identity)), computed
     /// once at startup. Deliberately the backend's identity, not the
-    /// ambient-env one: under the `[terminal] backend = "kitty"` override in a
-    /// nested zellij the dashboard sits in a zellij pane but every window it
-    /// spawns or drives lives in the outer Kitty.
+    /// ambient-env one: when zellij runs nested in Kitty the dashboard inherits
+    /// `KITTY_WINDOW_ID` but every window it spawns or drives lives in zellij.
     /// Kitty window ids and zellij pane ids overlap, so this namespaces every
     /// window binding: a local session or a persisted binding stamped with a
     /// *different* terminal is foreign — its window is inert to this backend
@@ -1261,10 +1271,10 @@ pub(super) struct App {
     /// none configured falls back to a deterministic emoji derived from its
     /// label, so the column always reads as icons rather than truncated names.
     pub(super) host_icons: HashMap<HostId, String>,
-    /// The host every new-session operation targets by default (`Space H`) —
-    /// `O`, a bare `o` with nothing selected, and `r`. `o` on a row and a fork
-    /// still follow *that row's* host; this is only the no-context default.
-    /// Persisted in `dashboard-overrides.json`.
+    /// The host every new-session operation targets by default — `O`, a bare
+    /// `o` with nothing selected, and `r`. `o` on a row and a fork still follow
+    /// *that row's* host; this is only the no-context default. Persisted in
+    /// `dashboard-overrides.json`.
     pub(super) default_host: HostId,
     /// Per-host recent-dir cache for the workdir picker, seeded at connect and
     /// invalidated when a launch records a new cwd. The picker is cache-first
@@ -1809,12 +1819,9 @@ impl App {
             pending_prefix: None,
             keymap,
             capabilities: crate::terminal::get().capabilities(),
-            new_session_agent: AgentControl::from_cli(&crate::config::get().launcher.default_agent)
+            new_session_agent: AgentControl::from_cli(&cfg.launcher.default_agent)
                 .unwrap_or_default(),
-            sessions_layout: crate::config::get()
-                .terminal
-                .sessions_layout
-                .unwrap_or_default(),
+            sessions_layout: cfg.terminal.sessions_layout.unwrap_or_default(),
             preview_text: None,
             preview_lines: None,
             preview_max_width: 0,
@@ -1839,6 +1846,9 @@ impl App {
             resume_seq: 0,
             dir_edit: None,
             host_edit: None,
+            prefs: None,
+            extra_prefs: prefs::PrefsOverrides::default(),
+            agent_order: prefs::default_agent_list(),
             directory_marks: HashMap::new(),
             recent_cwds: Vec::new(),
             workdir_completion: None,
@@ -2192,10 +2202,11 @@ impl App {
                 overrides.follow_up.push(*pid);
             }
         }
-        overrides.prevent_sleep = Some(self.prevent_sleep_enabled);
-        overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
-        overrides.sessions_layout = Some(self.sessions_layout.label().to_string());
+        overrides.prevent_sleep = self.extra_prefs.prevent_sleep;
+        overrides.sessions_layout = self.extra_prefs.sessions_layout.clone();
         overrides.default_host = Some(self.default_host.0.clone());
+        overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
+        overrides.prefs = self.extra_prefs.clone();
         let _ = state::write_json_atomic(&state::dashboard_overrides_path(), &overrides);
     }
 
@@ -2221,33 +2232,54 @@ impl App {
                 .or_default()
                 .follow_up = true;
         }
-        if let Some(v) = overrides.prevent_sleep {
-            // A `true` persisted from a previous run on a system that no
-            // longer has the backend (binary uninstalled, switched distros)
-            // is silently downgraded — the user can re-enable via Space z
-            // once the binary is back, and we won't keep printing errors at
-            // them on every reload.
-            self.prevent_sleep_enabled = v && crate::sleep::supported();
+        self.extra_prefs = overrides.prefs;
+        if self.extra_prefs.prevent_sleep.is_none() {
+            self.extra_prefs.prevent_sleep = overrides.prevent_sleep;
         }
-        if let Some(a) = overrides
-            .default_agent
-            .as_deref()
-            .and_then(AgentControl::from_cli)
-        {
-            self.new_session_agent = a;
+        if self.extra_prefs.sessions_layout.is_none() {
+            self.extra_prefs.sessions_layout = overrides.sessions_layout.clone();
+        }
+        if let Some(v) = self.extra_prefs.prevent_sleep {
+            self.prevent_sleep_enabled = v;
         }
         if let Some(h) = overrides.default_host.filter(|h| !h.is_empty()) {
             // Kept even when that host isn't currently configured — the user may
             // re-add it. `default_host_or_local` resolves the fallback at use.
             self.default_host = HostId(h);
         }
-        if let Some(l) = overrides
-            .sessions_layout
-            .as_deref()
-            .and_then(SessionsLayout::from_label)
-        {
-            self.sessions_layout = l;
+        let agents_missing = self.extra_prefs.agents.is_none();
+        self.agent_order = prefs::resolve_agent_list(self.extra_prefs.agents.as_deref());
+        if agents_missing {
+            let preferred = overrides
+                .default_agent
+                .as_deref()
+                .and_then(AgentControl::from_cli)
+                .or_else(|| {
+                    AgentControl::from_cli(
+                        &crate::config::Config::from_disk().launcher.default_agent,
+                    )
+                })
+                .unwrap_or_default();
+            self.agent_order =
+                prefs::prefer_agent_first(std::mem::take(&mut self.agent_order), preferred);
+            self.extra_prefs.agents = Some(
+                self.agent_order
+                    .iter()
+                    .map(|(a, on)| prefs::AgentPref {
+                        id: a.cli_subcommand().to_string(),
+                        enabled: *on,
+                    })
+                    .collect(),
+            );
+            self.save_overrides();
         }
+        self.new_session_agent = prefs::first_enabled_agent(&self.agent_order);
+        if let Some(ref order) = self.extra_prefs.host_order
+            && let Some(first) = order.iter().find(|h| !h.is_empty())
+        {
+            self.default_host = HostId(first.clone());
+        }
+        self.reapply_live_config();
         // Startup: nothing is selected yet, and none of these reorder the list.
         self.mark_dirty(Cursor::HoldIndex);
     }
@@ -2292,27 +2324,25 @@ impl App {
         }
     }
 
-    /// Flip `prevent_sleep_enabled`, immediately reconcile caffeinate, persist
-    /// the new value, and surface a status message. Bound to `Space z`.
-    /// Refuses to enable when no backend is available — the user gets the
-    /// missing-binary explanation as a status-line error so they know what to
-    /// install. Disabling is always allowed (so a stale persisted `true`
-    /// can still be cleared even if `supported()` would block re-enabling).
+    /// Flip keep-awake and persist the choice. Enabling with no inhibitor still
+    /// records `true` so a later machine honours it; the inhibitor stays off
+    /// and the status line names why.
     pub(super) fn toggle_prevent_sleep(&mut self) {
         let want_on = !self.prevent_sleep_enabled;
+        self.prevent_sleep_enabled = want_on;
+        self.extra_prefs.prevent_sleep = Some(want_on);
+        self.update_sleep_inhibitor();
+        self.save_overrides();
         if want_on && !crate::sleep::supported() {
             self.set_status(
                 format!(
-                    "Cannot enable prevent-sleep: {}",
+                    "Keep-awake saved, but inactive here: {}",
                     crate::sleep::missing_reason()
                 ),
                 true,
             );
             return;
         }
-        self.prevent_sleep_enabled = want_on;
-        self.update_sleep_inhibitor();
-        self.save_overrides();
         let label = if self.prevent_sleep_enabled {
             "enabled"
         } else {
@@ -2327,12 +2357,14 @@ impl App {
     }
 
     /// Flip the session layout (Stacked ↔ Per-tab), persist it, and surface a
-    /// status message. Bound to `Space l`. A spawn-time policy: this changes
-    /// where *new* sessions land, not where running ones sit — the hint nudges
-    /// the user to `Space e`/`Space E` (restart) to migrate existing sessions.
+    /// status message. A spawn-time policy: this changes where *new* sessions
+    /// land, not where running ones sit — the hint nudges the user to
+    /// `Space e`/`Space E` (restart) to migrate existing sessions.
     pub(super) fn toggle_sessions_layout(&mut self) {
         self.sessions_layout = self.sessions_layout.toggled();
+        self.extra_prefs.sessions_layout = Some(self.sessions_layout.label().to_string());
         self.save_overrides();
+        self.reapply_live_config();
         self.set_status(
             format!(
                 "Session layout: {} — restart sessions (Space e/E) to move existing ones",
@@ -2342,25 +2374,25 @@ impl App {
         );
     }
 
-    /// Open a picker to set the persistent default backend for new sessions
-    /// (`o` / `O`). Bound to `Space a`. The choice is saved to the overrides
-    /// file and survives restart; an individual launch can still override it
-    /// from inside the new-session picker (`Ctrl-t`). The cursor starts on the
-    /// current default so it reads as "this is active, change it."
+    /// Open a picker of *enabled* agents to set the persistent default for
+    /// `o` / `O`. The choice is saved to the overrides file; `Ctrl-t` in the
+    /// workdir picker still overrides one launch. The cursor starts on the
+    /// current default.
     pub(super) fn open_default_agent_picker(&mut self) {
-        let items: Vec<PickerItem> = AgentControl::ALL
+        let enabled: Vec<AgentControl> = self
+            .agent_order
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(a, _)| *a)
+            .collect();
+        let items: Vec<PickerItem> = enabled
             .iter()
             .map(|a| {
-                // `new` already sets the filter text to the lowercased label, so
-                // no `with_filter_text` is needed.
                 PickerItem::new(a.label().to_string()).with_payload(a.cli_subcommand().to_string())
             })
             .collect();
         let mut picker = Picker::new("Default backend for new sessions", items);
-        if let Some(idx) = AgentControl::ALL
-            .iter()
-            .position(|a| *a == self.new_session_agent)
-        {
+        if let Some(idx) = enabled.iter().position(|a| *a == self.new_session_agent) {
             picker.cursor = idx;
         }
         self.picker = Some(ActivePicker {
@@ -2370,11 +2402,8 @@ impl App {
         self.input_mode = InputMode::Picker;
     }
 
-    /// Open the default-host picker (`Space H`) — the exact analog of the
-    /// default-agent one. Every new-session operation with no row context (`O`,
-    /// a bare `o`, `r`) targets whatever this selects, which is what let the
-    /// cross-host unions go away: each picker's scope is now a stated default
-    /// rather than "everything, merged" (§9).
+    /// Open the default-host picker. Every new-session operation with no row
+    /// context (`O`, a bare `o`, `r`) targets whatever this selects.
     pub(super) fn open_default_host_picker(&mut self) {
         let current = self.default_host_or_local();
         let hosts: Vec<(HostId, ConnState)> = self.host_states();
@@ -5220,7 +5249,8 @@ impl App {
     /// Only the two pickers that carry per-launch settings get one — the rest
     /// have nothing to say that their title doesn't already.
     pub(super) fn refresh_picker_status_bar(&mut self) {
-        let ui = &crate::config::get().colors.ui;
+        let cfg = crate::config::get();
+        let ui = &cfg.colors.ui;
         let dim = Style::default().add_modifier(Modifier::DIM);
         let value = Style::default().fg(ui.title_fg).bold();
         let host_span = |app: &Self, host: &HostId| {
@@ -5440,8 +5470,8 @@ impl App {
     /// new session lands is decided at spawn time by the current
     /// [`SessionsLayout`] (`resolve_spawn_target`), not by the selected window.
     pub(super) fn open_workdir_picker(&mut self) {
-        // New sessions target the persisted default host (`Space H`); `Ctrl-h`
-        // cycles per-launch, re-seeding the list from that machine.
+        // New sessions target the persisted default host; `Ctrl-h` cycles
+        // per-launch, re-seeding the list from that machine.
         let host = self.default_host_or_local();
 
         // Seed the launch backend from the persistent default; `Ctrl-t` in the
@@ -5457,9 +5487,9 @@ impl App {
         self.picker = Some(ActivePicker {
             picker,
             // Worktrees start off on every launch. There is no persisted
-            // default for it on purpose: `Space a`/`Space H` answer "what do I
-            // usually use", while isolation answers "is *this* task one that
-            // should not touch my checkout" — a question with a different
+            // default for it on purpose: the agent/host defaults answer "what
+            // do I usually use", while isolation answers "is *this* task one
+            // that should not touch my checkout" — a question with a different
             // answer nearly every time.
             kind: PickerKind::Workdir {
                 agent,

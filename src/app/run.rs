@@ -847,7 +847,8 @@ async fn launch_agent(
         argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &bind_host.0, &bind_token);
     }
 
-    let launcher_cfg = &config::get().launcher;
+    let cfg = config::get();
+    let launcher_cfg = &cfg.launcher;
     // The configured titles are templates ({agent}/{basename}/{cwd}), so the
     // tab names the session's project instead of a generic "Claude (new)".
     let template = if copy.is_resume {
@@ -1401,11 +1402,11 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     app.prompt_restart_missing(missing);
     app.save_session_snapshot();
 
-    let polling = &config::get().polling;
+    let cfg = config::get();
+    let polling = &cfg.polling;
     let reload_min_interval = Duration::from_millis(polling.fs_reload_debounce_ms);
     let preview_debounce = Duration::from_millis(polling.preview_debounce_ms);
     let event_poll = Duration::from_millis(polling.event_poll_ms);
-    let preview_auto_refresh = Duration::from_secs(polling.preview_auto_refresh_secs);
 
     let mut fs_dirty = false;
     let mut last_reload: Option<Instant> = None;
@@ -1773,6 +1774,8 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         // the user is following the live tail, re-arm the debounced fetch
         // once per interval so the preview tracks the selected session's
         // output without manual `R` presses.
+        let preview_auto_refresh =
+            Duration::from_secs(config::get().polling.preview_auto_refresh_secs);
         if app.wants_preview_auto_refresh(preview_auto_refresh) {
             app.request_preview_refresh();
         }
@@ -2085,7 +2088,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         }
                     }
                     Action::FetchResumeList { host } => {
-                        // One host's list, chosen by the default host (`Space H`)
+                        // One host's list, chosen by the persisted default host
                         // and switchable in-picker with `Ctrl-h`.
                         start_resume_load(&mut app, host, false);
                     }

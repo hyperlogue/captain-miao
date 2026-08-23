@@ -87,7 +87,8 @@ pub fn init_tracing(role: &str) {
 
     // Shared debug.log layer for every role when debug mode is on.
     let debug_layer = if config::debug_enabled() {
-        let path = log_dir.join(&config::get().debug.log_file);
+        let cfg = config::get();
+        let path = log_dir.join(&cfg.debug.log_file);
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)

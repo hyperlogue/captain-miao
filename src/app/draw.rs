@@ -42,7 +42,8 @@ impl App {
         // At or below `narrow_max_width` the side-by-side layout can't breathe,
         // so we stack the panels vertically (session list → detail → preview)
         // with a trimmed table and a compact detail panel instead.
-        let panels = &config::get().ui.panels;
+        let cfg = config::get();
+        let panels = &cfg.ui.panels;
         let narrow = body.width <= panels.narrow_max_width;
 
         // One-shot auto-hide: on the first draw we pick defaults based on the
@@ -86,6 +87,9 @@ impl App {
         }
         if self.input_mode == InputMode::Messages {
             self.draw_message_log(frame, frame.area());
+        }
+        if self.input_mode == InputMode::Prefs {
+            self.draw_prefs(frame, frame.area());
         }
         // Last, and independent of `input_mode`: an attach freezes the loop for
         // its whole round trip, so this is the only feedback the keypress gets
@@ -403,7 +407,8 @@ impl App {
     /// isn't in the backend set at all (a row the user is still typing) — shows
     /// only what's known.
     fn host_status_spans(&self, host: &HostId, max_width: usize) -> Vec<Span<'static>> {
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
         let Some(backend) = self.backend_for(host) else {
             return vec![Span::styled(
                 "not connected".to_string(),
@@ -554,7 +559,8 @@ impl App {
 
         let lines = self.host_log_lines(&host);
         let rows = inner.height as usize;
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
         let rendered: Vec<Line> = if lines.is_empty() {
             vec![Line::from(Span::styled(
                 // Two ways to get here, and they aren't the same thing.
@@ -945,7 +951,8 @@ impl App {
     fn draw_header(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let total = self.sessions.len();
         let noun = if total == 1 { "session" } else { "sessions" };
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
 
         // The header area is two rows: the bar itself plus a blank padding row
         // beneath it (the gap off the Sessions panel). The flat bar background
@@ -997,9 +1004,8 @@ impl App {
             Style::default().add_modifier(Modifier::DIM),
         )]]));
 
-        // Right cluster: the session layout and the default new-session backend
-        // (always visible so the `Space l` / `Space a` choices are never hidden
-        // state), then the host cluster — default host, then the ☁ tally beside
+        // Right cluster: session layout and default new-session backend, then
+        // the host cluster — default host, then the ☁ tally beside
         // it, since both answer "which machines am I working across" and read as
         // one group — and finally the keep-awake ☕ indicator when sleep is
         // actively being inhibited. Flat text on the bar, with a trailing space
@@ -1007,7 +1013,7 @@ impl App {
         let mut right_segs: Vec<Vec<Span<'static>>> = Vec::new();
         // The layout indicator names a *choice*; on a backend that has only one
         // arrangement (tmux — a tab per session either way) it would report state
-        // the user can't change, so it hides with its `Space l` key.
+        // the user can't change, so it is hidden.
         if self.capabilities.layout_is_a_choice() {
             right_segs.push(vec![
                 Span::styled("Layout: ", Style::default().add_modifier(Modifier::DIM)),
@@ -1186,7 +1192,8 @@ impl App {
             (SessionStatus::Active, Some(tool)) => format!("{} ({tool})", s.status.label()),
             _ => s.status.label().to_string(),
         };
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
         let status_fg = super::format::status_fg(&s.status, self.is_follow_up(&super::flag_key(s)));
         let live_sid = self.index_of(s).live_session_id(s);
         let sid_short = live_sid
@@ -1400,7 +1407,8 @@ impl App {
 
         let visible = self.visible_sessions();
 
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
 
         let title = {
             let mut spans = vec![Span::styled(" Sessions", Style::default().bold())];
@@ -1904,17 +1912,19 @@ impl App {
             cmd(Command::TogglePreview),
             cmd(Command::ToggleDetail),
             cmd(Command::EditDir),
-            cmd(Command::ToggleKeepAwake),
-            cmd(Command::DefaultAgent),
         ]);
-        // Both layouts spawn a tab per session on a backend with no shared-tab
-        // arrangement (tmux), so the toggle has nothing to switch between.
+        let push_if_bound = |lines: &mut Vec<Line>, c: Command| {
+            if self.keymap.keys_for(c).is_some() {
+                lines.push(cmd(c));
+            }
+        };
+        push_if_bound(&mut lines, Command::ToggleKeepAwake);
+        push_if_bound(&mut lines, Command::DefaultAgent);
         if self.capabilities.layout_is_a_choice() {
-            lines.push(cmd(Command::SessionsLayout));
+            push_if_bound(&mut lines, Command::SessionsLayout);
         }
-        // The default-host choice only exists once there's more than one host.
         if self.backends.len() > 1 {
-            lines.push(cmd(Command::DefaultHost));
+            push_if_bound(&mut lines, Command::DefaultHost);
         }
         // Remote hosts are gated behind the `remote` feature (work in progress);
         // hide the key rather than list one that only reports it's unavailable.
@@ -1928,6 +1938,7 @@ impl App {
             cmd(Command::Search),
             cmd(Command::ClearSearch),
             cmd(Command::MessageLog),
+            cmd(Command::Preferences),
             cmd(Command::Help),
             row(
                 self.keymap
@@ -1976,7 +1987,8 @@ impl App {
         let text_width = (inner.width as usize).saturating_sub(AGE_WIDTH);
         let lines = self.message_log_lines(text_width);
         let rows = inner.height as usize;
-        let ui = &config::get().colors.ui;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
         let rendered: Vec<Line> = if self.messages.is_empty() {
             vec![Line::from(Span::styled(
                 "(nothing said yet)",
@@ -2141,8 +2153,8 @@ impl App {
                         spans.extend(hint_pair("Ctrl-d", "drop dir"));
                         spans.extend(hint_pair("Ctrl-t", "agent"));
                         // Hidden for an agent that has no worktrees, the same
-                        // rule as `t` on zellij and `Space l` on tmux: don't
-                        // offer a key that can only report it does nothing.
+                        // rule as `t` on zellij and the layout toggle on tmux:
+                        // don't offer a key that can only report it does nothing.
                         if agent.capabilities().worktrees {
                             spans.extend(hint_pair("Ctrl-g", "worktree"));
                         }
@@ -2174,6 +2186,14 @@ impl App {
             InputMode::Messages => {
                 let mut spans = hint_pair("j/k", "scroll");
                 spans.extend(hint_pair("g/G", "top/bottom"));
+                spans.extend(hint_pair("Esc", "close"));
+                spans
+            }
+            InputMode::Prefs => {
+                let mut spans = hint_pair("j/k", "move");
+                spans.extend(hint_pair("h/l", "pane"));
+                spans.extend(hint_pair("Enter", "edit"));
+                spans.extend(hint_pair("r", "reset"));
                 spans.extend(hint_pair("Esc", "close"));
                 spans
             }
