@@ -19,11 +19,12 @@
 //! the same owned-file-in-the-real-home idea, without a selector.
 //!
 //! **Approval is the lifecycle `Notification` / `permission_prompt` matcher**
-//! in that same hooks file. There is no second site in `config.toml`. 1.0.5
-//! also fires that Notification on the **parent** session id ~20ms after a
-//! subagent's auto-allowed `run_terminal_command` has already started
-//! (`wait_ms` 10–40, no parent UI). Those are dropped — see
-//! [`permission_prompt_already_resolved`].
+//! in that same hooks file. There is no second site in `config.toml`. A
+//! subagent's waiting prompt is parent-attributed too (Grok queues it on the
+//! parent's TUI), so it still reaches Approval. What 1.0.5 *also* fires on
+//! the parent session id is the echo ~20ms after a subagent's auto-allowed
+//! `run_terminal_command` has already started (`wait_ms` 10–40, no UI).
+//! Those are dropped — see [`permission_prompt_already_resolved`].
 //!
 //! **What this module still does not do**, and why:
 //!
@@ -847,11 +848,10 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             state.status = SessionStatus::WaitingForDecision;
             state.last_tool = msg.tool_name;
         }
-        // A `permission_prompt` that is not a waiting UI. 1.0.5 forwards
-        // subagent bash auto-allows on the parent session id after the
-        // child's PreToolUse; mapping those to Approval sticks the row
-        // there until the parent's own PostToolUse — minutes, when that
-        // tool is `get_command_or_subagent_output`.
+        // A `permission_prompt` that is not a waiting UI: 1.0.5 forwards
+        // subagent bash auto-allows on the parent session id *after* the
+        // child's PreToolUse. A subagent that is actually waiting has no
+        // child Pre yet, so it still takes the shared mapping to Approval.
         HookEvent::PermissionRequest if permission_prompt_already_resolved(state) => {
             common::adopt_session_facts(state, &mut msg);
         }
@@ -873,19 +873,14 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// 1.0.5 fires `permission_prompt` on the **parent** session id after a
 /// subagent's auto-allowed `run_terminal_command` has already started
 /// (`wait_ms` 10–40; the Notification lands ~20ms after that child's
-/// PreToolUse). The parent row has no follow-up: child hooks used to be
-/// ignored entirely, and the parent's own PostToolUse may be minutes away
-/// (`get_command_or_subagent_output`). Captured from session `01a02efd`.
+/// PreToolUse). Captured from session `01a02efd`.
 ///
-/// A parent tool already in flight (`last_tool`) has passed its own gate —
-/// that PreToolUse ran — so a later parent-attributed Notification is the
-/// same late echo, not a waiting UI. A genuine parent wait on 1.0.5 does
-/// not fire this hook at all (PreToolUse starts the wait; there is no
-/// matching PermissionRequest in the launcher log).
+/// The tell is the child's own PreToolUse: auto-allow runs the tool first,
+/// then the Notification; a waiting prompt has no child PreToolUse yet (the
+/// tool cannot start). `last_tool` on the parent is *not* that tell — the
+/// parent is routinely in `get_command_or_subagent_output` while a child
+/// actually waits, and Grok queues that prompt on the parent TUI.
 fn permission_prompt_already_resolved(state: &LauncherState) -> bool {
-    if state.last_tool.is_some() {
-        return true;
-    }
     match state.child_pre_tool_at {
         Some(at) => LauncherState::now().saturating_sub(at) <= 1,
         None => false,
@@ -1485,20 +1480,21 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("s1"));
     }
 
-    /// Session `01a02efd` at 20:02:52: parent already in
-    /// `get_command_or_subagent_output`, no child Pre in that second. The
-    /// Notification still must not enter Approval — the in-flight parent
-    /// tool has passed its own gate.
+    /// A subagent's *waiting* prompt is parent-attributed the same way the
+    /// auto-allow echo is. Grok queues it on the parent TUI, so the row
+    /// must still go to Approval even while the parent is polling
+    /// `get_command_or_subagent_output`. The child's PreToolUse has not
+    /// run — that is what separates this from the echo.
     #[test]
-    fn a_parent_tool_in_flight_drops_a_late_permission_prompt() {
+    fn a_subagent_permission_wait_while_the_parent_is_polling_is_approval() {
         let mut state = state_at(SessionStatus::Active);
         state.last_tool = Some("get_command_or_subagent_output".to_string());
         feed(
             &mut state,
             HookEvent::PermissionRequest,
-            r#"{"sessionId":"s1"}"#,
+            r#"{"sessionId":"parent","notificationType":"permission_prompt"}"#,
         );
-        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
         assert_eq!(
             state.last_tool.as_deref(),
             Some("get_command_or_subagent_output")
@@ -1566,9 +1562,8 @@ mod tests {
     }
 
     /// A child tool completing is enough to leave Approval even if the
-    /// Notification landed first (the 20:02:52 case: no child Pre in the
-    /// same second, last_tool already set so we never enter — this pins
-    /// the release path).
+    /// Notification landed first (the echo won the race, then the child's
+    /// PostToolUse proves the gate already resolved).
     #[test]
     fn a_child_tool_releases_a_stuck_approval() {
         let mut state = state_at(SessionStatus::WaitingForApproval);
