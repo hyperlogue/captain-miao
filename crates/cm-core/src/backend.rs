@@ -654,7 +654,6 @@ mod tests {
             flags: None,
             attached: None,
             host: HostId::local(),
-            child_pre_tool_at: None,
         }
     }
 

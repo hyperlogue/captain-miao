@@ -62,8 +62,11 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 use super::common;
@@ -771,11 +774,11 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // Child Pre/PostToolUse is still evidence: 1.0.5's `permission_prompt`
     // Notification is parent-attributed and arrives *after* an auto-allowed
     // child bash has started, so the child's tool event is what releases a
-    // stuck Approval (and stamps `child_pre_tool_at` so a Notification in
-    // the same second never enters it).
+    // stuck Approval (and [`note_child_pre`] so a Notification in the echo
+    // window never enters it).
     if msg.session_is_child == Some(true) {
         if msg.event == HookEvent::PreToolUse {
-            state.child_pre_tool_at = Some(LauncherState::now());
+            note_child_pre(state.launcher_pid);
         }
         if matches!(
             msg.event,
@@ -880,11 +883,33 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// tool cannot start). `last_tool` on the parent is *not* that tell — the
 /// parent is routinely in `get_command_or_subagent_output` while a child
 /// actually waits, and Grok queues that prompt on the parent TUI.
+///
+/// The timestamp is **not** on [`LauncherState`]: it is Grok-only scratch
+/// and a launcher is one process per session, so a pid-keyed map here is
+/// enough. Other backends never see it.
 fn permission_prompt_already_resolved(state: &LauncherState) -> bool {
-    match state.child_pre_tool_at {
-        Some(at) => LauncherState::now().saturating_sub(at) <= 1,
-        None => false,
+    child_pre_is_recent(state.launcher_pid)
+}
+
+/// Observed echo is ~20ms. Wide enough for a slow hook spawn, tight enough
+/// that a later real wait is not eaten by an earlier child's PreToolUse.
+const PERMISSION_ECHO_AFTER_CHILD_PRE: Duration = Duration::from_millis(500);
+
+static LAST_CHILD_PRE: LazyLock<Mutex<HashMap<u32, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn note_child_pre(launcher_pid: u32) {
+    if let Ok(mut m) = LAST_CHILD_PRE.lock() {
+        m.insert(launcher_pid, Instant::now());
     }
+}
+
+fn child_pre_is_recent(launcher_pid: u32) -> bool {
+    LAST_CHILD_PRE
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&launcher_pid).copied())
+        .is_some_and(|t| t.elapsed() <= PERMISSION_ECHO_AFTER_CHILD_PRE)
 }
 
 /// Live background work named on a `Stop` payload, or `None` when the payload
@@ -1508,6 +1533,9 @@ mod tests {
     #[test]
     fn a_subagent_auto_allow_does_not_stick_the_parent_at_approval() {
         let mut state = state_at(SessionStatus::Active);
+        // Distinct from `for_test`'s pid 0 so a parallel test's PermissionRequest
+        // cannot see this child's PreToolUse in the process-wide echo map.
+        state.launcher_pid = 11;
         state.session_id = Some("parent".to_string());
         state.last_tool = Some("get_command_or_subagent_output".to_string());
         feed(
@@ -1541,8 +1569,9 @@ mod tests {
     /// Same echo when the parent's last tool has already cleared (PostToolUse
     /// of a previous bash) but a child PreToolUse just ran.
     #[test]
-    fn a_child_pre_tool_in_the_same_second_drops_the_permission_echo() {
+    fn a_recent_child_pre_tool_drops_the_permission_echo() {
         let mut state = state_at(SessionStatus::Active);
+        state.launcher_pid = 12;
         state.session_id = Some("parent".to_string());
         feed(
             &mut state,

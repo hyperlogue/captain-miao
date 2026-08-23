@@ -986,12 +986,6 @@ pub struct LauncherState {
     /// keying can disambiguate a remote pid from a local one. Defaults `local`.
     #[serde(skip)]
     pub host: HostId,
-    /// Grok: unix-seconds of the last child `PreToolUse`. 1.0.5 fires
-    /// `permission_prompt` on the parent session id ~20ms after a subagent's
-    /// auto-allowed bash has already started; a Notification in the same
-    /// second is not a waiting UI. Launcher scratch — never on the wire.
-    #[serde(skip)]
-    pub child_pre_tool_at: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1035,7 +1029,6 @@ impl LauncherState {
             flags: None,
             attached: None,
             host: HostId::local(),
-            child_pre_tool_at: None,
         }
     }
 }
@@ -1447,7 +1440,6 @@ mod tests {
             flags: None,
             attached: None,
             host: HostId::default(),
-            child_pre_tool_at: None,
         };
         let states = vec![
             mk(10, None),                  // local session, no pool name
@@ -1534,7 +1526,6 @@ mod tests {
             flags: None,
             attached: None,
             host: HostId::default(),
-            child_pre_tool_at: None,
         };
         let pids = pooled_launcher_pids(&[
             mk(1, None),
