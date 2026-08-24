@@ -1259,7 +1259,9 @@ impl AgentControl {
             // each wake (`transcript_path_is_replaced`) rather than polling
             // or watching the session directory — `updates.jsonl` in that
             // directory is the long-held-fd append stream we deliberately
-            // don't follow.
+            // don't follow. The fold reads a bounded tail of it
+            // (`grok::last_compaction`), which is not a watch: it runs on a
+            // wake one of those two sidecars already delivered.
             AgentControl::Grok => None,
             // Moot, and structurally so rather than merely for now: opencode
             // keeps each message as its own JSON blob under `storage/`, so there

@@ -40,7 +40,9 @@
 //! `StopCancelled` is a first-class observe hook (Kimi's `Interrupt` standing),
 //! `UserPromptSubmit` carries `prompt`, `summary.json` is resolved from the
 //! session id (1.0.4's documented common fields do not include `transcriptPath`),
-//! and `signals.json` persists `contextTokensUsed` / `contextWindowTokens`.
+//! and `signals.json` persists `contextTokensUsed` / `contextWindowTokens` —
+//! at turn end only, which is why a compaction (not a turn end) needs
+//! [`last_compaction`] to keep the gauge honest.
 //! A `Stop` with in-flight `backgroundTasks` / `sessionCrons` lands on
 //! Task / Server / Review (an r3 watch is Review) rather than Idle.
 //! Unrecognized event names are still skipped, which is why `StopCancelled` is
@@ -1056,7 +1058,8 @@ fn status_from_shells(shells: &[BgShell]) -> SessionStatus {
 /// each wake rather than polling or watching the session directory. The
 /// context gauge is sibling `signals.json`'s `contextTokensUsed` over
 /// `contextWindowTokens` — that file is replaced independently, so it has the
-/// same file watch (started once it exists, never via the session dir).
+/// same file watch (started once it exists, never via the session dir), and
+/// [`last_compaction`] covers the one moment it goes stale.
 /// `prior` is unused: both files are small whole-JSON documents.
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     let dir = sidecar_dir(path);
@@ -1077,12 +1080,27 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         #[serde(default)]
         primary_model_id: Option<String>,
     }
-    if let Ok(body) = std::fs::read_to_string(dir.join("signals.json"))
+    let signals_path = dir.join("signals.json");
+    if let Ok(body) = std::fs::read_to_string(&signals_path)
         && let Ok(signals) = serde_json::from_str::<Signals>(&body)
     {
         stats.context_tokens = signals.context_tokens_used.filter(|&n| n > 0);
         stats.context_window = signals.context_window_tokens.filter(|&n| n > 0);
         stats.model = signals.primary_model_id.filter(|m| !m.trim().is_empty());
+    }
+    // A compaction that postdates the last turn is the newer truth about the
+    // context, and the *only* newer one on disk. `>` and not `>=`: a turn that
+    // ended in the same second the compaction did wrote a `signals.json` that
+    // already accounts for it.
+    if let Some(compaction) = last_compaction(dir).filter(|c| c.at > modified_secs(&signals_path)) {
+        if compaction.tokens > 0 {
+            stats.context_tokens = Some(compaction.tokens);
+        }
+        // Only as a fallback: the window is a property of the model, not of the
+        // turn, so a `signals.json` that named one is not stale about it.
+        if stats.context_window.is_none() {
+            stats.context_window = compaction.window.filter(|&n| n > 0);
+        }
     }
 
     if let Ok(body) = std::fs::read_to_string(dir.join("summary.json"))
@@ -1095,6 +1113,105 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         }
     }
     stats
+}
+
+/// What the newest compaction record in `updates.jsonl` says the context holds.
+struct Compaction {
+    /// The record's own unix timestamp, to weigh against `signals.json`'s.
+    at: u64,
+    /// `tokens_after` once it finished; the pre-compaction `tokens_used` while
+    /// it is still running — which is what the session holds at that instant,
+    /// and stays true if the compaction then fails.
+    tokens: u64,
+    /// `context_window`, present on the `started` record only.
+    window: Option<u64>,
+}
+
+/// The newest `auto_compact_started` / `auto_compact_completed` in the session's
+/// `updates.jsonl`, or `None` when the tail holds neither.
+///
+/// **Grok rewrites `signals.json` at turn end and nowhere else** — its mtime is
+/// the last `turn_completed` timestamp in every session sampled — and a
+/// compaction is not a turn end. So a `/compact` (or an auto-compact on an idle
+/// resumed session) leaves the gauge reading the last completed turn's total
+/// until the next turn ends: 297k against the 14k the session actually holds,
+/// and not even the pre-compaction number if that last turn predates a restart.
+/// These two records are the only post-compaction totals Grok persists — the
+/// hook payload carries no token field of any kind, and neither `summary.json`,
+/// the compaction checkpoint nor `chat_history.jsonl` records one.
+///
+/// This is the one read of `updates.jsonl`, and it is not a watch: a bounded
+/// tail on a fold the summary/signals watch already woke. Grok rewrites
+/// `summary.json` a few ms *after* the `auto_compact_completed` line lands
+/// (the `PostCompact` hook fires before either), so that wake is what makes the
+/// record reachable — which is also why this belongs in the fold and not in the
+/// hook path.
+///
+/// Walking back rather than taking the newest `auto_compact_*` outright is what
+/// makes a failed compaction read right: 1.0.5 has an `auto_compact_failed`
+/// whose payload we've never seen, and skipping any record that states no total
+/// lands on the `started` before it — whose `tokens_used` is exactly what a
+/// session still holds when its compaction didn't happen.
+///
+/// The search pattern carries unescaped quotes on purpose: a tool result that
+/// quotes one of these records (a `grep` of `updates.jsonl`, say) reaches the
+/// file as an escaped `\"sessionUpdate\":\"…` inside a JSON string, so it can
+/// never be mistaken for the record itself.
+fn last_compaction(dir: &Path) -> Option<Compaction> {
+    const MARK: &str = "\"sessionUpdate\":\"auto_compact_";
+
+    #[derive(Deserialize)]
+    struct Record {
+        #[serde(default)]
+        timestamp: u64,
+        params: Params,
+    }
+    #[derive(Deserialize)]
+    struct Params {
+        update: Update,
+    }
+    // The envelope is camelCase and the update's own fields are snake_case —
+    // Grok's shape, not a transcription slip.
+    #[derive(Deserialize)]
+    struct Update {
+        #[serde(rename = "sessionUpdate")]
+        session_update: String,
+        #[serde(default)]
+        tokens_after: Option<u64>,
+        #[serde(default)]
+        tokens_used: Option<u64>,
+        #[serde(default)]
+        context_window: Option<u64>,
+    }
+
+    let tail = common::read_tail(&dir.join("updates.jsonl"))?;
+    tail.rsplit('\n')
+        .filter(|line| line.contains(MARK))
+        .find_map(|line| {
+            let record: Record = serde_json::from_str(line).ok()?;
+            let update = record.params.update;
+            let tokens = match update.session_update.as_str() {
+                "auto_compact_completed" => update.tokens_after,
+                "auto_compact_started" => update.tokens_used,
+                _ => None,
+            }?;
+            Some(Compaction {
+                at: record.timestamp,
+                tokens,
+                window: update.context_window,
+            })
+        })
+}
+
+/// A file's mtime in whole unix seconds, or `0` when it can't be read — which
+/// makes a missing `signals.json` lose to any compaction record, the same
+/// answer as an empty one.
+fn modified_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
 }
 
 // =============================================================================
@@ -2099,6 +2216,176 @@ mod tests {
         .unwrap();
         let stats = read_transcript_stats(&dir.join("summary.json"));
         assert_eq!(stats, TranscriptStats::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session directory of its own, so the fold tests can each own their
+    /// sidecars.
+    fn fold_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cm-grok-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a sidecar and stamp its mtime: what makes `signals.json` newer or
+    /// older than a compaction record is the whole rule under test, and mtime
+    /// is the only clock either side of it has.
+    fn write_at(path: &Path, body: &str, unix: u64) {
+        std::fs::write(path, body).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(unix));
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+
+    /// One `updates.jsonl` line — the envelope Grok wraps every ACP event in.
+    fn update_line(at: u64, update: &str) -> String {
+        format!(
+            r#"{{"timestamp":{at},"method":"_x.ai/session/update","params":{{"sessionId":"01a0254c","update":{update}}}}}"#
+        )
+    }
+
+    /// The gauge Grok persists is written at *turn end*, so a compaction — which
+    /// is not one — leaves it reading the last completed turn's total. A
+    /// compaction that postdates that write is the newer truth and replaces it,
+    /// while the model and the window it also carries are untouched.
+    #[test]
+    fn a_compaction_after_the_last_turn_replaces_the_stale_gauge() {
+        let dir = fold_dir("compacted");
+        write_at(
+            &dir.join("signals.json"),
+            r#"{"contextTokensUsed":297120,"contextWindowTokens":500000,"primaryModelId":"grok-4.6"}"#,
+            1_787_495_847,
+        );
+        std::fs::write(
+            dir.join("updates.jsonl"),
+            [
+                update_line(1_787_495_847, r#"{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}"#),
+                update_line(
+                    1_787_541_440,
+                    r#"{"sessionUpdate":"auto_compact_started","tokens_used":254404,"context_window":500000,"percentage":80}"#,
+                ),
+                update_line(
+                    1_787_541_529,
+                    r#"{"sessionUpdate":"auto_compact_completed","tokens_before":254404,"tokens_after":14035,"summary_preview":null}"#,
+                ),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats.context_tokens, Some(14035));
+        assert_eq!(stats.context_window, Some(500_000));
+        assert_eq!(stats.model.as_deref(), Some("grok-4.6"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and it hands back over the moment a turn ends: that `signals.json` was
+    /// written *after* the compaction, so it already accounts for it and is the
+    /// live number again.
+    #[test]
+    fn a_turn_after_the_compaction_puts_signals_back_in_charge() {
+        let dir = fold_dir("recompacted");
+        write_at(
+            &dir.join("signals.json"),
+            r#"{"contextTokensUsed":21400,"contextWindowTokens":500000}"#,
+            1_787_541_600,
+        );
+        std::fs::write(
+            dir.join("updates.jsonl"),
+            update_line(
+                1_787_541_529,
+                r#"{"sessionUpdate":"auto_compact_completed","tokens_before":254404,"tokens_after":14035}"#,
+            ),
+        )
+        .unwrap();
+
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats.context_tokens, Some(21400));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction still running reports the total it is compacting *from* —
+    /// what the session holds until it lands, and what it keeps if the compaction
+    /// then fails. That record is also the only one carrying the window, which
+    /// is how a session that has yet to end a turn gets one at all.
+    #[test]
+    fn a_compaction_still_running_reports_the_pre_compaction_total() {
+        let dir = fold_dir("compacting");
+        std::fs::write(
+            dir.join("updates.jsonl"),
+            update_line(
+                1_787_541_440,
+                r#"{"sessionUpdate":"auto_compact_started","tokens_used":400900,"context_window":500000,"percentage":80,"reason":"Context window 80% full"}"#,
+            ),
+        )
+        .unwrap();
+
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats.context_tokens, Some(400_900));
+        assert_eq!(stats.context_window, Some(500_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction that didn't happen leaves the session holding what it held
+    /// before: the scan walks back past any record stating no total — 1.0.5 has
+    /// an `auto_compact_failed` whose payload we've never seen — to the
+    /// `started` that named one.
+    #[test]
+    fn a_record_with_no_total_is_walked_past() {
+        let dir = fold_dir("compact-failed");
+        std::fs::write(
+            dir.join("updates.jsonl"),
+            [
+                update_line(
+                    1_787_541_440,
+                    r#"{"sessionUpdate":"auto_compact_started","tokens_used":402338,"context_window":500000}"#,
+                ),
+                update_line(
+                    1_787_541_460,
+                    r#"{"sessionUpdate":"auto_compact_failed","error":"summarization sample failed"}"#,
+                ),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats.context_tokens, Some(402_338));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool result that quotes one of these records — `grep`ping
+    /// `updates.jsonl` is how this bug was found — lands in the file as an
+    /// escaped string. The scan matches raw quotes, which a JSON string can
+    /// never contain, so the quote is inert however late it appears.
+    #[test]
+    fn a_quoted_record_in_a_tool_result_is_not_a_compaction() {
+        let dir = fold_dir("quoted");
+        std::fs::write(
+            dir.join("updates.jsonl"),
+            [
+                update_line(
+                    1_787_541_529,
+                    r#"{"sessionUpdate":"auto_compact_completed","tokens_before":254404,"tokens_after":14035}"#,
+                ),
+                update_line(
+                    1_787_541_600,
+                    r#"{"sessionUpdate":"tool_call_update","status":"completed","content":[{"type":"content","content":{"type":"text","text":"{\"sessionUpdate\":\"auto_compact_completed\",\"tokens_after\":999999}"}}]}"#,
+                ),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let stats = read_transcript_stats(&dir.join("summary.json"));
+        assert_eq!(stats.context_tokens, Some(14035));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
