@@ -876,7 +876,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// 1.0.5 fires `permission_prompt` on the **parent** session id after a
 /// subagent's auto-allowed `run_terminal_command` has already started
 /// (`wait_ms` 10–40; the Notification lands ~20ms after that child's
-/// PreToolUse). Captured from session `01a02efd`.
+/// PreToolUse). Timings measured off a launcher log, not documented.
 ///
 /// The tell is the child's own PreToolUse: auto-allow runs the tool first,
 /// then the Notification; a waiting prompt has no child PreToolUse yet (the
@@ -1408,6 +1408,59 @@ mod tests {
             .block_on(dispatch_hook(state, msg));
     }
 
+    /// One `backgroundTasks` entry: the task `type`, its `status`, and the
+    /// fields that type carries (`command` for a shell, `description` for a
+    /// monitor or subagent).
+    fn bg_task(kind: &str, status: &str, body: &str) -> String {
+        format!(r#"{{"type":"{kind}","status":"{status}",{body}}}"#)
+    }
+
+    /// The common case: a shell still running, named by its command line.
+    fn shell(command: &str) -> String {
+        bg_task("shell", "running", &format!(r#""command":"{command}""#))
+    }
+
+    /// The tail of a `Stop` payload — the end reason plus its task array —
+    /// spelled once so a test reads as its cases rather than as JSON.
+    fn stop_tail(reason: &str, tasks: &[String]) -> String {
+        format!(
+            r#","reason":"{reason}","backgroundTasks":[{}]"#,
+            tasks.join(",")
+        )
+    }
+
+    /// Feed one `Stop` to a working row and report the status it settles on.
+    fn stop_status(extra: &str) -> SessionStatus {
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, &payload("stop", extra));
+        state.status
+    }
+
+    /// A parent-attributed permission Notification — the shape Grok fires for
+    /// a subagent's prompt, whether that prompt is waiting or already
+    /// auto-allowed. Telling those apart is the child's own PreToolUse, not
+    /// anything in here.
+    fn permission_prompt(session: &str) -> String {
+        format!(r#"{{"sessionId":"{session}","notificationType":"permission_prompt"}}"#)
+    }
+
+    /// A child session's PreToolUse: the parent's envelope plus the
+    /// `subagentType` that marks the event as the child's.
+    fn child_tool(name: &str) -> String {
+        format!(r#","toolName":"{name}","subagentType":"explore""#)
+    }
+
+    /// The parent row is untouched — still working, still its own session,
+    /// still polling the tool it was polling when the child fired.
+    fn assert_parent_polling(state: &LauncherState) {
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            state.last_tool.as_deref(),
+            Some("get_command_or_subagent_output")
+        );
+    }
+
     #[test]
     fn a_turn_runs_from_prompt_to_stop() {
         let mut state = state_at(SessionStatus::Starting);
@@ -1517,7 +1570,7 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PermissionRequest,
-            r#"{"sessionId":"parent","notificationType":"permission_prompt"}"#,
+            &permission_prompt("parent"),
         );
         assert_eq!(state.status, SessionStatus::WaitingForApproval);
         assert_eq!(
@@ -1526,10 +1579,11 @@ mod tests {
         );
     }
 
-    /// Session `01a02efd`: parent `get_command_or_subagent_output` in flight,
-    /// subagent bash auto-allowed (`wait_ms` 13), then a parent-attributed
-    /// `permission_prompt` ~20ms later. The row sat at Approval until the
-    /// parent's poll returned, while the TUI showed no prompt.
+    /// The auto-allow echo, in order: the parent is polling
+    /// `get_command_or_subagent_output`, a subagent's bash is auto-allowed and
+    /// *runs*, and only then does a parent-attributed `permission_prompt`
+    /// arrive. The row used to sit at Approval until the parent's poll
+    /// returned — minutes — while the TUI showed no prompt at all.
     #[test]
     fn a_subagent_auto_allow_does_not_stick_the_parent_at_approval() {
         let mut state = state_at(SessionStatus::Active);
@@ -1541,29 +1595,16 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PreToolUse,
-            &payload(
-                "pre_tool_use",
-                r#","toolName":"run_terminal_command","subagentType":"explore""#,
-            ),
+            &payload("pre_tool_use", &child_tool("run_terminal_command")),
         );
-        assert_eq!(state.status, SessionStatus::Active);
-        assert_eq!(state.session_id.as_deref(), Some("parent"));
-        assert_eq!(
-            state.last_tool.as_deref(),
-            Some("get_command_or_subagent_output")
-        );
+        assert_parent_polling(&state);
 
         feed(
             &mut state,
             HookEvent::PermissionRequest,
-            r#"{"sessionId":"parent","notificationType":"permission_prompt"}"#,
+            &permission_prompt("parent"),
         );
-        assert_eq!(state.status, SessionStatus::Active);
-        assert_eq!(state.session_id.as_deref(), Some("parent"));
-        assert_eq!(
-            state.last_tool.as_deref(),
-            Some("get_command_or_subagent_output")
-        );
+        assert_parent_polling(&state);
     }
 
     /// Same echo when the parent's last tool has already cleared (PostToolUse
@@ -1576,10 +1617,7 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PreToolUse,
-            &payload(
-                "pre_tool_use",
-                r#","toolName":"run_terminal_command","subagentType":"explore""#,
-            ),
+            &payload("pre_tool_use", &child_tool("run_terminal_command")),
         );
         assert!(state.last_tool.is_none(), "child must not stamp last_tool");
         feed(
@@ -1601,25 +1639,17 @@ mod tests {
         feed(
             &mut state,
             HookEvent::PostToolUse,
-            &payload(
-                "post_tool_use",
-                r#","toolName":"run_terminal_command","subagentType":"explore""#,
-            ),
+            &payload("post_tool_use", &child_tool("run_terminal_command")),
         );
-        assert_eq!(state.status, SessionStatus::Active);
-        assert_eq!(state.session_id.as_deref(), Some("parent"));
-        assert_eq!(
-            state.last_tool.as_deref(),
-            Some("get_command_or_subagent_output")
-        );
+        assert_parent_polling(&state);
     }
 
     /// `ask_user_question` renders a multiple-choice card and blocks on the
     /// answer. Grok auto-allows it (no `PermissionRequest` in the launcher
     /// log), so this `PreToolUse` is the only evidence the session is waiting,
-    /// and it must not read as `Active`. Captured from a live session: the
-    /// launcher logged `PreToolUse tool=Some("ask_user_question")` and the
-    /// row stayed Active while the card was up.
+    /// and it must not read as `Active`. The symptom it pins: the launcher
+    /// logs `PreToolUse tool=Some("ask_user_question")` and the row stays
+    /// Active for as long as the card is up.
     #[test]
     fn the_ask_user_question_tool_is_a_decision_not_plain_work() {
         let mut state = state_at(SessionStatus::Active);
@@ -1812,9 +1842,64 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::Idle);
     }
-
-    /// The live `r3 watch` from session `01a0254c-…`: `Stop` names it as a
-    /// shell task, so the row is `Review` rather than `Idle`.
+    /// The whole tier map in one place, which the cases below refine: a finite
+    /// background command is busy `Task`; a recognized dev server is at-rest
+    /// `Server`; a `monitor` is at-rest by construction; a background subagent
+    /// is busy work; a `/loop` cron is a parked wakeup; an empty array is
+    /// plain `Idle`.
+    #[test]
+    fn stop_background_tasks_pick_the_tier_from_type_and_command() {
+        let cases: &[(&str, String, SessionStatus)] = &[
+            (
+                "a finite shell is busy work",
+                stop_tail("end_turn", &[shell("cargo test")]),
+                SessionStatus::BackgroundActive,
+            ),
+            (
+                "a recognized dev server is parked",
+                stop_tail("end_turn", &[shell("npm run dev")]),
+                SessionStatus::BackgroundServer,
+            ),
+            (
+                "a monitor is parked by construction",
+                stop_tail(
+                    "end_turn",
+                    &[bg_task("monitor", "running", r#""description":"tail -f log""#)],
+                ),
+                SessionStatus::BackgroundServer,
+            ),
+            (
+                "a background subagent is busy work",
+                stop_tail(
+                    "end_turn",
+                    &[bg_task(
+                        "subagent",
+                        "running",
+                        r#""description":"explore the repo","agentType":"explore""#,
+                    )],
+                ),
+                SessionStatus::BackgroundActive,
+            ),
+            (
+                "a /loop cron is a parked wakeup",
+                r#","reason":"end_turn","sessionCrons":[{"id":"loop-1","schedule":"every 5 minutes","prompt":"check CI"}]"#
+                    .to_string(),
+                SessionStatus::BackgroundServer,
+            ),
+            (
+                "nothing in flight is plain Idle",
+                stop_tail("end_turn", &[]),
+                SessionStatus::Idle,
+            ),
+        ];
+        for (name, extra, want) in cases {
+            assert_eq!(stop_status(extra), *want, "{name}");
+        }
+    }
+    /// An `r3 watch` run by absolute path, carrying the `id` and `--session`
+    /// fields a real `Stop` includes: none of that stops it being named a
+    /// shell task, so the row is `Review` rather than `Idle`, and a review
+    /// wait is not a tool call.
     #[test]
     fn a_stop_with_an_r3_watch_is_review() {
         let mut state = state_at(SessionStatus::Active);
@@ -1823,74 +1908,56 @@ mod tests {
             HookEvent::Stop,
             &payload(
                 "stop",
-                r#","reason":"end_turn","backgroundTasks":[{
-                    "id":"01a02559-f9f7-7760-8bd5-ab655a564e7c",
-                    "type":"shell","status":"running",
-                    "command":"/home/liteye/projects/hovo/r3/r3 watch review_a130e24bc728 --session grok-deep-review"
-                }]"#,
+                &stop_tail(
+                    "end_turn",
+                    &[bg_task(
+                        "shell",
+                        "running",
+                        concat!(
+                            r#""id":"01a00000-0000-7000-8000-00000000000b","#,
+                            r#""command":"/home/miao/bin/r3 watch review_abc --session grok""#,
+                        ),
+                    )],
+                ),
             ),
         );
         assert_eq!(state.status, SessionStatus::ReviewPending);
         assert_eq!(state.last_tool, None);
     }
-
-    /// A finite background command is busy `Task`; a recognized dev server is
-    /// at-rest `Server`; a `monitor` is at-rest by construction; a background
-    /// subagent is busy work; a `/loop` cron is a parked wakeup.
-    #[test]
-    fn stop_background_tasks_pick_the_tier_from_type_and_command() {
-        let cases: &[(&str, SessionStatus)] = &[
-            (
-                r#","reason":"end_turn","backgroundTasks":[{"type":"shell","status":"running","command":"cargo test"}]"#,
-                SessionStatus::BackgroundActive,
-            ),
-            (
-                r#","reason":"end_turn","backgroundTasks":[{"type":"shell","status":"running","command":"npm run dev"}]"#,
-                SessionStatus::BackgroundServer,
-            ),
-            (
-                r#","reason":"end_turn","backgroundTasks":[{"type":"monitor","status":"running","description":"tail -f log"}]"#,
-                SessionStatus::BackgroundServer,
-            ),
-            (
-                r#","reason":"end_turn","backgroundTasks":[{"type":"subagent","status":"running","description":"explore the repo","agentType":"explore"}]"#,
-                SessionStatus::BackgroundActive,
-            ),
-            (
-                r#","reason":"end_turn","sessionCrons":[{"id":"loop-1","schedule":"every 5 minutes","prompt":"check CI"}]"#,
-                SessionStatus::BackgroundServer,
-            ),
-            (
-                r#","reason":"end_turn","backgroundTasks":[]"#,
-                SessionStatus::Idle,
-            ),
-        ];
-        for (extra, want) in cases {
-            let mut state = state_at(SessionStatus::Active);
-            feed(&mut state, HookEvent::Stop, &payload("stop", extra));
-            assert_eq!(state.status, *want, "extra {extra}");
-        }
-    }
-
     /// Finite work dominates: an r3 watch plus a `cargo test` is `Task`, not
     /// `Review`, matching the launcher's classify-and-learn precedence.
     #[test]
     fn a_transient_task_outranks_an_r3_watch() {
-        let mut state = state_at(SessionStatus::Active);
-        feed(
-            &mut state,
-            HookEvent::Stop,
-            &payload(
-                "stop",
-                r#","reason":"end_turn","backgroundTasks":[
-                    {"type":"shell","status":"running","command":"r3 watch review_abc"},
-                    {"type":"shell","status":"running","command":"cargo test"}
-                ]"#,
-            ),
+        assert_eq!(
+            stop_status(&stop_tail(
+                "end_turn",
+                &[shell("r3 watch review_abc"), shell("cargo test")],
+            )),
+            SessionStatus::BackgroundActive,
         );
-        assert_eq!(state.status, SessionStatus::BackgroundActive);
     }
-
+    /// A completed shell is not in-flight; a session-end Stop still must not
+    /// adopt leftover tasks as live work.
+    #[test]
+    fn a_completed_task_and_a_shutdown_stop_are_not_live_background_work() {
+        assert_eq!(
+            stop_status(&stop_tail(
+                "end_turn",
+                &[bg_task(
+                    "shell",
+                    "completed",
+                    r#""command":"r3 watch review_abc""#,
+                )],
+            )),
+            SessionStatus::Idle,
+            "a completed shell is not in flight",
+        );
+        assert_eq!(
+            stop_status(&stop_tail("shutdown", &[shell("r3 watch review_abc")])),
+            SessionStatus::Active,
+            "a session-end Stop adopts nothing",
+        );
+    }
     /// `idle_prompt` is forwarded as `Stop` but is a Notification payload, so
     /// it has no `backgroundTasks` field. That omission must not retire a
     /// review-watch the previous real Stop already named.
@@ -1905,33 +1972,6 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::ReviewPending);
         assert_eq!(state.session_id.as_deref(), Some("s1"));
-    }
-
-    /// A completed shell is not in-flight; a session-end Stop still must not
-    /// adopt leftover tasks as live work.
-    #[test]
-    fn a_completed_task_and_a_shutdown_stop_are_not_live_background_work() {
-        let mut state = state_at(SessionStatus::Active);
-        feed(
-            &mut state,
-            HookEvent::Stop,
-            &payload(
-                "stop",
-                r#","reason":"end_turn","backgroundTasks":[{"type":"shell","status":"completed","command":"r3 watch review_abc"}]"#,
-            ),
-        );
-        assert_eq!(state.status, SessionStatus::Idle);
-
-        let mut state = state_at(SessionStatus::Active);
-        feed(
-            &mut state,
-            HookEvent::Stop,
-            &payload(
-                "stop",
-                r#","reason":"shutdown","backgroundTasks":[{"type":"shell","status":"running","command":"r3 watch review_abc"}]"#,
-            ),
-        );
-        assert_eq!(state.status, SessionStatus::Active);
     }
 
     /// A subagent's turn-end must not Idle the parent or steal its session id.
