@@ -32,7 +32,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -314,40 +314,6 @@ const SELF_CONTINUES_SQL: &str = "SELECT 1 FROM thread_goals g \
 // Rollout reading
 // =============================================================================
 
-/// Read the tail of a rollout and return whole lines (dropping any leading
-/// partial line from a mid-file seek).
-///
-/// We start with a ~256 KB window but grow it backward (doubling) until the
-/// window either contains a newline — so at least one complete line survives the
-/// leading-partial drop — or reaches the file start. Without this, a single
-/// rollout line longer than the window (e.g. a giant pasted message) would leave
-/// the window newline-free and the `split_once('\n')` drop would discard the
-/// whole thing, losing every later `token_count`/`turn_context` line.
-fn read_rollout_tail(path: &Path) -> Option<String> {
-    const INITIAL_WINDOW: u64 = 256 * 1024;
-    let mut file = std::fs::File::open(path).ok()?;
-    let size = file.metadata().ok()?.len();
-
-    let mut window = INITIAL_WINDOW;
-    loop {
-        let start = size.saturating_sub(window);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut buf = Vec::with_capacity(window.min(size) as usize);
-        file.read_to_end(&mut buf).ok()?;
-        let text = String::from_utf8_lossy(&buf);
-
-        if start == 0 {
-            return Some(text.into_owned());
-        }
-        if let Some((_, rest)) = text.split_once('\n') {
-            return Some(rest.to_string());
-        }
-        // No newline in this window: an oversized line precedes us. Grow and
-        // retry so the preceding complete lines become reachable.
-        window = window.saturating_mul(2);
-    }
-}
-
 #[derive(Deserialize)]
 struct TokenUsage {
     #[serde(default)]
@@ -376,7 +342,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
     let first_prompt = prior
         .and_then(|p| p.first_prompt.clone())
         .or_else(|| read_first_user_prompt(path));
-    let Some(tail) = read_rollout_tail(path) else {
+    let Some(tail) = common::read_tail(path) else {
         return TranscriptStats {
             first_prompt,
             ..TranscriptStats::default()
