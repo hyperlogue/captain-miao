@@ -5,68 +5,73 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-08-23
 
 ### Added
 
+- **A preferences panel (`,` / `Space p`)** sets which agents the pickers offer
+  and in what order, the session layout, keep-awake, on-window-close, the
+  context-pressure thresholds, preview refresh, the table's colors, and Kitty's
+  remote-control password.
 - **Grok Build `Ctrl+V` pastes a screenshot in a remote session**, the same
-  clipboard offer the other shimmable agents use. Grok 1.0.5 only shells out
-  to `wl-paste` when `WAYLAND_DISPLAY` is set, so a pooled launch without a
-  display sets the documented kill switch and a dummy value rather than
-  waiting on arboard.
-
-### Fixed
-
-- **A daemon restart no longer leaves pooled sessions running but unattachable.**
-  The pool lives in the daemon process, so a SIGTERM / upgrade / crash cannot
-  keep the pty; leftover launchers used to survive anyway and attach then
-  refused (`cm-… not in the pool`). They now exit when the daemon that minted
-  their name is gone, and a freshly started daemon SIGTERMs any it still sees.
-- **The npm launcher runs on a bun-only machine.** `#!/usr/bin/env node` made
-  `miao` fail after `bun add -g` when no `node` binary was on PATH; the file
-  now starts with a `/bin/sh` polyglot that execs `node` or `bun`.
-- **A Grok session with live background work no longer reads as Idle.** `Stop`
-  carries `backgroundTasks` / `sessionCrons`; an `r3 watch` now lands on
-  Review, a parked server or `/loop` on Server, and a finite task on Task.
-- **A Grok background subagent no longer wears the parent's title.** Child
-  sessions live as siblings under the same cwd-key and share the hook socket;
-  the launcher was adopting their `summary.json` before dispatch could ignore
-  the payload, so the row flickered between the two `generated_title`s for as
-  long as the child was running.
-- **Grok token counts follow a `signals.json` replace**, the same file-watch
-  re-arm as `/rename` on `summary.json` — not a poll, and not a watch on the
-  session directory.
-- **Grok's glance column drops the `<user_query>` harness wrapper** so the
-  row shows the typed prompt.
-- **Kitty's `miao:sessions` tab is created to the right of the dashboard tab**
-  rather than at the end of the tab bar.
-
-## [0.6.1] - 2026-08-21
+  clipboard offer the other shimmable agents use.
 
 ### Changed
 
-- **Grok Build tracks 1.0.4** more information surfaced on the dashboard thanks
-  to the new API.
-- **Grok no longer uses a synthetic `GROK_HOME`** — hooks live in
-  `~/.grok/hooks/captain-miao.json`, `miao hook` is a no-op without a
-  launcher socket, and leftover `~/.local/state/captain-miao/grok-home` is
-  ignored (remove it yourself after old sessions exit).
+- **Grok Build tracking now runs through 1.0.5**, so titles, branch, token
+  counts, choice prompts and background work all reach the dashboard.
+- **Grok sessions run in your real `~/.grok`** instead of a synthetic
+  `GROK_HOME` (delete the leftover `~/.local/state/captain-miao/grok-home`
+  once old sessions have exited).
 - **Managed Codex sessions use an owned profile in the real Codex home**
   instead of a synthetic `CODEX_HOME` (leftover
-  `~/.local/state/captain-miao/codex-home` is ignored; remove it yourself
-  after old sessions exit).
-- **The new-session popup no longer titles itself with the agent and host**
-  the settings line already names.
-- **A typed workdir sits on the recents list as a ranked row**, so Enter
-  takes it when it beats a filter hit.
+  `~/.local/state/captain-miao/codex-home` is ignored; remove it yourself after
+  old sessions exit).
+- **A typed workdir sits on the recents list as a ranked row**, so Enter takes
+  it when it beats a filter hit.
 
 ### Fixed
 
-- **A bare name in the workdir picker is always a filter**, never a launch
-  of Linux `/sys` or any coincidental directory next to the dashboard.
-- **Codex trust survives a managed launch** instead of prompting again
-  every time.
+- **Pooled rows attach from a direct-local dashboard**, so sessions a remote
+  client launched into this machine's daemon are no longer dead-ended on
+  Enter/`D`/steal and no longer all look free.
+- **Reattaching to a pooled Grok session restores the screen it was using** —
+  the alt screen, mouse tracking, bracketed paste and (under kitty/foot) the
+  keyboard-protocol push, none of which a plain restore replayed.
+- **A daemon restart no longer leaves pooled sessions running but
+  unattachable**; leftover launchers now exit when the daemon that minted their
+  name is gone, and a fresh daemon reaps any it still sees.
+- **`miao-server daemon stop` waits until the pool is actually gone** instead
+  of returning on the signal, which is what left an upgrade showing two rows
+  per session with the second frozen.
+- **A host upgrade no longer restores sessions it failed to end**, which used
+  to fork a transcript between two live agents.
+- **A Grok choice prompt reads as a Decision** and rings for attention, rather
+  than looking like a session doing work.
+- **A Grok session with live background work no longer reads Idle** — an
+  `r3 watch` lands on Review, a parked server or `/loop` on Server, and a
+  finite task on Task.
+- **A Grok subagent's auto-allowed tool no longer strands the parent row on
+  Approval** for minutes with no prompt on screen, while a subagent that
+  genuinely is waiting still shows one.
+- **A Grok background subagent no longer wears the parent's title.**
+- **A Grok `/compact` drops the row's token count to what the session now
+  holds**, rather than leaving it on the last completed turn's total until the
+  next turn ends.
+- **Grok token counts follow a `signals.json` replace**, the same file-watch
+  re-arm as `/rename` on `summary.json`.
+- **Grok's glance column drops the `<user_query>` harness wrapper** so the row
+  shows the typed prompt.
 - **A Grok `/rename` reaches the dashboard row.**
+- **A bare name in the workdir picker is always a filter**, never a launch of
+  Linux `/sys` or any coincidental directory next to the dashboard.
+- **Codex trust survives a managed launch** instead of prompting again every
+  time.
+- **A wide emoji next to an overlay no longer punches a hole in its border.**
+- **Kitty's `miao:sessions` tab is created to the right of the dashboard tab**
+  rather than at the end of the tab bar.
+- **The npm launcher runs on a bun-only machine**; `miao` no longer fails after
+  `bun add -g` when no `node` binary is on PATH.
 
 ## [0.6.0] - 2026-08-19
 
@@ -468,8 +473,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.6.1
+[0.7.0]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hyperlogue/captain-miao/compare/v0.3.0...v0.4.0
