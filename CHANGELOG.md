@@ -5,6 +5,18 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A managed Codex session no longer asks you to trust its hooks on every
+  launch.** Two of the eight hooks were seeded with a trust hash Codex read as
+  changed, because it drops the matcher of an event that has none (`Stop`,
+  `UserPromptSubmit`) before hashing. Refreshing the profile also no longer
+  discards what Codex itself wrote there — Codex persists into the profile it
+  was launched with, so its directory-trust answers, a `/model` change and its
+  own corrections to a trust hash now survive the next launch.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added
@@ -473,6 +485,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0

@@ -11,13 +11,20 @@
 //! JSONL than Claude's transcript, so context tokens and lifecycle signals come
 //! straight from typed events.
 //!
-//! The profile carries only our inline hooks and their trust hashes; the user's
+//! We write only our inline hooks and their trust hashes into it; the user's
 //! `config.toml` and global `hooks.json` are never parsed or changed, and bare
 //! Codex runs never load the profile. This became possible when Codex 0.134
 //! moved named profiles into separate `<name>.config.toml` layers. A profile
 //! does not compose with another named profile, so `--profile` / `-p` is
 //! deliberately reserved on a captain-miao launch and rejected before Codex
 //! starts.
+//!
+//! The file is not ours alone, though: **Codex persists into the profile it was
+//! launched with**, not into the base config, so a managed session's answers —
+//! directory trust, a `/model` change — land there. Refreshing the profile is
+//! therefore a merge, never a rewrite ([`build_profile`]). The user-visible
+//! corner of that: a directory trusted inside a managed session stays untrusted
+//! for a bare `codex` run, and vice versa.
 //!
 //! Trust cannot be moved to `-c` beside an injected hook. Codex registers that
 //! definition under `HookSource::sessionFlags`, but ignores a trust entry passed
@@ -53,7 +60,16 @@ pub(crate) const BIN: &str = "codex";
 /// The one named-profile slot captain-miao reserves on managed Codex launches.
 const PROFILE_NAME: &str = "captain-miao";
 const PROFILE_FILE: &str = "captain-miao.config.toml";
+/// First line of the file and the whole ownership probe, so it has to stay
+/// byte-stable: every profile already on disk would read as someone else's the
+/// moment this string changes, and a launch refuses those.
 const PROFILE_MARKER: &str = "# Managed by captain-miao; changes are overwritten.\n";
+/// What a refresh actually writes. The second line is the honest version of
+/// the first: [`build_profile`] regenerates only the `hooks` tables.
+const PROFILE_HEADER: &str = concat!(
+    "# Managed by captain-miao; changes are overwritten.\n",
+    "# Only [hooks] is regenerated; Codex's own writes here are preserved.\n",
+);
 
 // =============================================================================
 // Filesystem locations
@@ -616,6 +632,8 @@ fn reject_profile_arg(extra_args: &[String]) -> Result<()> {
 /// 0700, and the profile itself is written atomically 0600. Refuse every
 /// pre-existing non-owned entry, including a symlink, so a user profile can
 /// never be replaced merely because it chose the same name.
+///
+/// A refresh **merges** into whatever is already there — see [`build_profile`].
 fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
     if !home.exists() {
         std::fs::DirBuilder::new()
@@ -626,7 +644,7 @@ fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
     }
 
     let path = home.join(PROFILE_FILE);
-    match std::fs::symlink_metadata(&path) {
+    let existing = match std::fs::symlink_metadata(&path) {
         Ok(meta) => {
             if !meta.is_file() || meta.file_type().is_symlink() {
                 anyhow::bail!(
@@ -642,17 +660,16 @@ fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
                     path.display()
                 );
             }
+            Some(current)
         }
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => {
             return Err(e).with_context(|| format!("inspecting Codex profile {}", path.display()));
         }
-    }
+    };
 
-    let contents = build_profile(&path, hooks_json)?;
-    let unchanged = std::fs::read_to_string(&path)
-        .map(|current| current == contents)
-        .unwrap_or(false);
+    let contents = build_profile(&path, hooks_json, existing.as_deref())?;
+    let unchanged = existing.is_some_and(|current| current == contents);
     if !unchanged {
         atomic_write(&path, contents.as_bytes())
             .with_context(|| format!("writing Codex profile {}", path.display()))?;
@@ -689,10 +706,13 @@ fn codex_event_label(pascal: &str) -> Option<&'static str> {
 /// our hooks is dropping the always-`None` `commandWindows`/`statusMessage`,
 /// while keeping `timeout` (Codex's `unwrap_or(600)`) and `async` (false).
 /// Verified byte-for-byte against a real Codex-persisted hash (see tests).
-fn command_hook_hash(label: &str, matcher: &str, command: &str) -> String {
-    let identity = serde_json::json!({
+///
+/// A `None` matcher drops the key rather than hashing a null, for the same
+/// reason: TOML has no null, so the round-trip omits it. Which events carry a
+/// matcher at all is decided in [`build_hooks_settings`].
+fn command_hook_hash(label: &str, matcher: Option<&str>, command: &str) -> String {
+    let mut identity = serde_json::json!({
         "event_name": label,
-        "matcher": matcher,
         "hooks": [{
             "type": "command",
             "command": command,
@@ -700,6 +720,9 @@ fn command_hook_hash(label: &str, matcher: &str, command: &str) -> String {
             "async": false,
         }],
     });
+    if let (Some(matcher), Some(map)) = (matcher, identity.as_object_mut()) {
+        map.insert("matcher".to_string(), serde_json::json!(matcher));
+    }
     let serialized = serde_json::to_vec(&canonical_json(&identity)).unwrap_or_default();
     let digest = Sha256::digest(&serialized);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -730,7 +753,16 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
 /// interactive review. Inline hooks are keyed by the profile file path
 /// itself (`<profile>:<event>:<group>:<handler>`), so every byte that controls
 /// their identity and every byte that trusts it remain in the same owned file.
-fn build_profile(profile_path: &Path, hooks_json: &str) -> Result<String> {
+///
+/// `existing` is the profile as it stands, and **only the `hooks` tables are
+/// ours to regenerate**. Codex persists its own writes into the *selected*
+/// profile layer, not the base config: the answer to its startup "do you trust
+/// the contents of this directory" prompt lands in `[projects."<cwd>"]` here,
+/// as does a `/model` change. Rebuilding the file from scratch dropped those on
+/// the next launch, so every managed session asked to trust the directory
+/// again — the same shape of bug as replacing a whole `hooks.state` table, and
+/// the reason foreign trust entries are kept below too.
+fn build_profile(profile_path: &Path, hooks_json: &str, existing: Option<&str>) -> Result<String> {
     let parsed: serde_json::Value =
         serde_json::from_str(hooks_json).context("parsing Codex hooks settings")?;
     let events = parsed
@@ -747,7 +779,7 @@ fn build_profile(profile_path: &Path, hooks_json: &str) -> Result<String> {
             .as_array()
             .with_context(|| format!("Codex hook event {pascal} is not an array"))?;
         for (gi, group) in groups_array.iter().enumerate() {
-            let matcher = group.get("matcher").and_then(|m| m.as_str()).unwrap_or("*");
+            let matcher = group.get("matcher").and_then(|m| m.as_str());
             let handlers = group
                 .get("hooks")
                 .and_then(|h| h.as_array())
@@ -772,12 +804,48 @@ fn build_profile(profile_path: &Path, hooks_json: &str) -> Result<String> {
                 .with_context(|| format!("converting Codex hook event {pascal} to TOML"))?,
         );
     }
+    // Anything in the file that is not a hook definition of ours stays. A
+    // profile that no longer parses is past preserving — Codex could not load
+    // it either — so that one case regenerates from nothing.
+    let mut profile: toml::Table = existing
+        .and_then(|current| current.parse().ok())
+        .unwrap_or_default();
+    let previous = match profile.remove("hooks") {
+        Some(toml::Value::Table(t)) => t,
+        _ => toml::map::Map::new(),
+    };
+
+    // Two kinds of entry in the file survive a refresh. One is a trust entry
+    // keyed to some *other* config file: approving a user or project hook
+    // mid-session writes it into whichever profile is selected, which is ours.
+    //
+    // The other is one of ours that Codex has since rewritten. It writes an
+    // approval back into the profile it was launched with, so a value on disk
+    // under our prefix is either what we last wrote or Codex's own correction
+    // of it — and while the definition it trusts is the definition we are
+    // writing, its answer beats ours. That is what keeps a future Codex
+    // normalizing an identity differently from [`command_hook_hash`] to a
+    // single prompt: the user is asked once, and the answer sticks instead of
+    // being re-seeded away on the next launch. Keys under our prefix that we
+    // no longer emit are retired either way.
+    let prefix = format!("{}:", profile_path.display());
+    let same_definitions = previous
+        .iter()
+        .filter(|(key, _)| key.as_str() != "state")
+        .eq(hooks.iter());
+    if let Some(toml::Value::Table(carried)) = previous.get("state") {
+        for (key, value) in carried {
+            let ours = key.starts_with(&prefix);
+            if !ours || (same_definitions && state.contains_key(key)) {
+                state.insert(key.clone(), value.clone());
+            }
+        }
+    }
     hooks.insert("state".to_string(), toml::Value::Table(state));
 
-    let mut profile = toml::map::Map::new();
     profile.insert("hooks".to_string(), toml::Value::Table(hooks));
     let serialized = toml::to_string(&profile).context("serializing Codex profile")?;
-    Ok(format!("{PROFILE_MARKER}{serialized}"))
+    Ok(format!("{PROFILE_HEADER}{serialized}"))
 }
 
 /// Build Codex's hook event table as JSON for the launcher's generic settings
@@ -791,26 +859,40 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
 
-    let hook = |event: HookEvent| -> serde_json::Value {
-        serde_json::json!([{
-            "matcher": "*",
-            "hooks": [{
+    let hook = |event: HookEvent, matcher: Option<&str>| -> serde_json::Value {
+        let mut group = serde_json::Map::new();
+        if let Some(matcher) = matcher {
+            group.insert("matcher".to_string(), serde_json::json!(matcher));
+        }
+        group.insert(
+            "hooks".to_string(),
+            serde_json::json!([{
                 "type": "command",
                 "command": format!("{exe_q} hook --agent codex {}", event.as_kebab()),
-            }],
-        }])
+            }]),
+        );
+        serde_json::Value::Array(vec![serde_json::Value::Object(group)])
     };
+    // A matcher on `UserPromptSubmit` or `Stop` is not merely useless, it
+    // silently costs the hook its trust: Codex drops the matcher of an event
+    // that has none while parsing, so the identity it hashes has no matcher
+    // *key* at all, and a seeded hash computed with one reads back as
+    // `modified` — the "N hooks are new or changed" prompt, on every launch,
+    // for as long as we keep re-seeding it. Probed with `hooks/list` over
+    // `codex app-server` on 0.149.0: every other event reports the `"*"` it
+    // was given, these two report `null`.
+    let matcherless = None;
 
     serde_json::json!({
         "hooks": {
-            "SessionStart":      hook(HookEvent::SessionStart),
-            "UserPromptSubmit":  hook(HookEvent::PromptSubmit),
-            "PreToolUse":        hook(HookEvent::PreToolUse),
-            "PostToolUse":       hook(HookEvent::PostToolUse),
-            "PermissionRequest": hook(HookEvent::PermissionRequest),
-            "Stop":              hook(HookEvent::Stop),
-            "PreCompact":        hook(HookEvent::PreCompact),
-            "PostCompact":       hook(HookEvent::PostCompact),
+            "SessionStart":      hook(HookEvent::SessionStart, Some("*")),
+            "UserPromptSubmit":  hook(HookEvent::PromptSubmit, matcherless),
+            "PreToolUse":        hook(HookEvent::PreToolUse, Some("*")),
+            "PostToolUse":       hook(HookEvent::PostToolUse, Some("*")),
+            "PermissionRequest": hook(HookEvent::PermissionRequest, Some("*")),
+            "Stop":              hook(HookEvent::Stop, matcherless),
+            "PreCompact":        hook(HookEvent::PreCompact, Some("*")),
+            "PostCompact":       hook(HookEvent::PostCompact, Some("*")),
         }
     })
     .to_string()
@@ -1357,20 +1439,35 @@ mod tests {
 
     #[test]
     fn command_hook_hash_matches_codex_persisted_value() {
-        // Hermetic regression anchor for our reproduction of Codex's hook-trust
+        // Hermetic regression anchors for our reproduction of Codex's hook-trust
         // hashing (TOML-normalized identity → canonical JSON → sha256). No
         // `codex` binary, file, or network involved. The algorithm was validated
         // during development against a real `$CODEX_HOME/config.toml` that Codex
-        // wrote after an interactive "Trust all and continue"; this frozen
-        // input→hash pair then guards against *us* regressing that reproduction.
-        // It does NOT detect a future *Codex* changing its algorithm — the value
-        // is frozen, so that case slips past here and instead resurfaces the
-        // one-time trust prompt in the field. The command is a placeholder path;
-        // the hash covers exactly this literal, so re-freeze it if you edit it.
+        // wrote after an interactive "Trust all and continue", and each value
+        // below was re-read from a live `hooks/list` on 0.149.0; these frozen
+        // input→hash pairs then guard against *us* regressing that reproduction.
+        // They do NOT detect a future *Codex* changing its algorithm — the
+        // values are frozen, so that case slips past here and instead
+        // resurfaces the trust prompt in the field, which
+        // `build_profile` then heals by carrying Codex's own correction
+        // forward. The commands are placeholder paths; each hash covers exactly
+        // that literal, so re-freeze it if you edit one.
         let cmd = "/usr/local/bin/captain-miao hook --agent codex permission-request";
         assert_eq!(
-            command_hook_hash("permission_request", "*", cmd),
+            command_hook_hash("permission_request", Some("*"), cmd),
             "sha256:ede30d21fa951d0bb9bc60a12e12755ee1a789566aab412f398596e0f2d6302b",
+        );
+        // A matcher-less event hashes an identity with no matcher key — the
+        // difference that cost `Stop` and `UserPromptSubmit` their trust on
+        // every launch.
+        let cmd = "/usr/local/bin/captain-miao hook --agent codex stop";
+        assert_eq!(
+            command_hook_hash("stop", None, cmd),
+            "sha256:90fd1d6853d72d9d677685e0d64a0dafcbce96d50962de1dabaa6065823ec50c",
+        );
+        assert_ne!(
+            command_hook_hash("stop", Some("*"), cmd),
+            command_hook_hash("stop", None, cmd),
         );
     }
 
@@ -1415,7 +1512,7 @@ mod tests {
     #[test]
     fn profile_contains_only_inline_hooks_and_own_trust() {
         let path = PathBuf::from("/users/me/.codex/captain-miao.config.toml");
-        let profile = build_profile(&path, &build_hooks_settings("/run/x.sock")).unwrap();
+        let profile = build_profile(&path, &build_hooks_settings("/run/x.sock"), None).unwrap();
         assert!(profile.starts_with(PROFILE_MARKER));
         let doc: toml::Table = profile.parse().unwrap();
         assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
@@ -1428,6 +1525,131 @@ mod tests {
         assert!(doc.get("features").is_none());
         assert!(doc.get("model").is_none());
         assert!(doc.get("projects").is_none());
+    }
+
+    #[test]
+    fn profile_refresh_keeps_what_codex_wrote_into_the_profile() {
+        // Codex persists into the *selected* profile layer, so a managed
+        // session's answers land in our file: directory trust from its startup
+        // prompt, a `/model` change, and a trust entry for someone else's hook.
+        // A refresh that rebuilt the file from scratch dropped all three, which
+        // is what brought the trust prompt back on every managed launch.
+        let home = scratch_home("merge");
+        let hooks = build_hooks_settings("/run/x.sock");
+        let path = ensure_profile_at(&home, &hooks).unwrap();
+        let stale = format!("{}:removed_event:0:0", path.display());
+        let mut doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc.insert("model".to_string(), toml::Value::String("gpt-5.5".into()));
+        doc.insert(
+            "projects".to_string(),
+            toml::Value::try_from(std::collections::BTreeMap::from([(
+                "/work/repo".to_string(),
+                std::collections::BTreeMap::from([(
+                    "trust_level".to_string(),
+                    "trusted".to_string(),
+                )]),
+            )]))
+            .unwrap(),
+        );
+        let state = doc["hooks"]["state"].as_table_mut().unwrap();
+        state.insert(
+            "/work/repo/.codex/hooks.json:stop:0:0".to_string(),
+            toml::Value::try_from(std::collections::BTreeMap::from([(
+                "trusted_hash".to_string(),
+                "sha256:their-hook".to_string(),
+            )]))
+            .unwrap(),
+        );
+        state.insert(
+            stale.clone(),
+            toml::Value::try_from(std::collections::BTreeMap::from([(
+                "trusted_hash".to_string(),
+                "sha256:ours-but-retired".to_string(),
+            )]))
+            .unwrap(),
+        );
+        atomic_write(
+            &path,
+            format!("{PROFILE_HEADER}{}", toml::to_string(&doc).unwrap()).as_bytes(),
+        )
+        .unwrap();
+
+        ensure_profile_at(&home, &hooks).unwrap();
+        let doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            doc["projects"]["/work/repo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        let state = doc["hooks"]["state"].as_table().unwrap();
+        assert_eq!(
+            state["/work/repo/.codex/hooks.json:stop:0:0"]["trusted_hash"].as_str(),
+            Some("sha256:their-hook"),
+            "a trust entry for another config file survives our refresh"
+        );
+        assert!(
+            !state.contains_key(&stale),
+            "an entry for an event we no longer emit is retired"
+        );
+        // Our own hooks are still there, still trusted, still exactly ours.
+        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(state.len(), 9);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn profile_refresh_carries_a_correction_codex_made_to_our_own_trust() {
+        // Codex rewrites the trust entry in place when the user answers its
+        // "hooks are new or changed" prompt. Ours is the same file, so a
+        // refresh must not put the rejected hash back — otherwise a Codex that
+        // hashes an identity differently than we do asks again on every single
+        // launch, which is exactly how `Stop` and `UserPromptSubmit` behaved.
+        let home = scratch_home("carry");
+        let hooks = build_hooks_settings("/run/x.sock");
+        let path = ensure_profile_at(&home, &hooks).unwrap();
+        let key = format!("{}:stop:0:0", path.display());
+        let corrected = "sha256:what-this-codex-actually-computes";
+
+        let approve = |path: &Path, key: &str| {
+            let mut doc: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+            doc["hooks"]["state"][key]["trusted_hash"] = toml::Value::String(corrected.into());
+            atomic_write(
+                path,
+                format!("{PROFILE_HEADER}{}", toml::to_string(&doc).unwrap()).as_bytes(),
+            )
+            .unwrap();
+        };
+        approve(&path, &key);
+
+        ensure_profile_at(&home, &hooks).unwrap();
+        let doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["hooks"]["state"][&key]["trusted_hash"].as_str(),
+            Some(corrected),
+            "an approval for an unchanged hook survives the next launch"
+        );
+
+        // A *changed* command is a different hook, so the carried answer no
+        // longer applies and our own hash takes over again.
+        let moved = hooks.replace("hook --agent codex", "hook --moved --agent codex");
+        assert_ne!(moved, hooks);
+        ensure_profile_at(&home, &moved).unwrap();
+        let doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["hooks"]["state"][&key]["trusted_hash"].as_str(),
+            Some(
+                command_hook_hash(
+                    "stop",
+                    None,
+                    &format!(
+                        "{} hook --moved --agent codex stop",
+                        shell_quote(&std::env::current_exe().unwrap().to_string_lossy())
+                    )
+                )
+                .as_str()
+            ),
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
