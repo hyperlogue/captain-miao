@@ -402,6 +402,11 @@ const GENERIC_INTERPS: &[&str] = &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux
 /// remains the backstop for everything a local read cannot see (glibc version,
 /// NSS, a truncated transfer); this just stops the plausible-looking local
 /// mistake from getting that far. Pure.
+///
+/// `Result<(), String>`, not `anyhow::Result`, for the reason the whole
+/// provisioning path uses it (`src/backend.rs`): the `Err` is a sentence the
+/// hosts panel prints and the upload gate remembers, not an error a caller
+/// propagates.
 pub(crate) fn check_interpreter(bytes: &[u8], target: &str) -> Result<(), String> {
     let Some(interp) = elf_interpreter(bytes) else {
         return Ok(()); // static, or not an ELF we can read — the host decides.

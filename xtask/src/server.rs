@@ -21,6 +21,13 @@
 //! step is memoised here, keyed on the digest of the binary that arrived,
 //! because compressing ~9 MB at maximum effort is the one part that would
 //! otherwise cost real time on a no-op run.
+//!
+//! **The fallible functions here return `Result<_, String>` rather than
+//! `anyhow::Result`.** `xtask` is a build tool whose caller's whole handling of
+//! a failure is to print it and set an exit code: there is no layer above that
+//! adds context, inspects a source chain, or downcasts. A `String` says that
+//! outright, and it keeps every message something written for the person running
+//! `cargo xtask dist` — which is the only reader an error here ever gets.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

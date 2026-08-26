@@ -2138,6 +2138,16 @@ fn remote_shell_argv(target: &str, options: &[String], cwd: &str) -> Vec<String>
 // the cache path is ours.** A version-matching binary the user installed always
 // wins and is never overwritten; the cache path is refreshed to match our
 // payload exactly whenever it doesn't.
+//
+// **Everything fallible in this section returns `Result<_, String>`, not
+// `anyhow::Result`** — the one place in the dashboard that does. A provisioning
+// failure is not propagated; it is *stored and re-displayed*. `UploadGate` and
+// the terminfo gate keep it in a map to suppress the retry that would otherwise
+// repeat a multi-megabyte upload every reconnect, and `ConnLog` shows it in the
+// hosts panel verbatim. That wants a `Clone`, comparable, already-phrased-for-a-
+// human sentence, which is what these functions build and what `anyhow::Error`
+// is not. Where an error really does propagate to a caller — `open_session`,
+// `attach_plan`, `shell_plan` — it is `anyhow::Result` like everywhere else.
 // =============================================================================
 
 /// The binary's name: what it's called on the remote's `PATH`, and what a
