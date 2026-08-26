@@ -1,5 +1,30 @@
-//! Preferences overlay (`InputMode::Prefs`). Writes `dashboard-overrides.json`
-//! only — never `config.toml`.
+//! Preferences overlay (`InputMode::Prefs`): the handful of tunables worth
+//! changing without leaving the dashboard.
+//!
+//! **It writes `dashboard-overrides.json` and never `config.toml`.** That file
+//! is the user's — hand-edited, Home Manager-generated, or a dotfiles symlink —
+//! and a TUI that rewrote it would fight whatever generates it. So settings
+//! stack in three layers, and this overlay only ever touches the top one:
+//!
+//! 1. the compiled default,
+//! 2. `~/.config/captain-miao/config.toml`, the declarative file,
+//! 3. `dashboard-overrides.json`'s `prefs`, what this overlay writes.
+//!
+//! Every field of [`PrefsOverrides`] is therefore an `Option`, and `None` means
+//! *inherit* rather than "off" — which is why **resetting a row writes `None`
+//! rather than the default value**. Writing the default would freeze today's
+//! compiled-in number into the user's state file, and a later config.toml edit
+//! would then appear to do nothing. [`apply_prefs_to_config`] is the one place
+//! layer 3 is folded onto 1+2, and [`App::reapply_live_config`] re-runs the
+//! whole stack from disk after any write.
+//!
+//! Two rows are deliberately absent, because they are not single values: the
+//! default agent is the first entry of the ordered agent list in this overlay,
+//! and the default host is the first entry of the one behind `Space h`.
+//!
+//! The overlay itself is two panes ([`PrefsPane`]) — categories on the left,
+//! that category's rows on the right — with a row's editor opening in place.
+//! `docs/prefs-overlay.md` carries the design; this file is the implementation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -16,6 +41,8 @@ use super::format::{centered_rect, clear_overlay};
 use super::picker::TextInput;
 use super::{Action, App, InputMode};
 
+/// The left pane's tabs. `ALL` is the order they cycle in; [`Self::visible`]
+/// is what hides one whose rows this terminal cannot offer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrefsCategory {
     Agents,
@@ -74,17 +101,28 @@ impl PrefsCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which pane has the cursor. The overlay opens on `Items`, because landing on
+/// the category list would make every visit start with an extra keystroke.
 enum PrefsPane {
     Categories,
     Items,
 }
 
+/// The overlay's whole state, `Some` exactly while `input_mode == Prefs`.
+///
+/// Only the *cursor* lives here. An edited value is written straight through to
+/// `App` and `dashboard-overrides.json` as it is committed, so closing the
+/// overlay — by any route, including a crash — never loses or half-applies a
+/// change, and there is no "unsaved" state to reconcile.
 #[derive(Debug)]
 pub(crate) struct PrefsState {
     category: PrefsCategory,
     cursor: usize,
     pane: PrefsPane,
+    /// The in-place editor for a text row, `Some` only while it is open.
     field: Option<TextInput>,
+    /// "Reset everything" is armed by one keypress and fired by a second, since
+    /// it is the only row here that cannot be undone by re-typing a value.
     pending_reset_all: bool,
 }
 
@@ -100,7 +138,14 @@ impl PrefsState {
     }
 }
 
-/// Extra overlay fields stored under `dashboard-overrides.json` `prefs`.
+/// Layer 3: what this overlay has overridden, stored under
+/// `dashboard-overrides.json`'s `prefs` key.
+///
+/// Every field is `Option` and skipped when `None`, so the file records only
+/// what the user actually changed — and `DashboardOverrides` skips the whole
+/// `prefs` key via [`Self::is_empty`], leaving no trace at all until something
+/// is set. Absence is what makes the layer below show through; see the module
+/// doc on why a reset writes `None` rather than the current default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PrefsOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +183,10 @@ pub(crate) struct PrefsOverrides {
 }
 
 impl PrefsOverrides {
+    /// Whether nothing is overridden — the `skip_serializing_if` for the whole
+    /// `prefs` key. Spelled out field by field rather than derived from
+    /// `PartialEq` with the default, so adding a field is a compile error here
+    /// rather than a silently-always-written key.
     pub(super) fn is_empty(&self) -> bool {
         self.on_window_close.is_none()
             && self.pooled.is_none()
@@ -163,6 +212,8 @@ pub(crate) struct AgentPref {
     pub enabled: bool,
 }
 
+/// Every known backend, in declaration order, all enabled — what a dashboard
+/// that has never opened this overlay shows.
 pub(super) fn default_agent_list() -> Vec<(AgentControl, bool)> {
     AgentControl::ALL
         .iter()
@@ -171,6 +222,13 @@ pub(super) fn default_agent_list() -> Vec<(AgentControl, bool)> {
         .collect()
 }
 
+/// Merge the stored agent order with the backends this build knows about.
+///
+/// The stored list leads, so the user's order and enable/disable survive; a
+/// stored id this build no longer recognises is dropped rather than kept as a
+/// dead row; and a backend added since the list was written is appended
+/// **enabled**, so upgrading surfaces new agents instead of hiding them behind
+/// a preference the user never expressed.
 pub(super) fn resolve_agent_list(prefs: Option<&[AgentPref]>) -> Vec<(AgentControl, bool)> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -205,6 +263,8 @@ pub(super) fn prefer_agent_first(
     list
 }
 
+/// The default agent: the first enabled entry of the ordered list. This is why
+/// there is no "default agent" row — reordering *is* the setting.
 pub(super) fn first_enabled_agent(list: &[(AgentControl, bool)]) -> AgentControl {
     list.iter()
         .find(|(_, on)| *on)
@@ -212,6 +272,9 @@ pub(super) fn first_enabled_agent(list: &[(AgentControl, bool)]) -> AgentControl
         .unwrap_or_default()
 }
 
+/// Fold layer 3 onto a `Config` already carrying layers 1 and 2. One direction
+/// only: this reads the overrides and writes the config, never the reverse, so
+/// a `None` leaves whatever `config.toml` and the compiled default settled on.
 pub(super) fn apply_prefs_to_config(cfg: &mut config::Config, prefs: &PrefsOverrides) {
     if let Some(ref s) = prefs.sessions_layout
         && let Some(l) = SessionsLayout::from_label(s)
@@ -265,6 +328,10 @@ pub(super) fn apply_prefs_to_config(cfg: &mut config::Config, prefs: &PrefsOverr
 }
 
 #[derive(Clone, Copy)]
+// Each category's rows are an enum plus a `const` slice giving their order.
+// The slice is what the cursor indexes and what `prefs_item_count` measures, so
+// a row that exists but is left out of the slice simply never appears — which
+// is the intended way to stage one, not an oversight to fix.
 enum GeneralRow {
     Layout,
     KeepAwake,
@@ -362,6 +429,9 @@ impl App {
         }
     }
 
+    /// The overlay's key dispatch. Fixed keys, not the remappable table — this
+    /// is a text-input mode like the pickers, and an open field must be able to
+    /// swallow any character.
     pub(super) fn handle_prefs_key(&mut self, key: KeyEvent) -> Option<Action> {
         if self.prefs.as_ref().is_some_and(|p| p.pending_reset_all) {
             match key.code {
@@ -521,6 +591,9 @@ impl App {
         }
     }
 
+    /// Move the highlighted agent up or down. Reordering is the only edit here
+    /// that changes another setting as a side effect: the first enabled entry is
+    /// the default agent.
     fn prefs_reorder(&mut self, delta: i32) {
         let Some(st) = self.prefs.as_ref() else {
             return;
@@ -575,6 +648,10 @@ impl App {
         self.reapply_live_config();
     }
 
+    /// Enter on the highlighted row. What that means is per-row: a toggle
+    /// flips, an enumerated value advances, and a free-form one opens its editor
+    /// seeded with the value currently in force — which may come from any of the
+    /// three layers, so what you see is what you are about to override.
     fn prefs_activate(&mut self) {
         let Some(st) = self.prefs.as_ref() else {
             return;
@@ -675,6 +752,9 @@ impl App {
         }
     }
 
+    /// Accept an edited text row. An unparseable or empty value clears the
+    /// override rather than storing junk, so a typo degrades to "inherit"
+    /// instead of pinning a nonsense number.
     fn commit_prefs_field(&mut self, cat: PrefsCategory, cursor: usize, raw: String) {
         match cat {
             PrefsCategory::Display => {
@@ -739,6 +819,9 @@ impl App {
         self.reapply_live_config();
     }
 
+    /// Nudge a numeric row without opening its editor. Steps are relative to the
+    /// value currently in force, so the first nudge on an un-overridden row
+    /// starts from the inherited value rather than from zero.
     fn prefs_step(&mut self, dir: i64) {
         let Some(st) = self.prefs.as_ref() else {
             return;
@@ -769,6 +852,8 @@ impl App {
         self.commit_prefs_field(PrefsCategory::Display, cursor, next.to_string());
     }
 
+    /// `r` on a row: clear that override so the layer below shows through
+    /// again. Note every arm assigns `None`, never a value — see the module doc.
     fn prefs_reset_row(&mut self) {
         let Some(st) = self.prefs.as_ref() else {
             return;
@@ -822,6 +907,9 @@ impl App {
         self.reapply_live_config();
     }
 
+    /// The armed half of "reset everything": drop every override at once and
+    /// re-derive what depends on them, so the dashboard matches a fresh install
+    /// reading this user's `config.toml`.
     fn reset_all_prefs(&mut self) {
         self.extra_prefs = PrefsOverrides::default();
         self.agent_order = default_agent_list();
@@ -833,6 +921,11 @@ impl App {
         self.set_status("preference overrides cleared".into(), false);
     }
 
+    /// Rebuild the live `Config` from disk and re-fold the overrides onto it,
+    /// then re-read the two settings `App` caches out of it. Called after any
+    /// write here: re-reading from disk rather than patching the in-memory copy
+    /// is what keeps a hand-edit of `config.toml` from being shadowed by a stale
+    /// value this overlay happened to be holding.
     pub(super) fn reapply_live_config(&mut self) {
         let mut cfg = config::Config::from_disk();
         apply_prefs_to_config(&mut cfg, &self.extra_prefs);
