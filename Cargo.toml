@@ -97,6 +97,10 @@ remote = []
 # embeds the finished `.gray` masks (the `.png` outputs are eyeball previews).
 [dev-dependencies]
 tiny-skia = "0.11"
+# The same `cm-core`, plus `LauncherState::for_test`. Listing it here rather than
+# on the normal dependency keeps the helper out of every non-test build: dev-
+# dependency features are not unified into one under the v2+ resolver.
+cm-core = { path = "crates/cm-core", features = ["test-support"] }
 
 [profile.release]
 # Strip symbols from the release binary (~0.9 MB smaller); we ship the binary,

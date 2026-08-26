@@ -573,7 +573,7 @@ fn split_for_completion(path: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{HostId, SessionStatus};
+    use crate::state::SessionStatus;
 
     /// The picker sends back what it was shown, and what it was shown came out
     /// of `recent_dirs` — i.e. collapsed. So the match has to be made in that
@@ -626,34 +626,10 @@ mod tests {
 
     fn codex_state(session_id: Option<&str>) -> LauncherState {
         LauncherState {
-            agent: AgentControl::Codex,
             launcher_pid: 1,
             session_id: session_id.map(str::to_string),
-            child_session_ids: Vec::new(),
-            window_id: None,
-            tab_id: None,
-            cwd: String::new(),
-            status: SessionStatus::Idle,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
-            child_pid: None,
-            last_error: None,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            name: None,
             first_prompt: Some("first prompt".into()),
-            pool_session: None,
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            alt_screen: false,
-            kitty_keyboard: false,
-            flags: None,
-            attached: None,
-            host: HostId::local(),
+            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
         }
     }
 

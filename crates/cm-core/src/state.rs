@@ -988,7 +988,7 @@ pub struct LauncherState {
     pub host: HostId,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl LauncherState {
     /// A blank row for one backend, for tests that care about two or three
     /// fields and had to spell all two dozen to get them.
@@ -996,10 +996,15 @@ impl LauncherState {
     /// It lives here rather than in a test module because the point is the
     /// *compiler error*: this struct has no `Default` on purpose — every field
     /// is a decision a real launcher makes — so a new field would otherwise
-    /// break eight identical literals across seven backend test modules and the
-    /// launcher's own, which is exactly the tax that keeps people from adding
-    /// the field. One literal, one fix.
-    pub(crate) fn for_test(agent: AgentControl, status: SessionStatus) -> Self {
+    /// break a dozen identical literals across every backend's test module, the
+    /// launcher's own, and the dashboard's, which is exactly the tax that keeps
+    /// people from adding the field. One literal, one fix.
+    ///
+    /// Gated on `any(test, feature = "test-support")` rather than plain
+    /// `cfg(test)` so it survives compilation as a *dependency*: a `cfg(test)`
+    /// item is invisible to the dashboard crate, which is where two of those
+    /// literals lived precisely because they could not call this.
+    pub fn for_test(agent: AgentControl, status: SessionStatus) -> Self {
         Self {
             agent,
             launcher_pid: 0,
@@ -1412,34 +1417,9 @@ mod tests {
     #[test]
     fn find_live_pool_session_requires_matching_name_and_live_pid() {
         let mk = |pid: u32, pool: Option<&str>| LauncherState {
-            agent: crate::agent::AgentControl::Claude,
             launcher_pid: pid,
-            session_id: None,
-            child_session_ids: Vec::new(),
-            window_id: None,
-            tab_id: None,
-            cwd: String::new(),
-            status: SessionStatus::Idle,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
-            child_pid: None,
-            last_error: None,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            name: None,
-            first_prompt: None,
             pool_session: pool.map(str::to_string),
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            alt_screen: false,
-            kitty_keyboard: false,
-            flags: None,
-            attached: None,
-            host: HostId::default(),
+            ..LauncherState::for_test(crate::agent::AgentControl::Claude, SessionStatus::Idle)
         };
         let states = vec![
             mk(10, None),                  // local session, no pool name
@@ -1498,34 +1478,9 @@ mod tests {
     #[test]
     fn pooled_launcher_pids_skips_local_sessions() {
         let mk = |pid: u32, pool: Option<&str>| LauncherState {
-            agent: crate::agent::AgentControl::Claude,
             launcher_pid: pid,
-            session_id: None,
-            child_session_ids: Vec::new(),
-            window_id: None,
-            tab_id: None,
-            cwd: String::new(),
-            status: SessionStatus::Idle,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
-            child_pid: None,
-            last_error: None,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            name: None,
-            first_prompt: None,
             pool_session: pool.map(str::to_string),
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            alt_screen: false,
-            kitty_keyboard: false,
-            flags: None,
-            attached: None,
-            host: HostId::default(),
+            ..LauncherState::for_test(crate::agent::AgentControl::Claude, SessionStatus::Idle)
         };
         let pids = pooled_launcher_pids(&[
             mk(1, None),

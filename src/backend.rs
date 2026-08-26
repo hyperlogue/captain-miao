@@ -4989,34 +4989,11 @@ mod tests {
 
     fn test_state(pid: u32) -> LauncherState {
         LauncherState {
-            agent: AgentControl::Claude,
             launcher_pid: pid,
             session_id: Some(format!("sess-{pid}")),
-            child_session_ids: Vec::new(),
-            window_id: None,
-            tab_id: None,
             cwd: "/tmp".to_string(),
-            status: SessionStatus::Idle,
-            last_tool: None,
-            updated_at: 0,
-            active_since: None,
-            last_prompt: None,
             child_pid: Some(pid + 1),
-            last_error: None,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            name: None,
-            first_prompt: None,
-            pool_session: None,
-            launch_id: None,
-            terminal: None,
-            terminfo: None,
-            alt_screen: false,
-            kitty_keyboard: false,
-            flags: None,
-            attached: None,
-            host: crate::state::HostId::local(),
+            ..LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle)
         }
     }
 

@@ -171,39 +171,19 @@ fn find_cell(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> 
 
 fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
     LauncherState {
-        agent: crate::agent::AgentControl::Claude,
         launcher_pid: pid,
         session_id: Some(format!("sess-{pid}")),
-        child_session_ids: Vec::new(),
         window_id: Some(WindowId::from(pid as u64 * 100)),
         tab_id: Some(TabId::from(pid as u64)),
         cwd: cwd.to_string(),
-        status,
-        last_tool: None,
         updated_at: LauncherState::now(),
-        active_since: None,
-        last_prompt: None,
-        child_pid: None,
-        last_error: None,
-        context_tokens: None,
-        context_window: None,
-        model: None,
-        name: None,
-        first_prompt: None,
-        pool_session: None,
         // A dashboard-spawned local session: it carries a launch_id and the
         // dashboard holds the matching (local, launch_id) → window binding.
         // `set_sessions` seeds that binding from `window_id`, so resolution works
         // in tests exactly as it does live. A few tests clear this to exercise the
         // hand-launched fallback (no launch_id, self-reported window_id).
         launch_id: Some(format!("launch-{pid}")),
-        terminal: None,
-        terminfo: None,
-        alt_screen: false,
-        kitty_keyboard: false,
-        flags: None,
-        attached: None,
-        host: crate::state::HostId::local(),
+        ..LauncherState::for_test(crate::agent::AgentControl::Claude, status)
     }
 }
 

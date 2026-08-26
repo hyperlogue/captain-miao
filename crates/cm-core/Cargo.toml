@@ -12,6 +12,15 @@ description = "captain-miao shared core: state, wire protocol, agent backends, l
 # so it cross-compiles cleanly as part of the server and stays a pure data/logic
 # layer. It does carry bundled SQLite (for Codex titles) — portable C, unlike the
 # platform-linking libshpool, so it cross-compiles without trouble.
+# `test-support` exposes `LauncherState::for_test` to *other* crates' tests. It
+# is not a `#[cfg(test)]` item because a `#[cfg(test)]` item in a dependency is
+# never compiled — so the dashboard crate, which has the two largest test
+# modules in the workspace, could not reach the helper written to spare it two
+# dozen-field literals. Off by default: a release build and cm-core's public API
+# carry none of it, and the dashboard turns it on through its dev-dependency.
+[features]
+test-support = []
+
 [dependencies]
 # `fs` is for `clipboard paste` alone: it streams the image to disk rather than
 # buffering up to the 128 MB cap in memory first.
