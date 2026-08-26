@@ -3863,6 +3863,76 @@ fn workdir_picker_lists_recent_cwds() {
     assert_eq!(picker.items[0].payload.as_deref(), Some("~/alpha"));
 }
 
+/// Opening the picker over a session is nearly always "another one of these",
+/// so the cursor starts on that row's cwd and a bare Enter launches it — rather
+/// than on the most-recent dir, which is the same directory only when the
+/// focused row happens to be the newest launch.
+#[test]
+fn workdir_picker_starts_on_the_focused_sessions_cwd() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
+    d.set_sessions(vec![session(1, "~/beta", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/beta"),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+/// A session launched by hand (`miao launch claude .`) recorded an absolute cwd
+/// on its state file, while the picker's rows are host-canonical (§3). Both
+/// sides collapse before the match, or the preselect would work only for rows
+/// this picker launched.
+#[test]
+fn workdir_picker_preselect_matches_an_absolute_session_cwd() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
+    d.set_sessions(vec![session(1, "/home/test/beta/", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/beta"),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+/// A cwd the host's list doesn't hold leaves the ranking alone — the recents
+/// are the host's own list, and nothing is injected to make the miss look like
+/// a hit.
+#[test]
+fn workdir_picker_preselect_is_a_noop_when_the_cwd_is_not_listed() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
+    d.set_sessions(vec![session(1, "/var/log/archive", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/alpha"),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
+/// The list belongs to the host the launch lands on, so the same spelling under
+/// another machine's home is a different directory: a focused *remote* row must
+/// not move the cursor of a picker pointed at this machine.
+#[test]
+fn workdir_picker_preselect_is_host_gated() {
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 15);
+    d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
+    let mut s = session(1, "~/beta", SessionStatus::Active);
+    s.host = HostId("box".into());
+    s.pool_session = Some("cm-1".to_string());
+    d.set_sessions(vec![s]);
+
+    d.press(KeyCode::Char('O'));
+    match d.press(KeyCode::Enter) {
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/alpha"),
+        other => panic!("expected NewSessionSplit, got {other:?}"),
+    }
+}
+
 #[test]
 fn workdir_picker_selects_recent_over_free_input() {
     let mut d = TestDashboard::new(120, 15);

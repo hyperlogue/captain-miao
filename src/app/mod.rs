@@ -5498,6 +5498,7 @@ impl App {
             },
         });
         self.sync_workdir_picker_list();
+        self.preselect_focused_workdir();
         self.input_mode = InputMode::Picker;
         self.refresh_picker_status_bar();
     }
@@ -5595,6 +5596,57 @@ impl App {
             } else if active.picker.cursor >= n {
                 active.picker.cursor = n - 1;
             }
+        }
+    }
+
+    /// Put the workdir picker's cursor on the **focused row's** cwd, when the
+    /// list already holds it. Opening the picker while looking at a session is
+    /// nearly always "another one of these", so this makes a bare Enter launch
+    /// it; without it the cursor sits on the most-recent dir, which is the same
+    /// directory only when the focused row happens to be the newest launch.
+    ///
+    /// A miss leaves the ranking alone rather than injecting a row: the recents
+    /// are the host's own list, and a cwd that isn't on it (a hand-launched
+    /// absolute path, an agent-made worktree) is not something the picker was
+    /// offering. Typing re-ranks and re-zeroes the cursor as before — this only
+    /// decides where an *untouched* picker points.
+    ///
+    /// Host-gated on purpose (§8: branch on host, never on locality): the list
+    /// belongs to the host this launch lands on, so the same spelling under
+    /// another machine's home is a different directory, and preselecting it
+    /// would put Enter on a path the user never looked at.
+    pub(super) fn preselect_focused_workdir(&mut self) {
+        let Some(active) = self.picker.as_ref() else {
+            return;
+        };
+        let PickerKind::Workdir { host, .. } = &active.kind else {
+            return;
+        };
+        let Some(session) = self.selected_session_ref() else {
+            return;
+        };
+        if &session.host != host {
+            return;
+        }
+        // Both sides to the host-canonical `~` form the items carry (§3): a row
+        // launched from this picker already matches, while one launched by hand
+        // (`miao launch claude .`) recorded an absolute cwd on its state file.
+        let key = self.shorten_path(&session.cwd);
+        let key = key.trim_end_matches('/').to_string();
+        if key.is_empty() {
+            return;
+        }
+        let Some(active) = self.picker.as_mut() else {
+            return;
+        };
+        let items = &active.picker.items;
+        if let Some(pos) = active.picker.filtered().iter().position(|&i| {
+            items[i]
+                .payload
+                .as_deref()
+                .is_some_and(|p| p.trim_end_matches('/') == key)
+        }) {
+            active.picker.cursor = pos;
         }
     }
 
@@ -5709,6 +5761,7 @@ impl App {
             active.picker.set_text("");
         }
         self.sync_workdir_picker_list();
+        self.preselect_focused_workdir();
     }
 
     /// Drop the highlighted recent-cwd from the workdir picker. Persists the
