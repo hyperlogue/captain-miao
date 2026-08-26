@@ -15,11 +15,11 @@
 //! to answer a remote dashboard's requests, so the same local-read logic backs
 //! both the in-process path and the remote path. See `docs/remote-sessions.md`.
 //!
-//! Phase 1 routed the reads and the kill through here. Phase 3's first slice adds
-//! the spawn seam: [`Backend::open_session`] turns an [`OpenSpec`] into a
-//! [`LaunchPlan`] — today always the argv for a local Kitty window (the window
-//! *is* the launcher); the remote `AttachRemote` plan lands once the pty pool can
-//! host a launcher. See §14.
+//! [`Backend::open_session`] is the spawn seam: it turns an [`OpenSpec`] into a
+//! [`LaunchPlan`], either a `SpawnLocal` argv (the window *is* the launcher) or
+//! an `AttachRemote` argv onto a launcher the host already started inside its
+//! pty pool. Either way the client only ever does the window half — the plan is
+//! pure metadata until it spawns one. See §5 and §6.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
@@ -980,9 +980,7 @@ impl Backend {
     /// process starts until the client spawns the window. Remote RPCs the server
     /// to start the launcher inside its pty pool and returns an `AttachRemote`
     /// plan (an `ssh … attach` window). May block on the round-trip, so an async
-    /// caller of the remote path should wrap this in `block_in_place`. (The
-    /// client still routes its own spawns to the local backend for now — remote
-    /// attach windows arrive with the 3d browser; see `App::local_backend`.)
+    /// caller of the remote path should wrap this in `block_in_place`.
     pub(crate) fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         match self {
             Backend::Local(h) => h.inner.open_session(spec),
