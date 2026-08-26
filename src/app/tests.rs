@@ -7,7 +7,9 @@ use crate::terminal::{TabId, TabInfo, TabTarget, WindowId};
 use super::format::{ansi_to_lines, base64_encode, default_dir_emoji_and_color, format_coarse_age};
 use super::{Action, App, Cursor, InputMode};
 
-// -- Test harness --
+// =============================================================================
+// Test harness
+// =============================================================================
 
 /// Redirect `state_dir()` to a per-process tempdir before any test touches
 /// disk. Without this, `commit_dir_edit` etc. would clobber the user's real
@@ -167,7 +169,9 @@ fn find_cell(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> 
     None
 }
 
-// -- Mock builders --
+// =============================================================================
+// Mock builders
+// =============================================================================
 
 fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
     LauncherState {
@@ -199,7 +203,9 @@ fn session_with_prompt(pid: u32, cwd: &str, status: SessionStatus, prompt: &str)
     s
 }
 
-// -- Tests --
+// =============================================================================
+// Rendering the table, and moving in it
+// =============================================================================
 
 #[test]
 fn auto_title_from_first_prompt_is_truncated() {
@@ -321,7 +327,9 @@ fn enter_returns_focus_action() {
     assert!(matches!(action, Some(Action::FocusWindow(w)) if w == WindowId::from(100)));
 }
 
-// -- Mouse input --
+// =============================================================================
+// Mouse input and what Enter dispatches
+// =============================================================================
 
 #[test]
 fn click_selects_correct_row_when_scrolled() {
@@ -424,6 +432,10 @@ fn o_opens_workdir_picker_when_no_session_selected() {
     assert!(picker_input_text(&d.app).is_empty());
 }
 
+// =============================================================================
+// The footer, the status line and the message log
+// =============================================================================
+
 #[test]
 fn q_sets_should_quit() {
     let mut d = TestDashboard::new(120, 10);
@@ -507,6 +519,10 @@ fn the_message_log_opens_at_the_newest_entry() {
         view.scroll
     );
 }
+
+// =============================================================================
+// The preferences overlay
+// =============================================================================
 
 #[test]
 fn space_a_picker_sets_default_new_session_backend() {
@@ -623,6 +639,10 @@ fn prefs_r_on_layout_clears_the_override() {
         "r must delete the override so TOML wins, not write stacked"
     );
 }
+
+// =============================================================================
+// Worktrees: arming, naming, and where they show
+// =============================================================================
 
 #[test]
 fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
@@ -864,6 +884,10 @@ fn workdir_picker_hides_worktrees_for_an_agent_without_them() {
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
 }
+
+// =============================================================================
+// Picker chrome, and the resume picker
+// =============================================================================
 
 #[test]
 fn workdir_picker_defaults_to_local_host() {
@@ -1127,6 +1151,10 @@ fn a_table_emoji_does_not_paint_over_the_resume_picker_border() {
         );
     }
 }
+
+// =============================================================================
+// Resolving a session to its local window
+// =============================================================================
 
 #[test]
 fn enter_on_running_remote_session_emits_attach() {
@@ -1418,6 +1446,10 @@ fn the_host_glyph_shares_the_workdir_icon_column() {
     );
 }
 
+// =============================================================================
+// Foreign-terminal rows
+// =============================================================================
+
 #[test]
 fn foreign_terminal_row_is_window_inert() {
     use crate::state::HostId;
@@ -1621,6 +1653,10 @@ fn enter_on_foreign_terminal_row_reports_it() {
     );
 }
 
+// =============================================================================
+// The window-bindings file
+// =============================================================================
+
 #[test]
 fn window_bindings_file_round_trips_through_seed() {
     let _guard = bindings_file_guard();
@@ -1683,6 +1719,10 @@ fn window_bindings_file_round_trips_through_seed() {
         Some(WindowId::from(777u64))
     );
 }
+
+// =============================================================================
+// Detached rows: how they sort and draw
+// =============================================================================
 
 /// A remote row with no pool session is one this dashboard can neither attach
 /// nor act on, so it never reaches the list at all (§9). The hosts panel's
@@ -1750,6 +1790,10 @@ fn a_detached_row_draws_dim() {
         "a row with a window here must keep full brightness"
     );
 }
+
+// =============================================================================
+// Host upgrades, and the restore they owe
+// =============================================================================
 
 /// Two rows can both be "no window here" for opposite reasons: free to take, or
 /// The two refusals the server upgrade owes the user, and the one case it lets
@@ -1911,6 +1955,10 @@ fn a_restore_waits_for_the_hosts_account_and_skips_what_survived() {
     assert_eq!(d.app.take_upgrade_restores(&host), (Vec::new(), 0));
 }
 
+// =============================================================================
+// Rows another client holds
+// =============================================================================
+
 /// held by somebody else's terminal. `Enter` behaves differently on each (the
 /// second needs a steal), so they must not wear the same glyph. The host's
 /// attached-bit overlay is what separates them — and an *unknown* bit (an
@@ -1970,6 +2018,10 @@ fn a_row_held_by_another_client_reads_apart_from_a_free_one() {
         "unexpected placeholder: {placeholder}"
     );
 }
+
+// =============================================================================
+// Attention ranking against a detached row
+// =============================================================================
 
 /// …and no status lifts it back out — not even a live blocking prompt. A
 /// parked approval or decision is urgent, but it's urgent *elsewhere*: it
@@ -2133,6 +2185,10 @@ fn a_follow_up_bell_does_not_lift_a_detached_row() {
         "the flagged detached row still sorts last"
     );
 }
+
+// =============================================================================
+// Attach, detach, and what ends a session
+// =============================================================================
 
 /// Detachment is a sort key, so retiring a binding has to invalidate the cached
 /// visible order. It used to not: the row picked up the unplugged icon (computed
@@ -2414,6 +2470,10 @@ fn a_refused_attach_names_its_reason() {
     );
 }
 
+// =============================================================================
+// Queued window closes
+// =============================================================================
+
 /// A queued close waits before it goes out, and that wait is the guard against
 /// the one event that looks exactly like a user closing every window at once: a
 /// terminal quitting. The dashboard dies with it in milliseconds, so anything
@@ -2555,6 +2615,10 @@ fn a_queued_close_takes_its_row_with_it_immediately() {
         vec![SessionKey::from_launcher_pid(1)]
     );
 }
+
+// =============================================================================
+// Detach reports and the expectation bit
+// =============================================================================
 
 /// Where the session *stays* — `D`, or a closed window under
 /// `on_window_close = "detach"` — the row has to lose the attached bit with its
@@ -2882,6 +2946,10 @@ fn the_attaching_overlay_draws_over_everything() {
     assert!(out.contains("Attaching to cm-away…"), "{out}");
 }
 
+// =============================================================================
+// Unknown hosts, the reconnect sweep, served flags
+// =============================================================================
+
 /// `backend_for` must never silently fall back to localhost (§9's one
 /// correctness-grade leak): a row carrying a host that's no longer configured
 /// would otherwise aim its kill or its open at the wrong machine.
@@ -2957,6 +3025,10 @@ fn host_served_flags_are_adopted_onto_rows() {
     // A locally-issued pin sequence is assigned so it sorts among our own pins.
     assert!(d.app.flags_of(&key).pin_seq > 0);
 }
+
+// =============================================================================
+// Attention counts and rank
+// =============================================================================
 
 /// The tab label is what the dashboard says about itself while you are looking
 /// at some *other* tab, so the number behind it has to be the whole picture —
@@ -3116,6 +3188,10 @@ fn clearing_follow_up_on_focus_keeps_cursor_on_the_session() {
         "pid 1 re-sorted to index 1, and the cursor moved with it"
     );
 }
+
+// =============================================================================
+// Tabs, and reaping departed windows
+// =============================================================================
 
 #[test]
 fn tab_ids_resolved_from_cache_local_only() {
@@ -3315,6 +3391,10 @@ fn seed_queues_dead_local_binding_pane_for_reap() {
     assert_eq!(d2.app.window_bindings.len(), 2);
 }
 
+// =============================================================================
+// The follow-up and needs-input flags
+// =============================================================================
+
 #[test]
 fn follow_up_transitions_mark_and_clear() {
     use super::{FlagKey, flag_key};
@@ -3473,7 +3553,9 @@ fn clearing_needs_input_on_last_row_moves_to_previous() {
     assert_eq!(d.app.selected_pid(), Some(1));
 }
 
-// -- New feature tests --
+// =============================================================================
+// Jumps, search, and the sort-invalidation rule
+// =============================================================================
 
 #[test]
 fn gg_jumps_to_top() {
@@ -3739,6 +3821,10 @@ fn workdir_visible_paths(app: &super::App) -> Vec<String> {
         .map(|i| p.items[i].payload.clone().unwrap_or_default())
         .collect()
 }
+
+// =============================================================================
+// The workdir picker
+// =============================================================================
 
 #[test]
 fn shift_o_enters_workdir_picker() {
@@ -4301,6 +4387,10 @@ fn tab_completion_cycles_through_matches() {
     let _ = std::fs::remove_dir_all(&test_root);
 }
 
+// =============================================================================
+// Directory marks and the emoji picker
+// =============================================================================
+
 #[test]
 fn session_name_displayed() {
     // Width chosen so the last-prompt column (elastic, after the fixed 45-cell
@@ -4605,6 +4695,10 @@ fn dir_edit_says_the_color_is_inert_for_an_emoji_icon() {
     assert!(!out.contains("no effect on emoji"), "{out}");
 }
 
+// =============================================================================
+// Capability gates: move-to-tab and capture
+// =============================================================================
+
 #[test]
 fn t_returns_fetch_tabs_action() {
     let mut d = TestDashboard::new(120, 15);
@@ -4750,6 +4844,10 @@ fn help_overlay_hides_move_tab_when_unsupported() {
         "unsupported backend should omit the move-tab hint"
     );
 }
+
+// =============================================================================
+// The tab picker
+// =============================================================================
 
 #[test]
 fn tab_picker_navigation() {
@@ -4906,6 +5004,10 @@ fn tab_picker_esc_clears_filter_before_closing() {
 fn picker_cursor(app: &super::App) -> usize {
     app.picker.as_ref().expect("picker").picker.cursor
 }
+
+// =============================================================================
+// Layout: wide, narrow, and the detail panel
+// =============================================================================
 
 #[test]
 fn search_footer_shown() {
@@ -5296,6 +5398,10 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     assert!(!out.contains("xterm"), "no terminfo invented: {out}");
 }
 
+// =============================================================================
+// Stealing a held row, and attach-all
+// =============================================================================
+
 /// `Enter` on a row another client holds is a *steal*, so it asks. Left to the
 /// attach wrapper this was a window that opened, printed libshpool's refusal and
 /// closed — the answer arriving where the user isn't looking. The confirm keys
@@ -5459,6 +5565,10 @@ fn a_foreign_terminfo_warns_and_names_this_terminal() {
         "absence is not a mismatch: {out}"
     );
 }
+
+// =============================================================================
+// The preview panel
+// =============================================================================
 
 #[test]
 fn narrow_layout_hides_preview_when_too_short() {
@@ -5660,6 +5770,10 @@ fn format_coarse_age_has_minute_resolution() {
     assert_eq!(format_coarse_age(3660), "1h01m");
 }
 
+// =============================================================================
+// The hosts panel: connection log and ssh options
+// =============================================================================
+
 #[test]
 fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     let mut d = TestDashboard::new(120, 30);
@@ -5849,6 +5963,10 @@ fn the_clipboard_is_a_field_in_the_row_editor() {
     d.press(KeyCode::Esc);
     assert!(row(&d), "Esc must restore the pre-edit value");
 }
+
+// =============================================================================
+// The hosts row editor
+// =============================================================================
 
 /// The row editor is a **card over the list**, not a form pinned under it.
 ///
@@ -6228,6 +6346,10 @@ fn a_ctrl_key_does_not_trigger_the_hosts_lists_plain_commands() {
     assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
 }
 
+// =============================================================================
+// Host status, tallies, and the dialing cloud
+// =============================================================================
+
 #[test]
 fn a_host_status_is_flattened_and_truncated_to_its_row() {
     use super::draw::one_line;
@@ -6409,6 +6531,10 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
     assert!(out.contains("loading sessions from slow…"), "{out}");
 }
 
+// =============================================================================
+// Leader keys, remaps, and panel toggles
+// =============================================================================
+
 #[test]
 fn leader_v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);
@@ -6541,6 +6667,10 @@ fn remapped_leader_completes_sequence() {
     d.press(KeyCode::Char('r'));
     assert!(d.app.pending_prefix.is_none());
 }
+
+// =============================================================================
+// Keep-awake
+// =============================================================================
 
 #[test]
 fn space_z_toggles_prevent_sleep() {
@@ -6686,6 +6816,10 @@ fn keep_awake_indicator_renders_in_header() {
     d.app.sleep_inhibitor.disable(); // reap any spawned caffeinate
 }
 
+// =============================================================================
+// Structural keys, and scrolling the preview
+// =============================================================================
+
 #[test]
 fn ctrl_n_and_ctrl_p_navigate_rows() {
     let mut d = TestDashboard::new(120, 15);
@@ -6761,6 +6895,10 @@ fn ctrl_u_scrolls_preview() {
     assert_eq!(d.app.preview_scroll, 0);
 }
 
+// =============================================================================
+// The ANSI parser
+// =============================================================================
+
 #[test]
 fn ansi_to_lines_basic() {
     use ratatui::style::{Color, Modifier};
@@ -6824,7 +6962,9 @@ fn ansi_to_lines_strips_osc_and_charset() {
     assert_eq!(lines[0].spans[0].content, "hello");
 }
 
-// -- Readline keybinds in pickers --
+// =============================================================================
+// Readline keybinds in the pickers
+// =============================================================================
 
 #[test]
 fn picker_readline_ctrl_a_and_e() {
@@ -7054,7 +7194,9 @@ fn picker_readline_alt_b_and_f_word_motion() {
     assert_eq!(d.app.picker.as_ref().unwrap().picker.input.cursor(), 7);
 }
 
-// -- Restart feature --
+// =============================================================================
+// Restart: confirming, rejecting, restart-all
+// =============================================================================
 
 /// `Space e` on an idle session opens a confirmation dialog without firing
 /// the action. `y` then yields a RestartSession action carrying the session
@@ -7319,7 +7461,9 @@ fn picker_arrow_keys_move_cursor() {
     assert_eq!(d.app.picker.as_ref().unwrap().picker.input.cursor(), 3);
 }
 
-// -- Restart flag restoration --
+// =============================================================================
+// Restart: restoring flags onto the new pid
+// =============================================================================
 
 #[test]
 fn restart_restores_flags_to_new_pid_by_window() {
@@ -7433,6 +7577,10 @@ fn snapshot_entry_flags_roundtrip_and_back_compat() {
     assert!(parsed.flags.is_default());
     assert_eq!(parsed.window_id, WindowId::from(100));
 }
+
+// =============================================================================
+// Override glyphs and the column they reserve
+// =============================================================================
 
 #[test]
 fn override_glyphs_measure_what_they_paint() {
@@ -7565,6 +7713,10 @@ fn the_override_indent_is_the_width_the_status_column_reserves() {
     }
 }
 
+// =============================================================================
+// Copying to the clipboard
+// =============================================================================
+
 #[test]
 fn base64_encode_matches_known_vectors() {
     // RFC 4648 §10 test vectors plus the padding boundaries.
@@ -7607,6 +7759,10 @@ fn y_without_session_id_reports_instead_of_copying() {
     );
     assert!(d.app.status_is_error, "should surface an error status");
 }
+
+// =============================================================================
+// Work tabs
+// =============================================================================
 
 #[test]
 fn w_dispatches_work_tab_action_and_map_validates_against_snapshot() {
@@ -7864,6 +8020,10 @@ fn work_tabs_persist_across_restart() {
     );
 }
 
+// =============================================================================
+// Spawn target and sessions layout
+// =============================================================================
+
 #[test]
 fn launch_tab_title_expands_template() {
     use super::run::expand_tab_title;
@@ -7958,6 +8118,10 @@ fn sessions_layout_label_round_trips() {
     assert_eq!(SessionsLayout::from_label("bogus"), None);
     assert_eq!(SessionsLayout::default(), SessionsLayout::Stacked);
 }
+
+// =============================================================================
+// Host reconciliation, and the clipboard server
+// =============================================================================
 
 /// Committing a hosts-panel row used to rebuild every backend, so changing one
 /// host's target dropped and re-dialled every *other* host too — and an emoji
@@ -8127,6 +8291,10 @@ fn the_clipboard_server_runs_only_when_a_host_wants_it() {
     ]));
 }
 
+// =============================================================================
+// Pruning writes the bindings file
+// =============================================================================
+
 /// A prune must reach `window-bindings.json`, not just the in-memory map.
 ///
 /// The timer prune exists precisely for the case where **no reload runs** —
@@ -8179,7 +8347,9 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
     );
 }
 
-// -- Logo graphics --
+// =============================================================================
+// Logo graphics
+// =============================================================================
 
 /// A resize costs the logo its kitty *images*, not just its placement: ratatui
 /// clears the screen on every resize, and kitty's clear frees every image the
@@ -8209,7 +8379,9 @@ fn resize_invalidation_forces_a_logo_re_upload() {
     assert!(d.app.cat_walking());
 }
 
-// -- Ctrl-t backend cycle --
+// =============================================================================
+// The backend cycle (Ctrl-t)
+// =============================================================================
 
 /// The ordinary case, and the one the key was designed for when there were two
 /// backends: step through the installed set and wrap.
