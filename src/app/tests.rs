@@ -3707,6 +3707,51 @@ fn picker_input_text(app: &super::App) -> &str {
     app.picker.as_ref().expect("picker").picker.input.text()
 }
 
+/// The path the workdir picker's cursor is on — what a bare Enter would launch.
+fn workdir_highlighted(app: &super::App) -> String {
+    let p = &app.picker.as_ref().expect("picker").picker;
+    let filtered = p.filtered();
+    assert!(!filtered.is_empty(), "picker has no rows");
+    p.items[filtered[p.cursor.min(filtered.len() - 1)]]
+        .payload
+        .clone()
+        .unwrap_or_default()
+}
+
+/// A dashboard with three hosts to cycle with `Ctrl-h` — this machine plus two
+/// remotes, each serving its own recent list out of the per-host cache (as it
+/// would after a `ListRecentDirs` came back). Unconnected on purpose: the
+/// picker's list is cache-first precisely so a host switch never waits on a
+/// round trip (§9).
+fn dashboard_with_three_hosts(
+    local: &[&str],
+    box_dirs: &[&str],
+    cloud_dirs: &[&str],
+) -> TestDashboard {
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 15);
+    d.app.recent_cwds = local.iter().map(|s| s.to_string()).collect();
+    for (name, dirs) in [("box", box_dirs), ("cloud", cloud_dirs)] {
+        let host = HostId(name.into());
+        d.app
+            .backends
+            .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+                host.clone(),
+                Vec::new(),
+            )));
+        d.app
+            .recent_dirs_cache
+            .insert(host, dirs.iter().map(|s| s.to_string()).collect());
+    }
+    d
+}
+
+fn press_ctrl(d: &mut TestDashboard, c: char) {
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+}
+
 fn workdir_visible_paths(app: &super::App) -> Vec<String> {
     let p = &app.picker.as_ref().expect("picker").picker;
     p.filtered()
@@ -3931,6 +3976,83 @@ fn workdir_picker_preselect_is_host_gated() {
         Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/alpha"),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
+}
+
+/// The pin follows the user, not the host. Cycling `Ctrl-h` onto a host that
+/// lacks the pinned dir falls back to the top of that host's list *without*
+/// disturbing the pin, so cycling on to one that does have it lands back on it
+/// — an intermediate host the user only passed through can't silently rewrite
+/// the choice.
+#[test]
+fn workdir_picker_pin_survives_a_host_without_the_dir() {
+    let mut d = dashboard_with_three_hosts(
+        &["~/other", "~/aaa"],
+        &["~/bbb", "~/ccc"],
+        &["~/bbb", "~/aaa"],
+    );
+    d.set_sessions(vec![session(1, "~/aaa", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
+
+    // Host B has no ~/aaa, so the cursor falls to the top of its list.
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/bbb");
+
+    // Host C has it again — and it wins over B's top row, which the user never
+    // chose.
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
+}
+
+/// Moving the cursor is the one gesture that names a directory, so it takes the
+/// pin over from the focused row's cwd and the next host switch restores *that*.
+#[test]
+fn workdir_picker_cursor_movement_repins() {
+    let mut d = dashboard_with_three_hosts(&["~/other", "~/aaa"], &["~/other", "~/aaa"], &[]);
+    d.set_sessions(vec![session(1, "~/aaa", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
+    // Down wraps from the last row back to the top.
+    d.press(KeyCode::Down);
+    assert_eq!(workdir_highlighted(&d.app), "~/other");
+
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/other");
+}
+
+/// Typing names a *filter*, not a directory — and `Ctrl-h` clears the input on
+/// its way through — so a filter that happened to highlight something else
+/// leaves the pin where it was.
+#[test]
+fn workdir_picker_typing_does_not_repin() {
+    let mut d = dashboard_with_three_hosts(&["~/other", "~/aaa"], &["~/other", "~/aaa"], &[]);
+    d.set_sessions(vec![session(1, "~/aaa", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    for c in "other".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(workdir_highlighted(&d.app), "~/other");
+
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
+}
+
+/// The pin is taken from the focused row even when *this* host's list has no
+/// such dir: it records which directory is wanted, and each host answers
+/// separately whether it has one.
+#[test]
+fn workdir_picker_pins_a_cwd_the_current_host_does_not_list() {
+    let mut d = dashboard_with_three_hosts(&["~/other"], &["~/bbb", "~/aaa"], &[]);
+    d.set_sessions(vec![session(1, "~/aaa", SessionStatus::Active)]);
+
+    d.press(KeyCode::Char('O'));
+    assert_eq!(workdir_highlighted(&d.app), "~/other");
+
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
 }
 
 #[test]

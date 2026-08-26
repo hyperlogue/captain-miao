@@ -430,6 +430,12 @@ impl PickerItem {
 #[derive(Debug)]
 pub(in crate::app) enum PickerEvent {
     Noop,
+    /// The item cursor moved (Up/Down/Ctrl-N/Ctrl-P). Its own variant rather
+    /// than a `Noop` because the workdir picker treats a deliberate move as the
+    /// user naming a directory — it re-pins to it, and that pin then survives a
+    /// host switch. Keeping the navigation keys listed in exactly one place is
+    /// the point: a caller that had to recognise them itself would drift.
+    Moved,
     Cancel,
     /// User picked the item at the given index (into `self.items`).
     Submit(usize),
@@ -586,11 +592,11 @@ impl Picker {
             match key.code {
                 KeyCode::Char('n') => {
                     self.move_cursor_down(total);
-                    return PickerEvent::Noop;
+                    return PickerEvent::Moved;
                 }
                 KeyCode::Char('p') => {
                     self.move_cursor_up(total);
-                    return PickerEvent::Noop;
+                    return PickerEvent::Moved;
                 }
                 _ => {}
             }
@@ -609,11 +615,11 @@ impl Picker {
             }
             KeyCode::Down => {
                 self.move_cursor_down(total);
-                return PickerEvent::Noop;
+                return PickerEvent::Moved;
             }
             KeyCode::Up => {
                 self.move_cursor_up(total);
-                return PickerEvent::Noop;
+                return PickerEvent::Moved;
             }
             KeyCode::Enter => {
                 // A highlighted item is reported via `Submit`. Clamp the cursor

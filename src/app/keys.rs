@@ -691,6 +691,7 @@ impl App {
             agent,
             host,
             worktree,
+            ..
         } = &active.kind
         else {
             return None;
@@ -923,6 +924,14 @@ impl App {
         let before = active.picker.input.text().to_string();
         let workdir = matches!(active.kind, PickerKind::Workdir { .. });
         match active.picker.handle_key(key) {
+            PickerEvent::Moved => {
+                // A move is the user naming a directory, so the workdir picker
+                // re-pins to it — that pin is what a later `Ctrl-h` restores.
+                if workdir {
+                    self.repin_workdir_from_cursor();
+                }
+                None
+            }
             PickerEvent::Noop => {
                 if workdir
                     && self

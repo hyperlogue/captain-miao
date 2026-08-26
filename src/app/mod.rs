@@ -322,6 +322,18 @@ pub(super) enum PickerKind {
         /// clears it rather than carrying a request that would be silently
         /// dropped at launch.
         worktree: Option<WorktreeArm>,
+        /// The workdir the cursor wants to be on, in the host-canonical `~`
+        /// form. Seeded from the focused row's cwd
+        /// ([`App::preselect_workdir`]) and re-pinned by any cursor movement
+        /// ([`App::repin_workdir_from_cursor`]) — never by typing, which only
+        /// re-ranks a list `Ctrl-h` is about to clear anyway.
+        ///
+        /// It deliberately survives a host switch *unresolved*: a dir the new
+        /// host doesn't have leaves the cursor at the top without disturbing
+        /// the pin, so cycling on through to a host that does have it lands
+        /// back on it. Anything narrower would make an intermediate host the
+        /// user only passed through silently rewrite the choice.
+        pinned: Option<String>,
     },
     /// Set the persistent default backend for new sessions (Preferences).
     DefaultAgent,
@@ -5264,6 +5276,7 @@ impl App {
                 agent,
                 host,
                 worktree,
+                ..
             } => {
                 let mut spans = vec![
                     Span::styled(" Agent ", dim),
@@ -5495,10 +5508,11 @@ impl App {
                 agent,
                 host,
                 worktree: None,
+                pinned: None,
             },
         });
         self.sync_workdir_picker_list();
-        self.preselect_focused_workdir();
+        self.preselect_workdir();
         self.input_mode = InputMode::Picker;
         self.refresh_picker_status_bar();
     }
@@ -5599,29 +5613,66 @@ impl App {
         }
     }
 
-    /// Put the workdir picker's cursor on the **focused row's** cwd, when the
-    /// list already holds it. Opening the picker while looking at a session is
-    /// nearly always "another one of these", so this makes a bare Enter launch
-    /// it; without it the cursor sits on the most-recent dir, which is the same
-    /// directory only when the focused row happens to be the newest launch.
+    /// Settle the workdir picker's cursor on its pinned dir, seeding the pin
+    /// from the **focused row's** cwd the first time there is nothing pinned.
+    /// Run on open and after every `Ctrl-h` re-seed — the two moments the list
+    /// is rebuilt from scratch.
     ///
-    /// A miss leaves the ranking alone rather than injecting a row: the recents
-    /// are the host's own list, and a cwd that isn't on it (a hand-launched
-    /// absolute path, an agent-made worktree) is not something the picker was
-    /// offering. Typing re-ranks and re-zeroes the cursor as before — this only
-    /// decides where an *untouched* picker points.
+    /// Opening the picker while looking at a session is nearly always "another
+    /// one of these", so the cursor starts on that row's cwd and a bare Enter
+    /// launches it; without the seed it would sit on the most-recent dir, which
+    /// is the same directory only when the focused row happens to be the newest
+    /// launch.
     ///
-    /// Host-gated on purpose (§8: branch on host, never on locality): the list
-    /// belongs to the host this launch lands on, so the same spelling under
-    /// another machine's home is a different directory, and preselecting it
-    /// would put Enter on a path the user never looked at.
-    pub(super) fn preselect_focused_workdir(&mut self) {
+    /// The seed is host-gated (§8: branch on host, never on locality) because
+    /// the focused row's cwd is a path on *its* machine: the same spelling under
+    /// another home is a different directory. The pin, once taken, is not —
+    /// it's the user's answer to "which dir", and `Ctrl-h` re-asks it of each
+    /// host in turn.
+    ///
+    /// A dir the host's list doesn't hold leaves both the ranking and the pin
+    /// alone. Nothing is injected: the recents are that host's own list, and a
+    /// cwd absent from it (a hand-launched absolute path, an agent-made
+    /// worktree) is not something the picker was offering there.
+    pub(super) fn preselect_workdir(&mut self) {
+        self.seed_pinned_workdir();
         let Some(active) = self.picker.as_ref() else {
             return;
         };
-        let PickerKind::Workdir { host, .. } = &active.kind else {
+        let PickerKind::Workdir { pinned, .. } = &active.kind else {
             return;
         };
+        let Some(key) = pinned.clone() else {
+            return;
+        };
+        let Some(active) = self.picker.as_mut() else {
+            return;
+        };
+        let items = &active.picker.items;
+        if let Some(pos) = active.picker.filtered().iter().position(|&i| {
+            items[i]
+                .payload
+                .as_deref()
+                .is_some_and(|p| p.trim_end_matches('/') == key)
+        }) {
+            active.picker.cursor = pos;
+        }
+    }
+
+    /// Take the pin from the focused session's cwd, if there is nothing pinned
+    /// yet and that row lives on the host this launch would land on. Splits out
+    /// of [`App::preselect_workdir`] only because the pin outlives any one
+    /// host: seeding asks about the focused row, resolving asks about the list.
+    fn seed_pinned_workdir(&mut self) {
+        let Some(active) = self.picker.as_ref() else {
+            return;
+        };
+        let PickerKind::Workdir { host, pinned, .. } = &active.kind else {
+            return;
+        };
+        if pinned.is_some() {
+            return;
+        }
         let Some(session) = self.selected_session_ref() else {
             return;
         };
@@ -5636,17 +5687,31 @@ impl App {
         if key.is_empty() {
             return;
         }
+        if let Some(active) = self.picker.as_mut()
+            && let PickerKind::Workdir { pinned, .. } = &mut active.kind
+        {
+            *pinned = Some(key);
+        }
+    }
+
+    /// Re-pin the workdir picker to whatever the cursor now sits on. Cursor
+    /// movement is the one gesture that overrides the pin, precisely because it
+    /// is the only one that *says a directory*: typing names a filter, and
+    /// `Ctrl-h` names a host.
+    pub(super) fn repin_workdir_from_cursor(&mut self) {
         let Some(active) = self.picker.as_mut() else {
             return;
         };
-        let items = &active.picker.items;
-        if let Some(pos) = active.picker.filtered().iter().position(|&i| {
-            items[i]
-                .payload
-                .as_deref()
-                .is_some_and(|p| p.trim_end_matches('/') == key)
-        }) {
-            active.picker.cursor = pos;
+        if !matches!(active.kind, PickerKind::Workdir { .. }) {
+            return;
+        }
+        let filtered = active.picker.filtered();
+        let key = filtered
+            .get(active.picker.cursor.min(filtered.len().saturating_sub(1)))
+            .and_then(|&i| active.picker.items[i].payload.as_deref())
+            .map(|p| p.trim_end_matches('/').to_string());
+        if let PickerKind::Workdir { pinned, .. } = &mut active.kind {
+            *pinned = key;
         }
     }
 
@@ -5761,7 +5826,7 @@ impl App {
             active.picker.set_text("");
         }
         self.sync_workdir_picker_list();
-        self.preselect_focused_workdir();
+        self.preselect_workdir();
     }
 
     /// Drop the highlighted recent-cwd from the workdir picker. Persists the
