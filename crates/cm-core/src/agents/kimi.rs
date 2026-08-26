@@ -358,6 +358,9 @@ fn list_resumable_in(home: &Path, limit: usize) -> Vec<ResumeCandidate> {
 // Launcher: process spawn + synthetic KIMI_CODE_HOME
 // =============================================================================
 
+/// Build the argv for a Kimi session. Kimi looks for hooks in its home's
+/// `config.toml` and nowhere else — no override flag, no per-invocation
+/// injection — so the block the launcher wrote is merged into a synthetic one.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -713,6 +716,8 @@ struct HookPayload {
     prompt: Option<String>,
 }
 
+/// Normalize one Kimi hook payload. Kimi names no transcript, so the path is
+/// derived from the session id before the message is built.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse kimi hook JSON from stdin")?;

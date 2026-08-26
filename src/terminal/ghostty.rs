@@ -118,6 +118,8 @@ use super::{
 /// tight retry would spin and a generous one would hold up startup for nothing.
 const OWN_SURFACE_SETTLE: (u32, f32) = (10, 0.05);
 
+/// Ghostty, driven by AppleScript. The one backend that cannot read a window at
+/// all, which is what `capabilities().capture` exists to say.
 pub struct GhosttyTerminal {
     /// The surface the dashboard itself runs in, resolved lazily on first use
     /// and then cached. `Some(None)` is a *settled* failure (no tty, or Ghostty

@@ -376,6 +376,9 @@ fn is_newer(meta: &std::fs::Metadata, other: &Path) -> bool {
     ours > theirs
 }
 
+/// Write a file in a synthetic home by temp-file and rename, so a reader (the
+/// agent) never sees a half-written config. The temp file is made in the same
+/// directory, because a rename across filesystems is not atomic.
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()

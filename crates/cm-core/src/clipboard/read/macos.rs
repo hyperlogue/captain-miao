@@ -77,6 +77,12 @@ fn available_source(pb: &NSPasteboard) -> Option<Retained<NSPasteboardType>> {
     pb.availableTypeFromArray(&source_types())
 }
 
+/// Which image formats the pasteboard is offering. The macOS counterpart of
+/// `tools::available`: `NSPasteboard` is the only way to see a screenshot's
+/// bytes, since `pbpaste` serves text flavours and `osascript` returns hex.
+/// Which image formats the pasteboard is offering. The macOS counterpart of
+/// `tools::available`: `NSPasteboard` is the only way to see a screenshot's
+/// bytes, since `pbpaste` serves text flavours and `osascript` returns hex.
 pub(super) fn available() -> Vec<Format> {
     autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();

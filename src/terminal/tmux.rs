@@ -88,6 +88,9 @@ const SNAPSHOT_FORMAT: &str = "#{window_id}\t#{pane_id}\t#{window_active}\t#{win
 /// printed by the one atomic `new-window`.
 const SPAWN_FORMAT: &str = "#{pane_id} #{window_id}";
 
+/// tmux, driven by shelling out against the socket and session this process's
+/// `TMUX` names. Pinned at startup: every call names its socket and session
+/// explicitly, so the dashboard never drives a server it did not start under.
 pub struct TmuxTerminal {
     /// Socket every call is pinned to (`tmux -S <socket>`), from `TMUX`.
     socket: String,

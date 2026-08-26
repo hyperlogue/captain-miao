@@ -150,6 +150,12 @@ fn formats_in(listing: &str) -> Vec<Format> {
         .collect()
 }
 
+/// Which image formats the clipboard is currently offering, according to the
+/// first CLI tool on this machine that answers. Empty when no tool is installed
+/// or the clipboard holds no image — both are ordinary, not errors.
+/// Which image formats the clipboard is currently offering, according to the
+/// first CLI tool on this machine that answers. Empty when no tool is installed
+/// or the clipboard holds no image — both are ordinary, not errors.
 pub(super) async fn available() -> Vec<Format> {
     for tool in preference() {
         let Some(listing) = tool.list().await else {
@@ -167,6 +173,12 @@ pub(super) async fn available() -> Vec<Format> {
     Vec::new()
 }
 
+/// Pull the clipboard image in `fmt`, trying each tool in preference order.
+/// `None` once every tool has declined — the clipboard may simply have changed
+/// since [`available`] answered.
+/// Pull the clipboard image in `fmt`, trying each tool in preference order.
+/// `None` once every tool has declined — the clipboard may simply have changed
+/// since [`available`] answered.
 pub(super) async fn open(fmt: Format) -> Option<Image> {
     for tool in preference() {
         if let Some(img) = tool.fetch(fmt).await {

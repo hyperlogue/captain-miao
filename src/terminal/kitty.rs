@@ -32,6 +32,12 @@ const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// on each Stacked spawn (`SpawnTarget::SharedStackTab`) and created on first use.
 const SESSIONS_TAB: &str = "miao:sessions";
 
+/// Kitty, driven over `kitten @` remote control. Unit struct: everything it
+/// needs it reads from the environment or asks kitty for, so there is no
+/// per-instance state to hold.
+/// Kitty, driven over `kitten @` remote control. Unit struct: everything it
+/// needs it reads from the environment or asks kitty for, so there is no
+/// per-instance state to hold.
 pub struct KittyTerminal;
 
 /// The socket `kitten @` talks to, from the env kitty exports into its windows.

@@ -31,6 +31,9 @@ static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 /// can't fill the disk. One generation (`<path>.1`) is kept.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Open the keybind log, if `[debug]` asked for one. Idempotent, and a no-op
+/// (including the file open) when debugging is off, so the recording path costs
+/// nothing in an ordinary run.
 pub(super) fn init() {
     SINK.get_or_init(|| {
         if !config::debug_enabled() {
@@ -66,6 +69,8 @@ fn rotate_if_oversized(path: &std::path::Path) {
     }
 }
 
+/// Note one keypress and what it resolved to. Plain cursor movement is dropped:
+/// it is most of the traffic and none of the signal when a binding misbehaves.
 pub(super) fn record(mode: InputMode, key: KeyEvent, action: Option<&Action>) {
     let Some(Some(sink)) = SINK.get() else { return };
     if is_basic_movement(key) {

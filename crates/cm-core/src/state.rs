@@ -68,6 +68,8 @@ fn harden_dir(dir: &Path) {
     }
 }
 
+/// `~/.local/state/captain-miao`, honouring `XDG_STATE_HOME`. Created `0700` by
+/// [`create_dir_all_private`] wherever it is written to, never here.
 pub fn state_dir() -> PathBuf {
     // Per the XDG spec an empty env var is treated as unset, not as a
     // relative path, so filter out the empty string before falling back.
@@ -115,10 +117,13 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| state_dir().join("run"))
 }
 
+/// Where every launcher writes its `{pid}.json`. Also the directory the
+/// dashboard watches, and where bell and detach sentinels are dropped.
 pub fn sessions_dir() -> PathBuf {
     state_dir().join("sessions")
 }
 
+/// [`sessions_dir`], created `0700` if it isn't there yet.
 pub fn ensure_sessions_dir() -> Result<PathBuf> {
     let dir = sessions_dir();
     create_dir_all_private(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
@@ -128,6 +133,8 @@ pub fn ensure_sessions_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where the dashboard records the window it occupies, so `miao focus` can find
+/// it from a session's terminal without any IPC.
 pub fn dashboard_window_id_path() -> PathBuf {
     state_dir().join("dashboard-window-id")
 }
@@ -154,6 +161,7 @@ pub fn parse_dashboard_window_id(s: &str) -> (Option<String>, WindowId) {
     }
 }
 
+/// The dashboard's own pid, for the single-instance check.
 pub fn dashboard_pid_path() -> PathBuf {
     state_dir().join("dashboard.pid")
 }
@@ -228,6 +236,9 @@ pub fn ssh_control_path(target: &str) -> PathBuf {
     ssh_sock_dir().join(format!("c{}", short_hash(target)))
 }
 
+/// Everything the dashboard persists about itself — pins, marks, prefs, the
+/// default host and agent. Safe to delete; the dashboard resets rather than
+/// failing.
 pub fn dashboard_overrides_path() -> PathBuf {
     state_dir().join("dashboard-overrides.json")
 }
@@ -240,6 +251,8 @@ pub fn dashboard_sessions_snapshot_path() -> PathBuf {
     state_dir().join("dashboard-sessions.json")
 }
 
+/// The workdir picker's history for *this* machine. A remote host keeps its own,
+/// which the dashboard fetches rather than mirroring.
 pub fn recent_cwds_path() -> PathBuf {
     state_dir().join("recent-cwds.json")
 }
@@ -305,6 +318,9 @@ pub fn session_flags_path() -> PathBuf {
 // Process utilities
 // =============================================================================
 
+/// Whether a pid is still running, by `kill(pid, 0)`. Used wherever a recorded
+/// pid has to be re-checked rather than trusted — a stale state file, a pool
+/// name whose launcher died, a snapshot from a previous dashboard.
 pub fn is_process_alive(pid: u32) -> bool {
     // `kill(pid, 0)` returns 0 when the signal could be sent, but -1/EPERM
     // when the process exists yet is owned by another user. Treat EPERM as
@@ -573,6 +589,14 @@ impl std::fmt::Display for HostId {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// What a session is doing. The dashboard's central axis: it drives the row's
+/// colour, whether the row counts as needing attention, whether the sort lifts
+/// it, and whether it holds the machine awake.
+///
+/// The launcher owns every transition. Where a backend keeps its own session
+/// file that file is authoritative and is mirrored rather than edge-tracked;
+/// hooks own the promotion out of rest, and refinement against the file is
+/// demote-only. Each variant's doc says which evidence produces it.
 pub enum SessionStatus {
     Starting,
     Active,
@@ -801,6 +825,11 @@ impl<'de> Deserialize<'de> for HookEvent {
 // =============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
+/// One hook event, normalized out of whatever shape the agent sent.
+///
+/// The point of the type is that the launcher's dispatch never learns which
+/// backend it is serving: every `parse_hook_payload` produces this, and only
+/// the fields a given backend can actually fill are `Some`.
 pub struct HookMessage {
     pub event: HookEvent,
     #[serde(default)]
@@ -876,6 +905,13 @@ pub struct HookMessage {
 // =============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One session, as its launcher last wrote it — the record the whole dashboard
+/// is a view of.
+///
+/// Its launcher is the **only** writer and rewrites the file atomically, so
+/// killing the daemon, the dashboard, or a tunnel loses nothing: state lives
+/// with the session. Deliberately has no `Default`; see `for_test` below for
+/// why, and for what tests use instead.
 pub struct LauncherState {
     /// Which backend produced this session. Per-session: a single dashboard
     /// can host sessions from multiple backends side by side and dispatches
@@ -1410,6 +1446,10 @@ fn drain_detach_reports_in(dir: &Path) -> Vec<DetachReport> {
     reports
 }
 
+/// Every session on this machine, read fresh off the sessions dir. The
+/// dashboard's whole input on a reload, and the server-core's answer to a
+/// remote dashboard's `Snapshot`. An unreadable or unparseable file is skipped
+/// rather than failing the sweep.
 pub fn read_all_launcher_states() -> Vec<LauncherState> {
     let dir = sessions_dir();
     let entries = match std::fs::read_dir(&dir) {

@@ -231,6 +231,9 @@ fn transcript_path(cli_dir: &Path, id: &str) -> PathBuf {
 // Launcher: process spawn + synthetic $HOME
 // =============================================================================
 
+/// Build the argv for an Antigravity session. Antigravity reads global hooks
+/// from one place only, so the config the launcher wrote is relocated into a
+/// synthetic `$HOME` rather than passed on a flag.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -542,6 +545,9 @@ struct HookPayload {
     tool_call: Option<ToolCall>,
 }
 
+/// Normalize one Antigravity hook payload. Its event names differ from ours and
+/// two of our variants have no event of their own, so both are synthesized here
+/// from the payload rather than mapped later.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse antigravity hook JSON from stdin")?;

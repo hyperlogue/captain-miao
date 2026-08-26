@@ -338,6 +338,10 @@ pub fn uses_kitty_keyboard(term: &str) -> bool {
 // Launcher: process spawn + real ~/.grok hooks file
 // =============================================================================
 
+/// Build the argv for a Grok session. Grok's hooks live in one shared file in
+/// the user's real `~/.grok`, so the socket cannot ride argv and travels in the
+/// environment instead — and the file fires in sessions started outside
+/// captain-miao too, which is why a missing socket is not an error.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -585,6 +589,9 @@ struct SessionCron {
     schedule: Option<String>,
 }
 
+/// Normalize one Grok hook payload. Grok fires the same hooks for a subagent as
+/// for its parent, so a payload naming a `subagent_type` is classified as a
+/// child session here rather than being taken for the session itself.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse grok hook JSON from stdin")?;

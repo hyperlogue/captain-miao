@@ -769,6 +769,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A byte count for the build log, in MiB or KiB.
 pub fn human(bytes: u64) -> String {
     if bytes >= 1 << 20 {
         format!("{:.1} MiB", bytes as f64 / (1u64 << 20) as f64)

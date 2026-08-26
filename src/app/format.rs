@@ -483,6 +483,8 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// A colour's index in [`DIR_COLORS`] by name, for reading a stored directory
+/// mark back. `None` for a name this build no longer offers.
 pub(super) fn dir_color_index(name: &str) -> Option<usize> {
     DIR_COLORS.iter().position(|(n, _)| *n == name)
 }
@@ -505,6 +507,8 @@ pub(super) const ICON_SLOT_WIDTH: usize = 2;
 /// workdir slot alone and so is one slot wide.
 pub(super) const ICON_COL_WIDTH: u16 = 2 * ICON_SLOT_WIDTH as u16;
 
+/// How many cells an icon will actually occupy, clamped to the slot. At least
+/// one, so an empty or zero-width icon still reserves its column.
 pub(super) fn dir_icon_width(icon: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     icon.width().clamp(1, ICON_SLOT_WIDTH)
@@ -719,6 +723,9 @@ pub(super) fn session_display_name(
         .unwrap_or_else(|| format!("session-{}", s.launcher_pid))
 }
 
+/// A stable, readable stand-in name for a session with none — derived from the
+/// pid, so the same row keeps the same name for as long as it lives and two
+/// rows never collide on screen.
 pub(super) fn random_session_name(pid: u32) -> String {
     const ADJECTIVES: &[&str] = &[
         "amber", "bold", "calm", "dark", "eager", "fair", "glad", "hazy", "keen", "lush", "mild",
@@ -738,6 +745,7 @@ pub(super) fn random_session_name(pid: u32) -> String {
     format!("{adj}-{noun}")
 }
 
+/// A wall-clock age as a short human phrase ("just now", "4m", "2h").
 pub(super) fn format_relative_time(since: std::time::SystemTime) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(since)
@@ -848,6 +856,7 @@ pub(super) fn model_color(id: &str) -> Color {
     }
 }
 
+/// A token count at table width: `1.2M` / `340k` / the number itself.
 pub(super) fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -925,6 +934,8 @@ pub(super) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// A rect centred in `area`, sized as a percentage of it — the geometry every
+/// modal overlay is drawn into.
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let [_, v_center, _] = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
@@ -984,6 +995,8 @@ fn clip_wide_glyphs_left_of(buf: &mut Buffer, area: Rect) {
 /// is shorter and right-aligns within this width.
 pub(super) const ELAPSED_MAX_WIDTH: u16 = 7;
 
+/// A session's age for the table's elapsed column, floored at `1m` so a
+/// just-started row reads as running rather than as zero.
 pub(super) fn format_elapsed(secs: u64) -> String {
     if secs < 3600 {
         format!("{}m", (secs / 60).max(1))

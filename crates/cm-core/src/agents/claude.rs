@@ -1162,6 +1162,9 @@ fn clear_parent_session_env(cmd: &mut Command) {
     }
 }
 
+/// Build the argv for a Claude Code session. The one backend that takes its
+/// hook config on a flag (`--settings`), so nothing has to be installed in the
+/// user's real home and teardown is just deleting the per-session file.
 pub fn build_launch_command(
     cwd: &str,
     _sock_path: &Path,
@@ -1227,6 +1230,7 @@ struct HookPayload {
     transcript_path: Option<String>,
 }
 
+/// Normalize one Claude Code hook payload.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse hook JSON from stdin")?;

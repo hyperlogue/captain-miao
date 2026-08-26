@@ -65,6 +65,9 @@ use super::{
 /// the identity, and a user closing the tab just gets it recreated.
 const SESSIONS_TAB: &str = "miao:sessions";
 
+/// zellij, driven by `zellij action` against the session captured at startup.
+/// Note the standing rule that `list-panes` never goes on a hot path — it costs
+/// ~20ms *per pane* server-side.
 pub struct ZellijTerminal {
     /// Session every `zellij action` call is pinned to, captured at startup.
     session: String,

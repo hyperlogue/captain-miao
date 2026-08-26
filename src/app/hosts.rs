@@ -13,6 +13,9 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// One entry of `hosts.json`: a host the dashboard federates, and how to reach
+/// it. Every field is additive and defaulted — see the module doc on why the
+/// file must keep decoding across versions.
 pub(super) struct HostConfig {
     /// Display label, and the `HostId` sessions from this host are tagged with.
     pub label: String,

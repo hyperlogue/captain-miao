@@ -379,6 +379,9 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
 // Launcher: process spawn
 // =============================================================================
 
+/// Build the argv for a Pi session. Like omp, what the launcher wrote is a
+/// generated TypeScript extension rather than a hook config, relocated to a
+/// path Pi's loader will accept.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -450,6 +453,7 @@ struct HookPayload {
     is_error: bool,
 }
 
+/// Normalize one Pi hook payload, as sent by the generated extension.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse pi hook JSON from stdin")?;

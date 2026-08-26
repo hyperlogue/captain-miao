@@ -1315,6 +1315,16 @@ fn leave_terminal_modes(kb_enhanced: bool) {
 // Entry point
 // =============================================================================
 
+/// Start the dashboard: claim single-instance, take over the terminal, run the
+/// loop, and put the terminal back however the loop ended.
+///
+/// Terminal state is acquired and released here and nowhere else, so a panic or
+/// an error inside [`run_app`] still leaves a usable shell behind.
+/// Start the dashboard: claim single-instance, take over the terminal, run the
+/// loop, and put the terminal back however the loop ended.
+///
+/// Terminal state is acquired and released here and nowhere else, so a panic or
+/// an error inside [`run_app`] still leaves a usable shell behind.
 pub async fn run() -> Result<()> {
     check_existing_dashboard()?;
 

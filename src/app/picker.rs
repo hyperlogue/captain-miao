@@ -394,6 +394,8 @@ impl TextInput {
 // =============================================================================
 
 #[derive(Debug, Clone)]
+/// One row of a [`Picker`]: what is shown, and what it means if chosen. The
+/// picker never interprets these — `keys.rs` does, per `PickerKind`.
 pub(in crate::app) struct PickerItem {
     pub primary: String,
     pub secondary: Option<String>,
@@ -456,6 +458,8 @@ impl PickerItem {
 }
 
 #[derive(Debug)]
+/// What a keypress did to a [`Picker`], for the caller to act on. The picker
+/// itself only ever moves its own cursor and filter.
 pub(in crate::app) enum PickerEvent {
     Noop,
     /// The item cursor moved (Up/Down/Ctrl-N/Ctrl-P). Its own variant rather

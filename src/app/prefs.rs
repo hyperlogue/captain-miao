@@ -219,6 +219,9 @@ impl PrefsOverrides {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry of the stored agent list: a backend's CLI name, and whether it is
+/// offered. Stored by *name* rather than by index so a build that adds or drops
+/// a backend still reads an older list correctly — see [`resolve_agent_list`].
 pub(crate) struct AgentPref {
     pub id: String,
     pub enabled: bool,

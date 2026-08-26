@@ -366,6 +366,9 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
 // Launcher: process spawn
 // =============================================================================
 
+/// Build the argv for an omp session. omp has no shell-command hook, so what
+/// the launcher wrote is a generated TypeScript extension, relocated to a path
+/// omp's loader will accept.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -442,6 +445,7 @@ struct HookPayload {
     will_continue: bool,
 }
 
+/// Normalize one omp hook payload, as sent by the generated extension.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse omp hook JSON from stdin")?;

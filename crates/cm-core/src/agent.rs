@@ -1586,6 +1586,8 @@ impl SessionIndex {
 pub type SessionIndexCache = HashMap<u32, SessionIndexEntry>;
 
 #[derive(Debug, Default, Clone)]
+/// What a backend's own session index knows about one session — enough to name
+/// a row before any transcript has been read.
 pub struct SessionIndexEntry {
     pub mtime: Option<SystemTime>,
     pub session_id: Option<String>,

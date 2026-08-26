@@ -89,6 +89,9 @@ const PENDING_FOCUS_MAX_AGE: Duration = Duration::from_secs(30);
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// What the dashboard is currently accepting keys for. Every key handler
+/// branches on this first, because which keys mean what is entirely a function
+/// of what is on screen — and only `Normal` goes through the remappable table.
 pub(super) enum InputMode {
     Normal,
     Search,
@@ -107,18 +110,27 @@ pub(super) enum InputMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Which pane divider a mouse drag is currently moving.
 pub(super) enum DragTarget {
     VerticalSplit,
     HorizontalSplit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// A per-session flag the *user* sets, as opposed to anything the launcher
+/// reports. Dashboard-owned: no launcher knows or cares about these.
 pub(super) enum SessionFlag {
     Pin,
     FollowUp,
 }
 
 #[derive(Debug)]
+/// Work a key asked for, described rather than done.
+///
+/// `keys.rs` returns one of these; `run.rs` executes it. The split is what
+/// keeps input dispatch pure enough to test by feeding keys to an `App`:
+/// anything that spawns a window, reaches a host, or blocks lands here as data
+/// instead of happening inside the handler.
 pub(super) enum Action {
     FocusWindow(WindowId),
     NewSessionSplit {
@@ -380,6 +392,8 @@ pub(super) enum PickerKind {
 }
 
 #[derive(Debug)]
+/// The picker currently open, and what it is picking. `Some` exactly while
+/// `input_mode == Picker`.
 pub(super) struct ActivePicker {
     pub(in crate::app) picker: Picker,
     pub(in crate::app) kind: PickerKind,
@@ -573,6 +587,7 @@ pub(super) struct DirEditState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Which field of the directory-mark popup has the cursor.
 pub(super) enum DirEditFocus {
     Custom,
     Color,
@@ -793,6 +808,8 @@ impl HostRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// One editable field of a host's row in the hosts panel. The order here is the
+/// order Tab walks them in.
 pub(super) enum HostField {
     Label,
     Target,
@@ -1037,6 +1054,13 @@ pub(super) struct WorkdirCompletion {
 // App
 // =============================================================================
 
+/// Every piece of dashboard-side state, on one struct.
+///
+/// Deliberately not split by concern: the ordering rules *between* these fields
+/// are the hard part — see `mark_dirty` on invalidating the sort after a
+/// mutation, and `record_window_binding` and friends on why bindings are never
+/// written directly — and those are easier to keep right in one place than to
+/// rediscover across several. The module doc has the rest.
 pub(super) struct App {
     pub(super) sessions: Vec<LauncherState>,
     pub(super) table_state: TableState,
@@ -1790,6 +1814,8 @@ fn resume_picker_title(host: &HostId) -> String {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The user-set flags for one session, as the dashboard holds them. The
+/// host-owned sidecar of the same name is what a pooled host persists.
 pub(super) struct SessionFlags {
     #[serde(default)]
     pub pinned: bool,

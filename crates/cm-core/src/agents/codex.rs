@@ -555,6 +555,9 @@ fn read_rollout_header(path: &Path) -> RolloutHeader {
 // Launcher: process spawn + owned Codex profile
 // =============================================================================
 
+/// Build the argv for a Codex session. Codex will not load the launcher's JSON
+/// directly, so the event table is rewritten as the inline TOML of a profile we
+/// own — which is also why that profile's trust hashes must stay stable.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -911,6 +914,8 @@ struct HookPayload {
     transcript_path: Option<String>,
 }
 
+/// Normalize one Codex hook payload. Codex's event names are already ours, so
+/// this is a straight field rename.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse codex hook JSON from stdin")?;

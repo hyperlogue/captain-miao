@@ -120,6 +120,7 @@ pub(crate) const CAPABILITIES: Capabilities = Capabilities {
     graphics: false,
 };
 
+/// iTerm2, driven by AppleScript against its Python-free scripting bridge.
 pub struct ItermTerminal {
     /// The session the dashboard itself runs in, read once from
     /// `ITERM_SESSION_ID`. `None` only if iTerm2 stopped exporting it — the

@@ -113,6 +113,7 @@ const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+/// `[launcher]` in `config.toml`: how a launched session is run.
 pub struct LauncherConfig {
     pub approval_grace_secs: u64,
     pub max_recent_cwds: usize,
@@ -201,6 +202,7 @@ impl LauncherConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+/// `[debug]` in `config.toml`: tracing knobs, off unless asked for.
 pub struct DebugConfig {
     /// Master switch for verbose debug logging. When on, the launcher,
     /// dashboard, and per-event hook subprocess all append to a shared

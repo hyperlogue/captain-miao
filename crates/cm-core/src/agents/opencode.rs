@@ -297,6 +297,9 @@ fn synth_config_dir() -> PathBuf {
 // Launcher: process spawn + synthetic OPENCODE_CONFIG_DIR
 // =============================================================================
 
+/// Build the argv for an opencode session. opencode discovers global plugins
+/// from its config dir alone, so the generated JavaScript plugin is installed
+/// into a synthetic one — the whole reason this backend needs a config dir.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -746,6 +749,9 @@ fn first_text_part(output: &Value) -> Option<String> {
         .and_then(|p| str_at(p, &["text"]))
 }
 
+/// Normalize one opencode hook payload, as sent by the generated plugin. The raw
+/// stdin is carried through alongside it, so a failure event can surface the
+/// plugin's full payload verbatim rather than only the fields named here.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse opencode hook JSON from stdin")?;

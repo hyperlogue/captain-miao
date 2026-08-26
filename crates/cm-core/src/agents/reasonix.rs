@@ -197,6 +197,9 @@ fn synth_home() -> PathBuf {
 // Launcher: process spawn + synthetic REASONIX_HOME
 // =============================================================================
 
+/// Build the argv for a Reasonix session. `hook.Load` reads the project file,
+/// installed plugin manifests, and `<home>/settings.json` — there is no
+/// override flag — so the settings go into a synthetic home.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -469,6 +472,7 @@ struct HookPayload {
     is_interrupt: bool,
 }
 
+/// Normalize one Reasonix hook payload.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse reasonix hook JSON from stdin")?;
