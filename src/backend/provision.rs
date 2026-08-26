@@ -834,19 +834,21 @@ fn remote_exe_for(action: &Provision, home: &str) -> String {
 /// Pure over an injected `now`, so the cooldown is unit-tested without sleeping.
 #[derive(Default)]
 pub(super) struct UploadGate {
-    /// digest → (when it failed, what the host said). **A map, not a single
-    /// slot**, and that is the whole point: with more than one candidate per
-    /// host, one remembered failure is evicted by the next. A NixOS box with
-    /// LDAP/SSSD users refuses *both* payloads — gnu has no loader, musl fails
-    /// the self-check — so a single slot would remember only musl, leave gnu
-    /// unsuppressed on the next pass, and re-send both, forever, at a backoff
-    /// that caps at 30s. Remembering each independently is what makes the wasted
-    /// transfer once per host rather than once per reconnect.
-    /// key → (when it may be retried, what went wrong). A `None` deadline means
-    /// **never, until the gate is cleared** — that is a deliberate refusal,
-    /// which is a different thing from a transient failure and must not expire
-    /// on a timer. A 5-minute cooldown on a decline means the popup returns
-    /// twice an hour forever on a host the user has already said no to.
+    /// digest → (when it failed, what the host said).
+    ///
+    /// **A map, not a single slot**, and that is the whole point: with more than
+    /// one candidate per host, one remembered failure is evicted by the next. A
+    /// NixOS box with LDAP/SSSD users refuses *both* payloads — gnu has no
+    /// loader, musl fails the self-check — so a single slot would remember only
+    /// musl, leave gnu unsuppressed on the next pass, and re-send both, forever,
+    /// at a backoff that caps at 30s. Remembering each independently is what
+    /// makes the wasted transfer once per host rather than once per reconnect.
+    ///
+    /// A `None` stamp means **never retry, until the gate is cleared** — that is
+    /// a deliberate refusal, which is a different thing from a transient failure
+    /// and must not expire on a timer. A 5-minute cooldown on a decline means
+    /// the popup returns twice an hour forever on a host the user already said
+    /// no to.
     failed: HashMap<String, (Option<Instant>, String)>,
 }
 
