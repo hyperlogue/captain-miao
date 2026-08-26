@@ -153,11 +153,11 @@ pub(crate) struct ConfigSlotGuard {
 #[cfg(test)]
 impl ConfigSlotGuard {
     pub(crate) fn install(cfg: Config) -> Self {
-        let _lock = CONFIG_SLOT_LOCK
+        let lock = CONFIG_SLOT_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let prev = replace_arc(Arc::new(cfg));
-        Self { prev, _lock }
+        Self { prev, _lock: lock }
     }
 }
 

@@ -1414,11 +1414,11 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // Detach reports: an attach window telling us its session ended. The watcher
     // must outlive the loop, so it is bound here (dropping it stops the watch).
     let detach_reports = Arc::new(AtomicBool::new(false));
-    let _detach_report_watcher = start_detach_report_watcher(detach_reports.clone());
+    let detach_report_watcher = start_detach_report_watcher(detach_reports.clone());
     // Without a watcher nothing ever flips the flag, so the reports need the
     // reload tick to drain them (see the reload block) — otherwise they pile up
     // in the sessions dir until the next dashboard start.
-    let detach_reports_watched = _detach_report_watcher.is_some();
+    let detach_reports_watched = detach_report_watcher.is_some();
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
     // The connecting cloud's blink phase as last drawn: `None` while nothing is
