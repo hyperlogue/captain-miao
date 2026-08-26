@@ -515,7 +515,9 @@ fn apply_kill_result(app: &mut App, result: KillResult) {
     }
 }
 
-// -- Dashboard singleton --
+// =============================================================================
+// Dashboard singleton
+// =============================================================================
 
 fn write_dashboard_pid_and_window() {
     let dir = state::state_dir();
@@ -1266,7 +1268,9 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
     true
 }
 
-// -- Terminal modes --
+// =============================================================================
+// Terminal modes
+// =============================================================================
 
 /// Enable the terminal modes the dashboard relies on, beyond what
 /// `render_backend::init` sets up (raw mode + alt screen): mouse capture, focus
@@ -1307,7 +1311,9 @@ fn leave_terminal_modes(kb_enhanced: bool) {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
 }
 
-// -- Entry point --
+// =============================================================================
+// Entry point
+// =============================================================================
 
 pub async fn run() -> Result<()> {
     check_existing_dashboard()?;

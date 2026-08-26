@@ -73,7 +73,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 /// isn't our exact build.
 const VERSION: &str = "v1";
 
-// -- Formats --
+// =============================================================================
+// Formats
+// =============================================================================
 
 /// An image format the bridge will serve.
 ///
@@ -116,7 +118,9 @@ impl Format {
     }
 }
 
-// -- The line protocol --
+// =============================================================================
+// The line protocol
+// =============================================================================
 
 /// Cap on a request line, excluding its newline. The longest we generate is 13
 /// bytes; the cap exists so a client that connects and streams without ever
@@ -342,7 +346,9 @@ fn err(kind: io::ErrorKind, msg: &str) -> io::Error {
     io::Error::new(kind, format!("clipboard: {msg}"))
 }
 
-// -- The shim's argv --
+// =============================================================================
+// The shim's argv
+// =============================================================================
 
 /// The names the shim farm mints, as symlinks to the binary that already ran.
 ///
@@ -548,7 +554,9 @@ pub fn render_targets(formats: &[Format]) -> String {
     })
 }
 
-// -- Delegation --
+// =============================================================================
+// Delegation
+// =============================================================================
 
 /// A file's identity on disk: `(st_dev, st_ino)`.
 pub type FileId = (u64, u64);

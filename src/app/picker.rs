@@ -23,7 +23,9 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::format::{centered_rect, clear_overlay, truncate_str};
 
-// -- TextInput: cursor-aware buffer with readline-style keybinds --
+// =============================================================================
+// TextInput: cursor-aware buffer with readline-style keybinds
+// =============================================================================
 
 /// A single-line text input with a cursor and readline-style keybinds
 /// (Ctrl-A/E/B/F/D/U/K/W, Alt-B/F/D, Home/End, arrow keys).
@@ -379,7 +381,9 @@ impl TextInput {
     }
 }
 
-// -- PickerItem / Picker --
+// =============================================================================
+// PickerItem / Picker
+// =============================================================================
 
 #[derive(Debug, Clone)]
 pub(in crate::app) struct PickerItem {

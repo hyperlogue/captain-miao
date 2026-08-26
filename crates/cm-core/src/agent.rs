@@ -1489,7 +1489,9 @@ pub enum AgentActivity {
     BackgroundShell,
 }
 
-// -- Generic types shared across backends --
+// =============================================================================
+// Generic types shared across backends
+// =============================================================================
 
 /// Lookup tables derived from an agent's on-disk session manifest. The
 /// dashboard merges entries from every active backend into one view; per-row

@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use crate::agent::AgentControl;
 use crate::terminal::{TabId, WindowId};
 
-// -- Paths --
+// =============================================================================
+// Paths
+// =============================================================================
 
 /// State files carry the user's own prompt text (`first_prompt`/`last_prompt`),
 /// working directories, and session ids, so they are owner-only — matching the
@@ -299,7 +301,9 @@ pub fn session_flags_path() -> PathBuf {
     state_dir().join("session-flags.json")
 }
 
-// -- Process utilities --
+// =============================================================================
+// Process utilities
+// =============================================================================
 
 pub fn is_process_alive(pid: u32) -> bool {
     // `kill(pid, 0)` returns 0 when the signal could be sent, but -1/EPERM
@@ -309,7 +313,9 @@ pub fn is_process_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-// -- Attach guards (shared by miao-server and miao-client) --
+// =============================================================================
+// Attach guards (shared by miao-server and miao-client)
+// =============================================================================
 
 /// Exit code of `attach` when the pool session already has a client attached.
 /// libshpool's own busy refusal exits 0 — indistinguishable from a clean
@@ -486,7 +492,9 @@ fn write_to_tty(seq: &[u8]) {
     let _ = out.flush();
 }
 
-// -- JSON file helpers --
+// =============================================================================
+// JSON file helpers
+// =============================================================================
 
 /// Atomic write: serialize to pretty JSON, write to `<path>.tmp`, then rename.
 /// Returns Err if serialization, write, or rename fails.
@@ -559,7 +567,9 @@ impl std::fmt::Display for HostId {
     }
 }
 
-// -- Session status --
+// =============================================================================
+// Session status
+// =============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -707,7 +717,9 @@ impl SessionStatus {
     }
 }
 
-// -- Hook events --
+// =============================================================================
+// Hook events
+// =============================================================================
 
 /// Normalized hook-event vocabulary the launcher acts on. The current shape
 /// mirrors Claude Code's hook contract; other backends are responsible for
@@ -784,7 +796,9 @@ impl<'de> Deserialize<'de> for HookEvent {
     }
 }
 
-// -- Hook message (hooks -> launcher) --
+// =============================================================================
+// Hook message (hooks -> launcher)
+// =============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HookMessage {
@@ -857,7 +871,9 @@ pub struct HookMessage {
     pub session_is_child: Option<bool>,
 }
 
-// -- Launcher state file --
+// =============================================================================
+// Launcher state file
+// =============================================================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LauncherState {

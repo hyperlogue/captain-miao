@@ -101,9 +101,9 @@ pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
     }
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // The source chain
-// ---------------------------------------------------------------------------
+// =============================================================================
 
 /// Environment variable prefix for both the per-target and the directory form.
 const ENV_PREFIX: &str = "CAPTAIN_MIAO_SERVER";
@@ -374,9 +374,9 @@ fn describe_table(table: &[ServerPayload]) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // Interpreter check
-// ---------------------------------------------------------------------------
+// =============================================================================
 
 /// The only two dynamic loaders a portable Linux payload may ask for.
 const GENERIC_INTERPS: &[&str] = &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"];

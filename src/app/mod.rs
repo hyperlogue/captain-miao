@@ -84,7 +84,9 @@ pub(super) const REMOTE_ENABLED: bool = cfg!(feature = "remote");
 /// where the launcher dies first and a later, unrelated window reuses the id.
 const PENDING_FOCUS_MAX_AGE: Duration = Duration::from_secs(30);
 
-// -- Input mode --
+// =============================================================================
+// Input mode
+// =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum InputMode {
@@ -1031,7 +1033,9 @@ pub(super) struct WorkdirCompletion {
     pub index: usize,
 }
 
-// -- App --
+// =============================================================================
+// App
+// =============================================================================
 
 pub(super) struct App {
     pub(super) sessions: Vec<LauncherState>,

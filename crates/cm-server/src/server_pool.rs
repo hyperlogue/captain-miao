@@ -162,7 +162,9 @@ pub(crate) fn open_in_pool(spec: &OpenSpec) -> Result<String> {
     Ok(name)
 }
 
-// -- Pending sessions (the reservation half of create-on-first-attach) --
+// =============================================================================
+// Pending sessions (the reservation half of create-on-first-attach)
+// =============================================================================
 
 /// A reserved-but-not-yet-created pool session: everything the first attach
 /// needs to bring it into being. Written by [`open_in_pool`], claimed by

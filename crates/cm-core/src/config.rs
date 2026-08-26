@@ -99,7 +99,9 @@ pub fn debug_enabled() -> bool {
     ) || get().debug.enabled
 }
 
-// -- launcher --
+// =============================================================================
+// launcher
+// =============================================================================
 
 /// The current default session-tab title template, applied verbatim to every
 /// agent (`{agent}`/`{basename}`/`{cwd}` placeholders, expanded at spawn).
@@ -193,7 +195,9 @@ impl LauncherConfig {
     }
 }
 
-// -- debug --
+// =============================================================================
+// debug
+// =============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]

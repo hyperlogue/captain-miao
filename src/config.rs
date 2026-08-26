@@ -277,7 +277,9 @@ impl Config {
     }
 }
 
-// -- terminal --
+// =============================================================================
+// terminal
+// =============================================================================
 
 /// Terminal-backend selection. `backend` is ignored at runtime (auto-detect
 /// only). Kitty-specific knobs stay under `[kitty]`.
@@ -308,7 +310,9 @@ pub enum ConfiguredBackend {
     Iterm,
 }
 
-// -- remote --
+// =============================================================================
+// remote
+// =============================================================================
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -339,7 +343,9 @@ pub enum OnWindowClose {
     Detach,
 }
 
-// -- kitty --
+// =============================================================================
+// kitty
+// =============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -355,7 +361,9 @@ impl Default for KittyConfig {
     }
 }
 
-// -- colors --
+// =============================================================================
+// colors
+// =============================================================================
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -428,7 +436,9 @@ impl Default for PickerColors {
     }
 }
 
-// -- ui --
+// =============================================================================
+// ui
+// =============================================================================
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -472,7 +482,9 @@ impl Default for TableConfig {
     }
 }
 
-// -- thresholds --
+// =============================================================================
+// thresholds
+// =============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -495,7 +507,9 @@ impl Default for ThresholdsConfig {
     }
 }
 
-// -- polling --
+// =============================================================================
+// polling
+// =============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -520,7 +534,9 @@ impl Default for PollingConfig {
     }
 }
 
-// -- color parsing --
+// =============================================================================
+// color parsing
+// =============================================================================
 
 fn de_color<'de, D: Deserializer<'de>>(d: D) -> Result<Color, D::Error> {
     let s = String::deserialize(d)?;
