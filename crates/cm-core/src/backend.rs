@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCache};
 
+// =============================================================================
+// What to open, and how
+// =============================================================================
+
 /// The subcommand every launcher argv goes through: `miao launch <agent> <cwd>`.
 ///
 /// One verb rather than one subcommand per backend, so the top-level CLI doesn't
@@ -84,6 +88,10 @@ impl LaunchPlan {
     }
 }
 
+// =============================================================================
+// Codex thread titles
+// =============================================================================
+
 /// Floor between sqlite re-reads of the Codex title store once a change is
 /// detected. Renames are rare and low-stakes, so the overlay trades freshness
 /// for quiet: a title change surfaces on the first overlay pass at least this
@@ -138,6 +146,10 @@ fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<
         }
     }
 }
+
+// =============================================================================
+// The server-core: reads, flags, overlays
+// =============================================================================
 
 /// In-process backend: read the local filesystem and signal local processes
 /// directly. Owns the per-agent session-name cache and the per-host Codex
@@ -441,6 +453,10 @@ impl LocalBackend {
             .collect()
     }
 
+    // =============================================================================
+    // Recent cwds and path completion
+    // =============================================================================
+
     /// Directory completions for `prefix` on this host's filesystem.
     pub fn complete_path(&self, prefix: &str) -> Vec<String> {
         complete_dirs(&paths::expand_home(prefix, &self.home))
@@ -569,6 +585,10 @@ fn split_for_completion(path: &str) -> (String, String) {
         None => (".".into(), path.to_string()),
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

@@ -1811,6 +1811,10 @@ impl SessionFlags {
 }
 
 impl App {
+    // =============================================================================
+    // Construction
+    // =============================================================================
+
     pub(super) fn new() -> Self {
         let home_dir = dirs::home_dir()
             .map(|h| h.to_string_lossy().to_string())
@@ -1962,6 +1966,10 @@ impl App {
         app
     }
 
+    // =============================================================================
+    // Sort invalidation, and the cursor anchor
+    // =============================================================================
+
     /// Invalidate the derived caches (visible order, dir labels) after a
     /// mutation, and apply `cursor` to the table selection.
     ///
@@ -2025,6 +2033,10 @@ impl App {
         }
         self.sessions.get(*indices.get(i)?).map(flag_key)
     }
+
+    // =============================================================================
+    // Per-session flags, and the bell
+    // =============================================================================
 
     pub(super) fn flags_of(&self, key: &FlagKey) -> SessionFlags {
         self.flags.get(key).copied().unwrap_or_default()
@@ -2223,6 +2235,10 @@ impl App {
         }
     }
 
+    // =============================================================================
+    // Persisted overrides
+    // =============================================================================
+
     pub(super) fn save_overrides(&self) {
         let mut overrides = DashboardOverrides::default();
         // Only local flags persist (keyed by pid, the historical format); remote
@@ -2329,6 +2345,10 @@ impl App {
         self.mark_dirty(Cursor::HoldIndex);
     }
 
+    // =============================================================================
+    // Keep-awake
+    // =============================================================================
+
     /// Whether a session runs on the machine the dashboard runs on.
     ///
     /// Keyed on `backends[0]`'s host rather than [`HostId::is_local`]: under
@@ -2400,6 +2420,10 @@ impl App {
         };
         self.set_status(format!("Prevent sleep {label}{suffix}"), false);
     }
+
+    // =============================================================================
+    // Preference pickers: layout, default agent and host, emoji
+    // =============================================================================
 
     /// Flip the session layout (Stacked ↔ Per-tab), persist it, and surface a
     /// status message. A spawn-time policy: this changes where *new* sessions
@@ -2546,6 +2570,10 @@ impl App {
         self.input_mode = InputMode::HostEdit;
     }
 
+    // =============================================================================
+    // Directory marks, recent cwds, work tabs
+    // =============================================================================
+
     /// Seed this machine's recent-dir list from its backend (which collapses
     /// each entry to the host-canonical `~` form on the way out, so a list
     /// written by an older build is migrated on read). Only meaningful for a
@@ -2657,6 +2685,10 @@ impl App {
         });
         self.input_mode = InputMode::DirEdit;
     }
+
+    // =============================================================================
+    // Hosts: dialling, reconciliation, the hosts panel
+    // =============================================================================
 
     /// One [`ConnIdentity`] per host that actually gets a backend, in config
     /// order — the whole desired state the reconcile aims at. Pure, so the set
@@ -3067,6 +3099,10 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    // =============================================================================
+    // The session snapshot, crash recovery, recent cwds
+    // =============================================================================
+
     /// Snapshot every currently-alive session that has the metadata needed to
     /// restart it. Called after every `reload_sessions`; removed entirely on
     /// clean exit by `cleanup_dashboard`. Skips the disk write when the
@@ -3144,6 +3180,10 @@ impl App {
         }
         self.save_recent_cwds();
     }
+
+    // =============================================================================
+    // The window -> tab cache
+    // =============================================================================
 
     /// Session windows whose `tab_id` isn't in `window_tab_cache` yet — the run
     /// loop snapshots the terminal only when this is non-empty (a new session
@@ -3261,6 +3301,10 @@ impl App {
             s.tab_id = tab;
         }
     }
+
+    // =============================================================================
+    // Reloading the session list
+    // =============================================================================
 
     pub(super) fn reload_sessions(&mut self) {
         // Remember which session was selected so re-sorting (e.g. a new
@@ -3401,6 +3445,10 @@ impl App {
         }
         self.clamp_selection();
     }
+
+    // =============================================================================
+    // The visible-row projection
+    // =============================================================================
 
     /// Run `f` over the cached visible-row indices without materializing a
     /// `Vec<&LauncherState>`. The index list is recomputed only when
@@ -3591,6 +3639,10 @@ impl App {
             .collect()
     }
 
+    // =============================================================================
+    // Lookups by index, key and host
+    // =============================================================================
+
     /// The session-name index for `host` — the only correct way to read one,
     /// since an index is meaningful solely against its own host's pids. An
     /// unknown host yields a shared empty index, which degrades to "no cached
@@ -3687,6 +3739,10 @@ impl App {
             .count();
         (rows.len(), attached)
     }
+
+    // =============================================================================
+    // Window bindings
+    // =============================================================================
 
     /// Record the local window the dashboard just opened for a session, keyed by
     /// its binding token (a remote `pool_session` or a local `launch_id`, §6),
@@ -3907,6 +3963,10 @@ impl App {
         self.pending_session_close.iter().map(|p| p.due).min()
     }
 
+    // =============================================================================
+    // Detached and pooled rows
+    // =============================================================================
+
     /// What to say about an attach that came back refused, and — for the two
     /// refusals captain-miao mints itself — the correction it is worth applying
     /// to the row it was about.
@@ -3970,6 +4030,10 @@ impl App {
             .find(|s| &s.host == host && s.pool_session.as_deref() == Some(token))
             .map(|s| s.key())
     }
+
+    // =============================================================================
+    // Transitions a reload notices
+    // =============================================================================
 
     /// The follow-up flag auto-mark / auto-clear transitions to apply after a
     /// reload — a pure function of the previous status map and the freshly
@@ -4120,6 +4184,10 @@ impl App {
         reaped
     }
 
+    // =============================================================================
+    // The window-bindings file
+    // =============================================================================
+
     /// Seed the in-memory `WindowBindings` from `window-bindings.json` at startup
     /// so a dashboard that restarts while sessions keep running can still resolve
     /// their windows (§6). A stale entry (its window died while
@@ -4223,6 +4291,10 @@ impl App {
         *self.last_bindings.borrow_mut() = Some(entries);
     }
 
+    // =============================================================================
+    // Selection bounds, and the status line
+    // =============================================================================
+
     pub(super) fn clamp_selection(&mut self) {
         let len = self.visible_len();
         if len == 0 {
@@ -4280,6 +4352,10 @@ impl App {
         self.selected_session_ref()
             .and_then(|s| self.window_id_for_session(s))
     }
+
+    // =============================================================================
+    // Resolving a session to its window
+    // =============================================================================
 
     /// The *local* window showing this session — the single choke point every
     /// `s.window_id` consumer routes through (§6). The dashboard
@@ -4356,6 +4432,10 @@ impl App {
         let term = s.terminal.as_ref()?;
         (Some(term) != self.terminal_identity.as_ref()).then(|| term.clone())
     }
+
+    // =============================================================================
+    // Focus, attach, and what a row can do
+    // =============================================================================
 
     /// Decide how to act on a live session: focus its local window (a local
     /// session, or an already-attached remote), attach a new window to a running
@@ -4501,6 +4581,10 @@ impl App {
             .filter_map(|s| Some((s.host.clone(), s.pool_session.clone()?)))
             .collect()
     }
+
+    // =============================================================================
+    // Host upgrades
+    // =============================================================================
 
     /// Why this host's server cannot be upgraded right now, phrased for the
     /// panel — `None` when it can.
@@ -4671,6 +4755,10 @@ impl App {
         Some(Action::AttachAll { targets })
     }
 
+    // =============================================================================
+    // Preview placeholders, and the reconnect sweep
+    // =============================================================================
+
     /// What the preview panel says when it has no captured text.
     ///
     /// The preview is a `capture_text` of the row's **local** window, so a row
@@ -4765,6 +4853,10 @@ impl App {
             .filter(|t| live.contains(t.as_str()))
             .collect()
     }
+
+    // =============================================================================
+    // The selected row, and acting on it
+    // =============================================================================
 
     /// Focus (or attach to) the currently selected session — the shared body
     /// behind `Enter`, a row double-click, and the `Ctrl-<digit>` selector, so
@@ -5045,6 +5137,10 @@ impl App {
         self.focus_selected()
     }
 
+    // =============================================================================
+    // Restart
+    // =============================================================================
+
     /// Build the spec to restart `s`, or the user-facing reason it can't be: a
     /// session that isn't at rest, or one missing the window/session id.
     /// `request_restart_selected` surfaces the `Err` verbatim; the restart-all
@@ -5160,6 +5256,10 @@ impl App {
         });
         self.input_mode = InputMode::Confirm;
     }
+
+    // =============================================================================
+    // The resume picker
+    // =============================================================================
 
     /// Build one resume/browser picker row from a resumable candidate. Shared by
     /// the resume picker (`tag = None`) and the cross-host browser's resumable
@@ -5355,6 +5455,10 @@ impl App {
         }
     }
 
+    // =============================================================================
+    // The move-to-tab picker
+    // =============================================================================
+
     /// Open the move-window-to-tab picker. The trailing `[New Tab]` entry is
     /// synthetic — selecting it maps to the Kitty `new` target.
     pub(super) fn open_move_tab_picker(&mut self, window_id: WindowId, tabs: Vec<TabInfo>) {
@@ -5388,6 +5492,10 @@ impl App {
         });
         self.input_mode = InputMode::Picker;
     }
+
+    // =============================================================================
+    // Moving the cursor, and the preview
+    // =============================================================================
 
     pub(super) fn select_next(&mut self) {
         let len = self.visible_len();
@@ -5509,6 +5617,10 @@ impl App {
             None => 0,
         }
     }
+
+    // =============================================================================
+    // The workdir picker
+    // =============================================================================
 
     /// Open the workdir picker: recent cwds as suggestions, free-form path
     /// entry via the text input, Tab for filesystem completion. The typed path
@@ -6029,6 +6141,10 @@ impl App {
         FALLBACK[format::stable_index(&host.0, FALLBACK.len())].to_string()
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests;

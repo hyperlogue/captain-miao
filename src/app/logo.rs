@@ -34,6 +34,10 @@ use crate::terminal::graphics::{self, PAW_IMAGE_ID, Placement};
 
 use super::App;
 
+// =============================================================================
+// The paw: masks, colours, pulse
+// =============================================================================
+
 /// Cells the resting logo occupies (width, height). One source of truth for the
 /// header layout, the click hit-test, and the graphics placement.
 pub(super) const LOGO_CELLS: (u16, u16) = (2, 1);
@@ -75,6 +79,10 @@ const PAW_STATES: [PawState; 3] = [PawState::Idle, PawState::Active, PawState::A
 /// Kept in sync with `examples/gen_logo_assets.rs`.
 const PAW_MASK: &[u8] = include_bytes!("../../assets/logo/paw-mask.gray");
 const PAW_MASK_DIM: u32 = 64;
+
+// =============================================================================
+// The walking cat
+// =============================================================================
 
 /// The cat walk sprite **sheet**: `CAT_FRAMES` walk poses laid out horizontally,
 /// each `CAT_FRAME_W`×`CAT_FRAME_H` px. One alpha mask (like the paw), tinted to a
@@ -141,6 +149,10 @@ pub(super) const DEFAULT_PAW_COLORS: [(u8, u8, u8); 3] = [
     (0xa6, 0xe3, 0xa1), // active — green
     (0xf9, 0xe2, 0xaf), // attention — yellow
 ];
+
+// =============================================================================
+// Rendering, and invalidation
+// =============================================================================
 
 /// kitty image id for a status colour's animated paw (base id + the colour index).
 fn paw_image_id(state: PawState) -> u32 {
@@ -392,6 +404,10 @@ impl App {
     }
 }
 
+// =============================================================================
+// Tinting and easing
+// =============================================================================
+
 /// Choose a cat tint from a whitened random `rand`: usually one of the four common
 /// dashboard colours (equal odds), and 1 in `CAT_RARE_ONE_IN` the rare special
 /// pink. Pure (given `rand`) so the split is unit-testable; the low and high bits
@@ -516,6 +532,10 @@ fn brighten((r, g, b): (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
     (scale(r), scale(g), scale(b))
 }
 
+// =============================================================================
+// Probing the terminal's palette
+// =============================================================================
+
 /// Caches of the startup-probed paw + cat tints, so `App::new` (which runs after
 /// the terminal modes are armed) can read what `probe_logo_colors` resolved earlier.
 static PROBED_PAW_COLORS: OnceLock<[(u8, u8, u8); 3]> = OnceLock::new();
@@ -603,6 +623,10 @@ fn ansi_palette_index(color: Color) -> Option<u8> {
         _ => return None,
     })
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

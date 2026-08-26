@@ -27,6 +27,10 @@ use super::format::{centered_rect, clear_overlay, truncate_str};
 // TextInput: cursor-aware buffer with readline-style keybinds
 // =============================================================================
 
+// =============================================================================
+// TextInput: a cursor-aware buffer with readline keybinds
+// =============================================================================
+
 /// A single-line text input with a cursor and readline-style keybinds
 /// (Ctrl-A/E/B/F/D/U/K/W, Alt-B/F/D, Home/End, arrow keys).
 #[derive(Debug, Default, Clone)]
@@ -383,6 +387,10 @@ impl TextInput {
 
 // =============================================================================
 // PickerItem / Picker
+// =============================================================================
+
+// =============================================================================
+// Picker: a TextInput plus a filtered list
 // =============================================================================
 
 #[derive(Debug, Clone)]

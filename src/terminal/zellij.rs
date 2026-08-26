@@ -54,6 +54,10 @@ use super::{
     tail_lines, wrap_env,
 };
 
+// =============================================================================
+// Tabs, panes, and the command we shell out with
+// =============================================================================
+
 /// Title of the shared tab hosting every session's floating pane. Looked up
 /// by name on each floating spawn (one `list-tabs`, per-tab cost) rather than
 /// by a cached id: zellij recycles a closed highest tab's id onto the next
@@ -222,6 +226,10 @@ impl ZellijTerminal {
     }
 }
 
+// =============================================================================
+// Parsing what zellij prints
+// =============================================================================
+
 /// Validate a zellij pane/tab id: bare ASCII digits only (zellij's stable ids
 /// are non-negative integers). The only untrusted source is captain-miao's own
 /// state files; anything else fails closed rather than mis-target — same
@@ -379,6 +387,10 @@ fn floating_new_pane_args(
     push_exec_tail(&mut args, close_on_exit, exec);
     args
 }
+
+// =============================================================================
+// The Terminal impl
+// =============================================================================
 
 /// The zellij backend's fixed capabilities: no cross-tab reparent CLI, so `t`
 /// is hidden (`move_to_tab: false`); and sessions live as floating panes in one
@@ -592,6 +604,10 @@ impl Terminal for ZellijTerminal {
         CAPABILITIES
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

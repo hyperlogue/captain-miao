@@ -41,6 +41,10 @@ use super::format::{centered_rect, clear_overlay};
 use super::picker::TextInput;
 use super::{Action, App, InputMode};
 
+// =============================================================================
+// Categories, panes, and the overlay's state
+// =============================================================================
+
 /// The left pane's tabs. `ALL` is the order they cycle in; [`Self::visible`]
 /// is what hides one whose rows this terminal cannot offer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +142,10 @@ impl PrefsState {
     }
 }
 
+// =============================================================================
+// What the overlay persists
+// =============================================================================
+
 /// Layer 3: what this overlay has overridden, stored under
 /// `dashboard-overrides.json`'s `prefs` key.
 ///
@@ -205,6 +213,10 @@ impl PrefsOverrides {
             && self.prevent_sleep.is_none()
     }
 }
+
+// =============================================================================
+// The agent list
+// =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentPref {
@@ -332,6 +344,11 @@ pub(super) fn apply_prefs_to_config(cfg: &mut config::Config, prefs: &PrefsOverr
 // The slice is what the cursor indexes and what `prefs_item_count` measures, so
 // a row that exists but is left out of the slice simply never appears — which
 // is the intended way to stage one, not an oversight to fix.
+
+// =============================================================================
+// Each category's rows
+// =============================================================================
+
 enum GeneralRow {
     Layout,
     KeepAwake,
@@ -377,6 +394,10 @@ const COLOR_ROWS: &[ColorRow] = &[
 ];
 
 impl App {
+    // =============================================================================
+    // The overlay: keys, edits, and drawing
+    // =============================================================================
+
     pub(super) fn open_prefs(&mut self) {
         self.prefs = Some(PrefsState::new());
         self.input_mode = InputMode::Prefs;
@@ -1134,6 +1155,10 @@ impl App {
         }
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

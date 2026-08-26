@@ -35,6 +35,10 @@ use super::{
 /// Max gap between two left-clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
+// =============================================================================
+// Entry points: one per input device
+// =============================================================================
+
 /// The backend `Ctrl-t` lands on next, given the ones currently installed.
 ///
 /// Pure and separate from the key handler for its two edge cases, both of which
@@ -220,6 +224,10 @@ impl App {
             _ => None,
         }
     }
+
+    // =============================================================================
+    // Normal mode, and the command table
+    // =============================================================================
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Option<Action> {
         // Capture any half-typed chord and clear both flags up front, so an
@@ -641,6 +649,10 @@ impl App {
         }
     }
 
+    // =============================================================================
+    // Search
+    // =============================================================================
+
     fn handle_search_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc => {
@@ -781,6 +793,10 @@ impl App {
             host,
         }
     }
+
+    // =============================================================================
+    // The pickers
+    // =============================================================================
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
         let Some(active) = self.picker.as_mut() else {
@@ -1094,6 +1110,10 @@ impl App {
         }
     }
 
+    // =============================================================================
+    // The hosts panel
+    // =============================================================================
+
     /// The hosts panel (`Space h`). A list view with live per-host state, not a
     /// staged edit form (§9): there is no Save step, because every mutation
     /// persists as it happens — adding a host connects it immediately (so you
@@ -1391,6 +1411,10 @@ impl App {
         }
     }
 
+    // =============================================================================
+    // Directory marks
+    // =============================================================================
+
     fn handle_dir_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
         // Esc and Enter are unconditional — even with the text row focused
         // they should close / commit, not get inserted as text.
@@ -1476,6 +1500,10 @@ impl App {
         }
         None
     }
+
+    // =============================================================================
+    // Message log, help, confirm
+    // =============================================================================
 
     /// Scroll keys for the message log. Reading, not editing, so the bindings
     /// are the pager ones the hosts panel's connection log already uses —

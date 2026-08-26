@@ -46,6 +46,10 @@ use super::{
     ssh_common_opts,
 };
 
+// =============================================================================
+// Filesystem locations, and where a release lives
+// =============================================================================
+
 /// The binary's name: what it's called on the remote's `PATH`, and what a
 /// `--version` line starts with.
 const SERVER_BIN: &str = "miao-server";
@@ -125,6 +129,10 @@ fn release_url(base: &str, version: &str, target: &str) -> String {
     format!("{base}/v{version}/{SERVER_BIN}-v{version}-{target}.tar.gz")
 }
 
+// =============================================================================
+// Asking the user
+// =============================================================================
+
 /// How long the user has to answer a download prompt before the attempt gives
 /// up. Bounded because the connection task is *blocked* here: a sync `Backend`
 /// call from the UI thread parks in `block_in_place` waiting on this host, so an
@@ -173,6 +181,10 @@ const UPLOAD_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 /// Ceiling on one upload, so a stalled transfer can't wedge the reconnect loop
 /// forever. Generous: this is multiple megabytes over whatever link the user has.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+// =============================================================================
+// Probing the host
+// =============================================================================
 
 /// Which binary answered `daemon status` with a live daemon, if either did.
 ///
@@ -484,6 +496,10 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
         terminfo,
     })
 }
+
+// =============================================================================
+// Deciding what to deploy
+// =============================================================================
 
 /// Decide which remote binary to invoke.
 ///
@@ -808,6 +824,10 @@ fn remote_exe_for(action: &Provision, home: &str) -> String {
     }
 }
 
+// =============================================================================
+// The scripts we send
+// =============================================================================
+
 /// Remembers a failed upload so the next reconnect doesn't repeat it. Keyed on
 /// the payload digest, so building a new server *does* get a fresh attempt
 /// immediately — only re-sending the same bytes to the same host is suppressed.
@@ -976,6 +996,10 @@ fn upgrade_script(sha256: &str, target: &str, running: RunningDaemon) -> String 
         publish_steps(sha256, target)
     )
 }
+
+// =============================================================================
+// Doing it: probe, deploy, install a terminfo
+// =============================================================================
 
 /// Bounds on fetching a published server. The download is the one step that
 /// leaves the machine, so what is on the far end is a web server — which may be
@@ -1509,6 +1533,10 @@ async fn try_download_candidate(
         }
     }
 }
+
+// =============================================================================
+// Resolving the command to invoke
+// =============================================================================
 
 /// Resolve the remote command to invoke: probe → decide → (deploy) → invoke.
 /// Never errors — any failure resolves to `miao-server` on PATH so the

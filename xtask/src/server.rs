@@ -36,6 +36,10 @@ use std::process::{Command, Stdio};
 use liblzma::write::XzEncoder;
 use sha2::{Digest, Sha256};
 
+// =============================================================================
+// Names, and where a release lives
+// =============================================================================
+
 /// The cargo package we build. Distinct from [`SERVER_BIN`] since the rename:
 /// `cargo -p` still wants the package name, everything downstream wants the file.
 const SERVER_PKG: &str = "captain-miao-server";
@@ -60,6 +64,10 @@ pub const GLIBC_FLOOR: &str = "2.28";
 /// Overridable so a fork, a private mirror, or a test can be pointed somewhere
 /// else without a code change — the URL shape is the contract, not the host.
 pub const RELEASE_BASE: &str = "https://github.com/hyperlogue/captain-miao/releases/download";
+
+// =============================================================================
+// Provenance
+// =============================================================================
 
 /// Where a payload came from. Recorded rather than inferred: the three sources
 /// are indistinguishable by the time the bytes are packed, and "which server is
@@ -93,6 +101,10 @@ impl Provenance {
         }
     }
 }
+
+// =============================================================================
+// Choosing a build strategy
+// =============================================================================
 
 /// How a given target gets built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +244,10 @@ pub fn unpinned_floor(strategy: Strategy, target: &str) -> Option<&'static str> 
         Strategy::Cross => Some("the glibc in cross's container image for this target"),
     }
 }
+
+// =============================================================================
+// Building
+// =============================================================================
 
 /// The command line a strategy runs. Pure, so the zigbuild glibc suffix is
 /// testable without zig installed.
@@ -442,6 +458,10 @@ pub fn from_file(build_dir: &Path, target: &str, path: &Path) -> Result<Payload,
     pack_binary(build_dir, target, path, &raw, Provenance::Local)
 }
 
+// =============================================================================
+// Downloading a published server
+// =============================================================================
+
 /// Download a published `miao-server` for `target` and pack it.
 ///
 /// The point of this source is that a bundled dashboard no longer needs a cross
@@ -568,6 +588,10 @@ pub fn release_url(base: &str, version: &str, target: &str) -> String {
     format!("{base}/v{version}/{SERVER_BIN}-v{version}-{target}.tar.gz")
 }
 
+// =============================================================================
+// Packing
+// =============================================================================
+
 /// Digest, compress, and record a server binary — the tail every source shares.
 ///
 /// Split out so the three of them differ only in how the bytes arrive: anything
@@ -671,6 +695,10 @@ fn pack(
     Ok((packed_path, packed.len() as u64, true))
 }
 
+// =============================================================================
+// Running a command
+// =============================================================================
+
 /// Run the nested cargo, with its output going straight to the terminal.
 ///
 /// The environment is inherited except for the flags aimed at the *outer* build:
@@ -748,6 +776,10 @@ pub fn human(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

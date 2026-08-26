@@ -25,6 +25,10 @@
 //! `include_bytes!` data is allocated and referenced, so — like the slot it
 //! replaced — it survives `strip`.
 
+// =============================================================================
+// What this build carries
+// =============================================================================
+
 /// One embedded server build.
 pub(crate) struct ServerPayload {
     /// The Rust target triple it was built for.
@@ -103,6 +107,10 @@ pub(crate) fn target_candidates(uname_sm: &str) -> &'static [&'static str] {
 
 // =============================================================================
 // The source chain
+// =============================================================================
+
+// =============================================================================
+// Where else a payload can come from
 // =============================================================================
 
 /// Environment variable prefix for both the per-target and the directory form.
@@ -218,6 +226,10 @@ fn digest_of(path: &std::path::Path) -> std::io::Result<String> {
             s
         }))
 }
+
+// =============================================================================
+// Resolving the candidates for a host
+// =============================================================================
 
 /// Every server we can supply **locally** for a host, in preference order.
 ///
@@ -376,6 +388,10 @@ fn describe_table(table: &[ServerPayload]) -> String {
 
 // =============================================================================
 // Interpreter check
+// =============================================================================
+
+// =============================================================================
+// The interpreter check
 // =============================================================================
 
 /// The only two dynamic loaders a portable Linux payload may ask for.

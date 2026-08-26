@@ -29,6 +29,10 @@ use crate::agent::SessionIndex;
 use crate::state::{LauncherState, SessionStatus};
 use cm_core::agents::grok::unwrap_user_query;
 
+// =============================================================================
+// Status colours
+// =============================================================================
+
 /// The foreground color for a status label. Presentation policy, so it lives in
 /// the dashboard rather than on `SessionStatus` in core (which stays ratatui-free).
 pub(super) fn status_color(status: &SessionStatus) -> Color {
@@ -76,6 +80,10 @@ const BAR_BG: Color = Color::Rgb(49, 50, 68);
 const KEY_BG: Color = Color::Rgb(69, 71, 90);
 const BAR_FG: Color = Color::Rgb(205, 214, 244);
 const LABEL_FG: Color = Color::Rgb(186, 194, 222);
+
+// =============================================================================
+// The footer bar: pills, hints, badges
+// =============================================================================
 
 /// The base style both bars fill their whole row with, so the bar reads as one
 /// continuous surface. Callers render their content spans on top; any span with
@@ -185,6 +193,10 @@ pub(super) fn contains_ci(haystack: &str, needle: &str) -> bool {
     let (h, n) = (haystack.as_bytes(), needle.as_bytes());
     h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
+
+// =============================================================================
+// The ANSI parser, and fading
+// =============================================================================
 
 /// Parse a (possibly ANSI-coded) terminal-text dump into styled ratatui lines.
 /// Handles SGR (`\x1b[…m`), OSC (`\x1b]…BEL` or `…ST`), and the charset-designator
@@ -395,6 +407,10 @@ fn fade_rgb(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     (mix(r), mix(g), mix(b))
 }
 
+// =============================================================================
+// A directory's emoji and colour
+// =============================================================================
+
 /// Single-codepoint emojis only (no ZWJ sequences or skin tones) so wide
 /// renderers stay consistent across terminals.
 const DEFAULT_DIR_EMOJIS: &[&str] = &[
@@ -523,6 +539,10 @@ pub(crate) enum Detached {
 /// The secondary indicator's slot: one emoji, 2 cells.
 const SECONDARY_SLOT_WIDTH: u16 = 2;
 
+// =============================================================================
+// Override indicators
+// =============================================================================
+
 /// Width of the override indicator: the secondary's emoji slot plus the 1-cell
 /// follow-up slot after it. It is the *indent* on the status column rather than a
 /// column of its own — see [`override_indicator_spans`] for why — so the status
@@ -632,6 +652,10 @@ pub(super) fn override_indicator_spans(
     spans
 }
 
+// =============================================================================
+// Naming a session
+// =============================================================================
+
 /// Display-cell budget for an auto-title folded from the first prompt. A
 /// deliberate `/rename` is short by nature and shown in full; a first prompt is
 /// unbounded, so it's clipped to a title's worth even in the panels/pickers that
@@ -729,6 +753,10 @@ pub(super) fn format_relative_time(since: std::time::SystemTime) -> String {
         format!("{}d", secs / 86400)
     }
 }
+
+// =============================================================================
+// Model, context pressure, token counts
+// =============================================================================
 
 /// Color the context-length cell by pressure: warning (yellow) and critical
 /// (red) thresholds come from config — the yellow/red is semantic here, so it
@@ -840,6 +868,10 @@ pub(super) fn format_context_detail(tokens: u64, window: Option<u64>) -> String 
     }
 }
 
+// =============================================================================
+// Text and layout helpers
+// =============================================================================
+
 /// Truncate `s` to fit within `max` terminal cells (not chars), appending a
 /// 1-cell `…` when content is dropped. Wide chars (CJK, 2-cell emoji) count
 /// their full display width and zero-width combining marks count nothing, so a
@@ -943,6 +975,10 @@ fn clip_wide_glyphs_left_of(buf: &mut Buffer, area: Rect) {
     }
 }
 
+// =============================================================================
+// Elapsed and relative time
+// =============================================================================
+
 /// Worst-case width of `format_elapsed` output (`>99h00m` = 7 chars). Used by
 /// the dashboard to size the "Updated" column tightly — every other variant
 /// is shorter and right-aligns within this width.
@@ -1020,6 +1056,10 @@ pub(super) fn elapsed_cell(secs: u64) -> Cell<'static> {
     Cell::from(Line::from(spans).alignment(Alignment::Right))
 }
 
+// =============================================================================
+// Version comparison
+// =============================================================================
+
 /// Whether `theirs` is an older release than `ours`, by SemVer-ish numeric
 /// comparison of the dotted components.
 ///
@@ -1051,6 +1091,10 @@ pub(super) fn version_is_older(theirs: &str, ours: &str) -> bool {
     let n = t.len().min(o.len());
     t[..n] < o[..n]
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

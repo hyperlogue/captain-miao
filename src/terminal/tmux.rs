@@ -75,6 +75,10 @@ use super::{
     Terminal, WindowId, tail_lines, wrap_env,
 };
 
+// =============================================================================
+// Formats, and the command we shell out with
+// =============================================================================
+
 /// The format `snapshot` requests, one line per pane. The free-text field
 /// (`window_name`) goes **last** so a name containing the separator can't shift
 /// the id fields; everything before it is a fixed, validated shape.
@@ -191,6 +195,10 @@ impl TmuxTerminal {
         }
     }
 }
+
+// =============================================================================
+// Ids, and parsing what tmux prints
+// =============================================================================
 
 /// Validate a tmux id of the form `<sigil><digits>`, failing closed. The shared
 /// [`super::validate_id`] doesn't fit (tmux ids carry a sigil), but the rationale
@@ -325,6 +333,10 @@ fn quote_argv(argv: &[String]) -> String {
 fn trim_trailing_blank_lines(s: &str) -> &str {
     s.trim_end_matches(['\n', '\r', ' ', '\t'])
 }
+
+// =============================================================================
+// The Terminal impl
+// =============================================================================
 
 /// The tmux backend's fixed capabilities. `move_to_tab` is **true** — the first
 /// multiplexer backend where it is, since `break-pane`/`join-pane` are real CLI
@@ -581,6 +593,10 @@ impl Terminal for TmuxTerminal {
     }
 }
 
+// =============================================================================
+// Naming this dashboard's own window
+// =============================================================================
+
 /// What `set_own_tab_title` asks about the dashboard's window before renaming it.
 const WINDOW_NAME_FORMAT: &str = "#{window_name}\t#{automatic-rename}";
 
@@ -597,6 +613,10 @@ fn parse_window_name(reply: &str) -> (String, bool) {
         None => (line.to_string(), false),
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

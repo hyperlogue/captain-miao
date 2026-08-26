@@ -21,6 +21,10 @@ use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+// =============================================================================
+// A chord, and a one-or-two chord sequence
+// =============================================================================
+
 /// A single key press: a key code plus the Ctrl/Alt modifiers that matter for
 /// dispatch. Shift is folded into the character itself (e.g. `Shift+o` is
 /// stored as `Char('O')`), matching crossterm's delivery and the dashboard's
@@ -207,6 +211,10 @@ impl KeySeq {
         }
     }
 }
+
+// =============================================================================
+// The commands a key can be bound to
+// =============================================================================
 
 /// Every remappable Normal-mode command. Each carries a stable config id (used
 /// as the `[keybinds]` key) and a help description. The `keys.rs` dispatcher
@@ -419,6 +427,10 @@ impl Command {
     }
 }
 
+// =============================================================================
+// The default table
+// =============================================================================
+
 /// Default bindings, in display order. The first string per command is its
 /// canonical key; extra strings are alternates (all dispatch to the same
 /// command). These reproduce the dashboard's historical hard-coded keys.
@@ -464,6 +476,10 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::MessageLog,         &["space m"]),
     (Command::Preferences,        &[",", "space p"]),
 ];
+
+// =============================================================================
+// The keymap: build it, then ask it
+// =============================================================================
 
 /// Resolved binding table: sequence → command, plus the set of prefix chords
 /// (first chords of two-chord sequences) and an ordered list for display.
@@ -701,6 +717,10 @@ impl Keymap {
         (!joined.is_empty()).then_some(joined)
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

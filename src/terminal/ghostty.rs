@@ -104,6 +104,10 @@ use super::{
     Terminal, WindowId,
 };
 
+// =============================================================================
+// Finding our own surface
+// =============================================================================
+
 /// How long [`GhosttyTerminal::resolve_own_surface`] waits for the title it just
 /// wrote to reach Ghostty's model, as `(tries, seconds between)` — the two halves
 /// of one AppleScript `repeat`, so the whole wait costs a single `osascript`.
@@ -285,6 +289,10 @@ fn own_tty() -> Option<String> {
     None
 }
 
+// =============================================================================
+// Ids, and refusing a hostile one
+// =============================================================================
+
 /// Validate an id before it is interpolated into a script, failing closed.
 ///
 /// Ghostty mints three shapes — a surface UUID, `tab-<hex>`, and
@@ -361,6 +369,10 @@ fn diagnose(outcome: ProbeOutcome<'_>) -> String {
     };
     format!("Ghostty automation check failed: {problem}")
 }
+
+// =============================================================================
+// The AppleScript we send
+// =============================================================================
 
 /// Ghostty's answer to [`Terminal::capabilities`]. Exported so tests assert
 /// against the real value rather than a hand-built literal that could silently
@@ -569,6 +581,10 @@ fn spawn_script(spec: &SpawnSpec) -> Result<String> {
     ))
 }
 
+// =============================================================================
+// The Terminal impl
+// =============================================================================
+
 #[async_trait]
 impl Terminal for GhosttyTerminal {
     fn current_window(&self) -> Option<WindowId> {
@@ -721,6 +737,10 @@ impl Terminal for GhosttyTerminal {
         CAPABILITIES
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

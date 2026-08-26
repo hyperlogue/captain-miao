@@ -50,6 +50,10 @@ use crate::agents;
 use crate::agents::{antigravity, claude, codex, grok, kimi, omp, opencode, pi, reasonix};
 use crate::state::{HookEvent, HookMessage, LauncherState};
 
+// =============================================================================
+// Which backends exist, and what they can do
+// =============================================================================
+
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
 /// [`AgentControl::Unknown`]; `Serialize` stays derived — `rename_all` maps that
 /// variant to `"unknown"`, which decodes back to itself.
@@ -408,6 +412,10 @@ impl AgentControl {
         }
     }
 
+    // =============================================================================
+    // Argv: launch, resume, fork, worktree
+    // =============================================================================
+
     /// Whether this agent can launch into an isolated worktree. Derived from
     /// [`Self::worktree_args`] rather than matched separately, so the UI gate
     /// and the argv can never disagree about which agents support it.
@@ -577,6 +585,10 @@ impl AgentControl {
             .filter(|e| mentions_event(&config, e.as_kebab()))
             .collect()
     }
+
+    // =============================================================================
+    // Hooks: what each backend registers
+    // =============================================================================
 
     /// Hook commands a backend installs **somewhere other than** the file
     /// [`Self::hooks_settings_json`] returns, so [`Self::forwarded_events`] can
@@ -820,6 +832,10 @@ impl AgentControl {
         }
     }
 
+    // =============================================================================
+    // Reading a backend's own files
+    // =============================================================================
+
     /// Resumable sessions across all of this agent's transcripts. Most-recent
     /// first, capped at `limit`. The returned candidates carry their source
     /// agent so a future picker can mix backends in one list.
@@ -995,6 +1011,10 @@ impl AgentControl {
             )),
         }
     }
+
+    // =============================================================================
+    // Probing a live session
+    // =============================================================================
 
     /// Whether a session that has just ended a turn will open its **own** next
     /// one, with no hook to announce it — so its `Stop` is a turn boundary
@@ -1491,6 +1511,10 @@ pub enum AgentActivity {
 
 // =============================================================================
 // Generic types shared across backends
+// =============================================================================
+
+// =============================================================================
+// Types shared across backends
 // =============================================================================
 
 /// Lookup tables derived from an agent's on-disk session manifest. The

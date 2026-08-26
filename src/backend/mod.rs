@@ -194,6 +194,10 @@ const REMOTE_OUTPUT_CAP: u64 = 256 * 1024;
 /// and a cold NFS home has been known to make that unhurried.
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 
+// =============================================================================
+// The Backend seam, connection state, and the log
+// =============================================================================
+
 /// Per-host session management. `Local` is in-process; `Remote` speaks the wire
 /// protocol to a `miao-server` over a (possibly ssh-forwarded) socket.
 ///
@@ -620,6 +624,10 @@ impl PoolRow {
         })
     }
 }
+
+// =============================================================================
+// Vitals, capabilities, and the plans a backend returns
+// =============================================================================
 
 /// A backend's change signal, taken (and cleared) by the run loop. One handle
 /// per backend, from [`Backend::subscribe`]; a local one is fed by that
@@ -3207,6 +3215,10 @@ fn scratch_home(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

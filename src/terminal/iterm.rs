@@ -95,6 +95,10 @@ use super::{
     Terminal, WindowId, tail_lines, wrap_env,
 };
 
+// =============================================================================
+// Ids, and refusing a hostile one
+// =============================================================================
+
 /// How long a [`spawn`](Terminal::spawn) waits for iTerm2 to answer before
 /// giving up on it.
 ///
@@ -225,6 +229,10 @@ fn diagnose(outcome: ProbeOutcome<'_>) -> String {
 }
 
 // ---- snapshot ----
+
+// =============================================================================
+// The AppleScript we send
+// =============================================================================
 
 /// The one snapshot script, run per [`snapshot`](Terminal::snapshot).
 ///
@@ -501,6 +509,10 @@ fn walk_script(id: &str, body: &str, missing: &str) -> Result<String> {
     ))
 }
 
+// =============================================================================
+// The Terminal impl
+// =============================================================================
+
 #[async_trait]
 impl Terminal for ItermTerminal {
     fn current_window(&self) -> Option<WindowId> {
@@ -641,6 +653,10 @@ impl Terminal for ItermTerminal {
         CAPABILITIES
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

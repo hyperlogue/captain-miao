@@ -49,6 +49,10 @@ use super::{
 };
 
 impl App {
+    // =============================================================================
+    // The frame, and the two body layouts
+    // =============================================================================
+
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) {
         let footer_h: u16 = 1;
         // The header is a borderless single-row zellij-style ribbon plus one
@@ -292,6 +296,10 @@ impl App {
             self.last_preview_rect = None;
         }
     }
+
+    // =============================================================================
+    // Overlays: directory marks, hosts, confirm
+    // =============================================================================
 
     fn draw_dir_edit(&self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(state) = self.dir_edit.as_ref() else {
@@ -970,6 +978,10 @@ impl App {
         frame.render_widget(para, inner);
     }
 
+    // =============================================================================
+    // The header
+    // =============================================================================
+
     fn draw_header(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let total = self.sessions.len();
         let noun = if total == 1 { "session" } else { "sessions" };
@@ -1146,6 +1158,10 @@ impl App {
             .unwrap_or_default();
         Some(vitals_spinner_frame(since_epoch))
     }
+
+    // =============================================================================
+    // The detail panel
+    // =============================================================================
 
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
         self.last_detail_rect = Some(area);
@@ -1400,6 +1416,10 @@ impl App {
         }
         Some(self.host_icon(&s.host))
     }
+
+    // =============================================================================
+    // The session table
+    // =============================================================================
 
     fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
         self.last_table_rect = Some(area);
@@ -1720,6 +1740,10 @@ impl App {
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
+    // =============================================================================
+    // The preview panel
+    // =============================================================================
+
     fn draw_preview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         self.last_preview_rect = Some(area);
 
@@ -1825,6 +1849,10 @@ impl App {
         let window: Vec<Line> = lines[start..end].to_vec();
         frame.render_widget(Paragraph::new(window).scroll((0, h_scroll)), inner);
     }
+
+    // =============================================================================
+    // Help, and the message log
+    // =============================================================================
 
     fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
         let popup = centered_rect(70, 90, area);
@@ -2045,6 +2073,10 @@ impl App {
             view.scroll = view.scroll.min(lines.len().saturating_sub(rows));
         }
     }
+
+    // =============================================================================
+    // The footer
+    // =============================================================================
 
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
         // The footer is a zellij-style ribbon of "<key> <label>" hints, but the
@@ -2268,6 +2300,10 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style()), area);
     }
 }
+
+// =============================================================================
+// Free helpers: wrapping, blink and spinner phases, tallies
+// =============================================================================
 
 /// The hosts row-editor hint for one field, or `None` for a field that speaks for
 /// itself. Indented to the label column, so it reads as belonging to the form

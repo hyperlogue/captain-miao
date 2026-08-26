@@ -43,6 +43,10 @@ use crate::state::{self, LauncherState, SessionKey};
 use cm_core::agent::AgentControl;
 use cm_core::vitals::{HostVitals, VitalsSampler};
 
+// =============================================================================
+// Timings
+// =============================================================================
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Auto-exit after this long with no pool sessions and no connected clients.
@@ -66,6 +70,10 @@ const VITALS_CACHE: Duration = Duration::from_secs(10);
 /// enough for the tick counters to move, short enough to be invisible in the
 /// reply — the alternative is a blank CPU column until the *next* poll.
 const VITALS_PRIME_GAP: Duration = Duration::from_millis(200);
+
+// =============================================================================
+// The daemon: ensure, run, stop, status
+// =============================================================================
 
 /// Build the `Opened` reply for an `OpenSession` request. With the `pty-pool`
 /// feature, starts the launcher in this host's pool and returns its session
@@ -545,6 +553,10 @@ pub(crate) fn wake_subscribers() {
     let _ = CHANGES.send(());
 }
 
+// =============================================================================
+// Serving one connection
+// =============================================================================
+
 /// The async server core: bind the control socket, watch `sessions/`, and serve
 /// connections until SIGTERM or idle-exit. Assumes the singleton check + pid file
 /// + (with pty-pool) the pool thread are already set up by `ensure`.
@@ -648,6 +660,10 @@ async fn serve() -> Result<()> {
     }
 }
 
+// =============================================================================
+// Host vitals
+// =============================================================================
+
 /// The host's utilisation, sampled on demand and held for [`VITALS_CACHE`].
 ///
 /// Daemon-wide rather than per-connection — the deliberate exception to the
@@ -691,6 +707,10 @@ impl VitalsProbe {
         vitals
     }
 }
+
+// =============================================================================
+// Sockets, and healing a wedged one
+// =============================================================================
 
 /// The daemon's [`LocalBackend`], wired with the pool's attached-bit probe when
 /// this build hosts a pool. Without the pool the bit stays `None` ("unknown"),
@@ -775,6 +795,10 @@ impl Drop for ConnGuard {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+// =============================================================================
+// Change notification
+// =============================================================================
 
 /// Serve one dashboard connection: handshake, then multiplex the subscription
 /// push with request/response until the peer hangs up.
@@ -965,6 +989,10 @@ fn host_label() -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "captain-miao-host".to_string())
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

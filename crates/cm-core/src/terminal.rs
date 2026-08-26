@@ -26,6 +26,10 @@ pub struct WindowId(pub String);
 #[serde(transparent)]
 pub struct TabId(pub String);
 
+// =============================================================================
+// Window and tab ids
+// =============================================================================
+
 /// Deserialize an opaque id from either a JSON string (current format) or a JSON
 /// integer (pre-abstraction format, where ids were `u64`). Coercing the integer
 /// to its decimal string keeps old state/snapshot files parseable.
@@ -135,6 +139,10 @@ pub struct TerminalEnv {
     /// [`iterm_surface`].
     pub iterm_session: Option<String>,
 }
+
+// =============================================================================
+// Reading the terminal out of the environment
+// =============================================================================
 
 /// The terminal *instance* identity and the window/pane of the current process,
 /// read from one env snapshot so the two can never disagree. `current_window`
@@ -268,6 +276,10 @@ pub fn iterm_identity() -> String {
 pub fn is_ghostty(term_program: Option<&str>) -> bool {
     term_program.is_some_and(|s| s.eq_ignore_ascii_case("ghostty"))
 }
+
+// =============================================================================
+// Per-emulator identity
+// =============================================================================
 
 /// The identity of a Ghostty instance — the single constructor for the form, as
 /// [`zellij_identity`] is for its own.
@@ -422,6 +434,10 @@ pub fn kitty_identity(listen_on: Option<String>, pid: Option<String>) -> Option<
         .or_else(|| clean(pid))
         .map(|key| format!("kitty:{key}"))
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

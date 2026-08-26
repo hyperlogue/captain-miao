@@ -36,6 +36,10 @@ use crate::cli::ClipboardShims;
 use crate::learned;
 use crate::state::{self, HookEvent, HookMessage, HostId, LauncherState, SessionStatus};
 
+// =============================================================================
+// Launch, and the loop that supervises it
+// =============================================================================
+
 /// Run an agent under captain-miao supervision. The launcher is single-backend
 /// per process: it picks `agent` once, threads it through every hook dispatch
 /// and transcript scan, and writes it onto the session's state file so the
@@ -344,6 +348,10 @@ async fn wait_until_minting_daemon_gone(pool_session: Option<&str>) {
     }
 }
 
+// =============================================================================
+// The hook socket, and cleaning up after it
+// =============================================================================
+
 /// Bind the launcher's hook socket, owner-only and non-blocking. Factored out
 /// because [`restore_hook_socket`] has to repeat it exactly when the socket is
 /// removed mid-session; the two must not drift on the permission bits.
@@ -522,6 +530,10 @@ impl Drop for CleanupGuard {
         cleanup_launcher_files(self.launcher_pid, &self.sock_path, &self.settings_path);
     }
 }
+
+// =============================================================================
+// Hook events -> state
+// =============================================================================
 
 async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mut LauncherState) {
     let agent = state.agent;
@@ -1141,6 +1153,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     }
 }
 
+// =============================================================================
+// Watching the transcript
+// =============================================================================
+
 /// A live transcript watch. Dropping either variant stops it — the binding's
 /// lifetime is the watch's lifetime, which is how the poll's engaged-only
 /// lifecycle (the gate at the bottom of the loop) turns it on and off.
@@ -1393,6 +1409,10 @@ fn on_transcript_changed(
     }
 }
 
+// =============================================================================
+// Folding a transcript read into the row
+// =============================================================================
+
 /// Stamp a freshly-read session name onto `state.name`, returning whether it
 /// changed. Forward-only: `None` — a transient unreadable/absent session file, or a
 /// backend without one — leaves an already-shown name untouched, so a torn read
@@ -1481,6 +1501,10 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
     }
     changed
 }
+
+// =============================================================================
+// Background shells: classify, learn, refine
+// =============================================================================
 
 /// The aggregate background-shell classification a session's running shells
 /// reduce to, in precedence order — see [`classify_and_learn`].
@@ -1710,6 +1734,10 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
         None => std::future::pending::<()>().await,
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
