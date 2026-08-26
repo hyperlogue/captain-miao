@@ -1373,7 +1373,18 @@ pub async fn run() -> Result<()> {
     result
 }
 
-async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
+/// Everything the dashboard does exactly once, before the loop: build the
+/// [`App`], load what it persists, and settle whatever a previous dashboard
+/// left behind.
+///
+/// The order is load-bearing, and each step's comment says why. The two that
+/// bite hardest: bindings are seeded from disk *before* the first reload, so
+/// that reload's window resolves see them; and the startup drains of bells,
+/// detach reports and orphaned panes all run against rows that already exist.
+/// A detach report drained here is `Backlog`, never `Live` — a terminal
+/// quitting SIGHUPs every attach window on its way out, and reading those as
+/// the user closing each one by hand would end the sessions.
+async fn start_dashboard() -> App {
     let mut app = App::new();
     // Recover window bindings a previous dashboard left behind so live sessions
     // resolve their windows across a restart (§6). Before the first reload, so
@@ -1428,6 +1439,159 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         .collect();
     let missing = take_missing_from_snapshot(&alive_pids, app.backends[0].host_id());
     app.prompt_restart_missing(missing);
+    app
+}
+
+/// One reload pass: re-read every host's rows, then everything that only makes
+/// sense once they are fresh — bell sentinels, detach reports, the pending-focus
+/// target, the window→tab cache, and the detached-session prune.
+///
+/// Split out of [`run_app`] because it is the loop's one genuinely long branch,
+/// and because the *ordering* inside it is the whole point: each step reads
+/// something the step before it established. The caller keeps the debounce
+/// bookkeeping (`fs_dirty`, `last_reload`) so the decision to reload stays
+/// beside the signals that ask for one.
+async fn reload_pass(
+    app: &mut App,
+    last_detach_prune: &mut Option<Instant>,
+    detach_reports_watched: bool,
+) {
+    // `reload_sessions` walks the sessions dir and reads each backend's
+    // transcripts synchronously. `block_in_place` hands the current
+    // worker thread to those blocking reads while letting the
+    // multi-threaded runtime keep servicing other tasks, so the loop's
+    // own awaits (kitty rc, title pulls) aren't starved during a large
+    // reload.
+    tokio::task::block_in_place(|| app.reload_sessions());
+    // Drain bell sentinels written by `miao focus --window-id`
+    // *after* reload_sessions so we know which pids are alive.
+    app.apply_bell_signals(state::drain_bell_flag_pids());
+    // Detach reports, when they have no watcher to wake us with. Their
+    // own arm above is the fast path; this is what keeps the sentinels
+    // from accumulating in the sessions dir until the next restart on a
+    // dashboard whose watcher failed to start. The reap queue is drained
+    // just below either way.
+    if !detach_reports_watched {
+        app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live);
+    }
+    // Bring just-failed launch windows (direnv blocked, missing agent) to
+    // the foreground. `reload_sessions` queued them on the transition
+    // into `FailedToStart`; the launcher can't focus its own window (it
+    // may be headless/remote), so the dashboard does it here.
+    for wid in std::mem::take(&mut app.failed_launch_focus_queue) {
+        let _ = terminal::get().focus_window(&wid).await;
+    }
+    // Close held panes orphaned by rows that just departed without a clean
+    // kill (crash / SIGKILL / state-file gone) — and dead remote-attach
+    // panes. `reload_sessions` queues them on row removal, gated on the
+    // `floating_sessions` capability (zellij): the held exited pane is an
+    // invisible leak buried in the shared sessions tab, inflating every
+    // `list-panes`. Best-effort — the pane may already be gone.
+    for wid in std::mem::take(&mut app.reap_window_queue) {
+        if let Err(e) = terminal::get().close_window(&wid).await {
+            tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
+        }
+    }
+    // Auto-reattach (§7): a host that just came back gets an attach
+    // window respawned for every session the dashboard remembers having
+    // one, so a laptop sleep or a broken pipe restores the whole working
+    // set without the user re-Entering each row. A session detached
+    // deliberately with `D` isn't in the list — that's the distinction
+    // the expected-attached flag exists to draw. Done here rather than
+    // in `reload_sessions` because it spawns windows.
+    for (host, pool_session) in std::mem::take(&mut app.pending_reattach) {
+        reattach_session(app, host, pool_session).await;
+    }
+    // A host back from an upgrade owes its user everything the restart
+    // ended. Resumed, not reattached: the pool session died with the
+    // daemon, so what comes back is a new launcher — new pid, new key,
+    // new pool name — continuing the same transcript. Every one of them
+    // gets a window, including sessions that were detached before, which
+    // is why the gate refuses a host another terminal is attached to.
+    for host in app.hosts_ready_to_restore() {
+        let (specs, survived) = app.take_upgrade_restores(&host);
+        let n = specs.len();
+        for spec in specs {
+            launch_agent(
+                app,
+                spec.agent,
+                &spec.cwd,
+                Some((spec.session_id.as_str(), false)),
+                &LAUNCH_COPY_RESUME,
+                &host,
+                // As everywhere else on a resume: the agent re-enters
+                // the session's own worktree.
+                None,
+            )
+            .await;
+        }
+        // A survivor is a session the stop was meant to end and did
+        // not, so the line says so: it is the difference between "we
+        // brought everything back" and "we left one alone rather than
+        // fork it", and only the second explains a row that never went
+        // away.
+        let status = match (n, survived) {
+            (0, 0) => None,
+            (0, k) => Some(format!(
+                "{} upgraded — {k} {} still running, not resumed",
+                host.0,
+                super::plural_sessions(k)
+            )),
+            (n, 0) => Some(format!(
+                "{} upgraded — resumed {n} {}",
+                host.0,
+                super::plural_sessions(n)
+            )),
+            (n, k) => Some(format!(
+                "{} upgraded — resumed {n} {}; {k} still running, not resumed",
+                host.0,
+                super::plural_sessions(n)
+            )),
+        };
+        if let Some(status) = status {
+            app.set_status(status, survived > 0);
+        }
+    }
+    // Both consumers below want a terminal snapshot: the tab-cache
+    // refresh (a new/moved local window is unresolved) and the remote
+    // detach prune (a live remote attachment whose window may have died).
+    // Fetch it at most once so a reload needing both pays a single
+    // `kitten @ ls`. The detach prune is gated on holding a *remote*
+    // binding — a local `launch_id` binding GCs via the row's own state
+    // file, so it must not drive a per-reload snapshot — and further
+    // floored to `DETACH_PRUNE_MIN_INTERVAL` so a snapshot-cheap backend
+    // aside, a busy zellij tree doesn't pay `list-panes` on every
+    // debounced reload. The tab cache is never floored: if it needs the
+    // snapshot this pass, the prune rides along on the same data.
+    let need_tab_cache = !app.unresolved_local_tab_windows().is_empty();
+    let detach_prune = app.window_bindings.has_remote()
+        && (need_tab_cache || detach_prune_due(*last_detach_prune, Instant::now()));
+    let tabs = if need_tab_cache || detach_prune {
+        terminal::get().snapshot().await.ok()
+    } else {
+        None
+    };
+    if need_tab_cache && let Some(tabs) = &tabs {
+        app.refresh_tab_cache(tabs);
+    }
+    app.fill_tab_ids_from_cache();
+    // Refresh the snapshot so a crash from this point sees the
+    // current session set, not a stale older one.
+    app.save_session_snapshot();
+    // Detach detection (§5): if a remote attach window died (laptop
+    // slept, ssh dropped), drop its binding so the row leaves cleanly.
+    // Only with a snapshot in hand: a failed one means "we don't know",
+    // not "nothing is alive" (see `prune_detached_from_tabs`). The floor
+    // isn't stamped on a failure either — the timer below picks the
+    // retry up in this same iteration and stamps it there.
+    if detach_prune && let Some(tabs) = &tabs {
+        *last_detach_prune = Some(Instant::now());
+        prune_detached_from_tabs(app, tabs);
+    }
+}
+
+async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
+    let mut app = start_dashboard().await;
     app.save_session_snapshot();
 
     let cfg = config::get();
@@ -1609,138 +1773,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         if fs_dirty && last_reload.is_none_or(|t| t.elapsed() >= reload_min_interval) {
             fs_dirty = false;
             last_reload = Some(Instant::now());
-            // `reload_sessions` walks the sessions dir and reads each backend's
-            // transcripts synchronously. `block_in_place` hands the current
-            // worker thread to those blocking reads while letting the
-            // multi-threaded runtime keep servicing other tasks, so the loop's
-            // own awaits (kitty rc, title pulls) aren't starved during a large
-            // reload.
-            tokio::task::block_in_place(|| app.reload_sessions());
-            // Drain bell sentinels written by `miao focus --window-id`
-            // *after* reload_sessions so we know which pids are alive.
-            app.apply_bell_signals(state::drain_bell_flag_pids());
-            // Detach reports, when they have no watcher to wake us with. Their
-            // own arm above is the fast path; this is what keeps the sentinels
-            // from accumulating in the sessions dir until the next restart on a
-            // dashboard whose watcher failed to start. The reap queue is drained
-            // just below either way.
-            if !detach_reports_watched {
-                app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live);
-            }
-            // Bring just-failed launch windows (direnv blocked, missing agent) to
-            // the foreground. `reload_sessions` queued them on the transition
-            // into `FailedToStart`; the launcher can't focus its own window (it
-            // may be headless/remote), so the dashboard does it here.
-            for wid in std::mem::take(&mut app.failed_launch_focus_queue) {
-                let _ = terminal::get().focus_window(&wid).await;
-            }
-            // Close held panes orphaned by rows that just departed without a clean
-            // kill (crash / SIGKILL / state-file gone) — and dead remote-attach
-            // panes. `reload_sessions` queues them on row removal, gated on the
-            // `floating_sessions` capability (zellij): the held exited pane is an
-            // invisible leak buried in the shared sessions tab, inflating every
-            // `list-panes`. Best-effort — the pane may already be gone.
-            for wid in std::mem::take(&mut app.reap_window_queue) {
-                if let Err(e) = terminal::get().close_window(&wid).await {
-                    tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
-                }
-            }
-            // Auto-reattach (§7): a host that just came back gets an attach
-            // window respawned for every session the dashboard remembers having
-            // one, so a laptop sleep or a broken pipe restores the whole working
-            // set without the user re-Entering each row. A session detached
-            // deliberately with `D` isn't in the list — that's the distinction
-            // the expected-attached flag exists to draw. Done here rather than
-            // in `reload_sessions` because it spawns windows.
-            for (host, pool_session) in std::mem::take(&mut app.pending_reattach) {
-                reattach_session(&mut app, host, pool_session).await;
-            }
-            // A host back from an upgrade owes its user everything the restart
-            // ended. Resumed, not reattached: the pool session died with the
-            // daemon, so what comes back is a new launcher — new pid, new key,
-            // new pool name — continuing the same transcript. Every one of them
-            // gets a window, including sessions that were detached before, which
-            // is why the gate refuses a host another terminal is attached to.
-            for host in app.hosts_ready_to_restore() {
-                let (specs, survived) = app.take_upgrade_restores(&host);
-                let n = specs.len();
-                for spec in specs {
-                    launch_agent(
-                        &mut app,
-                        spec.agent,
-                        &spec.cwd,
-                        Some((spec.session_id.as_str(), false)),
-                        &LAUNCH_COPY_RESUME,
-                        &host,
-                        // As everywhere else on a resume: the agent re-enters
-                        // the session's own worktree.
-                        None,
-                    )
-                    .await;
-                }
-                // A survivor is a session the stop was meant to end and did
-                // not, so the line says so: it is the difference between "we
-                // brought everything back" and "we left one alone rather than
-                // fork it", and only the second explains a row that never went
-                // away.
-                let status = match (n, survived) {
-                    (0, 0) => None,
-                    (0, k) => Some(format!(
-                        "{} upgraded — {k} {} still running, not resumed",
-                        host.0,
-                        super::plural_sessions(k)
-                    )),
-                    (n, 0) => Some(format!(
-                        "{} upgraded — resumed {n} {}",
-                        host.0,
-                        super::plural_sessions(n)
-                    )),
-                    (n, k) => Some(format!(
-                        "{} upgraded — resumed {n} {}; {k} still running, not resumed",
-                        host.0,
-                        super::plural_sessions(n)
-                    )),
-                };
-                if let Some(status) = status {
-                    app.set_status(status, survived > 0);
-                }
-            }
-            // Both consumers below want a terminal snapshot: the tab-cache
-            // refresh (a new/moved local window is unresolved) and the remote
-            // detach prune (a live remote attachment whose window may have died).
-            // Fetch it at most once so a reload needing both pays a single
-            // `kitten @ ls`. The detach prune is gated on holding a *remote*
-            // binding — a local `launch_id` binding GCs via the row's own state
-            // file, so it must not drive a per-reload snapshot — and further
-            // floored to `DETACH_PRUNE_MIN_INTERVAL` so a snapshot-cheap backend
-            // aside, a busy zellij tree doesn't pay `list-panes` on every
-            // debounced reload. The tab cache is never floored: if it needs the
-            // snapshot this pass, the prune rides along on the same data.
-            let need_tab_cache = !app.unresolved_local_tab_windows().is_empty();
-            let detach_prune = app.window_bindings.has_remote()
-                && (need_tab_cache || detach_prune_due(last_detach_prune, Instant::now()));
-            let tabs = if need_tab_cache || detach_prune {
-                terminal::get().snapshot().await.ok()
-            } else {
-                None
-            };
-            if need_tab_cache && let Some(tabs) = &tabs {
-                app.refresh_tab_cache(tabs);
-            }
-            app.fill_tab_ids_from_cache();
-            // Refresh the snapshot so a crash from this point sees the
-            // current session set, not a stale older one.
-            app.save_session_snapshot();
-            // Detach detection (§5): if a remote attach window died (laptop
-            // slept, ssh dropped), drop its binding so the row leaves cleanly.
-            // Only with a snapshot in hand: a failed one means "we don't know",
-            // not "nothing is alive" (see `prune_detached_from_tabs`). The floor
-            // isn't stamped on a failure either — the timer below picks the
-            // retry up in this same iteration and stamps it there.
-            if detach_prune && let Some(tabs) = &tabs {
-                last_detach_prune = Some(Instant::now());
-                prune_detached_from_tabs(&mut app, tabs);
-            }
+            reload_pass(&mut app, &mut last_detach_prune, detach_reports_watched).await;
             needs_redraw = true;
         }
 
