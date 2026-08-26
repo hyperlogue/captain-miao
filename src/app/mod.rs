@@ -1,3 +1,32 @@
+//! The dashboard's state: `App`, the types it holds, and the operations on it
+//! that are neither input, drawing, nor the event loop.
+//!
+//! `App` is one struct with every piece of dashboard-side state on it —
+//! sessions, selection and sort, input mode and whichever overlay is open,
+//! per-host backends and their connection state, window bindings, previews,
+//! prefs, and the channels background work replies on. It is deliberately not
+//! split by concern: the ordering rules between these fields are the hard part
+//! (see `mark_dirty` below), and they are easier to keep right in one place
+//! than to rediscover across several.
+//!
+//! The submodules are the seams that *are* worth having: `keys` (event →
+//! [`Action`]), `run` (the loop that executes one), `draw` (the frame),
+//! `keymap` (the remappable table), `format` and `picker` (presentation),
+//! `bindings`, `hosts`, `prefs`, `logo`, `messages`.
+//!
+//! **The dashboard is a viewer.** It never writes another process's state file
+//! and does no IPC of its own: it re-reads on a `notify` event and asks a
+//! [`Backend`] for anything on a host. What it owns are the things no launcher
+//! could know — which row is selected, which window shows which session, and
+//! what the user has pinned, muted or marked.
+//!
+//! Two invariants in this file bite from elsewhere. Every mutation that changes
+//! row order must call `mark_dirty` **after** it lands and with an explicit
+//! [`Cursor`], because the anchor is read from the current rows. And every
+//! window-binding change goes through the `App` methods rather than
+//! `window_bindings` directly, since those re-anchor the cursor as well as
+//! marking dirty.
+
 mod bindings;
 mod draw;
 mod format;

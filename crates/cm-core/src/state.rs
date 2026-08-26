@@ -1,3 +1,28 @@
+//! Everything captain-miao writes down, and where.
+//!
+//! Two things live here that are easy to think of as separate and are not:
+//! the **paths** under `~/.local/state/captain-miao/` (plus the runtime
+//! sockets), and the **records** that go in them — chiefly [`LauncherState`],
+//! the one row per session that the whole dashboard is a view of.
+//!
+//! **The permissions are part of the data model, not an afterthought.** State
+//! records the user's prompt text and working directories, so every directory
+//! is `0700` and every JSON file `0600`. That is why writes go through
+//! [`create_dir_all_private`] and [`write_json_atomic`] and never `fs::write`:
+//! the mode is applied by the helper, so a new call site cannot forget it.
+//! Runtime sockets live under `$XDG_RUNTIME_DIR`, falling back to a state
+//! subdirectory where that is unset (macOS) — never `$TMPDIR`, which macOS
+//! reaps out from under a long-lived session. [`ssh_sock_dir`] documents the
+//! one exception.
+//!
+//! All of it is safe to delete; each file regenerates or resets.
+//!
+//! Alongside the JSON there are three **sentinel** mechanisms — bell flags,
+//! detach reports, and the dashboard pid/window files — which are files in a
+//! watched directory rather than IPC. Each is written by a process that may be
+//! dying, may not reach the dashboard, and may be racing a dashboard restart;
+//! their docs carry the reasoning.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};

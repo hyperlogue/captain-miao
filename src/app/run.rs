@@ -1,3 +1,25 @@
+//! The dashboard's process lifecycle and its event loop.
+//!
+//! [`run`] owns the terminal (raw mode, alt screen, the keyboard-enhancement
+//! and mouse modes) and the single-instance check; [`run_app`] is the loop
+//! inside it. Everything asynchronous the dashboard does is a branch of that
+//! loop's `select!`: key and mouse input, each backend's change signal, the
+//! reload tick, background resume/kill/upgrade replies, detach reports, the
+//! preview debounce, and the redraw timers.
+//!
+//! **This is where an [`Action`] becomes a side effect.** `keys.rs` decides
+//! *what* the user asked for and returns a description; the free functions here
+//! (`launch_agent`, `attach_pool_session`, `start_kill`, `restart_one`, …) are
+//! what actually spawn a window, reach a host, or move a session. Anything that
+//! can block a host round-trip runs off the UI path or under
+//! `block_in_place`, because the loop is also what repaints.
+//!
+//! Almost every constant in this file is a **floor or a debounce**, and each
+//! exists because something below it is expensive or flappy — a `snapshot()` of
+//! the window tree, a preview capture, a reload of every state file. Their docs
+//! carry the measurement; changing one without reading it is how the dashboard
+//! gets slow.
+
 use anyhow::{Context, Result, bail};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,

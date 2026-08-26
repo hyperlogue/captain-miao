@@ -1,3 +1,21 @@
+//! Input dispatch: a crossterm key or mouse event becomes an [`Action`].
+//!
+//! One entry point per device — [`App::handle_key`] and [`App::handle_mouse`] —
+//! both of which first branch on [`InputMode`], because which keys mean what is
+//! entirely a function of what is on screen. Only Normal mode goes through the
+//! remappable table: it resolves the event to a `Command` via the `Keymap` table and
+//! hands it to [`App::run_command`], which is the one place a `Command` becomes
+//! a side effect. Every other mode (Search, the pickers, DirEdit, HostEdit,
+//! Confirm, Help, Messages) keeps fixed keys and has its own `handle_*_key`.
+//!
+//! The split from `keymap.rs` is deliberate: that module owns the *table* and
+//! nothing else, so a remap is a config question and never a code change here.
+//!
+//! Handlers return `Option<Action>` rather than doing the work. Anything that
+//! spawns a window, reaches a host, or blocks is described as an `Action` and
+//! executed by the event loop in `run.rs`; what stays here is pure enough to
+//! test by feeding keys to an `App`.
+
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};

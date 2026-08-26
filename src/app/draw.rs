@@ -1,3 +1,25 @@
+//! Every render pass the dashboard makes.
+//!
+//! [`App::draw`] is the single entry point, called once per frame from the
+//! event loop; everything else is a `draw_*` for one region or overlay. Layout
+//! forks early on width — [`App::draw_wide_body`] versus
+//! [`App::draw_narrow_body`] — and the current [`InputMode`] decides which
+//! overlay, if any, is painted over the result.
+//!
+//! **Read-mostly, and that is what keeps it testable.** These methods take
+//! `&self` wherever they can; the `&mut self` ones exist for render-side caches
+//! (parsed preview lines, logo placements, the last table rect the mouse
+//! handler needs) and never for dashboard state. Anything a draw wants to know
+//! is already on `App` by the time the frame starts — a draw never reads a file,
+//! reaches a host, or asks the terminal a question.
+//!
+//! Two rules from elsewhere land in this file. Bindings are rendered through
+//! `keys_for`/`primary_key`, never spelled literally, so a user's remap shows
+//! through without touching this module. And an affordance the backend cannot
+//! support is *hidden*, not drawn as a key that only errors — which is why so
+//! many of these functions take a `Capabilities` or ask
+//! `AgentControl::capabilities()` before emitting a hint.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::{

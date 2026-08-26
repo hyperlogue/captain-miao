@@ -1,3 +1,26 @@
+//! The `miao launch` process: one per session, and the single writer of that
+//! session's state file.
+//!
+//! It is what the terminal window actually runs. It spawns the agent, binds a
+//! Unix socket for that session's hooks, watches the agent's transcript, and
+//! folds all of it into one [`LauncherState`] that it rewrites atomically —
+//! which is the whole of the dashboard's input. The arrow only points one way:
+//! nothing here reads dashboard state, and the dashboard never talks back.
+//!
+//! Single-backend per process. [`run`] picks the [`AgentControl`] once and
+//! threads it through every hook dispatch, transcript scan and activity probe,
+//! so a mixed-backend dashboard is just several launchers.
+//!
+//! **Two sources of truth meet here, and the precedence between them is the
+//! module's central rule.** Hooks report events; the agent's own session file
+//! reports what it believes it is doing. Where a backend keeps such a file it
+//! is authoritative on the working/idle/background-shell axis and is mirrored
+//! rather than edge-tracked, and refinement against it is **demote-only** —
+//! hooks own the promotion out of rest. An unreadable or unrecognised read maps
+//! to "leave unchanged", never to a definite state. `promote_stale_background`
+//! is the one promotion, and it fires on the *process tree* disproving a
+//! background status, not on a second opinion from the same file.
+
 use anyhow::{Context, Result};
 use notify::Watcher;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

@@ -1,3 +1,19 @@
+//! The two reusable input widgets: a text field and a filtered list.
+//!
+//! [`TextInput`] is a cursor-aware buffer with readline editing, used by
+//! Search, every picker, and the host and directory forms. [`Picker`] is a
+//! `TextInput` plus a filtered, scrollable [`PickerItem`] list — the shape
+//! behind agent selection, workdir entry, the resume list, and the emoji grid.
+//!
+//! Both are **self-contained**: they own their state, take a key event, and
+//! return a [`TextInputEvent`] / [`PickerEvent`] saying what happened. Neither
+//! knows what it is picking, reaches the filesystem, or touches `App` — which
+//! is what lets one implementation serve every `PickerKind`, and what keeps
+//! the readline keybinds identical in all of them.
+//!
+//! What varies between pickers is supplied from outside: the items, the title,
+//! and how a submission is interpreted (`keys.rs`). What is fixed lives here.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

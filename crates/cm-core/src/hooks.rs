@@ -1,3 +1,20 @@
+//! The `miao hook` subcommand: the client half of the hook path.
+//!
+//! Every agent backend is configured to run `miao hook --agent <a> <event>`
+//! when something happens in a session. This module is what that process does:
+//! read the agent's payload from stdin, hand it to that backend's parser
+//! ([`AgentControl::parse_hook_payload`]) for normalisation into a
+//! [`crate::state::HookMessage`], and write it down the launcher's Unix socket.
+//! Nothing here
+//! interprets the message — the launcher owns the state transition.
+//!
+//! It runs once per event, as a fresh short-lived process, in the agent's own
+//! terminal. Both constraints show up as the same rule: **a hook must never be
+//! an error the user sees**. It cannot block on an unreachable launcher, and a
+//! missing socket exits 0 rather than non-zero (see [`handle_event`]) — an
+//! always-on hook file also fires in sessions started outside captain-miao,
+//! where there is no launcher to talk to and nothing to report.
+
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;

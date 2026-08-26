@@ -1,3 +1,21 @@
+//! Presentation helpers: pure functions from data to what a cell looks like.
+//!
+//! Colours and styles for a status or a model, the footer's pill/hint spans,
+//! a minimal ANSI-to-ratatui parser for captured previews, the relative-time
+//! and token formatters, truncation that respects wide glyphs, and the
+//! deterministic emoji/colour a directory gets.
+//!
+//! **Nothing here reads state, and nothing here decides policy.** Every
+//! function takes what it needs and returns spans, a `Style`, or a `String`;
+//! the only inputs are its arguments. That is what lets `draw.rs` stay a
+//! layout module and what makes this file the one place in the dashboard with
+//! straightforwardly unit-testable rendering.
+//!
+//! Two of these are less innocent than they look and carry their own docs:
+//! [`session_display_name`], which is the whole precedence order for what a row
+//! is called, and [`ansi_to_lines`], which parses agent output the dashboard
+//! did not produce.
+
 use std::collections::HashMap;
 
 use ratatui::Frame;
