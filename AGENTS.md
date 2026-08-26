@@ -45,7 +45,8 @@ Four seams carry the whole design; each is documented at its definition.
   there, not a new trait method. Ghostty is the worked example: it can't read a
   window at all, and that became `capture`.
 - **`Keymap`** (`src/app/keymap.rs`) — every Normal-mode command is remappable;
-  `run_command` is the one place a `Command` becomes a side effect.
+  `run_command` (`src/app/keys.rs`) is the one place a `Command` becomes a side
+  effect.
 
 `docs/remote-sessions.md` is the authority on remote hosts and the wire
 protocol; `docs/crate-split.md` on the crate split and server payloads. The
