@@ -25,8 +25,9 @@ use clap::{Parser, Subcommand};
 /// `--version`'s long form: the version, plus which `miao-server`
 /// builds this binary can deploy to a remote host.
 ///
-/// That inventory is decided at *build* time (by the `bundle-*` cargo features),
-/// so no amount of looking at config or state can answer it — `--version` is the
+/// That inventory is decided at *build* time (by `CM_SERVER_PAYLOAD_MANIFEST`,
+/// which `cargo xtask dist` writes), so no amount of looking at config or state
+/// can answer it — `--version` is the
 /// only place it can honestly live, and with several dashboard variants shipping
 /// it is also how you tell two of them apart. `-V` keeps the bare version for
 /// scripts.

@@ -11,8 +11,8 @@
 //! be a functional server. What it sends now is a real `miao-server`,
 //! cross-built and embedded by `build.rs` in the same command that builds the
 //! dashboard (`src/server_payload.rs`, `xtask/src/server.rs`). A dashboard built
-//! without a `bundle-*` feature behaves exactly
-//! as it did before: probe, don't upload, and name what's wrong.
+//! without a payload — every plain `cargo build` — behaves exactly as it did
+//! before: probe, don't upload, and name what's wrong.
 //!
 //! Ownership rule, and the reason `UsePath` sorts first: **PATH is the user's,
 //! the cache path is ours.** A version-matching binary the user installed always
@@ -506,8 +506,8 @@ fn parse_probe(out: &str) -> Option<RemoteProbe> {
 /// `candidates` is `(target, sha256)` for every server we can supply **locally**
 /// for this host, in preference order (glibc before musl) — passed as plain
 /// strings rather than `&ServerPayload`s so the decision stays testable in a
-/// build carrying no payload, which is every test run since the `bundle-*`
-/// features are off.
+/// build carrying no payload, which is every test run that sets no
+/// `CM_SERVER_PAYLOAD_MANIFEST`.
 ///
 /// "Locally" is load-bearing and not a shorthand: a payload that only the
 /// downloader could supply has no digest until it has been fetched, so it cannot
@@ -3150,7 +3150,7 @@ mod tests {
             .next()
             .unwrap_or_else(|| {
                 panic!(
-                    "no payload for {:?}; build with a bundle-* feature (have: {:?})",
+                    "no payload for {:?}; set CM_SERVER_PAYLOAD_MANIFEST (have: {:?})",
                     probe.arch,
                     crate::server_payload::embedded_targets()
                 )
