@@ -1221,7 +1221,7 @@ impl App {
             .unwrap_or_else(|| "—".to_string());
         // Resolve through the binding so the detail panel shows the real local
         // window even when the launcher self-reports none (dashboard-spawned /
-        // remote-attached sessions, §15.3). A foreign-terminal row has no window
+        // remote-attached sessions, §6). A foreign-terminal row has no window
         // here — surface where it does live instead.
         let window = if let Some(identity) = self.foreign_terminal(s) {
             format!("in {identity}")

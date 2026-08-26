@@ -1192,7 +1192,7 @@ fn selected_window_id_resolves_bound_remote_window() {
 #[test]
 fn window_lookups_route_a_bound_remote_attach_window() {
     // Every `s.window_id` reader now goes through `window_id_for_session` (the
-    // single choke point — next-step #6 §15.3), so an *attached* remote session
+    // single choke point — §6), so an *attached* remote session
     // resolves to its local `ssh attach` window everywhere, not just for
     // `selected_window_id`. A pooled launcher has no kitty window of its own, so
     // before attaching these all see nothing.
@@ -1228,7 +1228,7 @@ fn hand_launched_session_resolves_via_window_id_fallback() {
     use crate::terminal::WindowId;
     // A session launched directly (`miao launch claude`, not via the dashboard)
     // carries no launch_id; its launcher self-reported window_id. With no binding,
-    // the resolver falls back to that field so preview/focus still work (§15.3).
+    // the resolver falls back to that field so preview/focus still work (§6).
     let mut d = TestDashboard::new(120, 10);
     let mut s = session(1, "/home/test/a", SessionStatus::Idle);
     s.launch_id = None; // hand-launched — set_sessions seeds no binding
@@ -1243,7 +1243,7 @@ fn dashboard_spawned_session_resolves_only_via_binding() {
     use crate::state::HostId;
     use crate::terminal::WindowId;
     // A dashboard-spawned local session carries a launch_id; it resolves *only*
-    // through the recorded binding (§15.2) and never reads a stale window_id.
+    // through the recorded binding (§6) and never reads a stale window_id.
     let mut d = TestDashboard::new(120, 10);
     let mut s = session(1, "/home/test/a", SessionStatus::Idle);
     s.launch_id = Some("L-7".into());
@@ -1647,7 +1647,7 @@ fn window_bindings_file_round_trips_through_seed() {
     use crate::state::HostId;
     use crate::terminal::WindowId;
     // The reload writes window-bindings.json; a restarted dashboard seeds from it
-    // and re-resolves a live local session by its launch_id (§15.7 recovery), plus
+    // and re-resolves a live local session by its launch_id (§6 recovery), plus
     // a remote session by its pool_session. It is no longer the only test to
     // touch the shared window-bindings.json file, hence `bindings_file_guard`.
     // The state dir is only created below, after the first TestDashboard::new

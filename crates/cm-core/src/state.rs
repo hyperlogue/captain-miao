@@ -250,10 +250,10 @@ pub fn work_tabs_path() -> PathBuf {
 }
 
 /// Dashboard-owned projection of `window → (host, launcher_pid, token)` for every
-/// session the dashboard has a window for (next-step #6 §15.4). The dashboard is
+/// session the dashboard has a window for (§6). The dashboard is
 /// the sole writer — rebuilt each reload from the live rows + `WindowBindings` —
 /// and three readers consume it: the dashboard re-seeds its in-memory bindings
-/// from it on startup (recovery across a restart, §15.7), the external
+/// from it on startup (recovery across a restart), the external
 /// `miao focus --window-id` bell keybind resolves a window→pid through it
 /// (replacing the old state-file scan), and the prune loop garbage-collects it.
 /// Safe to delete (regenerated next reload).
@@ -902,7 +902,7 @@ pub struct LauncherState {
     /// Opaque token the dashboard mints and threads onto a *local* launcher it
     /// spawns (`--launch-id`), echoed back here so the dashboard can bind the
     /// appearing row to the window it opened — local's analog of `pool_session`
-    /// (next-step #6 §15). `None` for a hand-launched session (`captain-miao
+    /// (§6). `None` for a hand-launched session (`captain-miao
     /// claude` run directly); such a launcher self-reports `window_id` instead
     /// and the resolver falls back to it.
     #[serde(default)]
@@ -1169,7 +1169,7 @@ fn bell_flag_path(launcher_pid: u32) -> PathBuf {
 }
 
 /// One entry of `window-bindings.json` — the dashboard's disk projection of which
-/// local window shows which session (next-step #6 §15.4). `host == "local"` for
+/// local window shows which session (§6). `host == "local"` for
 /// in-process sessions; `token` is the session's `launch_id` (local) or
 /// `pool_session` (remote). See [`window_bindings_path`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1193,7 +1193,7 @@ pub struct WindowBinding {
 /// No-op when no *local* session is bound to the window — pressing the keybind in
 /// a non-agent window simply focuses the dashboard. (A window holding a remote
 /// `ssh attach` resolves to a non-`local` host here; ringing its bell needs the
-/// per-host RPC that remote focus/bell will add — next-step #4(b) — so it's left
+/// per-host RPC that remote focus/bell will add — §10.4 — so it's left
 /// alone for now.) Reads the projection rather than scanning state files because
 /// the launcher no longer self-reports `window_id` for dashboard-spawned sessions.
 ///

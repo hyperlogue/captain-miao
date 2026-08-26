@@ -382,7 +382,7 @@ impl App {
                 // The local window to close alongside the signal, resolved through
                 // the binding: a local session's own window, an attached remote's
                 // `ssh attach` window, or `None` for a remote we aren't attached to
-                // (signal only) — §15.3.
+                // (signal only) — §6.
                 let window_id = self.window_id_for_session(&s);
                 let window_pid = self.window_process_pid(&s);
                 Some(Action::KillSession {

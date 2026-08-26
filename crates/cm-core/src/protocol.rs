@@ -1,6 +1,6 @@
 //! Wire protocol between a `captain-miao server` (one per host) and a
 //! dashboard's `RemoteBackend`. Length-prefixed JSON frames over a (possibly
-//! ssh-forwarded) unix socket — see `docs/remote-sessions.md` §14.5.
+//! ssh-forwarded) unix socket — see `docs/remote-sessions.md` §3.
 //!
 //! Framing: a 4-byte big-endian length followed by that many JSON bytes. JSON
 //! (not a compact binary codec) keeps frames debuggable and rides serde's

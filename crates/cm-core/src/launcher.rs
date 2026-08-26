@@ -30,7 +30,7 @@ pub async fn run(
     let launcher_pid = std::process::id();
     // The dashboard (or server) owns the session↔window binding for any launch it
     // spawned — it threads a token (`--launch-id` locally, `--pool-session`
-    // remotely) and records the window itself (next-step #6 §15). So self-report
+    // remotely) and records the window itself (§6). So self-report
     // `window_id` *only* when neither token is present — a hand-launched
     // `miao claude` in a real Kitty window, where nothing else can supply
     // it and the resolver falls back to this field. A headless/pooled launcher

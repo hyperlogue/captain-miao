@@ -1311,8 +1311,8 @@ pub(crate) struct RemoteBackend {
     requests: mpsc::UnboundedSender<PendingRequest>,
     next_req_id: AtomicU64,
     /// The command to invoke the remote daemon, resolved at connect by
-    /// `setup_ssh` (PATH `miao-server`, or a deployed cache path —
-    /// open-decision #3). Defaults to `miao-server`, so before the task
+    /// `setup_ssh` (PATH `miao-server`, or a deployed cache path — see
+    /// `docs/crate-split.md`). Defaults to `miao-server`, so before the task
     /// resolves it (or for a socket transport) the attach argv is unchanged.
     /// Never the dashboard binary (`miao`) — the remote runs the headless server.
     remote_exe: Arc<Mutex<String>>,
@@ -2120,7 +2120,7 @@ fn remote_shell_argv(target: &str, options: &[String], cwd: &str) -> Vec<String>
 }
 
 // =============================================================================
-// Remote binary provisioning (next-step #1, open-decision #3)
+// Remote binary provisioning (`docs/crate-split.md`)
 //
 // On connect, probe the remote for a version-matching `miao-server` and
 // invoke whichever copy it finds: one on PATH first (a user install — never
@@ -4401,7 +4401,7 @@ async fn setup_ssh(
     }
 
     // Probe the host, auto-provision our binary if it's missing/stale and our
-    // build can run there (open-decision #3), and resolve the command to invoke.
+    // build can run there (`docs/crate-split.md`), and resolve the command to invoke.
     // This also primes the ControlMaster, replacing the `--print-path` priming.
     // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
     let provisioned = resolve_remote_exe(target, &opts, prov, log).await;

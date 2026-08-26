@@ -17,7 +17,7 @@
 //! `ensure` against a live daemon just prints the socket path and exits. It
 //! **auto-exits when idle** (no pool sessions and no connected clients for a
 //! grace window), and `daemon stop` SIGTERMs it (killing the pool + all its
-//! sessions). See `docs/remote-sessions.md` §8/§11.
+//! sessions). See `docs/remote-sessions.md` §8/§10.
 
 use std::collections::HashMap;
 use std::io::Write;

@@ -32,7 +32,7 @@ pub fn take_pool_session(args: Vec<String>) -> (Option<String>, Vec<String>) {
 
 /// Pull a `--launch-id <token>` pair out of the launcher args (the dashboard adds
 /// it when it spawns a *local* launcher so the appearing row can be matched back
-/// to the window it opened — next-step #6 §15). captain-miao owns this flag, so it
+/// to the window it opened — §6). captain-miao owns this flag, so it
 /// must be removed before the rest is forwarded to the agent.
 pub fn take_launch_id(args: Vec<String>) -> (Option<String>, Vec<String>) {
     take_flag_value(args, "--launch-id")

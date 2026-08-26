@@ -1,10 +1,10 @@
 //! Client-side window↔session bindings.
 //!
 //! The dashboard owns the session↔window binding for every session it spawns —
-//! local and remote uniformly (next-step #6 §15). Each binding is keyed by
+//! local and remote uniformly (§6). Each binding is keyed by
 //! `(host, token)`, where the **token** is the session's `pool_session` for a
 //! remote pty-pool session (the libshpool join key the local `ssh attach` window
-//! names — §8) or its dashboard-minted `launch_id` for a local one (§15.2). The
+//! names — §8) or its dashboard-minted `launch_id` for a local one. The
 //! value is the local window the dashboard opened. When that window dies (laptop
 //! slept, ssh dropped, or — locally — the user closed the kitty window) the
 //! binding is pruned against the live window set; for a remote session that
@@ -13,8 +13,8 @@
 //!
 //! Pure data structure: the spawn path calls [`WindowBindings::record`], the
 //! reload loop calls [`WindowBindings::prune_dead`] with a `Terminal::snapshot`'s
-//! live window ids, and startup seeds it from `window-bindings.json` (§15.7). See
-//! `docs/remote-sessions.md` §8, §15.
+//! live window ids, and startup seeds it from `window-bindings.json`. See
+//! `docs/remote-sessions.md` §6, §8.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -23,8 +23,8 @@ use crate::state::HostId;
 use crate::terminal::WindowId;
 
 /// Identifies one bound session: its host plus the binding **token** — the pool
-/// session name for a remote session (§8) or the `launch_id` for a local one
-/// (§15.2). Only surfaces at the [`WindowBindings::prune_dead`] boundary (the
+/// session name for a remote session (§8) or the `launch_id` for a local one.
+/// Only surfaces at the [`WindowBindings::prune_dead`] boundary (the
 /// dropped keys); lookups probe the two-level map by reference and never build
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

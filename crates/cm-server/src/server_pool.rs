@@ -9,7 +9,7 @@
 //! it for sessions to persist across disconnects, so `ensure_daemon` starts the
 //! daemon **detached** (own process group, stdio to /dev/null, not killed on the
 //! server's exit). A later server reconnect finds it already bound and reuses
-//! it. This is the open lifecycle question from §11; revisit during host
+//! it. This is the open lifecycle question from §10; revisit during host
 //! verification.
 //!
 //! Runs from `handle_conn` via `block_in_place` (it spawns child processes and

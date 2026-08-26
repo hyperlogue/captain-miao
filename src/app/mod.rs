@@ -1250,7 +1250,7 @@ pub(super) struct App {
     /// `(host, token) → local window` for every session the dashboard has a
     /// window for — remote attaches (token = `pool_session`) and local spawns
     /// (token = `launch_id`). Populated when a session is opened, pruned when its
-    /// window dies. See [`bindings`] and next-step #6 §15.
+    /// window dies. See [`bindings`] and §6.
     pub(super) window_bindings: bindings::WindowBindings,
     /// The terminal instance this dashboard *drives* (`zellij:<session>` /
     /// `kitty:<socket|pid>`, from the active backend's
@@ -3336,7 +3336,7 @@ impl App {
         // returning to Idle needs to spin it down.
         self.update_sleep_inhibitor();
         // Refresh the on-disk window→(host, pid, token) projection the external
-        // bell keybind and the next startup seed read (§15.4). Done here, before
+        // bell keybind and the next startup seed read (§6). Done here, before
         // the early-returning selection block below, so it always runs.
         self.write_window_bindings_file();
         // Drop a pending-focus target the spawned launcher never claimed (it died
@@ -3656,7 +3656,7 @@ impl App {
     }
 
     /// Record the local window the dashboard just opened for a session, keyed by
-    /// its binding token (a remote `pool_session` or a local `launch_id`, §15.2),
+    /// its binding token (a remote `pool_session` or a local `launch_id`, §6),
     /// so the dashboard can resolve and prune it. Used by both the remote attach
     /// path and the local spawn path.
     pub(super) fn record_window_binding(&mut self, host: HostId, token: String, window: WindowId) {
@@ -3693,7 +3693,7 @@ impl App {
     }
 
     /// Mint a fresh, opaque `launch_id` for a local launcher the dashboard is
-    /// about to spawn (next-step #6 §15.2). Pid-namespaced so two dashboards
+    /// about to spawn (§6). Pid-namespaced so two dashboards
     /// (or a restarted one) never collide, and monotonic within a run. Threaded
     /// onto the launcher as `--launch-id` and echoed back on its state file, so
     /// the appearing row resolves to the window the dashboard opened.
@@ -3707,7 +3707,7 @@ impl App {
     /// loop so a slept laptop / dropped ssh empties those *remote* rows cleanly
     /// (§5); for a *local* session, window death and launcher death coincide (the
     /// kitty window's SIGHUP kills the launcher), so the row already left via its
-    /// state file and this just garbage-collects the stale binding (§15.5). A
+    /// state file and this just garbage-collects the stale binding (§6). A
     /// no-op until the dashboard holds a binding.
     pub(super) fn prune_detached_sessions(
         &mut self,
@@ -4089,7 +4089,7 @@ impl App {
 
     /// Seed the in-memory `WindowBindings` from `window-bindings.json` at startup
     /// so a dashboard that restarts while sessions keep running can still resolve
-    /// their windows (next-step #6 §15.7). A stale entry (its window died while
+    /// their windows (§6). A stale entry (its window died while
     /// the dashboard was off) is cleared by the first reload's `prune_dead`,
     /// which diffs against the live terminal snapshot. Idempotent; called once
     /// before the first reload.
@@ -4147,7 +4147,7 @@ impl App {
     }
 
     /// Rewrite `window-bindings.json` from the live rows + the in-memory bindings
-    /// (next-step #6 §15.4): for each session that resolves to a window, emit
+    /// (§6): for each session that resolves to a window, emit
     /// `{ window_id, host, launcher_pid, token, terminal }`. The dashboard is the
     /// sole writer; the external `focus --window-id` bell keybind and the next
     /// startup seed read it back. Called each reload.
@@ -4249,10 +4249,10 @@ impl App {
     }
 
     /// The *local* window showing this session — the single choke point every
-    /// `s.window_id` consumer routes through (next-step #6 §15.3). The dashboard
+    /// `s.window_id` consumer routes through (§6). The dashboard
     /// owns the binding for any session it spawned: it resolves the session's
-    /// **token** (a local session's `launch_id`, a remote one's `pool_session`,
-    /// §15.2) to the window it opened. A token-less local session — hand-launched
+    /// **token** (a local session's `launch_id`, a remote one's `pool_session`)
+    /// to the window it opened. A token-less local session — hand-launched
     /// `miao launch claude`, or a launcher predating `launch_id` — self-reported
     /// `window_id`, so fall back to that. Returns `None` for a remote session we
     /// aren't attached to (no local window); preview / focus / move-to-tab then

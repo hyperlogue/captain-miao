@@ -33,7 +33,7 @@ use crate::paths;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey};
 
 /// What to open: which agent, where, and whether it's a fresh session or a
-/// resume/fork of an existing one. This is §3/§14.2's `SpawnSpec`, renamed to
+/// resume/fork of an existing one. This is §3's `SpawnSpec`, renamed to
 /// avoid colliding with `terminal::SpawnSpec` (which describes the *window*).
 /// [`LocalBackend::open_session`] turns it into a [`LaunchPlan`]. Serializable
 /// because it rides the wire to a remote server (`ClientFrame::OpenSession`).
@@ -69,7 +69,7 @@ pub enum LaunchPlan {
     /// against the local window (§8 binding).
     AttachRemote {
         argv: Vec<String>,
-        #[allow(dead_code)] // recorded as the window↔session binding key in 3d
+        #[allow(dead_code)] // recorded as the window↔session binding key (§6)
         session_name: String,
     },
 }

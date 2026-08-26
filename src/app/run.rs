@@ -823,7 +823,7 @@ async fn launch_agent(
     };
     let mut argv = plan.argv().to_vec();
     // The (host, token) the appearing row will carry home, so we can bind the
-    // window we're about to open to it (§15.2). A pooled open reuses the
+    // window we're about to open to it (§6). A pooled open reuses the
     // server-minted pool session name; a direct local spawn gets a fresh
     // dashboard-minted `launch_id` threaded onto the launcher as `--launch-id`.
     let (bind_host, bind_token) = match &plan {
@@ -912,7 +912,7 @@ async fn launch_agent(
             app.set_status(format!("{} (window {id})", copy.succeeded), false);
             // Bind the window to the session's token so the dashboard resolves it
             // (preview / focus / move-to-tab) and prunes it when the window dies —
-            // local and remote uniformly (§8, §15).
+            // local and remote uniformly (§6, §8).
             app.record_window_binding(bind_host, bind_token, id.clone());
             // Seed the display-only window→tab cache from the spawn itself when
             // the backend reported the tab (zellij does; kitty's `launch` prints
@@ -1348,7 +1348,7 @@ pub async fn run() -> Result<()> {
 async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let mut app = App::new();
     // Recover window bindings a previous dashboard left behind so live sessions
-    // resolve their windows across a restart (§15.7). Before the first reload, so
+    // resolve their windows across a restart (§6). Before the first reload, so
     // that reload's resolves (preview select, tab fill, snapshot) see them.
     app.seed_window_bindings_from_disk();
     // The clipboard bridge's server, if any host is offered it. Before the first
