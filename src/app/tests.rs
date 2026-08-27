@@ -203,6 +203,18 @@ fn session_with_prompt(pid: u32, cwd: &str, status: SessionStatus, prompt: &str)
     s
 }
 
+/// A hosts-editor row carrying only the two fields these tests set; every other
+/// field is `Default` at all seven call sites. A blank `target` is what the
+/// editor holds for a half-typed entry, so the label-only cases pass `""`
+/// rather than needing a second constructor.
+fn host_row(label: &str, target: &str) -> super::HostRow {
+    super::HostRow {
+        label: super::picker::TextInput::with_text(label),
+        target: super::picker::TextInput::with_text(target),
+        ..Default::default()
+    }
+}
+
 // =============================================================================
 // Rendering the table, and moving in it
 // =============================================================================
@@ -5814,15 +5826,11 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     // Give it a row to stand on. (No backend for it, so the log is empty — the
     // view says so rather than showing a blank box.)
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("polaris"),
-        target: super::picker::TextInput::with_text("polaris"),
-        ..Default::default()
-    });
+    state.rows.push(host_row("skipper", "skipper"));
     state.cursor = 0;
     d.press(KeyCode::Char('l'));
     let view = d.app.host_edit.as_ref().unwrap().log_view.as_ref();
-    assert_eq!(view.map(|v| v.host.0.as_str()), Some("polaris"));
+    assert_eq!(view.map(|v| v.host.0.as_str()), Some("skipper"));
 
     let out = d.render();
     assert!(out.contains("connection log"), "{out}");
@@ -5897,11 +5905,7 @@ fn a_host_offered_the_clipboard_shows_it_on_its_row() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("box"),
-        target: super::picker::TextInput::with_text("user@box"),
-        ..Default::default()
-    });
+    state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;
 
     let out = d.render();
@@ -5931,10 +5935,7 @@ fn the_clipboard_is_a_field_in_the_row_editor() {
     // backend — the same trick `esc_abandons_a_hosts_row_edit_and_enter_keeps_it`
     // uses, and here it also keeps an ssh host out of the shared `hosts.json`.
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("box"),
-        ..Default::default()
-    });
+    state.rows.push(host_row("box", ""));
     state.cursor = 0;
     let row = |d: &TestDashboard| d.app.host_edit.as_ref().unwrap().rows[0].clipboard;
 
@@ -6012,10 +6013,7 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     // Two lines each, so seven hosts fill the popup exactly — which is more than
     // the old layout had room for once the form took the bottom eight rows.
     for i in 1..=7 {
-        state.rows.push(super::HostRow {
-            label: super::picker::TextInput::with_text(format!("h{i}")),
-            ..Default::default()
-        });
+        state.rows.push(host_row(&format!("h{i}"), ""));
     }
     state.cursor = 0;
     let out = d.render();
@@ -6088,10 +6086,8 @@ fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
     let opts = "-L 8010:localhost:8010 -L 8089:localhost:8089 -L 7891:localhost:7891";
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("polaris"),
-        target: super::picker::TextInput::with_text("polaris"),
         options: super::picker::TextInput::with_text(opts),
-        ..Default::default()
+        ..host_row("skipper", "skipper")
     });
     state.cursor = 0;
     d.press(KeyCode::Char('e'));
@@ -6297,11 +6293,7 @@ fn ctrl_keys_open_the_hosts_editor_on_a_named_field() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("box"),
-        target: super::picker::TextInput::with_text("user@box"),
-        ..Default::default()
-    });
+    state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;
 
     d.press_ctrl(KeyCode::Char('t'));
@@ -6352,11 +6344,7 @@ fn a_ctrl_key_does_not_trigger_the_hosts_lists_plain_commands() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(super::HostRow {
-        label: super::picker::TextInput::with_text("box"),
-        target: super::picker::TextInput::with_text("user@box"),
-        ..Default::default()
-    });
+    state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;
 
     d.press_ctrl(KeyCode::Char('d'));
