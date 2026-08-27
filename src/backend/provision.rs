@@ -2375,17 +2375,19 @@ mod tests {
         }
     }
 
+    /// At the same version, the marker decides — not our preference order.
+    ///
+    /// The failure this prevents: a NixOS host settles on musl; the next
+    /// connect compares its marker against our *preferred* gnu payload, sees a
+    /// mismatch, re-deploys gnu, watches the host refuse it, falls back to musl
+    /// — and does the whole thing again every reconnect, forever.
     #[test]
     fn the_marker_makes_the_winning_target_sticky() {
-        // The failure this prevents: a NixOS host settles on musl; the next
-        // connect compares its marker against our *preferred* gnu payload, sees
-        // a mismatch, re-deploys gnu, watches the host refuse it, falls back to
-        // musl — and does the whole thing again every reconnect, forever.
         let both = [GNU, MUSL];
         let mut p = probe("Linux x86_64", None, Some("0.1.0"));
 
-        // (2) The marker names musl and we can still supply it; same digest, so
-        // it is already this exact build — keep it, even though gnu is what we
+        // The marker names musl and we can still supply it; same digest, so it
+        // is already this exact build — keep it, even though gnu is what we
         // would otherwise offer first.
         p.cache_sha = Some(MUSL.1.into());
         p.cache_target = Some(MUSL.0.into());
@@ -2394,15 +2396,15 @@ mod tests {
             Provision::UseCache
         );
 
-        // (2) Same target, different digest: the dev loop. Re-deploy *that*
-        // target rather than restarting the race from the top.
+        // Same target, different digest: the dev loop. Re-deploy *that* target
+        // rather than restarting the race from the top.
         p.cache_sha = Some("some-older-build".into());
         assert_eq!(
             decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
             upload_of(MUSL)
         );
 
-        // (3) The marker names a target we can no longer supply — a released
+        // The marker names a target we can no longer supply — a released
         // dashboard whose host runs a downloaded musl, now offline or declined.
         // Keep what proved itself here; re-offering gnu is how the loop starts.
         assert_eq!(
@@ -2410,7 +2412,7 @@ mod tests {
             Provision::UseCache
         );
 
-        // (4) A marker written before targets were recorded falls back to the
+        // A marker written before targets were recorded falls back to the
         // single-candidate rule this had before the loop existed.
         p.cache_target = None;
         p.cache_sha = Some(GNU.1.into());
@@ -2423,17 +2425,20 @@ mod tests {
             decide_provision("0.1.0", &p, &both, BOTH_TARGETS),
             upload_of(GNU)
         );
+    }
+
+    /// The same stickiness across a version bump, which is the case that costs
+    /// something: on the connect path a re-run of the race from gnu wastes a
+    /// 4.8MB upload before it recovers; on the upgrade path — one shot — it is
+    /// the whole outcome.
+    #[test]
+    fn an_upgrade_goes_to_the_target_the_marker_names() {
+        let both = [GNU, MUSL];
 
         // A version mismatch upgrades — but to the target the marker names, not
         // to the one at the head of our preference list. The old binary is
         // stale; the *host's verdict on which target it can execute* is not, and
         // a release does not repeal a fact about the host's loader.
-        //
-        // This is the polaris case: a NixOS host settled on musl, the dashboard
-        // moved 0.3.0 → 0.4.0, and re-running the race from gnu offered it a
-        // binary it had already proved it cannot start. On the connect path that
-        // costs a wasted 4.8MB upload before the loop recovers; on the upgrade
-        // path — one shot — it was the whole outcome.
         let mut old = probe("Linux x86_64", None, Some("0.0.9"));
         old.cache_sha = Some(MUSL.1.into());
         old.cache_target = Some(MUSL.0.into());
