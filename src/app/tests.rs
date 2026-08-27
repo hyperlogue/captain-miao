@@ -3914,6 +3914,30 @@ fn workdir_picker_esc_cancels() {
     assert!(d.app.picker.is_none());
 }
 
+/// The clear-then-cancel Esc that every filtering picker has is wrong here: the
+/// workdir picker's text is a path the user typed, not a view of a list that is
+/// still sitting there, so the first Esc has nothing to restore it from. Someone
+/// reaching for Esc to dismiss the popup got a silently emptied field instead.
+/// Free input cancels on the first press (`Picker::handle_key`).
+#[test]
+fn workdir_picker_esc_cancels_without_eating_the_typed_path() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
+    d.press(KeyCode::Char('O'));
+    for c in "~/proj".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    assert_eq!(d.app.picker.as_ref().unwrap().picker.input.text(), "~/proj");
+
+    let action = d.press(KeyCode::Esc);
+    assert!(action.is_none());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(
+        d.app.picker.is_none(),
+        "a non-empty path must not turn Esc into a clear"
+    );
+}
+
 #[test]
 fn workdir_picker_submits_the_canonical_form() {
     let mut d = TestDashboard::new(120, 15);
@@ -4974,6 +4998,9 @@ fn tab_picker_filters() {
         if *w == WindowId::from(100) && *t == TabTarget::Existing(TabId::from(2))));
 }
 
+/// A *filtering* picker keeps clear-then-cancel: the text only narrows a list
+/// that is still there, so the first Esc costs nothing and the second is under
+/// the same finger. Only `free_input` pickers cancel outright.
 #[test]
 fn tab_picker_esc_clears_filter_before_closing() {
     let mut d = TestDashboard::new(120, 20);

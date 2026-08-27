@@ -2189,7 +2189,14 @@ impl App {
                 let mut spans = hint_pair("type", "filter");
                 spans.extend(hint_pair("↑/↓", "navigate"));
                 spans.extend(hint_pair("Enter", "select"));
-                spans.extend(hint_pair("Esc", "clear/cancel"));
+                // Esc means one thing on a free-input picker and two on a
+                // filtering one (`Picker::handle_key`), so the label reads the
+                // same flag the handler branches on rather than naming both.
+                let free_input = self.picker.as_ref().is_some_and(|a| a.picker.free_input);
+                spans.extend(hint_pair(
+                    "Esc",
+                    if free_input { "cancel" } else { "clear/cancel" },
+                ));
                 let multi_host = self.backends.len() > 1;
                 match self.picker.as_ref().map(|a| &a.kind) {
                     // Naming a worktree owns the keyboard, so the ribbon shows

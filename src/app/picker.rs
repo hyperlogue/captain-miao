@@ -636,7 +636,15 @@ impl Picker {
 
         match key.code {
             KeyCode::Esc => {
-                if self.input.is_empty() {
+                // Clear-then-cancel, except under `free_input`. On a filter the
+                // text is a *view* of a list that is still there, so throwing it
+                // away is cheap and the second Esc is right where the first one
+                // left the hand. Under free input the text is the **value** —
+                // the path being typed into the workdir picker — and there is
+                // nothing to retype it from, so an Esc aimed at the popup that
+                // silently ate the path instead is the worse of the two
+                // mistakes. Cancel outright there.
+                if self.free_input || self.input.is_empty() {
                     return PickerEvent::Cancel;
                 }
                 self.input.clear();
