@@ -324,19 +324,24 @@ mod tests {
     #[test]
     fn an_update_lands_where_a_repaint_would_at_either_emoji_width() {
         const WIDTH: u16 = 44;
+        // The one name the cluster carries. The short case is that same name
+        // truncated, the way the header itself shortens it — built from `HOST`
+        // so the two cannot drift apart, and so the widths `WIDTH` was chosen
+        // against keep their relationship if it ever changes.
+        const HOST: &str = "skipper";
         // The header's right cluster, at every width its parts take: the tally
         // gaining a bucket, the host name growing, the keep-awake ☕ arriving.
         // Each slides the glyphs left of it onto columns that held a digit.
         let shifts = [
-            "Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} polaris",
-            "Claude  \u{2601}\u{fe0f}1 1  host: \u{1f4e6} polaris",
-            "Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} pol",
-            "Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} polaris  \u{2615}",
-            "Codex  \u{2601}\u{fe0f}0 2  host: \u{1f5a5}\u{fe0f} polaris",
+            format!("Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} {HOST}"),
+            format!("Claude  \u{2601}\u{fe0f}1 1  host: \u{1f4e6} {HOST}"),
+            format!("Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} {}", &HOST[..3]),
+            format!("Claude  \u{2601}\u{fe0f}1  host: \u{1f4e6} {HOST}  \u{2615}"),
+            format!("Codex  \u{2601}\u{fe0f}0 2  host: \u{1f5a5}\u{fe0f} {HOST}"),
         ];
         for emoji_cols in [2, 1] {
-            for a in shifts {
-                for b in shifts {
+            for a in &shifts {
+                for b in &shifts {
                     let (prev, next) = (bar(a, WIDTH), bar(b, WIDTH));
                     let mut screen = Screen::repaint(&prev, emoji_cols);
                     screen.cursor = 0;
