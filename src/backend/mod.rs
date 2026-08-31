@@ -194,6 +194,35 @@ const REMOTE_OUTPUT_CAP: u64 = 256 * 1024;
 /// and a cold NFS home has been known to make that unhurried.
 const ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a `-O cancel` may take. It reads as a local operation — the mux
+/// client only writes to a unix socket — but the master turns it into a global
+/// request and waits for sshd's reply, so it is a round trip like any other.
+const MUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the host may take to make its clipboard socket path bindable. A
+/// `mkdir` and an `rm` behind a login shell; the generous end of that is a
+/// second.
+const CLIPBOARD_PREP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a fire-and-forget ssh child to completion under a deadline, reporting
+/// only whether it succeeded.
+///
+/// Every remote call on the connect path is bounded, and these are remote calls
+/// too. The argument the probe's own `PROBE_TIMEOUT` makes holds here unchanged:
+/// `ConnectTimeout` bounds only the handshake and
+/// `ServerAlive*` only a host that goes *silent*, so neither covers a host — or a
+/// wedged `ControlMaster`, which answers its socket and then does nothing — that
+/// simply never finishes. Unbounded, one of those parks [`connection_task`] in
+/// `Connecting` for good, and that task is the only thing that would ever retry.
+///
+/// `kill_on_drop` is what makes the deadline mean anything: the timeout ends the
+/// attempt by dropping the future, which would otherwise leave an ssh child
+/// talking to nobody.
+async fn bounded_status(mut cmd: Command, limit: Duration) -> bool {
+    cmd.kill_on_drop(true);
+    matches!(tokio::time::timeout(limit, cmd.status()).await, Ok(Ok(s)) if s.success())
+}
+
 // =============================================================================
 // The Backend seam, connection state, and the log
 // =============================================================================
@@ -2787,15 +2816,15 @@ async fn setup_ssh(
     // master. Cancel any such stale forward first; it's a quiet no-op when none
     // exists (or no master is up). Verified against a real host: without this the
     // forward socket never appears; with it, it binds on the first try.
-    let _ = detached("ssh")
+    let mut cancel = detached("ssh");
+    cancel
         .args(&opts)
         .arg("-O")
         .arg("cancel")
         .arg("-L")
         .arg(format!("{}:{}", local_sock.display(), remote_sock))
-        .arg(target)
-        .status()
-        .await;
+        .arg(target);
+    bounded_status(cancel, MUX_CONTROL_TIMEOUT).await;
     cancel_user_forwards(prov.host, target, &opts, forwards).await;
 
     // Clear any stale local socket and ensure its parent dir exists.
@@ -2809,13 +2838,9 @@ async fn setup_ssh(
     // above released the path and before the tunnel asks for it.
     if clipboard_home.is_some() {
         let script = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
-        let prepared = detached("ssh")
-            .args(&opts)
-            .arg(target)
-            .arg(&script)
-            .status()
-            .await
-            .is_ok_and(|s| s.success());
+        let mut prep = detached("ssh");
+        prep.args(&opts).arg(target).arg(&script);
+        let prepared = bounded_status(prep, CLIPBOARD_PREP_TIMEOUT).await;
         if !prepared {
             // Not fatal: ssh may still bind (nothing was holding the path), and
             // if it doesn't, its own stderr file names the listen path. Logged
@@ -3031,15 +3056,14 @@ pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
 /// *could* have been cancelled down with it.
 async fn cancel_forwards(target: &str, opts: &[String], forwards: &[Forward]) {
     for f in forwards {
-        let _ = detached("ssh")
-            .args(opts)
+        let mut cmd = detached("ssh");
+        cmd.args(opts)
             .arg("-O")
             .arg("cancel")
             .arg(&f.flag)
             .arg(&f.spec)
-            .arg(target)
-            .status()
-            .await;
+            .arg(target);
+        bounded_status(cmd, MUX_CONTROL_TIMEOUT).await;
     }
 }
 
@@ -3789,6 +3813,41 @@ mod tests {
             "a silent child must time out rather than be waited on"
         );
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The connect path's fire-and-forget ssh children are bounded too. Nothing
+    /// downstream of a hung `-O cancel` runs, so an unbounded one parks the
+    /// connection task in `Connecting` with no retry left to rescue it — and the
+    /// child has to actually die, or every timed-out attempt leaks an ssh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_control_command_gives_up_and_takes_its_child_with_it() {
+        let mut cmd = detached("/bin/sh");
+        // A sleeper that reports its own pid first, so the test can ask the OS
+        // whether the kill actually happened rather than trusting `kill_on_drop`.
+        let pidfile = std::env::temp_dir().join(format!("cm-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}; sleep 60", pidfile.display()));
+        let start = Instant::now();
+        assert!(
+            !bounded_status(cmd, Duration::from_millis(300)).await,
+            "a child that never exits cannot report success"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "it must give up");
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the sleeper wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let _ = std::fs::remove_file(&pidfile);
+        // `kill_on_drop` reaps asynchronously, so give it a moment before asking.
+        for _ in 0..50 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the ssh child outlived its deadline");
     }
 
     /// The log quotes a remote host's stderr verbatim. ratatui is what stops an
