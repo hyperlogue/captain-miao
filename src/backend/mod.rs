@@ -3611,9 +3611,10 @@ mod tests {
             ]
         );
         assert!(ssh[5..].iter().all(|d| *d == CONNECT_RETRY_CEILING));
-        // The whole budget still lands under what the flat schedule cost.
+        // Which fixes the budget exactly — the number a reader wants, and well
+        // under the 6s the flat 400ms schedule spent to reach the same place.
         let total: Duration = ssh.iter().sum();
-        assert!(total < Duration::from_millis(400) * 15, "{total:?}");
+        assert_eq!(total, Duration::from_millis(4775));
 
         // The socket transport's three attempts are now a rounding error.
         let direct: Duration = connect_retry_delays(3).sum();
@@ -4131,7 +4132,11 @@ mod tests {
         let pidfile = std::env::temp_dir().join(format!("cm-bounded-{}", std::process::id()));
         let _ = std::fs::remove_file(&pidfile);
         cmd.arg("-c")
-            .arg(format!("echo $$ > {}; sleep 60", pidfile.display()));
+            // `exec`, so the pid recorded is the sleeper's under any `/bin/sh`:
+            // dash and bash tail-exec the last command anyway, but a shell that
+            // forked instead would have this test watch the shell die and pass
+            // while leaking the sleeper it is supposed to be pinning.
+            .arg(format!("echo $$ > {}; exec sleep 60", pidfile.display()));
         let start = Instant::now();
         assert!(
             !bounded_status(cmd, Duration::from_millis(300)).await,
@@ -4144,8 +4149,11 @@ mod tests {
             .parse()
             .expect("a pid");
         let _ = std::fs::remove_file(&pidfile);
-        // `kill_on_drop` reaps asynchronously, so give it a moment before asking.
-        for _ in 0..50 {
+        // `kill_on_drop` signals and then reaps on tokio's orphan queue, and a
+        // zombie still answers signal 0 — so this is waiting on the reap, which
+        // is the strictly later event. Polled with an `await` between, which is
+        // what lets the reaper run at all.
+        for _ in 0..100 {
             if unsafe { libc::kill(pid, 0) } != 0 {
                 return;
             }
