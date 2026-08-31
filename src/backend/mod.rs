@@ -2397,6 +2397,12 @@ async fn connection_task(
     let mut download_gate = UploadGate::default();
     // Deliberately absent from the `clear()` below — see `Provisioning::terminfo`.
     let mut terminfo_gate = UploadGate::default();
+    // The probe answer a reconnect may reuse instead of re-interrogating a host
+    // we were talking to a moment ago (`PROBE_REUSE_WINDOW`). Dropped by every
+    // path below that did *not* reach a served connection: the probe is how a
+    // host that has started failing gets diagnosed, so anything short of
+    // "this worked" has to ask again.
+    let mut probe_cache = None;
     // The diagnosis the last attempt reached, held across the wait *and* the
     // next attempt. Retrying doesn't make "no miao-server on the host" any less
     // true, so blinking the sentence off to `connecting` once per backoff tick
@@ -2441,6 +2447,7 @@ async fn connection_task(
                         upload: &mut upload_gate,
                         download: &mut download_gate,
                         terminfo: &mut terminfo_gate,
+                        probe: &mut probe_cache,
                         host: &host,
                     },
                     &log,
@@ -2462,6 +2469,7 @@ async fn connection_task(
             // terminal state, since deploying the binary should heal it without
             // the user restarting anything.
             standing_failure = failure;
+            probe_cache = None;
             match &standing_failure {
                 Some(reason) => log.error(format!("could not set the connection up: {reason}")),
                 None => log.error("could not set the connection up (no diagnosis)"),
@@ -2483,6 +2491,7 @@ async fn connection_task(
             drop(ssh_child); // kill_on_drop tears ssh down
             // Setup got this far without a diagnosis, so an older one is stale.
             standing_failure = None;
+            probe_cache = None;
             log.error(format!(
                 "the daemon socket never answered at {} ({attempts} attempts)",
                 sock_path.display()
@@ -2527,6 +2536,11 @@ async fn connection_task(
         if matches!(outcome, ServeOutcome::ConnectionLost) {
             upload_gate.clear();
             download_gate.clear();
+        } else {
+            // A refused handshake is the one thing the probe would explain — a
+            // server below the protocol floor is exactly what a fresh probe
+            // turns into a deploy — so this is the last pass that may reuse one.
+            probe_cache = None;
         }
         drop(ssh_child); // explicit: kill the ssh child once the connection ends
         // The mirror is now stale; clear it so the host shows no (misleading)
@@ -2706,9 +2720,12 @@ async fn setup_ssh(
     }
 
     // Probe the host, auto-provision our binary if it's missing/stale and our
-    // build can run there (`docs/crate-split.md`), and resolve the command to invoke.
-    // This also primes the ControlMaster, replacing the `--print-path` priming.
-    // Non-fatal: a failure resolves to `miao-server` on PATH, the prior default.
+    // build can run there (`docs/crate-split.md`), and resolve the command to
+    // invoke. Non-fatal: a failure resolves to `miao-server` on PATH, the prior
+    // default. A reconnect inside `PROBE_REUSE_WINDOW` answers from the last
+    // clean probe instead — which is also why nothing here counts on it having
+    // primed the ControlMaster: every ssh below carries `ControlMaster=auto`, so
+    // whichever runs first opens it.
     let provisioned = resolve_remote_exe(target, &opts, prov, log).await;
     let exe = provisioned.exe;
     *remote_exe.lock().unwrap() = exe.clone();

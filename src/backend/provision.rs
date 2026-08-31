@@ -104,8 +104,48 @@ pub(super) struct Provisioning<'a> {
     /// forget once the host demonstrably works, which is right for a transient
     /// deploy failure and exactly wrong for a preference the user stated.
     pub(super) terminfo: &'a mut UploadGate,
+    /// The last clean probe answer, kept so a reconnect can skip re-asking —
+    /// see [`PROBE_REUSE_WINDOW`]. Cleared by `connection_task` on any pass that
+    /// did not reach `Connected`.
+    pub(super) probe: &'a mut Option<CachedProbe>,
     pub(super) host: &'a HostId,
 }
+
+/// A probe answer and when it landed. Only ever holds one that settled with no
+/// `failure`: a probe worth standing in for a fresh one is one that concluded
+/// the host is fine, and re-publishing a stale diagnosis would announce a
+/// problem that may already be over.
+pub(super) struct CachedProbe {
+    at: Instant,
+    provisioned: Provisioned,
+}
+
+impl CachedProbe {
+    /// The answer this still stands in for, if it is recent enough. Pure over an
+    /// injected `now`, so the window is unit-tested without sleeping — the same
+    /// shape as [`UploadGate::suppressed`].
+    fn fresh(&self, now: Instant) -> Option<&Provisioned> {
+        (now.duration_since(self.at) < PROBE_REUSE_WINDOW).then_some(&self.provisioned)
+    }
+}
+
+/// How long a probe answer stands in for a fresh one.
+///
+/// The probe is the dominant cost of a connect: five remote `--version` calls
+/// and a `cat` behind a login shell, and `setup_ssh` re-runs the whole sequence
+/// on **every** reconnect attempt. That is right for `daemon ensure`, which has
+/// to restart a daemon that died — but nothing the probe reports (the arch, the
+/// versions on the host, `$HOME`, the provisioning decision) changes on the
+/// timescale of a dropped link, and a healthy connection that drops re-dials
+/// 500ms later. On a flapping link that is a continuous re-interrogation of a
+/// host we were talking to a moment ago.
+///
+/// Bounded rather than sticky because the facts *can* move — someone upgrades
+/// the server out of band — and a window this size costs at most one stale
+/// answer while keeping every redial inside a backoff cycle ([`RECONNECT_MAX`]
+/// is 30s) free. Only a pass that reached `Connected` leaves an entry to reuse,
+/// so a host that is failing is always re-probed.
+const PROBE_REUSE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Where a published server is downloaded from, minus the tag and filename.
 ///
@@ -1552,6 +1592,16 @@ pub(super) async fn resolve_remote_exe(
     log: &ConnLog,
 ) -> Provisioned {
     let host = prov.host;
+    let now = Instant::now();
+    if let Some(cached) = prov.probe.as_ref()
+        && let Some(provisioned) = cached.fresh(now)
+    {
+        log.info(format!(
+            "reusing the probe from {}s ago",
+            now.duration_since(cached.at).as_secs()
+        ));
+        return provisioned.clone();
+    }
     let Some(probe) = probe_remote(target, opts).await else {
         tracing::debug!(
             target: "captain_miao::provision",
@@ -1776,7 +1826,7 @@ pub(super) async fn resolve_remote_exe(
         }
         _ => None,
     };
-    Provisioned {
+    let provisioned = Provisioned {
         exe,
         home: Some(probe.home.clone()),
         // `uname -sm`, so the sysname is the first word.
@@ -1792,12 +1842,21 @@ pub(super) async fn resolve_remote_exe(
                 .collect::<Vec<_>>(),
         ),
         upgrade,
-    }
+    };
+    // A diagnosis is never cached — see [`CachedProbe`]. The entry is also only
+    // *reached* by a pass that goes on to connect, since `connection_task`
+    // clears it otherwise, so this stores a candidate rather than a conclusion.
+    *prov.probe = provisioned.failure.is_none().then(|| CachedProbe {
+        at: Instant::now(),
+        provisioned: provisioned.clone(),
+    });
+    provisioned
 }
 
 /// What [`resolve_remote_exe`] settled: the command to invoke on the host, why
 /// that is a fall-back if it is one, and whether restarting the host's daemon
 /// would deploy something newer.
+#[derive(Clone)]
 pub(super) struct Provisioned {
     pub(super) exe: String,
     pub(super) failure: Option<String>,
@@ -1822,6 +1881,32 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    /// A probe answer stands in for a fresh one only inside its window: what it
+    /// reports *can* move (someone upgrades the server out of band), so a
+    /// reconnect an hour later is a different question from one 500ms after a
+    /// dropped link. Pure over `now`, so this sleeps for none of it.
+    #[test]
+    fn a_cached_probe_stops_standing_in_once_its_window_passes() {
+        let at = Instant::now();
+        let cached = CachedProbe {
+            at,
+            provisioned: Provisioned {
+                exe: "miao-server".to_string(),
+                failure: None,
+                upgrade: None,
+                home: Some("/home/miao".to_string()),
+                darwin: false,
+            },
+        };
+        assert!(cached.fresh(at).is_some());
+        assert!(
+            cached
+                .fresh(at + PROBE_REUSE_WINDOW - Duration::from_secs(1))
+                .is_some()
+        );
+        assert!(cached.fresh(at + PROBE_REUSE_WINDOW).is_none());
+    }
 
     /// The payload a test dashboard carries: `(target, sha256)`, exactly the
     /// shape `decide_provision` takes.
@@ -3200,6 +3285,9 @@ mod tests {
                 upload: &mut gate,
                 download: &mut dl,
                 terminfo: &mut UploadGate::default(),
+                // A fresh cache per call: each of these is a separate connect,
+                // and the point of the second is that it probes again.
+                probe: &mut None,
                 host: &host,
             },
             &log,
@@ -3240,6 +3328,9 @@ mod tests {
                 upload: &mut gate,
                 download: &mut dl,
                 terminfo: &mut UploadGate::default(),
+                // A fresh cache per call: each of these is a separate connect,
+                // and the point of the second is that it probes again.
+                probe: &mut None,
                 host: &host,
             },
             &log,
