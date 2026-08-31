@@ -1141,6 +1141,21 @@ decides what they mean**.
     breaks something real: the first two split the multiplexing this depends on
     (including the `-O cancel` that retires forwards), the third lets ssh prompt
     on a child whose stdin is `/dev/null`.
+  - **Editing them retires the master first**, or they would not take effect at
+    all. An options edit is already a drop-and-dial (`ConnIdentity` carries
+    them), and that does kill the `-N -L` tunnel — but the tunnel is a mux
+    *slave*. The master was minted by the previous connect's probe and
+    backgrounded itself under `ControlPersist`, `ssh_control_path` hashes the
+    **target alone**, so the fresh dial's probe joins that same master and every
+    connection-scoped option (`Port`, `User`, `IdentityFile`, `ProxyJump`, the
+    ciphers, and the three settings above) is inert against a connection that
+    already exists — indefinitely, since an open attach window keeps refreshing
+    it. So `options_changed_since_last_dial` memoizes each row's `extra` and
+    `setup_ssh` runs `-O exit` before the probe when it differs. Per **row**, not
+    per target: two rows naming one machine share a master, and keyed by target
+    each would exit the other's and flap forever. Forwards are excluded — those
+    are re-requested through the master on every pass anyway. A first sighting is
+    not a change, so a dashboard restart keeps its attach windows.
   - **`-O cancel` before every request**, and on every host that leaves the ssh
     set. A forward requested by a multiplexed client is registered with the
     *master*, so one deleted from the field would hold its port for as long as

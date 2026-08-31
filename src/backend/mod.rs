@@ -114,6 +114,10 @@ fn detached(program: &str) -> Command {
 /// forwards), the third lets ssh prompt on a child whose stdin is `/dev/null`.
 /// Documented where the field is edited rather than blocked — an escape hatch
 /// that second-guesses isn't one.
+///
+/// An *edit* to any of these takes effect only because
+/// [`options_changed_since_last_dial`] retires the shared master first;
+/// re-dialling on its own would re-join it and change nothing.
 fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
     let mut opts: Vec<String> = extra.to_vec();
     opts.extend([
@@ -2687,6 +2691,19 @@ async fn setup_ssh(
     if !options.is_empty() {
         log.info(format!("connection options: {}", options.join(" ")));
     }
+    // Ahead of the probe, because the probe is what would otherwise re-join the
+    // stale master and make the new options inert — see
+    // [`options_changed_since_last_dial`]. Best-effort: a master that is already
+    // gone (or was never up) makes this a quiet no-op, and a failure only leaves
+    // us where we were.
+    if options_changed_since_last_dial(prov.host, target, &extra) {
+        log.info(
+            "connection options changed — retiring the shared ssh connection so they take effect",
+        );
+        let mut exit = detached("ssh");
+        exit.args(&opts).arg("-O").arg("exit").arg(target);
+        bounded_status(exit, MUX_CONTROL_TIMEOUT).await;
+    }
 
     // Probe the host, auto-provision our binary if it's missing/stale and our
     // build can run there (`docs/crate-split.md`), and resolve the command to invoke.
@@ -2951,6 +2968,54 @@ fn clipboard_forward(remote_home: &str, local_sock: &Path) -> Forward {
             local_sock.display()
         ),
     }
+}
+
+/// The connection options this process last dialled each host row's ssh target
+/// with — the memo behind [`options_changed_since_last_dial`].
+///
+/// Keyed `(host label, ssh target)` exactly like [`REQUESTED_FORWARDS`], and for
+/// a sharper reason than that one: [`ssh_control_path`](state::ssh_control_path)
+/// hashes the **target alone**, so two panel rows naming the same machine share
+/// one master. Keyed by target, each row would see the other's options as a
+/// change, exit the master it is connected through, and drop the other's tunnel
+/// — which would reconnect, exit this one's master, and flap forever. Per row,
+/// neither sees a change of *its own*, so that config keeps behaving exactly as
+/// it does today.
+static LAST_CONN_OPTIONS: LazyLock<Mutex<HashMap<ForwardKey, Vec<String>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Whether this host row's ssh **connection** options differ from the ones it
+/// last dialled with, recording the new set either way.
+///
+/// The `extra` half only, never the forwards: a `-L`/`-R` is requested through
+/// the master per connection and [`cancel_user_forwards`] already re-asks for it
+/// on every pass, so an edit that only moves a forward needs no teardown.
+/// Everything left in `extra` is the opposite — `Port`, `User`, `IdentityFile`,
+/// `ProxyJump`, the ciphers, and the `ConnectTimeout`/`ServerAliveInterval`/
+/// `ControlPersist` that [`ssh_common_opts`] puts `extra` first to make settable
+/// — and every one of them is decided when the TCP connection is *established*.
+///
+/// **Re-dialling is not enough, which is the whole reason this exists.** An
+/// options edit is a genuine drop-and-dial (`ConnIdentity` carries them), and
+/// dropping the backend does kill the `-N -L` tunnel — but that child is a mux
+/// *slave*. The master was minted by the first ssh of the previous
+/// [`setup_ssh`], the probe, which backgrounded itself under `ControlPersist`;
+/// the fresh dial's probe then finds that socket still there and joins it as a
+/// slave, and every connection-scoped option it was given is inert because the
+/// connection it would configure already exists. Not merely for the persist
+/// window either: the re-dial is immediate, and an open attach window refreshes
+/// the master indefinitely. Only `-O exit` takes it down, so the edit reads as
+/// simply not working.
+///
+/// First sighting is deliberately not a change: the memo is per-process, so a
+/// dashboard restart has nothing to compare against, and exiting the master on
+/// every startup would drop the attach windows a restart is meant to keep.
+fn options_changed_since_last_dial(host: &HostId, target: &str, extra: &[String]) -> bool {
+    LAST_CONN_OPTIONS
+        .lock()
+        .unwrap()
+        .insert((host.0.clone(), target.to_string()), extra.to_vec())
+        .is_some_and(|previous| previous.as_slice() != extra)
 }
 
 /// Every port-forward spec this process has asked a given ssh target's
@@ -3450,6 +3515,78 @@ mod tests {
         let (opts, fwd) = split("-C -L");
         assert_eq!(opts, ["-C"]);
         assert!(fwd.is_empty());
+    }
+
+    /// A change to a row's **connection** options has to retire the shared
+    /// master, because re-dialling alone re-joins it and the new options never
+    /// take effect. Two things must not trip it: a forwards-only edit (those are
+    /// re-requested through the master every pass), and a second row on the same
+    /// target — that pair would exit each other's master forever.
+    #[test]
+    fn only_a_rows_own_connection_options_retire_its_master() {
+        let opt = |v: &str| vec!["-o".to_string(), v.to_string()];
+        let (a, b) = (HostId("opts-a".into()), HostId("opts-b".into()));
+        let target = "build-box";
+
+        // A first sighting is not a change: the memo is per-process, so a
+        // dashboard restart has nothing to compare against, and exiting the
+        // master then would drop the attach windows it means to keep.
+        assert!(!options_changed_since_last_dial(
+            &a,
+            target,
+            &opt("Port=2222")
+        ));
+        // Neither is an ordinary reconnect.
+        assert!(!options_changed_since_last_dial(
+            &a,
+            target,
+            &opt("Port=2222")
+        ));
+        // A second row on the same machine sees its own first sighting, not
+        // `a`'s options — otherwise each reconnect would retire the master the
+        // other is connected through, forever.
+        assert!(!options_changed_since_last_dial(
+            &b,
+            target,
+            &opt("Port=2200")
+        ));
+        assert!(!options_changed_since_last_dial(
+            &b,
+            target,
+            &opt("Port=2200")
+        ));
+        assert!(!options_changed_since_last_dial(
+            &a,
+            target,
+            &opt("Port=2222")
+        ));
+
+        // An actual edit to `a`'s row is — once.
+        assert!(options_changed_since_last_dial(
+            &a,
+            target,
+            &opt("Port=2200")
+        ));
+        assert!(!options_changed_since_last_dial(
+            &a,
+            target,
+            &opt("Port=2200")
+        ));
+
+        // A forwards-only edit reaches this as the same `extra`, so it isn't a
+        // change: the forward is cancelled and re-requested on every pass.
+        let c = HostId("opts-c".into());
+        let split = |port: &str| {
+            split_connection_options(&[
+                "-o".to_string(),
+                "Port=2200".to_string(),
+                "-L".to_string(),
+                format!("{port}:localhost:{port}"),
+            ])
+            .0
+        };
+        assert!(!options_changed_since_last_dial(&c, target, &split("9000")));
+        assert!(!options_changed_since_last_dial(&c, target, &split("9001")));
     }
 
     /// The clipboard bridge is a synthesized forward, so it has to be one the
