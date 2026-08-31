@@ -3016,22 +3016,22 @@ fn clipboard_forward(remote_home: &str, local_sock: &Path) -> Forward {
     }
 }
 
-/// The connection options this process last dialled each host row's ssh target
-/// with — the memo behind [`options_changed_since_last_dial`].
-///
-/// Keyed `(host label, ssh target)` exactly like [`REQUESTED_FORWARDS`], and for
-/// a sharper reason than that one: [`ssh_control_path`](state::ssh_control_path)
-/// hashes the **target alone**, so two panel rows naming the same machine share
-/// one master. Keyed by target, each row would see the other's options as a
-/// change, exit the master it is connected through, and drop the other's tunnel
-/// — which would reconnect, exit this one's master, and flap forever. Per row,
-/// neither sees a change of *its own*, so that config keeps behaving exactly as
-/// it does today.
-static LAST_CONN_OPTIONS: LazyLock<Mutex<HashMap<ForwardKey, Vec<String>>>> =
-    LazyLock::new(Mutex::default);
+/// The connection options this process has dialled with — the memo behind
+/// [`options_changed_since_last_dial`], from two angles, because one row's
+/// history and one target's master answer different halves of the question.
+#[derive(Default)]
+struct ConnOptionsMemo {
+    /// `(host label, ssh target)` → what that panel row last dialled with.
+    by_row: HashMap<ForwardKey, Vec<String>>,
+    /// ssh target → what the most recent dial to it used, which is the best
+    /// available account of what the master there was minted with.
+    by_target: HashMap<String, Vec<String>>,
+}
 
-/// Whether this host row's ssh **connection** options differ from the ones it
-/// last dialled with, recording the new set either way.
+static LAST_CONN_OPTIONS: LazyLock<Mutex<ConnOptionsMemo>> = LazyLock::new(Mutex::default);
+
+/// Whether the shared `ControlMaster` for `target` has to be retired before this
+/// dial, recording the options either way.
 ///
 /// The `extra` half only, never the forwards: a `-L`/`-R` is requested through
 /// the master per connection and [`cancel_user_forwards`] already re-asks for it
@@ -3053,15 +3053,39 @@ static LAST_CONN_OPTIONS: LazyLock<Mutex<HashMap<ForwardKey, Vec<String>>>> =
 /// the master indefinitely. Only `-O exit` takes it down, so the edit reads as
 /// simply not working.
 ///
-/// First sighting is deliberately not a change: the memo is per-process, so a
-/// dashboard restart has nothing to compare against, and exiting the master on
-/// every startup would drop the attach windows a restart is meant to keep.
+/// **A row we have dialled before is judged by its own history; one we have not,
+/// by the master's.** Neither angle can be the only one.
+/// [`ssh_control_path`](state::ssh_control_path) hashes the target alone, so two
+/// panel rows naming the same machine share a master — judge a known row by the
+/// master and each sees the other's options as a change, exits the master it is
+/// connected through, drops the other's tunnel, and the pair flaps forever. But
+/// judge an *unknown* row by its own (empty) history and a rename reads as a
+/// first sighting, which the hosts panel makes ordinary: one `Enter` commits
+/// every field of a row at once, so changing the label and the options together
+/// is a single edit, and the master would keep the options the user just
+/// replaced — indefinitely, with the panel showing them as live. Deleting a host
+/// and re-adding it under another label is the same shape.
+///
+/// So a genuinely new row costs at most one extra exit, never a flap, and a
+/// first sighting with nothing recorded for the target stays a no-op — the memo
+/// is per-process, and exiting on every startup would drop the attach windows a
+/// restart means to keep.
+///
+/// Retiring a master takes down *everyone* on that target, not just the row that
+/// asked: another row's attach and `w` windows go with it. That is benign and
+/// recoverable — ssh exits 255, which reads as a dropped link rather than a user
+/// close, so no session is ended, and the reconnect epoch's re-attach sweep puts
+/// the windows back — but it is the reason this is gated as tightly as it is.
 fn options_changed_since_last_dial(host: &HostId, target: &str, extra: &[String]) -> bool {
-    LAST_CONN_OPTIONS
-        .lock()
-        .unwrap()
-        .insert((host.0.clone(), target.to_string()), extra.to_vec())
-        .is_some_and(|previous| previous.as_slice() != extra)
+    let mut memo = LAST_CONN_OPTIONS.lock().unwrap();
+    let row = memo
+        .by_row
+        .insert((host.0.clone(), target.to_string()), extra.to_vec());
+    let minted = memo.by_target.insert(target.to_string(), extra.to_vec());
+    match row {
+        Some(row) => row.as_slice() != extra,
+        None => minted.is_some_and(|minted| minted.as_slice() != extra),
+    }
 }
 
 /// Every port-forward spec this process has asked a given ssh target's
@@ -3624,23 +3648,33 @@ mod tests {
             target,
             &opt("Port=2222")
         ));
-        // A second row on the same machine sees its own first sighting, not
-        // `a`'s options — otherwise each reconnect would retire the master the
-        // other is connected through, forever.
+        // A second row on the same machine, dialling with options the master
+        // was not minted with, retires it — **once**. It is a row we have never
+        // seen, so it may be `a` renamed, and the master is the only account of
+        // what is actually live.
+        assert!(options_changed_since_last_dial(
+            &b,
+            target,
+            &opt("Port=2200")
+        ));
+        // From here neither row may ever retire the other's master again, or the
+        // two would exit each other's forever: `b`'s reconnects are judged by
+        // `b`'s own history…
         assert!(!options_changed_since_last_dial(
             &b,
             target,
             &opt("Port=2200")
         ));
-        assert!(!options_changed_since_last_dial(
-            &b,
-            target,
-            &opt("Port=2200")
-        ));
+        // …and `a`'s by `a`'s, even though the master now holds `b`'s options.
         assert!(!options_changed_since_last_dial(
             &a,
             target,
             &opt("Port=2222")
+        ));
+        assert!(!options_changed_since_last_dial(
+            &b,
+            target,
+            &opt("Port=2200")
         ));
 
         // An actual edit to `a`'s row is — once.
@@ -3669,6 +3703,57 @@ mod tests {
         };
         assert!(!options_changed_since_last_dial(&c, target, &split("9000")));
         assert!(!options_changed_since_last_dial(&c, target, &split("9001")));
+    }
+
+    /// The hosts panel commits every field of a row on one `Enter`, so renaming
+    /// a host *and* changing its options is a single ordinary edit — and the new
+    /// label makes it a row we have never dialled. Judged on its own history
+    /// that reads as a first sighting, and the master keeps serving the options
+    /// the user just replaced, for as long as anything holds it open. What the
+    /// master was minted with is what has to decide for a row we don't know.
+    #[test]
+    fn a_rename_in_the_same_edit_still_retires_the_master() {
+        let opt = |v: &str| vec!["-o".to_string(), v.to_string()];
+        let target = "rename-box";
+        let before = HostId("rename-before".into());
+
+        assert!(!options_changed_since_last_dial(
+            &before,
+            target,
+            &opt("Port=2222")
+        ));
+
+        // Label *and* options changed together: a row we have never seen, on a
+        // target whose master was minted with something else.
+        let after = HostId("rename-after".into());
+        assert!(options_changed_since_last_dial(
+            &after,
+            target,
+            &opt("Port=2200")
+        ));
+        // …and its own reconnects are then ordinary.
+        assert!(!options_changed_since_last_dial(
+            &after,
+            target,
+            &opt("Port=2200")
+        ));
+
+        // A rename that changes *only* the label is not a change: nothing about
+        // the connection moved, so retiring the master would cost the attach
+        // windows for nothing.
+        let kept = HostId("rename-kept".into());
+        assert!(!options_changed_since_last_dial(
+            &kept,
+            target,
+            &opt("Port=2200")
+        ));
+
+        // Nor is a brand-new row on a target this process has never dialled.
+        assert!(!options_changed_since_last_dial(
+            &HostId("rename-fresh".into()),
+            "untouched-box",
+            &opt("Port=22")
+        ));
     }
 
     /// The clipboard bridge is a synthesized forward, so it has to be one the

@@ -1150,12 +1150,21 @@ decides what they mean**.
     connection-scoped option (`Port`, `User`, `IdentityFile`, `ProxyJump`, the
     ciphers, and the three settings above) is inert against a connection that
     already exists — indefinitely, since an open attach window keeps refreshing
-    it. So `options_changed_since_last_dial` memoizes each row's `extra` and
-    `setup_ssh` runs `-O exit` before the probe when it differs. Per **row**, not
-    per target: two rows naming one machine share a master, and keyed by target
-    each would exit the other's and flap forever. Forwards are excluded — those
-    are re-requested through the master on every pass anyway. A first sighting is
-    not a change, so a dashboard restart keeps its attach windows.
+    it. So `options_changed_since_last_dial` memoizes `extra` and `setup_ssh`
+    runs `-O exit` before the probe when it has moved. **A row we have dialled
+    before is judged by its own history; one we have not, by the master's**, and
+    neither angle works alone: judge a known row by the master and two rows on
+    one machine exit each other's forever, judge an unknown one by its own empty
+    history and a rename slips through — the panel commits every field on one
+    `Enter`, so relabelling a host while changing its options is a single edit,
+    and delete-then-re-add is the same shape. A new row therefore costs at most
+    one extra exit, never a flap. Forwards are excluded — those are re-requested
+    through the master every pass anyway — and a first sighting on a target
+    nothing has dialled is a no-op, so a dashboard restart keeps its attach
+    windows. Retiring a master takes down every row on that target, including
+    their attach windows; benign, since ssh's 255 reads as a dropped link rather
+    than a user close and the re-attach sweep restores them, but it is why the
+    gate is this tight.
   - **`-O cancel` before every request**, and on every host that leaves the ssh
     set. A forward requested by a multiplexed client is registered with the
     *master*, so one deleted from the field would hold its port for as long as
