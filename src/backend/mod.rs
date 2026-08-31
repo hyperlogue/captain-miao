@@ -2625,16 +2625,45 @@ async fn wait_before_retry(
     }
 }
 
+/// Bounds on [`connect_with_retry`]'s ramp. The floor is short because a
+/// `connect` to a path that isn't there yet is an instant `ENOENT` — the cost of
+/// asking early is nil, and the socket usually appears within a round trip of
+/// the master binding the forward. The ceiling is where a flat wait is the right
+/// shape anyway, once "not yet" has stopped meaning "any moment now".
+const CONNECT_RETRY_FLOOR: Duration = Duration::from_millis(25);
+const CONNECT_RETRY_CEILING: Duration = Duration::from_millis(400);
+
+/// The waits between [`connect_with_retry`]'s attempts: one fewer than the
+/// attempts themselves, since the last one has nothing to wait for.
+///
+/// Pure, so the schedule's shape *and* its total budget are pinned without
+/// sleeping through them — the budget being the number a reader actually wants,
+/// because it is what every failing attempt adds to the reconnect backoff before
+/// the backoff has even started.
+fn connect_retry_delays(attempts: u32) -> impl Iterator<Item = Duration> {
+    (0..attempts.saturating_sub(1)).scan(CONNECT_RETRY_FLOOR, |d, _| {
+        let this = *d;
+        *d = (*d * 2).min(CONNECT_RETRY_CEILING);
+        Some(this)
+    })
+}
+
 /// Try to connect to `sock` a few times, sleeping between attempts.
+///
+/// Ramped rather than flat. The socket answers on the first attempt or two in
+/// the ordinary case, so a flat wait paid its full price exactly where it was
+/// least needed; and where it *is* needed the ramp still reaches the same
+/// ceiling within five attempts.
 async fn connect_with_retry(sock: &Path, attempts: u32) -> Option<UnixStream> {
     let mut last_err = None;
-    for i in 0..attempts {
+    let mut delays = connect_retry_delays(attempts);
+    for _ in 0..attempts {
         match UnixStream::connect(sock).await {
             Ok(s) => return Some(s),
             Err(e) => last_err = Some(e),
         }
-        if i + 1 < attempts {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+        if let Some(delay) = delays.next() {
+            tokio::time::sleep(delay).await;
         }
     }
     tracing::warn!(
@@ -3532,6 +3561,42 @@ mod tests {
         let (opts, fwd) = split("-C -L");
         assert_eq!(opts, ["-C"]);
         assert!(fwd.is_empty());
+    }
+
+    /// The socket answers on the first attempt or two in the ordinary case, so
+    /// what the ramp is for is spending almost nothing to find that out — while
+    /// still reaching the ceiling early enough that a genuinely slow bind is
+    /// waited on, and inside a budget a failing attempt adds to the reconnect
+    /// backoff before the backoff has started.
+    #[test]
+    fn the_connect_retry_ramp_is_cheap_early_and_bounded_overall() {
+        let ssh: Vec<Duration> = connect_retry_delays(16).collect();
+        // One fewer wait than attempts: the last attempt has nothing to wait for.
+        assert_eq!(ssh.len(), 15);
+        // The first two attempts together cost less than one old flat wait.
+        assert!(ssh[0] + ssh[1] < CONNECT_RETRY_CEILING, "{ssh:?}");
+        // Doubling, then pinned at the ceiling — reached by the fifth wait.
+        assert_eq!(
+            &ssh[..5],
+            &[
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            ]
+        );
+        assert!(ssh[5..].iter().all(|d| *d == CONNECT_RETRY_CEILING));
+        // The whole budget still lands under what the flat schedule cost.
+        let total: Duration = ssh.iter().sum();
+        assert!(total < Duration::from_millis(400) * 15, "{total:?}");
+
+        // The socket transport's three attempts are now a rounding error.
+        let direct: Duration = connect_retry_delays(3).sum();
+        assert_eq!(direct, Duration::from_millis(75));
+
+        // No attempts means no waits, rather than an underflow.
+        assert_eq!(connect_retry_delays(0).count(), 0);
     }
 
     /// A change to a row's **connection** options has to retire the shared
