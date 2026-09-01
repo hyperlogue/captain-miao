@@ -188,6 +188,18 @@ library**.
   `header.cmd` branch) — so the test also pins that `join` → `split` round-trips.
   (The `{`/`}` ban is separate and still real: libshpool runs the string through
   its session-name *template* parser before that.)
+- **Arbitrary host env vars reach the session through `[remote] inherit_env`.**
+  The `COLORTERM` note above hard-codes one var because every attaching terminal
+  supports it; a *secret* like `ANTHROPIC_API_KEY` can't be hard-coded, so it
+  rides libshpool's `forward_env` instead. The dashboard threads each configured
+  name to `miao-server attach` as a `--inherit-env <NAME>` flag; `run_attach`
+  authors a per-session config carrying `forward_env = [names]` and passes it via
+  `--config-file` (the attach path did not load a config before, so this is also
+  the plumbing that makes `forward_env` reachable at all). libshpool then reads
+  each value **live from the attach client's own environment** — which runs on
+  the host, so it is the *host/container* env that is forwarded, not the
+  laptop's — and injects it into the otherwise-scrubbed session. Opt-in and empty
+  by default: forwarding a secret is deliberate, and the value never touches disk.
 - **OSC 52 (clipboard) works end-to-end.** libshpool's live relay is a
   transparent byte pipe — its source contains no OSC handling at all (the
   vterm engine exists only for the `screen`/`lines` restore buffer, unused in

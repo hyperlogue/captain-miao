@@ -79,6 +79,51 @@ fn write_pool_config() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The libshpool config captain-miao authors for the **attach client** in a
+/// pooled session, from `--inherit-env`. It carries **only** `forward_env` —
+/// the env-var *names* the attach should forward from its own environment into
+/// the pool session the *first time* that session is created. The attach
+/// client runs on the remote host in the container (it is what the dashboard's
+/// `ssh miao-server attach` lands on), so it can read each value live from the
+/// container env and ship it to the daemon — piercing libshpool's `env_clear`
+/// scrub for the handful of names a container sets that the session needs.
+///
+/// Deliberately **not** the daemon-side [`POOL_CONFIG`]: that file governs
+/// session-restore and keybinding, which are daemon concerns and must stay
+/// there. `forward_env` alone belongs here because it is a property of the
+/// attach path, not the daemon.
+fn attach_config_body(names: &[String]) -> String {
+    format!(
+        "forward_env = [{}]\n",
+        names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Path to the per-session libshpool attach config. Namespaced by session
+/// (`attach-config-<name>.toml`) so two concurrent attaches to different
+/// sessions never race on one file, and regenerated on every attach.
+fn attach_config_path(name: &str) -> PathBuf {
+    crate::state::runtime_dir().join(format!("attach-config-{name}.toml"))
+}
+
+/// Write [`attach_config_body`] to [`attach_config_path`] and return the path
+/// (to pass via `--config-file`). Mirror of [`write_pool_config`]: the file has
+/// to exist before libshpool runs, else it silently falls back to default and
+/// no env is forwarded.
+fn write_attach_config(name: &str, names: &[String]) -> Result<String> {
+    let path = attach_config_path(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, attach_config_body(names))
+        .with_context(|| format!("write attach config {}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
 /// True if a pty-daemon is already listening on `socket`. A bare connect is
 /// enough: it's captain-miao's private socket in its per-user runtime dir, so
 /// anything that accepts a connection there is our daemon. This is the liveness
@@ -438,6 +483,7 @@ pub(crate) fn run_attach(
     background: bool,
     force: bool,
     log_file: Option<String>,
+    inherit_env: Vec<String>,
 ) -> Result<()> {
     let (mut cmd, mut dir, mut log_file) = (cmd, dir, log_file);
     let mut prime = cm_core::state::ReattachPrime::default();
@@ -482,6 +528,23 @@ pub(crate) fn run_attach(
     if let Some(lf) = &log_file {
         global.push("--log-file");
         global.push(lf);
+    }
+    // When the dashboard asks for inherited env, author an attach config
+    // carrying `forward_env` and hand libshpool the path. The file must exist
+    // before `run_shpool` (it coalesces-style *skips* a missing config), and
+    // the pushed `&str` must outlive the call — `attach_cfg` owns the String,
+    // so the config path stays alive until `run_shpool` returns. The value of
+    // each name is read live from *this* process's env (the container's) on the
+    // host side, so it reaches a freshly-created session without sitting in
+    // `POOL_CONFIG` or the dashboard.
+    let attach_cfg = if !inherit_env.is_empty() {
+        Some(write_attach_config(&name, &inherit_env)?)
+    } else {
+        None
+    };
+    if let Some(cfg) = &attach_cfg {
+        global.push("--config-file");
+        global.push(cfg);
     }
     let mut sub: Vec<&str> = vec!["attach"];
     if background {
@@ -638,6 +701,29 @@ mod tests {
             !POOL_CONFIG.contains("[[keybinding]]"),
             "authored config: {POOL_CONFIG:?}"
         );
+    }
+
+    #[test]
+    fn attach_config_body_lists_forward_env() {
+        // The attach config exists to carry `forward_env`; each requested name
+        // becomes one quoted list element. It must not smuggle in the
+        // daemon-side session-restore/keybinding knobs — those belong to
+        // `POOL_CONFIG`, and a stray key here would override (or conflict with)
+        // what the daemon was told.
+        let body = attach_config_body(&["ANTHROPIC_API_KEY".into(), "OPENAI_API_KEY".into()]);
+        assert_eq!(
+            body,
+            "forward_env = [\"ANTHROPIC_API_KEY\", \"OPENAI_API_KEY\"]\n"
+        );
+        assert!(!body.contains("session_restore_mode"));
+        assert!(!body.contains("keybinding"));
+    }
+
+    #[test]
+    fn attach_config_body_empty_is_empty_array() {
+        // An empty forbid-list yields a valid (empty) TOML array, not a comment
+        // or a bare line — libshpool must see a defined `forward_env`.
+        assert_eq!(attach_config_body(&[]), "forward_env = []\n");
     }
 
     #[test]
