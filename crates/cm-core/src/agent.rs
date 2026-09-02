@@ -1645,6 +1645,28 @@ pub struct TranscriptStats {
     pub cursor: Option<claude::StatsCursor>,
 }
 
+impl TranscriptStats {
+    /// Adopt a model the agent named on a hook, so the *next* fold agrees with
+    /// it rather than reverting to the last turn's.
+    ///
+    /// A backend can learn the model two ways — folded out of the transcript, or
+    /// stated on a payload — and for Claude both are live at once: the fold
+    /// bootstraps the row, and `PostModelSwitch` covers the window the fold is
+    /// blind to (see [`claude::StatsCursor::adopt_model`]). That would be two
+    /// sources for one fact, which is exactly what
+    /// [`crate::agents::common::adopt_session_facts`] warns against — so this is
+    /// how the hook *feeds* the fold instead of competing with it. A cursor-less
+    /// backend recomputes from scratch every time and so has no memory to
+    /// correct: it keeps the two in step here and is overwritten by its own next
+    /// read, which is the right outcome for a fold that is already authoritative.
+    pub fn adopt_model(&mut self, model: &str) {
+        self.model = Some(model.to_string());
+        if let Some(cursor) = self.cursor.as_mut() {
+            cursor.adopt_model(model);
+        }
+    }
+}
+
 /// Result of an incremental transcript scan — the launcher reads new bytes
 /// since the last `new_offset` and the backend extracts whatever side-band
 /// signals it cares about.
@@ -1960,6 +1982,7 @@ mod tests {
                     PreCompact,
                     PostCompact,
                     CwdChanged,
+                    ModelSwitch,
                 ],
             ),
             // Eight, not the twelve `HookEvent`s that appear in `agents::codex`:

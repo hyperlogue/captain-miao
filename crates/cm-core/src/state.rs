@@ -764,6 +764,11 @@ pub enum HookEvent {
     PreCompact,
     PostCompact,
     CwdChanged,
+    /// The session's model changed out of band — the user picked another one,
+    /// or the agent fell back. Carries the new id on [`HookMessage::model`] and
+    /// says nothing about what the session is *doing*, which is why it is the
+    /// one event with no status mapping at all.
+    ModelSwitch,
 }
 
 impl HookEvent {
@@ -781,6 +786,7 @@ impl HookEvent {
         Self::PreCompact,
         Self::PostCompact,
         Self::CwdChanged,
+        Self::ModelSwitch,
     ];
 
     pub fn as_kebab(&self) -> &'static str {
@@ -798,6 +804,7 @@ impl HookEvent {
             Self::PreCompact => "pre-compact",
             Self::PostCompact => "post-compact",
             Self::CwdChanged => "cwd-changed",
+            Self::ModelSwitch => "model-switch",
         }
     }
 

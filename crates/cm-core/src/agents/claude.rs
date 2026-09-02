@@ -187,7 +187,9 @@ pub fn read_session_index(cache: &mut SessionIndexCache) -> SessionIndex {
 /// Model: `message.model` of the latest non-error assistant turn (which the same
 /// loop already parses), skipping `<synthetic>` interrupt/error placeholders. The
 /// model can change mid-session via `/model`, so last-wins; it survives
-/// `/compact` (compaction doesn't change the model). None before the first turn.
+/// `/compact` (compaction doesn't change the model). None before the first turn
+/// — and stale between a switch and the first turn the new model answers, which
+/// is the window [`StatsCursor::adopt_model`] closes from the hook.
 #[cfg(test)]
 pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
     use std::io::{BufRead, BufReader};
@@ -377,6 +379,21 @@ impl StatsCursor {
             self.last_total = Some(total);
             self.compact_pending = false;
         }
+    }
+
+    /// Overwrite the remembered model with one Claude stated directly (its
+    /// `PostModelSwitch` hook's `to_model`).
+    ///
+    /// The **accumulator**, not just the field [`Self::into_stats`] derives from
+    /// it: `last_model` is carried across incremental folds, so a switch the
+    /// transcript has not yet witnessed would be undone by the very next fold —
+    /// and one arrives within milliseconds, because `/model` echoes its result
+    /// into the transcript as a `<local-command-stdout>` line. Teaching the
+    /// cursor keeps the fold the single source of the model and simply advances
+    /// what it knows, instead of standing a second source beside it that the
+    /// two would then have to be arbitrated between.
+    pub(crate) fn adopt_model(&mut self, model: &str) {
+        self.last_model = Some(model.to_string());
     }
 
     /// Derive the displayed context-token total from the current accumulators.
@@ -1184,6 +1201,14 @@ pub fn build_launch_command(
 /// keep the launcher's kebab-case internally and map here. `UserPromptSubmit`
 /// is the one outlier — Claude uses that name but we surface it as
 /// `prompt-submit`.
+///
+/// `PostModelSwitch` is deliberately the model-switch subscription rather than
+/// its `PreModelSwitch` sibling. `Pre` is a **gate**: Claude waits on it and
+/// reads a `permissionDecision` off its stdout, so subscribing would put a
+/// process spawn in front of every `/model` and report a `to_model` the switch
+/// may then refuse. `Post` fires after the switch has landed and is
+/// non-blocking, so it reports a fact rather than a proposal — the same reason
+/// the rest of this table reads status from `Post*` events.
 pub fn build_hooks_settings(sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
@@ -1211,6 +1236,7 @@ pub fn build_hooks_settings(sock_path: &str) -> String {
             "PreCompact":         hook_cmd(HookEvent::PreCompact),
             "PostCompact":        hook_cmd(HookEvent::PostCompact),
             "CwdChanged":         hook_cmd(HookEvent::CwdChanged),
+            "PostModelSwitch":    hook_cmd(HookEvent::ModelSwitch),
         }
     })
     .to_string()
@@ -1228,6 +1254,10 @@ struct HookPayload {
     cwd: Option<String>,
     prompt: Option<String>,
     transcript_path: Option<String>,
+    /// `PostModelSwitch` only: the resolved model id the session runs *after*
+    /// the switch. Absent from every other payload, which is what lets it be
+    /// read unconditionally below.
+    to_model: Option<String>,
 }
 
 /// Normalize one Claude Code hook payload.
@@ -1244,10 +1274,17 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Claude's payload has no title; a `/rename` reaches `name` through the
         // session-file fold instead.
         session_title: None,
-        // Claude's tokens and model come from the transcript fold, which is
-        // richer here: it is incremental and yields the first prompt too.
+        // Claude's tokens come from the transcript fold, which is richer here:
+        // it is incremental and yields the first prompt too.
         context_tokens: None,
-        model: None,
+        // The model does *not* — the fold reads the last assistant turn, so it
+        // is a record of what the session ran, not what it will run. A switch
+        // is only visible there once the new model has answered, and a `/model`
+        // on an idle session is never visible at all. `to_model` is Claude's own
+        // resolved answer to the same question, so it wins for the window the
+        // fold cannot see; `launcher::run` hands it straight back to the fold so
+        // the two never disagree afterwards.
+        model: payload.to_model,
         transcript_path: payload.transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child: None,
@@ -1900,6 +1937,96 @@ mod tests {
             dispatched(permission_request("Bash")),
             SessionStatus::WaitingForApproval,
         );
+    }
+
+    /// A real `PostModelSwitch` payload, trimmed to the fields that reach us.
+    const MODEL_SWITCH: &str = concat!(
+        r#"{"session_id":"s1","transcript_path":"/home/miao/.claude/projects/p/s1.jsonl","#,
+        r#""cwd":"/home/miao/src","hook_event_name":"PostModelSwitch","#,
+        r#""from_model":"claude-opus-4-8","to_model":"claude-sonnet-5","#,
+        r#""requested_model":"sonnet","source":"command","context_tokens":42000}"#,
+    );
+
+    #[test]
+    fn a_model_switch_reports_the_model_it_switched_to() {
+        // `to_model` is the resolved id the session runs *from now on*;
+        // `from_model` and `requested_model` are history and shorthand, and
+        // neither is what the row should show.
+        let msg = parse_hook_payload(HookEvent::ModelSwitch, MODEL_SWITCH).expect("payload parses");
+        assert_eq!(msg.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(msg.session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn every_other_claude_hook_still_leaves_the_model_to_the_fold() {
+        // The field is read unconditionally because only a model-switch payload
+        // carries it — if that stopped being true, an ordinary hook would start
+        // overwriting the fold.
+        let ordinary = r#"{"session_id":"s1","tool_name":"Bash","cwd":"/home/miao/src"}"#;
+        let msg = parse_hook_payload(HookEvent::PreToolUse, ordinary).expect("payload parses");
+        assert_eq!(msg.model, None);
+    }
+
+    #[test]
+    fn a_model_switch_adopts_the_model_without_touching_the_status() {
+        // The switch fires from `/model` on an idle row and from an automatic
+        // fallback mid-turn alike, so it must leave whatever the row was doing
+        // exactly as it found it — while still stamping the new id.
+        for status in [
+            SessionStatus::Active,
+            SessionStatus::Idle,
+            SessionStatus::WaitingForApproval,
+        ] {
+            let mut state =
+                LauncherState::for_test(crate::agent::AgentControl::Claude, status.clone());
+            let msg = parse_hook_payload(HookEvent::ModelSwitch, MODEL_SWITCH).expect("parses");
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(dispatch_hook(&mut state, msg));
+            assert_eq!(state.status, status);
+            assert_eq!(state.model.as_deref(), Some("claude-sonnet-5"));
+        }
+    }
+
+    #[test]
+    fn an_adopted_model_survives_the_next_fold() {
+        // The regression the hook would otherwise lose to: `/model` echoes its
+        // own result into the transcript, so a fold lands within milliseconds of
+        // the switch — and its newest assistant turn is still the *old* model's.
+        let path = write_tmp("adopt_model", &format!("{LINE_A}\n"));
+        let mut stats = read_transcript_stats_incremental(&path, None);
+        assert_eq!(stats.model.as_deref(), Some("claude-opus-4-8"));
+
+        stats.adopt_model("claude-sonnet-5");
+        assert_eq!(stats.model.as_deref(), Some("claude-sonnet-5"));
+
+        // `/model`'s echo, then a user turn: no assistant line, so the fold has
+        // nothing new to say about the model and must carry the adopted one.
+        std::fs::write(
+            &path,
+            format!(
+                "{LINE_A}\n{}\n",
+                r#"{"type":"user","message":{"content":"<local-command-stdout>Set model to Sonnet 5</local-command-stdout>"}}"#
+            ),
+        )
+        .unwrap();
+        let next = read_transcript_stats_incremental(&path, Some(&stats));
+        assert_eq!(next.model.as_deref(), Some("claude-sonnet-5"));
+
+        // And the new model's first answer is folded normally from there.
+        std::fs::write(
+            &path,
+            format!(
+                "{LINE_A}\n{}\n{}\n",
+                r#"{"type":"user","message":{"content":"go"}}"#,
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":10},"model":"claude-sonnet-5"}}"#
+            ),
+        )
+        .unwrap();
+        let after = read_transcript_stats_incremental(&path, Some(&next));
+        assert_eq!(after.model.as_deref(), Some("claude-sonnet-5"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

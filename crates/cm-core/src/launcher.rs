@@ -811,7 +811,19 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 
                 let was_approval = state.status == SessionStatus::WaitingForApproval;
                 let dispatched_event = msg.event;
+                // Taken before the dispatch consumes the message, and handed to
+                // the fold after it: `dispatch_hook` stamps the model onto the
+                // state, but the fold's own accumulator still remembers the last
+                // turn's, and the next transcript write would put that back —
+                // for Claude a `/model` echoes itself into the transcript, so
+                // "next" is milliseconds away. See `TranscriptStats::adopt_model`.
+                let hook_model = msg.model.clone();
                 agent.dispatch_hook(state, msg).await;
+                if let Some(model) = hook_model.filter(|m| !m.trim().is_empty())
+                    && let Some(data) = transcript_data.as_mut()
+                {
+                    data.adopt_model(&model);
+                }
                 tracing::debug!(
                     target: "captain_miao::hook",
                     "dispatch pid={} event={:?} status={:?}",

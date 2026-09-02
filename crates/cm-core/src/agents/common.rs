@@ -279,6 +279,13 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
                 state.cwd = cwd;
             }
         }
+        // Nothing to do here, and that is the mapping rather than an omission:
+        // `adopt_session_facts` above has already stamped the new id, and the
+        // switch itself proves nothing about the session's status. It fires
+        // from a `/model` on an idle row just as readily as from an automatic
+        // fallback mid-turn, so *any* status written here would be wrong half
+        // the time — and would overwrite a live one with a guess.
+        HookEvent::ModelSwitch => {}
     }
 }
 

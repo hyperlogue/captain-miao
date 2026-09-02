@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Model column follows a Claude Code `/model` immediately.** Claude's new
+  `PostModelSwitch` hook is now one of the events a managed session forwards, so
+  a switch shows up the moment it lands instead of waiting for the new model to
+  answer — and a switch made on an idle session, which the transcript never
+  records at all, now shows up too.
+
 ### Fixed
 
 - **A managed Codex session no longer asks you to trust its hooks on every
