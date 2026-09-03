@@ -983,7 +983,10 @@ Three layers, strictly ordered by authority:
    sidecar and not a field on the state file: that file has exactly one writer
    (its launcher), and flags are set by someone else entirely. Overlaid onto
    served rows like the Codex titles, updated by `SetSessionFlags`, and
-   garbage-collected against live sessions.
+   garbage-collected against live sessions. A cleared flag is stored as an
+   all-false **entry**, never by dropping the key: `flags: None` on a served row
+   means *no host owns this row's flags*, so a removal would say nothing at all
+   and every dashboard showing the bell would keep showing it.
 3. **Server — in-memory only, all rebuildable**: per-connection `last_sent`
    diff maps, `LocalBackend` caches, the pool's ptys (which live as long as
    the daemon), plus the host's persisted `recent-cwds.json`.
@@ -1370,7 +1373,11 @@ decides what they mean**.
   dashboard attached to that host — and a phone-ssh user on the box — sees the
   same ones, and they survive a dashboard restart. `pin_seq` stays client-side:
   pin *ordering* is presentation. Direct-local rows keep using
-  `dashboard-overrides.json`.
+  `dashboard-overrides.json`. Because adoption re-reads the host on *every*
+  reload, every writer has to push there — the automatic follow-up arm and the
+  focus-clear as much as the `i` toggle. A mutation that only reached
+  `dashboard-overrides.json` is reverted within a reload, and the second copy it
+  leaves behind is restored at the next startup.
 
 ### How mixed is remote support with the rest of the code?
 

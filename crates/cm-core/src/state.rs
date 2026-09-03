@@ -1053,9 +1053,11 @@ pub struct LauncherState {
     pub kitty_keyboard: bool,
     /// Per-session flags (pinned / follow-up) as the **owning host**
     /// knows them, overlaid by the server-core from its sidecar as sessions are
-    /// served — never written by the launcher (single-writer rule). `None` from
-    /// a backend that doesn't serve flags (a plain local dashboard, which keeps
-    /// its own `dashboard-overrides.json`). Serialized so it rides the wire;
+    /// served — never written by the launcher (single-writer rule). `None`
+    /// means *no host owns this row's flags* (a plain local dashboard, which
+    /// keeps its own `dashboard-overrides.json`) — never "cleared", which a
+    /// serving host says with an all-false value, since a reader has to be able
+    /// to tell a clear from silence. Serialized so it rides the wire;
     /// part of `PartialEq`, so a flag change from another dashboard pushes a
     /// `Delta` like any other state change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1138,14 +1140,6 @@ impl LauncherState {
 pub struct SessionFlags {
     pub pinned: bool,
     pub follow_up: bool,
-}
-
-impl SessionFlags {
-    /// Whether every flag is off — the value that means "drop the entry"
-    /// rather than persist a row of `false`s.
-    pub fn is_clear(&self) -> bool {
-        *self == SessionFlags::default()
-    }
 }
 
 /// The opaque identifier for a session on its owning host — the **only** thing

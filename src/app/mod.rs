@@ -2100,7 +2100,7 @@ impl App {
     /// Apply bell sentinels dropped into the sessions dir by
     /// `miao focus --window-id <id>`. Each pid that still has a live
     /// session gets `follow_up = true`; entries for dead pids are silently
-    /// dropped. Persists overrides only if at least one flag actually changed.
+    /// dropped. Persists only the flags that actually changed.
     pub(super) fn apply_bell_signals(&mut self, pids: Vec<u32>) {
         // Bell sentinels come from `miao focus --window-id`, which only
         // ever targets local windows, so these pids are local.
@@ -2110,20 +2110,18 @@ impl App {
             .filter(|s| s.host.is_local())
             .map(|s| s.launcher_pid)
             .collect();
-        let mut changed = false;
+        let mut armed = Vec::new();
         for pid in pids {
             let key = (HostId::local(), pid);
             if !alive.contains(&pid) || self.flags_of(&key).follow_up {
                 continue;
             }
-            self.update_flags(key, Cursor::FollowSession, |f| {
+            self.update_flags(key.clone(), Cursor::FollowSession, |f| {
                 f.follow_up = true;
             });
-            changed = true;
+            armed.push(key);
         }
-        if changed {
-            self.save_overrides();
-        }
+        self.persist_flags(armed);
     }
 
     /// Adopt the flags a host serves for its own sessions (§9).
@@ -2163,18 +2161,42 @@ impl App {
         }
     }
 
+    /// Whether `host` owns its sessions' flags — a pooled host keeps them in
+    /// its own sidecar (§9), so this dashboard neither pushes them anywhere
+    /// else nor persists a second copy of them.
+    ///
+    /// The one predicate behind both halves of that, deliberately: if
+    /// [`publish_flags`] and [`save_overrides`] disagreed about who owns a row,
+    /// the loser's copy would be the one [`adopt_host_flags`] keeps overwriting.
+    ///
+    /// [`publish_flags`]: Self::publish_flags
+    /// [`save_overrides`]: Self::save_overrides
+    /// [`adopt_host_flags`]: Self::adopt_host_flags
+    fn host_owns_flags(&self, host: &HostId) -> bool {
+        self.backend_for(host)
+            .is_some_and(|b| b.capabilities().pooled)
+    }
+
+    /// Whether `host`'s flags belong in this dashboard's own overrides file:
+    /// the host doesn't own them, and its pids still mean something after a
+    /// restart (which a remote host's don't).
+    fn ours_to_persist(&self, host: &HostId) -> bool {
+        host.is_local() && !self.host_owns_flags(host)
+    }
+
     /// Push a session's flags to its host when that host owns them, so the
     /// change reaches every other dashboard watching it. Returns whether the
     /// host took them — `false` means "this host doesn't serve flags", the
     /// caller's signal to persist them in `dashboard-overrides.json` instead.
     fn publish_flags(&self, key: &FlagKey, flags: SessionFlags) -> bool {
         let (host, pid) = key;
+        if !self.host_owns_flags(host) {
+            return false;
+        }
+        // Unreachable: the predicate above answered from this very backend.
         let Some(backend) = self.backend_for(host) else {
             return false;
         };
-        if !backend.capabilities().pooled {
-            return false;
-        }
         let wire = HostSessionFlags {
             pinned: flags.pinned,
             follow_up: flags.follow_up,
@@ -2182,6 +2204,44 @@ impl App {
         tokio::task::block_in_place(|| {
             backend.set_session_flags(&SessionKey::from_launcher_pid(*pid), wire)
         })
+    }
+
+    /// Push every just-mutated key's flags to whichever host owns them.
+    /// Returns whether any of them are *ours* to persist — the caller's signal
+    /// that it still owes a [`save_overrides`], batched so one reload writes
+    /// that file once however many rows transitioned.
+    ///
+    /// **Every flag mutation must go through here or [`persist_flags`].** It
+    /// isn't bookkeeping: [`adopt_host_flags`] re-reads the owning host's value
+    /// on every reload and overwrites ours with it, so a mutation that only
+    /// touched `dashboard-overrides.json` is reverted within a reload. That is
+    /// what made an auto-armed bell on a pooled row impossible to put out —
+    /// the sidecar still said `follow_up`, because only the manual `i` toggle
+    /// had ever written to it.
+    ///
+    /// [`save_overrides`]: Self::save_overrides
+    /// [`persist_flags`]: Self::persist_flags
+    /// [`adopt_host_flags`]: Self::adopt_host_flags
+    #[must_use]
+    fn publish_flag_changes(&self, keys: impl IntoIterator<Item = FlagKey>) -> bool {
+        let mut ours = false;
+        for key in keys {
+            if !self.publish_flags(&key, self.flags_of(&key)) {
+                ours = true;
+            }
+        }
+        ours
+    }
+
+    /// [`publish_flag_changes`] plus the local save it may ask for — the
+    /// one-shot spelling, for a mutation outside the reload path that has no
+    /// other reason to write the overrides file.
+    ///
+    /// [`publish_flag_changes`]: Self::publish_flag_changes
+    fn persist_flags(&self, keys: impl IntoIterator<Item = FlagKey>) {
+        if self.publish_flag_changes(keys) {
+            self.save_overrides();
+        }
     }
 
     /// Mutate a session's flags; removes the entry entirely if the result is
@@ -2233,6 +2293,7 @@ impl App {
         // Apply oldest-pinned first so the re-issued pin sequence numbers
         // preserve the sessions' relative pin order.
         matched.sort_by_key(|(_, _, f)| f.pin_seq);
+        let mut restored: Vec<FlagKey> = Vec::with_capacity(matched.len());
         for (key, wid, mut f) in matched {
             // The saved pin_seq lived in the previous run's sequence space; it
             // ordered the batch above but would clash with the live counter, so
@@ -2241,9 +2302,14 @@ impl App {
                 self.next_pin_seq += 1;
                 f.pin_seq = self.next_pin_seq;
             }
-            self.flags.insert(key, f);
+            self.flags.insert(key.clone(), f);
             self.pending_flag_restores.remove(&wid);
+            restored.push(key);
         }
+        // The restart minted a fresh pid, so an owning host has no flags for
+        // the new row at all: tell it what carried over, or its silence
+        // overwrites the restore on the next reload.
+        let _ = self.publish_flag_changes(restored);
         // Restored pins float rows up; the user keeps whatever they were on.
         self.mark_dirty(Cursor::FollowSession);
         true
@@ -2267,14 +2333,18 @@ impl App {
 
     pub(super) fn save_overrides(&self) {
         let mut overrides = DashboardOverrides::default();
-        // Only local flags persist (keyed by pid, the historical format); remote
-        // flags are session-lifetime — a remote pid means nothing across runs.
+        // Only flags this dashboard owns persist here, for two separate
+        // reasons. A remote pid means nothing across runs (the file is keyed by
+        // pid, the historical format), and a *pooled* host — localhost
+        // included — owns its rows' flags in its own sidecar. Writing a second
+        // copy of a host-owned flag is what let a stale entry here re-arm, at
+        // the next startup, a bell the host had already been told to clear.
         // Persist pinned in sequence order (oldest first, most-recent last) so
         // reload reconstructs the same ranking.
         let mut pinned: Vec<(u64, u32)> = self
             .flags
             .iter()
-            .filter(|((host, _), f)| host.is_local() && f.pinned)
+            .filter(|((host, _), f)| self.ours_to_persist(host) && f.pinned)
             .map(|((_, pid), f)| (f.pin_seq, *pid))
             .collect();
         pinned.sort_by_key(|(seq, _)| *seq);
@@ -2282,7 +2352,7 @@ impl App {
             overrides.pinned.push(pid);
         }
         for ((host, pid), f) in &self.flags {
-            if !host.is_local() {
+            if !self.ours_to_persist(host) {
                 continue;
             }
             if f.follow_up {
@@ -3386,12 +3456,16 @@ impl App {
         // Auto-mark follow_up on Active→Idle and Compacting→Compacted
         // transitions, and clear it when a session goes back to Active — the
         // user has re-engaged, so any stale attention flag is obsolete.
-        let mut overrides_changed = false;
         let transitions = self.follow_up_transitions(&prev_status, &self.sessions);
+        let mut flag_changes: Vec<FlagKey> = Vec::with_capacity(transitions.len());
         for (key, want) in transitions {
-            self.update_flags(key, Cursor::HoldIndex, |f| f.follow_up = want);
-            overrides_changed = true;
+            self.update_flags(key.clone(), Cursor::HoldIndex, |f| f.follow_up = want);
+            flag_changes.push(key);
         }
+        // The auto-arm reaches the owning host like every other flag change:
+        // leaving it local would let the host's older value win the next
+        // `adopt_host_flags` and the bell would never settle.
+        let mut overrides_changed = self.publish_flag_changes(flag_changes);
         // Bring a just-failed launch's held window to the foreground exactly
         // once — on the transition into `FailedToStart`. The run loop drains and
         // focuses (the launcher can't focus its own window). Computed before the
@@ -4947,8 +5021,12 @@ impl App {
         // The row drops from the attention rank to the idle rank and slides
         // down; the cursor goes with it rather than staying at an index that
         // now names whichever row rose into it.
-        self.update_flags(key, Cursor::FollowSession, |f| f.follow_up = false);
-        self.save_overrides();
+        self.update_flags(key.clone(), Cursor::FollowSession, |f| f.follow_up = false);
+        // Through the same persistence path as the `i` toggle: a clear that
+        // only landed locally was undone by the owning host's stale sidecar on
+        // the very next reload, which is what made a pooled row's bell
+        // impossible to put out by focusing it.
+        self.persist_flags([key]);
         // Persist the flag change into the restart snapshot too, so a crash
         // before the next reload doesn't restore the stale flag on recovery.
         self.save_session_snapshot();
@@ -5040,9 +5118,7 @@ impl App {
         // dashboard watching that host sees it too; otherwise it's ours to
         // persist locally. Either way the in-memory value above already applied,
         // so the UI responds immediately and a failed push just isn't shared.
-        if !self.publish_flags(&key, self.flags_of(&key)) {
-            self.save_overrides();
-        }
+        self.persist_flags([key.clone()]);
 
         // No cursor work here: the `Cursor` handed to `update_flags` above
         // already placed it, which is the point of routing the policy through
@@ -5054,7 +5130,9 @@ impl App {
             (SessionFlag::FollowUp, false) => "Cleared needs input",
         };
         self.set_status(format!("{label} session {pid}"), false);
-        self.save_overrides();
+        // No second `save_overrides` here: `persist_flags` above already wrote
+        // the file for a flag that is ours, and writing it for one that isn't
+        // is how a host-owned value got a stale local copy to be restored from.
         // Persist the flag change into the restart snapshot too, so a crash
         // before the next reload doesn't restore the stale flag on recovery.
         self.save_session_snapshot();

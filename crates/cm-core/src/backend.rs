@@ -262,19 +262,11 @@ impl LocalBackend {
         if !self.serve_host_state {
             return false;
         }
-        let mut all = read_session_flags();
-        if flags.is_clear() {
-            all.remove(key);
-        } else {
-            all.insert(key.clone(), flags);
-        }
-        // Garbage-collect entries whose session is gone, so the sidecar can't
-        // grow without bound across a host's lifetime.
         let live: std::collections::HashSet<SessionKey> = state::read_all_launcher_states()
             .iter()
             .map(|s| s.key())
             .collect();
-        all.retain(|k, _| live.contains(k) || k == key);
+        let all = sidecar_with(read_session_flags(), key, flags, &live);
         state::write_json_atomic(&state::session_flags_path(), &all).is_ok()
     }
 
@@ -548,6 +540,32 @@ fn forget_recent_dir(cwd: &str, home: &str) -> bool {
 /// deleted file just resets flags rather than failing anything.
 fn read_session_flags() -> HashMap<SessionKey, SessionFlags> {
     state::read_json(&state::session_flags_path()).unwrap_or_default()
+}
+
+/// The flags sidecar after recording `flags` for `key`, minus the entries whose
+/// session is gone — the garbage collection that keeps it from growing without
+/// bound across a host's lifetime.
+///
+/// An all-false entry is **kept**, not dropped. A served row carries
+/// `flags: None` when no host owns its flags at all
+/// ([`LauncherState::flags`]), so dropping the entry would make "cleared"
+/// indistinguishable from "not mine to say": every other dashboard watching
+/// the host — and this one after a restart — would go on showing a bell it was
+/// never told to put out.
+///
+/// Split out of [`LocalBackend::set_session_flags`] so that rule is testable
+/// without a state dir.
+///
+/// [`LauncherState::flags`]: crate::state::LauncherState::flags
+fn sidecar_with(
+    mut all: HashMap<SessionKey, SessionFlags>,
+    key: &SessionKey,
+    flags: SessionFlags,
+    live: &std::collections::HashSet<SessionKey>,
+) -> HashMap<SessionKey, SessionFlags> {
+    all.insert(key.clone(), flags);
+    all.retain(|k, _| live.contains(k) || k == key);
+    all
 }
 
 /// Directory completions for `prefix` on the local filesystem, as absolute paths
@@ -1035,5 +1053,51 @@ mod tests {
         assert!(all.iter().all(|p| p.ends_with('/')));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Clearing a session's flags leaves an all-false **entry** behind rather
+    /// than removing it. `None` on a served row means "no host owns this row's
+    /// flags", so a removal says nothing at all — every other dashboard
+    /// watching the host, and this one after a restart, would go on showing a
+    /// bell it was never told to put out. The GC is what bounds the sidecar.
+    #[test]
+    fn clearing_a_session_flag_keeps_a_cleared_entry() {
+        let key = |s: &str| SessionKey(s.to_string());
+        let live: std::collections::HashSet<SessionKey> =
+            [key("1"), key("2")].into_iter().collect();
+        let before: HashMap<SessionKey, SessionFlags> = [
+            (
+                key("1"),
+                SessionFlags {
+                    pinned: false,
+                    follow_up: true,
+                },
+            ),
+            (
+                key("2"),
+                SessionFlags {
+                    pinned: true,
+                    follow_up: false,
+                },
+            ),
+            // A session that has since exited.
+            (
+                key("3"),
+                SessionFlags {
+                    pinned: true,
+                    follow_up: true,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let after = sidecar_with(before, &key("1"), SessionFlags::default(), &live);
+        // The clear is recorded, not erased.
+        assert_eq!(after.get(&key("1")), Some(&SessionFlags::default()));
+        // Another live session's flags are untouched...
+        assert!(after[&key("2")].pinned);
+        // ...and a departed session's are collected.
+        assert!(!after.contains_key(&key("3")));
     }
 }

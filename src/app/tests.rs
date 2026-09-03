@@ -3038,6 +3038,34 @@ fn host_served_flags_are_adopted_onto_rows() {
     assert!(d.app.flags_of(&key).pin_seq > 0);
 }
 
+/// The other direction, and the one the bell hangs on: a host that serves
+/// *cleared* flags clears this dashboard's copy too.
+///
+/// `None` is not that signal — it means the host doesn't own the row's flags at
+/// all — so the host has to be able to say "all false" and be believed. Without
+/// it, adoption could only ever add flags: a follow-up the host was told to drop
+/// would come back on the very next reload, which is what once made a pooled
+/// row's auto-armed bell impossible to put out.
+#[test]
+fn a_host_served_clear_puts_out_a_locally_armed_bell() {
+    use crate::state::{HostId, SessionFlags as HostFlags};
+    let mut d = TestDashboard::new(120, 10);
+    let mut s = session(1, "/srv/p", SessionStatus::Idle);
+    s.host = HostId("box".into());
+    s.pool_session = Some("cm-1".into());
+    s.flags = Some(HostFlags::default());
+    let key = super::flag_key(&s);
+    d.app.sessions = vec![s];
+    // Armed here by the Active→Idle auto-mark, and cleared on the host since.
+    d.app
+        .update_flags(key.clone(), Cursor::HoldIndex, |f| f.follow_up = true);
+    assert!(d.app.is_attention_row(&d.app.sessions[0]));
+
+    d.app.adopt_host_flags();
+    assert!(!d.app.flags_of(&key).follow_up);
+    assert!(!d.app.is_attention_row(&d.app.sessions[0]));
+}
+
 // =============================================================================
 // Attention counts and rank
 // =============================================================================
