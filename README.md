@@ -362,6 +362,8 @@ on_window_close = "close"    # "close" | "detach": what closing a pooled session
                              # does to the session. Only a window *you* close counts — an
                              # attach that ends because its link died (a laptop resuming to
                              # a dropped ssh) always detaches, and the session keeps running.
+inherit_env = []           # list of host environment variable names to forward to
+                           # pooled sessions (e.g. ["ANTHROPIC_API_KEY"])
 
 [thresholds]
 context_warning_tokens = 175000    # context usage turns to the warning color here

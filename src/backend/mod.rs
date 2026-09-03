@@ -1189,6 +1189,7 @@ impl Backend {
         session_name: &str,
         force: bool,
     ) -> anyhow::Result<AttachPlan> {
+        let inherit_env = cm_core::config::get().remote.inherit_env.clone();
         match self {
             // A direct-local backend pools nothing *itself*, but the machine it
             // runs on may still hold a pool — the daemon serving a laptop's
@@ -1198,7 +1199,7 @@ impl Backend {
             // but "can this machine reach its own pool", and the caller has
             // already established that the row carries a `pool_session` at all.
             Backend::Local(_) => Ok(AttachPlan {
-                argv: local_attach_argv(session_name, force)?,
+                argv: local_attach_argv(session_name, force, &inherit_env)?,
             }),
             Backend::Remote(b) => Ok(AttachPlan {
                 argv: attach_argv(
@@ -1207,6 +1208,7 @@ impl Backend {
                     &b.remote_exe.lock().unwrap(),
                     session_name,
                     force,
+                    &inherit_env,
                 ),
             }),
         }
@@ -1918,6 +1920,7 @@ impl RemoteBackend {
     /// so an async caller should wrap this in `block_in_place`.
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         let spec = spec.clone();
+        let inherit_env = cm_core::config::get().remote.inherit_env.clone();
         match self.request(|req_id| ClientFrame::OpenSession { req_id, spec }) {
             Some(ServerFrame::Opened {
                 session_name: Some(name),
@@ -1931,6 +1934,7 @@ impl RemoteBackend {
                     // A session we just created can't already have a client, so
                     // the create path never steals.
                     false,
+                    &inherit_env,
                 ),
                 session_name: name,
             }),
@@ -2143,6 +2147,7 @@ fn attach_argv(
     remote_exe: &str,
     session_name: &str,
     force: bool,
+    inherit_env: &[String],
 ) -> Vec<String> {
     let mut argv = match target {
         Some(t) => {
@@ -2157,6 +2162,10 @@ fn attach_argv(
     argv.push("attach".to_string());
     if force {
         argv.push("--force".to_string());
+    }
+    for name in inherit_env {
+        argv.push("--inherit-env".to_string());
+        argv.push(name.clone());
     }
     argv.push(session_name.to_string());
     argv
@@ -2180,7 +2189,11 @@ const LOCAL_ATTACH_EXES: [&str; 2] = ["miao-client", "miao-server"];
 /// target), because it is the same operation: the pool is a per-user,
 /// per-machine socket, so what reaches it is a question about the binaries on
 /// this box and not about which backend happens to be drawing the row.
-fn local_attach_argv(session_name: &str, force: bool) -> anyhow::Result<Vec<String>> {
+fn local_attach_argv(
+    session_name: &str,
+    force: bool,
+    inherit_env: &[String],
+) -> anyhow::Result<Vec<String>> {
     let exe = local_attach_exe(session_name).ok_or_else(|| {
         anyhow::anyhow!(
             "no pool client on this machine — install {} beside `miao` or on PATH",
@@ -2191,7 +2204,14 @@ fn local_attach_argv(session_name: &str, force: bool) -> anyhow::Result<Vec<Stri
                 .join(" or ")
         )
     })?;
-    Ok(attach_argv(None, &[], &exe, session_name, force))
+    Ok(attach_argv(
+        None,
+        &[],
+        &exe,
+        session_name,
+        force,
+        inherit_env,
+    ))
 }
 
 /// The binary to run for an attach to `session_name` on this machine.
@@ -3866,7 +3886,7 @@ mod tests {
 
     #[test]
     fn attach_argv_ssh_vs_direct() {
-        let ssh = attach_argv(Some("user@box"), &[], "miao-server", "s1", false);
+        let ssh = attach_argv(Some("user@box"), &[], "miao-server", "s1", false, &[]);
         assert_eq!(ssh[0], "ssh");
         assert_eq!(ssh[1], "-t");
         assert_eq!(ssh_tail(&ssh), ["user@box", "miao-server", "attach", "s1"]);
@@ -3877,18 +3897,35 @@ mod tests {
 
         // A socket transport (pooled localhost) needs no ssh hop at all.
         assert_eq!(
-            attach_argv(None, &[], "miao-server", "s1", false),
+            attach_argv(None, &[], "miao-server", "s1", false, &[]),
             ["miao-server", "attach", "s1"]
         );
         // The steal is a flag on the attach, never on the create path.
         assert_eq!(
-            attach_argv(None, &[], "miao-server", "s1", true),
+            attach_argv(None, &[], "miao-server", "s1", true, &[]),
             ["miao-server", "attach", "--force", "s1"]
         );
         // A deployed cache path is invoked in place of `miao-server`.
         let cache = "/home/u/.cache/captain-miao/bin/miao-server";
-        let ssh = attach_argv(Some("user@box"), &[], cache, "s1", false);
+        let ssh = attach_argv(Some("user@box"), &[], cache, "s1", false, &[]);
         assert_eq!(ssh_tail(&ssh), ["user@box", cache, "attach", "s1"]);
+    }
+
+    /// `[remote] inherit_env` runs as one `--inherit-env <NAME>` pair per name on
+    /// the attach, pushed before the session name so the session stays the last
+    /// positional arg.
+    #[test]
+    fn attach_argv_appends_inherit_env() {
+        let inherit = ["ANTHROPIC_API_KEY".to_string()];
+        let ssh = attach_argv(Some("box"), &[], "miao-server", "s1", false, &inherit);
+        let tail = ssh_tail(&ssh);
+        assert!(
+            tail.windows(2)
+                .any(|w| w == ["--inherit-env", "ANTHROPIC_API_KEY"]),
+            "expected contiguous [--inherit-env, ANTHROPIC_API_KEY], got {tail:?}"
+        );
+        // The session name stays the last positional arg, behind the flag pairs.
+        assert_eq!(tail.last(), Some(&"s1".to_string()));
     }
 
     /// The searched *fallback* for the direct-local attach — reached only when
@@ -3938,11 +3975,11 @@ mod tests {
     fn local_attach_argv_is_the_socket_shape() {
         let exe = "/opt/miao/bin/miao-client";
         assert_eq!(
-            attach_argv(None, &[], exe, "cm-claude-9-1", false),
+            attach_argv(None, &[], exe, "cm-claude-9-1", false, &[]),
             [exe, "attach", "cm-claude-9-1"]
         );
         assert_eq!(
-            attach_argv(None, &[], exe, "cm-claude-9-1", true),
+            attach_argv(None, &[], exe, "cm-claude-9-1", true, &[]),
             [exe, "attach", "--force", "cm-claude-9-1"]
         );
     }
@@ -3954,7 +3991,7 @@ mod tests {
     fn local_attach_names_what_is_missing() {
         // Drive the pure resolver, since the real one reads this machine.
         assert!(resolve_local_attach_exe(&[PathBuf::from("/nowhere")], |_| false).is_none());
-        let msg = local_attach_argv("cm-claude-9-1", false)
+        let msg = local_attach_argv("cm-claude-9-1", false, &[])
             .err()
             .map(|e| e.to_string());
         // This machine may genuinely have one installed; only assert the text
@@ -4567,7 +4604,15 @@ mod tests {
         match plan {
             // A socket transport (no ssh target) yields a direct attach window.
             LaunchPlan::AttachRemote { argv, session_name } => {
-                assert_eq!(argv, ["miao-server", "attach", "pool-claude"]);
+                // Only the fixed shape is asserted: the exe name is whichever
+                // pool client this machine has, and `[remote] inherit_env`
+                // threads `--inherit-env NAME` pairs between `attach` and the
+                // session (pinned with explicit values by
+                // `attach_argv_appends_inherit_env`), so an exact argv here
+                // would fail on any machine whose real config sets it.
+                assert_eq!(argv.first().map(String::as_str), Some("miao-server"));
+                assert_eq!(argv.get(1).map(String::as_str), Some("attach"));
+                assert_eq!(argv.last().map(String::as_str), Some("pool-claude"));
                 assert_eq!(session_name, "pool-claude");
             }
             LaunchPlan::SpawnLocal { .. } => panic!("expected AttachRemote from a remote backend"),

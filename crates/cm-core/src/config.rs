@@ -62,6 +62,7 @@ pub fn config_path() -> PathBuf {
 pub struct CoreConfig {
     pub launcher: LauncherConfig,
     pub debug: DebugConfig,
+    pub remote: RemoteConfig,
 }
 
 impl CoreConfig {
@@ -225,9 +226,48 @@ impl Default for DebugConfig {
     }
 }
 
+// =============================================================================
+// remote
+// =============================================================================
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+/// `[remote]` in `config.toml`: knobs for sessions this dashboard reaches over
+/// a `miao-server` (ssh or pooled-localhost).
+pub struct RemoteConfig {
+    /// Names of environment variables a pooled session should **inherit from
+    /// the remote host** it runs on. libshpool's pty pool starts every session
+    /// with a scrubbed environment (`env_clear`), so a container-level secret
+    /// like `ANTHROPIC_API_KEY` — present for a plain interactive shell —
+    /// otherwise never reaches the agent. Each name here is threaded to
+    /// `miao-server attach` (`--inherit-env`), which hands it to libshpool's
+    /// `forward_env`: the value is read live from the attach process's own
+    /// environment on the host (never the dashboard's, never disk) and injected
+    /// into the session. Empty by default — opt in per var, since forwarding a
+    /// secret is a deliberate act.
+    pub inherit_env: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_inherit_env_parses() {
+        let cfg: CoreConfig =
+            toml::from_str("[remote]\ninherit_env = [\"ANTHROPIC_API_KEY\", \"OPENAI_API_KEY\"]\n")
+                .unwrap();
+        assert_eq!(
+            cfg.remote.inherit_env,
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn remote_inherit_env_defaults_empty() {
+        let cfg = CoreConfig::default();
+        assert!(cfg.remote.inherit_env.is_empty());
+    }
 
     #[test]
     fn legacy_literal_titles_migrate_to_default() {

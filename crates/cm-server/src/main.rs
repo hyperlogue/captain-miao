@@ -122,6 +122,13 @@ enum Commands {
         /// `io::empty()`, making a failed create undebuggable.
         #[arg(long)]
         log_file: Option<String>,
+        /// Environment variable NAMES the pooled session should inherit from
+        /// this host. Threaded from the dashboard's `[remote] inherit_env`;
+        /// each becomes a libshpool `forward_env` entry, so the value is read
+        /// live from this attach process's own environment (the container's
+        /// env) and injected into the otherwise-scrubbed pool session.
+        #[arg(long = "inherit-env")]
+        inherit_env: Vec<String>,
     },
 
     /// Clipboard-bridge helpers for the machine an agent runs on.
@@ -287,7 +294,8 @@ fn main() -> Result<()> {
             background,
             force,
             log_file,
-        } => return pty_pool::run_attach(name, cmd, dir, background, force, log_file),
+            inherit_env,
+        } => return pty_pool::run_attach(name, cmd, dir, background, force, log_file, inherit_env),
         _ => {}
     }
 
