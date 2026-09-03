@@ -1443,6 +1443,20 @@ fn apply_session_name(state: &mut LauncherState, name: Option<String>) -> bool {
     }
 }
 
+/// Whether two directory strings name the same directory — equal spellings, or
+/// two that resolve to one place (a launch through a symlink against the
+/// physical path Claude records, which is `process.cwd()`'s). Resolution runs
+/// only when the spellings differ, on the host that owns both paths.
+fn same_directory(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Stamp the transcript-folded fields onto the state, returning whether any
 /// changed (so the caller can mark the state dirty). `context_tokens`/`model`
 /// track the fold (which may report None — matching the dashboard's old tail
@@ -1474,6 +1488,17 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
     }
     if data.first_prompt.is_some() && state.first_prompt != data.first_prompt {
         state.first_prompt = data.first_prompt.clone();
+        changed = true;
+    }
+    // The session's directory, read off the entries the fold parsed. Last-wins
+    // like `name` — a worktree entry is a real move — but the spelling stays
+    // the launch's while the two are the same directory: Claude records the
+    // physical path, and a row launched through a symlink must not flip to it
+    // on its first turn.
+    if let Some(cwd) = data.cwd.as_deref().filter(|c| !c.is_empty())
+        && !same_directory(&state.cwd, cwd)
+    {
+        state.cwd = cwd.to_string();
         changed = true;
     }
     // Grok's `last_turn_summary`: the glance column on an idle/resumed row.
@@ -2523,6 +2548,49 @@ mod tests {
             &TranscriptStats::default()
         ));
         assert_eq!(state.name.as_deref(), Some("miao hooks"));
+    }
+
+    /// The row follows the transcript's directory — a worktree entry moves it,
+    /// last-wins — while a fold with no opinion leaves the launch directory
+    /// alone, and one naming the same directory by another spelling (the
+    /// physical path behind a symlinked launch) keeps the launch's.
+    #[test]
+    fn a_cwd_fold_moves_the_row_only_to_a_different_directory() {
+        let mut state = state_with(SessionStatus::Idle);
+        state.cwd = "/home/miao/proj".to_string();
+        assert!(!apply_transcript_data(
+            &mut state,
+            &TranscriptStats::default()
+        ));
+        assert_eq!(state.cwd, "/home/miao/proj");
+
+        let moved = TranscriptStats {
+            cwd: Some("/home/miao/proj/.claude/worktrees/fox".to_string()),
+            ..TranscriptStats::default()
+        };
+        assert!(apply_transcript_data(&mut state, &moved));
+        assert_eq!(state.cwd, "/home/miao/proj/.claude/worktrees/fox");
+        assert!(!apply_transcript_data(&mut state, &moved));
+
+        let base = std::env::temp_dir().join(format!("cm-cwd-alias-{}", std::process::id()));
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        state.cwd = link.to_string_lossy().into_owned();
+        let physical = TranscriptStats {
+            cwd: Some(
+                std::fs::canonicalize(&real)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..TranscriptStats::default()
+        };
+        assert!(!apply_transcript_data(&mut state, &physical));
+        assert_eq!(state.cwd, link.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Grok's `last_turn_summary` lands on `last_prompt` at rest (resume, idle)

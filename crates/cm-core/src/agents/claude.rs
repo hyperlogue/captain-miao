@@ -287,6 +287,9 @@ struct StatsEntry {
     is_compact_summary: bool,
     #[serde(default)]
     message: Option<StatsMessage>,
+    /// Every entry carries the session's directory; the fold keeps the latest.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// Running accumulators for the transcript-stats parse, persisted across reloads
@@ -305,6 +308,9 @@ pub struct StatsCursor {
     last_model: Option<String>,
     /// First real user prompt (first-wins), the auto-title fallback.
     first_prompt: Option<String>,
+    /// Directory of the latest parsed entry (last-wins) — the row's directory,
+    /// see [`TranscriptStats::cwd`].
+    cwd: Option<String>,
 }
 
 impl StatsCursor {
@@ -338,6 +344,12 @@ impl StatsCursor {
             Ok(e) => e,
             Err(_) => return,
         };
+        // Every entry carries it, so the lines already parsed for stats are
+        // enough to track it: a worktree entry is followed by an assistant
+        // turn inside the same user turn.
+        if let Some(cwd) = entry.cwd.as_deref().filter(|c| !c.is_empty()) {
+            self.cwd = Some(cwd.to_string());
+        }
         if entry.is_compact_summary {
             self.last_summary_chars = entry
                 .message
@@ -421,6 +433,7 @@ impl StatsCursor {
             name: None,
             last_prompt: None,
             context_window: None,
+            cwd: self.cwd.clone(),
             cursor: Some(self),
         }
     }
@@ -1209,6 +1222,14 @@ pub fn build_launch_command(
 /// may then refuse. `Post` fires after the switch has landed and is
 /// non-blocking, so it reports a fact rather than a proposal — the same reason
 /// the rest of this table reads status from `Post*` events.
+///
+/// `CwdChanged` is deliberately absent. It fires for the Bash tool's `cd`, not
+/// for the session moving (`EnterWorktree` fires no `CwdChanged` at all), and
+/// its `cwd` has been seen carrying the `cd` target even under
+/// `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`, which parked a row on a
+/// subdirectory of its project for hours. The row's directory comes from the
+/// transcript fold instead ([`TranscriptStats::cwd`]): every entry stamps the
+/// session's directory, and that one does follow a worktree.
 pub fn build_hooks_settings(sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
     let exe_q = shell_quote(&exe.to_string_lossy());
@@ -1235,7 +1256,6 @@ pub fn build_hooks_settings(sock_path: &str) -> String {
             "StopFailure":        hook_cmd(HookEvent::StopFailure),
             "PreCompact":         hook_cmd(HookEvent::PreCompact),
             "PostCompact":        hook_cmd(HookEvent::PostCompact),
-            "CwdChanged":         hook_cmd(HookEvent::CwdChanged),
             "PostModelSwitch":    hook_cmd(HookEvent::ModelSwitch),
         }
     })
@@ -1251,7 +1271,6 @@ struct HookPayload {
     session_id: Option<String>,
     tool_name: Option<String>,
     message: Option<String>,
-    cwd: Option<String>,
     prompt: Option<String>,
     transcript_path: Option<String>,
     /// `PostModelSwitch` only: the resolved model id the session runs *after*
@@ -1269,7 +1288,10 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         session_id: payload.session_id,
         tool_name: payload.tool_name,
         message: payload.message,
-        cwd: payload.cwd,
+        // Claude's `cwd` is the Bash tool's directory, not the session's — a
+        // `cd` moves it — so no payload carries it up: the transcript fold
+        // owns the row's directory ([`TranscriptStats::cwd`]).
+        cwd: None,
         prompt: payload.prompt,
         // Claude's payload has no title; a `/rename` reaches `name` through the
         // session-file fold instead.
@@ -2027,6 +2049,65 @@ mod tests {
         let after = read_transcript_stats_incremental(&path, Some(&next));
         assert_eq!(after.model.as_deref(), Some("claude-sonnet-5"));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The row's directory is the transcript's: every entry stamps the
+    /// session's cwd, so a worktree entry — which Claude records on each line
+    /// from then on — moves it, last-wins, and a fold that parsed no new entry
+    /// carries the one it has.
+    #[test]
+    fn the_fold_tracks_the_directory_of_the_latest_entry() {
+        let body = concat!(
+            r#"{"type":"user","cwd":"/home/miao/proj","message":{"content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/home/miao/proj","message":{"usage":{"input_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/home/miao/proj/.claude/worktrees/fox","message":{"usage":{"input_tokens":20}}}"#,
+            "\n",
+        );
+        let path = write_tmp("cwd_follows", body);
+        let stats = read_transcript_stats_incremental(&path, None);
+        assert_eq!(
+            stats.cwd.as_deref(),
+            Some("/home/miao/proj/.claude/worktrees/fox")
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{body}{}\n",
+                r#"{"type":"user","cwd":"/home/miao/proj/.claude/worktrees/fox","message":{"content":"more"}}"#
+            ),
+        )
+        .unwrap();
+        let next = read_transcript_stats_incremental(&path, Some(&stats));
+        assert_eq!(
+            next.cwd.as_deref(),
+            Some("/home/miao/proj/.claude/worktrees/fox")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The shape Claude 2.1.257 fires for a Bash `cd`: the shell went to a
+    /// subdirectory, the session did not — and the payload's `cwd` was seen
+    /// carrying that subdirectory. No hook payload moves the row; the
+    /// transcript fold does.
+    #[test]
+    fn a_hook_payload_never_moves_the_row() {
+        let cd = concat!(
+            r#"{"session_id":"s1","cwd":"/home/miao/proj/src","hook_event_name":"CwdChanged","#,
+            r#""old_cwd":"/home/miao/proj","new_cwd":"/home/miao/proj/src"}"#,
+        );
+        let msg = parse_hook_payload(HookEvent::CwdChanged, cd).expect("payload parses");
+        assert_eq!(msg.cwd, None);
+
+        let mut state = active_state();
+        state.cwd = "/home/miao/proj".to_string();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(dispatch_hook(&mut state, msg));
+        assert_eq!(state.cwd, "/home/miao/proj");
     }
 
     #[test]

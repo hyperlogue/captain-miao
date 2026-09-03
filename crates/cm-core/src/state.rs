@@ -791,6 +791,11 @@ pub enum HookEvent {
     StopFailure,
     PreCompact,
     PostCompact,
+    /// The *session* moved; `dispatch_default` adopts the payload's `cwd`.
+    /// Only a backend whose report means that subscribes (OpenCode's
+    /// `session.updated`). Claude's event of this name fires for the Bash
+    /// tool's `cd` and is deliberately not registered — its rows follow the
+    /// transcript instead (`TranscriptStats::cwd`).
     CwdChanged,
     /// The session's model changed out of band — the user picked another one,
     /// or the agent fell back. Carries the new id on [`HookMessage::model`] and

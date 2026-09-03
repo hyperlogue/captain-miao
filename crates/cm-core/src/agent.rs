@@ -1636,6 +1636,18 @@ pub struct TranscriptStats {
     /// mid-turn, so a `PromptSubmit` value is left alone until the turn ends.
     /// `None` for backends whose last prompt arrives only on the hook.
     pub last_prompt: Option<String>,
+    /// The directory the agent's latest turn ran in, when the fold reads one
+    /// (Claude stamps `cwd` on every transcript entry). Stamped onto
+    /// [`crate::state::LauncherState::cwd`] last-write-wins, so a session that
+    /// enters a worktree mid-flight moves its row there — and a Bash `cd`
+    /// never does, because the transcript's `cwd` is the session's, not the
+    /// shell's. That is the reason the fold owns the directory rather than a
+    /// hook: Claude's `CwdChanged` fires for the shell (its `old_cwd`/`new_cwd`
+    /// are the `cd`'s), and its `cwd` was seen carrying the `cd` target even
+    /// under `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`, which parked a row on
+    /// a subdirectory of its project for hours. `None` for backends whose
+    /// transcript carries no directory.
+    pub cwd: Option<String>,
     /// Claude-only incremental-parse cursor: the byte offset reached plus the
     /// running accumulators, so the next reload folds only the lines appended
     /// since — instead of rescanning a multi-MB transcript on every keystroke
@@ -1981,7 +1993,6 @@ mod tests {
                     StopFailure,
                     PreCompact,
                     PostCompact,
-                    CwdChanged,
                     ModelSwitch,
                 ],
             ),
