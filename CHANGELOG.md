@@ -5,35 +5,45 @@ All notable changes to captain-miao are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-09-03
+
+Thanks to @TomGrozev, who added an `inherit_env` config
+([#3](https://github.com/hyperlogue/captain-miao/pull/3)).
 
 ### Added
 
-- **`[remote] inherit_env` forwards host environment variables into pooled
-  sessions.** The pty pool starts every session with a scrubbed environment, so
-  a container-level secret like `ANTHROPIC_API_KEY` never reached the agent;
-  each name listed here is now read from the host and injected. Opt-in and
-  empty by default. Two things to know before using it: it applies to **newly
-  created sessions only**, so editing the list or rotating a key leaves every
-  running session on its old value until you recreate it (reattaching will not
-  do it); and the pool writes every forwarded value to `forward.env` on the
-  host in cleartext, which on the ssh path every local account there can read.
-  Read the caveat in `docs/remote-sessions.md` before listing a secret.
-- **The Model column follows a Claude Code `/model` immediately.** Claude's new
-  `PostModelSwitch` hook is now one of the events a managed session forwards, so
-  a switch shows up the moment it lands instead of waiting for the new model to
-  answer — and a switch made on an idle session, which the transcript never
-  records at all, now shows up too.
+- **`[remote] inherit_env` forwards named host environment variables into remote
+  sessions**, so a secret like `ANTHROPIC_API_KEY` reaches the agent instead of
+  being pasted in by hand. This is opt-in, and by default no environment variables
+  are sent, except for the default ones sent by libshpool.
+- **The Model column follows a Claude Code `/model` immediately** instead of
+  waiting for the new model to answer, including a switch made on an idle
+  session, which never showed up at all before.
+
+### Changed
+
+- **The workdir picker opens on the focused session's directory and holds that
+  choice as you cycle hosts with `Ctrl-h`**, so launching a second session
+  alongside the one you are looking at is a single Enter.
+- **A dropped remote link reconnects without re-interrogating the host**,
+  reusing a clean probe for up to 60s and ramping the forwarded-socket retries
+  from 25ms rather than a flat 400ms.
 
 ### Fixed
 
 - **A managed Codex session no longer asks you to trust its hooks on every
-  launch.** Two of the eight hooks were seeded with a trust hash Codex read as
-  changed, because it drops the matcher of an event that has none (`Stop`,
-  `UserPromptSubmit`) before hashing. Refreshing the profile also no longer
-  discards what Codex itself wrote there — Codex persists into the profile it
-  was launched with, so its directory-trust answers, a `/model` change and its
-  own corrections to a trust hash now survive the next launch.
+  launch**, and refreshing its profile now keeps Codex's own directory-trust
+  answers and `/model` change instead of discarding them.
+- **Clearing a pin or a bell on a pooled row sticks**, where the host used to
+  put it straight back at the next reload and leave a quiet session parked in
+  the attention tier for good.
+- **Editing a host's connection options takes effect** — `Port`, `User`,
+  `IdentityFile`, `ProxyJump` and the timeouts were all inert, because the
+  fresh dial rejoined the ssh master minted under the old ones.
+- **A host that stops answering mid-connect no longer parks in `Connecting`**
+  until you restart the dashboard.
+- **Esc closes the workdir picker with a path typed in**, rather than emptying
+  the field and making you press it a second time.
 
 ## [0.7.0] - 2026-08-23
 
@@ -503,7 +513,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hyperlogue/captain-miao/compare/v0.4.0...v0.5.0
