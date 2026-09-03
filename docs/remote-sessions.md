@@ -199,7 +199,57 @@ library**.
   each value **live from the attach client's own environment** — which runs on
   the host, so it is the *host/container* env that is forwarded, not the
   laptop's — and injects it into the otherwise-scrubbed session. Opt-in and empty
-  by default: forwarding a secret is deliberate, and the value never touches disk.
+  by default: forwarding a secret is deliberate. Three consequences follow from
+  how libshpool implements it, none of them obvious from the config key:
+  - **Only at session creation.** The forwarded values are baked into the env
+    handed to the shell libshpool forks (`build_shell_env`, reached only from
+    `spawn_subshell`); nothing injects into a shell that is already running. So
+    changing `inherit_env` — or rotating a key — leaves every existing pooled
+    session on the old value until it is killed and recreated. captain-miao
+    therefore sends `--inherit-env` **only on the create path**
+    (`RemoteBackend::open_session`) and never from `attach_plan`.
+  - **The value is written to the host's disk, in cleartext, and on our path it
+    is world-readable.** libshpool's daemon calls `populate_session_env_file` on
+    *every* attach and writes each forwarded `NAME=VALUE` to
+    `$SHPOOL_SESSION_DIR/forward.env` with a plain `fs::write`, mode `0644`.
+    Whether anyone else can actually read it comes down to the `sessions/`
+    directory above it, and that is where the sharp edge is: libshpool chmods
+    that directory to `0700`, but it does so inside `link_ssh_auth_sock`
+    (`daemon/server.rs`), which **returns early when the attach client has no
+    `SSH_AUTH_SOCK`**. No agent socket, no chmod — the whole chain stays `0755`
+    and the secret is readable by every local account on the host.
+
+    captain-miao's remote attach is exactly that case. `ssh_common_opts` never
+    passes `-A`, so `ssh <target> miao-server attach …` arrives with no
+    `SSH_AUTH_SOCK` and the hardening never fires. A local desktop attach
+    usually *does* have one and so lands `0700` — which makes this worse, not
+    better: the protection is incidental, and it is absent precisely in the
+    remote-container case this feature exists to serve.
+
+    Verified rather than read: attaching with `--inherit-env CM_TEST_SECRET`
+    and no `SSH_AUTH_SOCK` leaves `sessions/`, the session dir and
+    `forward.env` at `0755/0755/0644` with the value in plain text; the same
+    attach *with* an agent socket leaves `sessions/` at `0700`.
+
+    Nothing cleans the file up — it survives the session and the daemon — and
+    where `XDG_RUNTIME_DIR` is unset on the host (the common case for
+    `ssh host cmd`) the path is `~/.local/run/shpool/…`, ordinary disk rather
+    than a tmpfs, so it survives the reboot too. This is upstream behaviour and
+    captain-miao cannot suppress it: the file is libshpool's own rendezvous for
+    refreshing `DISPLAY`/`SSH_AUTH_SOCK` on reattach (it writes it and never
+    reads it — sourcing it is left to the user's shell rc), and it was designed
+    for paths, not secrets. **Treat any name listed here as disclosed to every
+    local account on the host**, and prefer a host-side secret manager where
+    that is not acceptable.
+  - **Names are validated, and the check is a security boundary.** Each entry
+    must match `[A-Za-z_][A-Za-z0-9_]*`, filtered at config load and again in
+    `run_attach`. ssh joins the command words it is given with spaces and hands
+    the result to the account's login shell, so an unchecked name in a shared or
+    templated `config.toml` would be remote command execution on every
+    configured host; and libshpool `return Err`s on a `forward_env` array it
+    cannot parse rather than skipping it, so a name TOML cannot round-trip would
+    fail the attach outright. Invalid entries are dropped with a warning, not
+    escaped, and not fatal to the rest of the config.
 - **OSC 52 (clipboard) works end-to-end.** libshpool's live relay is a
   transparent byte pipe — its source contains no OSC handling at all (the
   vterm engine exists only for the `screen`/`lines` restore buffer, unused in
@@ -1008,6 +1058,34 @@ pins/bells too (the flags sidecar, pushed as a `Delta` to every subscriber).
 All shared mutable state lives in host-fs files with **last-writer-wins**
 semantics, accepted as-is. Steal-attach is an action, not state. Nothing
 coordinates concurrent writers beyond atomic file replacement, by decision.
+
+### `config.toml` is per-machine, and the halves are not interchangeable
+
+`cm_core::config::get()` resolves `$XDG_CONFIG_HOME/captain-miao/config.toml`
+**on whatever machine the process runs on**, so a remote host with a deployed
+`miao-server` has its own file, entirely separate from the dashboard's. Nothing
+syncs them and neither side can see the other's. Which keys each machine
+actually honours is decided by the four call sites, not by the file:
+
+| Read at | Key | Machine that supplies it |
+| --- | --- | --- |
+| `cm-core/backend.rs` | `[launcher] max_recent_cwds` | the **host** (`LocalBackend` is the server-core) |
+| `cm-core/launcher.rs` | `[launcher] approval_grace_secs` | the **host** (the launcher runs beside the agent) |
+| `cm-core/logging.rs` | `[debug]` | whichever machine the process is on |
+| `src/backend/mod.rs` | `[remote] inherit_env` | the **dashboard** |
+
+Everything else the dashboard parses — `[terminal]`, `[colors]`, `[ui]`,
+`[keybinds]`, `[thresholds]`, `[polling]`, `[remote] on_window_close` — is
+presentation or dashboard policy and is read only there.
+
+The one that surprises people is `[remote] inherit_env`. The host is where the
+environment variables it names actually live, so the host's `config.toml` is the
+intuitive place to put it — and it does nothing there, with no error. The
+dashboard is the only reader; the host learns the names as the `--inherit-env`
+argv flag threaded over ssh, and `miao-server` consults no config of its own to
+decide them. That is deliberate, and it is what makes the name validation in
+`cm_core::config::is_valid_env_name` worth anything: one writer means one place
+a name can enter, so there is no second path to also police.
 
 ## 9. The TUI surface — everything that operates on hosts
 

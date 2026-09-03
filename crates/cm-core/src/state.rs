@@ -537,6 +537,34 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Write `contents` to `path` with the parent dir `0700` and the file `0600`.
+///
+/// The plain-text counterpart to [`write_json_atomic`], for the config files
+/// captain-miao authors for libshpool. Not atomic — these are regenerated
+/// wholesale before the process that reads them starts, so there is no reader
+/// to catch a partial write — but the mode matters just as much: the attach
+/// config names the environment variables a session forwards, which on a shared
+/// machine tells every other local user which secrets are in play.
+///
+/// `.mode()` only applies when *creating*, so an existing file from an older
+/// build is re-chmod'd explicitly, exactly as [`write_json_atomic`] does.
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        create_dir_all_private(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(OWNER_ONLY_FILE)
+        .open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.set_permissions(std::fs::Permissions::from_mode(OWNER_ONLY_FILE))?;
+    Ok(())
+}
+
 /// Read + parse JSON, returning None if the file is missing or malformed.
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -1919,5 +1947,38 @@ mod tests {
             sock.to_string_lossy().len(),
             sock.display()
         );
+    }
+
+    /// Owner-only for the dir *and* the file, including when overwriting one
+    /// left 0644 by an older build — `.mode()` applies only on create, so the
+    /// explicit re-chmod is the half that is easy to drop.
+    #[test]
+    fn write_private_is_owner_only_even_over_a_loose_file() {
+        let dir = std::env::temp_dir().join(format!("cm-wp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("attach-config-s1.toml");
+
+        write_private(&path, "forward_env = [\"A\"]\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "forward_env = [\"A\"]\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "forward_env = []\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

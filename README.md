@@ -333,6 +333,8 @@ Command ids are the string in each `Command::id()`; the authoritative list lives
 
 captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). Every key is optional and falls back to the default shown below; an unparseable file falls back to defaults rather than crashing. The complete set of options:
 
+> **Using remote hosts?** This file is read per-machine, so a host running `miao-server` has its own, independent of your dashboard's. Almost everything below is read only by the dashboard — including all of `[remote]`. The exceptions are `[launcher] max_recent_cwds`, `[launcher] approval_grace_secs` and `[debug]`, which each host supplies for itself. Worth knowing for `[remote] inherit_env` in particular: the variables it names live on the host, but the setting is read from the **dashboard's** file and threaded over the connection, so putting it in the host's `config.toml` silently does nothing. See [docs/remote-sessions.md](docs/remote-sessions.md#configtoml-is-per-machine-and-the-halves-are-not-interchangeable).
+
 ```toml
 [terminal]
 backend = "kitty"            # "kitty" | "ghostty" | "iterm" | "zellij" | "tmux"; unset
@@ -362,8 +364,24 @@ on_window_close = "close"    # "close" | "detach": what closing a pooled session
                              # does to the session. Only a window *you* close counts — an
                              # attach that ends because its link died (a laptop resuming to
                              # a dropped ssh) always detaches, and the session keeps running.
-inherit_env = []           # list of host environment variable names to forward to
-                           # pooled sessions (e.g. ["ANTHROPIC_API_KEY"])
+inherit_env = []             # host environment variable names to forward into pooled
+                             # sessions, e.g. ["ANTHROPIC_API_KEY"]. Names only, matching
+                             # [A-Za-z_][A-Za-z0-9_]*.
+                             #
+                             # NEW SESSIONS ONLY. The value is read on the host and baked
+                             # in when the session is created; sessions already running
+                             # keep whatever they started with. Editing this list, or
+                             # rotating a key, changes nothing until you kill a session and
+                             # start a fresh one — reattaching an existing one will not do
+                             # it, and nothing in the dashboard flags the mismatch.
+                             #
+                             # Before you list a secret: the pty pool writes each forwarded
+                             # NAME=VALUE to $SHPOOL_SESSION_DIR/forward.env on the host in
+                             # cleartext, mode 0644, and on the ssh path the directory above
+                             # it stays 0755 too — so every local account on that host can
+                             # read it. Nothing cleans it up; it outlives the session and,
+                             # where XDG_RUNTIME_DIR is unset, the reboot.
+                             # See docs/remote-sessions.md.
 
 [thresholds]
 context_warning_tokens = 175000    # context usage turns to the warning color here

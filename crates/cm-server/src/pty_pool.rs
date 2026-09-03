@@ -71,10 +71,7 @@ fn pool_config_path() -> PathBuf {
 /// default, so the file has to exist first.
 fn write_pool_config() -> Result<PathBuf> {
     let path = pool_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, POOL_CONFIG)
+    crate::state::write_private(&path, POOL_CONFIG)
         .with_context(|| format!("write pool config {}", path.display()))?;
     Ok(path)
 }
@@ -92,12 +89,24 @@ fn write_pool_config() -> Result<PathBuf> {
 /// session-restore and keybinding, which are daemon concerns and must stay
 /// there. `forward_env` alone belongs here because it is a property of the
 /// attach path, not the daemon.
+/// Every name is required to be [`cm_core::config::is_valid_env_name`]-shaped
+/// before it gets here ([`run_attach`] filters, and the dashboard filters again
+/// at config load), which is what lets this quote them by hand. Rust's `{:?}`
+/// is *not* TOML escaping — it renders an unprintable as `\u{7f}`, which TOML
+/// does not accept — and libshpool `return Err`s on a config it cannot parse
+/// rather than skipping it, so a name that survived to here unvalidated would
+/// take the whole attach down. `[A-Za-z_][A-Za-z0-9_]*` contains no character
+/// TOML escapes, so a bare `"…"` is exact.
 fn attach_config_body(names: &[String]) -> String {
+    debug_assert!(
+        names.iter().all(|n| cm_core::config::is_valid_env_name(n)),
+        "attach_config_body needs pre-validated env names"
+    );
     format!(
         "forward_env = [{}]\n",
         names
             .iter()
-            .map(|n| format!("{n:?}"))
+            .map(|n| format!("\"{n}\""))
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -114,12 +123,15 @@ fn attach_config_path(name: &str) -> PathBuf {
 /// (to pass via `--config-file`). Mirror of [`write_pool_config`]: the file has
 /// to exist before libshpool runs, else it silently falls back to default and
 /// no env is forwarded.
+///
+/// `0600` via [`cm_core::state::write_private`], like the rest of the state
+/// tree — `runtime_dir()` falls back *into* that tree where `XDG_RUNTIME_DIR`
+/// is unset, and this file lists the environment variables a session forwards,
+/// which on a shared host tells every other local user which secrets are in
+/// play.
 fn write_attach_config(name: &str, names: &[String]) -> Result<String> {
     let path = attach_config_path(name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, attach_config_body(names))
+    crate::state::write_private(&path, &attach_config_body(names))
         .with_context(|| format!("write attach config {}", path.display()))?;
     Ok(path.display().to_string())
 }
@@ -537,6 +549,24 @@ pub(crate) fn run_attach(
     // each name is read live from *this* process's env (the container's) on the
     // host side, so it reaches a freshly-created session without sitting in
     // `POOL_CONFIG` or the dashboard.
+    //
+    // Filtered again on this side rather than trusted from the wire: this is a
+    // positional CLI flag on `miao-server attach`, so the caller is whoever can
+    // run the binary on this host, not necessarily a dashboard that already
+    // validated. See `cm_core::config::is_valid_env_name`.
+    let inherit_env: Vec<String> = inherit_env
+        .into_iter()
+        .filter(|n| {
+            let ok = cm_core::config::is_valid_env_name(n);
+            if !ok {
+                tracing::warn!(
+                    target: "captain_miao::pool",
+                    "ignoring --inherit-env {n:?}: not an environment variable name"
+                );
+            }
+            ok
+        })
+        .collect();
     let attach_cfg = if !inherit_env.is_empty() {
         Some(write_attach_config(&name, &inherit_env)?)
     } else {

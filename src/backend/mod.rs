@@ -1189,7 +1189,6 @@ impl Backend {
         session_name: &str,
         force: bool,
     ) -> anyhow::Result<AttachPlan> {
-        let inherit_env = cm_core::config::get().remote.inherit_env.clone();
         match self {
             // A direct-local backend pools nothing *itself*, but the machine it
             // runs on may still hold a pool — the daemon serving a laptop's
@@ -1199,7 +1198,7 @@ impl Backend {
             // but "can this machine reach its own pool", and the caller has
             // already established that the row carries a `pool_session` at all.
             Backend::Local(_) => Ok(AttachPlan {
-                argv: local_attach_argv(session_name, force, &inherit_env)?,
+                argv: local_attach_argv(session_name, force)?,
             }),
             Backend::Remote(b) => Ok(AttachPlan {
                 argv: attach_argv(
@@ -1208,7 +1207,19 @@ impl Backend {
                     &b.remote_exe.lock().unwrap(),
                     session_name,
                     force,
-                    &inherit_env,
+                    // No `[remote] inherit_env` here, and not an oversight:
+                    // this is the *reattach* path. libshpool injects a
+                    // forwarded value into the shell's environment only where
+                    // it spawns that shell (`build_shell_env`, reached from
+                    // `spawn_subshell`), which happens once, when the session
+                    // is created — so a name passed here changes nothing about
+                    // the session. What it *would* still do is make the daemon
+                    // re-serialize every forwarded name and value to
+                    // `$SHPOOL_SESSION_DIR/forward.env` in cleartext, which it
+                    // does on every attach: pure exposure, zero effect. The
+                    // create path ([`RemoteBackend::open_session`]) is the only
+                    // one that passes them.
+                    &[],
                 ),
             }),
         }
@@ -2189,11 +2200,7 @@ const LOCAL_ATTACH_EXES: [&str; 2] = ["miao-client", "miao-server"];
 /// target), because it is the same operation: the pool is a per-user,
 /// per-machine socket, so what reaches it is a question about the binaries on
 /// this box and not about which backend happens to be drawing the row.
-fn local_attach_argv(
-    session_name: &str,
-    force: bool,
-    inherit_env: &[String],
-) -> anyhow::Result<Vec<String>> {
+fn local_attach_argv(session_name: &str, force: bool) -> anyhow::Result<Vec<String>> {
     let exe = local_attach_exe(session_name).ok_or_else(|| {
         anyhow::anyhow!(
             "no pool client on this machine — install {} beside `miao` or on PATH",
@@ -2204,14 +2211,11 @@ fn local_attach_argv(
                 .join(" or ")
         )
     })?;
-    Ok(attach_argv(
-        None,
-        &[],
-        &exe,
-        session_name,
-        force,
-        inherit_env,
-    ))
+    // Never any `--inherit-env`: this is a reattach (which cannot forward
+    // anything — see [`Backend::attach_plan`]), and `exe` here may well be
+    // `miao-client`, whose `attach` subcommand has no such flag and would exit
+    // 2 on a clap usage error rather than opening the window.
+    Ok(attach_argv(None, &[], &exe, session_name, force, &[]))
 }
 
 /// The binary to run for an attach to `session_name` on this machine.
@@ -3928,6 +3932,37 @@ mod tests {
         assert_eq!(tail.last(), Some(&"s1".to_string()));
     }
 
+    /// The *reattach* path forwards nothing, however `[remote] inherit_env` is
+    /// configured — and this is the assertion that keeps it that way.
+    ///
+    /// Two independent reasons, either of which is sufficient. libshpool injects
+    /// a forwarded value only into a shell it is spawning, which happens once at
+    /// session creation, so a name passed here cannot reach the session; what it
+    /// *can* still do is make the daemon rewrite every forwarded name and value
+    /// to `forward.env` in cleartext, which it does on every attach. And the
+    /// binary on the direct-local path may be `miao-client`, whose `attach` has
+    /// no `--inherit-env` at all, so the flag would exit 2 on a clap usage error
+    /// instead of opening a window.
+    ///
+    /// Only the remote arm is exercised here; the direct-local one is pinned by
+    /// construction, since [`local_attach_argv`] no longer takes names at all
+    /// (it needs a pool client installed to run, which a test host has no
+    /// reason to have).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reattach_path_never_forwards_env() {
+        let backend = Backend::Remote(RemoteBackend::connect(
+            Transport::LocalSocket(PathBuf::from("/nonexistent/cm-test.sock")),
+            HostId("mock".into()),
+        ));
+        // An *exact* argv, which is the strong form of the assertion: it holds
+        // only because `attach_plan` reads no config at all, so no machine's own
+        // `[remote] inherit_env` can slip a flag pair in here. (The create path's
+        // plan still reads config and is asserted loosely — see
+        // `remote_open_session_returns_attach_plan`.)
+        let plan = backend.attach_plan("cm-claude-9-1", false).unwrap();
+        assert_eq!(plan.argv, ["miao-server", "attach", "cm-claude-9-1"]);
+    }
+
     /// The searched *fallback* for the direct-local attach — reached only when
     /// the pool name carries no daemon pid to ask (see `local_attach_exe`).
     ///
@@ -3991,7 +4026,7 @@ mod tests {
     fn local_attach_names_what_is_missing() {
         // Drive the pure resolver, since the real one reads this machine.
         assert!(resolve_local_attach_exe(&[PathBuf::from("/nowhere")], |_| false).is_none());
-        let msg = local_attach_argv("cm-claude-9-1", false, &[])
+        let msg = local_attach_argv("cm-claude-9-1", false)
             .err()
             .map(|e| e.to_string());
         // This machine may genuinely have one installed; only assert the text

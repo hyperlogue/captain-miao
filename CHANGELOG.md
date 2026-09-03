@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[remote] inherit_env` forwards host environment variables into pooled
+  sessions.** The pty pool starts every session with a scrubbed environment, so
+  a container-level secret like `ANTHROPIC_API_KEY` never reached the agent;
+  each name listed here is now read from the host and injected. Opt-in and
+  empty by default. Two things to know before using it: it applies to **newly
+  created sessions only**, so editing the list or rotating a key leaves every
+  running session on its old value until you recreate it (reattaching will not
+  do it); and the pool writes every forwarded value to `forward.env` on the
+  host in cleartext, which on the ssh path every local account there can read.
+  Read the caveat in `docs/remote-sessions.md` before listing a secret.
 - **The Model column follows a Claude Code `/model` immediately.** Claude's new
   `PostModelSwitch` hook is now one of the events a managed session forwards, so
   a switch shows up the moment it lands instead of waiting for the new model to

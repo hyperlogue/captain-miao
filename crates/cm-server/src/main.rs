@@ -127,6 +127,12 @@ enum Commands {
         /// each becomes a libshpool `forward_env` entry, so the value is read
         /// live from this attach process's own environment (the container's
         /// env) and injected into the otherwise-scrubbed pool session.
+        ///
+        /// Takes effect only where this attach *creates* the session — that is
+        /// the one place libshpool builds a shell environment. On a reattach
+        /// the names change nothing, so the dashboard does not send them.
+        /// Names must match `[A-Za-z_][A-Za-z0-9_]*`; anything else is dropped
+        /// with a warning.
         #[arg(long = "inherit-env")]
         inherit_env: Vec<String>,
     },

