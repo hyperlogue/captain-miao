@@ -822,7 +822,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 // for Claude a `/model` echoes itself into the transcript, so
                 // "next" is milliseconds away. See `TranscriptStats::adopt_model`.
                 let hook_model = msg.model.clone();
-                agent.dispatch_hook(state, msg).await;
+                agent.dispatch_hook(state, msg);
                 if let Some(model) = hook_model.filter(|m| !m.trim().is_empty())
                     && let Some(data) = transcript_data.as_mut()
                 {

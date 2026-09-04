@@ -971,17 +971,26 @@ impl AgentControl {
     /// Apply a hook event to the launcher state. Encapsulates per-agent
     /// status mapping (`PreToolUse` → `Active`, `PreCompact` → `Compacting`,
     /// etc.).
-    pub async fn dispatch_hook(self, state: &mut LauncherState, msg: HookMessage) {
+    ///
+    /// **Synchronous, and the seam keeps it that way.** Every backend maps a
+    /// parsed message onto `state` and nothing else; none reads a file or waits
+    /// on a socket. That matters at the call site rather than here — the
+    /// dispatch sits inside `process_hooks`' `select!`, where whether a
+    /// suspension point exists decides whether `state` can change underneath
+    /// the surrounding code. It cannot, and the signature is what says so. A
+    /// backend that genuinely needs to await belongs behind its own async
+    /// method, not by making this one async for the other eight.
+    pub fn dispatch_hook(self, state: &mut LauncherState, msg: HookMessage) {
         match self {
-            AgentControl::Claude => claude::dispatch_hook(state, msg).await,
-            AgentControl::Codex => codex::dispatch_hook(state, msg).await,
-            AgentControl::Reasonix => reasonix::dispatch_hook(state, msg).await,
-            AgentControl::Kimi => kimi::dispatch_hook(state, msg).await,
-            AgentControl::Grok => grok::dispatch_hook(state, msg).await,
-            AgentControl::OpenCode => opencode::dispatch_hook(state, msg).await,
-            AgentControl::Pi => pi::dispatch_hook(state, msg).await,
-            AgentControl::Antigravity => antigravity::dispatch_hook(state, msg).await,
-            AgentControl::Omp => omp::dispatch_hook(state, msg).await,
+            AgentControl::Claude => claude::dispatch_hook(state, msg),
+            AgentControl::Codex => codex::dispatch_hook(state, msg),
+            AgentControl::Reasonix => reasonix::dispatch_hook(state, msg),
+            AgentControl::Kimi => kimi::dispatch_hook(state, msg),
+            AgentControl::Grok => grok::dispatch_hook(state, msg),
+            AgentControl::OpenCode => opencode::dispatch_hook(state, msg),
+            AgentControl::Pi => pi::dispatch_hook(state, msg),
+            AgentControl::Antigravity => antigravity::dispatch_hook(state, msg),
+            AgentControl::Omp => omp::dispatch_hook(state, msg),
             AgentControl::Unknown => {}
         }
     }

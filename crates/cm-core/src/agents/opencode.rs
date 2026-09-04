@@ -888,7 +888,7 @@ fn parse_session_list(stdout: &str) -> Vec<ResumeCandidate> {
 ///   window where a resumed child's first event arrives before the lineage
 ///   that would condemn it — and the root's own `session.updated` re-proves
 ///   the root id on every prompt regardless.
-pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     let blocks_on_user = matches!(
         msg.event,
         HookEvent::PermissionRequest | HookEvent::ElicitationResult
@@ -948,10 +948,7 @@ mod tests {
     /// it — so the tests exercise the same path a live hook takes.
     fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     /// A whole turn, in the order a live session produces it: `session.created`

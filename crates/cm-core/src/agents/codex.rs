@@ -960,7 +960,7 @@ pub fn session_activity(_agent_pid: u32) -> Option<AgentActivity> {
 
 /// Codex's departures from [`common::dispatch_default`]; everything else maps
 /// the way every backend maps it.
-pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     common::adopt_session_facts(state, &mut msg);
 
     match msg.event {
@@ -1776,10 +1776,7 @@ mod tests {
 
     fn dispatched(msg: HookMessage) -> SessionStatus {
         let mut state = active_state();
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(&mut state, msg));
+        dispatch_hook(&mut state, msg);
         state.status
     }
 

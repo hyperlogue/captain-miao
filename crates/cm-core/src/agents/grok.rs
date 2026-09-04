@@ -772,7 +772,7 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 /// choice card, not work), and a `permission_prompt` that is a subagent
 /// auto-allow echo rather than a waiting UI. Everything else maps the way
 /// every backend maps it.
-pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // A subagent's hooks share this process's socket. Adopting their session
     // id would rename the parent row, their Stop/StopCancelled would Idle a
     // session that is still working, and their `generated_title` would wear
@@ -1526,10 +1526,7 @@ mod tests {
     /// `Stop`-reason branch that only reads the raw payload.
     fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     /// One `backgroundTasks` entry: the task `type`, its `status`, and the

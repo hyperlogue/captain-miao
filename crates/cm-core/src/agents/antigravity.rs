@@ -601,7 +601,7 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 /// three events it registers is one of ours under a different spelling, and the
 /// two failure variants are synthesized in [`parse_hook_payload`] before they
 /// get here. The wrapper stays so the seam keeps one callee per backend.
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
     common::dispatch_default(state, msg)
 }
 
@@ -827,10 +827,7 @@ mod tests {
     }
 
     fn feed(state: &mut LauncherState, msg: HookMessage) {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     /// A real `PostToolUse` payload, captured from `agy` 1.1.11. The fields that

@@ -1319,7 +1319,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 
 /// Claude's departures from [`common::dispatch_default`]; everything else maps
 /// the way every backend maps it.
-pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     // Claude mints a new sessionId on `/resume`; always take the freshest.
     common::adopt_session_facts(state, &mut msg);
 
@@ -1936,10 +1936,7 @@ mod tests {
 
     fn dispatched(msg: HookMessage) -> SessionStatus {
         let mut state = active_state();
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(&mut state, msg));
+        dispatch_hook(&mut state, msg);
         state.status
     }
 
@@ -2002,10 +1999,7 @@ mod tests {
             let mut state =
                 LauncherState::for_test(crate::agent::AgentControl::Claude, status.clone());
             let msg = parse_hook_payload(HookEvent::ModelSwitch, MODEL_SWITCH).expect("parses");
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(dispatch_hook(&mut state, msg));
+            dispatch_hook(&mut state, msg);
             assert_eq!(state.status, status);
             assert_eq!(state.model.as_deref(), Some("claude-sonnet-5"));
         }
@@ -2103,10 +2097,7 @@ mod tests {
 
         let mut state = active_state();
         state.cwd = "/home/miao/proj".to_string();
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(&mut state, msg));
+        dispatch_hook(&mut state, msg);
         assert_eq!(state.cwd, "/home/miao/proj");
     }
 

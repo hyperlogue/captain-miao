@@ -527,7 +527,7 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 /// that would otherwise have needed an arm (an interrupt arriving as a failure)
 /// is normalized in [`parse_hook_payload`], and the missing `PostCompact` is
 /// handled by every other arm assigning a status unconditionally.
-pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     common::adopt_session_facts(state, &mut msg);
 
     match msg.event {
@@ -672,10 +672,7 @@ mod tests {
     /// event normalization that only happens in the parser.
     fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     #[test]

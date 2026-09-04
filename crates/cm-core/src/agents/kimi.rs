@@ -796,7 +796,7 @@ fn wire_log_for(session_id: &str) -> Option<PathBuf> {
 /// The wrapper stays so the seam keeps one callee per backend, and so the day
 /// Kimi grows a case of its own (a subagent-aware `Stop` is the likely first) it
 /// has a place to land.
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
     common::dispatch_default(state, msg)
 }
 
@@ -994,10 +994,7 @@ mod tests {
     /// it — so the tests take the same path a live hook takes.
     fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     /// Parse the emitted config back into its `[[hooks]]` entries.

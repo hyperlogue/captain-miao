@@ -515,7 +515,7 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 ///
 /// The wrapper stays so the seam keeps one callee per backend, and so the day
 /// omp grows a case of its own it has a place to land.
-pub async fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
     common::dispatch_default(state, msg)
 }
 
@@ -554,10 +554,7 @@ mod tests {
     /// including the event normalization that only happens in the parser.
     fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(dispatch_hook(state, msg));
+        dispatch_hook(state, msg);
     }
 
     /// **The snapshot.** captain-miao ships this JavaScript into a tree that
