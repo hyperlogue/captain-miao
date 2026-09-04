@@ -196,20 +196,26 @@ impl AgentControl {
     /// unlaunchable. A missing binary still errors honestly, and from the one
     /// place that actually knows: `build_launch_command`.
     pub fn is_available(self) -> bool {
-        match self {
-            AgentControl::Claude => agents::binary_available(claude::BIN),
-            AgentControl::Codex => agents::binary_available(codex::BIN),
-            AgentControl::Reasonix => agents::binary_available(reasonix::BIN),
-            AgentControl::Kimi => agents::binary_available(kimi::BIN),
-            AgentControl::Grok => agents::binary_available(grok::BIN),
-            AgentControl::OpenCode => agents::binary_available(opencode::BIN),
-            AgentControl::Pi => agents::binary_available(pi::BIN),
-            AgentControl::Antigravity => agents::binary_available(antigravity::BIN),
-            AgentControl::Omp => agents::binary_available(omp::BIN),
-            // Not a backend this build can launch at all, so no binary could
-            // make it available. It is absent from `ALL` besides.
-            AgentControl::Unknown => false,
-        }
+        self.bin().is_some_and(agents::binary_available)
+    }
+
+    /// The executable this backend drives, and the one place that mapping is
+    /// written down. `None` only for [`Unknown`](Self::Unknown), which is not a
+    /// backend this build can launch at all — so no binary could make it
+    /// available, and it is absent from [`ALL`](Self::ALL) besides.
+    pub fn bin(self) -> Option<&'static str> {
+        Some(match self {
+            AgentControl::Claude => claude::BIN,
+            AgentControl::Codex => codex::BIN,
+            AgentControl::Reasonix => reasonix::BIN,
+            AgentControl::Kimi => kimi::BIN,
+            AgentControl::Grok => grok::BIN,
+            AgentControl::OpenCode => opencode::BIN,
+            AgentControl::Pi => pi::BIN,
+            AgentControl::Antigravity => antigravity::BIN,
+            AgentControl::Omp => omp::BIN,
+            AgentControl::Unknown => return None,
+        })
     }
 
     /// Human-facing backend name for headers and status lines.
