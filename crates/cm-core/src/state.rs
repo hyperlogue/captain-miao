@@ -623,8 +623,9 @@ impl std::fmt::Display for HostId {
 ///
 /// The launcher owns every transition. Where a backend keeps its own session
 /// file that file is authoritative and is mirrored rather than edge-tracked;
-/// hooks own the promotion out of rest, and refinement against the file is
-/// demote-only. Each variant's doc says which evidence produces it.
+/// refinement against it is demote-only apart from `Idle`, which the file also
+/// promotes (a queued prompt fires no hook when it is dequeued). Each variant's
+/// doc says which evidence produces it.
 pub enum SessionStatus {
     Starting,
     Active,

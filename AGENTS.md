@@ -154,13 +154,16 @@ Anything local to one module is in that module's doc instead.
   is **not** instance-granular, and `ghostty_identity` states why: its surface
   ids are UUIDs, so nothing overlaps and there is nothing to disambiguate.
 - **Treat Claude's own session file as authoritative** on the
-  working/idle/background-shell axis; mirror it, no edge-tracking. Refinement is
-  **demote-only** — hooks own rest→`Active`. An unreadable or unrecognized read
-  maps to `None` (leave unchanged), never a definite state. The one promotion
-  (`promote_stale_background`) is not an exception to that rule so much as a
-  different one: it fires only when the **process tree** disproves a background
-  status, never on the session file alone. Anything else that wants to promote
-  needs its own corroborating evidence, not a second opinion from the same file.
+  working/idle/background-shell axis; mirror it, no edge-tracking. An unreadable
+  or unrecognized read maps to `None` (leave unchanged), never a definite state.
+  Refinement is **demote-only except from `Idle`**, which the file also promotes
+  to `Active`: hooks cannot own rest→`Active` for a *queued* prompt, whose
+  `UserPromptSubmit` fires when it is queued (mid-turn, row already `Active`)
+  and never when it is dequeued — so the turn a flushed queue starts announces
+  itself only in that file, whose turn boundary is a ~20ms `idle` blip followed
+  by `busy`. Every other promotion needs corroboration from outside the file:
+  `promote_stale_background` fires only when the **process tree** disproves a
+  background status, never on the session file alone.
 - **Leave worktrees entirely to the agent.** captain-miao creates, names and
   cleans up nothing: `worktree_args` contributes `--worktree [name]` and the
   agent owns the branch, base ref, enforcement and cleanup. Resume and restart

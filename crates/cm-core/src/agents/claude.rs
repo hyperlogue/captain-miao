@@ -1343,7 +1343,7 @@ pub async fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             // `"shell"` status, no child process to scan), so the one signal is
             // Claude's own session file, which it holds at `"busy"` throughout.
             // Defer to it: hold `Active` while it still reports work, and let the
-            // file's eventual idle-write wake the launcher so the demote-only
+            // file's eventual idle-write wake the launcher so the mirroring
             // reconciliation settles us to `Idle` exactly when Claude goes idle.
             // A missing/unreadable file (`None`) falls back to `Idle` — the
             // pre-subagent behaviour, and the safe default if the signal is gone.

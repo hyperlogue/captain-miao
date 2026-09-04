@@ -15,11 +15,15 @@
 //! module's central rule.** Hooks report events; the agent's own session file
 //! reports what it believes it is doing. Where a backend keeps such a file it
 //! is authoritative on the working/idle/background-shell axis and is mirrored
-//! rather than edge-tracked, and refinement against it is **demote-only** —
-//! hooks own the promotion out of rest. An unreadable or unrecognised read maps
-//! to "leave unchanged", never to a definite state. `promote_stale_background`
-//! is the one promotion, and it fires on the *process tree* disproving a
-//! background status, not on a second opinion from the same file.
+//! rather than edge-tracked. An unreadable or unrecognised read maps to "leave
+//! unchanged", never to a definite state. Refinement against it is demote-only
+//! with **one exception, `Idle`**, which mirrors both ways: a *queued* prompt
+//! fires its `UserPromptSubmit` when it is queued and nothing when it is
+//! dequeued, so the file's `busy` is the only announcement the flushed turn
+//! ever makes (see `reconcile_activity`). Every other promotion still needs
+//! evidence from outside the file — `promote_stale_background` fires on the
+//! *process tree* disproving a background status, not on a second opinion from
+//! the same file.
 
 use anyhow::{Context, Result};
 use notify::Watcher;
@@ -946,12 +950,16 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         // authoritative on the coarse working/idle/background-shell axis. Runs
         // ONLY on a session-file wake (`session_file_event`) — never in the same
         // iteration as a hook, which just set the status and outranks a possibly
-        // lagging file read (see the flag's declaration). Two jobs:
+        // lagging file read (see the flag's declaration). Three jobs:
         //   - A turn can end with NO hook — an interrupt (Esc) fires no `Stop`, so
         //     `Active` would otherwise stick forever. When the file reports the
         //     agent is at rest, settle `Active` to the rest shape it reports.
         //   - A turn can also end while a `run_in_background` shell keeps running
         //     (`"shell"`), which reads as `BackgroundActive` rather than `Idle`.
+        //   - A turn can equally *start* with no hook: a queued prompt's
+        //     `UserPromptSubmit` fires when it is queued (mid-turn, on a row
+        //     already `Active`), never when it is dequeued, so only the file's
+        //     `busy` marks the flushed turn — which is why `Idle` promotes.
         // The table itself is `reconcile_activity`; the gate below is only an
         // optimization, keeping the read (and, on a background row, the
         // process-tree scan under it) off wakes that could not change anything.
@@ -974,7 +982,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         {
             // Offload the blocking status-file read off the runtime thread. A
             // join error is treated like the read failing (`None`), so the
-            // demote-only refinement holds the status unchanged.
+            // refinement holds the status unchanged.
             activity = tokio::task::spawn_blocking(move || agent.agent_activity(cpid))
                 .await
                 .unwrap_or(None);
@@ -1640,10 +1648,23 @@ fn classify_and_learn(
 /// working/idle/background-shell axis; this is the table that mirrors it (the
 /// call site owns *when* it runs — only on a session-file wake).
 ///
-/// **Demote-only**: hook events own the rest→`Active` direction, so a momentary
-/// or lagging `"busy"` read can never bounce a resting row into `Active`. The
-/// one promotion in the loop is `promote_stale_background`, which turns on
-/// corroborating process-tree evidence rather than on this read alone. An
+/// **`Idle` mirrors both ways.** Hooks normally own the rest→`Active` direction,
+/// but a *queued* prompt has no hook to own it: Claude fires `UserPromptSubmit`
+/// when the message is **queued** — mid-turn, on a row that is already `Active`
+/// — and nothing at all when it is later dequeued. So the turn that starts when
+/// the queue flushes (the previous turn ending, or the user cancelling it with
+/// Esc) announces itself only in the session file, and the boundary is a 10-30ms
+/// `idle` blip immediately followed by `busy`. Demoting on the blip and then
+/// refusing the `busy` that corrects it left the row `Idle` for the whole
+/// queued turn — until some later hook (a `PreToolUse`, or the turn's own
+/// `Stop`) happened to repair it. The file is the authority on this axis in
+/// *both* directions, so `busy` promotes `Idle` back, and the write throttle
+/// swallows the blip entirely.
+///
+/// The other rest states still refuse to promote, each for its own reason: a
+/// background row needs the process tree to corroborate (that is
+/// `promote_stale_background`), and `Compacted` would trade away the compaction
+/// signal — a mid-turn auto-compaction reads `"busy"` by construction. An
 /// unknown/torn read (`None`) always holds.
 ///
 /// Only the working/idle/shell axis is consulted; the fine-grained,
@@ -1666,6 +1687,9 @@ fn reconcile_activity(
         (SessionStatus::Active, Some(AgentActivity::BackgroundShell)) => {
             Some(SessionStatus::BackgroundActive)
         }
+        // Queue flush: a dequeued prompt fires no hook, so the file's `busy` is
+        // the only word that the row is working again.
+        (SessionStatus::Idle, Some(AgentActivity::Working)) => Some(SessionStatus::Active),
         // At rest: track the background shell appearing / clearing.
         (SessionStatus::Idle | SessionStatus::Compacted, Some(AgentActivity::BackgroundShell)) => {
             Some(SessionStatus::BackgroundActive)
@@ -1680,7 +1704,8 @@ fn reconcile_activity(
             SessionStatus::BackgroundServer | SessionStatus::ReviewPending,
             Some(AgentActivity::Idle),
         ) => Some(SessionStatus::Idle),
-        // Working, unknown/torn read (None), or already-consistent: hold.
+        // Working on a background/compacted row, unknown/torn read (None), or
+        // already-consistent: hold.
         _ => None,
     }
 }
@@ -1695,20 +1720,20 @@ fn reconcile_activity(
 /// stale by its own definition. It must be `Active` or `Idle`, and the session
 /// file says which.
 ///
-/// This is the sole exception to the demote-only rule above it, and it does not
-/// weaken it: that rule guards against a *momentary or lagging* `"busy"` read
-/// bouncing a resting row into `Active`, whereas this needs two independent
-/// signals to agree. Both halves are load-bearing:
+/// The mirror above promotes on the file alone only from `Idle`, where a queued
+/// turn leaves it no choice; a background row asserts something the file cannot
+/// see, so this needs two independent signals to agree. Both halves are
+/// load-bearing:
 ///
 /// - `Some(&[])` is "tree read fine, nothing running"; `None` is "couldn't read
 ///   the tree" and must never promote — acting on an unreadable tree is exactly
-///   the spurious bounce the demote-only rule exists to prevent.
+///   the spurious bounce this corroboration exists to prevent.
 /// - `activity` is `None` on any wake that didn't re-read the session file, so a
 ///   stale value can never be mistaken for fresh evidence.
 ///
 /// Without this, a session whose background shell ends *while the agent goes
-/// back to work* has no path back to `Active`: the demote-only table only exits
-/// these states toward `Idle`, and `refine_background_kind` declines to act on
+/// back to work* has no path back to `Active`: the mirror only exits these
+/// states toward `Idle`, and `refine_background_kind` declines to act on
 /// an empty tree. Hooks normally cover the gap in milliseconds, so the hole is
 /// invisible until hooks are missing — a lost socket, a hook binary that can't
 /// run — at which point the row reads `Review`/`Task`/`Server` for every working
@@ -2120,8 +2145,8 @@ mod tests {
         }
     }
 
-    /// The demote-only mirror of the agent's session file, plus the one rest
-    /// status that also takes a background shell.
+    /// The mirror of the agent's session file: demote-only apart from `Idle`,
+    /// plus the one rest status that also takes a background shell.
     #[test]
     fn reconcile_activity_mirrors_the_session_file() {
         use AgentActivity as A;
@@ -2144,11 +2169,20 @@ mod tests {
             assert_eq!(reconcile_activity(&st, Some(A::Idle)), Some(S::Idle));
         }
 
-        // Demote-only: a "busy" read never promotes a resting row to Active
-        // (that's `promote_stale_background`'s job, on corroborated evidence),
-        // and an unknown/torn read holds everything.
-        for st in [S::Idle, S::Compacted, S::BackgroundActive, S::ReviewPending] {
+        // `Idle` is the one rest status a "busy" read promotes: the turn a
+        // queued prompt flushes into announces itself nowhere else.
+        assert_eq!(
+            reconcile_activity(&S::Idle, Some(A::Working)),
+            Some(S::Active)
+        );
+        // Everywhere else a "busy" read still holds — a background row needs
+        // `promote_stale_background`'s corroborating tree, and `Compacted` would
+        // lose the compaction signal to a mid-turn auto-compaction's own `busy`.
+        // An unknown/torn read holds everything, `Idle` included.
+        for st in [S::Compacted, S::BackgroundActive, S::ReviewPending] {
             assert_eq!(reconcile_activity(&st, Some(A::Working)), None);
+        }
+        for st in [S::Idle, S::Compacted, S::BackgroundActive, S::ReviewPending] {
             assert_eq!(reconcile_activity(&st, None), None);
         }
         // The fine-grained hook/transcript-backed states are none of the file's
@@ -2175,6 +2209,37 @@ mod tests {
             Some(S::BackgroundActive)
         );
         assert_eq!(reconcile_activity(&S::Compacted, Some(A::Idle)), None);
+    }
+
+    /// The queue flush, walked end to end. Claude fires `UserPromptSubmit` when
+    /// a prompt is **queued** — mid-turn, on a row that is already `Active` —
+    /// and fires nothing when the queue is later flushed (the turn ending, or
+    /// the user cancelling it with Esc). All the flushed turn writes is the
+    /// session file, and at that boundary it writes `idle` and then `busy`
+    /// ~20ms apart. Mirroring only the first left the row `Idle` for the whole
+    /// queued turn — the reported bug — because the `busy` that corrects it
+    /// arrives as its own wake, and nothing else speaks until that turn's own
+    /// `Stop`.
+    #[test]
+    fn a_queued_turn_recovers_from_the_boundary_idle_blip() {
+        use AgentActivity as A;
+        use SessionStatus as S;
+
+        // Turn 1 ends: the `Stop` hook has already settled the row, and the
+        // file's `idle` write agrees.
+        let mut status = S::Active;
+        if let Some(next) = reconcile_activity(&status, Some(A::Idle)) {
+            status = next;
+        }
+        assert_eq!(status, S::Idle);
+        // ~20ms later the dequeued turn's `busy` write lands. This is the only
+        // notice it gives.
+        if let Some(next) = reconcile_activity(&status, Some(A::Working)) {
+            status = next;
+        }
+        assert_eq!(status, S::Active);
+        // Its own end still settles normally.
+        assert_eq!(reconcile_activity(&status, Some(A::Idle)), Some(S::Idle));
     }
 
     #[test]
@@ -2228,7 +2293,7 @@ mod tests {
         }
     }
 
-    /// The half that protects the demote-only rule. `bg_shells` returns `None`
+    /// The half that protects the corroboration rule. `bg_shells` returns `None`
     /// when the process tree could not be read at all — promoting on that would
     /// be acting on no evidence, which is precisely the spurious bounce into
     /// `Active` the surrounding reconciliation is written to prevent. This is
@@ -2258,7 +2323,7 @@ mod tests {
         assert_eq!(s.status, SessionStatus::ReviewPending);
 
         // Tree is empty, but the agent is at rest or the session file wasn't
-        // re-read this wake (`None`) — the demote-only path owns the exit to
+        // re-read this wake (`None`) — the mirror path owns the exit to
         // `Idle`; promotion must not invent work.
         for activity in [None, Some(AgentActivity::Idle)] {
             let mut s = state_with(SessionStatus::ReviewPending);
