@@ -83,6 +83,9 @@ impl App {
             self.detail_visible = narrow || frame.area().width >= panels.detail_auto_min_width;
             self.panels_initialized = true;
         }
+        // The canonical copy: `draw_table`/`draw_detail` and the mouse
+        // hit-testing in `keys.rs` all read it from here rather than being
+        // handed it, so a third body layout cannot pass the wrong literal.
         self.narrow_layout = narrow;
 
         self.draw_header(frame, header);
@@ -210,8 +213,8 @@ impl App {
             let [table_area, detail_area] =
                 Layout::horizontal([Constraint::Min(30), Constraint::Length(self.detail_width)])
                     .areas(top_area);
-            self.draw_table(frame, table_area, false);
-            self.draw_detail(frame, detail_area, false);
+            self.draw_table(frame, table_area);
+            self.draw_detail(frame, detail_area);
             // Search mode focuses the eye on the session names: dim the whole
             // detail panel alongside the table's non-name columns.
             if self.input_mode == InputMode::Search {
@@ -221,7 +224,7 @@ impl App {
             }
         } else {
             self.last_detail_rect = None;
-            self.draw_table(frame, top_area, false);
+            self.draw_table(frame, top_area);
         }
 
         if let Some(prev) = preview_area {
@@ -272,10 +275,10 @@ impl App {
         ])
         .areas(body);
 
-        self.draw_table(frame, table_area, true);
+        self.draw_table(frame, table_area);
 
         if detail_h > 0 {
-            self.draw_detail(frame, detail_area, true);
+            self.draw_detail(frame, detail_area);
             if self.input_mode == InputMode::Search {
                 frame
                     .buffer_mut()
@@ -1163,7 +1166,8 @@ impl App {
     // The detail panel
     // =============================================================================
 
-    fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
+    fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let narrow = self.narrow_layout;
         self.last_detail_rect = Some(area);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1421,7 +1425,8 @@ impl App {
     // The session table
     // =============================================================================
 
-    fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect, narrow: bool) {
+    fn draw_table(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let narrow = self.narrow_layout;
         self.last_table_rect = Some(area);
         // Chrome above the data rows is the top rule + the table header (2
         // rows); there's no bottom border to subtract now.
