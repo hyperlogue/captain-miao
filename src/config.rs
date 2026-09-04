@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer};
 // The `[launcher]`/`[debug]` sections + the loader path + `debug_enabled` live in
 // core (the launcher/daemon read them too). Re-exported so `config::LauncherConfig`
 // / `config::debug_enabled()` resolve unchanged across the dashboard.
-pub use cm_core::config::{DebugConfig, LauncherConfig, config_path, debug_enabled};
+pub use cm_core::config::{DebugConfig, LauncherConfig, TomlLoad, config_path, debug_enabled};
 
 static CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
 
@@ -236,29 +236,17 @@ impl Config {
     }
 
     fn from_path(path: &Path) -> Self {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return Self::default();
-        };
-        // Parse errors fall back to defaults rather than killing the dashboard;
-        // the user wouldn't see the error because the TUI takes over stderr.
-        // Log via tracing for the launcher log, and also eprintln! because the
-        // first config access can happen before a tracing subscriber exists
-        // (and the dashboard with debug off never installs one).
-        let mut cfg = match toml::from_str::<Self>(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::warn!("Failed to parse {}: {e}", path.display());
-                eprintln!("captain-miao: failed to parse {}: {e}", path.display());
-                // The whole file reverted to defaults — including [keybinds],
-                // colors, and the kitty rc_password. Carry the reason so the
-                // dashboard can surface it in its status line (see field doc).
-                Self {
-                    load_warning: Some(format!(
-                        "config.toml failed to parse (using defaults): {e}"
-                    )),
-                    ..Self::default()
-                }
-            }
+        let mut cfg = match cm_core::config::load_toml_file::<Self>(path) {
+            TomlLoad::Loaded(cfg) => cfg,
+            TomlLoad::Absent => Self::default(),
+            // The whole file reverted to defaults — including [keybinds],
+            // colors, and the kitty rc_password. Carry the reason so the
+            // dashboard can surface it in its status line (see field doc);
+            // `load_toml_file` has already logged it.
+            TomlLoad::Failed(e) => Self {
+                load_warning: Some(format!("config.toml failed to parse (using defaults): {e}")),
+                ..Self::default()
+            },
         };
         cfg.normalize();
         cfg

@@ -76,29 +76,55 @@ pub struct CoreConfig {
     pub debug: DebugConfig,
 }
 
+/// What [`load_toml_file`] found. Three outcomes, because "no file" and
+/// "malformed file" are different things that happen to share a fallback.
+pub enum TomlLoad<T> {
+    Loaded(T),
+    /// No file, or one we cannot read. Not an error — the whole config is
+    /// optional, and every section defaults.
+    Absent,
+    /// Malformed. Already reported; the message is carried for the callers that
+    /// also surface it to the user (the dashboard's startup status line).
+    Failed(String),
+}
+
+/// Read and parse one TOML config file, reporting a parse failure exactly once.
+///
+/// Both `config.toml` loaders — this crate's `CoreConfig` and the dashboard's
+/// fuller `Config` — go through here so the failure policy is stated in one
+/// place: a malformed file **falls back to defaults rather than killing the
+/// process**, because the TUI takes over stderr and a hard failure is a
+/// dashboard that dies with no visible reason.
+///
+/// The report goes to `tracing::warn!` *and* `eprintln!` on purpose: the first
+/// config access can happen before a tracing subscriber exists, and a dashboard
+/// with debug off never installs one.
+pub fn load_toml_file<T: serde::de::DeserializeOwned>(path: &Path) -> TomlLoad<T> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return TomlLoad::Absent;
+    };
+    match toml::from_str::<T>(&content) {
+        Ok(v) => TomlLoad::Loaded(v),
+        Err(e) => {
+            tracing::warn!("Failed to parse {}: {e}", path.display());
+            eprintln!("captain-miao: failed to parse {}: {e}", path.display());
+            TomlLoad::Failed(e.to_string())
+        }
+    }
+}
+
 impl CoreConfig {
     fn load() -> Self {
         Self::load_from(&config_path())
     }
 
     fn load_from(path: &Path) -> Self {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return Self::default();
+        let mut cfg = match load_toml_file::<Self>(path) {
+            TomlLoad::Loaded(cfg) => cfg,
+            TomlLoad::Absent | TomlLoad::Failed(_) => Self::default(),
         };
-        // Parse errors fall back to defaults rather than killing the process;
-        // log via tracing and also eprintln! because the first config access can
-        // happen before a tracing subscriber exists.
-        match toml::from_str::<Self>(&content) {
-            Ok(mut cfg) => {
-                cfg.launcher.migrate_legacy_titles();
-                cfg
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse {}: {e}", path.display());
-                eprintln!("captain-miao: failed to parse {}: {e}", path.display());
-                Self::default()
-            }
-        }
+        cfg.launcher.migrate_legacy_titles();
+        cfg
     }
 }
 
