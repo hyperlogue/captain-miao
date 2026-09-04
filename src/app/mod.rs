@@ -910,18 +910,6 @@ pub(super) struct App {
     /// screen, so a question can never displace an open picker — an unread one
     /// simply waits in the channel.
     pub(super) consent_prompts: tokio::sync::mpsc::UnboundedReceiver<crate::backend::ConsentPrompt>,
-    /// Resumable lists arriving from a background fetch, and the sequence number
-    /// that tells a live one from a stale one.
-    ///
-    /// A remote `ListResumable` is a blocking round trip over ssh; running it on
-    /// the UI thread froze the dashboard for its whole duration, which is what
-    /// made `Ctrl-h` in the resume picker feel broken. The picker now opens
-    /// empty and interactive, and the list lands here when it lands. `seq` is
-    /// bumped per request, so a user who switches hosts twice in a second gets
-    /// the *second* answer, not whichever host replied last.
-    pub(super) resume_loads: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
-    pub(super) resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
-    pub(super) resume_seq: u64,
     /// Hosts held down for the duration of a server upgrade: no backend, no
     /// connection task, no redial. Deliberately **not** the persisted `disabled`
     /// flag — a dashboard that dies mid-upgrade must not leave a host suspended
@@ -931,20 +919,6 @@ pub(super) struct App {
     /// for that host to come back so they can be resumed. Held until the
     /// reconnect edge fires, or until the upgrade reports a failure.
     pub(super) upgrade_restores: HashMap<HostId, Vec<RestoreSpec>>,
-    pub(super) upgrade_reports: tokio::sync::mpsc::UnboundedReceiver<UpgradeReport>,
-    pub(super) upgrade_tx: tokio::sync::mpsc::UnboundedSender<UpgradeReport>,
-    /// Kills coming back from the round trip that carried them, for the same
-    /// reason the resume list does: a remote `KillSession` is an ssh round trip,
-    /// and running it on the UI thread meant `x` froze the dashboard until the
-    /// host answered — the whole span in which the row it killed sat there
-    /// looking alive. The row now goes at the keystroke
-    /// (`Backend::presume_killed`) and the answer lands here, where it is either
-    /// nothing to do or grounds to put the row back.
-    ///
-    /// No sequence number, unlike `resume_loads`: each result names the session
-    /// it belongs to, so two kills in flight can't be confused for one another.
-    pub(super) kill_results: tokio::sync::mpsc::UnboundedReceiver<KillResult>,
-    pub(super) kill_tx: tokio::sync::mpsc::UnboundedSender<KillResult>,
     /// Active directory-mark popup. `Some` iff `input_mode == InputMode::DirEdit`.
     pub(super) dir_edit: Option<DirEditState>,
     /// Active hosts popup. `Some` iff `input_mode == InputMode::HostEdit`.
@@ -1583,9 +1557,6 @@ impl App {
         // immediately, and with no channel set it would (safely) refuse.
         let (consent_tx, consent_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::backend::set_consent_channel(consent_tx);
-        let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
         // Surface config problems the TUI would otherwise hide (it swallows
@@ -1643,15 +1614,8 @@ impl App {
             picker: None,
             pending_confirm: None,
             consent_prompts: consent_rx,
-            resume_loads: resume_rx,
-            resume_tx,
             upgrading: HashSet::new(),
             upgrade_restores: HashMap::new(),
-            upgrade_reports: upgrade_rx,
-            upgrade_tx,
-            kill_results: kill_rx,
-            kill_tx,
-            resume_seq: 0,
             dir_edit: None,
             host_edit: None,
             prefs: None,

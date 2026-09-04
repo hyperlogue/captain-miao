@@ -78,6 +78,66 @@ const DETACH_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// the ~20ms-per-pane `list-panes`.
 const EVIDENCE_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+// =============================================================================
+// The run loop's own state
+// =============================================================================
+
+/// The three background channels the loop owns, and the request generation that
+/// guards one of them.
+///
+/// These lived on `App` only because `App::new` was a convenient place to build
+/// a channel — nothing outside this file ever touched them. Held here instead,
+/// they are the loop's state in the loop's scope, and a fourth channel is one
+/// field rather than one more thing `App` carries for a reader to rule out.
+///
+/// Each `tx` is cloned into the task that will answer; each `rx` is drained by
+/// [`drain_background_results`].
+struct LoopInboxes {
+    /// Resumable lists arriving from a background fetch, and the sequence number
+    /// that tells a live one from a stale one.
+    ///
+    /// A remote `ListResumable` is a blocking round trip over ssh; running it on
+    /// the UI thread froze the dashboard for its whole duration, which is what
+    /// made `Ctrl-h` in the resume picker feel broken. The picker now opens
+    /// empty and interactive, and the list lands here when it lands. `seq` is
+    /// bumped per request, so a user who switches hosts twice in a second gets
+    /// the *second* answer, not whichever host replied last.
+    resume_rx: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
+    resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
+    resume_seq: u64,
+    upgrade_rx: tokio::sync::mpsc::UnboundedReceiver<super::UpgradeReport>,
+    upgrade_tx: tokio::sync::mpsc::UnboundedSender<super::UpgradeReport>,
+    /// Kills coming back from the round trip that carried them, for the same
+    /// reason the resume list does: a remote `KillSession` is an ssh round trip,
+    /// and running it on the UI thread meant `x` froze the dashboard until the
+    /// host answered — the whole span in which the row it killed sat there
+    /// looking alive. The row now goes at the keystroke
+    /// (`Backend::presume_killed`) and the answer lands here, where it is either
+    /// nothing to do or grounds to put the row back.
+    ///
+    /// No sequence number, unlike `resume_rx`: each result names the session it
+    /// belongs to, so two kills in flight can't be confused for one another.
+    kill_rx: tokio::sync::mpsc::UnboundedReceiver<KillResult>,
+    kill_tx: tokio::sync::mpsc::UnboundedSender<KillResult>,
+}
+
+impl LoopInboxes {
+    fn new() -> Self {
+        let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            resume_rx,
+            resume_tx,
+            resume_seq: 0,
+            upgrade_rx,
+            upgrade_tx,
+            kill_rx,
+            kill_tx,
+        }
+    }
+}
+
 /// Whether the detach prune's floor (`DETACH_PRUNE_MIN_INTERVAL`) has elapsed
 /// since its last snapshot. `None` (never pruned) is always due. Pure so the
 /// throttle is unit-tested without a wall clock.
@@ -168,10 +228,10 @@ pub(super) fn prune_detached_from_tabs(app: &mut App, tabs: &[Tab]) -> bool {
 /// [`apply_resume_load`] fills it in when the reply arrives. A **local** host
 /// still resolves inline: it's an in-process directory walk, and routing it
 /// through a task would only add a frame of "Loading…" flicker.
-fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
+fn start_resume_load(app: &mut App, inboxes: &mut LoopInboxes, host: HostId, reseed: bool) {
     let limit = config::get().launcher.resume_list_limit;
-    app.resume_seq += 1;
-    let seq = app.resume_seq;
+    inboxes.resume_seq += 1;
+    let seq = inboxes.resume_seq;
     if reseed {
         app.reseed_resume_picker(host.clone(), Vec::new());
     } else {
@@ -191,14 +251,14 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
         None => {
             let errors = vec![format!("unknown host {}", host.0)];
             let reply = load(host, (Vec::new(), errors));
-            apply_resume_load(app, reply);
+            apply_resume_load(app, inboxes, reply);
         }
         // Remote: hand the blocking round trip to a pool thread. The `Arc` clone
         // is why `Backend::Remote` holds one — a spawned task can't borrow the
         // `App` that owns the backend.
         Some(Backend::Remote(remote)) => {
             let remote = std::sync::Arc::clone(remote);
-            let tx = app.resume_tx.clone();
+            let tx = inboxes.resume_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let listed = remote.list_resumable(limit);
                 let _ = tx.send(load(host, listed));
@@ -207,7 +267,7 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
         Some(backend) => {
             let listed = tokio::task::block_in_place(|| backend.list_resumable(limit));
             let reply = load(host, listed);
-            apply_resume_load(app, reply);
+            apply_resume_load(app, inboxes, reply);
         }
     }
 }
@@ -223,7 +283,7 @@ fn start_resume_load(app: &mut App, host: HostId, reseed: bool) {
 /// The gate is re-checked rather than trusted from the keystroke — a session can
 /// go from idle to working while the confirm sits on screen, and that is exactly
 /// the session this must not take down.
-fn start_host_upgrade(app: &mut App, host: HostId) {
+fn start_host_upgrade(app: &mut App, inboxes: &LoopInboxes, host: HostId) {
     let Some(offer) = app
         .backend_for(&host)
         .and_then(crate::backend::Backend::upgrade_offer)
@@ -261,7 +321,7 @@ fn start_host_upgrade(app: &mut App, host: HostId) {
     app.upgrade_restores.insert(host.clone(), restores);
     app.suspend_for_upgrade(&host);
 
-    let tx = app.upgrade_tx.clone();
+    let tx = inboxes.upgrade_tx.clone();
     let options = config.options.clone();
     let reported = host.clone();
     let version = offer.version.clone();
@@ -326,8 +386,8 @@ fn finish_host_upgrade(app: &mut App, report: super::UpgradeReport) {
 /// the status line — the pre-async behaviour, and there is nothing in an empty
 /// popup to act on — while a failed `Ctrl-h` switch keeps it open on the error
 /// so the next host is one keystroke away.
-fn apply_resume_load(app: &mut App, load: ResumeLoad) {
-    if load.seq != app.resume_seq {
+fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
+    if load.seq != inboxes.resume_seq {
         return;
     }
     if !matches!(
@@ -442,7 +502,13 @@ fn process_is_alive(pid: u32) -> bool {
 /// Returns whether a host was actually asked, so a batch can report an honest
 /// count. Only an unknown `host` (a row whose host has since been removed from
 /// the config — never a guess at `backends[0]`, §9) comes back false.
-fn start_kill(app: &mut App, host: HostId, key: SessionKey, origin: KillOrigin) -> bool {
+fn start_kill(
+    app: &mut App,
+    inboxes: &LoopInboxes,
+    host: HostId,
+    key: SessionKey,
+    origin: KillOrigin,
+) -> bool {
     let Some(backend) = app.backend_for(&host) else {
         app.set_status(format!("Unknown host {}", host.0), true);
         return false;
@@ -455,7 +521,7 @@ fn start_kill(app: &mut App, host: HostId, key: SessionKey, origin: KillOrigin) 
     // owns the backend.
     if let Backend::Remote(remote) = backend {
         let remote = Arc::clone(remote);
-        let tx = app.kill_tx.clone();
+        let tx = inboxes.kill_tx.clone();
         tokio::task::spawn_blocking(move || {
             let outcome = remote.kill_session(&key);
             let _ = tx.send(KillResult {
@@ -1084,14 +1150,14 @@ async fn attach_pool_session(
 ///
 /// Returns whether anything was closed, so the caller can arm the settle reload
 /// that picks up the departed rows (the deadline is the loop's own local).
-fn close_reported_sessions(app: &mut App) -> bool {
+fn close_reported_sessions(app: &mut App, inboxes: &LoopInboxes) -> bool {
     let queued = app.take_due_session_closes(Instant::now());
     if queued.is_empty() {
         return false;
     }
     let mut closed = 0usize;
     for (host, key) in queued {
-        if start_kill(app, host, key, KillOrigin::WindowClosed) {
+        if start_kill(app, inboxes, host, key, KillOrigin::WindowClosed) {
             closed += 1;
         }
     }
@@ -1601,9 +1667,312 @@ async fn reload_pass(
     }
 }
 
+/// Drain everything the loop learns about from somewhere other than the
+/// keyboard, and say whether the frame has to be redrawn.
+///
+/// **The order here is load-bearing, not incidental.** Detach reports run before
+/// the reload block so a retired binding is already gone if a reload runs this
+/// same iteration; kills are drained above the change-signal sweep so a row
+/// restored by an unreachable host is picked up by *this* iteration's reload
+/// rather than the next; the host-panel edge sets `hosts_panel_open` before the
+/// vitals ask reads it. Reordering these is a behaviour change.
+///
+/// Everything here is level-triggered or a `try_recv` — nothing blocks, so a
+/// quiet tick costs one pass of cheap checks.
+async fn drain_background_results(
+    app: &mut App,
+    inboxes: &mut LoopInboxes,
+    detach_reports: &AtomicBool,
+    settle_reload_at: &mut Option<Instant>,
+    fs_dirty: &mut bool,
+    hosts_panel_open: &mut bool,
+) -> bool {
+    let mut redraw = false;
+    // An attach window reporting that its session ended — the event that
+    // makes detachment prompt without polling the window tree (§5). Handled
+    // before the reload block so the retired binding is already gone if a
+    // reload runs this same iteration, and outside it because retiring a
+    // binding needs no session re-read.
+    if detach_reports.swap(false, Ordering::Relaxed)
+        && app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live)
+    {
+        // A report can queue the ended attach's held pane for reaping, and
+        // no reload need run this iteration to drain it.
+        for wid in std::mem::take(&mut app.reap_window_queue) {
+            if let Err(e) = terminal::get().close_window(&wid).await {
+                tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
+            }
+        }
+        redraw = true;
+    }
+    // Sessions whose closed window has now waited out its delay. Checked
+    // every tick rather than beside the report that queued it: the wait is
+    // what makes the queue safe, and it comes due on an iteration that may
+    // carry no report and no reload of its own.
+    if close_reported_sessions(app, inboxes) {
+        arm_settle_reload(settle_reload_at);
+        redraw = true;
+    }
+    // Notice a clipboard server that died and bring it back. One non-blocking
+    // `waitpid` when it's wanted and nothing at all when it isn't — cheap
+    // enough for every tick, and a tick is the only place it can be seen: a
+    // child exiting is not an event any of the channels below carry.
+    app.clipboard_server.poll();
+    // Kills coming back from the hosts that took them. Drained above the
+    // change-signal sweep just below, so a row restored by an unreachable
+    // host is picked up by this iteration's reload rather than the next.
+    while let Ok(result) = inboxes.kill_rx.try_recv() {
+        apply_kill_result(app, result);
+        redraw = true;
+    }
+    // Take each backend's change signal and coalesce (§5). One uniform
+    // question per host: the local backend's watcher fires on every state
+    // file write, a remote's connection task flips it on a pushed
+    // Snapshot/Delta/Removed or a connect/disconnect. A busy session
+    // rewrites its state file on every hook event, so without debouncing a
+    // burst would queue reloads faster than we can service them and lag the
+    // UI by seconds — hence one reload per `reload_min_interval` no matter
+    // how many signals arrived.
+    for events in &app.backend_events {
+        if events.take() {
+            *fs_dirty = true;
+        }
+    }
+    // Host utilisation: asked for only while the panel that displays it is
+    // open, and only every `VITALS_POLL` (each backend throttles itself, so
+    // this can run every iteration). Nothing is measured, sent or woken for
+    // the hours the panel is closed — which is most of them.
+    //
+    // Which is also why *opening* it invalidates: the newest reading a host
+    // has is from the last time the panel was up, and on a dim row there is
+    // nothing to say that was an hour ago. The panel therefore always opens
+    // on the spinner and fills in from the ask below. Done on the edge here
+    // rather than in `open_host_edit` so it can't be missed by a second way
+    // in.
+    let panel_open = app.host_edit.is_some();
+    if panel_open {
+        if !*hosts_panel_open {
+            for backend in &app.backends {
+                backend.invalidate_vitals();
+            }
+        }
+        for backend in &app.backends {
+            backend.poll_vitals();
+        }
+    }
+    *hosts_panel_open = panel_open;
+    // A reply is redraw-only: it changes no row, so it must not reach the
+    // reload path. Taken unconditionally (hence not folded into the `if`
+    // above) so a reply that lands as the panel closes drains here instead
+    // of banking a stale repaint for whenever it next opens.
+    let vitals_moved = app
+        .backend_events
+        .iter()
+        .fold(false, |acc, e| acc | e.take_vitals());
+    if vitals_moved && panel_open {
+        redraw = true;
+    }
+    // Resumable lists finishing their background fetch. Drained
+    // unconditionally: a reply for a picker the user has closed or
+    // re-scoped is discarded inside `apply_resume_load`, so leaving them
+    // queued would only make the *next* picker read a stale answer.
+    while let Ok(load) = inboxes.resume_rx.try_recv() {
+        apply_resume_load(app, inboxes, load);
+        redraw = true;
+    }
+    // Upgrades finishing. Whichever way one went the host goes back on the
+    // air — on the new binary if it landed, on the one it was already
+    // running if it didn't.
+    while let Ok(report) = inboxes.upgrade_rx.try_recv() {
+        finish_host_upgrade(app, report);
+        redraw = true;
+    }
+    redraw
+}
+
+/// Keep the preview pane pointed at the selected session and reasonably fresh.
+///
+/// Three triggers, in the order they have to run: a changed selection retargets
+/// the pane, the auto-refresh interval marks it stale, and the debounce is what
+/// actually fetches — deferred so a held-down `j` does not put a capture between
+/// every keystroke and its echo.
+async fn refresh_preview(
+    app: &mut App,
+    last_detach_prune: &mut Option<Instant>,
+    preview_debounce: Duration,
+) -> bool {
+    let mut redraw = false;
+    // Preview debounce: mark dirty when selection differs from cached preview,
+    // then fetch after a short settle period so rapid navigation doesn't block.
+    let selected_wid = app.selected_window_id();
+    if selected_wid != app.preview_window_id {
+        // Clearing on the transition only — subsequent loop iterations
+        // during the 200ms debounce window would otherwise redraw
+        // continuously without any new content.
+        if app.set_preview_text(None) {
+            redraw = true;
+        }
+        app.preview_scroll = 0;
+        app.preview_h_scroll = 0;
+        if app.preview_dirty_since.is_none() {
+            app.preview_dirty_since = Some(Instant::now());
+        }
+    }
+    // Periodic auto-refresh: while the dashboard has terminal focus and
+    // the user is following the live tail, re-arm the debounced fetch
+    // once per interval so the preview tracks the selected session's
+    // output without manual `R` presses.
+    let preview_auto_refresh = Duration::from_secs(config::get().polling.preview_auto_refresh_secs);
+    if app.wants_preview_auto_refresh(preview_auto_refresh) {
+        app.request_preview_refresh();
+    }
+    if let Some(dirty_at) = app.preview_dirty_since
+        && dirty_at.elapsed() >= preview_debounce
+    {
+        app.preview_dirty_since = None;
+        // A backend that can't capture is never asked to
+        // (`Capabilities::capture` carries why). The window id is still
+        // stamped below, because that is what keeps the selection-mismatch
+        // check above from re-arming the debounce on the very next
+        // iteration; `preview_fetched_at` deliberately is not, so the
+        // auto-refresh timer has nothing to fire on either.
+        if let Some(wid) = selected_wid.as_ref().filter(|_| !app.capabilities.capture) {
+            app.preview_window_id = Some(wid.clone());
+            app.set_preview_text(None);
+        } else if let Some(wid) = selected_wid {
+            app.preview_fetched_at = Some(Instant::now());
+            match terminal::get()
+                .capture_text(&wid, PREVIEW_CAPTURE_LINES)
+                .await
+            {
+                Ok(text) => {
+                    app.set_preview_text(Some(text));
+                    app.preview_window_id = Some(wid);
+                    app.preview_scroll = 0;
+                    app.preview_h_scroll = 0;
+                }
+                // Record the attempted window id even on failure so the
+                // selection-mismatch check above doesn't re-arm
+                // `preview_dirty_since` every loop iteration — which would
+                // re-spawn a `kitten get-text` subprocess every ~200ms for
+                // as long as a dead window stays selected. Clear any stale
+                // text so nothing outdated is shown for the dead window.
+                Err(_) => {
+                    app.set_preview_text(None);
+                    app.preview_window_id = Some(wid);
+                    // A window that won't answer a `get-text`/`dump-screen`
+                    // is usually a window that no longer exists — the second
+                    // free signal (with a failed focus) that a binding may
+                    // be stale. Not proof on its own, so it only arms the
+                    // snapshot-verified prune.
+                    arm_detach_prune(last_detach_prune, Instant::now());
+                }
+            }
+        } else {
+            app.preview_window_id = None;
+            app.set_preview_text(None);
+        }
+        redraw = true;
+    }
+    redraw
+}
+
+/// Redraw reasons that are not events: things whose rendering changes with the
+/// clock rather than with any state the loop was told about.
+///
+/// Each is an edge check against the value last drawn, so a steady screen costs
+/// three comparisons and no frame.
+fn redraw_reasons(
+    app: &App,
+    last_age_label: &mut Option<String>,
+    last_blink_phase: &mut Option<bool>,
+    last_vitals_phase: &mut Option<usize>,
+) -> bool {
+    let mut redraw = false;
+    // Redraw when the preview staleness label changes (at most once a
+    // minute at its resolution). Nothing else triggers a draw on an
+    // otherwise idle dashboard, so the age would freeze on screen.
+    let age_label = app.preview_age_label();
+    if age_label != *last_age_label {
+        *last_age_label = age_label;
+        redraw = true;
+    }
+
+    // A walking cat is client-driven (kitty can't move a placement on its
+    // own), so keep the frame ticking — each redraw calls render_logo_graphics,
+    // which advances the cat — until it leaves the row and clears the flag.
+    if app.cat_walking() {
+        redraw = true;
+    }
+
+    // The header ☁️ blinks while a host is dialing — also client-driven, and
+    // on the same terms as the age label: an idle dashboard draws nothing on
+    // its own, so a frame per *phase flip* is what animates it. Comparing
+    // phases rather than redrawing on "is connecting" keeps that to roughly
+    // one frame a second, and the flip back to `None` repaints the settled
+    // cloud once, lit.
+    let blink_phase = app.connect_blink_phase();
+    if blink_phase != *last_blink_phase {
+        *last_blink_phase = blink_phase;
+        redraw = true;
+    }
+
+    // The hosts panel's utilisation spinner, on exactly those terms: a frame
+    // per phase change while any host is waiting on a reading, and `None`
+    // the rest of the time — including whenever the panel is shut, which is
+    // most of the dashboard's life.
+    let vitals_phase = app.vitals_spinner_phase();
+    if vitals_phase != *last_vitals_phase {
+        *last_vitals_phase = vitals_phase;
+        redraw = true;
+    }
+    redraw
+}
+
+/// How long the loop may sleep before its next pass.
+///
+/// The base is the configured poll interval, tightened while a cat walks so its
+/// motion stays smooth. Each clamp exists because nothing else would wake the
+/// dashboard for that deadline: an armed settle would land a poll interval late,
+/// a session close would fire late, and a dashboard that was only resized would
+/// sit with a blank paw until some unrelated event came along.
+fn next_wakeup(
+    app: &App,
+    event_poll: Duration,
+    settle_reload_at: Option<Instant>,
+    logo_recompose_at: Option<Instant>,
+) -> Duration {
+    // Tick fast while a cat walks so its motion stays smooth; otherwise idle at
+    // the configured poll interval, waking only on input/timers.
+    let mut poll_timeout = if app.cat_walking() {
+        event_poll.min(Duration::from_millis(30))
+    } else {
+        event_poll
+    };
+    // Never sleep past an armed settle deadline, or the post-action reload
+    // would land up to a poll interval late (100ms by default) on top of the
+    // settle itself. A zero timeout just makes `poll` a non-blocking check.
+    if let Some(t) = settle_reload_at {
+        poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
+    }
+    // Nor past a session close coming due, or an idle dashboard would fire
+    // the kill up to a poll interval after the delay it was waiting out.
+    if let Some(t) = app.next_session_close_due() {
+        poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
+    }
+    // Nor past the post-resize logo rebuild: nothing else wakes a dashboard
+    // that was only resized, so the paw would stay blank until some
+    // unrelated event happened along.
+    if let Some(t) = logo_recompose_at {
+        poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
+    }
+    poll_timeout
+}
+
 async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let mut app = start_dashboard().await;
     app.save_session_snapshot();
+    let mut inboxes = LoopInboxes::new();
 
     let cfg = config::get();
     let polling = &cfg.polling;
@@ -1658,105 +2027,15 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             app.invalidate_logo_graphics();
             needs_redraw = true;
         }
-        // An attach window reporting that its session ended — the event that
-        // makes detachment prompt without polling the window tree (§5). Handled
-        // before the reload block so the retired binding is already gone if a
-        // reload runs this same iteration, and outside it because retiring a
-        // binding needs no session re-read.
-        if detach_reports.swap(false, Ordering::Relaxed)
-            && app.apply_detach_reports(state::drain_detach_reports(), ReportOrigin::Live)
-        {
-            // A report can queue the ended attach's held pane for reaping, and
-            // no reload need run this iteration to drain it.
-            for wid in std::mem::take(&mut app.reap_window_queue) {
-                if let Err(e) = terminal::get().close_window(&wid).await {
-                    tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
-                }
-            }
-            needs_redraw = true;
-        }
-        // Sessions whose closed window has now waited out its delay. Checked
-        // every tick rather than beside the report that queued it: the wait is
-        // what makes the queue safe, and it comes due on an iteration that may
-        // carry no report and no reload of its own.
-        if close_reported_sessions(&mut app) {
-            arm_settle_reload(&mut settle_reload_at);
-            needs_redraw = true;
-        }
-        // Notice a clipboard server that died and bring it back. One non-blocking
-        // `waitpid` when it's wanted and nothing at all when it isn't — cheap
-        // enough for every tick, and a tick is the only place it can be seen: a
-        // child exiting is not an event any of the channels below carry.
-        app.clipboard_server.poll();
-        // Kills coming back from the hosts that took them. Drained above the
-        // change-signal sweep just below, so a row restored by an unreachable
-        // host is picked up by this iteration's reload rather than the next.
-        while let Ok(result) = app.kill_results.try_recv() {
-            apply_kill_result(&mut app, result);
-            needs_redraw = true;
-        }
-        // Take each backend's change signal and coalesce (§5). One uniform
-        // question per host: the local backend's watcher fires on every state
-        // file write, a remote's connection task flips it on a pushed
-        // Snapshot/Delta/Removed or a connect/disconnect. A busy session
-        // rewrites its state file on every hook event, so without debouncing a
-        // burst would queue reloads faster than we can service them and lag the
-        // UI by seconds — hence one reload per `reload_min_interval` no matter
-        // how many signals arrived.
-        for events in &app.backend_events {
-            if events.take() {
-                fs_dirty = true;
-            }
-        }
-        // Host utilisation: asked for only while the panel that displays it is
-        // open, and only every `VITALS_POLL` (each backend throttles itself, so
-        // this can run every iteration). Nothing is measured, sent or woken for
-        // the hours the panel is closed — which is most of them.
-        //
-        // Which is also why *opening* it invalidates: the newest reading a host
-        // has is from the last time the panel was up, and on a dim row there is
-        // nothing to say that was an hour ago. The panel therefore always opens
-        // on the spinner and fills in from the ask below. Done on the edge here
-        // rather than in `open_host_edit` so it can't be missed by a second way
-        // in.
-        let panel_open = app.host_edit.is_some();
-        if panel_open {
-            if !hosts_panel_open {
-                for backend in &app.backends {
-                    backend.invalidate_vitals();
-                }
-            }
-            for backend in &app.backends {
-                backend.poll_vitals();
-            }
-        }
-        hosts_panel_open = panel_open;
-        // A reply is redraw-only: it changes no row, so it must not reach the
-        // reload path. Taken unconditionally (hence not folded into the `if`
-        // above) so a reply that lands as the panel closes drains here instead
-        // of banking a stale repaint for whenever it next opens.
-        let vitals_moved = app
-            .backend_events
-            .iter()
-            .fold(false, |acc, e| acc | e.take_vitals());
-        if vitals_moved && panel_open {
-            needs_redraw = true;
-        }
-        // Resumable lists finishing their background fetch. Drained
-        // unconditionally: a reply for a picker the user has closed or
-        // re-scoped is discarded inside `apply_resume_load`, so leaving them
-        // queued would only make the *next* picker read a stale answer.
-        while let Ok(load) = app.resume_loads.try_recv() {
-            apply_resume_load(&mut app, load);
-            needs_redraw = true;
-        }
-        // Upgrades finishing. Whichever way one went the host goes back on the
-        // air — on the new binary if it landed, on the one it was already
-        // running if it didn't.
-        while let Ok(report) = app.upgrade_reports.try_recv() {
-            finish_host_upgrade(&mut app, report);
-            needs_redraw = true;
-        }
+        needs_redraw |= drain_background_results(
+            &mut app,
+            &mut inboxes,
+            &detach_reports,
+            &mut settle_reload_at,
+            &mut fs_dirty,
+            &mut hosts_panel_open,
+        )
+        .await;
         // A host asking whether it may download a server. Only taken while
         // nothing else owns the screen: a question left in the channel simply
         // waits, where popping it here would clobber an open picker or a
@@ -1826,117 +2105,14 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             }
         }
 
-        // Preview debounce: mark dirty when selection differs from cached preview,
-        // then fetch after a short settle period so rapid navigation doesn't block.
-        let selected_wid = app.selected_window_id();
-        if selected_wid != app.preview_window_id {
-            // Clearing on the transition only — subsequent loop iterations
-            // during the 200ms debounce window would otherwise redraw
-            // continuously without any new content.
-            if app.set_preview_text(None) {
-                needs_redraw = true;
-            }
-            app.preview_scroll = 0;
-            app.preview_h_scroll = 0;
-            if app.preview_dirty_since.is_none() {
-                app.preview_dirty_since = Some(Instant::now());
-            }
-        }
-        // Periodic auto-refresh: while the dashboard has terminal focus and
-        // the user is following the live tail, re-arm the debounced fetch
-        // once per interval so the preview tracks the selected session's
-        // output without manual `R` presses.
-        let preview_auto_refresh =
-            Duration::from_secs(config::get().polling.preview_auto_refresh_secs);
-        if app.wants_preview_auto_refresh(preview_auto_refresh) {
-            app.request_preview_refresh();
-        }
-        if let Some(dirty_at) = app.preview_dirty_since
-            && dirty_at.elapsed() >= preview_debounce
-        {
-            app.preview_dirty_since = None;
-            // A backend that can't capture is never asked to
-            // (`Capabilities::capture` carries why). The window id is still
-            // stamped below, because that is what keeps the selection-mismatch
-            // check above from re-arming the debounce on the very next
-            // iteration; `preview_fetched_at` deliberately is not, so the
-            // auto-refresh timer has nothing to fire on either.
-            if let Some(wid) = selected_wid.as_ref().filter(|_| !app.capabilities.capture) {
-                app.preview_window_id = Some(wid.clone());
-                app.set_preview_text(None);
-            } else if let Some(wid) = selected_wid {
-                app.preview_fetched_at = Some(Instant::now());
-                match terminal::get()
-                    .capture_text(&wid, PREVIEW_CAPTURE_LINES)
-                    .await
-                {
-                    Ok(text) => {
-                        app.set_preview_text(Some(text));
-                        app.preview_window_id = Some(wid);
-                        app.preview_scroll = 0;
-                        app.preview_h_scroll = 0;
-                    }
-                    // Record the attempted window id even on failure so the
-                    // selection-mismatch check above doesn't re-arm
-                    // `preview_dirty_since` every loop iteration — which would
-                    // re-spawn a `kitten get-text` subprocess every ~200ms for
-                    // as long as a dead window stays selected. Clear any stale
-                    // text so nothing outdated is shown for the dead window.
-                    Err(_) => {
-                        app.set_preview_text(None);
-                        app.preview_window_id = Some(wid);
-                        // A window that won't answer a `get-text`/`dump-screen`
-                        // is usually a window that no longer exists — the second
-                        // free signal (with a failed focus) that a binding may
-                        // be stale. Not proof on its own, so it only arms the
-                        // snapshot-verified prune.
-                        arm_detach_prune(&mut last_detach_prune, Instant::now());
-                    }
-                }
-            } else {
-                app.preview_window_id = None;
-                app.set_preview_text(None);
-            }
-            needs_redraw = true;
-        }
+        needs_redraw |= refresh_preview(&mut app, &mut last_detach_prune, preview_debounce).await;
 
-        // Redraw when the preview staleness label changes (at most once a
-        // minute at its resolution). Nothing else triggers a draw on an
-        // otherwise idle dashboard, so the age would freeze on screen.
-        let age_label = app.preview_age_label();
-        if age_label != last_age_label {
-            last_age_label = age_label;
-            needs_redraw = true;
-        }
-
-        // A walking cat is client-driven (kitty can't move a placement on its
-        // own), so keep the frame ticking — each redraw calls render_logo_graphics,
-        // which advances the cat — until it leaves the row and clears the flag.
-        if app.cat_walking() {
-            needs_redraw = true;
-        }
-
-        // The header ☁️ blinks while a host is dialing — also client-driven, and
-        // on the same terms as the age label: an idle dashboard draws nothing on
-        // its own, so a frame per *phase flip* is what animates it. Comparing
-        // phases rather than redrawing on "is connecting" keeps that to roughly
-        // one frame a second, and the flip back to `None` repaints the settled
-        // cloud once, lit.
-        let blink_phase = app.connect_blink_phase();
-        if blink_phase != last_blink_phase {
-            last_blink_phase = blink_phase;
-            needs_redraw = true;
-        }
-
-        // The hosts panel's utilisation spinner, on exactly those terms: a frame
-        // per phase change while any host is waiting on a reading, and `None`
-        // the rest of the time — including whenever the panel is shut, which is
-        // most of the dashboard's life.
-        let vitals_phase = app.vitals_spinner_phase();
-        if vitals_phase != last_vitals_phase {
-            last_vitals_phase = vitals_phase;
-            needs_redraw = true;
-        }
+        needs_redraw |= redraw_reasons(
+            &app,
+            &mut last_age_label,
+            &mut last_blink_phase,
+            &mut last_vitals_phase,
+        );
 
         if needs_redraw {
             terminal.draw(|frame| app.draw(frame))?;
@@ -1963,30 +2139,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             last_tab_title = Some(tab_title);
         }
 
-        // Tick fast while a cat walks so its motion stays smooth; otherwise idle at
-        // the configured poll interval, waking only on input/timers.
-        let mut poll_timeout = if app.cat_walking() {
-            event_poll.min(Duration::from_millis(30))
-        } else {
-            event_poll
-        };
-        // Never sleep past an armed settle deadline, or the post-action reload
-        // would land up to a poll interval late (100ms by default) on top of the
-        // settle itself. A zero timeout just makes `poll` a non-blocking check.
-        if let Some(t) = settle_reload_at {
-            poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
-        }
-        // Nor past a session close coming due, or an idle dashboard would fire
-        // the kill up to a poll interval after the delay it was waiting out.
-        if let Some(t) = app.next_session_close_due() {
-            poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
-        }
-        // Nor past the post-resize logo rebuild: nothing else wakes a dashboard
-        // that was only resized, so the paw would stay blank until some
-        // unrelated event happened along.
-        if let Some(t) = logo_recompose_at {
-            poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
-        }
+        let poll_timeout = next_wakeup(&app, event_poll, settle_reload_at, logo_recompose_at);
         if event::poll(poll_timeout)? {
             let evt = event::read()?;
             // Any input event can mutate state (selection, status, input mode,
@@ -2162,10 +2315,10 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::FetchResumeList { host } => {
                         // One host's list, chosen by the persisted default host
                         // and switchable in-picker with `Ctrl-h`.
-                        start_resume_load(&mut app, host, false);
+                        start_resume_load(&mut app, &mut inboxes, host, false);
                     }
                     Action::SwitchResumeHost { host } => {
-                        start_resume_load(&mut app, host, true);
+                        start_resume_load(&mut app, &mut inboxes, host, true);
                     }
                     Action::KillSession {
                         host,
@@ -2179,7 +2332,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // The row goes at this keystroke rather than when the
                         // host gets round to answering; the answer itself lands
                         // in `apply_kill_result`.
-                        start_kill(&mut app, host, key, KillOrigin::Asked);
+                        start_kill(&mut app, &inboxes, host, key, KillOrigin::Asked);
                         if let Some(wid) = window_id {
                             // The signal is on its way; let it land before the
                             // window goes, so the launcher exits on its own and
@@ -2385,7 +2538,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         };
                         app.set_status(msg, ok != total);
                     }
-                    Action::UpgradeHost { host } => start_host_upgrade(&mut app, host),
+                    Action::UpgradeHost { host } => start_host_upgrade(&mut app, &inboxes, host),
                     Action::RestartAll { sessions } => {
                         let total = sessions.len();
                         let mut ok = 0usize;
