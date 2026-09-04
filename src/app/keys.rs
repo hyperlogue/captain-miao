@@ -87,7 +87,8 @@ impl App {
         }
         let pt = (mouse.column, mouse.row);
         let in_logo = self
-            .logo_rect
+            .logo
+            .rect
             .map(|r| r.contains(pt.into()))
             .unwrap_or(false);
         let in_table = self

@@ -364,13 +364,13 @@ impl App {
         // One cell of left padding so the paw isn't jammed against the edge.
         left.push(Span::styled(" ", bar_style()));
         let logo_x = bar.x + 1;
-        if self.logo_caps.is_some() {
+        if self.logo.caps.is_some() {
             left.push(Span::styled(" ".repeat(logo_w as usize), bar_style()));
         } else {
             left.push(Span::raw("🐾"));
         }
         left.push(Span::raw(" "));
-        self.logo_rect = Some(Rect {
+        self.logo.rect = Some(Rect {
             x: logo_x,
             y: bar.y,
             width: logo_w,
@@ -378,7 +378,7 @@ impl App {
         });
         // The blank padding row beneath the bar is the cat's walking track (full
         // width, one cell tall) — empty, so the cat never collides with text.
-        self.cat_track = Some(Rect {
+        self.logo.cat_track = Some(Rect {
             x: area.x,
             y: bar.y + 1,
             width: area.width,

@@ -8386,9 +8386,9 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
 #[test]
 fn resize_invalidation_forces_a_logo_re_upload() {
     let mut d = TestDashboard::new(80, 24);
-    d.app.logo_caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
-    d.app.logo_composed = true;
-    d.app.logo_placed_color = Some(super::logo::PawState::Idle);
+    d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    d.app.logo.composed = true;
+    d.app.logo.placed_color = Some(super::logo::PawState::Idle);
     // A cat mid-walk, its sheet already uploaded.
     d.app.start_logo_anim();
     assert!(d.app.cat_walking(), "precondition: a cat should be walking");
@@ -8396,10 +8396,10 @@ fn resize_invalidation_forces_a_logo_re_upload() {
     d.app.invalidate_logo_graphics();
 
     assert!(
-        !d.app.logo_composed,
+        !d.app.logo.composed,
         "the paws must be re-uploaded, not merely re-placed"
     );
-    assert!(d.app.logo_placed_color.is_none());
+    assert!(d.app.logo.placed_color.is_none());
     // The walk isn't retired — the cat re-transmits its sheet on the next frame
     // rather than finishing its trip invisibly.
     assert!(d.app.cat_walking());

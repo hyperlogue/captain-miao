@@ -1118,39 +1118,8 @@ pub(super) struct App {
     pub(super) last_table_rect: Option<Rect>,
     pub(super) last_preview_rect: Option<Rect>,
     pub(super) last_detail_rect: Option<Rect>,
-    /// Cell pixel size when the terminal can render kitty graphics, else `None`
-    /// (the header draws the emoji-paw fallback). Recomputed on resize.
-    pub(super) logo_caps: Option<crate::terminal::graphics::CellSize>,
-    /// Screen cells the header paw occupies; the click hit-test (M2) and the
-    /// graphics placement both read it. Set by `draw_header` each frame.
-    pub(super) logo_rect: Option<Rect>,
-    /// Whether the three animated paws (one kitty image per status colour) are
-    /// composed and uploaded. Done once; reset across terminal re-inits (which drop
-    /// kitty images).
-    pub(super) logo_composed: bool,
-    /// Which status colour's paw image is currently placed, so an unrelated redraw
-    /// doesn't re-place (which would disturb a running pulse) — only a genuine
-    /// colour change swaps the displayed image. `None` = nothing placed yet.
-    pub(super) logo_placed_color: Option<logo::PawState>,
-    /// A click is waiting to fire its one-shot pulse on the next render. Set by the
-    /// click handler, consumed (and cleared) by `render_logo_graphics`.
-    pub(super) logo_pulse_pending: bool,
-    /// The paw's RGB tints indexed by `PawState` (idle/active/attention), seeded
-    /// from `DEFAULT_PAW_COLORS` and overlaid at startup with the terminal's own
-    /// palette so the paw matches the Sessions status symbols. Baked into the frames.
-    pub(super) paw_colors: [(u8, u8, u8); 3],
-    /// Cats currently walking the padding row — each paw click spawns one (up to a
-    /// pool cap), so several can trot at once. Client-driven: `render_cat_walk`
-    /// advances them from wall-clock elapsed, and the run loop ticks fast while any
-    /// are live (see `App::cat_walking`).
-    pub(super) cats: Vec<logo::CatWalk>,
-    /// The cat's four common tints (error/active/attention/selection), resolved from
-    /// the terminal palette at startup; a walk picks one at random (or, rarely, a
-    /// fixed special colour). See `logo::probe_logo_colors`.
-    pub(super) cat_colors: [(u8, u8, u8); 4],
-    /// The header's blank padding row (full width, one cell tall) the cat walks
-    /// across. Set by `draw_header` each frame; `None` before the first draw.
-    pub(super) cat_track: Option<Rect>,
+    /// The header paw and its cats — see [`logo::LogoState`].
+    pub(super) logo: logo::LogoState,
     pub(super) detail_width: u16,
     pub(super) preview_height: u16,
     /// Whether the last frame used the narrow vertical-stack layout (body width
@@ -1720,15 +1689,7 @@ impl App {
             last_table_rect: None,
             last_preview_rect: None,
             last_detail_rect: None,
-            logo_caps: crate::terminal::graphics::capability(),
-            logo_rect: None,
-            logo_composed: false,
-            logo_placed_color: None,
-            logo_pulse_pending: false,
-            paw_colors: logo::probed_paw_colors(),
-            cats: Vec::new(),
-            cat_track: None,
-            cat_colors: logo::probed_cat_colors(),
+            logo: logo::LogoState::new(),
             detail_width: crate::config::get().ui.panels.detail_default_width,
             preview_height: 0,
             narrow_layout: false,

@@ -2044,7 +2044,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     // drag-resize from re-uploading per event. (Graphics capability
                     // is fixed for the process on kitty, so this never needs to tear
                     // down.)
-                    app.logo_caps = terminal::graphics::capability();
+                    app.logo.caps = terminal::graphics::capability();
                     arm_logo_recompose(&mut logo_recompose_at);
                     None
                 }

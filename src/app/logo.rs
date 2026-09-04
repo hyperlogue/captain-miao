@@ -164,14 +164,14 @@ impl App {
     /// graphics (the emoji fallback doesn't animate); a no-op otherwise. The click
     /// event triggers a redraw, so `render_logo_graphics` fires it promptly.
     pub(super) fn start_logo_anim(&mut self) {
-        if self.logo_caps.is_some() {
-            self.logo_pulse_pending = true;
+        if self.logo.caps.is_some() {
+            self.logo.pulse_pending = true;
             // Same click also sends a cat trotting across the padding row, tinted to
             // a fresh random colour (its sheet is uploaded on the first render). A
             // click while earlier cats are still walking spawns *another* one — until
             // the pool is full, in which case the click just pulses the paw.
             if let Some(image_id) = self.alloc_cat_image_id() {
-                self.cats.push(CatWalk {
+                self.logo.cats.push(CatWalk {
                     started: Instant::now(),
                     color: self.pick_cat_color(),
                     image_id,
@@ -184,7 +184,7 @@ impl App {
     /// Lowest free image id in the cat pool (`None` when all `CAT_MAX` are in use).
     fn alloc_cat_image_id(&self) -> Option<u32> {
         (CAT_IMAGE_ID..CAT_IMAGE_ID + CAT_MAX)
-            .find(|id| self.cats.iter().all(|c| c.image_id != *id))
+            .find(|id| self.logo.cats.iter().all(|c| c.image_id != *id))
     }
 
     /// Pick this walk's cat tint: usually one of the four common dashboard colours
@@ -194,13 +194,13 @@ impl App {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| (d.as_secs() << 32) ^ d.subsec_nanos() as u64);
-        select_cat_color(splitmix64(seed), self.cat_colors)
+        select_cat_color(splitmix64(seed), self.logo.cat_colors)
     }
 
     /// Whether a cat is mid-walk, so the run loop ticks fast enough to animate it
     /// (it's client-driven — see the module docs). False once it leaves the row.
     pub(super) fn cat_walking(&self) -> bool {
-        !self.cats.is_empty()
+        !self.logo.cats.is_empty()
     }
 
     /// Render the paw on the header via kitty graphics, called once per frame
@@ -210,28 +210,28 @@ impl App {
     /// terminal can't do graphics (the header drew the emoji) or the rect is
     /// unknown.
     pub(super) fn render_logo_graphics(&mut self) {
-        let Some(rect) = self.logo_rect else {
+        let Some(rect) = self.logo.rect else {
             return;
         };
-        if self.logo_caps.is_none() {
-            self.logo_pulse_pending = false;
+        if self.logo.caps.is_none() {
+            self.logo.pulse_pending = false;
             // No graphics → nothing to walk, and this early return skips
             // `render_cat_walk`; without clearing here `cat_walking()` would pin the
             // run loop at its fast walk tick forever.
-            self.cats.clear();
+            self.logo.cats.clear();
             return;
         }
 
         // Compose the three animated paws once (a base frame plus the pulse frames,
         // per status colour, parked stopped on frame 1). The cat sheet isn't composed
         // here — its colour is random per walk, so it's uploaded in `render_cat_walk`.
-        if !self.logo_composed {
+        if !self.logo.composed {
             if PAW_STATES
                 .into_iter()
-                .all(|s| compose_paw(paw_image_id(s), self.paw_colors[s as usize]))
+                .all(|s| compose_paw(paw_image_id(s), self.logo.paw_colors[s as usize]))
             {
-                self.logo_composed = true;
-                self.logo_placed_color = None;
+                self.logo.composed = true;
+                self.logo.placed_color = None;
             } else {
                 return; // compose/upload failed — retry next frame
             }
@@ -240,20 +240,20 @@ impl App {
         // Show the current status colour, swapping which image is placed on a
         // change (and dropping the previous one so it doesn't linger underneath).
         let state = self.logo_state();
-        if self.logo_placed_color != Some(state)
+        if self.logo.placed_color != Some(state)
             && graphics::place(&paw_placement(paw_image_id(state), rect)).is_ok()
         {
-            if let Some(prev) = self.logo_placed_color {
+            if let Some(prev) = self.logo.placed_color {
                 let _ = graphics::delete_placements(paw_image_id(prev));
             }
-            self.logo_placed_color = Some(state);
+            self.logo.placed_color = Some(state);
         }
 
         // Fire the pulse on the shown colour; kitty runs PULSE_LOOPS loops from
         // here and settles on the resting frame.
-        if self.logo_pulse_pending {
+        if self.logo.pulse_pending {
             let _ = graphics::play_loops(paw_image_id(state), PULSE_LOOPS);
-            self.logo_pulse_pending = false;
+            self.logo.pulse_pending = false;
         }
 
         // Advance a walking cat across the padding row (client-driven).
@@ -268,21 +268,21 @@ impl App {
     /// until the click). Called from `render_logo_graphics` (so `logo_caps`/
     /// `logo_composed` already hold). A no-op when no cats are walking.
     fn render_cat_walk(&mut self) {
-        if self.cats.is_empty() {
+        if self.logo.cats.is_empty() {
             return;
         }
         // The padding row spans the full header width; without it (pre-first-draw)
         // there's nowhere to walk, so drop the walk rather than guess.
-        let Some(track) = self.cat_track else {
-            self.cats.clear();
+        let Some(track) = self.logo.cat_track else {
+            self.logo.cats.clear();
             return;
         };
-        let cell_w = self.logo_caps.map_or(1, |c| c.w).max(1) as u32;
+        let cell_w = self.logo.caps.map_or(1, |c| c.w).max(1) as u32;
         let track_px = track.width as u32 * cell_w;
 
         // Image ids of cats that finished this frame (to free after the loop).
         let mut finished: Vec<u32> = Vec::new();
-        for cat in &mut self.cats {
+        for cat in &mut self.logo.cats {
             // Position first, from monotonic elapsed (cells/s → px/ms), split into a
             // whole cell column and a sub-cell offset for smooth motion between
             // cells. Deciding this *before* the upload means a cat always retires
@@ -335,7 +335,7 @@ impl App {
             for id in &finished {
                 let _ = graphics::free_image(*id);
             }
-            self.cats.retain(|c| !finished.contains(&c.image_id));
+            self.logo.cats.retain(|c| !finished.contains(&c.image_id));
         }
     }
 
@@ -355,9 +355,9 @@ impl App {
     /// A cat mid-walk is only marked for re-upload, not retired: it re-transmits
     /// its sheet on the next frame and finishes its walk visibly.
     pub(super) fn invalidate_logo_graphics(&mut self) {
-        self.logo_composed = false;
-        self.logo_placed_color = None;
-        for cat in &mut self.cats {
+        self.logo.composed = false;
+        self.logo.placed_color = None;
+        for cat in &mut self.logo.cats {
             cat.transmitted = false;
         }
     }
@@ -386,7 +386,7 @@ impl App {
         // gating on `logo_composed`: a compose that failed partway (some ids
         // uploaded, the flag still false) would otherwise strand those images in
         // kitty until the window closes. `a=d` on an unknown id is silent (q=2).
-        if self.logo_caps.is_some() {
+        if self.logo.caps.is_some() {
             for s in PAW_STATES {
                 let _ = graphics::free_image(paw_image_id(s));
             }
@@ -397,10 +397,10 @@ impl App {
                 let _ = graphics::free_image(id);
             }
         }
-        self.logo_composed = false;
-        self.logo_placed_color = None;
-        self.logo_pulse_pending = false;
-        self.cats.clear();
+        self.logo.composed = false;
+        self.logo.placed_color = None;
+        self.logo.pulse_pending = false;
+        self.logo.cats.clear();
     }
 }
 
@@ -622,6 +622,72 @@ fn ansi_palette_index(color: Color) -> Option<u8> {
         Color::Indexed(n) => n,
         _ => return None,
     })
+}
+
+// =============================================================================
+// The header paw's own state
+// =============================================================================
+
+/// Everything the header paw and its cats need, held as one `App` field.
+///
+/// Nine fields on `App` said "logo" in their names because there was nothing
+/// else to say it; here the type says it and the names shed the prefix. Three
+/// of them (`pulse_pending`, `paw_colors`, `cat_colors`) are read nowhere but
+/// this module, which is only visible now that they are not sitting in a
+/// 98-field struct every file in `app` can see.
+pub(crate) struct LogoState {
+    /// Cell pixel size when the terminal can render kitty graphics, else `None`
+    /// (the header draws the emoji-paw fallback). Recomputed on resize.
+    pub(in crate::app) caps: Option<crate::terminal::graphics::CellSize>,
+    /// Screen cells the header paw occupies; the click hit-test (M2) and the
+    /// graphics placement both read it. Set by `draw_header` each frame.
+    pub(in crate::app) rect: Option<Rect>,
+    /// Whether the three animated paws (one kitty image per status colour) are
+    /// composed and uploaded. Done once; reset across terminal re-inits (which drop
+    /// kitty images).
+    pub(in crate::app) composed: bool,
+    /// Which status colour's paw image is currently placed, so an unrelated redraw
+    /// doesn't re-place (which would disturb a running pulse) — only a genuine
+    /// colour change swaps the displayed image. `None` = nothing placed yet.
+    pub(in crate::app) placed_color: Option<PawState>,
+    /// A click is waiting to fire its one-shot pulse on the next render. Set by the
+    /// click handler, consumed (and cleared) by `render_logo_graphics`.
+    pub(in crate::app) pulse_pending: bool,
+    /// The paw's RGB tints indexed by `PawState` (idle/active/attention), seeded
+    /// from `DEFAULT_PAW_COLORS` and overlaid at startup with the terminal's own
+    /// palette so the paw matches the Sessions status symbols. Baked into the frames.
+    pub(in crate::app) paw_colors: [(u8, u8, u8); 3],
+    /// Cats currently walking the padding row — each paw click spawns one (up to a
+    /// pool cap), so several can trot at once. Client-driven: `render_cat_walk`
+    /// advances them from wall-clock elapsed, and the run loop ticks fast while any
+    /// are live (see `App::cat_walking`).
+    pub(in crate::app) cats: Vec<CatWalk>,
+    /// The cat's four common tints (error/active/attention/selection), resolved from
+    /// the terminal palette at startup; a walk picks one at random (or, rarely, a
+    /// fixed special colour). See `logo::probe_logo_colors`.
+    pub(in crate::app) cat_colors: [(u8, u8, u8); 4],
+    /// The header's blank padding row (full width, one cell tall) the cat walks
+    /// across. Set by `draw_header` each frame; `None` before the first draw.
+    pub(in crate::app) cat_track: Option<Rect>,
+}
+
+impl LogoState {
+    /// Probes the terminal: graphics capability and the palette the paw and cat
+    /// tints are baked from. Not `Default` for that reason — it is a startup
+    /// action, not a zero value.
+    pub(crate) fn new() -> Self {
+        Self {
+            caps: crate::terminal::graphics::capability(),
+            rect: None,
+            composed: false,
+            placed_color: None,
+            pulse_pending: false,
+            paw_colors: probed_paw_colors(),
+            cats: Vec::new(),
+            cat_track: None,
+            cat_colors: probed_cat_colors(),
+        }
+    }
 }
 
 // =============================================================================
