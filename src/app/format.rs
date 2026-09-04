@@ -907,33 +907,6 @@ pub(super) fn truncate_str(s: &str, max: usize) -> String {
     out
 }
 
-/// Minimal standard-base64 encoder (RFC 4648, with `=` padding). Kept
-/// dependency-free since the crate's only base64 need is wrapping a session id
-/// for the OSC 52 clipboard escape, and those inputs are tiny.
-pub(super) fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 /// A rect centred in `area`, sized as a percentage of it — the geometry every
 /// modal overlay is drawn into.
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

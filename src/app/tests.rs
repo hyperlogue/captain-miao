@@ -4,7 +4,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use crate::state::{LauncherState, SessionStatus};
 use crate::terminal::{TabId, TabInfo, TabTarget, WindowId};
 
-use super::format::{ansi_to_lines, base64_encode, default_dir_emoji_and_color, format_coarse_age};
+use super::format::{ansi_to_lines, default_dir_emoji_and_color, format_coarse_age};
 use super::{Action, App, Cursor, InputMode};
 
 // =============================================================================
@@ -7759,23 +7759,6 @@ fn the_override_indent_is_the_width_the_status_column_reserves() {
 // =============================================================================
 // Copying to the clipboard
 // =============================================================================
-
-#[test]
-fn base64_encode_matches_known_vectors() {
-    // RFC 4648 §10 test vectors plus the padding boundaries.
-    assert_eq!(base64_encode(b""), "");
-    assert_eq!(base64_encode(b"f"), "Zg==");
-    assert_eq!(base64_encode(b"fo"), "Zm8=");
-    assert_eq!(base64_encode(b"foo"), "Zm9v");
-    assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-    assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-    assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    // A realistic session id (uuid) round-trips to the expected encoding.
-    assert_eq!(
-        base64_encode(b"1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"),
-        "MWI5ZDZiY2QtYmJmZC00YjJkLTliNWQtYWI4ZGZiYmQ0YmVk",
-    );
-}
 
 #[test]
 fn y_copies_selected_session_id() {

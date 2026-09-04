@@ -722,8 +722,9 @@ fn try_cli_copy(bin: &str, args: &[&str], text: &str) -> Option<std::io::Result<
 /// visible output, so writing it between the key event and the next ratatui
 /// frame doesn't disturb the rendered screen.
 fn emit_osc52(text: &str) -> std::io::Result<()> {
+    use base64::Engine as _;
     use std::io::Write;
-    let encoded = super::format::base64_encode(text.as_bytes());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let mut stdout = std::io::stdout();
     // OSC 52: ESC ] 52 ; c ; <base64> BEL  — `c` targets the clipboard selection.
     write!(stdout, "\x1b]52;c;{encoded}\x07")?;
