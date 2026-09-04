@@ -201,10 +201,12 @@ state files owner-only via `write_json_atomic`. No new IPC. No
    (0600), not `CAPTAIN_MIAO_RC_PASSWORD`.
 
 10. **No `[terminal] backend` override.** `detect_backend` is enough.
-    Drop the panel row. Leave the TOML key in the parser with
-    `#[serde(default)]` so an existing file still loads, but the
-    dashboard ignores it (or keep honouring TOML for one release —
-    **ignore it**. Auto-detect only).
+    Drop the panel row. The TOML key is gone from the parser too:
+    keeping it only *validated* the value, and a whole-file fallback
+    on a parse error meant a typo discarded everything else in the
+    file. `Config` has no `deny_unknown_fields`, so an older file
+    with a leftover `backend` still loads — which was the whole point
+    of keeping it.
 
 11. **Watch TOML and overrides.** Echo of our own overrides write is
     skipped with `WRITE_GEN`. TOML we never write, so no echo there.

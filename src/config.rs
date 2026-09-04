@@ -171,8 +171,6 @@ impl Drop for ConfigSlotGuard {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Terminal-backend selection. `backend` is parsed for Home Manager
-    /// compatibility but ignored at runtime — auto-detect is the only mechanism.
     pub terminal: TerminalConfig,
     pub kitty: KittyConfig,
     pub colors: ColorsConfig,
@@ -281,23 +279,26 @@ impl Config {
 // terminal
 // =============================================================================
 
-/// Terminal-backend selection. `backend` is ignored at runtime (auto-detect
-/// only). Kitty-specific knobs stay under `[kitty]`.
+/// Kitty-specific knobs stay under `[kitty]`.
+///
+/// There is deliberately no `backend` key: auto-detect
+/// ([`crate::terminal::detect_backend`]) is the only mechanism, and a key that
+/// merely *validated* was worse than none — `Config::from_path` turns any parse
+/// error into a whole-file fallback, so a typo'd backend discarded the user's
+/// colors, keybinds and `rc_password` for a setting nothing read. Dropping the
+/// field is what keeps an older file loading: `Config` has no
+/// `deny_unknown_fields`, so serde ignores a leftover `backend` outright.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
-    pub backend: Option<ConfiguredBackend>,
     /// Initial session layout: `"stacked"` or `"per-tab"`. Unset ⇒ stacked.
     /// Dashboard overrides win over this value.
     pub sessions_layout: Option<crate::terminal::SessionsLayout>,
 }
 
-/// A `[terminal] backend` value. Serde-renamed so the config reads
-/// `backend = "kitty"` / `"zellij"` / `"tmux"` / `"ghostty"` / `"iterm"`; any
-/// other string fails the parse loudly (the loader logs it and falls back to
-/// defaults) rather than silently picking a backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Which terminal the dashboard is driving — the result of
+/// [`crate::terminal::detect_backend`], never a config value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfiguredBackend {
     Kitty,
     Zellij,
@@ -624,26 +625,6 @@ mod tests {
     fn keybinds_default_is_empty() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.keybinds.is_empty());
-    }
-
-    #[test]
-    fn terminal_backend_parses_and_defaults() {
-        // Unset → None. A set value is stored but ignored at runtime.
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.terminal.backend, None);
-        // Explicit lowercase values still parse (Home Manager may write them).
-        let cfg: Config = toml::from_str("[terminal]\nbackend = \"zellij\"").unwrap();
-        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Zellij));
-        let cfg: Config = toml::from_str("[terminal]\nbackend = \"kitty\"").unwrap();
-        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Kitty));
-        let cfg: Config = toml::from_str("[terminal]\nbackend = \"tmux\"").unwrap();
-        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Tmux));
-        let cfg: Config = toml::from_str("[terminal]\nbackend = \"ghostty\"").unwrap();
-        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Ghostty));
-        let cfg: Config = toml::from_str("[terminal]\nbackend = \"iterm\"").unwrap();
-        assert_eq!(cfg.terminal.backend, Some(ConfiguredBackend::Iterm));
-        // An unknown value fails the parse loudly rather than being ignored.
-        assert!(toml::from_str::<Config>("[terminal]\nbackend = \"wezterm\"").is_err());
     }
 
     #[test]

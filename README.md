@@ -337,9 +337,8 @@ captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml`
 
 ```toml
 [terminal]
-backend = "kitty"            # "kitty" | "ghostty" | "iterm" | "zellij" | "tmux"; unset
-                             # auto-detects (zellij, then tmux, then iTerm2/Ghostty,
-                             # else Kitty)
+# The terminal itself is auto-detected (zellij, then tmux, then iTerm2/Ghostty,
+# else Kitty); there is no key to pin it.
 sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this;
                              # tmux, Ghostty and iTerm2 are always per-tab)
 
