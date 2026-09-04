@@ -170,23 +170,17 @@ impl AgentControl {
         }
     }
 
-    /// Parse the `--agent` flag / config value. Mirrors `cli_subcommand`.
+    /// Parse the `--agent` flag / config value: the inverse of
+    /// [`cli_subcommand`](Self::cli_subcommand), *derived* from it rather than
+    /// restated, so a new backend cannot land with a name that renders but does
+    /// not parse.
     ///
     /// Never yields `Unknown`: a name this build can't drive stays `None` so the
-    /// caller reports it, rather than launching into an inert backend.
+    /// caller reports it, rather than launching into an inert backend. That now
+    /// falls out of the search space — [`ALL`](Self::ALL) omits `Unknown`.
     pub fn from_cli(s: &str) -> Option<AgentControl> {
-        match s.to_ascii_lowercase().as_str() {
-            "claude" => Some(AgentControl::Claude),
-            "codex" => Some(AgentControl::Codex),
-            "reasonix" => Some(AgentControl::Reasonix),
-            "kimi" => Some(AgentControl::Kimi),
-            "grok" => Some(AgentControl::Grok),
-            "opencode" => Some(AgentControl::OpenCode),
-            "pi" => Some(AgentControl::Pi),
-            "antigravity" => Some(AgentControl::Antigravity),
-            "omp" => Some(AgentControl::Omp),
-            _ => None,
-        }
+        let s = s.to_ascii_lowercase();
+        Self::ALL.iter().copied().find(|a| a.cli_subcommand() == s)
     }
 
     /// Whether this agent's binary resolves on `$PATH`.
