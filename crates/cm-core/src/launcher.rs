@@ -1273,6 +1273,14 @@ async fn rescan_transcript(
         // Only the two at-rest states promote: `Waiting*` is the user's own
         // turn to act and outranks a transcript read, and every busy state
         // already says what this would.
+        //
+        // This state set is deliberately **wider** than the one
+        // `reconcile_activity` promotes, and the difference is the evidence,
+        // not an oversight. A turn-open marker is specific: it cannot be
+        // anything but a new turn, so it may promote `Compacted`. The session
+        // file's `busy` is coarse — a mid-turn auto-compaction reads `busy` by
+        // construction — so it may not. Keep them different for that reason or
+        // change both, but do not "align" them.
         if matches!(state.status, SessionStatus::Idle | SessionStatus::Compacted) {
             state.status = SessionStatus::Active;
             state.last_tool = None;
@@ -1532,7 +1540,7 @@ fn classify_and_learn(
 /// when the message is **queued** — mid-turn, on a row that is already `Active`
 /// — and nothing at all when it is later dequeued. So the turn that starts when
 /// the queue flushes (the previous turn ending, or the user cancelling it with
-/// Esc) announces itself only in the session file, and the boundary is a 10-30ms
+/// Esc) announces itself only in the session file, and the boundary is a ~20ms
 /// `idle` blip immediately followed by `busy`. Demoting on the blip and then
 /// refusing the `busy` that corrects it left the row `Idle` for the whole
 /// queued turn — until some later hook (a `PreToolUse`, or the turn's own
@@ -2049,10 +2057,21 @@ mod tests {
         // `promote_stale_background`'s corroborating tree, and `Compacted` would
         // lose the compaction signal to a mid-turn auto-compaction's own `busy`.
         // An unknown/torn read holds everything, `Idle` included.
-        for st in [S::Compacted, S::BackgroundActive, S::ReviewPending] {
+        for st in [
+            S::Compacted,
+            S::BackgroundActive,
+            S::BackgroundServer,
+            S::ReviewPending,
+        ] {
             assert_eq!(reconcile_activity(&st, Some(A::Working)), None);
         }
-        for st in [S::Idle, S::Compacted, S::BackgroundActive, S::ReviewPending] {
+        for st in [
+            S::Idle,
+            S::Compacted,
+            S::BackgroundActive,
+            S::BackgroundServer,
+            S::ReviewPending,
+        ] {
             assert_eq!(reconcile_activity(&st, None), None);
         }
         // The fine-grained hook/transcript-backed states are none of the file's

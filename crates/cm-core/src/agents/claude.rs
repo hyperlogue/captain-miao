@@ -1519,8 +1519,13 @@ pub fn scan_transcript_signals(path: &Path, offset: u64) -> TranscriptScan {
         new_offset: delta.new_offset,
         interrupted,
         compact_aborted,
-        // Claude opens every turn with a `UserPromptSubmit` hook, so there is
-        // no hookless turn start to report and nothing that would make one.
+        // `turn_started` stays false — not because Claude has no hookless turn
+        // start (a *dequeued* queued prompt is exactly one: `UserPromptSubmit`
+        // fired when it was queued, mid-turn, and fires nothing when it is
+        // flushed), but because the transcript is the wrong witness for it.
+        // Claude announces that turn in its **session file**, as a `busy` read,
+        // and `launcher::reconcile_activity` is what promotes on it. Reporting
+        // it from here too would be a second answer to one question.
         ..TranscriptScan::default()
     }
 }
@@ -1858,6 +1863,29 @@ mod tests {
         let scan = scan_transcript_signals(&path, 0);
         assert!(scan.compact_aborted);
         assert!(!scan.interrupted);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Claude's hookless turn start is real — a dequeued queued prompt — but the
+    /// transcript is the wrong witness for it, and this scanner must not become a
+    /// second one. The session file's `busy` read is what promotes that row
+    /// (`launcher::reconcile_activity`); reporting the same turn from here would
+    /// be two answers to one question, promoting a *wider* set of states than the
+    /// file's coarser evidence licenses.
+    #[test]
+    fn scan_signals_never_reports_a_turn_start() {
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[]}}"#,
+            "\n",
+        );
+        let path = write_tmp("scan_no_turn_start", body);
+        let scan = scan_transcript_signals(&path, 0);
+        assert!(
+            !scan.turn_started,
+            "Claude's turn starts are the session file's to report, not this scan's"
+        );
         let _ = std::fs::remove_file(path);
     }
 

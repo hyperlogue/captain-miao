@@ -632,6 +632,15 @@ pub enum SessionStatus {
     Active,
     Compacting,
     Compacted,
+    /// The agent's turn has ended and nothing it spawned is still running.
+    ///
+    /// The **only** rest status the agent's own session file may promote back to
+    /// `Active` on its own word (`launcher::reconcile_activity`). It has to be:
+    /// a *queued* prompt's `UserPromptSubmit` fires when the prompt is queued —
+    /// mid-turn, on a row already `Active` — and nothing fires when it is later
+    /// dequeued, so the turn a flushed queue starts is announced nowhere but
+    /// that file. Every other promotion needs corroboration from outside it (see
+    /// `launcher::promote_stale_background`).
     Idle,
     /// The agent's turn has ended (it would be `Idle`) but a **short-term**
     /// `run_in_background` shell it spawned is still running — a build/test/step
