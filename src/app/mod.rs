@@ -30,6 +30,7 @@
 mod bindings;
 mod draw;
 mod format;
+mod host_edit;
 mod hosts;
 mod keybind_log;
 mod keymap;
@@ -40,6 +41,11 @@ mod picker;
 mod prefs;
 mod render_backend;
 mod run;
+
+/// The hosts panel's types stay reachable as `super::X` from every module
+/// that already named them; the panel owns them, `mod.rs` no longer declares
+/// them.
+pub(in crate::app) use host_edit::{HostEditState, HostField, HostLogLine, HostRow, UpgradePrompt};
 
 pub use run::{read_dashboard_window_id, run};
 
@@ -593,113 +599,6 @@ pub(super) enum DirEditFocus {
     Color,
 }
 
-/// Active hosts popup (`input_mode == InputMode::HostEdit`). A working copy of
-/// the host list edited in place; committed (and the backends rebuilt) on save,
-/// discarded on cancel.
-#[derive(Debug)]
-pub(super) struct HostEditState {
-    pub(in crate::app) rows: Vec<HostRow>,
-    /// Selected row (`0..rows.len()`), or `rows.len()` for the "+ add" line.
-    pub(in crate::app) cursor: usize,
-    /// `Some` while the selected row's fields have the keyboard — see
-    /// [`RowEdit`]. `None` in the list. Drawn as a card over the list rather
-    /// than inside it, so this is what dims the panel behind it too.
-    pub(in crate::app) edit: Option<RowEdit>,
-    /// The row a `d` press is asking about — the removal confirm (§9). `None`
-    /// when nothing is pending.
-    pub(in crate::app) pending_remove: Option<usize>,
-    /// What a `u` press put on screen — a question to answer, or a refusal to
-    /// acknowledge. Kept beside `pending_remove` rather than folded into the
-    /// global [`PendingConfirm`] because that one switches `InputMode`, which
-    /// would tear this panel down mid-question.
-    pub(in crate::app) pending_upgrade: Option<UpgradePrompt>,
-    /// The connection log open over the list (`l`). `Some` replaces the list
-    /// view entirely — it wants the whole popup, since the text it exists to
-    /// show is what didn't fit on a row.
-    pub(in crate::app) log_view: Option<HostLogView>,
-}
-
-/// The hosts panel's row editor: which field has the keyboard, and what `Esc`
-/// puts back.
-///
-/// One `Option` rather than an `editing` flag beside a focus and a snapshot: an
-/// entry point that set two of the three and forgot the third would compile,
-/// and the one it would forget is the snapshot — which is the difference
-/// between `Esc` restoring a mistyped target and losing the old one. There are
-/// three entry points (`a`, `e`/`Enter`, and the `^`-key that opens the editor
-/// on a named field), so that is a live risk rather than a hypothetical one.
-#[derive(Debug)]
-pub(in crate::app) struct RowEdit {
-    pub(in crate::app) focus: HostField,
-    pub(in crate::app) origin: EditOrigin,
-}
-
-/// What `Esc` undoes in the hosts panel's row editor.
-///
-/// The panel has no Save step — a commit persists immediately (§9) — so its
-/// counterpart has to be a real cancel, and a cancel needs the pre-edit
-/// contents from somewhere. A row the edit *created* has none: abandoning it
-/// removes it again, which is also what stops a half-typed `(unnamed)` row from
-/// lingering in the list until the panel is reopened.
-#[derive(Debug)]
-pub(in crate::app) enum EditOrigin {
-    Existing(HostRow),
-    Added,
-}
-
-impl HostEditState {
-    /// Start editing the selected row on `focus`, recording what `Esc` restores.
-    pub(in crate::app) fn begin_edit(&mut self, focus: HostField) {
-        let Some(row) = self.rows.get(self.cursor) else {
-            return;
-        };
-        self.edit = Some(RowEdit {
-            focus,
-            origin: EditOrigin::Existing(row.clone()),
-        });
-    }
-
-    /// Append a blank row and edit it from the Label field. `Esc` removes it
-    /// again — an empty row is not a host, and never became one on disk
-    /// ([`App::apply_host_edits`] filters it), so leaving it in the list would
-    /// only be a lie about what is configured.
-    pub(in crate::app) fn begin_new_row(&mut self) {
-        self.rows.push(HostRow::default());
-        self.cursor = self.rows.len() - 1;
-        self.edit = Some(RowEdit {
-            focus: HostField::Label,
-            origin: EditOrigin::Added,
-        });
-    }
-
-    /// Abandon the edit in progress, restoring what was there before it.
-    /// Persists nothing: no mutation reaches disk between `begin_edit` and the
-    /// commit, so putting the row back is the whole of the undo.
-    pub(in crate::app) fn cancel_edit(&mut self) {
-        let Some(edit) = self.edit.take() else {
-            return;
-        };
-        match edit.origin {
-            EditOrigin::Existing(row) => {
-                if let Some(slot) = self.rows.get_mut(self.cursor) {
-                    *slot = row;
-                }
-            }
-            EditOrigin::Added => {
-                if self.cursor < self.rows.len() {
-                    self.rows.remove(self.cursor);
-                }
-                self.cursor = self.cursor.min(self.rows.len());
-            }
-        }
-    }
-
-    /// The field with the keyboard, or `None` in the list.
-    pub(in crate::app) fn focus(&self) -> Option<HostField> {
-        self.edit.as_ref().map(|e| e.focus)
-    }
-}
-
 /// One session an upgrade will kill, recorded so it can be brought back on the
 /// other side of the restart.
 ///
@@ -724,126 +623,6 @@ pub(super) struct UpgradeReport {
     /// `None` on success. On failure this is what the host said, and the host
     /// comes back up on whatever it was already running.
     pub(super) error: Option<String>,
-}
-
-/// The line a `u` press leaves in the hosts panel.
-///
-/// One type for both outcomes because they render identically and are dismissed
-/// identically; only `actionable` decides whether `y` does anything. Keeping the
-/// refusal on screen matters — this panel has no status line (its footer is key
-/// hints), so a message set anywhere else would surface stale, after the panel
-/// closed, or not at all.
-#[derive(Debug)]
-pub(super) struct UpgradePrompt {
-    pub(in crate::app) row: usize,
-    pub(in crate::app) text: String,
-    /// `false` for a refusal: any key dismisses it and nothing happens.
-    pub(in crate::app) actionable: bool,
-}
-
-/// One rendered line of a host's connection log — see [`App::host_log_lines`].
-#[derive(Debug, Clone)]
-pub(super) struct HostLogLine {
-    /// How long ago the entry happened, on its **first** line only; `None` on
-    /// the continuation lines of a multi-line entry.
-    pub(super) age: Option<String>,
-    pub(super) error: bool,
-    pub(super) text: String,
-}
-
-/// The hosts panel's connection-log view (`l`), scrolled over one host's
-/// [`ConnLogEntry`](crate::backend::ConnLogEntry) list.
-#[derive(Debug)]
-pub(super) struct HostLogView {
-    pub(in crate::app) host: HostId,
-    /// First visible line, counted in *physical* lines — a host's multi-line
-    /// refusal scrolls like the paragraph it is, not as one indivisible entry.
-    pub(in crate::app) scroll: usize,
-    /// Content rows the last draw had. Recorded there because `G` and PageDown
-    /// need a viewport height, and the popup's size is only known while
-    /// rendering; 0 until the first frame, which just makes those keys no-ops
-    /// for one frame.
-    pub(in crate::app) rows: usize,
-}
-
-/// One editable host row in the popup.
-///
-/// The four text fields are [`TextInput`](picker::TextInput)s rather than bare
-/// `String`s. They hold ssh targets and argument lines long enough that fixing a
-/// typo in the middle has to be possible, which needs a cursor — and the widget
-/// that has one already backs every picker's query and the directory-mark
-/// editor's icon field, so the readline keys are the same ones here.
-#[derive(Debug, Clone, Default)]
-pub(super) struct HostRow {
-    pub(in crate::app) label: picker::TextInput,
-    /// ssh target (`user@host`) or, when `is_socket`, a socket path.
-    pub(in crate::app) target: picker::TextInput,
-    pub(in crate::app) is_socket: bool,
-    /// Per-host emoji shown beside the workdir icon, picked with the same
-    /// searchable picker as the workdir marks. Empty = derive one from the label.
-    pub(in crate::app) icon: picker::TextInput,
-    /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
-    pub(in crate::app) disabled: bool,
-    /// ssh arguments as one line of text — see [`hosts::HostConfig::options`].
-    /// Edited as text rather than as a list of rows because the whole set is
-    /// nearly always one or two arguments, and a sub-list inside a popup row
-    /// would need its own cursor, its own add/remove keys and its own footer.
-    pub(in crate::app) options: picker::TextInput,
-    /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
-    /// A form field, toggled with `Space`: the panel's plain letters are for
-    /// things you do *to* a row (connect, delete, upgrade), and this is part of
-    /// what a host **is**, like its options. Being a field also means it shows its
-    /// own state — `[off]` is visible the moment the editor opens, where a list
-    /// key was only discoverable from the footer.
-    pub(in crate::app) clipboard: bool,
-}
-
-impl HostRow {
-    /// The `HostId` this row configures — its label, trimmed exactly as
-    /// [`App::apply_host_edits`] trims it on the way to disk, so a lookup
-    /// against the live backends matches a row still being typed.
-    pub(in crate::app) fn host(&self) -> HostId {
-        HostId(self.label.text().trim().to_string())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// One editable field of a host's row in the hosts panel. The order here is the
-/// order Tab walks them in.
-pub(super) enum HostField {
-    Label,
-    Target,
-    Options,
-    Icon,
-    /// The one field with nothing to type — see [`HostRow::clipboard`].
-    Clipboard,
-}
-
-impl HostField {
-    /// Form order — the order the fields are drawn in, which is the order the
-    /// focus keys walk, and what the editor's card measures itself from: the
-    /// widest hint over these fields sets its width and the count sets its
-    /// height, so a sixth field changes the box without anyone resizing it.
-    ///
-    /// `Clipboard` is last rather than beside `Options`, where it belongs by
-    /// meaning: the four text fields keep the Tab positions fingers already know,
-    /// and `^e`'s "open the editor on Icon" stays the fourth stop it names.
-    const ORDER: [HostField; 5] = [
-        HostField::Label,
-        HostField::Target,
-        HostField::Options,
-        HostField::Icon,
-        HostField::Clipboard,
-    ];
-
-    /// The next field, forwards or back. Wraps: the form is a ring, so
-    /// overshooting the last field costs one more press either way.
-    pub(in crate::app) fn step(self, forward: bool) -> Self {
-        let n = Self::ORDER.len();
-        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
-        let next = if forward { i + 1 } else { i + n - 1 };
-        Self::ORDER[next % n]
-    }
 }
 
 /// What one host's backend is built *from*, and the unit the reconcile in
