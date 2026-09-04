@@ -117,34 +117,13 @@ impl ZellijTerminal {
         })
     }
 
+    /// Actions cost ~18ms except `list-panes`, which is ~20ms *per pane*
+    /// server-side — the reason `run_capture`'s timing exists, and the reason
+    /// AGENTS.md forbids that one call on a hot path.
     async fn zellij_cmd(&self, args: &[&str]) -> Result<String> {
-        let started = std::time::Instant::now();
-        let output = Command::new("zellij")
-            .env("ZELLIJ_SESSION_NAME", &self.session)
-            .arg("action")
-            .args(args)
-            .output()
-            .await
-            .context("Failed to run zellij")?;
-        // Per-call timing in the debug log: zellij actions are ~18ms except
-        // `list-panes`, which costs ~20ms *per pane* server-side — this is
-        // how a hot path that regressed onto it gets spotted.
-        tracing::debug!(
-            "zellij action {} took {:?}",
-            args.join(" "),
-            started.elapsed()
-        );
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "zellij action {} failed: {}",
-                args.first().unwrap_or(&""),
-                stderr.trim()
-            );
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let mut cmd = Command::new("zellij");
+        cmd.env("ZELLIJ_SESSION_NAME", &self.session).arg("action");
+        super::run_capture("zellij action", cmd, args).await
     }
 
     /// The full pane list as raw JSON values, terminal panes only (plugin panes

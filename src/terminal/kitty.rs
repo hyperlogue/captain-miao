@@ -56,7 +56,7 @@ fn listen_on() -> Option<String> {
 /// a timeout by dropping the future: `kill_on_drop` is what makes that reap the
 /// child instead of leaving an orphaned `kitten` blocked on kitty's permission
 /// prompt. Every other call site awaits to completion, where it's inert.
-fn kitten_command(args: &[&str]) -> Result<Command> {
+fn kitten_command() -> Result<Command> {
     let listen_on = listen_on().context("KITTY_LISTEN_ON not set")?;
     let cfg = config::get();
 
@@ -67,27 +67,12 @@ fn kitten_command(args: &[&str]) -> Result<Command> {
         .arg("--password-env")
         .arg(RC_PASSWORD_ENV)
         .env(RC_PASSWORD_ENV, &cfg.kitty.rc_password)
-        .args(args)
         .kill_on_drop(true);
     Ok(cmd)
 }
 
 async fn kitten_cmd(args: &[&str]) -> Result<String> {
-    let output = kitten_command(args)?
-        .output()
-        .await
-        .context("Failed to run kitten")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "kitten @ {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    super::run_capture("kitten @", kitten_command()?, args).await
 }
 
 /// Validate a window/tab id before it is interpolated into a kitty `--match`

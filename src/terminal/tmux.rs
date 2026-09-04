@@ -137,30 +137,12 @@ impl TmuxTerminal {
         })
     }
 
+    /// Nothing here measured worse than ~4ms, `list-panes` included — the
+    /// timing `run_capture` logs is a regression tripwire, not a live cost.
     async fn tmux_cmd(&self, args: &[&str]) -> Result<String> {
-        let started = std::time::Instant::now();
-        let output = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.socket)
-            .args(args)
-            .output()
-            .await
-            .context("Failed to run tmux")?;
-        // Per-call timing in the debug log, mirroring the zellij backend: this is
-        // how a hot path that regressed onto an expensive command gets spotted.
-        // On tmux nothing measured worse than ~4ms, `list-panes` included.
-        tracing::debug!("tmux {} took {:?}", args.join(" "), started.elapsed());
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "tmux {} failed: {}",
-                args.first().unwrap_or(&""),
-                stderr.trim()
-            );
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let mut cmd = Command::new("tmux");
+        cmd.arg("-S").arg(&self.socket);
+        super::run_capture("tmux", cmd, args).await
     }
 
     /// Pin a window's title against later renaming. An explicit `-n` already

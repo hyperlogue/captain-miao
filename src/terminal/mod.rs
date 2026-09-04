@@ -391,6 +391,46 @@ pub fn list_tabs(tabs: &[Tab]) -> Vec<TabInfo> {
 /// integers and the only untrusted source is its own state files, so anything
 /// else is rejected rather than mis-targeted. The backend wrappers
 /// ([`kitty::match_id`], [`zellij::digits_id`]) carry the per-backend rationale.
+/// Run one terminal-control command to completion: time it, fail with the
+/// tool's own stderr, and hand back its stdout.
+///
+/// `label` is how the tool names itself to a user — `"tmux"`, `"zellij
+/// action"`, `"kitten @"` — and is what both the timing line and the error are
+/// phrased in terms of. `cmd` carries the invocation's fixed prefix (a socket,
+/// a subcommand, the rc credentials); `args` is the call itself, appended here
+/// so the same slice can name the call in both messages.
+///
+/// Every backend's control commands go through here, which is what makes the
+/// per-call timing uniform: a hot path that regressed onto an expensive command
+/// shows up in the debug log whichever emulator you are on. What that costs
+/// differs per backend and is noted at each call site -- zellij's `list-panes`
+/// is the one that bites.
+async fn run_capture(
+    label: &str,
+    mut cmd: tokio::process::Command,
+    args: &[&str],
+) -> Result<String> {
+    use anyhow::Context as _;
+    let started = std::time::Instant::now();
+    let output = cmd
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("Failed to run {label}"))?;
+    tracing::debug!("{label} {} took {:?}", args.join(" "), started.elapsed());
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{label} {} failed: {}",
+            args.first().unwrap_or(&""),
+            stderr.trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn validate_id<'a>(id: &'a str, backend: &str) -> Result<&'a str> {
     if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
         Ok(id)
