@@ -36,14 +36,14 @@ use crate::config;
 use crate::state::{HostId, LauncherState, SessionStatus};
 
 use super::format::{
-    DIR_COLORS, ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH,
-    ansi_to_lines, bar_segments, bar_style, centered_rect, clear_overlay, context_pressure_style,
-    dir_icon_width, elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens,
-    hint_badge, hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans,
-    pill, session_display_name, truncate_str,
+    ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH, ansi_to_lines,
+    bar_segments, bar_style, centered_rect, clear_overlay, context_pressure_style, dir_icon_width,
+    elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
+    hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans, pill,
+    session_display_name, truncate_str,
 };
 use super::keymap::Command;
-use super::{App, DirEditFocus, HostTally, InputMode, PickerKind, split_worktree};
+use super::{App, HostTally, InputMode, PickerKind, split_worktree};
 
 impl App {
     // =============================================================================
@@ -300,135 +300,6 @@ impl App {
     // =============================================================================
     // Overlays: directory marks, hosts, confirm
     // =============================================================================
-
-    fn draw_dir_edit(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(state) = self.dir_edit.as_ref() else {
-            return;
-        };
-        // 35% height accounts for the 16-name color palette wrapping onto a
-        // second visual line on narrow popups.
-        let popup = centered_rect(80, 35, area);
-        clear_overlay(frame, popup);
-
-        let preview_color = DIR_COLORS[state.color_idx].1;
-        let custom = state.custom.text();
-        let preview_icon: String = if custom.trim().is_empty() {
-            self.effective_dir_mark(&state.cwd).0
-        } else {
-            custom.to_string()
-        };
-        // Taken before the preview moves into the title: it is a property of the
-        // icon the mark will actually wear, default included.
-        let color_is_inert = super::format::icon_is_emoji(&preview_icon);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(vec![
-                Span::styled(" Directory Mark  ", Style::default().bold()),
-                Span::styled(
-                    preview_icon,
-                    Style::default()
-                        .fg(preview_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-            ]));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-
-        let [path_area, custom_area, color_area, help_area] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ])
-        .areas(inner);
-
-        let path_display = self.shorten_path(&state.cwd).into_owned();
-        let path_line = Line::from(vec![
-            Span::styled("Path  ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw(path_display),
-        ]);
-        frame.render_widget(Paragraph::new(path_line), path_area);
-
-        let row_label = |focused: bool, label: &'static str| {
-            Span::styled(
-                if focused {
-                    format!("\u{276F} {label}  ")
-                } else {
-                    format!("  {label}  ")
-                },
-                Style::default().add_modifier(Modifier::DIM),
-            )
-        };
-
-        let custom_focus = state.focus == DirEditFocus::Custom;
-        let custom_inner_color = if custom.trim().is_empty() {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(preview_color)
-        };
-        let inner_text = if custom.trim().is_empty() && !custom_focus {
-            Span::styled(
-                format!("(emoji or up to {ICON_SLOT_WIDTH} chars — empty = default)"),
-                Style::default().add_modifier(Modifier::DIM),
-            )
-        } else {
-            Span::styled(custom.to_string(), custom_inner_color)
-        };
-        let mut custom_spans = vec![
-            row_label(custom_focus, "Icon "),
-            Span::raw("[ "),
-            inner_text,
-        ];
-        if custom_focus {
-            custom_spans.push(Span::styled(
-                "_",
-                Style::default().add_modifier(Modifier::REVERSED),
-            ));
-        }
-        custom_spans.push(Span::raw(" ]"));
-        // Advertise the emoji picker only while the icon field is focused,
-        // since that's the only place Ctrl-E is bound.
-        if custom_focus {
-            custom_spans.push(Span::styled(
-                "   ^E emoji picker",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Line::from(custom_spans)), custom_area);
-
-        let color_focus = state.focus == DirEditFocus::Color;
-        let mut color_spans: Vec<Span<'static>> = vec![row_label(color_focus, "Color")];
-        // Said on the row it applies to, and only while it is true — switching
-        // to a text icon is answered by the caveat going away. It rides the
-        // label rather than taking a line of its own because this popup's
-        // layout is already tight on a short terminal. The *default* mark is an
-        // emoji too, so an untouched directory opens straight into this, which
-        // is exactly when the colour keys would otherwise look broken.
-        if color_is_inert {
-            color_spans.push(Span::styled(
-                "(no effect on emoji) ",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        for (i, (name, color)) in DIR_COLORS.iter().enumerate() {
-            let mut style = Style::default().fg(*color);
-            if i == state.color_idx {
-                style = style.add_modifier(Modifier::REVERSED);
-            }
-            color_spans.push(Span::styled(format!(" {name} "), style));
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(color_spans)).wrap(Wrap { trim: false }),
-            color_area,
-        );
-
-        let help = Paragraph::new(vec![Line::from(Span::styled(
-            "Tab/↑↓ switch row   ←→/h/l color   ^E emoji picker   Enter save   r reset   Esc cancel",
-            Style::default().add_modifier(Modifier::DIM),
-        ))]);
-        frame.render_widget(help, help_area);
-    }
 
     fn draw_confirm(&self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(pending) = self.pending_confirm.as_ref() else {

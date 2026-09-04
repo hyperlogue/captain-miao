@@ -24,10 +24,9 @@ use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::{HostId, SessionStatus};
 use crate::terminal::TabTarget;
 
-use super::format::{DIR_COLORS, ICON_SLOT_WIDTH};
 use super::keymap::{Chord, Command};
 use super::picker::{PickerEvent, TextInputEvent};
-use super::{Action, App, DirEditFocus, DragTarget, InputMode, PickerKind, SessionFlag};
+use super::{Action, App, DragTarget, InputMode, PickerKind, SessionFlag};
 
 /// Max gap between two left-clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
@@ -1109,96 +1108,6 @@ impl App {
 
     // =============================================================================
     // The hosts panel
-    // =============================================================================
-
-    fn handle_dir_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
-        // Esc and Enter are unconditional — even with the text row focused
-        // they should close / commit, not get inserted as text.
-        match key.code {
-            KeyCode::Esc => {
-                self.cancel_dir_edit();
-                return None;
-            }
-            KeyCode::Enter => {
-                self.commit_dir_edit();
-                return None;
-            }
-            _ => {}
-        }
-
-        // `r` resets the override only when Color is focused, so a future
-        // third focus mode is opt-in instead of inheriting the reset bind.
-        let focus = self.dir_edit.as_ref()?.focus;
-        if matches!(key.code, KeyCode::Char('r')) && focus == DirEditFocus::Color {
-            self.reset_dir_edit();
-            return None;
-        }
-
-        // Ctrl-E from the icon field opens the searchable emoji picker. The
-        // field is at most a few cells, so shadowing readline's end-of-line
-        // here costs nothing. Intercept before TextInput consumes it.
-        if focus == DirEditFocus::Custom
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('e'))
-        {
-            self.open_emoji_picker();
-            return None;
-        }
-
-        // Tab/↑/↓/^n/^p toggle focus. j/k are reserved for text input — binding
-        // them here would let the user *enter* Custom but never *leave* it;
-        // ^n/^p carry no such cost, since `TextInput` leaves them alone
-        // precisely so a list around it can have them.
-        let switches_row = matches!(
-            key.code,
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
-        ) || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('n' | 'p')));
-        let s = self.dir_edit.as_mut()?;
-        if switches_row {
-            s.focus = match s.focus {
-                DirEditFocus::Custom => DirEditFocus::Color,
-                DirEditFocus::Color => DirEditFocus::Custom,
-            };
-            return None;
-        }
-
-        match s.focus {
-            DirEditFocus::Color => {
-                let len = DIR_COLORS.len();
-                match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        s.color_idx = if s.color_idx == 0 {
-                            len - 1
-                        } else {
-                            s.color_idx - 1
-                        };
-                    }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        s.color_idx = (s.color_idx + 1) % len;
-                    }
-                    _ => {}
-                }
-            }
-            DirEditFocus::Custom => {
-                // Post-hoc width cap (revert on overrun) instead of pre-check
-                // so paste / multi-byte input still goes through TextInput's
-                // normal handling first.
-                let prev = s.custom.text().to_string();
-                let evt = s.custom.handle_key(key);
-                if matches!(evt, TextInputEvent::Changed) {
-                    use unicode_width::UnicodeWidthStr;
-                    if s.custom.text().width() > ICON_SLOT_WIDTH {
-                        s.custom.set_text(prev);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    // =============================================================================
-    // Message log, help, confirm
     // =============================================================================
 
     /// Scroll keys for the message log. Reading, not editing, so the bindings

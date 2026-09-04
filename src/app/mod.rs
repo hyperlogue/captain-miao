@@ -28,6 +28,7 @@
 //! marking dirty.
 
 mod bindings;
+mod dir_edit;
 mod draw;
 mod format;
 mod host_edit;
@@ -45,6 +46,7 @@ mod run;
 /// The hosts panel's types stay reachable as `super::X` from every module
 /// that already named them; the panel owns them, `mod.rs` no longer declares
 /// them.
+pub(in crate::app) use dir_edit::{DirEditFocus, DirEditState};
 pub(in crate::app) use host_edit::{HostEditState, HostField, HostLogLine, HostRow, UpgradePrompt};
 
 pub use run::{read_dashboard_window_id, run};
@@ -580,23 +582,6 @@ pub(super) struct WorkTabEntry {
     /// the legacy id + title validation.
     #[serde(default)]
     pub window_id: Option<WindowId>,
-}
-
-/// Active state for the directory-mark popup editor. `Some` iff
-/// `input_mode == InputMode::DirEdit`.
-#[derive(Debug)]
-pub(super) struct DirEditState {
-    pub(in crate::app) cwd: String,
-    pub(in crate::app) color_idx: usize,
-    pub(in crate::app) custom: self::picker::TextInput,
-    pub(in crate::app) focus: DirEditFocus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// Which field of the directory-mark popup has the cursor.
-pub(super) enum DirEditFocus {
-    Custom,
-    Color,
 }
 
 /// One session an upgrade will kill, recorded so it can be brought back on the
