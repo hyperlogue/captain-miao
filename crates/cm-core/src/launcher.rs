@@ -542,6 +542,57 @@ impl Drop for CleanupGuard {
 // Hook events -> state
 // =============================================================================
 
+/// Coalesces state-file writes: an observable change schedules a trailing flush
+/// [`WRITE_THROTTLE`](Self::WRITE_THROTTLE) out, so a burst of hook/transcript
+/// updates lands as one write — and one dashboard fan-out — rather than one per
+/// event. Real-time-ness isn't a requirement here; a sub-second settle is fine.
+///
+/// The pair is a type because it carries an invariant the loop used to maintain
+/// by hand across three separate sites: **a deadline is only ever set on a dirty
+/// throttle**. Set one without the flag and the elapsed deadline flushes
+/// nothing while still counting as armed, so the *next* change rides a deadline
+/// that already passed and writes immediately — silently defeating the
+/// coalescing this exists for. Going through [`mark`](Self::mark) is what makes
+/// that unrepresentable.
+#[derive(Default)]
+struct WriteThrottle {
+    dirty: bool,
+    /// Read directly by the `select!` timer arm, which has to await it; every
+    /// *mutation* goes through a method, which is what holds the invariant.
+    flush_at: Option<tokio::time::Instant>,
+}
+
+impl WriteThrottle {
+    const WRITE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Record an observable change. `now` forces an immediate flush, overriding
+    /// a pending trailing deadline; otherwise a later change inside the window
+    /// rides the deadline already set (that is the coalescing).
+    fn mark(&mut self, now: bool) {
+        self.dirty = true;
+        if now {
+            self.flush_at = Some(tokio::time::Instant::now());
+        } else if self.flush_at.is_none() {
+            self.flush_at = Some(tokio::time::Instant::now() + Self::WRITE_THROTTLE);
+        }
+    }
+
+    /// Whether to write now — the deadline has passed, whether the timer arm
+    /// woke us or a later event arrived after it elapsed.
+    fn flush_due(&self) -> bool {
+        self.dirty
+            && self
+                .flush_at
+                .is_some_and(|d| tokio::time::Instant::now() >= d)
+    }
+
+    /// Called after a successful write; re-arms the throttle for the next change.
+    fn flushed(&mut self) {
+        self.dirty = false;
+        self.flush_at = None;
+    }
+}
+
 async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mut LauncherState) {
     let agent = state.agent;
     // Watch the agent's transcript file instead of polling. For Claude,
@@ -627,13 +678,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     let approval_grace =
         std::time::Duration::from_secs(crate::config::get().launcher.approval_grace_secs);
 
-    // Coalesce state-file writes: an observable change schedules a trailing flush
-    // `WRITE_THROTTLE` out, so a burst of hook/transcript updates lands as one
-    // write — and one dashboard fan-out — rather than one per event. Real-time-ness
-    // isn't a requirement here; a sub-second settle is fine.
-    const WRITE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut dirty = false;
-    let mut flush_at: Option<tokio::time::Instant> = None;
+    let mut throttle = WriteThrottle::default();
 
     // A background command the seed heuristic didn't recognize is treated as a
     // busy transient task — but if it keeps running past this threshold it's
@@ -916,7 +961,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             }
             // Debounced-write deadline. Wakes the loop with no event so the flush
             // block below can persist a pending change once the burst has settled.
-            _ = sleep_until_opt(flush_at) => {}
+            _ = sleep_until_opt(throttle.flush_at) => {}
             // Held-Stop confirmation deadline. The block below re-asks the
             // agent whether the turn it promised is still coming; nothing else
             // would ever wake a row holding Active on a promise that lapsed.
@@ -1107,23 +1152,13 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 
         if state_changed {
             state.updated_at = LauncherState::now();
-            dirty = true;
-            if state.status.needs_attention() && !was_attention {
-                // Switched into an actionable state — flush now (overriding any
-                // pending trailing deadline) so the prompt isn't held back.
-                flush_at = Some(tokio::time::Instant::now());
-            } else if flush_at.is_none() {
-                // Schedule a trailing flush; a later change within the window
-                // rides the same deadline (coalesced).
-                flush_at = Some(tokio::time::Instant::now() + WRITE_THROTTLE);
-            }
+            // Switching into an actionable state flushes now, overriding any
+            // pending trailing deadline, so the prompt isn't held back.
+            throttle.mark(state.status.needs_attention() && !was_attention);
         }
-        // Flush once the debounce deadline has passed — whether the timer arm
-        // woke us or a later event arrived after it elapsed.
-        if dirty && flush_at.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        if throttle.flush_due() {
             let _ = state.write();
-            dirty = false;
-            flush_at = None;
+            throttle.flushed();
         }
         // Lifecycle of the poll-backed transcript watch (Codex on macOS — see
         // `AgentControl::transcript_poll_interval`): it runs only while the
@@ -1648,6 +1683,34 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant the type exists for: a marked throttle always has a
+    /// deadline, so an armed deadline can never outlive the flag. Left to the
+    /// loop, setting one without the other made the next change ride an
+    /// already-elapsed deadline and write immediately, defeating the coalescing.
+    #[tokio::test]
+    async fn marking_always_arms_a_deadline() {
+        let mut t = WriteThrottle::default();
+        assert!(!t.dirty && t.flush_at.is_none());
+        assert!(!t.flush_due(), "a clean throttle never flushes");
+
+        t.mark(false);
+        assert!(t.dirty && t.flush_at.is_some());
+        assert!(!t.flush_due(), "the trailing deadline has not passed yet");
+
+        // A later change inside the window rides the same deadline.
+        let first = t.flush_at;
+        t.mark(false);
+        assert_eq!(t.flush_at, first, "coalesced onto the existing deadline");
+
+        // An actionable state overrides it and flushes now.
+        t.mark(true);
+        assert!(t.flush_due());
+
+        t.flushed();
+        assert!(!t.dirty && t.flush_at.is_none());
+        assert!(!t.flush_due());
+    }
     use crate::agent::AgentControl;
 
     /// A local (non-pool) launcher must not exit because a daemon somewhere
