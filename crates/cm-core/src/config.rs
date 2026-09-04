@@ -52,12 +52,7 @@ pub fn reload_from(path: &Path) -> Arc<CoreConfig> {
 /// Path to `config.toml`. Public so the dashboard's fuller loader reuses it
 /// rather than duplicating the XDG resolution.
 pub fn config_path() -> PathBuf {
-    // Per the XDG spec an empty env var is treated as unset, not as a
-    // relative path, so filter out the empty string before falling back.
-    std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    crate::state::xdg_dir("XDG_CONFIG_HOME")
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/"))

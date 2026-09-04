@@ -68,15 +68,22 @@ fn harden_dir(dir: &Path) {
     }
 }
 
-/// `~/.local/state/captain-miao`, honouring `XDG_STATE_HOME`. Created `0700` by
-/// [`create_dir_all_private`] wherever it is written to, never here.
-pub fn state_dir() -> PathBuf {
-    // Per the XDG spec an empty env var is treated as unset, not as a
-    // relative path, so filter out the empty string before falling back.
-    std::env::var("XDG_STATE_HOME")
+/// The directory `var` names, honouring the XDG rule that an **empty** value is
+/// unset rather than a relative path — the one line of spec compliance all four
+/// XDG lookups here and in [`crate::config`] share, and the one worth having in
+/// a single place. What to fall back to is deliberately *not* part of it: each
+/// caller's fallback is a different decision, documented where it is made.
+pub fn xdg_dir(var: &str) -> Option<PathBuf> {
+    std::env::var(var)
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+}
+
+/// `~/.local/state/captain-miao`, honouring `XDG_STATE_HOME`. Created `0700` by
+/// [`create_dir_all_private`] wherever it is written to, never here.
+pub fn state_dir() -> PathBuf {
+    xdg_dir("XDG_STATE_HOME")
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -108,12 +115,8 @@ pub fn state_dir() -> PathBuf {
 /// live under a much tighter path-length limit, and ssh re-establishes a
 /// control master whose socket went missing.)
 pub fn runtime_dir() -> PathBuf {
-    // Per the XDG spec an empty env var is treated as unset, not as a relative
-    // path, so filter out the empty string before falling back.
-    std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|d| PathBuf::from(d).join("captain-miao"))
+    xdg_dir("XDG_RUNTIME_DIR")
+        .map(|d| d.join("captain-miao"))
         .unwrap_or_else(|| state_dir().join("run"))
 }
 
@@ -199,10 +202,8 @@ pub fn pool_socket_path() -> PathBuf {
 /// whose socket went missing. `$XDG_RUNTIME_DIR` (short on Linux:
 /// `/run/user/<uid>`) is used when present.
 pub fn ssh_sock_dir() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|d| PathBuf::from(d).join("miao"))
+    xdg_dir("XDG_RUNTIME_DIR")
+        .map(|d| d.join("miao"))
         .unwrap_or_else(|| {
             let uid = unsafe { libc::getuid() };
             std::env::temp_dir().join(format!("cm-{uid}"))
