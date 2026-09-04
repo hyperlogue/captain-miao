@@ -1931,7 +1931,7 @@ impl RemoteBackend {
     /// so an async caller should wrap this in `block_in_place`.
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         let spec = spec.clone();
-        let inherit_env = cm_core::config::get().remote.inherit_env.clone();
+        let inherit_env = crate::config::get().remote.inherit_env.clone();
         match self.request(|req_id| ClientFrame::OpenSession { req_id, spec }) {
             Some(ServerFrame::Opened {
                 session_name: Some(name),
