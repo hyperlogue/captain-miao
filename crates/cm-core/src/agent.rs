@@ -1054,6 +1054,41 @@ impl AgentControl {
         }
     }
 
+    /// Whether *any* session of this backend can self-continue — the question
+    /// [`Self::self_continues`] answers about one session, asked of the backend.
+    /// The two matches are the same shape on purpose and have to agree: this one
+    /// is `true` exactly where that one has a store to ask.
+    ///
+    /// The launcher needs the backend-level answer because a `Stop` that leaves a
+    /// row **busy** no longer means one thing. Codex's is a *bet*: its goal store
+    /// is asked before Codex itself has decided, so the hold is unconfirmed and
+    /// the launcher arms a deadline to settle it (`confirm_hold_at`). Claude's is
+    /// not a bet at all — `claude::status_after_stop` holds `Active` because
+    /// Claude's own session file reads `busy`, i.e. a subagent is still running.
+    /// That is evidence, not a prediction; it needs no confirming, and the file's
+    /// next write revokes it. Arming the deadline on it parks a working row at
+    /// `Idle` two seconds later and nothing wakes it again: the file stays frozen
+    /// at `busy` for the whole subagent phase, so the mirror gets no event and the
+    /// row reads at rest until some later tool hook happens to land.
+    ///
+    /// Deliberately per-*backend*: the launcher asks while dispatching the `Stop`,
+    /// and asking [`Self::self_continues`] that early is exactly the stale read the
+    /// confirmation exists to correct.
+    pub fn may_self_continue(self) -> bool {
+        match self {
+            AgentControl::Codex => true,
+            AgentControl::Claude
+            | AgentControl::Reasonix
+            | AgentControl::Kimi
+            | AgentControl::Grok
+            | AgentControl::OpenCode
+            | AgentControl::Pi
+            | AgentControl::Antigravity
+            | AgentControl::Omp
+            | AgentControl::Unknown => false,
+        }
+    }
+
     /// Scan new bytes of the transcript starting at `offset` for signals the
     /// launcher cares about (interrupt detection). Backends that don't expose
     /// such signals return an empty scan.

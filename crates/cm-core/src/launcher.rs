@@ -883,12 +883,12 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                     dispatched_event,
                     state.status,
                 );
-                // A Stop that did *not* land on a rest state is a session
-                // that re-drives itself (only `codex::dispatch_hook` does
-                // this, and only under a goal). Note it, and arm the one
-                // confirmation the bet needs — see `confirm_hold_at`.
+                // A Stop that did *not* land on a rest state may be a session
+                // that re-drives itself (`codex::dispatch_hook`, under a goal).
+                // Note it, and arm the one confirmation the bet needs — see
+                // `confirm_hold_at` and `stop_holds_for_goal`.
                 if dispatched_event == HookEvent::Stop {
-                    held_for_goal = state.status.is_busy();
+                    held_for_goal = stop_holds_for_goal(agent, &state.status);
                     confirm_hold_at = held_for_goal
                         .then(|| tokio::time::Instant::now() + CONFIRM_HELD_STOP_AFTER);
                 }
@@ -1564,6 +1564,23 @@ fn classify_and_learn(
 /// `Review` its shells say it is. It is never demoted to `Idle`, though: both
 /// are at rest, so that trades away the compaction signal (and the follow-up
 /// bell armed on entering it) for nothing.
+/// Whether the `Stop` just dispatched left an *unconfirmed* hold — a busy row
+/// resting on a prediction, which `confirm_hold_at` then has to settle.
+///
+/// Busy alone is not enough, and treating it as enough is a live bug: two
+/// backends now hold `Active` through a `Stop` for opposite reasons. Codex bets
+/// on its goal store, which answers before Codex has decided, so the hold is a
+/// prediction and needs the deadline. Claude holds because its own session file
+/// reads `busy` — a subagent still running — which is *evidence*, revoked by
+/// that file's next write and by nothing else. Confirming Claude's hold demotes
+/// a working row to `Idle` two seconds in, and the file (frozen at `busy` for
+/// the whole subagent phase) then fires no wake to undo it: the row reads at
+/// rest until some later tool hook lands. `may_self_continue` is what tells the
+/// two apart.
+fn stop_holds_for_goal(agent: AgentControl, status: &SessionStatus) -> bool {
+    status.is_busy() && agent.may_self_continue()
+}
+
 fn reconcile_activity(
     current: &SessionStatus,
     activity: Option<AgentActivity>,
@@ -2021,6 +2038,25 @@ mod tests {
             key: key.to_string(),
             kind,
         }
+    }
+
+    /// Only a backend that can re-drive itself leaves an *unconfirmed* hold.
+    /// Claude's busy `Stop` is `status_after_stop` mirroring a session file that
+    /// reads `busy` (a subagent is still running) — arming the confirmation on it
+    /// parks a working row at `Idle` two seconds later, and the file, frozen at
+    /// `busy` until that subagent phase ends, then fires no wake to undo it.
+    #[test]
+    fn only_a_self_continuing_backend_leaves_a_hold_to_confirm() {
+        use AgentControl as C;
+        use SessionStatus as S;
+
+        assert!(stop_holds_for_goal(C::Codex, &S::Active));
+        // The bug this pins: Claude holds `Active` through a Stop too, on
+        // evidence rather than a bet, so there is nothing to confirm.
+        assert!(!stop_holds_for_goal(C::Claude, &S::Active));
+        assert!(!stop_holds_for_goal(C::Claude, &S::BackgroundActive));
+        // A Stop that landed at rest never held anything, whatever the backend.
+        assert!(!stop_holds_for_goal(C::Codex, &S::Idle));
     }
 
     /// The mirror of the agent's session file: demote-only apart from `Idle`,
