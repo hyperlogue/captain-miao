@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-04
+
 ### Fixed
 
-- **A typo in `config.toml` no longer discards the rest of the file.** The only
-  key that validated its value was `[terminal] backend`, which nothing read —
-  auto-detect has always been the sole mechanism — so `backend = "kity"` failed
-  the parse and reset colors, keybinds and `rc_password` along with it. The key
-  is gone; a file that still sets it loads fine and the value is ignored.
+- **A Claude session's row no longer drifts and stays drifted**, in three cases
+  where nothing woke it.
+  - A prompt queued mid-turn no longer runs showing `Idle`, which a tool-less
+    turn showed throughout.
+  - A session whose subagents outlive its turn stays `Active` instead of parking
+    at `Idle` for minutes.
+  - The directory follows the transcript, not the `CwdChanged` hook, which fired
+    for the Bash tool and could strand a row on a subdirectory for hours.
+- **A typo in `config.toml` no longer discards the rest of the file** — only
+  `[terminal] backend` validated its value and nothing read it, so
+  `backend = "kity"` reset colors, keybinds and `rc_password` too (the key is
+  gone and now ignored).
 
 ## [0.8.0] - 2026-09-03
 
@@ -523,6 +532,7 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[0.8.1]: https://github.com/hyperlogue/captain-miao/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hyperlogue/captain-miao/compare/v0.5.0...v0.6.0
