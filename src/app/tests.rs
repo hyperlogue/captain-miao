@@ -2325,6 +2325,76 @@ fn detaching_before_the_close_is_what_keeps_d_from_killing() {
     );
 }
 
+/// …and the snapshot prune getting there first must **not** be mistaken for that
+/// ordering. Two detectors watch an attach window die and only one of them knows
+/// *how* it died: the snapshot says "gone", the report carries the 129 that
+/// `[remote] on_window_close` turns on. When the prune wins, the report used to
+/// find nothing to retire and stop at the same `continue` `D` relies on — so a
+/// closed window left its session running.
+///
+/// This is the shape the bug actually took, which is why it looked like it
+/// depended on how many windows were open: closing the **last** attach window
+/// hands focus back to the dashboard, `FocusGained` arms the prune on the spot,
+/// and the snapshot beats the wrapper's report. Close one of several and focus
+/// lands on a sibling, nothing arms, and the report wins.
+#[test]
+fn a_prune_that_beats_the_report_still_closes_the_session() {
+    use super::ReportOrigin;
+    use crate::state::{DetachReport, HostId};
+    use crate::terminal::WindowId;
+    use std::collections::HashSet;
+    let _guard = bindings_file_guard();
+    let mut d = TestDashboard::new(120, 12);
+    let host = HostId("box".into());
+    let mut away = session(1, "/srv/away", SessionStatus::Idle);
+    away.host = host.clone();
+    away.pool_session = Some("cm-away".into());
+    away.window_id = None;
+    d.set_sessions(vec![away]);
+    d.app.on_window_close = crate::config::OnWindowClose::Close;
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(900u64));
+
+    // The focus-armed snapshot prune runs first and sees no live windows.
+    d.app.prune_detached_sessions(&HashSet::new());
+    // The wrapper's report lands a moment later, naming the status the snapshot
+    // could never have known.
+    assert!(d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(129),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live
+    ));
+    assert_eq!(
+        d.app.pending_session_close.len(),
+        1,
+        "a user-closed window must end its session whichever detector saw it first"
+    );
+
+    // A dropped link retires the same way and must still keep its session: the
+    // recovered binding changes who answers the report, never what it says.
+    d.app
+        .record_window_binding(host.clone(), "cm-away".into(), WindowId::from(901u64));
+    d.app.pending_session_close.clear();
+    d.app.prune_detached_sessions(&HashSet::new());
+    d.app.apply_detach_reports(
+        vec![DetachReport {
+            host: "box".into(),
+            token: "cm-away".into(),
+            status: Some(255),
+            held_secs: Some(600),
+        }],
+        ReportOrigin::Live,
+    );
+    assert!(
+        d.app.pending_session_close.is_empty(),
+        "ssh's 255 is a dropped link, not a close — grace map or not"
+    );
+}
+
 /// The whole-batch version of the above, through `apply_detach_reports`: a
 /// user-closed window queues its session for closing, a dropped link does not,
 /// and a backlogged report never does whatever its status says.

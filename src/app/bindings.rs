@@ -46,10 +46,33 @@ struct Bound {
 /// window is worth closing or worth leaving on screen, so it is returned rather
 /// than the raw `Instant` — the policy is the dashboard's, the bookkeeping is
 /// this module's.
+#[derive(Clone)]
 pub(crate) struct RetiredBinding {
     pub(crate) window: WindowId,
     pub(crate) held_for: Duration,
 }
+
+/// How long a binding retired by [`WindowBindings::prune_dead`] stays
+/// recoverable by [`WindowBindings::prune_token`].
+///
+/// The two detectors race, and the snapshot is the one that can win without
+/// knowing anything: it says only "that window is gone", where the report says
+/// *how* it went — and `[remote] on_window_close` turns entirely on the 129 only
+/// the report carries. Closing the **last** attach window is the case that makes
+/// the race deterministic: focus falls back to the dashboard, `FocusGained` arms
+/// the prune on the spot, and its `kitten @ ls` beats the wrapper's
+/// `miao attach-exited` — so the report found nothing to retire and the session
+/// stayed up. Close one of several windows and focus lands on a sibling, no
+/// prune is armed, and the report wins; that is the whole of why the bug looked
+/// like it depended on how many windows were open.
+///
+/// Generous on purpose. The report is written milliseconds after the window
+/// dies, so anything past a second is already slack for a loaded machine — while
+/// on the other side nothing but a real window teardown produces the 129 this
+/// gates, and a queued close still waits out
+/// [`CLOSE_ON_WINDOW_CLOSE_DELAY`](super::CLOSE_ON_WINDOW_CLOSE_DELAY) with the
+/// dashboard alive.
+const PRUNE_REPORT_GRACE: Duration = Duration::from_secs(10);
 
 /// `(host, token) → local window` for every session the dashboard has a window
 /// for. Nested `host → (token → window)` so `window_for`/`remove` probe by
@@ -68,16 +91,28 @@ pub(crate) struct WindowBindings {
     /// A deliberate `D` detach clears it — that's the whole distinction between
     /// "you detached" and "the link dropped".
     expected: HashSet<BindingKey>,
+    /// Bindings [`WindowBindings::prune_dead`] retired in the last
+    /// [`PRUNE_REPORT_GRACE`], so a detach report that lost the race to the
+    /// snapshot still finds what it came to retire. Kept out of `by_host`
+    /// deliberately: for every other purpose — the detached tier, `Enter`,
+    /// auto-reattach — the binding really is gone the moment the snapshot says
+    /// the window is.
+    recently_pruned: HashMap<BindingKey, (RetiredBinding, Instant)>,
 }
 
 impl WindowBindings {
     /// Record (or replace) the local window bound to a session's token, and
     /// remember that this session is expected to stay attached.
     pub(crate) fn record(&mut self, host: HostId, token: String, window: WindowId) {
-        self.expected.insert(BindingKey {
+        let key = BindingKey {
             host: host.clone(),
             token: token.clone(),
-        });
+        };
+        // A fresh window for this session settles the race the grace map exists
+        // for: whatever the old binding was, a report naming it can no longer
+        // mean "end the session behind this row".
+        self.recently_pruned.remove(&key);
+        self.expected.insert(key);
         self.by_host.entry(host).or_default().insert(
             token,
             Bound {
@@ -95,10 +130,16 @@ impl WindowBindings {
     /// died; this initiates the teardown — and being deliberate, it also clears
     /// the expected-attached memory so auto-reattach leaves it detached.
     pub(crate) fn remove(&mut self, host: &HostId, token: &str) -> Option<WindowId> {
-        self.expected.remove(&BindingKey {
+        let key = BindingKey {
             host: host.clone(),
             token: token.to_string(),
-        });
+        };
+        self.expected.remove(&key);
+        // And it forgets any pruned remnant, which is what keeps `D` from
+        // killing: `D` retires *then* closes the window, so the 129 that follows
+        // must find nothing — including in the grace map, in case a snapshot
+        // prune had already retired this same binding moments earlier.
+        self.recently_pruned.remove(&key);
         let inner = self.by_host.get_mut(host)?;
         let removed = inner.remove(token);
         if inner.is_empty() {
@@ -117,16 +158,28 @@ impl WindowBindings {
     /// closed window and a killed ssh are indistinguishable from here, and both
     /// should come back when the host reconnects. Only `D` retires the
     /// expectation.
+    /// A binding [`WindowBindings::prune_dead`] retired within
+    /// [`PRUNE_REPORT_GRACE`] is still answered here, once. The report is the
+    /// only witness to *how* the window went, and dropping it because the
+    /// snapshot got there first is what left a closed window's session running.
     pub(crate) fn prune_token(&mut self, host: &HostId, token: &str) -> Option<RetiredBinding> {
-        let inner = self.by_host.get_mut(host)?;
-        let removed = inner.remove(token);
-        if inner.is_empty() {
-            self.by_host.remove(host);
+        if let Some(inner) = self.by_host.get_mut(host)
+            && let Some(b) = inner.remove(token)
+        {
+            if inner.is_empty() {
+                self.by_host.remove(host);
+            }
+            return Some(RetiredBinding {
+                window: b.window,
+                held_for: b.since.elapsed(),
+            });
         }
-        removed.map(|b| RetiredBinding {
-            window: b.window,
-            held_for: b.since.elapsed(),
-        })
+        let key = BindingKey {
+            host: host.clone(),
+            token: token.to_string(),
+        };
+        let (retired, at) = self.recently_pruned.remove(&key)?;
+        (at.elapsed() < PRUNE_REPORT_GRACE).then_some(retired)
     }
 
     /// Tokens on `host` the dashboard expects to be attached to but currently
@@ -168,9 +221,25 @@ impl WindowBindings {
                     )
                 })
                 .collect();
+        // Anything already past the grace is dead weight; sweeping on the one
+        // path that inserts keeps the map bounded without a timer of its own.
+        let now = Instant::now();
+        self.recently_pruned
+            .retain(|_, (_, at)| now.duration_since(*at) < PRUNE_REPORT_GRACE);
         for k in &dead {
             if let Some(inner) = self.by_host.get_mut(&k.host) {
-                inner.remove(&k.token);
+                if let Some(b) = inner.remove(&k.token) {
+                    self.recently_pruned.insert(
+                        k.clone(),
+                        (
+                            RetiredBinding {
+                                window: b.window,
+                                held_for: b.since.elapsed(),
+                            },
+                            now,
+                        ),
+                    );
+                }
                 if inner.is_empty() {
                     self.by_host.remove(&k.host);
                 }
@@ -264,6 +333,50 @@ mod tests {
         assert_eq!(b.window_for(&host("h1"), "live"), Some(&win("w1")));
         assert_eq!(b.window_for(&host("h1"), "dead"), None);
         assert!(!b.is_empty() && b.len() == 1);
+    }
+
+    /// A binding the snapshot prune retired is still answerable by the report
+    /// that follows — once, and never after the deliberate paths have spoken.
+    #[test]
+    fn a_pruned_binding_answers_one_late_report() {
+        let mut b = WindowBindings::default();
+        b.record(host("h1"), "a".into(), win("w1"));
+        b.prune_dead(&HashSet::new());
+
+        let recovered = b.prune_token(&host("h1"), "a").expect("the late report");
+        assert_eq!(recovered.window, win("w1"));
+        assert!(
+            b.prune_token(&host("h1"), "a").is_none(),
+            "and only once — a second report has nothing left to retire"
+        );
+
+        // `D` is the ordering the close policy leans on: retire, then close the
+        // window. A prune that already retired the binding must not leave a
+        // remnant for the 129 that follows.
+        b.record(host("h1"), "b".into(), win("w2"));
+        b.prune_dead(&HashSet::new());
+        b.remove(&host("h1"), "b");
+        assert!(
+            b.prune_token(&host("h1"), "b").is_none(),
+            "an explicit detach forgets the pruned remnant too"
+        );
+
+        // So does re-attaching. Auto-reattach binds a fresh window for a token
+        // the prune just retired, and the live binding must be the only thing
+        // left to answer for it — a remnant behind it would retire the *new*
+        // window on a report about the old one.
+        b.record(host("h1"), "c".into(), win("w3"));
+        b.prune_dead(&HashSet::new());
+        b.record(host("h1"), "c".into(), win("w4"));
+        assert_eq!(
+            b.prune_token(&host("h1"), "c").map(|r| r.window),
+            Some(win("w4")),
+            "the live binding answers first"
+        );
+        assert!(
+            b.prune_token(&host("h1"), "c").is_none(),
+            "and the re-attach had already cleared the earlier prune's remnant"
+        );
     }
 
     /// The expected-attached memory is what makes auto-reattach possible: a
