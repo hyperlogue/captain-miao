@@ -15,6 +15,19 @@
 //! reload loop calls [`WindowBindings::prune_dead`] with a `Terminal::snapshot`'s
 //! live window ids, and startup seeds it from `window-bindings.json`. See
 //! `docs/remote-sessions.md` §6, §8.
+//!
+//! **Two detectors notice a window is gone, and the binding is retired by
+//! whichever gets there first.** [`WindowBindings::prune_dead`] diffs the live
+//! window set; [`WindowBindings::prune_token`] answers the attach wrapper's
+//! detach report. They are not interchangeable: the snapshot knows only *that*
+//! the window went, while the report is the sole witness to *how* — the exit
+//! status separating a hand-closed window from a dropped ssh, which is the whole
+//! input to `[remote] on_window_close`. So retiring is one-shot but the answer
+//! is not: a binding the snapshot took stays answerable for
+//! [`PRUNE_REPORT_GRACE`], and the two deliberate paths ([`WindowBindings::record`]
+//! and [`WindowBindings::remove`]) revoke that. Reading the answer is the
+//! dashboard's job (`App::apply_detach_reports`); all this module promises is
+//! that a report always finds something to answer.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -36,9 +49,22 @@ pub(crate) struct BindingKey {
 /// A bound window, plus when the dashboard opened it.
 struct Bound {
     window: WindowId,
-    /// Used only by [`WindowBindings::prune_token`], to tell an attach that ran
-    /// and then ended from one that died on arrival — see [`RetiredBinding`].
+    /// Feeds [`RetiredBinding::held_for`], which tells an attach that ran and
+    /// then ended from one that died on arrival.
     since: Instant,
+}
+
+impl Bound {
+    /// What a binding becomes the moment it is retired. Stamped here rather than
+    /// when the report is read, so the two detectors describe the same window
+    /// the same way — and so `held_for` measures the attach, not the latency of
+    /// whichever detector happened to notice.
+    fn retire(self) -> RetiredBinding {
+        RetiredBinding {
+            window: self.window,
+            held_for: self.since.elapsed(),
+        }
+    }
 }
 
 /// What [`WindowBindings::prune_token`] hands back: the window that was bound,
@@ -46,25 +72,21 @@ struct Bound {
 /// window is worth closing or worth leaving on screen, so it is returned rather
 /// than the raw `Instant` — the policy is the dashboard's, the bookkeeping is
 /// this module's.
-#[derive(Clone)]
 pub(crate) struct RetiredBinding {
     pub(crate) window: WindowId,
     pub(crate) held_for: Duration,
 }
 
 /// How long a binding retired by [`WindowBindings::prune_dead`] stays
-/// recoverable by [`WindowBindings::prune_token`].
+/// answerable by [`WindowBindings::prune_token`].
 ///
-/// The two detectors race, and the snapshot is the one that can win without
-/// knowing anything: it says only "that window is gone", where the report says
-/// *how* it went — and `[remote] on_window_close` turns entirely on the 129 only
-/// the report carries. Closing the **last** attach window is the case that makes
-/// the race deterministic: focus falls back to the dashboard, `FocusGained` arms
-/// the prune on the spot, and its `kitten @ ls` beats the wrapper's
-/// `miao attach-exited` — so the report found nothing to retire and the session
-/// stayed up. Close one of several windows and focus lands on a sibling, no
-/// prune is armed, and the report wins; that is the whole of why the bug looked
-/// like it depended on how many windows were open.
+/// Sized by the race it settles, which is decided by *focus*: closing the last
+/// attach window hands focus back to the dashboard, whose `FocusGained` arms the
+/// prune on the spot — so its `kitten @ ls` beats the wrapper's
+/// `miao attach-exited` and the report arrives to find nothing. Close one of
+/// several and focus lands on a sibling window, nothing arms, and the report
+/// wins. That is the whole of why a closed window's session used to survive only
+/// when it was the last one open.
 ///
 /// Generous on purpose. The report is written milliseconds after the window
 /// dies, so anything past a second is already slack for a loaded machine — while
@@ -77,8 +99,9 @@ const PRUNE_REPORT_GRACE: Duration = Duration::from_secs(10);
 /// `(host, token) → local window` for every session the dashboard has a window
 /// for. Nested `host → (token → window)` so `window_for`/`remove` probe by
 /// `&HostId` then `&str` without allocating a [`BindingKey`]. Invariant: an
-/// inner map is never left empty — `remove`/`prune_dead` drop the host entry
-/// when its last token goes, so `is_empty` is just the outer map's emptiness.
+/// inner map is never left empty — every retirement goes through
+/// [`WindowBindings::take`], which drops the host entry when its last token
+/// goes, so `is_empty` is just the outer map's emptiness.
 #[derive(Default)]
 pub(crate) struct WindowBindings {
     by_host: HashMap<HostId, HashMap<String, Bound>>,
@@ -101,6 +124,25 @@ pub(crate) struct WindowBindings {
 }
 
 impl WindowBindings {
+    /// Lift the binding for `(host, token)` out of the live map, dropping the
+    /// host entry when that was its last token.
+    ///
+    /// Every retirement goes through here — the deliberate [`Self::remove`], the
+    /// report's [`Self::prune_token`], the snapshot's [`Self::prune_dead`] — so
+    /// the "an inner map is never left empty" invariant has one home rather than
+    /// three copies to keep in step. What differs between the three is only what
+    /// they do with the [`Bound`] and with the two memories beside it
+    /// (`expected`, `recently_pruned`); that difference is the whole of their
+    /// semantics, and it reads plainly once the bookkeeping is out of the way.
+    fn take(&mut self, host: &HostId, token: &str) -> Option<Bound> {
+        let inner = self.by_host.get_mut(host)?;
+        let taken = inner.remove(token);
+        if inner.is_empty() {
+            self.by_host.remove(host);
+        }
+        taken
+    }
+
     /// Record (or replace) the local window bound to a session's token, and
     /// remember that this session is expected to stay attached.
     pub(crate) fn record(&mut self, host: HostId, token: String, window: WindowId) {
@@ -137,42 +179,28 @@ impl WindowBindings {
         self.expected.remove(&key);
         // And it forgets any pruned remnant, which is what keeps `D` from
         // killing: `D` retires *then* closes the window, so the 129 that follows
-        // must find nothing — including in the grace map, in case a snapshot
-        // prune had already retired this same binding moments earlier.
+        // must find nothing to answer — including in the grace map, in case a
+        // snapshot prune had already retired this same binding moments earlier.
         self.recently_pruned.remove(&key);
-        let inner = self.by_host.get_mut(host)?;
-        let removed = inner.remove(token);
-        if inner.is_empty() {
-            self.by_host.remove(host);
-        }
-        removed.map(|b| b.window)
+        self.take(host, token).map(|b| b.window)
     }
 
-    /// Retire the binding for `(host, token)` because its window is gone,
-    /// returning the window it pointed at.
+    /// Retire the binding for `(host, token)` because a **detach report** says
+    /// its window is gone, returning what was bound.
     ///
-    /// The single-key form of [`WindowBindings::prune_dead`], and it keeps that
-    /// one's semantics rather than [`WindowBindings::remove`]'s: the
-    /// expected-attached memory **survives**. The caller is a detach report from
-    /// a window that ended, which is "the link dropped", not "you detached" — a
-    /// closed window and a killed ssh are indistinguishable from here, and both
+    /// Keeps [`Self::prune_dead`]'s semantics rather than [`Self::remove`]'s:
+    /// the expected-attached memory **survives**. The caller is a report from a
+    /// window that ended, which is "the link dropped", not "you detached" — from
+    /// here a closed window and a killed ssh are indistinguishable, and both
     /// should come back when the host reconnects. Only `D` retires the
     /// expectation.
-    /// A binding [`WindowBindings::prune_dead`] retired within
-    /// [`PRUNE_REPORT_GRACE`] is still answered here, once. The report is the
-    /// only witness to *how* the window went, and dropping it because the
-    /// snapshot got there first is what left a closed window's session running.
+    ///
+    /// A binding the snapshot already retired is answered from the grace map
+    /// instead, once, for [`PRUNE_REPORT_GRACE`] — the module doc says why the
+    /// report must not go unanswered merely because it lost that race.
     pub(crate) fn prune_token(&mut self, host: &HostId, token: &str) -> Option<RetiredBinding> {
-        if let Some(inner) = self.by_host.get_mut(host)
-            && let Some(b) = inner.remove(token)
-        {
-            if inner.is_empty() {
-                self.by_host.remove(host);
-            }
-            return Some(RetiredBinding {
-                window: b.window,
-                held_for: b.since.elapsed(),
-            });
+        if let Some(bound) = self.take(host, token) {
+            return Some(bound.retire());
         }
         let key = BindingKey {
             host: host.clone(),
@@ -227,22 +255,9 @@ impl WindowBindings {
         self.recently_pruned
             .retain(|_, (_, at)| now.duration_since(*at) < PRUNE_REPORT_GRACE);
         for k in &dead {
-            if let Some(inner) = self.by_host.get_mut(&k.host) {
-                if let Some(b) = inner.remove(&k.token) {
-                    self.recently_pruned.insert(
-                        k.clone(),
-                        (
-                            RetiredBinding {
-                                window: b.window,
-                                held_for: b.since.elapsed(),
-                            },
-                            now,
-                        ),
-                    );
-                }
-                if inner.is_empty() {
-                    self.by_host.remove(&k.host);
-                }
+            if let Some(bound) = self.take(&k.host, &k.token) {
+                self.recently_pruned
+                    .insert(k.clone(), (bound.retire(), now));
             }
         }
         dead
