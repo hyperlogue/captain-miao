@@ -33,7 +33,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 
 use crate::agent::{
-    AgentActivity, AgentControl, BgSeedKind, BgShell, TranscriptScan, TranscriptStats,
+    AgentActivity, AgentControl, BgSeedKind, BgShell, ResumeMetadata, TranscriptScan,
+    TranscriptStats,
 };
 use crate::cli::ClipboardShims;
 use crate::learned;
@@ -222,6 +223,7 @@ pub async fn run(
         }
     };
     launcher_state.child_pid = child.id();
+    seed_resumed_session(&mut launcher_state, agent.read_resume_metadata(agent_args));
     // `tab_id` (display-only) is resolved by the dashboard from its own terminal
     // snapshot (`window_tab_map`), not here: window/tab lookup is a presentation
     // concern and a launcher may be headless/remote, so it stays terminal-free
@@ -593,6 +595,23 @@ impl WriteThrottle {
     fn flushed(&mut self) {
         self.dirty = false;
         self.flush_at = None;
+    }
+}
+
+/// Seed a promptless resume after its child spawned, before hooks are serviced.
+/// The persisted transcript contributes facts only: its old turn markers do
+/// not describe activity in the newly started process.
+fn seed_resumed_session(state: &mut LauncherState, metadata: Option<ResumeMetadata>) {
+    if state.status != SessionStatus::Starting
+        || state.child_pid.is_none()
+        || state.session_id.is_some()
+    {
+        return;
+    }
+    if let Some(metadata) = metadata {
+        state.session_id = Some(metadata.session_id);
+        apply_transcript_data(state, &metadata.stats);
+        state.status = SessionStatus::Idle;
     }
 }
 
@@ -2049,6 +2068,96 @@ mod tests {
     fn a_session_without_a_goal_never_self_continues() {
         assert!(!AgentControl::Codex.self_continues("no-goal-was-ever-set-for-this-id"));
         assert!(!AgentControl::Claude.self_continues("no-goal-was-ever-set-for-this-id"));
+    }
+
+    #[test]
+    fn a_codex_resume_has_its_id_and_details_before_the_first_prompt() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("cm-resume-startup-{nonce}"));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"resumed-thread\",\"cwd\":\"/work/repo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Fix the parser\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":4242}}}}\n",
+                // Even a previous process's unfinished turn is history.
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            ),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            ["resumed-thread", path.to_str().unwrap()],
+        )
+        .unwrap();
+        let agent = AgentControl::Codex;
+        let args = agent.resume_args("resumed-thread", false);
+        let mut state = LauncherState::for_test(agent, SessionStatus::Starting);
+        state.child_pid = Some(42);
+        let metadata = crate::agents::codex::read_resume_metadata_at(&home, &args);
+        seed_resumed_session(&mut state, metadata);
+        assert_eq!(
+            state.status,
+            SessionStatus::Idle,
+            "no prompt or hook is needed"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("resumed-thread"));
+        assert_eq!(state.first_prompt.as_deref(), Some("Fix the parser"));
+        assert_eq!(state.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(state.context_tokens, Some(4242));
+        assert_eq!(
+            state.name, None,
+            "the host overlays the title by session id"
+        );
+
+        let msg = agent
+            .parse_hook_payload(
+                HookEvent::PromptSubmit,
+                r#"{"session_id":"resumed-thread","prompt":"Continue"}"#,
+            )
+            .unwrap();
+        agent.dispatch_hook(&mut state, msg);
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_prompt.as_deref(), Some("Continue"));
+        drop(conn);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn resume_metadata_never_replaces_a_failed_or_already_reported_start() {
+        for (status, child_pid, session_id) in [
+            (SessionStatus::Starting, None, None),
+            (SessionStatus::FailedToStart, None, None),
+            (SessionStatus::Active, Some(42), None),
+            (SessionStatus::Starting, Some(42), Some("reported-thread")),
+        ] {
+            let mut state = LauncherState::for_test(AgentControl::Codex, status);
+            state.child_pid = child_pid;
+            state.session_id = session_id.map(str::to_string);
+            let before = state.clone();
+            seed_resumed_session(
+                &mut state,
+                Some(ResumeMetadata {
+                    session_id: "resumed-thread".into(),
+                    stats: TranscriptStats::default(),
+                }),
+            );
+            assert_eq!(state, before);
+        }
+        let mut state = LauncherState::for_test(AgentControl::Codex, SessionStatus::Starting);
+        state.child_pid = Some(42);
+        let before = state.clone();
+        seed_resumed_session(&mut state, None);
+        assert_eq!(state, before, "an unreadable store is no startup evidence");
     }
 
     fn state_with(status: SessionStatus) -> LauncherState {

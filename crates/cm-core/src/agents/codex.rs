@@ -49,8 +49,8 @@ use super::common;
 use super::synth_home::atomic_write;
 use super::{collapse_whitespace, shell_quote};
 use crate::agent::{
-    AgentActivity, ResumeCandidate, SessionIndex, SessionIndexCache, TranscriptScan,
-    TranscriptStats,
+    AgentActivity, ResumeCandidate, ResumeMetadata, SessionIndex, SessionIndexCache,
+    TranscriptScan, TranscriptStats,
 };
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
@@ -680,6 +680,49 @@ fn read_rollout_header(path: &Path) -> RolloutHeader {
 // =============================================================================
 // Launcher: process spawn + owned Codex profile
 // =============================================================================
+
+/// Codex can defer `SessionStart` until immediately before the first prompt.
+/// A promptless `resume <id>` already identifies the idle session, so recover
+/// its persisted facts without waiting for that hook. Titles remain the host
+/// overlay's job; this read supplies the id it needs plus the saved details.
+pub fn read_resume_metadata(args: &[String]) -> Option<ResumeMetadata> {
+    read_resume_metadata_at(&codex_home()?, args)
+}
+
+pub(crate) fn read_resume_metadata_at(home: &Path, args: &[String]) -> Option<ResumeMetadata> {
+    // Accept exactly the argv our resume/restart planner emits. A fork mints a
+    // different id, `--last`/names need Codex's resolution, and extra arguments
+    // may include an initial prompt: none can be assumed to be an idle resume.
+    let [subcommand, id] = args else { return None };
+    if subcommand != "resume" || id.is_empty() || id.starts_with('-') {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        home.join("state_5.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let path: String = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let path = Path::new(&path);
+    let header = read_rollout_header(path);
+    // An unavailable or mismatched rollout is no evidence. In particular, a
+    // stale index entry must never stamp some other thread onto this launcher.
+    if header.session_id.as_deref() != Some(id.as_str()) {
+        return None;
+    }
+    Some(ResumeMetadata {
+        session_id: id.clone(),
+        stats: read_transcript_stats(path, None),
+    })
+}
 
 /// Build the argv for a Codex session. Codex will not load the launcher's JSON
 /// directly, so the event table is rewritten as the inline TOML of a profile we
@@ -1404,6 +1447,59 @@ mod tests {
         std::fs::write(&db, "unreadable database").unwrap();
         check();
         assert!(list_resumable_at(&home, 0).unwrap().is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn resume_metadata_requires_the_exact_promptless_resume_and_matching_rollout() {
+        let home = scratch_home("resume-metadata");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"saved-id\"}}\n",
+        )
+        .unwrap();
+        let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            ["saved-id", path.to_str().unwrap()],
+        )
+        .unwrap();
+        for args in [
+            vec![],
+            vec!["fork", "saved-id"],
+            vec!["resume"],
+            vec!["resume", "--last"],
+            vec!["resume", "saved-id", "Continue"],
+            vec!["resume", "saved-id", "--model", "gpt-5.5"],
+            vec!["resume", "missing-id"],
+        ] {
+            let args: Vec<_> = args.into_iter().map(str::to_string).collect();
+            assert!(read_resume_metadata_at(&home, &args).is_none(), "{args:?}");
+        }
+        let args = crate::agent::AgentControl::Codex.resume_args("saved-id", false);
+        assert_eq!(
+            read_resume_metadata_at(&home, &args).unwrap().session_id,
+            "saved-id"
+        );
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"different-id\"}}\n",
+        )
+        .unwrap();
+        assert!(read_resume_metadata_at(&home, &args).is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_resume_metadata_at(&home, &args).is_none());
+        drop(conn);
+        std::fs::remove_file(home.join("state_5.sqlite")).unwrap();
+        assert!(read_resume_metadata_at(&home, &args).is_none());
+        assert!(
+            !home.join("state_5.sqlite").exists(),
+            "startup reads never create the store"
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 

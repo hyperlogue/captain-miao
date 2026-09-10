@@ -248,6 +248,17 @@ impl AgentControl {
         }
     }
 
+    /// Saved facts for an explicit resume that starts without a prompt, when
+    /// the agent defers its startup hook until the first turn. The launcher
+    /// applies these only after spawning the child; ordinary hooks supersede
+    /// them. No metadata for fresh sessions, forks or ambiguous launch args.
+    pub fn read_resume_metadata(self, args: &[String]) -> Option<ResumeMetadata> {
+        match self {
+            Self::Codex => codex::read_resume_metadata(args),
+            _ => None,
+        }
+    }
+
     /// Extra args appended after the cwd to resume (or fork) `session_id`.
     ///
     /// The flag shapes differ per backend and each arm states its own; the
@@ -1679,6 +1690,13 @@ pub struct ResumeCandidate {
     pub custom_title: Option<String>,
     pub git_branch: Option<String>,
     pub mtime: SystemTime,
+}
+
+/// Persisted facts for a known session resumed without an initial prompt.
+/// These seed a newly spawned launcher's idle row, never replay old activity.
+pub struct ResumeMetadata {
+    pub session_id: String,
+    pub stats: TranscriptStats,
 }
 
 /// Per-session facts pulled from one pass over the transcript. Both fields come
