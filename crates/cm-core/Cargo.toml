@@ -48,6 +48,10 @@ toml = "1.1"
 # toolchain bump.
 rusqlite = { version = "0.39", features = ["bundled"] }
 
+[dev-dependencies]
+# Exercise deferred title refreshes with a paused clock, without wall sleeps.
+tokio = { version = "1", features = ["test-util"] }
+
 # macOS only, and only for the clipboard bridge: `NSPasteboard` is the sole way
 # to get a screenshot's image bytes off the pasteboard (`pbpaste` serves text
 # flavours, `osascript` returns hex — see `clipboard/read/macos.rs`). Feature-

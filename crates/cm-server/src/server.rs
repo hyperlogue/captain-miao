@@ -573,7 +573,10 @@ async fn serve() -> Result<()> {
     // The daemon is the host's server-core: on top of the reads it owns the
     // per-session flags sidecar and overlays the pool's live attached bit, so
     // every dashboard watching this host agrees about both.
-    let backend = Arc::new(build_server_core());
+    let retry_tx = changes_tx.clone();
+    let backend = Arc::new(build_server_core().with_change_notifier(move || {
+        let _ = retry_tx.send(());
+    }));
     // One probe for the whole daemon; see [`VitalsProbe`]. A tokio mutex because
     // a cold probe holds it across a short sleep.
     let vitals = Arc::new(tokio::sync::Mutex::new(VitalsProbe::new()));
@@ -959,8 +962,9 @@ async fn push_changes(
 /// sqlite alone: a rename touches only that file, so without this wake a remote
 /// rename wouldn't reach subscribers until some other session event fired. The
 /// wake just triggers the normal re-read + diff; the actual sqlite read is
-/// gated on store changes inside `LocalBackend`'s title overlay, and an unchanged
-/// diff pushes nothing. Best-effort: a missing store simply isn't watched.
+/// gated on store changes and a one-second floor inside `LocalBackend`'s title
+/// overlay. A deferred read schedules another broadcast at the deadline; an
+/// unchanged diff pushes nothing. Best-effort: a missing store isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
     let dir = state::sessions_dir();
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {

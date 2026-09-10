@@ -664,8 +664,8 @@ impl PoolRow {
 
 /// A backend's change signal, taken (and cleared) by the run loop. One handle
 /// per backend, from [`Backend::subscribe`]; a local one is fed by that
-/// backend's fs watcher, a remote one by its connection task's mirror pushes
-/// and connect/disconnect transitions.
+/// backend's fs watcher and deferred title refreshes, a remote one by its
+/// connection task's mirror pushes and connect/disconnect transitions.
 pub(crate) struct BackendEvents {
     changed: Arc<AtomicBool>,
     /// A utilisation poll came back. Kept apart from `changed` because it must
@@ -850,9 +850,13 @@ pub(crate) enum KillOutcome {
 
 impl Backend {
     pub(crate) fn local() -> Self {
+        let changed = Arc::new(AtomicBool::new(false));
+        let sink = changed.clone();
         Backend::Local(Box::new(LocalHost {
-            inner: LocalBackend::new(),
-            changed: Arc::new(AtomicBool::new(false)),
+            inner: LocalBackend::new().with_change_notifier(move || {
+                sink.store(true, Ordering::Relaxed);
+            }),
+            changed,
             watcher: None,
             pool: PoolWatch::default(),
         }))
