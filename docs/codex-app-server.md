@@ -71,8 +71,14 @@ interrupt from reaching newly resumed work.
 ## Lifecycle and operational differences
 
 The app-server owns execution; the TUI is a client. Closing an attached terminal
-through miao ends that managed session's work, while detaching from a pooled
-terminal keeps its launcher and work running. Teardown addresses only the
+through miao requests cleanup of that managed session's work, while detaching
+from a pooled terminal keeps its launcher and work running. The host waits for
+the launcher to acknowledge cleanup before reporting success. Miao restores an
+optimistically hidden row on failure, reports the error, and keeps its terminal
+binding. It closes the terminal only after successful cleanup. The launcher
+remains available for retry even if the terminal has already exited. A rollback
+restores visibility; it does not reactivate a paused goal or restart an
+interrupted turn. Teardown addresses only the
 selected thread, preserves history, and never stops the shared daemon. Codex
 may retain an idle thread in memory after clients disconnect.
 
@@ -94,3 +100,11 @@ control methods, including background-terminal cleanup, require the experimental
 API capability. Protocol changes are handled by Codex's TUI wherever possible;
 the monitor ignores fields and events it does not understand. See the
 [upstream app-server documentation](https://developers.openai.com/codex/app-server).
+
+Miao still reads its own configuration and session-state files. This adapter
+parses protocol messages rather than Codex-owned rollout files, hook payloads,
+or SQLite databases. Codex's TUI and daemon continue to manage their own files.
+
+Acknowledged cleanup requires an updated dashboard, host server, and launcher.
+An older app-server launcher without control support is refused by the new
+backend rather than reported as successfully stopped.

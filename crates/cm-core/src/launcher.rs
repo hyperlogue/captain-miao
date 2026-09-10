@@ -104,6 +104,7 @@ pub async fn run(
         agent,
         codex_mode: Default::default(),
         codex_connected: None,
+        codex_control: false,
         launcher_pid,
         session_id: None,
         child_session_ids: Vec::new(),
@@ -227,7 +228,7 @@ pub async fn run(
                 cwd,
                 agent_args,
                 shim_dir.as_deref(),
-                &sock_dir,
+                listener,
             )
             .await;
             match result {
@@ -385,47 +386,137 @@ async fn run_codex_app_server(
     cwd: &str,
     args: &[String],
     shim: Option<&Path>,
-    runtime: &Path,
+    listener: UnixListener,
 ) -> Result<i32> {
     use crate::agents::codex::app_server;
-    let socket = runtime.join(format!("{}-codex.sock", state.launcher_pid));
-    let mut relay = app_server::Relay::start(config, &socket).await?;
+    let socket = state::runtime_dir()
+        .join("launchers")
+        .join(format!("{}-codex.sock", state.launcher_pid));
+    let relay = app_server::Relay::start(config, &socket).await?;
     let mut command = app_server::command(cwd, args, &socket, shim)?;
-    let mut child = command
+    let child = command
         .kill_on_drop(true)
         .spawn()
         .context("starting attached Codex TUI")?;
     state.child_pid = child.id();
+    let control = app_server::Control::start(listener);
+    state.codex_control = true;
+    state.write()?;
+    supervise_codex_app_server(config, state, child, relay, control).await
+}
+
+async fn supervise_codex_app_server(
+    config: &crate::agents::codex::CodexConfig,
+    state: &mut LauncherState,
+    mut child: tokio::process::Child,
+    mut relay: crate::agents::codex::app_server::Relay,
+    mut control: crate::agents::codex::app_server::Control,
+) -> Result<i32> {
+    use crate::agents::codex::app_server;
+    use futures_util::future::BoxFuture;
     let mut monitor = app_server::Monitor::default();
     let pool = state.pool_session.clone();
-    let result = async {
-        state.write()?;
-        loop {
-            tokio::select! {
-                result = child.wait() => break Ok(result?.code().unwrap_or(1)),
-                _ = wait_for_termination_signal() => break Ok(143),
-                _ = wait_until_minting_daemon_gone(pool.as_deref()) => break Ok(143),
-                event = relay.events.recv() => {
-                    let Some(event) = event else { anyhow::bail!("Codex relay stopped") };
-                    let before = state.clone();
-                    monitor.apply(state, event);
-                    if *state != before {
+    let shutdown = async {
+        tokio::select! {
+            _ = wait_for_termination_signal() => {}
+            _ = wait_until_minting_daemon_gone(pool.as_deref()) => {}
+        }
+    };
+    tokio::pin!(shutdown);
+    let mut shutdown_seen = false;
+    let mut child_live = true;
+    let mut exit_code = 0;
+    let mut stopping: Option<BoxFuture<'static, Result<()>>> = None;
+    let mut reply: Option<app_server::StopRequest> = None;
+    loop {
+        let begin_stop = tokio::select! {
+            event = relay.events.recv() => {
+                let Some(event) = event else { anyhow::bail!("Codex relay stopped") };
+                let before = state.clone();
+                monitor.apply(state, event);
+                if *state != before {
+                    state.updated_at = LauncherState::now();
+                    state.write()?;
+                }
+                false
+            }
+            request = control.requests.recv() => {
+                let Some(request) = request else { anyhow::bail!("Codex launcher control stopped") };
+                if stopping.is_some() {
+                    request.reply(Some("Codex cleanup is already in progress; retry shortly".into())).await;
+                    false
+                } else {
+                    reply = Some(request);
+                    true
+                }
+            }
+            result = child.wait(), if child_live => {
+                child_live = false;
+                state.child_pid = None;
+                exit_code = result?.code().unwrap_or(1);
+                stopping.is_none()
+            }
+            _ = &mut shutdown, if !shutdown_seen => {
+                shutdown_seen = true;
+                exit_code = 143;
+                stopping.is_none()
+            }
+            result = async {
+                match stopping.as_mut() {
+                    Some(future) => future.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                stopping = None;
+                match result {
+                    Ok(()) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        if let Some(reply) = reply.take() { reply.reply(None).await; }
+                        return Ok(exit_code);
+                    }
+                    Err(error) => {
+                        let message = format!("Codex cleanup failed: {error:#}");
+                        tracing::warn!("{message}");
+                        state.last_error = Some(message.clone());
+                        if !child_live {
+                            state.codex_connected = Some(false);
+                            state.status = SessionStatus::Starting;
+                            state.active_since = None;
+                        }
                         state.updated_at = LauncherState::now();
                         state.write()?;
+                        let _ = relay.pause_input(false).await;
+                        if let Some(reply) = reply.take() { reply.reply(Some(message)).await; }
+                        // Preserve the launcher and its state for a retry, including
+                        // when the TUI/window has already closed. Never resend input.
+                        false
                     }
                 }
             }
+        };
+        if begin_stop {
+            let pause = relay.pause_input(true).await;
+            // A lifecycle reply can already have reached the TUI while its
+            // observation is queued here. Adopt it before selecting cleanup's
+            // thread; the paused input gate prevents a new turn overtaking us.
+            while let Ok(event) = relay.events.try_recv() {
+                monitor.apply(state, event);
+            }
+            let config = config.clone();
+            let snapshot = state.clone();
+            let turn = monitor.turn.clone();
+            stopping = Some(Box::pin(async move {
+                pause?;
+                tokio::time::timeout(
+                    Duration::from_secs(35),
+                    app_server::stop(&config, &snapshot, turn.as_deref()),
+                )
+                .await
+                .context("Codex cleanup timed out")?
+            }));
         }
     }
-    .await;
-    // End input before stopping server-owned work, on every exit path. The
-    // controller only addresses this thread and never signals the shared daemon.
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-    if let Err(error) = app_server::stop(config, state, monitor.turn.as_deref()).await {
-        tracing::warn!("could not stop Codex thread: {error:#}");
-    }
-    result
 }
 
 /// Resolve when the launcher is asked to terminate via SIGTERM or SIGHUP.
@@ -626,6 +717,7 @@ async fn hold_failed_launch(
     eprintln!("captain-miao: {msg}");
     tracing::warn!("launch failed; holding window as FailedToStart: {msg}");
     state.status = SessionStatus::FailedToStart;
+    state.codex_control = false;
     state.last_error = Some(msg);
     state.child_pid = None;
     state.active_since = None;
@@ -1853,6 +1945,112 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_cleanup_keeps_the_launcher_and_tui_alive_until_a_successful_retry() {
+        use crate::agents::codex::{CodexConfig, CodexMode, app_server};
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::{Value, json};
+        use tokio_tungstenite::tungstenite::Message;
+        state::ensure_sessions_dir().unwrap();
+        let root = state::runtime_dir().join(format!("cleanup-test-{}", std::process::id()));
+        state::create_dir_all_private(&root).unwrap();
+        let upstream = root.join("server.sock");
+        let listener = UnixListener::bind(&upstream).unwrap();
+        let config = CodexConfig {
+            mode: CodexMode::AppServer,
+            endpoint: format!("unix://{}", upstream.display()),
+        };
+        let server = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    if method == "initialized" {
+                        if attempt == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    let reply = if method == "thread/backgroundTerminals/clean" && attempt == 1 {
+                        json!({"id":request["id"],"error":{"code":-32603,"message":"cleanup denied"}})
+                    } else {
+                        let result = match method {
+                            "initialize" | "thread/backgroundTerminals/clean" => json!({}),
+                            "thread/goal/get" => json!({"goal":null}),
+                            "thread/turns/list" => json!({"data":[]}),
+                            _ => panic!("unexpected cleanup method {method}"),
+                        };
+                        json!({"id":request["id"],"result":result})
+                    };
+                    socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                    if method == "thread/backgroundTerminals/clean" {
+                        break;
+                    }
+                }
+            }
+        });
+        let relay = app_server::Relay::start(&config, &root.join("relay.sock"))
+            .await
+            .unwrap();
+        let control_path = root.join("control.sock");
+        let control = app_server::Control::start(UnixListener::bind(&control_path).unwrap());
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        row.launcher_pid = std::process::id() + 1;
+        row.child_pid = Some(pid);
+        row.codex_mode = CodexMode::AppServer;
+        row.codex_control = true;
+        row.session_id = Some("test-thread".into());
+        let _cleanup = CleanupGuard {
+            launcher_pid: row.launcher_pid,
+            sock_path: control_path.clone(),
+            settings_path: root.join("unused.json"),
+        };
+        let supervisor = tokio::spawn(async move {
+            supervise_codex_app_server(&config, &mut row, child, relay, control).await
+        });
+        for attempt in 0..2 {
+            let mut stream = tokio::net::UnixStream::connect(&control_path)
+                .await
+                .unwrap();
+            crate::protocol::write_frame(&mut stream, &"Stop")
+                .await
+                .unwrap();
+            let reply: Value = tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::protocol::read_frame(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            if attempt == 0 {
+                assert!(reply["error"].as_str().unwrap().contains("cleanup denied"));
+                assert!(!supervisor.is_finished());
+                assert!(
+                    state::is_process_alive(pid),
+                    "a rejected stop must preserve the TUI"
+                );
+            } else {
+                assert!(reply["error"].is_null());
+            }
+        }
+        assert_eq!(supervisor.await.unwrap().unwrap(), 0);
+        assert!(!state::is_process_alive(pid));
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn runtime_sweep_removes_dead_launchers_images_and_keeps_live_ones() {

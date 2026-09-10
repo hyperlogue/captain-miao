@@ -2,6 +2,7 @@
 //! stream, preserving its full input, approval, configuration and reconnect
 //! behavior. Only the launcher reduces observations into its own state file.
 //! No hook profile, rollout reader or SQLite connection belongs to this mode.
+mod control;
 mod monitor;
 mod relay;
 mod transport;
@@ -14,6 +15,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::CodexConfig;
 use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::LauncherState;
+pub(crate) use control::{Control, StopRequest, request_stop};
 pub(crate) use monitor::Monitor;
 pub(crate) use relay::Relay;
 
@@ -97,7 +99,20 @@ pub(crate) async fn stop(
             .await
             .map(|_| ())
     } else {
-        Ok(())
+        match goal {
+            // Codex 0.153.4 returns this explicit absence when goals are disabled.
+            // There is then no continuation to pause; other errors must surface.
+            Err(error)
+                if error
+                    .downcast_ref::<transport::RpcError>()
+                    .is_some_and(|rpc| {
+                        rpc.code == Some(-32600) && rpc.message == "goals feature is disabled"
+                    }) =>
+            {
+                Ok(())
+            }
+            other => other.map(|_| ()),
+        }
     };
     // A rejoined thread can already be busy before this TUI receives events.
     let latest = client
@@ -127,7 +142,7 @@ pub(crate) async fn stop(
     client
         .request("thread/backgroundTerminals/clean", json!({"threadId":id}))
         .await?;
-    paused.and(interrupt)
+    paused.and(latest.map(|_| ())).and(interrupt)
 }
 
 pub(crate) fn command(

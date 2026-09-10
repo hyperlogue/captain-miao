@@ -43,8 +43,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    Action, App, InputMode, KillOrigin, KillResult, PendingConfirm, PickerKind, ReportOrigin,
-    RestartSpec, ResumeLoad, SessionSnapshotEntry,
+    Action, App, InputMode, KillOrigin, KillResult, KillWindow, PendingConfirm, PickerKind,
+    ReportOrigin, RestartSpec, ResumeLoad, SessionSnapshotEntry,
 };
 
 /// Lines of terminal output captured for the preview panel — its vertical
@@ -497,7 +497,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// the UI thread, so the dashboard froze for its duration with the row it was
 /// killing still on screen. Nothing is lost by guessing: the key names a session
 /// on a host that is about to say the same thing, and [`apply_kill_result`] puts
-/// the row back for the one answer that means it never heard us.
+/// the row back when the request fails or cleanup is rejected.
 ///
 /// Returns whether a host was actually asked, so a batch can report an honest
 /// count. Only an unknown `host` (a row whose host has since been removed from
@@ -508,62 +508,64 @@ fn start_kill(
     host: HostId,
     key: SessionKey,
     origin: KillOrigin,
+    window: Option<(WindowId, Option<u32>)>,
 ) -> bool {
     let Some(backend) = app.backend_for(&host) else {
         app.set_status(format!("Unknown host {}", host.0), true);
         return false;
     };
-    // Before anyone has been asked — that ordering *is* the optimism. A no-op on
-    // a plain local backend, which has nothing to be optimistic about.
+    let window = window.map(|(id, pid)| KillWindow {
+        id,
+        pid,
+        binding_token: app
+            .sessions
+            .iter()
+            .find(|s| s.host == host && s.key() == key)
+            .and_then(|s| s.binding_token().map(str::to_owned)),
+    });
     backend.presume_killed(&key);
-    // Hand a host's blocking round trip to a pool thread. The `Arc` clone is why
-    // `Backend::Remote` holds one — a spawned task can't borrow the `App` that
-    // owns the backend.
-    if let Backend::Remote(remote) = backend {
-        let remote = Arc::clone(remote);
-        let tx = inboxes.kill_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let outcome = remote.kill_session(&key);
-            let _ = tx.send(KillResult {
-                host,
-                key,
-                outcome,
-                origin,
-            });
-        });
-        return true;
-    }
-    // Local: an in-process `libc::kill`, so it has already happened by the time
-    // this returns and the `sessions/` watcher takes the row within the settle.
-    let outcome = tokio::task::block_in_place(|| backend.kill_session(&key));
-    apply_kill_result(
-        app,
-        KillResult {
+    let task = backend.kill_session(key.clone());
+    let tx = inboxes.kill_tx.clone();
+    tokio::spawn(async move {
+        let outcome = task
+            .await
+            .unwrap_or_else(|error| KillOutcome::Failed(format!("Kill worker failed: {error}")));
+        let _ = tx.send(KillResult {
             host,
             key,
             outcome,
             origin,
-        },
-    );
+            window,
+        });
+    });
     true
 }
 
 /// Settle a kill that has come back from its host: put the row back if the
-/// request never landed, and say so if anyone is waiting to hear.
-fn apply_kill_result(app: &mut App, result: KillResult) {
+/// request fails or cleanup is rejected, and report the result.
+pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
     let KillResult {
         host,
         key,
         outcome,
         origin,
+        window,
     } = result;
-    if outcome == KillOutcome::Unreachable {
-        // Nothing was signalled, so the session is still running and hiding its
+    if matches!(outcome, KillOutcome::Unreachable | KillOutcome::Failed(_)) {
+        // Cleanup was not confirmed, so the launcher remains and hiding its
         // row was wrong. `AlreadyGone` is the opposite case and keeps the hide:
         // the host is telling us the session had ended before we asked.
         if let Some(backend) = app.backend_for(&host) {
             backend.unpresume_killed(&key);
         }
+    }
+    if matches!(outcome, KillOutcome::Signalled | KillOutcome::AlreadyGone)
+        && let Some(window) = window
+    {
+        if let Some(token) = window.binding_token {
+            app.retire_window_binding(&host, &token);
+        }
+        close_window_when_free(window.id, window.pid);
     }
     if origin == KillOrigin::WindowClosed {
         // Silent by design — `close_reported_sessions` says why. A restored row
@@ -575,6 +577,7 @@ fn apply_kill_result(app: &mut App, result: KillResult) {
         KillOutcome::Signalled => app.set_status("Session terminated".to_string(), false),
         // Not an error: the row leaving is what `x` was for, and it has.
         KillOutcome::AlreadyGone => app.set_status("Session had already ended".to_string(), false),
+        KillOutcome::Failed(error) => app.set_status(format!("Kill failed: {error}"), true),
         KillOutcome::Unreachable => {
             app.set_status(format!("Kill failed: {} did not answer", host.0), true)
         }
@@ -1157,7 +1160,7 @@ fn close_reported_sessions(app: &mut App, inboxes: &LoopInboxes) -> bool {
     }
     let mut closed = 0usize;
     for (host, key) in queued {
-        if start_kill(app, inboxes, host, key, KillOrigin::WindowClosed) {
+        if start_kill(app, inboxes, host, key, KillOrigin::WindowClosed, None) {
             closed += 1;
         }
     }
@@ -1262,9 +1265,9 @@ fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
 /// relaunch — signaling/closing either would hit the wrong target. We also
 /// re-check `child_pid` liveness before signaling even on the kill path.
 ///
-/// The close is *unconditional* on the kill path — best-effort, since closing an
-/// already-gone window is a no-op (zellij) or an ignored error (kitty) — rather
-/// than gated on a terminal snapshot. That snapshot cost a `list-panes`, ~20ms
+/// After a confirmed kill, the close is best-effort, since closing an
+/// already-gone window is a no-op (zellij) or an ignored error (kitty). It is
+/// not gated on a terminal snapshot. That snapshot cost a `list-panes`, ~20ms
 /// **per pane** on zellij (~780ms in a 30-pane session), and bought nothing: an
 /// id merely being present proves *some* window has it, which is exactly what a
 /// recycled id would look like too, so it never guarded the collision its gate
@@ -1324,7 +1327,23 @@ async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
         // window close is best-effort; an already-closed window just errors, and
         // a detached pooled session has no window at all.
         if let Some(backend) = app.backend_for(&host) {
-            let _ = tokio::task::block_in_place(|| backend.kill_session(&key));
+            let outcome = backend
+                .kill_session(key.clone())
+                .await
+                .unwrap_or_else(|error| KillOutcome::Failed(error.to_string()));
+            if matches!(outcome, KillOutcome::Failed(_) | KillOutcome::Unreachable) {
+                apply_kill_result(
+                    app,
+                    KillResult {
+                        host: host.clone(),
+                        key: key.clone(),
+                        outcome,
+                        origin: KillOrigin::Asked,
+                        window: None,
+                    },
+                );
+                return false;
+            }
         }
         if let Some(window_id) = window_id {
             close_window_when_free(window_id, spec.window_pid);
@@ -2333,13 +2352,14 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // The row goes at this keystroke rather than when the
                         // host gets round to answering; the answer itself lands
                         // in `apply_kill_result`.
-                        start_kill(&mut app, &inboxes, host, key, KillOrigin::Asked);
-                        if let Some(wid) = window_id {
-                            // The signal is on its way; let it land before the
-                            // window goes, so the launcher exits on its own and
-                            // takes its window with it.
-                            close_window_when_free(wid, window_pid);
-                        }
+                        start_kill(
+                            &mut app,
+                            &inboxes,
+                            host,
+                            key,
+                            KillOrigin::Asked,
+                            window_id.map(|id| (id, window_pid)),
+                        );
                         arm_settle_reload(&mut settle_reload_at);
                     }
                     Action::DetachRemote {

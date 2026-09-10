@@ -416,7 +416,7 @@ Hello{client_version, protocol}        Welcome{server_version, protocol, host}
 Subscribe                              Snapshot{sessions}         then push:
                                        Delta{state}  |  Removed{key}
 ListResumable{req_id, limit}           Resumable{req_id, candidates, errors}
-KillSession{req_id, key}               Killed{req_id, ok}
+KillSession{req_id, key}               Killed{req_id, ok, error?}
 OpenSession{req_id, spec}              Opened{req_id, session_name? | error?}
 SetSessionFlags{req_id, key, flags}    FlagsSet{req_id, ok}
 ListRecentDirs{req_id}                 RecentDirs{req_id, cwds}
@@ -691,11 +691,10 @@ different hosts indistinguishable to the app layer: `list_sessions`,
 - **A kill is optimistic**, and `presume_killed`/`unpresume_killed` are the seam
   for it: `Remote` hides the key from `list_sessions` (a `presumed_dead` set
   beside the mirror, never a write *to* the mirror — see §7), `Local` no-ops,
-  since its kill is an in-process signal its own watcher reports within the
-  settle. `KillOutcome` is three-valued for the same reason: `AlreadyGone`
-  ("this host has no such live session") and `Unreachable` ("this host never
-  heard you") used to be the same `false`, and only the second is grounds to
-  put the row back.
+  since its own watcher reports successful teardown. `AlreadyGone` means the
+  host has no such live session and keeps the hide. `Unreachable` and `Failed`
+  restore it; `Failed` includes the cleanup error reported by the host. Direct
+  local kills also run on a worker because app-server cleanup takes RPCs.
 - **Open is a plan, not a boolean.** `open_session(OpenSpec{agent, cwd,
   resume?})` returns a `LaunchPlan`: `SpawnLocal{argv}` (the window IS the
   launcher, dashboard mints `--launch-id`) or `AttachRemote{argv,
@@ -1035,8 +1034,8 @@ through the identical path.
   pushes only what changed, so a session that survived a kill it never heard
   about is one the host has no reason to re-send, and an edit to the mirror
   would leave nothing to correct against. An `Unreachable` reply — no answer at
-  all, so nothing was signalled — withdraws it immediately rather than waiting
-  the lapse out.
+  all — or a `Failed` cleanup reply withdraws it immediately rather than waiting
+  the lapse out. The terminal window is closed only after a successful result.
 - **RESTART / FORK**: kill + reopen **on the row's own host** (fork with
   `fork = true`), landing in that host's pool and auto-attaching like any open.
   No longer local-only.
@@ -1107,6 +1106,14 @@ argv flag threaded over ssh, and `miao-server` consults no config of its own to
 decide them. That is deliberate, and it is what makes the name validation in
 `cm_core::config::is_valid_env_name` worth anything: one writer means one place
 a name can enter, so there is no second path to also police.
+
+`Killed` replies may include an additive `error` field. A rejected Codex
+app-server cleanup restores the dashboard's optimistic hide and preserves the
+window binding. The host obtains that acknowledgement from the owning launcher
+through its private socket; only the launcher knows the session's selected
+app-server endpoint. `ok: false` with no error retains its older meaning of
+"already gone". This control exchange does not write session-state files from
+the backend or dashboard.
 
 The Hosts panel always includes **localhost**, even without a local pool. Its
 Codex editor writes this machine's `[codex]` section. Remote rows use additive

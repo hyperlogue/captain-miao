@@ -8625,3 +8625,54 @@ fn the_backend_cycle_survives_an_agent_it_cannot_see() {
         "an empty available set must still advance through ALL"
     );
 }
+
+#[test]
+fn rejected_cleanup_restores_the_optimistic_row_and_keeps_its_window_binding() {
+    use super::{KillOrigin, KillResult, KillWindow};
+    use crate::backend::{Backend, KillOutcome, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(120, 20);
+    let host = HostId("test-host".into());
+    let mut row = session(321, "~/work", SessionStatus::Active);
+    row.host = host.clone();
+    row.pool_session = Some("test-pool".into());
+    let key = row.key();
+    let window = WindowId::from(1234);
+    let remote = RemoteBackend::unconnected_for_tests(host.clone(), vec![row.clone()]);
+    d.app.backends.push(Backend::Remote(remote));
+    d.app
+        .record_window_binding(host.clone(), "test-pool".into(), window.clone());
+    d.app.backends.last().unwrap().presume_killed(&key);
+    assert!(
+        d.app
+            .backends
+            .last_mut()
+            .unwrap()
+            .list_sessions()
+            .is_empty()
+    );
+    super::run::apply_kill_result(
+        &mut d.app,
+        KillResult {
+            host: host.clone(),
+            key,
+            outcome: KillOutcome::Failed("Codex cleanup refused".into()),
+            origin: KillOrigin::Asked,
+            window: Some(KillWindow {
+                id: window.clone(),
+                pid: None,
+                binding_token: Some("test-pool".into()),
+            }),
+        },
+    );
+    assert_eq!(d.app.backends.last_mut().unwrap().list_sessions().len(), 1);
+    assert_eq!(d.app.window_id_for_session(&row), Some(window));
+    assert!(d.app.status_is_error);
+    assert!(
+        d.app
+            .status_msg
+            .as_deref()
+            .unwrap()
+            .contains("Codex cleanup refused")
+    );
+}

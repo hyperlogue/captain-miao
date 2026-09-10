@@ -147,7 +147,14 @@ pub enum ServerFrame {
         errors: Vec<String>,
     },
     /// Reply to `KillSession`.
-    Killed { req_id: u64, ok: bool },
+    Killed {
+        req_id: u64,
+        ok: bool,
+        /// A live session refused cleanup. Absent preserves old peers' meaning
+        /// of ok:false (already gone); new clients must undo their optimistic hide.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Reply to `OpenSession`: `session_name` is the pool join key on success;
     /// `error` carries a message instead (pool unavailable / server built
     /// without pty-pool / spawn failed). Exactly one is `Some`.

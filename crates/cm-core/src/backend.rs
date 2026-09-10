@@ -431,7 +431,7 @@ impl LocalBackend {
     /// Falls back to the launcher pid when the row carries no `child_pid` (a
     /// `FailedToStart` launcher holding its error), matching the client's own
     /// kill target.
-    pub fn kill_session(&self, key: &SessionKey) -> bool {
+    pub fn kill_session(key: &SessionKey) -> anyhow::Result<bool> {
         let Some(state) = state::read_all_launcher_states()
             .into_iter()
             .find(|s| &s.key() == key)
@@ -440,14 +440,28 @@ impl LocalBackend {
                 target: "captain_miao::backend",
                 "kill refused: no live session for key {key}"
             );
-            return false;
+            return Ok(false);
         };
         let pid = if state.codex_mode.is_native() {
             state.child_pid.unwrap_or(state.launcher_pid)
-        } else {
+        } else if state.codex_control {
+            crate::agents::codex::app_server::request_stop(state.launcher_pid)?;
+            return Ok(true);
+        } else if state.status == crate::state::SessionStatus::FailedToStart {
             state.launcher_pid
+        } else {
+            anyhow::bail!("This Codex launcher cannot confirm cleanup yet; use an updated launcher")
         };
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
+        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
+            Ok(true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error.into())
+            }
+        }
     }
 
     /// Build the argv for a local launcher window:

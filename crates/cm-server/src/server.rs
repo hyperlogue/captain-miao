@@ -879,8 +879,17 @@ async fn handle_conn(
                         // The key is re-resolved to a live pid inside the
                         // backend, so a stale mirror can't make us signal a
                         // recycled pid.
-                        let ok = backend.kill_session(&key);
-                        write_frame(&mut wr, &ServerFrame::Killed { req_id, ok }).await?;
+                        let result = tokio::task::block_in_place(|| LocalBackend::kill_session(&key));
+                        let (ok, error) = match result {
+                            Ok(ok) => (ok, None),
+                            Err(error) => {
+                                let home = cm_core::paths::host_home();
+                                let message = format!("{error:#}");
+                                let message = if home.len() > 1 { message.replace(&home, "~") } else { message };
+                                (false, Some(message))
+                            },
+                        };
+                        write_frame(&mut wr, &ServerFrame::Killed { req_id, ok, error }).await?;
                     }
                     ClientFrame::OpenSession { req_id, spec } => {
                         let reply = tokio::task::block_in_place(|| open_session_reply(req_id, spec));

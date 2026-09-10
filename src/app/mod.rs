@@ -458,6 +458,14 @@ pub(super) struct KillResult {
     pub(super) key: state::SessionKey,
     pub(super) outcome: KillOutcome,
     pub(super) origin: KillOrigin,
+    pub(super) window: Option<KillWindow>,
+}
+
+#[derive(Debug)]
+pub(super) struct KillWindow {
+    pub(super) id: WindowId,
+    pub(super) pid: Option<u32>,
+    pub(super) binding_token: Option<String>,
 }
 
 /// Persisted dashboard overrides (pin/needs-input) so they survive restarts.

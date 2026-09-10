@@ -830,13 +830,9 @@ pub(crate) struct AttachPlan {
 
 /// What came of asking a host to end a session.
 ///
-/// Three states rather than the `bool` this used to be, because the dashboard
-/// now hides the row *before* the answer arrives (`Backend::presume_killed`) and
-/// only one of the two failures is grounds for putting it back. "The host says
-/// there is no such live session" and "the host never answered" collapse into
-/// the same `false`, and they are opposites: the first means the row was right
-/// to go, the second that nothing was signalled at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A missing session is success for an optimistic hide. A transport failure or
+/// a rejected cleanup must restore the row, even if some work already stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
     /// The host resolved the key and signalled the session.
     Signalled,
@@ -845,8 +841,10 @@ pub(crate) enum KillOutcome {
     AlreadyGone,
     /// No answer: the host is unreachable, or too old to know the frame (it
     /// ignores what it can't decode, §3). Nothing was signalled and the session
-    /// is still running — the one outcome an optimistic hide must unwind.
+    /// may still be running, so its optimistic hide must unwind.
     Unreachable,
+    /// Cleanup was rejected; preserve the session and surface the host error.
+    Failed(String),
 }
 
 impl Backend {
@@ -1085,28 +1083,32 @@ impl Backend {
     /// Tear the session down, naming it by its opaque [`SessionKey`]. The
     /// *owning host* resolves the key to a live pid immediately before
     /// signalling, so a mirror lagging the session's exit can't make it SIGTERM
-    /// a recycled pid (§3). May block on a round-trip for a remote host, so an
-    /// async caller should wrap this in `block_in_place`.
-    pub(crate) fn kill_session(&self, key: &SessionKey) -> KillOutcome {
+    /// a recycled pid (§3). Both transports run off the UI thread: a direct
+    /// local Codex session also waits for its launcher to confirm cleanup.
+    pub(crate) fn kill_session(&self, key: SessionKey) -> tokio::task::JoinHandle<KillOutcome> {
         match self {
-            // In-process `libc::kill`: the only way to fail is to find no live
-            // session under the key, so there is no unreachable case here.
-            Backend::Local(h) => match h.inner.kill_session(key) {
-                true => KillOutcome::Signalled,
-                false => KillOutcome::AlreadyGone,
-            },
-            Backend::Remote(b) => b.kill_session(key),
+            Self::Local(_) => {
+                tokio::task::spawn_blocking(move || match LocalBackend::kill_session(&key) {
+                    Ok(true) => KillOutcome::Signalled,
+                    Ok(false) => KillOutcome::AlreadyGone,
+                    Err(error) => KillOutcome::Failed(format!("{error:#}")),
+                })
+            }
+            Self::Remote(remote) => {
+                let remote = remote.clone();
+                tokio::task::spawn_blocking(move || remote.kill_session(&key))
+            }
         }
     }
 
     /// Treat `key` as already gone, before the host has been asked — the
     /// optimistic half of a kill. The row leaves the table on the next reload
     /// rather than a round trip later; [`unpresume_killed`] puts it back if the
-    /// host turns out never to have heard the request.
+    /// host cannot confirm the requested cleanup.
     ///
     /// A no-op for a plain local backend, which has nothing to be optimistic
-    /// about: its kill is an in-process signal and its `sessions/` watcher takes
-    /// the row away within the settle. Under pooled-localhost the daemon is
+    /// about: its `sessions/` watcher takes the row away after successful
+    /// teardown, and a rejected cleanup leaves its state file in place. Under pooled-localhost the daemon is
     /// still on the far side of a socket, and that backend is a `Remote` — which
     /// is why this branches on the backend, not on locality.
     ///
@@ -1117,8 +1119,8 @@ impl Backend {
         }
     }
 
-    /// Undo a [`presume_killed`]: nothing was signalled after all, so the
-    /// session is still running and its row belongs back in the table.
+    /// Undo a [`presume_killed`]: teardown was not confirmed, so the session
+    /// remains managed and its row belongs back in the table.
     ///
     /// [`presume_killed`]: Self::presume_killed
     pub(crate) fn unpresume_killed(&self, key: &SessionKey) {
@@ -1916,6 +1918,9 @@ impl RemoteBackend {
     pub(crate) fn kill_session(&self, key: &SessionKey) -> KillOutcome {
         let key = key.clone();
         match self.request(|req_id| ClientFrame::KillSession { req_id, key }) {
+            Some(ServerFrame::Killed {
+                error: Some(error), ..
+            }) => KillOutcome::Failed(error),
             Some(ServerFrame::Killed { ok: true, .. }) => KillOutcome::Signalled,
             Some(ServerFrame::Killed { ok: false, .. }) => KillOutcome::AlreadyGone,
             // No reply at all — `request` fails fast on a known-down host and
@@ -4853,9 +4858,16 @@ mod tests {
                 .await
                 .unwrap(),
                 ClientFrame::KillSession { req_id, key } => {
-                    write_frame(&mut wr, &ServerFrame::Killed { req_id, ok: true })
-                        .await
-                        .unwrap();
+                    write_frame(
+                        &mut wr,
+                        &ServerFrame::Killed {
+                            req_id,
+                            ok: true,
+                            error: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
                     // What a real host does moments later, once the launcher has
                     // torn down and its state file gone. The client's optimistic
                     // hide is waiting for exactly this.
@@ -4938,6 +4950,26 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_cleanup_is_a_failed_kill_not_an_already_gone_session() {
+        let (remote, _shared, mut requests) = RemoteBackend::build(
+            &Transport::LocalSocket(std::path::PathBuf::from("/unused.sock")),
+            HostId("test-host".into()),
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            remote.kill_session(&SessionKey::from_launcher_pid(123))
+        });
+        let request = requests.recv().await.unwrap();
+        request.reply.send(serde_json::from_value(serde_json::json!({
+            "frame":"Killed", "req_id":request.req_id, "ok":false, "error":"Codex cleanup refused"
+        })).unwrap()).unwrap();
+        let outcome = task.await.unwrap();
+        assert!(
+            !matches!(outcome, KillOutcome::AlreadyGone | KillOutcome::Signalled),
+            "rejected cleanup must restore the row, got {outcome:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

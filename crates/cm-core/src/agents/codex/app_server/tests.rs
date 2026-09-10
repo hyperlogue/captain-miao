@@ -344,7 +344,15 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
     let (mut monitor, mut state) = (Monitor::default(), state());
     for _ in 0..2 {
         let mut tui = transport::connect(&proxy).await.unwrap();
+        relay.pause_input(true).await.unwrap();
         send(&mut tui,&json!({"id":8,"method":"thread/resume","params":{"threadId":"thread-root","futureField":"preserved"}})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), tui.next())
+                .await
+                .is_err(),
+            "a pending cleanup must prevent new TUI requests from reaching the server"
+        );
+        relay.pause_input(false).await.unwrap();
         assert_eq!(receive(&mut tui).await["id"], 8);
         assert_eq!(receive(&mut tui).await["id"], "approval");
         send(
@@ -418,6 +426,49 @@ async fn stopping_pauses_the_goal_and_cleans_shells_even_if_the_turn_just_finish
     state.session_id = Some("thread-root".into());
     assert!(stop(&config, &state, Some("old-turn")).await.is_err());
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_goals_allow_cleanup_but_real_goal_errors_are_reported() {
+    for message in ["goals feature is disabled", "goal store unavailable"] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("stop.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let config = CodexConfig {
+            endpoint: format!("unix://{}", path.display()),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let init = receive(&mut socket).await;
+            send(&mut socket, &json!({"id":init["id"],"result":{}})).await;
+            assert_eq!(receive(&mut socket).await["method"], "initialized");
+            for method in [
+                "thread/goal/get",
+                "thread/turns/list",
+                "thread/backgroundTerminals/clean",
+            ] {
+                let request = receive(&mut socket).await;
+                assert_eq!(request["method"], method);
+                let reply = if method == "thread/goal/get" {
+                    json!({"id":request["id"],"error":{"code":-32600,"message":message}})
+                } else {
+                    json!({"id":request["id"],"result":{"data":[]}})
+                };
+                send(&mut socket, &reply).await;
+            }
+        });
+        let mut row = state();
+        row.session_id = Some("test-thread".into());
+        let result = stop(&config, &row, None).await;
+        if message == "goals feature is disabled" {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().to_string().contains(message));
+        }
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

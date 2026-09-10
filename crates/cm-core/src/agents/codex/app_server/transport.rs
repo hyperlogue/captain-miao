@@ -35,6 +35,22 @@ pub(super) async fn connect(path: &Path) -> Result<Socket> {
     .context("Codex app-server connection timed out")?
 }
 
+/// Preserve the protocol error code so callers can distinguish an unavailable
+/// optional feature from a failed operation without parsing formatted errors.
+#[derive(Debug)]
+pub(super) struct RpcError {
+    method: String,
+    pub(super) code: Option<i64>,
+    pub(super) message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codex {}: {}", self.method, self.message)
+    }
+}
+impl std::error::Error for RpcError {}
+
 pub(super) struct Client {
     socket: Socket,
     next_id: u64,
@@ -82,10 +98,15 @@ impl Client {
                         let value: Value = serde_json::from_str(&text)?;
                         if value.get("id") == Some(&json!(id)) && value.get("method").is_none() {
                             if let Some(error) = value.get("error") {
-                                bail!(
-                                    "Codex {method}: {}",
-                                    error["message"].as_str().unwrap_or("request failed")
-                                );
+                                return Err(RpcError {
+                                    method: method.into(),
+                                    code: error["code"].as_i64(),
+                                    message: error["message"]
+                                        .as_str()
+                                        .unwrap_or("request failed")
+                                        .into(),
+                                }
+                                .into());
                             }
                             return value.get("result").cloned().context("missing Codex result");
                         }

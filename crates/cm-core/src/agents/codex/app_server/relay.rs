@@ -5,11 +5,13 @@ use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 pub(crate) struct Relay {
     pub(crate) events: mpsc::Receiver<Observation>,
+    input_paused: watch::Sender<bool>,
+    pause_ack: watch::Receiver<bool>,
     path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
@@ -24,9 +26,20 @@ impl Relay {
         let listener = UnixListener::bind(path).context("binding Codex TUI relay")?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let (tx, events) = mpsc::channel(128);
+        let (input_paused, mut pause_rx) = watch::channel(false);
+        let (ack_tx, pause_ack) = watch::channel(false);
         let task = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    biased;
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() { break; }
+                        ack_tx.send_replace(*pause_rx.borrow_and_update());
+                        continue;
+                    }
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, _)) = accepted else {
                     break;
                 };
                 let result = async {
@@ -36,7 +49,12 @@ impl Relay {
                     let mut server = transport::connect(&upstream).await?;
                     loop {
                         tokio::select! {
-                            frame = client.next() => {
+                            biased;
+                            changed = pause_rx.changed() => {
+                                if changed.is_err() { break; }
+                                ack_tx.send_replace(*pause_rx.borrow_and_update());
+                            }
+                            frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
                                 let frame = frame?;
                                 if let Message::Text(text) = &frame
@@ -76,9 +94,26 @@ impl Relay {
         });
         Ok(Self {
             events,
+            input_paused,
+            pause_ack,
             path: path.to_owned(),
             task,
         })
+    }
+    /// Confirm the relay has stopped forwarding new TUI requests before cleanup
+    /// starts. Replies/events continue flowing; a failed stop releases the gate.
+    pub(crate) async fn pause_input(&mut self, paused: bool) -> Result<()> {
+        self.input_paused
+            .send(paused)
+            .context("Codex relay stopped")?;
+        tokio::time::timeout(
+            transport::DEADLINE,
+            self.pause_ack.wait_for(|ack| *ack == paused),
+        )
+        .await
+        .context("Codex relay did not acknowledge input pause")?
+        .context("Codex relay stopped")?;
+        Ok(())
     }
 }
 

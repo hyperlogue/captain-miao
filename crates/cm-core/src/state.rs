@@ -1007,6 +1007,9 @@ pub struct LauncherState {
     /// App-server transport health; absent for native and older launchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_connected: Option<bool>,
+    /// This launcher can acknowledge cleanup through its private control socket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_control: bool,
     pub launcher_pid: u32,
     pub session_id: Option<String>,
     pub window_id: Option<WindowId>,
@@ -1179,6 +1182,7 @@ impl LauncherState {
             agent,
             codex_mode: Default::default(),
             codex_connected: None,
+            codex_control: false,
             launcher_pid: 0,
             session_id: None,
             child_session_ids: Vec::new(),
