@@ -36,7 +36,7 @@ use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCach
 pub const LAUNCH_VERB: &str = "launch";
 use crate::agents::codex;
 use crate::paths;
-use crate::state::{self, LauncherState, SessionFlags, SessionKey};
+use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus};
 
 /// What to open: which agent, where, and whether it's a fresh session or a
 /// resume/fork of an existing one. This is §3's `SpawnSpec`, renamed to
@@ -96,7 +96,7 @@ impl LaunchPlan {
 
 /// Bound reads during WAL churn without making a rename visibly lag. A change
 /// inside the window schedules one reload at its end, even if nothing else
-/// happens. Newly discovered session ids still get their first title at once.
+/// happens. New launchers, thread switches and status transitions read eagerly.
 const CODEX_TITLE_REFRESH_FLOOR: Duration = Duration::from_secs(1);
 
 /// The per-host Codex title cache behind [`LocalBackend`]'s overlay. Exactly
@@ -109,8 +109,12 @@ struct CodexTitles {
     /// row yet — the entry still marks the id *known*, so an untitled session
     /// doesn't re-trigger the first-sight read on every overlay pass.
     titles: HashMap<String, Option<String>>,
-    /// `(db, wal)` mtimes at the last read — the cheap change gate: an
-    /// unchanged stamp means no title can have moved, so sqlite isn't touched.
+    /// Last observed status per launcher/thread pair. A restart keeps the
+    /// thread id but replaces the launcher, and hooks can change status while
+    /// the title-store stamp stays unchanged. Both need an eager read.
+    sessions: HashMap<(u32, String), SessionStatus>,
+    /// `(db, wal)` mtimes at the last read — the cheap change gate between
+    /// lifecycle events, which bypass it to recover a stale or missing title.
     store_stamp: (Option<SystemTime>, Option<SystemTime>),
     last_read: Option<Instant>,
     /// One pending reload per host, shared by every subscriber. More events
@@ -292,10 +296,12 @@ impl LocalBackend {
     /// reaches remote rows for free (the daemon's `LocalBackend` overlays
     /// before `Snapshot`/`Delta`). No Codex sessions means no store IO; otherwise
     /// one batched read-only query runs when the store mtime changes, at most
-    /// once per second except for the first sight of a session id. A deferred
-    /// change arms one reload through the host's notifier. Its deadline stays
-    /// fixed during a burst, so an idle rename arrives without another event
-    /// and a busy store cannot keep postponing the refresh.
+    /// once per second except on launch, thread switch or status change. Those
+    /// lifecycle boundaries read eagerly even if the store stamp is unchanged,
+    /// so restarting a known thread cannot retain an earlier cached miss.
+    /// A deferred change arms one reload through the host's notifier. Its
+    /// deadline stays fixed during a burst, so an idle rename arrives without
+    /// another event and a busy store cannot keep postponing the refresh.
     fn overlay_codex_titles(&self, sessions: &mut [LauncherState]) {
         self.overlay_codex_titles_with(
             sessions,
@@ -325,14 +331,23 @@ impl LocalBackend {
         }
         if ids.is_empty() {
             cache.titles.clear();
+            cache.sessions.clear();
             cache.retry = None;
             return;
         }
-        let unknown = ids.iter().any(|id| !cache.titles.contains_key(id));
+        let live: HashMap<_, _> = sessions
+            .iter()
+            .filter(|s| s.agent == AgentControl::Codex)
+            .filter_map(|s| Some(((s.launcher_pid, s.session_id.clone()?), s.status.clone())))
+            .collect();
+        let eager = live
+            .iter()
+            .any(|(key, status)| cache.sessions.get(key) != Some(status));
+        cache.sessions = live;
         let stamp = store_stamp();
         let next_read = cache.last_read.map(|t| t + CODEX_TITLE_REFRESH_FLOOR);
         let changed = stamp != cache.store_stamp;
-        if unknown || (changed && next_read.is_none_or(|t| Instant::now() >= t)) {
+        if eager || (changed && next_read.is_none_or(|t| Instant::now() >= t)) {
             // Keep any armed wake: this read may serve a newly subscribing
             // dashboard, while the others still need the notification to
             // pick up the refreshed cache.
@@ -707,6 +722,126 @@ mod tests {
             let _ = tx.send(());
         });
         (backend, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_restart_refreshes_a_cached_title_without_another_store_event() {
+        let (backend, _changes) = title_backend_with_notifications();
+        let mut sessions: Vec<_> = (0..8)
+            .map(|i| {
+                let mut state = codex_state(Some(&format!("resumed-session-{i}")));
+                state.launcher_pid = i + 1;
+                state
+            })
+            .collect();
+        let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| HashMap::new());
+
+        // Restart resumes the same Codex threads under new launchers. A
+        // missing cached title must not survive this lifecycle boundary just
+        // because the store stamp has not changed since the failed read.
+        for session in &mut sessions {
+            session.launcher_pid += 8;
+        }
+        let reads = std::cell::Cell::new(0);
+        for _subscriber in 0..2 {
+            backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+                reads.set(reads.get() + 1);
+                assert_eq!(ids.len(), 8, "restart all shares one batch");
+                ids.iter()
+                    .map(|id| (id.clone(), format!("Title for {id}")))
+                    .collect()
+            });
+            for session in &sessions {
+                assert_eq!(
+                    session.name,
+                    Some(format!(
+                        "Title for {}",
+                        session.session_id.as_deref().unwrap()
+                    ))
+                );
+            }
+        }
+        assert_eq!(reads.get(), 1, "subscribers share the eager read too");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_status_changes_refresh_titles_without_waiting_for_store_events() {
+        let (backend, _changes) = title_backend_with_notifications();
+        let mut sessions = [codex_state(Some("starting-session"))];
+        sessions[0].status = SessionStatus::Starting;
+        let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| HashMap::new());
+
+        // Startup, a new turn, an approval prompt, and completion are useful
+        // chances to recover a stale title even if its watcher missed a write.
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Active,
+            SessionStatus::WaitingForApproval,
+            SessionStatus::Idle,
+        ] {
+            sessions[0].status = status.clone();
+            let title = format!("Title at {status:?}");
+            backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+                HashMap::from([("starting-session".into(), title.clone())])
+            });
+            assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
+            assert_eq!(sessions[0].status, status, "the launcher owns status");
+            // More hooks/transcript writes with the same status are still
+            // ordinary cache hits, as is another dashboard's same snapshot.
+            sessions[0].name = None;
+            sessions[0].updated_at += 1;
+            backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+                panic!("an unchanged lifecycle must reuse the eager read")
+            });
+            assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_status_refresh_keeps_pending_notifications_and_throttles_later_writes() {
+        let (backend, mut changes) = title_backend_with_notifications();
+        let mut sessions = [codex_state(Some("session"))];
+        let stamp = |revision| {
+            (
+                None,
+                Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(revision)),
+            )
+        };
+        backend.overlay_codex_titles_with(&mut sessions, || stamp(0), |_| HashMap::new());
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || stamp(1),
+            |_| panic!("an ordinary store write must be throttled"),
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        sessions[0].status = SessionStatus::Active;
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || stamp(1),
+            |_| HashMap::from([("session".into(), "Eager title".into())]),
+        );
+        assert_eq!(sessions[0].name.as_deref(), Some("Eager title"));
+        tokio::time::timeout(Duration::from_millis(501), changes.recv())
+            .await
+            .expect("other subscribers still need their original wake")
+            .unwrap();
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || stamp(2),
+            |_| panic!("the eager read starts a new throttle window"),
+        );
+        tokio::time::timeout(Duration::from_millis(501), changes.recv())
+            .await
+            .expect("a later store change still needs its own wake")
+            .unwrap();
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || stamp(2),
+            |_| HashMap::from([("session".into(), "Later title".into())]),
+        );
+        assert_eq!(sessions[0].name.as_deref(), Some("Later title"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -963,7 +963,8 @@ async fn push_changes(
 /// rename wouldn't reach subscribers until some other session event fired. The
 /// wake just triggers the normal re-read + diff; the actual sqlite read is
 /// gated on store changes and a one-second floor inside `LocalBackend`'s title
-/// overlay. A deferred read schedules another broadcast at the deadline; an
+/// overlay; launches, thread switches and status changes bypass both gates.
+/// A deferred read schedules another broadcast at the deadline; an
 /// unchanged diff pushes nothing. Best-effort: a missing store isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
     let dir = state::sessions_dir();
