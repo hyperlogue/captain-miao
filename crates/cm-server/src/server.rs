@@ -959,7 +959,7 @@ async fn push_changes(
 /// sqlite alone: a rename touches only that file, so without this wake a remote
 /// rename wouldn't reach subscribers until some other session event fired. The
 /// wake just triggers the normal re-read + diff; the actual sqlite read is
-/// heavily throttled inside `LocalBackend`'s title overlay, and an unchanged
+/// gated on store changes inside `LocalBackend`'s title overlay, and an unchanged
 /// diff pushes nothing. Best-effort: a missing store simply isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
     let dir = state::sessions_dir();

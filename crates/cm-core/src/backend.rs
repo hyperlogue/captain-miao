@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -92,13 +92,6 @@ impl LaunchPlan {
 // Codex thread titles
 // =============================================================================
 
-/// Floor between sqlite re-reads of the Codex title store once a change is
-/// detected. Renames are rare and low-stakes, so the overlay trades freshness
-/// for quiet: a title change surfaces on the first overlay pass at least this
-/// long after the previous read. First sight of a new session id bypasses the
-/// floor (one immediate read titles a fresh/resumed session).
-const CODEX_TITLE_REFRESH_FLOOR: Duration = Duration::from_secs(30);
-
 /// The per-host Codex title cache behind [`LocalBackend`]'s overlay. Exactly
 /// one exists per host process (the dashboard's local backend, or the daemon's
 /// server-core shared across every connection), so there is a **single sqlite
@@ -112,20 +105,6 @@ struct CodexTitles {
     /// `(db, wal)` mtimes at the last read — the cheap change gate: an
     /// unchanged stamp means no title can have moved, so sqlite isn't touched.
     store_stamp: (Option<SystemTime>, Option<SystemTime>),
-    last_read: Option<Instant>,
-}
-
-/// Whether the overlay should hit sqlite this pass. Pure so the throttle rules
-/// are pinned by tests: a never-seen session id reads immediately (first-load
-/// titling); otherwise a read requires both a store change (the mtime stamp
-/// moved) and the refresh floor elapsed since the last read — so even a
-/// wal-churning Codex burst costs at most one small read-only query batch per
-/// floor interval per host.
-fn title_refresh_due(unknown_id: bool, store_changed: bool, since_read: Option<Duration>) -> bool {
-    if unknown_id {
-        return true;
-    }
-    store_changed && since_read.is_none_or(|d| d >= CODEX_TITLE_REFRESH_FLOOR)
 }
 
 /// Stamp cached titles onto the Codex rows (matched by session id), leaving
@@ -275,10 +254,25 @@ impl LocalBackend {
     /// `state_5.sqlite` only — no hook, no rollout line — so this per-host
     /// reader stamps them onto `name` before the sessions are served, which
     /// reaches remote rows for free (the daemon's `LocalBackend` overlays
-    /// before `Snapshot`/`Delta`). Heavily throttled: no Codex sessions → no
-    /// reads at all; otherwise one batched read-only query, gated by the store
-    /// mtime stamp and [`CODEX_TITLE_REFRESH_FLOOR`] (see [`title_refresh_due`]).
+    /// before `Snapshot`/`Delta`). No Codex sessions means no store IO; otherwise
+    /// one batched read-only query runs when the store mtime changes or a new
+    /// session id appears. There is no time floor: a rename can be the last
+    /// event an idle session produces, so skipping its read would leave the
+    /// cached name in place until an unrelated event triggers another pass.
     fn overlay_codex_titles(&self, sessions: &mut [LauncherState]) {
+        self.overlay_codex_titles_with(
+            sessions,
+            codex::title_store_mtimes,
+            codex::read_thread_titles,
+        );
+    }
+
+    fn overlay_codex_titles_with(
+        &self,
+        sessions: &mut [LauncherState],
+        store_stamp: impl FnOnce() -> (Option<SystemTime>, Option<SystemTime>),
+        read_titles: impl FnOnce(&[String]) -> HashMap<String, String>,
+    ) {
         let ids: Vec<String> = sessions
             .iter()
             .filter(|s| s.agent == AgentControl::Codex)
@@ -290,13 +284,9 @@ impl LocalBackend {
             return;
         }
         let unknown = ids.iter().any(|id| !cache.titles.contains_key(id));
-        let stamp = codex::title_store_mtimes();
-        if title_refresh_due(
-            unknown,
-            stamp != cache.store_stamp,
-            cache.last_read.map(|t| t.elapsed()),
-        ) {
-            let read = codex::read_thread_titles(&ids);
+        let stamp = store_stamp();
+        if unknown || stamp != cache.store_stamp {
+            let read = read_titles(&ids);
             // Rebuild from the live ids: dead sessions fall out, and every live
             // id becomes *known* (`None` when untitled) so it doesn't re-trigger
             // the first-sight read.
@@ -305,7 +295,6 @@ impl LocalBackend {
                 .map(|id| (id.clone(), read.get(id).cloned()))
                 .collect();
             cache.store_stamp = stamp;
-            cache.last_read = Some(Instant::now());
         } else {
             cache.titles.retain(|id, _| ids.contains(id));
         }
@@ -638,30 +627,6 @@ mod tests {
         assert_eq!(cwds, ["~/other"]);
     }
 
-    #[test]
-    fn title_refresh_policy_throttles_heavily() {
-        // First sight of a session id reads immediately — floor or not — so a
-        // fresh/resumed session titles on its first overlay pass.
-        assert!(title_refresh_due(true, false, Some(Duration::ZERO)));
-        // Store changed + floor elapsed → read.
-        assert!(title_refresh_due(
-            false,
-            true,
-            Some(CODEX_TITLE_REFRESH_FLOOR)
-        ));
-        // Store changed but within the floor → hold (the heavy throttle: a
-        // wal-churning burst costs at most one read per floor interval).
-        assert!(!title_refresh_due(false, true, Some(Duration::ZERO)));
-        // Stamp unchanged → never read, no matter how long it's been.
-        assert!(!title_refresh_due(
-            false,
-            false,
-            Some(Duration::from_secs(9999))
-        ));
-        // Never read yet: the floor can't block the very first change-read.
-        assert!(title_refresh_due(false, true, None));
-    }
-
     fn codex_state(session_id: Option<&str>) -> LauncherState {
         LauncherState {
             launcher_pid: 1,
@@ -669,6 +634,77 @@ mod tests {
             first_prompt: Some("first prompt".into()),
             ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
         }
+    }
+
+    #[test]
+    fn codex_rename_reaches_overlay_on_next_store_change() {
+        let backend = LocalBackend::default();
+        let mut sessions = [codex_state(Some("renamed-session"))];
+        let stamp = SystemTime::UNIX_EPOCH;
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || (Some(stamp), Some(stamp)),
+            |_| HashMap::from([("renamed-session".into(), "Original title".into())]),
+        );
+        assert_eq!(sessions[0].name.as_deref(), Some("Original title"));
+
+        // A rename is the only event: the agent stays idle and writes no
+        // launcher state. It must refresh even immediately after a read.
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || {
+                (
+                    Some(stamp),
+                    Some(stamp + std::time::Duration::from_nanos(1)),
+                )
+            },
+            |_| HashMap::from([("renamed-session".into(), "Renamed title".into())]),
+        );
+        assert_eq!(sessions[0].name.as_deref(), Some("Renamed title"));
+    }
+
+    #[test]
+    fn codex_title_cache_reuses_unchanged_store_and_reads_new_ids() {
+        let backend = LocalBackend::default();
+        let mut sessions = vec![codex_state(Some("first-session"))];
+        let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+            assert_eq!(ids, ["first-session"]);
+            HashMap::from([("first-session".into(), "First title".into())])
+        });
+
+        // A state-file event does not query the unchanged title store.
+        sessions[0].name = None;
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+            panic!("unchanged store should use cached titles")
+        });
+        assert_eq!(sessions[0].name.as_deref(), Some("First title"));
+
+        // A new session must be queried even if the database has not changed.
+        // An absent title is cached too, so that id will not trigger more reads.
+        sessions.push(codex_state(Some("untitled-session")));
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+            assert_eq!(ids, ["first-session", "untitled-session"]);
+            HashMap::from([("first-session".into(), "First title".into())])
+        });
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+            panic!("untitled sessions should also be cached")
+        });
+        assert_eq!(sessions[1].name, None);
+
+        sessions.remove(0);
+        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+            panic!("removing a session does not need another read")
+        });
+        assert_eq!(backend.codex_titles.lock().unwrap().titles.len(), 1);
+
+        // Hosts without Codex sessions do not even stat the title store.
+        backend.overlay_codex_titles_with(
+            &mut [],
+            || panic!("no Codex sessions should mean no store IO"),
+            |_| panic!("no Codex sessions should mean no title reads"),
+        );
+        assert!(backend.codex_titles.lock().unwrap().titles.is_empty());
     }
 
     #[test]

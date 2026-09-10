@@ -1305,7 +1305,7 @@ impl Backend {
 /// Watch this host's session state for changes, feeding `changed`. Owned by the
 /// local backend (§5), not the app: the `sessions/` dir where launchers write,
 /// plus each agent backend's own nominated paths (Claude's session-name store,
-/// Codex's title-store WAL — the wake for the throttled title overlay).
+/// Codex's title-store WAL — the wake for the cached title overlay).
 ///
 /// Best-effort throughout: a missing path simply isn't watched, and a watcher
 /// that can't be created at all leaves the dashboard on its reload cadence

@@ -238,7 +238,7 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
 /// which the launcher learns from every hook payload and stores on
 /// `state.session_id`. Names — both user renames and Codex's own auto-titles —
 /// live in `state_5.sqlite`, read by the **per-host title overlay** in
-/// [`crate::backend::LocalBackend`] (one throttled reader per host, keyed by
+/// [`crate::backend::LocalBackend`] (one cached reader per host, keyed by
 /// session id — see [`read_thread_titles`]) and stamped onto
 /// `LauncherState.name`, so the title reaches the dashboard exactly like
 /// Claude's, local *and* remote. This index therefore stays empty: the name
@@ -283,7 +283,7 @@ pub fn title_store_mtimes() -> (Option<SystemTime>, Option<SystemTime>) {
 
 /// Batch-read the current titles for `ids` from `state_5.sqlite` over one
 /// read-only connection. Called by the per-host overlay in
-/// [`crate::backend::LocalBackend`] — a single throttled reader serving every
+/// [`crate::backend::LocalBackend`] — a single cached reader serving every
 /// Codex session on the host. Returns only the ids that have a (non-empty)
 /// title; an absent id simply has no title row yet. Empty on any open failure
 /// (the overlay tries again next pass).
