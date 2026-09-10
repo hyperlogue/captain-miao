@@ -257,47 +257,42 @@ library**.
   from the agent reaches the attaching terminal intact. The only gate is that
   terminal's own policy: kitty's `clipboard_control` (writes allowed by
   default), or zellij's own OSC 52 handling for an attach running in a pane.
-- **Restore mode is `simple`** (`pty_pool.rs`): reattach = reconnect +
-  SIGWINCH, **no scrollback replay**. Fine for the *contents* of a full-screen
-  agent TUI, which repaints on resize anyway — but replaying nothing also
-  replays no terminal **modes**. Grok sets its modes once at startup, into whichever
-  terminal was attached then — `ESC[?1049h`, the full mouse-tracking suite
-  (1000/1002/1003 + 1015/1006 encodings), focus (1004), bracketed paste
-  (2004), and under a kitty-ish `TERM` the kitty keyboard push (`ESC[>3u`). A
-  later window never receives any of it: it stays on the primary screen while
-  the agent repaints by cursor addressing (every bottom-row scroll leaking a
-  stale line into *native* scrollback — native scroll working at all is the
-  tell), the scrollwheel turns into arrow-key input (that translation is what
-  a terminal does on the alt screen with mouse tracking off), and Shift+Enter
-  collapses to a bare CR. Switching libshpool to `screen` restore would not
-  fix it — neither restore engine ever emits a mode; the vterm engine tracks
-  1049 and defines the control code but its dump never writes it, so it paints
-  alt-screen cells onto whatever screen the client is on. The stopgap: the
-  launcher resolves the agent's launch-time mode set at spawn
-  (`LauncherState::alt_screen` from Grok's own config reads —
-  `AgentControl::uses_alt_screen` — and `kitty_keyboard` from the agent's own
-  environment gate, `uses_kitty_keyboard`), and both attach entrypoints
-  (`run_attach`, `miao-client attach`) prime a **plain reattach**'s terminal
-  with that set around the relay (`cm_core::state::ReattachPrime`). Never on
-  the create path, where the agent sets up this very terminal itself.
-  **Codex's input modes are restored on the primary screen:** focus reporting,
-  bracketed paste, and, when its recorded `kitty_keyboard` is true, a keyboard
-  push. Codex's main view uses neither Grok's alternate-screen switch nor its
-  mouse tracking. The push uses flags **5** (disambiguate escape codes + report
-  alternate keys), the common subset of Codex 0.153.4's requests; event-type
-  reporting is omitted because Codex itself suppresses it on Ghostty, iTerm2
-  and tmux's xterm key format, and a reattach can change emulators. See
-  [Codex's keyboard setup](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/tui/src/tui/keyboard_modes.rs).
-  modifyOtherKeys is reset alongside that push; all enabled input modes are
-  undone and the cursor shown after the relay. The launcher records Codex's
-  `CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT` override and VS Code/WSL default at
-  spawn. Existing Codex sessions launched before this support need one restart
-  to record the keyboard setting; paste and focus restore immediately.
-  Accepted staleness: a mid-session mode switch (Grok's `/fullscreen` ↔
-  minimal) is invisible to a launch-time read; the durable fix is a restore
-  buffer that re-emits modes from the pool's own byte stream — though the
-  keyboard push is outside even that, since the vterm engine doesn't track
-  CSI-u state.
+- **Reattach restores live terminal modes, without replaying screen contents.**
+  The pool still uses `simple` restore and sends SIGWINCH so the agent redraws.
+  `PoolHooks::session_spool` replaces the empty upstream spool with a bounded
+  `TerminalModes` parser. The existing PTY output thread feeds it every byte,
+  including output while detached, and writes its restore buffer before any
+  subsequent live output. No polling, sidecar, or additional PTY is involved.
+  The small libshpool factory extension is pinned in `vendor/libshpool`;
+  `PATCH.md` there records its maintenance points.
+
+  Restoration selects the **currently active screen**, restores mouse tracking,
+  alternate scrolling (1007), paste and focus reporting, application keypad,
+  modifyOtherKeys, and both screens' independent kitty keyboard stacks. It
+  preserves saved stack levels too: closing Codex's alternate-screen overlay
+  must recover its primary-screen keyboard flags, and a nested pop must recover
+  the previous level. This follows the
+  [keyboard protocol's screen and stack rules](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement).
+  It also handles Grok's fullscreen/minimal switches after launch. The parser
+  retains no text, clipboard contents, or graphics payloads. Its CSI prefix and
+  stack depth are bounded; split CSI sequences survive a reattach, while an
+  unfinished control string resumes as an ignored command. A synchronized
+  frame is released so an idle application cannot leave the new window frozen.
+
+  Both attach clients retain `ReattachPrime` as a **fallback for older pool
+  daemons**, based on the launcher's `alt_screen` and `kitty_keyboard` fields.
+  A new daemon replaces that guess with the live modes it observed. With an old
+  daemon, the earlier limitations remain: launch-time snapshots miss later
+  screen changes, and older Codex launchers did not record keyboard support.
+  Installing a new attach client cannot add output history to an already
+  running daemon; live restoration requires sessions created by the updated
+  pool daemon.
+
+  Attach cleanup clears both keyboard stacks and input modes, returns to the
+  primary screen, and shows the cursor. `AttachTerminalGuard` registers a tty
+  cleanup through `atexit` because libshpool calls `process::exit` from inside
+  its relay, bypassing Rust destructors and the wrapper's normal return path.
+  Background creates and redirected stdout do not receive cleanup escapes.
 - **The pool has no keybindings** (`keybinding = []`, `pty_pool.rs`). libshpool
   scans every byte on the client→pty path for a chord and detaches on one,
   defaulting to `Ctrl-Space Ctrl-q`. captain-miao never chose that binding, it

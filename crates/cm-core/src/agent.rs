@@ -456,7 +456,8 @@ impl AgentControl {
             // rules (pager.toml / config.toml / `--no-alt-screen`) live with
             // the rest of Grok's config knowledge.
             AgentControl::Grok => grok::uses_alt_screen(agent_args),
-            // Inline renderers — the primary screen is their whole model.
+            // Inline at launch. Codex's later alternate-screen overlays are
+            // tracked by the pool's live mode spool, not this fallback bit.
             AgentControl::Claude | AgentControl::Codex => false,
             // Not verified on a pool pty; false per the note above. A backend
             // that turns out to be an alt-screen TUI moves up, with its own

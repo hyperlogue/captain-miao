@@ -420,24 +420,26 @@ pub fn pooled_launcher_pids(states: &[LauncherState]) -> Vec<u32> {
         .collect()
 }
 
-/// The terminal modes a *plain reattach*'s window is missing — every mode the
-/// agent set at startup went to whichever terminal was attached then, and the
-/// pool replays nothing. Composed from the flags the launcher stamped on
-/// [`LauncherState`] and written to the attach client's tty around libshpool's
-/// relay: enter *before* it (so the SIGWINCH repaint lands in a fully set-up
-/// terminal), leave after it returns — putting a CLI user's shell, or the
-/// attach wrapper's exit report, back on a terminal in its default modes.
+/// Launch-time mode fallback for a *plain reattach* to an older pool daemon,
+/// which replays no modes. An updated daemon replaces this guess with the live
+/// state tracked by [`crate::terminal_modes::TerminalModes`]. Composed from the
+/// flags stamped on [`LauncherState`] and written to the attach client's tty
+/// around libshpool's relay: enter *before* it (so the SIGWINCH repaint lands
+/// in a fully set-up terminal), leave after it returns — putting a CLI user's
+/// shell, or the attach wrapper's exit report, back on a terminal in its default
+/// modes.
 /// Never written on the create path, where the agent's own startup sets up
 /// this very terminal.
+/// [`crate::terminal_modes::AttachTerminalGuard`] handles cleanup even when
+/// libshpool exits the process without returning from its relay.
 ///
 /// The recipes live behind `AgentControl` and are verified against Grok 1.0.5
 /// and Codex 0.153.4 startup (probed on scripted ptys):
 ///
 /// * `alt_screen` — Grok's DECSET 1049 plus mouse tracking in both grades and
 ///   encodings (1000/1002/1003 + 1015/1006 — without these the terminal turns
-///   a scrollwheel on the alt
-///   screen into arrow-key input). Codex's main view stays on the primary
-///   screen and consumes no mouse tracking, so it gets neither.
+///   a scrollwheel on the alt screen into arrow-key input). Codex starts on
+///   the primary screen and consumes no mouse tracking, so it gets neither.
 /// * `input_modes` — focus reporting (1004) and bracketed paste (2004),
 ///   restored for both agents independently of the screen switch.
 /// * `keyboard_flags` — the kitty keyboard protocol push: Grok's `ESC[>3u`,
@@ -1091,9 +1093,9 @@ pub struct LauncherState {
     pub terminfo: Option<String>,
     /// Whether the agent's TUI occupies the terminal's **alternate screen**,
     /// resolved once at launch ([`crate::agent::AgentControl::uses_alt_screen`])
-    /// and stamped for pooled sessions only. One reader: the attach guards,
-    /// which prime a plain reattach's terminal with the alt-screen mode set
-    /// ([`ReattachPrime`]). The pool replays no bytes on reattach, so the
+    /// and stamped for pooled sessions only. The attach guards use it as an
+    /// older-daemon fallback to prime the alt-screen mode set
+    /// ([`ReattachPrime`]). An older pool replays no bytes on reattach, so the
     /// `ESC[?1049h` the agent sent at startup never reaches a later window —
     /// which leaves that window on the primary screen while the agent repaints
     /// by cursor addressing, and every bottom-row scroll then leaks a stale
@@ -1102,8 +1104,8 @@ pub struct LauncherState {
     ///
     /// A launch-time snapshot, deliberately conservative: an agent that
     /// switches modes mid-session (Grok's `/fullscreen` ↔ minimal) flips
-    /// reality out from under this bit, and the durable fix is restoring modes
-    /// from the pool's own byte stream. `false` for non-pooled sessions, for
+    /// reality out from under this bit. Updated pool daemons restore modes
+    /// from their own byte stream instead. `false` for non-pooled sessions, for
     /// agents not verified to use the alt screen, and from any host too old to
     /// send the field; skipped when false so an old peer never sees it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1119,7 +1121,8 @@ pub struct LauncherState {
     ///
     /// Pooled only, read by the same attach guards, with the same snapshot
     /// caveat. False from older launchers that did not record Codex's push:
-    /// those sessions need a restart to restore keyboard enhancements.
+    /// the fallback needs a restart to restore their keyboard enhancements.
+    /// Updated pool daemons restore the observed keyboard stacks instead.
     /// Skipped when false so an old peer never sees it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kitty_keyboard: bool,

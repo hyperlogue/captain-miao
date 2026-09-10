@@ -44,6 +44,8 @@ pub(crate) fn pool_socket_path() -> PathBuf {
 /// live redraw, and the spool costs memory per session for no benefit.
 /// libshpool's default is `screen` (restore a screenful), so `simple` has to be
 /// set explicitly. Pinned by `pool_config_is_simple_restore`.
+/// `PoolHooks::session_spool` supplies mode restoration within that contract:
+/// the existing output thread remembers protocols, never screen contents.
 ///
 /// We also take libshpool's **detach keybinding away entirely**. Its daemon
 /// scans every byte on the client→pty path for a chord, defaulting to
@@ -341,6 +343,10 @@ impl PoolHooks {
 }
 
 impl libshpool::Hooks for PoolHooks {
+    fn session_spool(&self, _name: &str) -> Option<Box<dyn libshpool::SessionSpool + Send>> {
+        Some(Box::new(ModeSpool::default()))
+    }
+
     fn on_new_session(&self, name: &str) -> anyhow::Result<()> {
         // A session is created by its first attach, so it is born attached.
         Self::set(name, true);
@@ -376,6 +382,23 @@ impl libshpool::Hooks for PoolHooks {
         // nothing else would ever ask for one.
         crate::server::wake_subscribers();
         Ok(())
+    }
+}
+
+/// Modes only: the pool's existing output thread owns all observation and
+/// replay, including output emitted while no terminal is attached.
+#[derive(Default)]
+struct ModeSpool(cm_core::terminal_modes::TerminalModes);
+
+impl libshpool::SessionSpool for ModeSpool {
+    fn resize(&mut self, _: shpool_protocol::TtySize) {}
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.0.process(bytes);
+    }
+
+    fn restore_buffer(&self) -> Vec<u8> {
+        self.0.restore_buffer()
     }
 }
 
@@ -595,12 +618,15 @@ pub(crate) fn run_attach(
         sub.push(d);
     }
     sub.push(&name);
-    // Enter before the relay so the SIGWINCH-triggered repaint lands in a
-    // fully set-up terminal; leave after it returns (a no-op where the agent
-    // already undid a mode) so the attach wrapper's exit report — or a CLI
-    // user's shell — is back on a terminal in its default modes. See
-    // `ReattachPrime` for the whole story. Both writes gate themselves on
-    // having anything to say.
+    // Prime for older daemons; an updated pool replaces this snapshot with
+    // the modes observed in its live byte stream. libshpool can process::exit
+    // inside the relay, so cleanup must also run through atexit. Background
+    // creates never take ownership of this process's terminal.
+    let _terminal_guard = if background {
+        None
+    } else {
+        Some(cm_core::terminal_modes::AttachTerminalGuard::new()?)
+    };
     prime.enter();
     let result = run_shpool(&global, &sub);
     prime.leave();

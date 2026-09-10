@@ -170,10 +170,10 @@ pub fn attach(name: String, force: bool) -> Result<()> {
     // and here is still caught by libshpool's own busy guard (which exits 0 —
     // acceptable for the residual race window).
     //
-    // The agent set its terminal modes (alt screen, mouse tracking, a
-    // keyboard push) in a terminal long gone; prime this one to match before
-    // the relay, and restore it after — mirrors the server's attach (see
-    // `cm_core::state::ReattachPrime`).
+    // Keep the launch-time prime for old daemons; an updated pool overwrites
+    // it with modes observed from live output. The guard also cleans up when
+    // libshpool exits the process without returning through this frame.
+    let _terminal_guard = cm_core::terminal_modes::AttachTerminalGuard::new()?;
     prime.enter();
     let result = attach_pty(&name, force);
     prime.leave();
