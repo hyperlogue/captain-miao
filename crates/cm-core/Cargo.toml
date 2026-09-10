@@ -38,6 +38,9 @@ dirs = "6"
 libc = "0.2"
 notify = "8"
 toml = "1.1"
+toml_edit = "0.22"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 # `bundled` statically compiles SQLite into the binary, so reading Codex's
 # state_5.sqlite for session renames needs no `sqlite3` CLI at runtime.
 # Capped at 0.39 because 0.40 pulls libsqlite3-sys 0.38, whose build script used

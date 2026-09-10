@@ -102,6 +102,8 @@ pub async fn run(
 
     let mut launcher_state = LauncherState {
         agent,
+        codex_mode: Default::default(),
+        codex_connected: None,
         launcher_pid,
         session_id: None,
         child_session_ids: Vec::new(),
@@ -157,11 +159,39 @@ pub async fn run(
 
     let mut listener = bind_hook_socket(&sock_path)?;
 
-    // Per-session hooks settings file. Path is generic; contents are
-    // backend-specific JSON the agent will read on launch.
-    let hooks_settings_json = agent.hooks_settings_json(&sock_path.to_string_lossy());
     let settings_path = sock_dir.join(format!("{launcher_pid}-settings.json"));
-    std::fs::write(&settings_path, &hooks_settings_json)?;
+    let codex_config = if agent == AgentControl::Codex {
+        match crate::config::read_codex() {
+            Ok(config) => {
+                launcher_state.codex_mode = config.mode;
+                Some(config)
+            }
+            Err(error) => {
+                hold_failed_launch(
+                    launcher_pid,
+                    &sock_path,
+                    &settings_path,
+                    &mut launcher_state,
+                    error,
+                )
+                .await
+            }
+        }
+    } else {
+        None
+    };
+    // App-server mode installs no native Codex hooks or profile. The generic
+    // launcher cleanup owns this private settings path in both modes.
+    let hooks_settings_json = if launcher_state.codex_mode.is_native() {
+        agent.hooks_settings_json(&sock_path.to_string_lossy())
+    } else {
+        "{}".into()
+    };
+    state::write_json_atomic(
+        &settings_path,
+        &serde_json::from_str::<serde_json::Value>(&hooks_settings_json)?,
+    )?;
+    launcher_state.write()?;
 
     // The clipboard shims, for a pooled session only. Minted here rather than by
     // the dashboard because the farm has to exist on the machine the *agent* runs
@@ -177,6 +207,47 @@ pub async fn run(
         },
         ClipboardShims::Skip => None,
     };
+
+    if let Some(config) = codex_config {
+        if let Err(error) = crate::agents::codex::wait_for_handoff(agent_args, launcher_pid).await {
+            hold_failed_launch(
+                launcher_pid,
+                &sock_path,
+                &settings_path,
+                &mut launcher_state,
+                error,
+            )
+            .await;
+        }
+        if config.mode == crate::agents::codex::CodexMode::AppServer {
+            launcher_state.codex_mode = config.mode;
+            let result = run_codex_app_server(
+                &config,
+                &mut launcher_state,
+                cwd,
+                agent_args,
+                shim_dir.as_deref(),
+                &sock_dir,
+            )
+            .await;
+            match result {
+                Ok(code) => {
+                    cleanup_launcher_files(launcher_pid, &sock_path, &settings_path);
+                    std::process::exit(code);
+                }
+                Err(error) => {
+                    hold_failed_launch(
+                        launcher_pid,
+                        &sock_path,
+                        &settings_path,
+                        &mut launcher_state,
+                        error,
+                    )
+                    .await
+                }
+            }
+        }
+    }
 
     let mut cmd = match agent.build_launch_command(
         cwd,
@@ -304,6 +375,57 @@ pub async fn run(
     cleanup.into_inner();
 
     std::process::exit(exit_status.code().unwrap_or(1))
+}
+
+/// App-server sessions share the launcher's state-file and termination contract,
+/// while the native hook/transcript loop remains entirely separate.
+async fn run_codex_app_server(
+    config: &crate::agents::codex::CodexConfig,
+    state: &mut LauncherState,
+    cwd: &str,
+    args: &[String],
+    shim: Option<&Path>,
+    runtime: &Path,
+) -> Result<i32> {
+    use crate::agents::codex::app_server;
+    let socket = runtime.join(format!("{}-codex.sock", state.launcher_pid));
+    let mut relay = app_server::Relay::start(config, &socket).await?;
+    let mut command = app_server::command(cwd, args, &socket, shim)?;
+    let mut child = command
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting attached Codex TUI")?;
+    state.child_pid = child.id();
+    let mut monitor = app_server::Monitor::default();
+    let pool = state.pool_session.clone();
+    let result = async {
+        state.write()?;
+        loop {
+            tokio::select! {
+                result = child.wait() => break Ok(result?.code().unwrap_or(1)),
+                _ = wait_for_termination_signal() => break Ok(143),
+                _ = wait_until_minting_daemon_gone(pool.as_deref()) => break Ok(143),
+                event = relay.events.recv() => {
+                    let Some(event) = event else { anyhow::bail!("Codex relay stopped") };
+                    let before = state.clone();
+                    monitor.apply(state, event);
+                    if *state != before {
+                        state.updated_at = LauncherState::now();
+                        state.write()?;
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    // End input before stopping server-owned work, on every exit path. The
+    // controller only addresses this thread and never signals the shared daemon.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    if let Err(error) = app_server::stop(config, state, monitor.turn.as_deref()).await {
+        tracing::warn!("could not stop Codex thread: {error:#}");
+    }
+    result
 }
 
 /// Resolve when the launcher is asked to terminate via SIGTERM or SIGHUP.
@@ -443,7 +565,8 @@ fn sweep_dead_launcher_runtime_files(sock_dir: &Path) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Some(pid) = name
-            .strip_suffix(".sock")
+            .strip_suffix("-codex.sock")
+            .or_else(|| name.strip_suffix(".sock"))
             .or_else(|| name.strip_suffix("-settings.json"))
             .or_else(|| name.strip_suffix("-images"))
             .and_then(|s| s.parse::<u32>().ok())
@@ -1744,7 +1867,13 @@ mod tests {
             std::fs::create_dir_all(image_dir).unwrap();
             std::fs::write(image_dir.join("image.png"), b"image fixture").unwrap();
         }
+        let dead_relay = dir.join("2000000000-codex.sock");
+        let live_relay = dir.join(format!("{}-codex.sock", std::process::id()));
+        std::fs::File::create(&dead_relay).unwrap();
+        std::fs::File::create(&live_relay).unwrap();
         sweep_dead_launcher_runtime_files(&dir);
+        assert!(!dead_relay.exists());
+        assert!(live_relay.exists());
         assert!(!dead.exists());
         assert!(live.join("image.png").exists());
         std::fs::remove_dir_all(dir).unwrap();

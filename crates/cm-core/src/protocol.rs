@@ -93,6 +93,12 @@ pub enum ClientFrame {
     /// while a client is *showing* the answer (the hosts panel), which is why it
     /// is a request at all — see [`ServerFrame::Vitals`].
     GetVitals { req_id: u64 },
+    /// Read/update the execution host's Codex policy, never dashboard config.
+    GetCodexConfig { req_id: u64 },
+    SetCodexConfig {
+        req_id: u64,
+        config: crate::agents::codex::CodexConfig,
+    },
     /// A frame this build doesn't know — a *newer* peer's addition. Decoded
     /// rather than erroring, so the connection survives; the handler ignores it.
     #[serde(other)]
@@ -129,6 +135,11 @@ pub enum ServerFrame {
     /// briefly, so several dashboards watching one host cost it one probe rather
     /// than one each.
     Vitals { req_id: u64, vitals: HostVitals },
+    CodexConfig {
+        req_id: u64,
+        config: Option<crate::agents::codex::CodexConfig>,
+        error: Option<String>,
+    },
     /// Reply to `ListResumable`.
     Resumable {
         req_id: u64,
@@ -182,6 +193,7 @@ impl ServerFrame {
             | ServerFrame::PathCompletions { req_id, .. }
             | ServerFrame::DirChecked { req_id, .. }
             | ServerFrame::Vitals { req_id, .. } => Some(*req_id),
+            ServerFrame::CodexConfig { req_id, .. } => Some(*req_id),
             ServerFrame::Welcome { .. }
             | ServerFrame::Snapshot { .. }
             | ServerFrame::Delta { .. }

@@ -69,6 +69,71 @@ pub fn config_path() -> PathBuf {
 pub struct CoreConfig {
     pub launcher: LauncherConfig,
     pub debug: DebugConfig,
+    pub codex: crate::agents::codex::CodexConfig,
+}
+
+/// Launch policy is read afresh on the execution host. A malformed setting
+/// must fail a launch rather than quietly select the native adapter.
+pub fn read_codex() -> anyhow::Result<crate::agents::codex::CodexConfig> {
+    read_codex_at(&config_path())
+}
+
+fn read_codex_at(path: &Path) -> anyhow::Result<crate::agents::codex::CodexConfig> {
+    use anyhow::Context;
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e).context("reading host Codex configuration"),
+    };
+    let config: CoreConfig = toml::from_str(&contents).context("parsing host configuration")?;
+    config.codex.socket_path()?;
+    Ok(config.codex)
+}
+
+/// The host editor changes only this table, preserving comments and unrelated
+/// configuration. Serialize writers with an advisory lock on a separate inode
+/// because the configuration itself is replaced atomically.
+pub fn write_codex(config: &crate::agents::codex::CodexConfig) -> anyhow::Result<()> {
+    write_codex_at(&config_path(), config)
+}
+
+fn write_codex_at(path: &Path, config: &crate::agents::codex::CodexConfig) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    config.socket_path()?;
+    crate::state::create_dir_all_private(path.parent().context("configuration has no parent")?)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path.with_extension("lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("locking host configuration");
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).context("reading host configuration"),
+    };
+    let _: CoreConfig = toml::from_str(&contents).context("parsing host configuration")?;
+    let mut doc: toml_edit::DocumentMut = contents.parse().context("parsing host configuration")?;
+    for (key, text) in [
+        ("mode", config.mode.label()),
+        ("endpoint", config.endpoint.as_str()),
+    ] {
+        let slot = &mut doc["codex"][key];
+        let mut value = toml_edit::Value::from(text);
+        if let Some(previous) = slot.as_value() {
+            *value.decor_mut() = previous.decor().clone();
+        }
+        *slot = toml_edit::Item::Value(value);
+    }
+    let tmp = path.with_extension("toml.tmp");
+    crate::state::write_private(&tmp, &doc.to_string())?;
+    std::fs::rename(&tmp, path).context("saving host Codex configuration")?;
+    Ok(())
 }
 
 /// What [`load_toml_file`] found. Three outcomes, because "no file" and
@@ -290,6 +355,48 @@ pub fn is_valid_env_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_settings_preserve_other_config_and_are_owned_by_each_host() {
+        use super::*;
+        use crate::agents::codex::{CodexConfig, CodexMode};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("miao-codex-config-{}", std::process::id()));
+        crate::state::create_dir_all_private(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "# keep this comment\n[launcher]\napproval_grace_secs = 9\n\n[codex]\nmode = 'native' # keep this too\n";
+        crate::state::write_private(&path, original).unwrap();
+        let config = CodexConfig {
+            mode: CodexMode::AppServer,
+            endpoint: "unix://~/codex.sock".into(),
+        };
+        write_codex_at(&path, &config).unwrap();
+        assert_eq!(read_codex_at(&path).unwrap(), config);
+        assert_eq!(
+            read_codex_at(&dir.join("another-host.toml")).unwrap(),
+            CodexConfig::default()
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("# keep this comment"));
+        assert!(contents.contains("# keep this too"));
+        assert!(contents.contains("approval_grace_secs = 9"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let invalid = CodexConfig {
+            endpoint: "ws://localhost:1234".into(),
+            ..config
+        };
+        assert!(write_codex_at(&path, &invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        crate::state::write_private(&path, "[codex]\nmode = 'typo'\n").unwrap();
+        assert!(
+            read_codex_at(&path).is_err(),
+            "invalid policy must not silently launch native"
+        );
+        assert!(write_codex_at(&path, &CodexConfig::default()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
 
     #[test]

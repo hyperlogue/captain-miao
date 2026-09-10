@@ -5912,10 +5912,99 @@ fn format_coarse_age_has_minute_resolution() {
 // =============================================================================
 
 #[test]
+fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
+    use cm_core::agents::codex::{CodexConfig, CodexMode};
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let panel = d.app.host_edit.as_mut().unwrap();
+    assert!(panel.rows[0].is_local);
+    assert_eq!(panel.rows[0].host(), crate::state::HostId::local());
+    panel.rows[0].codex = Some(CodexConfig::default());
+    panel.rows[0].codex_endpoint.set_text("unix://");
+    let count = panel.rows.len();
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('c'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().rows.len(), count);
+    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(!d.app.host_edit.as_ref().unwrap().rows[0].disabled);
+    let rendered = d.render();
+    assert!(rendered.contains("localhost"));
+    assert!(!rendered.contains("connect/disconnect"));
+    assert!(!rendered.contains("delete"));
+
+    d.press(KeyCode::Enter);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::CodexMode)
+    );
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Esc);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[0]
+            .codex
+            .as_ref()
+            .unwrap()
+            .mode,
+        CodexMode::Native
+    );
+    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::CodexEndpoint)
+    );
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::CodexMode)
+    );
+    let Some(Action::ConfigureCodex { host, config }) = d.press(KeyCode::Enter) else {
+        panic!("expected host setting action")
+    };
+    assert_eq!(host, crate::state::HostId::local());
+    assert_eq!(config.mode, CodexMode::AppServer);
+    assert_eq!(config.endpoint, "unix://");
+    assert!(
+        !super::hosts::load_hosts()
+            .iter()
+            .any(|h| h.label == "localhost" || h.label == "local")
+    );
+}
+
+#[test]
+fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
+    use super::HostField;
+    let mut d = TestDashboard::new(120, 30);
+    d.app.open_host_edit();
+    let panel = d.app.host_edit.as_mut().unwrap();
+    let mut row = host_row("test-host", "");
+    row.codex = Some(Default::default());
+    row.codex_endpoint.set_text("unix://");
+    panel.rows.push(row);
+    panel.cursor = panel.rows.len() - 1;
+    d.press(KeyCode::Enter);
+    for _ in 0..5 {
+        d.press(KeyCode::Tab);
+    }
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::CodexMode)
+    );
+    d.press(KeyCode::Char(' '));
+    let Some(Action::ConfigureCodex { host, .. }) = d.press(KeyCode::Enter) else {
+        panic!("expected host write")
+    };
+    assert_eq!(host, crate::state::HostId("test-host".into()));
+}
+
+#[test]
 fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     let mut d = TestDashboard::new(120, 30);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     // With no configured hosts the cursor sits on "+ add host", where there is
     // no host to log — `l` must not open an empty view over nothing.
     d.press(KeyCode::Char('l'));
@@ -5955,6 +6044,8 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
 fn the_hosts_panel_configures_a_hosts_ssh_options() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     // `a` adds a row on Label; Tab walks Label → Target → Options.
     d.press(KeyCode::Char('a'));
     for c in "box".chars() {
@@ -6002,6 +6093,8 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
 fn a_host_offered_the_clipboard_shows_it_on_its_row() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;
@@ -6029,6 +6122,8 @@ fn a_host_offered_the_clipboard_shows_it_on_its_row() {
 fn the_clipboard_is_a_field_in_the_row_editor() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     // No target, so committing the row exercises the commit without standing up a
     // backend — the same trick `esc_abandons_a_hosts_row_edit_and_enter_keeps_it`
     // uses, and here it also keeps an ssh host out of the shared `hosts.json`.
@@ -6107,6 +6202,8 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     use ratatui::style::Modifier;
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let state = d.app.host_edit.as_mut().unwrap();
     // Two lines each, so seven hosts fill the popup exactly — which is more than
     // the old layout had room for once the form took the bottom eight rows.
@@ -6181,6 +6278,8 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
 fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let opts = "-L 8010:localhost:8010 -L 8089:localhost:8089 -L 7891:localhost:7891";
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(super::HostRow {
@@ -6268,6 +6367,8 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
     use super::HostField::*;
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let focus = |d: &TestDashboard| d.app.host_edit.as_ref().unwrap().focus();
 
     d.press(KeyCode::Char('a'));
@@ -6303,6 +6404,8 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
 fn esc_abandons_a_hosts_row_edit_and_enter_keeps_it() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let rows = |d: &TestDashboard| {
         d.app
             .host_edit
@@ -6361,6 +6464,8 @@ fn esc_abandons_a_hosts_row_edit_and_enter_keeps_it() {
 fn a_hosts_panel_field_edits_at_the_cursor() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     d.press(KeyCode::Char('a'));
     for c in "usr@box".chars() {
         d.press(KeyCode::Char(c));
@@ -6390,6 +6495,8 @@ fn a_hosts_panel_field_edits_at_the_cursor() {
 fn ctrl_keys_open_the_hosts_editor_on_a_named_field() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;
@@ -6441,6 +6548,8 @@ fn ctrl_keys_open_the_hosts_editor_on_a_named_field() {
 fn a_ctrl_key_does_not_trigger_the_hosts_lists_plain_commands() {
     let mut d = TestDashboard::new(120, 30);
     d.app.open_host_edit();
+    // This fixture exercises remote rows; localhost is covered separately.
+    d.app.host_edit.as_mut().unwrap().rows.clear();
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(host_row("box", "user@box"));
     state.cursor = 0;

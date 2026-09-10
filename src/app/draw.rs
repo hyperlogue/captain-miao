@@ -572,7 +572,7 @@ impl App {
         // shows only the four fields that don't fit in the trimmed table row.
         if narrow {
             let lines = vec![
-                Line::from(vec![label("Agent"), Span::raw(s.agent.label())]),
+                Line::from(vec![label("Agent"), Span::raw(s.agent_label())]),
                 Line::from(vec![label("Model"), Span::styled(model, model_style)]),
                 Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
                 Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
@@ -583,8 +583,8 @@ impl App {
 
         let name = session_display_name(s, self.index_of(s), &self.random_names);
         let status_text = match (&s.status, &s.last_tool) {
-            (SessionStatus::Active, Some(tool)) => format!("{} ({tool})", s.status.label()),
-            _ => s.status.label().to_string(),
+            (SessionStatus::Active, Some(tool)) => format!("{} ({tool})", s.status_label()),
+            _ => s.status_label().to_string(),
         };
         let cfg = config::get();
         let ui = &cfg.colors.ui;
@@ -692,7 +692,7 @@ impl App {
         let name_style = Style::default().add_modifier(Modifier::BOLD);
         let mut lines: Vec<Line> = vec![
             Line::from(vec![label("Name"), Span::styled(name, name_style)]),
-            Line::from(vec![label("Agent"), Span::raw(s.agent.label())]),
+            Line::from(vec![label("Agent"), Span::raw(s.agent_label())]),
             Line::from(vec![label("Model"), Span::styled(model, model_style)]),
             Line::from(vec![
                 label("Status"),
@@ -933,7 +933,7 @@ impl App {
                 // another client holding it.
                 let detached_kind = self.detached_kind(s);
                 let detached = detached_kind.is_some();
-                let status_text = s.status.label();
+                let status_text = s.status_label();
                 let name = truncate_str(
                     &session_display_name(s, self.index_of(s), &self.random_names),
                     name_col_max as usize,
@@ -1627,8 +1627,14 @@ impl App {
                     // and Enter is what keeps the change, so the two keys have to
                     // read as the opposites they now are.
                     let mut spans = hint_pair("Tab/↑↓", "field");
-                    spans.extend(hint_pair("^t", "ssh/socket"));
-                    spans.extend(hint_pair("^e", "emoji"));
+                    let local = host_edit
+                        .and_then(|h| h.rows.get(h.cursor))
+                        .is_some_and(|r| r.is_local);
+                    if !local {
+                        spans.extend(hint_pair("^t", "ssh/socket"));
+                        spans.extend(hint_pair("^e", "emoji"));
+                    }
+                    spans.extend(hint_pair("Space", "toggle"));
                     spans.extend(hint_pair("Enter", "save"));
                     spans.extend(hint_pair("Esc", "cancel"));
                     spans
@@ -1642,10 +1648,15 @@ impl App {
                     // The two shortcuts into a *named* field, where `e` always
                     // lands on Label. Only worth a hint for the fields you'd open
                     // the editor specifically to change.
-                    spans.extend(hint_pair("^e", "icon"));
-                    spans.extend(hint_pair("^t", "target"));
-                    spans.extend(hint_pair("c", "connect/disconnect"));
-                    spans.extend(hint_pair("d", "delete"));
+                    let local = host_edit
+                        .and_then(|h| h.rows.get(h.cursor))
+                        .is_some_and(|r| r.is_local);
+                    if !local {
+                        spans.extend(hint_pair("^e", "icon"));
+                        spans.extend(hint_pair("^t", "target"));
+                        spans.extend(hint_pair("c", "connect/disconnect"));
+                        spans.extend(hint_pair("d", "delete"));
+                    }
                     // Shown only on a row that has somewhere to go, which is the
                     // same condition the row's `↑` marker draws under: a hint
                     // for a key that would silently do nothing is worse than no
@@ -1653,7 +1664,9 @@ impl App {
                     if self.selected_host_upgrade().is_some() {
                         spans.extend(hint_pair("u", "upgrade server"));
                     }
-                    spans.extend(hint_pair("l", "log"));
+                    if self.selected_host_has_log() {
+                        spans.extend(hint_pair("l", "log"));
+                    }
                     spans.extend(hint_pair("Esc", "close"));
                     spans
                 }

@@ -1756,6 +1756,7 @@ async fn drain_background_results(
                 backend.invalidate_vitals();
             }
         }
+        app.refresh_host_codex_settings();
         for backend in &app.backends {
             backend.poll_vitals();
         }
@@ -2496,6 +2497,22 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                             None,
                         )
                         .await;
+                    }
+                    Action::ConfigureCodex { host, config } => {
+                        let result = match app.backend_for(&host) {
+                            Some(backend) => backend.set_codex_config(config).await,
+                            None => Err("Host is not connected".into()),
+                        };
+                        if let Some(panel) = app.host_edit.as_mut() {
+                            panel.message = Some(match result {
+                                Ok(config) => format!(
+                                    "Codex: {}. Restart idle sessions to migrate existing ones.",
+                                    config.mode.label()
+                                ),
+                                Err(error) => format!("Could not save Codex settings: {error}"),
+                            });
+                        }
+                        app.refresh_host_codex_settings();
                     }
                     Action::RestartSession(spec) => {
                         let _ = restart_one(&mut app, spec).await;

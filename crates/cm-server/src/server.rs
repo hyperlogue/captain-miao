@@ -43,6 +43,24 @@ use crate::state::{self, LauncherState, SessionKey};
 use cm_core::agent::AgentControl;
 use cm_core::vitals::{HostVitals, VitalsSampler};
 
+fn codex_config_reply(
+    req_id: u64,
+    result: Result<cm_core::agents::codex::CodexConfig>,
+) -> ServerFrame {
+    match result {
+        Ok(config) => ServerFrame::CodexConfig {
+            req_id,
+            config: Some(config.canonical(&cm_core::paths::host_home())),
+            error: None,
+        },
+        Err(error) => ServerFrame::CodexConfig {
+            req_id,
+            config: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 // =============================================================================
 // Timings
 // =============================================================================
@@ -900,6 +918,15 @@ async fn handle_conn(
                         // three dashboards is still probed once per window.
                         let vitals = vitals.lock().await.get().await;
                         write_frame(&mut wr, &ServerFrame::Vitals { req_id, vitals }).await?;
+                    }
+                    ClientFrame::GetCodexConfig { req_id } => {
+                        let result = cm_core::config::read_codex();
+                        write_frame(&mut wr, &codex_config_reply(req_id, result)).await?;
+                    }
+                    ClientFrame::SetCodexConfig { req_id, config } => {
+                        let result = cm_core::config::write_codex(&config)
+                            .and_then(|()| cm_core::config::read_codex());
+                        write_frame(&mut wr, &codex_config_reply(req_id, result)).await?;
                     }
                     // A newer client's frame we don't know. Ignoring it keeps
                     // the connection alive (protocol §3 forward tolerance); a

@@ -998,6 +998,15 @@ pub struct LauncherState {
     /// Claude so state files written before the field existed still parse.
     #[serde(default)]
     pub agent: AgentControl,
+    /// Resolved at launch, independent of later host setting changes.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::agents::codex::CodexMode::is_native"
+    )]
+    pub codex_mode: crate::agents::codex::CodexMode,
+    /// App-server transport health; absent for native and older launchers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_connected: Option<bool>,
     pub launcher_pid: u32,
     pub session_id: Option<String>,
     pub window_id: Option<WindowId>,
@@ -1168,6 +1177,8 @@ impl LauncherState {
     pub fn for_test(agent: AgentControl, status: SessionStatus) -> Self {
         Self {
             agent,
+            codex_mode: Default::default(),
+            codex_connected: None,
             launcher_pid: 0,
             session_id: None,
             child_session_ids: Vec::new(),
@@ -1249,6 +1260,28 @@ impl std::fmt::Display for SessionKey {
 }
 
 impl LauncherState {
+    /// The resolved mode stays visible while a host migrates existing sessions.
+    pub fn agent_label(&self) -> &'static str {
+        if self.agent == AgentControl::Codex {
+            match self.codex_mode {
+                crate::agents::codex::CodexMode::Native => "Codex (native)",
+                crate::agents::codex::CodexMode::AppServer => "Codex (app-server)",
+            }
+        } else {
+            self.agent.label()
+        }
+    }
+
+    /// Transport health is additive on the wire; older dashboards can still
+    /// decode the existing Starting status while a Codex TUI reconnects.
+    pub fn status_label(&self) -> &'static str {
+        if self.codex_connected == Some(false) {
+            "Disconnected"
+        } else {
+            self.status.label()
+        }
+    }
+
     fn file_path(launcher_pid: u32) -> PathBuf {
         sessions_dir().join(format!("{launcher_pid}.json"))
     }

@@ -206,6 +206,10 @@ pub(super) enum Action {
     /// `--resume <session_id>` adjacent to the original window. Used to pick
     /// up out-of-process changes (e.g. agent binary upgrade, .envrc edits).
     RestartSession(RestartSpec),
+    ConfigureCodex {
+        host: HostId,
+        config: cm_core::agents::codex::CodexConfig,
+    },
     /// Restart every supplied session. The dashboard pre-filters this list to
     /// idle sessions only.
     RestartAll {
@@ -301,6 +305,7 @@ impl Action {
             Action::DetachRemote { .. } => "DetachRemote",
             Action::OpenShellTab { .. } => "OpenShellTab",
             Action::RestartSession(_) => "RestartSession",
+            Action::ConfigureCodex { .. } => "ConfigureCodex",
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
@@ -2712,7 +2717,7 @@ impl App {
     }
 
     pub(super) fn open_host_edit(&mut self) {
-        let rows = hosts::load_hosts()
+        let mut rows = hosts::load_hosts()
             .into_iter()
             .map(|h| HostRow {
                 is_socket: h.socket.is_some(),
@@ -2724,9 +2729,19 @@ impl App {
                 // space, so this join is the inverse of `parse_list`'s split.
                 options: picker::TextInput::with_text(h.options.join(" ")),
                 label: picker::TextInput::with_text(h.label),
+                ..HostRow::default()
             })
             .collect::<Vec<_>>();
+        rows.insert(
+            0,
+            HostRow {
+                is_local: true,
+                label: picker::TextInput::with_text("localhost"),
+                ..HostRow::default()
+            },
+        );
         self.host_edit = Some(HostEditState {
+            message: None,
             cursor: 0,
             edit: None,
             pending_remove: None,
@@ -2735,6 +2750,46 @@ impl App {
             rows,
         });
         self.input_mode = InputMode::HostEdit;
+        self.refresh_host_codex_settings();
+    }
+
+    /// Refresh landed host settings without overwriting an edit in progress.
+    pub(super) fn refresh_host_codex_settings(&mut self) {
+        let Some(panel) = self.host_edit.as_ref() else {
+            return;
+        };
+        let values: Vec<_> = panel
+            .rows
+            .iter()
+            .map(|row| {
+                self.backend_for(&row.host()).and_then(|backend| {
+                    backend.poll_codex_config();
+                    backend.codex_config()
+                })
+            })
+            .collect();
+        let panel = self.host_edit.as_mut().unwrap();
+        for (i, value) in values.into_iter().enumerate() {
+            if panel.edit.is_some() && panel.cursor == i {
+                continue;
+            }
+            let row = &mut panel.rows[i];
+            match value {
+                Some(Ok(config)) => {
+                    row.codex_endpoint.set_text(config.endpoint.clone());
+                    row.codex = Some(config);
+                    row.codex_error = None;
+                }
+                Some(Err(error)) => {
+                    row.codex = None;
+                    row.codex_error = Some(error);
+                }
+                None => {
+                    row.codex = None;
+                    row.codex_error = Some("loading; host must be connected".into());
+                }
+            }
+        }
     }
 
     /// One host's connection log, flattened to one item per **physical** line.
@@ -2787,7 +2842,8 @@ impl App {
             // Drop blank rows (a half-typed one being added) and any that alias
             // the reserved `local` host.
             .filter(|r| {
-                !r.label.text().trim().is_empty()
+                !r.is_local
+                    && !r.label.text().trim().is_empty()
                     && !r.target.text().trim().is_empty()
                     && !r.label.text().trim().eq_ignore_ascii_case("local")
             })
@@ -3310,7 +3366,7 @@ impl App {
                         || s.last_prompt
                             .as_deref()
                             .is_some_and(|p| contains_ci(last_prompt_text(p), q))
-                        || contains_ci(s.status.label(), q)
+                        || contains_ci(s.status_label(), q)
                         || self
                             .index_of(s)
                             .lookup(s)

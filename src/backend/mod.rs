@@ -51,6 +51,7 @@ pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
 // *before* a connection exists: nothing else here calls into it except
 // `setup_ssh`, and it calls nothing back except `ConnLog` and the ssh
 // primitives below.
+mod codex_config;
 mod provision;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
 use provision::{Provisioning, UploadGate, incompatible_daemon_reason, resolve_remote_exe};
@@ -1538,6 +1539,7 @@ pub(crate) struct RemoteBackend {
     /// with: together they say whether a host is reachable *and* whether it has
     /// room for more work.
     vitals: Arc<VitalsCell>,
+    codex_config: Arc<Mutex<codex_config::ConfigCell>>,
     /// Set by the connection task whenever the mirror or connection state
     /// changes (a pushed `Snapshot`/`Delta`/`Removed`, or a connect/disconnect).
     /// Read through [`BackendEvents`], the same handle a local backend's fs
@@ -1729,6 +1731,7 @@ impl RemoteBackend {
             upgrade,
             latency,
             vitals,
+            codex_config: Default::default(),
             dirty,
             mirrored,
             reconnect_epoch,

@@ -33,6 +33,7 @@ use super::{Action, App};
 #[derive(Debug)]
 pub(crate) struct HostEditState {
     pub(in crate::app) rows: Vec<HostRow>,
+    pub(in crate::app) message: Option<String>,
     /// Selected row (`0..rows.len()`), or `rows.len()` for the "+ add" line.
     pub(in crate::app) cursor: usize,
     /// `Some` while the selected row's fields have the keyboard — see
@@ -77,7 +78,7 @@ pub(in crate::app) struct RowEdit {
 /// lingering in the list until the panel is reopened.
 #[derive(Debug)]
 pub(in crate::app) enum EditOrigin {
-    Existing(HostRow),
+    Existing(Box<HostRow>),
     Added,
 }
 
@@ -87,9 +88,14 @@ impl HostEditState {
         let Some(row) = self.rows.get(self.cursor) else {
             return;
         };
+        let focus = if row.is_local {
+            HostField::CodexMode
+        } else {
+            focus
+        };
         self.edit = Some(RowEdit {
             focus,
-            origin: EditOrigin::Existing(row.clone()),
+            origin: EditOrigin::Existing(Box::new(row.clone())),
         });
     }
 
@@ -116,7 +122,7 @@ impl HostEditState {
         match edit.origin {
             EditOrigin::Existing(row) => {
                 if let Some(slot) = self.rows.get_mut(self.cursor) {
-                    *slot = row;
+                    *slot = *row;
                 }
             }
             EditOrigin::Added => {
@@ -183,6 +189,10 @@ pub(crate) struct HostLogView {
 /// editor's icon field, so the readline keys are the same ones here.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HostRow {
+    pub(in crate::app) is_local: bool,
+    pub(in crate::app) codex: Option<cm_core::agents::codex::CodexConfig>,
+    pub(in crate::app) codex_error: Option<String>,
+    pub(in crate::app) codex_endpoint: picker::TextInput,
     pub(in crate::app) label: picker::TextInput,
     /// ssh target (`user@host`) or, when `is_socket`, a socket path.
     pub(in crate::app) target: picker::TextInput,
@@ -211,7 +221,11 @@ impl HostRow {
     /// [`App::apply_host_edits`] trims it on the way to disk, so a lookup
     /// against the live backends matches a row still being typed.
     pub(in crate::app) fn host(&self) -> HostId {
-        HostId(self.label.text().trim().to_string())
+        if self.is_local {
+            HostId::local()
+        } else {
+            HostId(self.label.text().trim().to_string())
+        }
     }
 }
 
@@ -225,6 +239,8 @@ pub(crate) enum HostField {
     Icon,
     /// The one field with nothing to type — see [`HostRow::clipboard`].
     Clipboard,
+    CodexMode,
+    CodexEndpoint,
 }
 
 impl HostField {
@@ -236,12 +252,14 @@ impl HostField {
     /// `Clipboard` is last rather than beside `Options`, where it belongs by
     /// meaning: the four text fields keep the Tab positions fingers already know,
     /// and `^e`'s "open the editor on Icon" stays the fourth stop it names.
-    const ORDER: [HostField; 5] = [
+    const ORDER: [HostField; 7] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
         HostField::Icon,
         HostField::Clipboard,
+        HostField::CodexMode,
+        HostField::CodexEndpoint,
     ];
 
     /// The next field, forwards or back. Wraps: the form is a ring, so
@@ -548,10 +566,22 @@ impl App {
             )
             .trim_end()
             .to_string();
+            if r.is_local {
+                detail = "      this machine".into();
+            }
             // Appended after the trim, so a host with no options gets one space
             // before the marker rather than two.
             if r.clipboard {
                 detail.push_str(" \u{1f4cb}");
+            }
+            let codex = r
+                .codex
+                .as_ref()
+                .map(|c| c.mode.label())
+                .unwrap_or("unavailable");
+            detail.push_str(&format!("  Codex: {codex}"));
+            if let Some(error) = &r.codex_error {
+                detail.push_str(&format!(" ({error})"));
             }
             lines.push(Line::from(Span::styled(
                 detail,
@@ -589,6 +619,9 @@ impl App {
                     .fg(config::get().colors.ui.attention_fg)
                     .add_modifier(Modifier::BOLD),
             )));
+        }
+        if let Some(message) = &state.message {
+            lines.push(Line::from(message.clone()));
         }
         frame.render_widget(Paragraph::new(lines), list_area);
     }
@@ -721,6 +754,31 @@ impl App {
                 "Clipboard",
                 vec![clipboard_line],
             ));
+            if r.is_local {
+                form_lines.clear();
+            }
+            if let Some(codex) = &r.codex {
+                form_lines.extend(field_rows(
+                    focus == HostField::CodexMode,
+                    "Codex",
+                    vec![vec![Span::raw(format!("[{}]", codex.mode.label()))]],
+                ));
+                form_lines.extend(field_rows(
+                    focus == HostField::CodexEndpoint,
+                    "Endpoint",
+                    text_field_lines(
+                        &r.codex_endpoint,
+                        focus == HostField::CodexEndpoint,
+                        value_w,
+                    ),
+                ));
+            } else if r.is_local {
+                form_lines.push(Line::from(
+                    r.codex_error
+                        .clone()
+                        .unwrap_or_else(|| "Loading Codex settings…".into()),
+                ));
+            }
             // The field rows — one per field until a value wraps — a blank, the
             // hint line (held whether this field has a hint or not, for the same
             // reason the width is), and the two borders. The card grows down as a
@@ -781,12 +839,25 @@ impl App {
 // =============================================================================
 
 impl App {
+    pub(super) fn selected_host_has_log(&self) -> bool {
+        self.host_edit
+            .as_ref()
+            .and_then(|panel| panel.rows.get(panel.cursor))
+            .is_some_and(|row| {
+                !row.is_local
+                    || self
+                        .backend_for(&row.host())
+                        .is_some_and(|backend| backend.capabilities().pooled)
+            })
+    }
+
     /// The hosts panel (`Space h`). A list view with live per-host state, not a
     /// staged edit form (§9): there is no Save step, because every mutation
     /// persists as it happens — adding a host connects it immediately (so you
     /// watch its state animate in the list), an edit applies when you commit the
     /// row, and a removal takes a `d`-then-`y` confirm.
     pub(super) fn handle_host_edit_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let has_log = self.selected_host_has_log();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let editing = self.host_edit.as_ref()?.edit.is_some();
@@ -838,14 +909,17 @@ impl App {
                 // In the Icon field the picker *is* the editor, so it shadows
                 // readline's end-of-line — a field of at most four cells has
                 // nowhere to jump to anyway.
-                Some(HostField::Icon) => true,
+                Some(HostField::Icon) => {
+                    !state.rows.get(state.cursor).is_some_and(|row| row.is_local)
+                }
                 // In a text field ^e keeps that readline meaning and falls
                 // through to the input below.
                 Some(_) => false,
                 // From the list, on a row: open the editor on Icon and go
                 // straight where the key would have gone from there.
                 None => {
-                    let on_row = state.cursor < state.rows.len();
+                    let on_row =
+                        state.cursor < state.rows.len() && !state.rows[state.cursor].is_local;
                     if on_row {
                         state.begin_edit(HostField::Icon);
                     }
@@ -874,16 +948,43 @@ impl App {
             };
             if let Some(forward) = step {
                 if let Some(edit) = state.edit.as_mut() {
-                    edit.focus = focus.step(forward);
+                    let row = &state.rows[state.cursor];
+                    let mut next = focus.step(forward);
+                    for _ in 0..HostField::ORDER.len() {
+                        let codex_field =
+                            matches!(next, HostField::CodexMode | HostField::CodexEndpoint);
+                        if (row.is_local && codex_field)
+                            || (!row.is_local && (!codex_field || row.codex.is_some()))
+                        {
+                            break;
+                        }
+                        next = next.step(forward);
+                    }
+                    edit.focus = next;
                 }
                 return None;
             }
             match key.code {
                 // Committing a row applies it: persist + reconnect right away.
                 KeyCode::Enter => {
+                    let row = state.rows.get(state.cursor)?;
+                    let config = row.codex.clone().map(|mut config| {
+                        config.endpoint = row.codex_endpoint.text().trim().to_owned();
+                        config
+                    });
+                    let original = state.edit.as_ref().and_then(|edit| match &edit.origin {
+                        EditOrigin::Existing(row) => row.codex.as_ref(),
+                        EditOrigin::Added => None,
+                    });
+                    let action = config
+                        .filter(|config| Some(config) != original)
+                        .map(|config| Action::ConfigureCodex {
+                            host: row.host(),
+                            config,
+                        });
                     state.edit = None;
                     self.apply_host_edits();
-                    return None;
+                    return action;
                 }
                 // And Esc abandons it — the snapshot the edit carries is what
                 // makes that a real cancel rather than a second commit.
@@ -894,6 +995,23 @@ impl App {
                 KeyCode::Char('t') if ctrl && focus == HostField::Target => {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
                         r.is_socket = !r.is_socket;
+                    }
+                    return None;
+                }
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                    if focus == HostField::CodexMode =>
+                {
+                    if let Some(config) = state
+                        .rows
+                        .get_mut(state.cursor)
+                        .and_then(|r| r.codex.as_mut())
+                    {
+                        use cm_core::agents::codex::CodexMode;
+                        config.mode = if config.mode == CodexMode::Native {
+                            CodexMode::AppServer
+                        } else {
+                            CodexMode::Native
+                        };
                     }
                     return None;
                 }
@@ -943,7 +1061,10 @@ impl App {
                 // Nothing to type into: its own keys are handled above, and a key
                 // none of them claim is dropped rather than falling through to a
                 // `TextInput` this field does not have.
-                HostField::Clipboard => {}
+                HostField::Clipboard | HostField::CodexMode => {}
+                HostField::CodexEndpoint => {
+                    r.codex_endpoint.handle_key(key);
+                }
             }
         } else {
             let n = state.rows.len();
@@ -983,7 +1104,7 @@ impl App {
                 // surface, stale, once the panel closed — and the row itself
                 // answers immediately (dimmed, reading `disconnected`, or
                 // animating back through `connecting`).
-                KeyCode::Char('c') if state.cursor < n => {
+                KeyCode::Char('c') if state.cursor < n && !state.rows[state.cursor].is_local => {
                     let row = &mut state.rows[state.cursor];
                     row.disabled = !row.disabled;
                     // Persists and rebuilds: `disabled` is part of what a backend
@@ -992,7 +1113,7 @@ impl App {
                 }
                 // Removal is destructive (it drops the host and its mirror), so
                 // it asks first.
-                KeyCode::Char('d') if state.cursor < n => {
+                KeyCode::Char('d') if state.cursor < n && !state.rows[state.cursor].is_local => {
                     state.pending_remove = Some(state.cursor);
                 }
                 // Upgrade the host's server. Offered only where it would land on
@@ -1033,7 +1154,7 @@ impl App {
                 }
                 // The row shows one truncated line of a failure; `l` is where
                 // the whole thing — and the steps before it — is readable.
-                KeyCode::Char('l') if state.cursor < n => {
+                KeyCode::Char('l') if state.cursor < n && has_log => {
                     let host = state.rows[state.cursor].host();
                     state.log_view = Some(HostLogView {
                         host,
@@ -1099,6 +1220,12 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
     match field {
         // The label is a name. Nothing to explain.
         HostField::Label => None,
+        HostField::CodexMode => {
+            Some("  Space toggle   applies to new launches and explicit restarts")
+        }
+        HostField::CodexEndpoint => {
+            Some("  Unix socket on this host; unix:// uses the Codex default")
+        }
         HostField::Target => Some("  ^t toggle ssh / socket"),
         // An example of the one thing this field is really for, and a pointer to
         // where the rest belongs — which is the question the field raises rather

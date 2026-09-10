@@ -141,7 +141,7 @@ impl Drop for TitleRetry {
 fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<String>>) {
     for s in sessions
         .iter_mut()
-        .filter(|s| s.agent == AgentControl::Codex)
+        .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
     {
         if let Some(title) = s
             .session_id
@@ -318,7 +318,7 @@ impl LocalBackend {
     ) {
         let ids: Vec<String> = sessions
             .iter()
-            .filter(|s| s.agent == AgentControl::Codex)
+            .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
             .filter_map(|s| s.session_id.clone())
             .collect();
         let mut cache = self.codex_titles.lock().unwrap();
@@ -337,7 +337,7 @@ impl LocalBackend {
         }
         let live: HashMap<_, _> = sessions
             .iter()
-            .filter(|s| s.agent == AgentControl::Codex)
+            .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
             .filter_map(|s| Some(((s.launcher_pid, s.session_id.clone()?), s.status.clone())))
             .collect();
         let eager = live
@@ -442,7 +442,11 @@ impl LocalBackend {
             );
             return false;
         };
-        let pid = state.child_pid.unwrap_or(state.launcher_pid);
+        let pid = if state.codex_mode.is_native() {
+            state.child_pid.unwrap_or(state.launcher_pid)
+        } else {
+            state.launcher_pid
+        };
         unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
     }
 
@@ -679,6 +683,22 @@ fn split_for_completion(path: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn app_server_titles_never_enter_the_native_store() {
+        let backend = LocalBackend::default();
+        let mut sessions = vec![LauncherState {
+            session_id: Some("rpc-thread".into()),
+            codex_mode: crate::agents::codex::CodexMode::AppServer,
+            name: Some("RPC title".into()),
+            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
+        }];
+        backend.overlay_codex_titles_with(
+            &mut sessions,
+            || panic!("app-server mode must not stat native SQLite"),
+            |_| panic!("app-server mode must not query native SQLite"),
+        );
+        assert_eq!(sessions[0].name.as_deref(), Some("RPC title"));
+    }
     use super::*;
     use crate::state::SessionStatus;
 

@@ -1085,12 +1085,13 @@ coordinates concurrent writers beyond atomic file replacement, by decision.
 **on whatever machine the process runs on**, so a remote host with a deployed
 `miao-server` has its own file, entirely separate from the dashboard's. Nothing
 syncs them and neither side can see the other's. Which keys each machine
-actually honours is decided by the four call sites, not by the file:
+actually honours is decided by their read sites:
 
 | Read at | Key | Machine that supplies it |
 | --- | --- | --- |
 | `cm-core/backend.rs` | `[launcher] max_recent_cwds` | the **host** (`LocalBackend` is the server-core) |
 | `cm-core/launcher.rs` | `[launcher] approval_grace_secs` | the **host** (the launcher runs beside the agent) |
+| `cm-core/config.rs::read_codex` | `[codex]` | the **execution host**, read fresh for launches and resume inventory |
 | `cm-core/logging.rs` | `[debug]` | whichever machine the process is on |
 | `src/backend/mod.rs` | `[remote] inherit_env` | the **dashboard** |
 
@@ -1106,6 +1107,14 @@ argv flag threaded over ssh, and `miao-server` consults no config of its own to
 decide them. That is deliberate, and it is what makes the name validation in
 `cm_core::config::is_valid_env_name` worth anything: one writer means one place
 a name can enter, so there is no second path to also police.
+
+The Hosts panel always includes **localhost**, even without a local pool. Its
+Codex editor writes this machine's `[codex]` section. Remote rows use additive
+`GetCodexConfig` / `SetCodexConfig` requests and a `CodexConfig` reply; endpoints
+inside the reply use host-canonical `~` paths. Older servers that ignore these
+requests show settings as unavailable. Mode changes affect new launches and
+explicit restarts; each running launcher retains its selected mode. See
+[Codex execution modes](codex-app-server.md) for the adapters and lifecycle.
 
 ## 9. The TUI surface — everything that operates on hosts
 

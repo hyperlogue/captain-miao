@@ -68,7 +68,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | Agent                                                            | Notes                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **[Claude Code](https://claude.com/claude-code)**                |                                                                                                                                                                                                                                                                        |
-| **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. `Ctrl+V` attaches remote images through the pool's clipboard bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
+| **[Codex](https://github.com/openai/codex)**                     | Native mode uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is reserved in that mode. Hosts can instead use a shared [app-server](docs/codex-app-server.md). `Ctrl+V` attaches remote images through the pool's clipboard bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
 | **[Grok Build](https://github.com/xai-org/grok-build)**          | Hooks via `~/.grok/hooks/captain-miao.json` (no-op outside captain-miao). Token and model columns come off `signals.json`. Worktree name isn't shown on the row ([known limits](#grok-build-support)).                                                                 |
@@ -176,7 +176,7 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                       |
 | `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                                 |
 
-Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that injects the tracking hooks, so they show up in the dashboard automatically. Nothing is written to your global `~/.claude/settings.json` or `~/.codex/hooks.json`. For Codex, captain-miao writes one owner-only integration file: `~/.codex/captain-miao.config.toml` (or the same file under `$CODEX_HOME`), loaded only for managed sessions through `--profile captain-miao`. Because Codex selects only one named profile, forwarding your own `--profile` / `-p` is unsupported; move settings needed in managed sessions into the base `config.toml`. Codex writes its own answers into whichever profile it was launched with, so a directory you trust inside a managed session is trusted for managed sessions, not for a bare `codex` run. The one place a launch is refused is a bare Ghostty window — see [Ghostty setup](#ghostty-setup).
+Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that tracks their activity, so they show up in the dashboard automatically. Nothing is written to your global `~/.claude/settings.json` or `~/.codex/hooks.json`. For native Codex, captain-miao writes one owner-only integration file: `~/.codex/captain-miao.config.toml` (or the same file under `$CODEX_HOME`), loaded only for managed sessions through `--profile captain-miao`. Because Codex selects only one named profile, forwarding your own `--profile` / `-p` is unsupported; move settings needed in managed sessions into the base `config.toml`. Codex writes its own answers into whichever profile it was launched with, so a directory you trust inside a managed session is trusted for managed sessions, not for a bare `codex` run. App-server mode observes the Codex protocol and uses no managed hook profile. Launching in a bare Ghostty window is refused — see [Ghostty setup](#ghostty-setup).
 
 ### Per-agent limits
 
@@ -329,11 +329,18 @@ Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"enter"`,
 
 Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
 
+Codex can also run through a shared app-server, selected **per execution host**.
+Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix
+socket. The permanent **localhost** entry configures this machine. New launches
+and explicit restarts use the setting; existing sessions keep their current mode.
+See [Codex execution modes](docs/codex-app-server.md) for migration, interface
+coverage, daemon lifecycle and environment differences.
+
 ## Configuration
 
-captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). Every key is optional and falls back to the default shown below; an unparseable file falls back to defaults rather than crashing. The complete set of options:
+captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). Every key is optional and falls back to the default shown below; an unparseable file falls back to defaults for the dashboard. Codex launches reject invalid configuration so a broken mode setting cannot silently change execution ownership. The complete set of options:
 
-> **Using remote hosts?** This file is read per-machine, so a host running `miao-server` has its own, independent of your dashboard's. Almost everything below is read only by the dashboard — including all of `[remote]`. The exceptions are `[launcher] max_recent_cwds`, `[launcher] approval_grace_secs` and `[debug]`, which each host supplies for itself. Worth knowing for `[remote] inherit_env` in particular: the variables it names live on the host, but the setting is read from the **dashboard's** file and threaded over the connection, so putting it in the host's `config.toml` silently does nothing. See [docs/remote-sessions.md](docs/remote-sessions.md#configtoml-is-per-machine-and-the-halves-are-not-interchangeable).
+> **Using remote hosts?** This file is read per-machine, so a host running `miao-server` has its own, independent of your dashboard's. Almost everything below is read only by the dashboard — including all of `[remote]`. The exceptions are `[launcher] max_recent_cwds`, `[launcher] approval_grace_secs`, `[codex]` and `[debug]`, which each host supplies for itself. Worth knowing for `[remote] inherit_env` in particular: the variables it names live on the host, but the setting is read from the **dashboard's** file and threaded over the connection, so putting it in the host's `config.toml` silently does nothing. See [docs/remote-sessions.md](docs/remote-sessions.md#configtoml-is-per-machine-and-the-halves-are-not-interchangeable).
 
 ```toml
 [terminal]
@@ -357,6 +364,10 @@ new_tab_title = "{agent}: {basename}"     # new-session tab title; placeholders:
 resume_tab_title = "{agent}: {basename}"  # resumed-session tab title
 pooled = false               # run this machine's sessions in a local pty pool, so they
                              # survive closing the window; needs miao-server on PATH
+
+[codex]
+mode = "native"             # "native" | "app-server", owned by each execution host
+endpoint = "unix://"         # default Codex control socket; also unix:///path/to/socket
 
 [remote]
 on_window_close = "close"    # "close" | "detach": what closing a pooled session's window
