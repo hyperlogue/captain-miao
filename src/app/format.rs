@@ -842,12 +842,14 @@ pub(super) fn model_label(id: &str) -> String {
     out
 }
 
-/// Color for a raw Claude model id, keyed on the family: Sonnet → blue,
-/// Fable → purple (magenta), Opus → white. Anything else (a bare alias, a
-/// Codex `gpt-*`, an unknown family) stays the default `Reset`. Standard
-/// terminal colors only.
+/// Color for a raw model id: GPT-6 Astra → cyan; Claude families Sonnet → blue,
+/// Fable → purple (magenta), Opus → white. Anything else stays the default
+/// `Reset`. Standard terminal colors only.
 pub(super) fn model_color(id: &str) -> Color {
     let (core, _) = split_variant(id);
+    if core == "gpt-6-astra" {
+        return Color::Cyan;
+    }
     match claude_family(core) {
         Some("sonnet") => Color::Blue,
         Some("fable") => Color::Magenta,
@@ -1177,7 +1179,7 @@ mod tests {
         assert_eq!(model_color("claude-opus-4-8"), Color::White);
         // Variant marker doesn't disturb the family match.
         assert_eq!(model_color("claude-opus-4-8[1m]"), Color::White);
-        // Other families and non-Claude ids stay default.
+        // Unrecognized models stay default.
         assert_eq!(model_color("claude-haiku-4-5-20251001"), Color::Reset);
         assert_eq!(model_color("gpt-5.5"), Color::Reset);
     }
