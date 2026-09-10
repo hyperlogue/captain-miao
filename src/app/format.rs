@@ -842,13 +842,13 @@ pub(super) fn model_label(id: &str) -> String {
     out
 }
 
-/// Color for a raw model id: GPT-6 Astra → cyan; Claude families Sonnet → blue,
+/// Color for a raw model id: GPT-6 Astra → magenta; Claude families Sonnet → blue,
 /// Fable → purple (magenta), Opus → white. Anything else stays the default
 /// `Reset`. Standard terminal colors only.
 pub(super) fn model_color(id: &str) -> Color {
     let (core, _) = split_variant(id);
     if core == "gpt-6-astra" {
-        return Color::Cyan;
+        return Color::Magenta;
     }
     match claude_family(core) {
         Some("sonnet") => Color::Blue,
