@@ -428,7 +428,7 @@ fn restore_hook_socket(listener: &mut UnixListener, sock_path: &Path) -> Option<
     }
 }
 
-/// Remove `{pid}.sock` / `{pid}-settings.json` left by launchers that have
+/// Remove sockets, settings and pasted images left by launchers that have
 /// exited. `$TMPDIR` used to clear these for us; [`state::runtime_dir`]'s
 /// fallback now persists across reboots, so they need reaping on the same terms
 /// as the per-launcher logs — on every launcher startup, leaving live (and
@@ -443,12 +443,17 @@ fn sweep_dead_launcher_runtime_files(sock_dir: &Path) {
         let Some(pid) = name
             .strip_suffix(".sock")
             .or_else(|| name.strip_suffix("-settings.json"))
+            .or_else(|| name.strip_suffix("-images"))
             .and_then(|s| s.parse::<u32>().ok())
         else {
             continue;
         };
         if !state::is_process_alive(pid) {
-            let _ = std::fs::remove_file(entry.path());
+            if name.ends_with("-images") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -462,6 +467,7 @@ fn cleanup_launcher_files(launcher_pid: u32, sock_path: &Path, settings_path: &P
     LauncherState::remove(launcher_pid);
     let _ = std::fs::remove_file(sock_path);
     let _ = std::fs::remove_file(settings_path);
+    let _ = std::fs::remove_dir_all(crate::clipboard::shim::session_image_dir(launcher_pid));
 }
 
 /// Hold a launch that never produced an agent (direnv blocked on the session's
@@ -1705,6 +1711,25 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_sweep_removes_dead_launchers_images_and_keeps_live_ones() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cm-image-sweep-{nonce}"));
+        let dead = dir.join("2000000000-images");
+        let live = dir.join(format!("{}-images", std::process::id()));
+        for image_dir in [&dead, &live] {
+            std::fs::create_dir_all(image_dir).unwrap();
+            std::fs::write(image_dir.join("image.png"), b"image fixture").unwrap();
+        }
+        sweep_dead_launcher_runtime_files(&dir);
+        assert!(!dead.exists());
+        assert!(live.join("image.png").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The invariant the type exists for: a marked throttle always has a
     /// deadline, so an armed deadline can never outlive the flag. Left to the

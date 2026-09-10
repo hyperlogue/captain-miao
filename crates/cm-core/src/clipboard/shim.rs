@@ -347,6 +347,55 @@ pub async fn paste() -> Result<()> {
 }
 
 async fn fetch_to_file(fmt: Format) -> Result<Option<PathBuf>> {
+    let dir = home_rel(PASTE_REL).context("no $HOME to write the clipboard image to")?;
+    fetch_to_path(fmt, &dir.join(format!("clipboard.{}", fmt.token()))).await
+}
+
+/// Files attached by Ctrl+V must remain distinct until the launcher exits:
+/// Codex reads the bytes when submitting, not when showing the image placeholder.
+/// The launcher removes this directory on exit and sweeps dead launchers' dirs.
+pub fn session_image_dir(launcher_pid: u32) -> PathBuf {
+    crate::state::runtime_dir()
+        .join("launchers")
+        .join(format!("{launcher_pid}-images"))
+}
+
+pub async fn paste_for_session(launcher_pid: u32) -> Result<Option<PathBuf>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_IMAGE: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT_IMAGE.fetch_add(1, Ordering::Relaxed)
+    );
+    let dir = session_image_dir(launcher_pid);
+    let mut failure = None;
+    for fmt in Format::ALL {
+        let path = dir.join(format!("{name}.{}", fmt.token()));
+        match fetch_to_path(fmt, &path).await {
+            Ok(Some(path)) => return Ok(Some(path)),
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// Remove a partial download on errors, cancellation, or a disconnected attach.
+struct PartialImage(PathBuf);
+
+impl Drop for PartialImage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn fetch_to_path(fmt: Format, final_path: &Path) -> Result<Option<PathBuf>> {
     let Some(stream) = connect().await else {
         return Ok(None);
     };
@@ -362,21 +411,19 @@ async fn fetch_to_file(fmt: Format) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let dir = home_rel(PASTE_REL).context("no $HOME to write the clipboard image to")?;
-    crate::state::create_dir_all_private(&dir)
+    let dir = final_path
+        .parent()
+        .context("clipboard image path has no parent")?;
+    crate::state::create_dir_all_private(dir)
         .with_context(|| format!("could not create {}", dir.display()))?;
-    let final_path = dir.join(format!("clipboard.{}", fmt.token()));
     // Per-pid, because two `clipboard-paste` runs on the same host otherwise
     // stage into the same file: the second `truncate`s the inode the first is
     // still writing, and both then publish a corrupt image. The *published* name
     // stays shared on purpose (one file per format, no history on disk); only the
     // staging path has to be private, which is the same rule `synth_home`'s
     // `atomic_write` follows.
-    let part = dir.join(format!(
-        "clipboard.{}.{}.part",
-        fmt.token(),
-        std::process::id()
-    ));
+    let part = final_path.with_extension(format!("{}.{}.part", fmt.token(), std::process::id()));
+    let _partial = PartialImage(part.clone());
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -395,17 +442,10 @@ async fn fetch_to_file(fmt: Format) -> Result<Option<PathBuf>> {
     }
     .await;
     drop(file);
-    if let Err(e) = written {
-        // Never published: the caller must not be handed a path to a truncated
-        // image. The staging file goes with it, because now that the name carries
-        // a pid it is no longer reused — leaving it would accumulate one per
-        // failed paste in a dir whose whole point is holding no history.
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
-    }
-    std::fs::rename(&part, &final_path)
+    written?;
+    std::fs::rename(&part, final_path)
         .with_context(|| format!("could not publish {}", final_path.display()))?;
-    Ok(Some(final_path))
+    Ok(Some(final_path.to_path_buf()))
 }
 
 /// `$HOME`-relative path on *this* machine, or `None` with no `$HOME`.

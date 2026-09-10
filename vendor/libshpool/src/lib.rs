@@ -22,7 +22,7 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
-pub use hooks::Hooks;
+pub use hooks::{Hooks, SessionInput};
 pub use session_restore::SessionSpool;
 use parking_lot::{Mutex, MutexGuard};
 use tracing::error;

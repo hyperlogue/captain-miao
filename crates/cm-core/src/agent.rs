@@ -199,6 +199,17 @@ impl AgentControl {
         self.bin().is_some_and(agents::binary_available)
     }
 
+    /// Input that attaches an image from this host when the agent's native
+    /// clipboard reader cannot use the command shims. `None` leaves Ctrl+V to
+    /// the agent. The encoder is selected before fetching anything, so other
+    /// agents never make an extra clipboard request through this route.
+    pub fn clipboard_paste_encoder(self) -> Option<fn(&Path) -> Vec<u8>> {
+        match self {
+            Self::Codex => Some(codex::clipboard_paste_input),
+            _ => None,
+        }
+    }
+
     /// The executable this backend drives, and the one place that mapping is
     /// written down. `None` only for [`Unknown`](Self::Unknown), which is not a
     /// backend this build can launch at all — so no binary could make it

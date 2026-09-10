@@ -34,6 +34,11 @@
 ///
 /// All hooks do nothing by default.
 pub trait Hooks {
+    /// Optional input processing for one attachment. Runs on that client's
+    /// existing input thread, after keybindings. None preserves upstream bytes.
+    fn session_input(&self, _session_name: &str) -> Option<Box<dyn SessionInput + Send>> {
+        None
+    }
     /// Override output restoration for a newly created session. The spool is
     /// owned by the PTY output thread: it sees detached output too, and its
     /// restore bytes precede live output on every reattach. Returning None
@@ -67,5 +72,23 @@ pub trait Hooks {
     /// as the shell exiting.
     fn on_shell_disconnect(&self, _session_name: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+/// An input adapter owned by the client-to-PTY thread. A slow operation may
+/// wait on this session's input, but must observe `stop` so detach can finish.
+pub trait SessionInput {
+    /// Process bytes, writing their replacement to the PTY. An empty slice
+    /// flushes a partial sequence after an input timeout or EOF.
+    fn process(
+        &mut self,
+        bytes: &[u8],
+        output: &mut dyn std::io::Write,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<()>;
+
+    /// Whether a partial sequence needs a short read timeout before flushing.
+    fn pending(&self) -> bool {
+        false
     }
 }

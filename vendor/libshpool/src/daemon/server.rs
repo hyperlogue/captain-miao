@@ -331,7 +331,12 @@ impl Server {
             };
 
             info!("starting bidi stream loop");
-            match inner.bidi_stream(conn_id, init_tty_size, child_exit_notifier) {
+            match inner.bidi_stream(
+                conn_id,
+                init_tty_size,
+                child_exit_notifier,
+                self.hooks.session_input(&header.name),
+            ) {
                 Ok(done) => {
                     child_done = done;
                 }

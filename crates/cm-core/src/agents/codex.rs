@@ -57,6 +57,27 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "codex";
 
+/// Codex's composer recognizes a bracketed paste containing an image path as
+/// an attachment, retaining the current draft. Verified against 0.153.4's
+/// `ChatComposer::handle_paste_image_path` and the real TUI. A file URL keeps
+/// whitespace, quotes, non-UTF-8 bytes and terminal controls out of the input
+/// stream; Codex decodes it back to a host path before reading the image.
+pub(crate) fn clipboard_paste_input(path: &Path) -> Vec<u8> {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut input = String::from("\x1b[200~file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            input.push(char::from(byte));
+        } else {
+            let _ = write!(input, "%{byte:02X}");
+        }
+    }
+    input.push_str("\x1b[201~");
+    input.into_bytes()
+}
+
 /// Codex 0.153.4 pushes keyboard enhancements before querying support, on the
 /// primary screen and regardless of TERM. Mirror its opt-out at launch, where
 /// the environment is still the agent's; an attaching client cannot recover
@@ -680,9 +701,8 @@ pub fn build_launch_command(
     let home = codex_home().context("could not resolve Codex home")?;
     ensure_profile_at(&home, &hooks_json)?;
 
-    // `agent_command` puts the shim farm on `PATH`, which for Codex buys only
-    // `clipboard-paste`: it reads the clipboard in-process, so no shim can serve
-    // its `Ctrl+V`.
+    // The helper remains available on PATH. The pool handles Ctrl+V through
+    // `clipboard_paste_input`, since Codex's native read bypasses these shims.
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     // Set the real path explicitly. This is a no-op for the normal absolute
     // `$CODEX_HOME`, and makes a relative override resolve the same way here as
@@ -1185,6 +1205,18 @@ fn event_msg_kind(line: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_paste_encodes_a_path_without_terminal_or_shell_syntax() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            b"/work/a b/'\"\x1b[201~\n\xff.png",
+        ));
+        assert_eq!(
+            clipboard_paste_input(path),
+            b"\x1b[200~file:///work/a%20b/%27%22%1B%5B201~%0A%FF.png\x1b[201~"
+        );
+    }
 
     #[test]
     fn keyboard_reattach_honors_codex_opt_out() {

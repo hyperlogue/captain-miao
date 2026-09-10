@@ -5,7 +5,8 @@
 //! newly attached terminal receives before the application's next response.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -33,7 +34,12 @@ struct Pool {
 
 impl Pool {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("cm-mode-pool-{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("cm-mode-pool-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         // Keyboard stacks differ on purpose: returning from the alternate
         // screen must recover the primary screen's flags too.
@@ -62,6 +68,7 @@ done
         );
         let daemon = Command::new(env!("CARGO_BIN_EXE_miao-server"))
             .arg("pty-daemon")
+            .env("HOME", &root)
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_CONFIG_HOME", root.join("config"))
@@ -144,19 +151,74 @@ done
         );
         let _: DetachReply = receive(&stream);
     }
+
+    fn input_fixture(&self, agent: &str) {
+        let tool = |name: &str| {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .filter(|dir| dir.join(name).is_file())
+                .find_map(|dir| dir.canonicalize().ok().map(|dir| dir.join(name)))
+                .expect("tool on test PATH")
+        };
+        std::fs::write(
+            self.root.join("app.sh"),
+            format!(
+                "{} raw -echo\nprintf READY\nexec {}\n",
+                shell_words::quote(&tool("stty").to_string_lossy()),
+                shell_words::quote(&tool("cat").to_string_lossy())
+            ),
+        )
+        .unwrap();
+        #[derive(Serialize)]
+        struct State<'a> {
+            agent: &'a str,
+            launcher_pid: u32,
+            cwd: &'a str,
+            status: cm_core::state::SessionStatus,
+            updated_at: u64,
+            pool_session: &'a str,
+        }
+        let path = self
+            .root
+            .join("state/captain-miao/sessions")
+            .join(format!("{}.json", std::process::id()));
+        cm_core::state::create_dir_all_private(path.parent().unwrap()).unwrap();
+        cm_core::state::write_json_atomic(
+            &path,
+            &State {
+                agent,
+                launcher_pid: std::process::id(),
+                cwd: "/work/repo",
+                status: cm_core::state::SessionStatus::Idle,
+                updated_at: 0,
+                pool_session: "mode-test",
+            },
+        )
+        .unwrap();
+        assert!(cm_core::state::read_json::<cm_core::state::LauncherState>(&path).is_some());
+    }
+
+    fn clipboard(&self) -> UnixListener {
+        UnixListener::bind(self.root.join("run/captain-miao/clipboard.sock")).unwrap()
+    }
+
+    fn images(&self) -> PathBuf {
+        self.root
+            .join("run/captain-miao/launchers")
+            .join(format!("{}-images", std::process::id()))
+    }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        if self.socket().exists() {
-            let stream = self.connect();
-            send(
-                &stream,
-                &ConnectHeader::Kill(KillRequest {
+        if let Ok(stream) = UnixStream::connect(self.socket()) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            if rmp_serde::from_read::<_, VersionHeader>(&stream).is_ok() {
+                let _ = ConnectHeader::Kill(KillRequest {
                     sessions: vec!["mode-test".into()],
-                }),
-            );
-            let _: KillReply = receive(&stream);
+                })
+                .serialize(&mut rmp_serde::Serializer::new(&stream).with_struct_map());
+                let _ = rmp_serde::from_read::<_, KillReply>(&stream);
+            }
         }
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
@@ -174,7 +236,12 @@ fn read_until(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
         if kind[0] == 1 {
             continue;
         }
-        assert_eq!(kind[0], 0, "session exited unexpectedly");
+        assert_eq!(
+            kind[0],
+            0,
+            "session exited unexpectedly: {}",
+            String::from_utf8_lossy(&output)
+        );
         let mut length = [0; 4];
         stream.read_exact(&mut length).unwrap();
         let length = u32::from_le_bytes(length) as usize;
@@ -245,4 +312,146 @@ fn reattach_restores_an_active_alternate_screen_before_live_output() {
         expected.restore_buffer(),
         "detached output must update the mode state before the next response"
     );
+}
+
+#[test]
+fn codex_ctrl_v_fetches_distinct_images_and_survives_reattach() {
+    let pool = Pool::new();
+    pool.input_fixture("codex");
+    let clipboard = pool.clipboard();
+    let serve = std::thread::spawn(move || {
+        for image in [b"first image".as_slice(), b"second image"] {
+            let (mut stream, _) = clipboard.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 13];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"v1 image png\n");
+            stream
+                .write_all(format!("v1 image png\n{}\n", image.len()).as_bytes())
+                .unwrap();
+            stream.write_all(image).unwrap();
+            stream.write_all(b"0\n").unwrap();
+        }
+    });
+    let mut client = pool.attach(true);
+    read_until(&mut client, b"READY");
+    client.write_all(b"draft \x16 after").unwrap();
+    let first = read_until(&mut client, b" after");
+    let first = String::from_utf8(first).unwrap();
+    let path = first
+        .strip_prefix("draft \x1b[200~file://")
+        .unwrap()
+        .strip_suffix("\x1b[201~ after")
+        .unwrap();
+    let first_path = PathBuf::from(path);
+    assert_eq!(std::fs::read(&first_path).unwrap(), b"first image");
+    assert_eq!(
+        std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(pool.images())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    pool.detach();
+    drop(client);
+    let mut client = pool.attach(false);
+    // Consume the restored terminal modes before checking the transformed input.
+    client.write_all(b"SYNC").unwrap();
+    read_until(&mut client, b"SYNC");
+    client.write_all(b"\x1b[118:").unwrap();
+    client.write_all(b"86;5u after").unwrap();
+    let second = read_until(&mut client, b" after");
+    let second = String::from_utf8(second).unwrap();
+    let second_path = PathBuf::from(
+        second
+            .strip_prefix("\x1b[200~file://")
+            .unwrap()
+            .strip_suffix("\x1b[201~ after")
+            .unwrap(),
+    );
+    assert_ne!(first_path, second_path);
+    assert_eq!(std::fs::read(first_path).unwrap(), b"first image");
+    assert_eq!(std::fs::read(second_path).unwrap(), b"second image");
+    serve.join().unwrap();
+}
+
+#[test]
+fn other_agents_and_bracketed_text_keep_their_input_without_a_clipboard_read() {
+    for agent in ["claude", "codex"] {
+        let pool = Pool::new();
+        pool.input_fixture(agent);
+        let clipboard = pool.clipboard();
+        clipboard.set_nonblocking(true).unwrap();
+        let mut client = pool.attach(true);
+        read_until(&mut client, b"READY");
+        let bytes = if agent == "claude" {
+            b"\x16\x1b[118;5u!".as_slice()
+        } else {
+            b"\x1b[200~literal \x16 \x1b[118;5u\x1b[201~!"
+        };
+        client.write_all(bytes).unwrap();
+        assert_eq!(read_until(&mut client, b"!"), bytes);
+        assert_eq!(
+            clipboard.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        client.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            read_until(&mut client, b"\x1b"),
+            b"\x1b",
+            "standalone Escape must flush"
+        );
+    }
+}
+
+#[test]
+fn detach_cancels_a_stalled_clipboard_download_and_removes_the_partial_file() {
+    let pool = Pool::new();
+    pool.input_fixture("codex");
+    let clipboard = pool.clipboard();
+    let mut client = pool.attach(true);
+    read_until(&mut client, b"READY");
+    client.write_all(b"\x16").unwrap();
+    let (mut fetch, _) = clipboard.accept().unwrap();
+    fetch
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = [0; 13];
+    fetch.read_exact(&mut request).unwrap();
+    fetch.write_all(b"v1 image png\n100\npartial").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pool.images().exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let started = Instant::now();
+    pool.detach();
+    drop(client);
+    let mut client = pool.attach(false);
+    client.write_all(b"SYNC").unwrap();
+    read_until(&mut client, b"SYNC");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "detach waited for the clipboard deadline"
+    );
+    assert_eq!(std::fs::read_dir(pool.images()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_missing_clipboard_bridge_preserves_codex_ctrl_v() {
+    let pool = Pool::new();
+    pool.input_fixture("codex");
+    let mut client = pool.attach(true);
+    read_until(&mut client, b"READY");
+    client.write_all(b"\x16done").unwrap();
+    assert_eq!(read_until(&mut client, b"done"), b"\x16done");
+    assert!(!pool.images().exists());
 }

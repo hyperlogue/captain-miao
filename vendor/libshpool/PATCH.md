@@ -14,6 +14,14 @@ contents. The output thread owns the parser, processes detached output, and
 sends restoration before subsequent live output. No new socket, sidecar, pool
 wire frame, or second PTY relay is involved.
 
+`Hooks::session_input` optionally supplies a `SessionInput` for an attachment's
+existing client-to-PTY thread. It can replace input after keybinding handling,
+flush a split escape sequence after 30 ms without another byte, and observe the
+thread's stop flag during a slow operation. `None` preserves upstream input.
+captain-miao uses this for Codex image paste; clipboard policy and encoding stay
+outside libshpool. Detach cancels a pending image fetch, and the launcher owns
+the attachment files' lifetime across reattachments.
+
 Patch points: `src/lib.rs`, `src/hooks.rs`, `src/daemon/server.rs`, and
 `src/daemon/shell.rs`. Keep the extension confined to those points when
 updating the pinned source. The caller and regression tests live in

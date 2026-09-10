@@ -257,6 +257,19 @@ library**.
   from the agent reaches the attaching terminal intact. The only gate is that
   terminal's own policy: kitty's `clipboard_control` (writes allowed by
   default), or zellij's own OSC 52 handling for an attach running in a pane.
+- **Codex image paste uses the existing input thread.** `PoolHooks::session_input`
+  recognizes Ctrl+V (legacy, CSI-u and modifyOtherKeys), excluding bracketed text
+  and terminal control strings. It resolves the pool's live launcher on that key
+  and asks `AgentControl::clipboard_paste_encoder` whether input bridging applies.
+  Codex receives a bracketed file URL, which its composer converts to an image
+  attachment without submitting or replacing the draft. Other agents keep their
+  key bytes. The same forwarded image-only clipboard socket supplies the bytes;
+  no new wire frame or desktop clipboard is involved. Missing images or bridge
+  failures preserve the original key. Fetches have a 30-second deadline and
+  observe the input thread's stop flag, so detach cancels a stalled download.
+  Distinct `0600` image files live under the launcher's `0700` runtime directory
+  until launcher exit; the existing runtime sweep removes files left by a dead
+  launcher. See `clipboard/input.rs`, `clipboard/shim.rs`, and `pty_pool.rs`.
 - **Reattach restores live terminal modes, without replaying screen contents.**
   The pool still uses `simple` restore and sends SIGWINCH so the agent redraws.
   `PoolHooks::session_spool` replaces the empty upstream spool with a bounded

@@ -617,6 +617,7 @@ impl SessionInner {
         conn_id: usize,
         init_tty_size: TtySize,
         child_exit_notifier: Arc<ExitNotifier>,
+        input: Option<Box<dyn crate::SessionInput + Send>>,
     ) -> anyhow::Result<bool> {
         test_hooks::emit("daemon-bidi-stream-enter");
         #[allow(clippy::let_unit_value)]
@@ -668,7 +669,7 @@ impl SessionInner {
         thread::scope(|s| -> anyhow::Result<()> {
             // Spawn the main data transport threads
             let client_to_shell_h = self.spawn_client_to_shell(
-                s, conn_id, &stop, &pty_master, &mut client_to_shell_client_stream)?;
+                s, conn_id, &stop, &pty_master, &mut client_to_shell_client_stream, input)?;
 
             // Send a steady stream of heartbeats to the client
             // so that if the connection unexpectedly goes
@@ -770,6 +771,7 @@ impl SessionInner {
         stop: &'scope AtomicBool,
         pty_master: &'scope shpool_pty::fork::Master,
         shell_to_client_client_stream: &'scope mut UnixStream,
+        mut input: Option<Box<dyn crate::SessionInput + Send>>,
     ) -> anyhow::Result<thread::ScopedJoinHandle<'scope, anyhow::Result<()>>> {
         let empty_bindings = vec![config::Keybinding {
             binding: String::from("Ctrl-Space Ctrl-q"),
@@ -798,6 +800,7 @@ impl SessionInner {
                 let mut keep_sections = vec![]; // (<start offset>, <end offset>)
                 let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
                 let mut partial_keybinding = vec![];
+                let mut input_timeout = None;
 
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -812,10 +815,27 @@ impl SessionInner {
                     //
                     // Also, note that we don't access through the mutex because reads
                     // don't need to be excluded from trampling on writes.
-                    let mut len = shell_to_client_client_stream
-                        .read(&mut buf)
-                        .context("reading client chunk")?;
+                    let timeout = input.as_ref().filter(|i| i.pending())
+                        .map(|_| Duration::from_millis(30));
+                    if timeout != input_timeout {
+                        shell_to_client_client_stream.set_read_timeout(timeout)?;
+                        input_timeout = timeout;
+                    }
+                    let mut len = match shell_to_client_client_stream.read(&mut buf) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                            if let Some(input) = &mut input {
+                                input.process(&[], &mut master_writer, stop)?;
+                                master_writer.flush()?;
+                            }
+                            continue;
+                        }
+                        result => result.context("reading client chunk")?,
+                    };
                     if len == 0 {
+                        if let Some(input) = &mut input {
+                            input.process(&[], &mut master_writer, stop)?;
+                        }
                         info!("EOF");
                         return Ok(());
                     }
@@ -841,9 +861,12 @@ impl SessionInner {
                                     partial_keybinding.len(),
                                     i
                                 );
-                                master_writer
-                                    .write_all(&partial_keybinding)
-                                    .context("writing partial keybinding")?;
+                                if let Some(input) = &mut input {
+                                    input.process(&partial_keybinding, &mut master_writer, stop)?;
+                                } else {
+                                    master_writer.write_all(&partial_keybinding)
+                                        .context("writing partial keybinding")?;
+                                }
                                 if i > 0 {
                                     // snip the leading part of the input chunk that
                                     // was part of this keybinding
@@ -902,7 +925,11 @@ impl SessionInner {
                     }
                     len = snip_buf(&mut buf[..], len, &snip_sections[..], &mut keep_sections);
 
-                    master_writer.write_all(&buf[0..len]).context("writing client chunk")?;
+                    if let Some(input) = &mut input {
+                        input.process(&buf[..len], &mut master_writer, stop)?;
+                    } else {
+                        master_writer.write_all(&buf[0..len]).context("writing client chunk")?;
+                    }
 
                     master_writer.flush().context("flushing input from client to shell")?;
 

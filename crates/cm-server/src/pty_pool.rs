@@ -343,6 +343,13 @@ impl PoolHooks {
 }
 
 impl libshpool::Hooks for PoolHooks {
+    fn session_input(&self, name: &str) -> Option<Box<dyn libshpool::SessionInput + Send>> {
+        Some(Box::new(ClipboardInput {
+            name: name.to_string(),
+            parser: Default::default(),
+        }))
+    }
+
     fn session_spool(&self, _name: &str) -> Option<Box<dyn libshpool::SessionSpool + Send>> {
         Some(Box::new(ModeSpool::default()))
     }
@@ -383,6 +390,64 @@ impl libshpool::Hooks for PoolHooks {
         crate::server::wake_subscribers();
         Ok(())
     }
+}
+
+/// Runs only on this attachment's input thread. Agent identity is resolved on
+/// the paste key, since the first attach precedes the launcher's state file.
+/// No metadata read or clipboard request belongs on ordinary typing.
+struct ClipboardInput {
+    name: String,
+    parser: cm_core::clipboard::input::PasteInput,
+}
+
+impl libshpool::SessionInput for ClipboardInput {
+    fn process(
+        &mut self,
+        bytes: &[u8],
+        output: &mut dyn Write,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<()> {
+        let bytes = if bytes.is_empty() {
+            self.parser.flush()
+        } else {
+            self.parser
+                .process(bytes, || bridged_image_input(&self.name, stop))
+        };
+        if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            output.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+
+    fn pending(&self) -> bool {
+        self.parser.pending()
+    }
+}
+
+fn bridged_image_input(name: &str, stop: &std::sync::atomic::AtomicBool) -> Option<Vec<u8>> {
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let states = crate::state::read_all_launcher_states();
+    let session =
+        crate::state::find_live_pool_session(&states, name, crate::state::is_process_alive)?;
+    let encode = session.agent.clipboard_paste_encoder()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let path = runtime.block_on(async {
+        tokio::select! {
+            result = cm_core::clipboard::shim::paste_for_session(session.launcher_pid) => result.ok().flatten(),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => None,
+            _ = async {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            } => None,
+        }
+    })?;
+    Some(encode(&path))
 }
 
 /// Modes only: the pool's existing output thread owns all observation and

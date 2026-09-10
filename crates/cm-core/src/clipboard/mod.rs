@@ -17,6 +17,12 @@
 //! dashboard's machine over a unix socket that `ssh -R` forwarded into place
 //! ([`paths`]).
 //!
+//! Codex reads its desktop clipboard in-process. Its pool input adapter instead
+//! recognizes Ctrl+V via [`input`], downloads through the same socket, and
+//! supplies a bracketed image path that Codex's composer turns into an
+//! attachment. Those files stay distinct until launcher exit; both the input
+//! adapter and the explicit helper use [`shim`]'s streaming download.
+//!
 //! # Invariants, and why each is here
 //!
 //! **Every failure answers [`Response::None`]; there is no error frame.** The
@@ -53,6 +59,7 @@
 //! liberal flag parsing: being liberal has no upside and a loose `-s` prefix
 //! match would read `-s primary` as the clipboard selection.
 
+pub mod input;
 pub mod paths;
 pub mod read;
 pub mod serve;

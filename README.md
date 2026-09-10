@@ -68,7 +68,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | Agent                                                            | Notes                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **[Claude Code](https://claude.com/claude-code)**                |                                                                                                                                                                                                                                                                        |
-| **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. Use `!clipboard-paste` for remote images; native `Ctrl+V` bypasses the bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
+| **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. `Ctrl+V` attaches remote images through the pool's clipboard bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
 | **[Grok Build](https://github.com/xai-org/grok-build)**          | Hooks via `~/.grok/hooks/captain-miao.json` (no-op outside captain-miao). Token and model columns come off `signals.json`. Worktree name isn't shown on the row ([known limits](#grok-build-support)).                                                                 |
@@ -465,7 +465,9 @@ A host's **Clipboard** field (`Space h`, `e`, then `Space` on it) offers that ho
 **this machine's clipboard**, so `Ctrl+V` in an agent running there attaches a
 screenshot you just took here. It works by shadowing `xclip`/`wl-paste` on the
 agent's `PATH` with a shim that asks back over an owner-only unix socket,
-ssh-forwarded while the host is connected. A row that has it on shows 📋.
+ssh-forwarded while the host is connected. Codex uses the same bridge through
+the pool's input handler, because its native clipboard reader bypasses those
+commands. A row that has it on shows 📋.
 
 **Only images are ever served.** Text is not filtered out — it is never requested,
 so a remote can't read your password manager through this. It is off by default
@@ -475,14 +477,16 @@ when it holds an image.
 
 Sharp edges worth knowing:
 
-- **Codex has no `Ctrl+V`** here: it reads the clipboard in-process, so no shim
-  can serve it. Codex 0.153.4 can report `clipboard unavailable` with an
-  `X11 server connection timed out` error even when the host's Clipboard field
-  is on. In Codex, type **`!clipboard-paste` and press Enter** — it runs the helper,
-  writes the image beside the agent, and prints the path to put in your prompt.
-  From a shell on that host, the same helper is `miao-server clipboard paste`.
-- **Claude Code and Antigravity are confirmed to work through the shim**, and
-  only Codex is confirmed not to. Grok Build 1.0.5 reads the clipboard
+- **Codex's `Ctrl+V` attaches the image and keeps your draft.** The pool fetches
+  the image and delivers its path as a bracketed paste, which Codex recognizes
+  as an attachment. Verified with Codex 0.153.4, including its extended keyboard
+  protocol. Each image gets a separate private file, retained until the session
+  exits so multiple attachments remain intact. Ordinary text paste is unchanged.
+  This needs an updated host daemon; an older daemon still reports the X11
+  timeout. `!clipboard-paste` remains a manual fallback in Codex; from a shell
+  on that host, use `miao-server clipboard paste`.
+- **Claude Code and Antigravity are confirmed to work through the shim.**
+  Grok Build 1.0.5 reads the clipboard
   in-process (arboard) and only shells out to `wl-paste` when `WAYLAND_DISPLAY`
   is set, so a pooled launch without a display sets Grok's documented kill
   switch and a dummy value rather than waiting on arboard. Reasonix, Kimi Code,
@@ -490,13 +494,13 @@ Sharp edges worth knowing:
   out to `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
   in-process the way Codex does. `clipboard-paste` works on all of them
   regardless, so treat it as the reliable route until one is confirmed.
-- **A macOS host** gets nothing: the agent's clipboard path there is `osascript`,
-  which never reaches a shim. `clipboard-paste` is the whole story on such a host.
+- **On a macOS host**, agents using `osascript` bypass the command shims and
+  need `clipboard-paste`. Codex's pool input route does not depend on that tool.
 - **On a Linux dashboard** only what the clipboard actually offers can be served,
   so a browser-copied JPEG answers "no image" — there is no converter on that side.
   macOS re-encodes, so anything on the pasteboard works.
-- **Only sessions started after you enable it** are shimmed; restart a session to
-  pick it up.
+- **Command shims require a session restart** to pick up changes. Codex's pool
+  input route can use the clipboard as soon as its forwarding socket is available.
 - **Two dashboards on different machines against one host** collide: the later one
   wins the forward and the earlier one's paste stops working until it reconnects.
 
