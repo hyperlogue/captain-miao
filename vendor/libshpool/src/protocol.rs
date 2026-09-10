@@ -1,0 +1,583 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    cmp,
+    io::{self, Read, Write},
+    os::{fd::AsFd, unix::net::UnixStream},
+    path::Path,
+    sync::Mutex,
+    thread, time,
+};
+
+use anyhow::{anyhow, Context};
+use byteorder::{LittleEndian, ReadBytesExt as _, WriteBytesExt as _};
+use nix::poll;
+use serde::{Deserialize, Serialize};
+use shpool_protocol::{Chunk, ChunkKind, ConnectHeader, VersionHeader};
+use tracing::{debug, error, info, instrument, span, trace, warn, Level};
+
+use super::{common, consts, tty};
+
+const MAX_DETACH_WAIT_DUR: time::Duration = time::Duration::from_millis(300);
+const DETACH_BACKOFF_INITIAL_DUR: time::Duration = time::Duration::from_millis(1);
+// Cap backoff steps so slow-path stays responsive while still avoiding busy
+// waits.
+const DETACH_BACKOFF_MAX_STEP_DUR: time::Duration = time::Duration::from_millis(25);
+
+const STDIN_READ_POLL_MS: u16 = 50;
+
+/// The centralized encoding function that should be used for all protocol
+/// serialization.
+pub fn encode_to<T, W>(d: &T, w: W) -> anyhow::Result<()>
+where
+    T: Serialize,
+    W: Write,
+{
+    // You might be worried that since we are encoding and decoding
+    // directly to/from the stream, unknown fields might be left trailing
+    // and mangle followup data, but msgpack is basically binary
+    // encoded json, so it has a notion of an object, which means
+    // it will be able to skip past the unknown fields and avoid any
+    // sort of mangling.
+    let mut serializer = rmp_serde::Serializer::new(w).with_struct_map();
+    d.serialize(&mut serializer).context("serializing data")?;
+    Ok(())
+}
+
+/// The centralized decoding function that should be used for all protocol
+/// deserialization.
+pub fn decode_from<T, R>(r: R) -> anyhow::Result<T>
+where
+    for<'de> T: Deserialize<'de>,
+    R: Read,
+{
+    let mut deserializer = rmp_serde::Deserializer::new(r);
+    let d: T = Deserialize::deserialize(&mut deserializer).context("deserializing from reader")?;
+    Ok(d)
+}
+
+/// Methods for the Chunk protocol struct. Protocol structs
+/// are always bare structs, so we use ext traits to mix in methods.
+pub trait ChunkExt<'data>: Sized {
+    fn write_to<W>(&self, w: &mut W) -> io::Result<()>
+    where
+        W: std::io::Write;
+
+    fn read_into<R>(r: &mut R, buf: &'data mut [u8]) -> anyhow::Result<Self>
+    where
+        R: std::io::Read;
+}
+
+impl<'data> ChunkExt<'data> for Chunk<'data> {
+    fn write_to<W>(&self, w: &mut W) -> io::Result<()>
+    where
+        W: std::io::Write,
+    {
+        w.write_u8(self.kind as u8)?;
+        if let ChunkKind::ExitStatus = self.kind {
+            assert!(self.buf.len() == 4);
+            // the caller should have already little-endian encoded
+            // the exit status and stuffed it into buf
+        } else {
+            w.write_u32::<LittleEndian>(self.buf.len() as u32)?;
+        }
+        w.write_all(self.buf)?;
+
+        Ok(())
+    }
+
+    fn read_into<R>(r: &mut R, buf: &'data mut [u8]) -> anyhow::Result<Self>
+    where
+        R: std::io::Read,
+    {
+        let kind = r.read_u8().context("reading chunk kind")?;
+        let kind = ChunkKind::try_from(kind).context("parsing chunk kind")?;
+        if let ChunkKind::ExitStatus = kind {
+            if 4 > buf.len() {
+                return Err(anyhow!("chunk of size 4 exceeds size limit of {} bytes", buf.len()));
+            }
+
+            r.read_exact(&mut buf[..4]).context("reading exit status payload")?;
+            Ok(Chunk { kind, buf: &buf[..4] })
+        } else {
+            let len = r.read_u32::<LittleEndian>()? as usize;
+            if len > buf.len() {
+                return Err(anyhow!(
+                    "chunk of size {} exceeds size limit of {} bytes",
+                    len,
+                    buf.len()
+                ));
+            }
+            r.read_exact(&mut buf[..len]).context("reading chunk payload")?;
+            Ok(Chunk { kind, buf: &buf[..len] })
+        }
+    }
+}
+
+pub struct Client {
+    stream: UnixStream,
+}
+
+/// The result of creating a client, possibly with
+/// flagging some issues that need to be handled.
+pub enum ClientResult {
+    /// The created client, ready to go.
+    JustClient(Client),
+    /// There was a version mismatch between the client
+    /// process and the daemon process which ought to be
+    /// handled, though it is possible that some operations
+    /// will continue to work.
+    VersionMismatch {
+        /// A warning about a version mismatch that should be
+        /// displayed to the user.
+        warning: String,
+        /// The client, which may or may not work.
+        client: Client,
+    },
+}
+
+impl Client {
+    /// Create a new client
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new<P: AsRef<Path>>(sock: P) -> anyhow::Result<ClientResult> {
+        let stream = UnixStream::connect(sock).context("connecting to shpool")?;
+
+        let daemon_version: VersionHeader = match decode_from(&stream) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("error parsing VersionHeader: {:?}", e);
+                return Ok(ClientResult::VersionMismatch {
+                    warning: String::from("could not get daemon version"),
+                    client: Client { stream },
+                });
+            }
+        };
+        info!("read daemon version header: {:?}", daemon_version);
+
+        match Self::version_ord(shpool_protocol::VERSION, &daemon_version.version)
+            .context("comparing versions")?
+        {
+            cmp::Ordering::Equal => Ok(ClientResult::JustClient(Client { stream })),
+            cmp::Ordering::Less => Ok(ClientResult::VersionMismatch {
+                warning: format!(
+                    "client protocol (version {:?}) is older than daemon protocol (version {:?})",
+                    shpool_protocol::VERSION,
+                    daemon_version.version,
+                ),
+                client: Client { stream },
+            }),
+            cmp::Ordering::Greater => Ok(ClientResult::VersionMismatch {
+                warning: format!(
+                    "client protocol ({:?}) is newer than daemon protocol (version {:?})",
+                    shpool_protocol::VERSION,
+                    daemon_version.version,
+                ),
+                client: Client { stream },
+            }),
+        }
+    }
+
+    pub fn write_connect_header(&self, header: ConnectHeader) -> anyhow::Result<()> {
+        encode_to(&header, &self.stream).context("writing reply")?;
+        Ok(())
+    }
+
+    pub fn read_reply<R>(&mut self) -> anyhow::Result<R>
+    where
+        R: for<'de> serde::Deserialize<'de>,
+    {
+        let reply: R = decode_from(&mut self.stream).context("parsing header")?;
+        Ok(reply)
+    }
+
+    /// This is essentially just PartialOrd on client version strings
+    /// with more descriptive errors (since PartialOrd gives an option)
+    /// and without having to wrap in a newtype.
+    fn version_ord(client_version: &str, daemon_version: &str) -> anyhow::Result<cmp::Ordering> {
+        let client_parts = client_version
+            .split('.')
+            .map(|p| p.parse::<i64>())
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing client version")?;
+        if client_parts.len() != 3 {
+            return Err(anyhow!(
+                "parsing client version: got {} parts, want 3",
+                client_parts.len(),
+            ));
+        }
+
+        let daemon_parts = daemon_version
+            .split('.')
+            .map(|p| p.parse::<i64>())
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing daemon version")?;
+        if daemon_parts.len() != 3 {
+            return Err(anyhow!(
+                "parsing daemon version: got {} parts, want 3",
+                daemon_parts.len(),
+            ));
+        }
+
+        // pre 1.0 releases flag breaking changes with their
+        // minor version rather than major version.
+        if client_parts[0] == 0 && daemon_parts[0] == 0 {
+            return Ok(client_parts[1].cmp(&daemon_parts[1]));
+        }
+
+        Ok(client_parts[0].cmp(&daemon_parts[0]))
+    }
+
+    /// pipe_bytes suffles bytes from std{in,out} to the unix
+    /// socket and back again. It is the main loop of
+    /// `shpool attach`.
+    ///
+    /// The on_maybe_switch callback should return true if pipe_bytes
+    /// should exit with a PipeBytesResult::MaybeSwitch because the
+    /// attach process needs to reattach.
+    #[instrument(skip_all)]
+    pub fn pipe_bytes<OnMaybeSwitchF>(
+        self,
+        on_maybe_switch: OnMaybeSwitchF,
+    ) -> anyhow::Result<PipeBytesResult>
+    where
+        OnMaybeSwitchF: Fn(&shpool_protocol::MaybeSwitch) -> bool + Send + Sync + 'static,
+    {
+        let tty_guard = tty::set_attach_flags()?;
+
+        let mut read_client_stream = self.stream.try_clone().context("cloning read stream")?;
+        let mut write_client_stream = self.stream.try_clone().context("cloning read stream")?;
+
+        let result_slot = Mutex::new(None);
+        thread::scope(|s| {
+            // stdin -> sock
+            let stdin_to_sock_h = s.spawn(|| -> anyhow::Result<()> {
+                let _s = span!(Level::INFO, "stdin->sock").entered();
+                let mut stdin = std::io::stdin().lock();
+                let mut buf = vec![0; consts::BUF_SIZE];
+
+                loop {
+                    {
+                        let res = result_slot.lock().unwrap();
+                        if res.is_some() {
+                            return Ok(());
+                        }
+                    }
+
+                    {
+                        let mut poll_fds =
+                            [poll::PollFd::new(stdin.as_fd(), poll::PollFlags::POLLIN)];
+                        let nready = poll::poll(&mut poll_fds, STDIN_READ_POLL_MS)
+                            .context("polling stdin")?;
+                        if nready == 0 {
+                            // timeout
+                            continue;
+                        }
+                    }
+
+                    let nread = stdin.read(&mut buf).context("reading stdin from user")?;
+                    if nread == 0 {
+                        return Ok(());
+                    }
+                    debug!("read {} bytes", nread);
+
+                    let to_write = &buf[..nread];
+                    trace!("created to_write='{}'", String::from_utf8_lossy(to_write));
+
+                    write_client_stream.write_all(to_write)?;
+                    write_client_stream.flush().context("flushing client")?;
+                }
+            });
+
+            // sock -> stdout
+            let sock_to_stdout_h = s.spawn(|| -> anyhow::Result<()> {
+                let _s = span!(Level::INFO, "sock->stdout").entered();
+
+                let mut stdout = std::io::stdout().lock();
+                let mut buf = vec![0; consts::BUF_SIZE];
+
+                loop {
+                    {
+                        let res = result_slot.lock().unwrap();
+                        if res.is_some() {
+                            return Ok(());
+                        }
+                    }
+
+                    {
+                        let mut poll_fds = [poll::PollFd::new(
+                            read_client_stream.as_fd(),
+                            poll::PollFlags::POLLIN,
+                        )];
+                        let nready = poll::poll(&mut poll_fds, STDIN_READ_POLL_MS)
+                            .context("polling stdin")?;
+                        if nready == 0 {
+                            // timeout
+                            continue;
+                        }
+                    }
+
+                    let chunk = match Chunk::read_into(&mut read_client_stream, &mut buf) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            error!("reading chunk: {:?}", err);
+                            return Err(err);
+                        }
+                    };
+
+                    if !chunk.buf.is_empty() {
+                        debug!(
+                            "chunk='{}' kind={:?} len={}",
+                            String::from_utf8_lossy(chunk.buf),
+                            chunk.kind,
+                            chunk.buf.len()
+                        );
+                    }
+
+                    match chunk.kind {
+                        ChunkKind::Heartbeat => {
+                            trace!("got heartbeat chunk");
+                        }
+                        ChunkKind::Data => {
+                            stdout.write_all(chunk.buf).context("writing chunk to stdout")?;
+
+                            if let Err(e) = stdout.flush() {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    // If the fd is busy, we are likely just getting
+                                    // flooded with output and don't need to worry about
+                                    // flushing every last byte. Flushing is really
+                                    // about interactive situations where we want to
+                                    // see echoed bytes immediately.
+                                    continue;
+                                }
+                            }
+                            debug!("flushed stdout");
+                        }
+                        ChunkKind::ExitStatus => {
+                            let mut status_reader = io::Cursor::new(chunk.buf);
+                            let stat = status_reader
+                                .read_i32::<LittleEndian>()
+                                .context("reading exit status from exit status chunk")?;
+                            info!("got exit status frame (status={})", stat);
+                            {
+                                let mut res = result_slot.lock().unwrap();
+                                *res = Some(PipeBytesResult::Exit(stat));
+                            }
+                        }
+                        ChunkKind::MaybeSwitch => {
+                            let maybe_switch_reader = io::Cursor::new(chunk.buf);
+                            let maybe_switch: shpool_protocol::MaybeSwitch =
+                                decode_from(maybe_switch_reader).context("decoding vars list")?;
+
+                            info!("got vars update (maybe_switch={:?})", maybe_switch);
+                            if on_maybe_switch(&maybe_switch) {
+                                let mut res = result_slot.lock().unwrap();
+                                *res = Some(PipeBytesResult::MaybeSwitch(maybe_switch));
+                            }
+                        }
+                    }
+                }
+            });
+
+            loop {
+                let mut nfinished_threads = (stdin_to_sock_h.is_finished() as usize)
+                    + (sock_to_stdout_h.is_finished() as usize);
+
+                if nfinished_threads > 0 {
+                    // If one of the threads has exited, but not the other
+                    // make sure that the exit result slot has some contents
+                    // so the other thread will exit the next time it wakes
+                    // from its poll().
+                    {
+                        let mut res = result_slot.lock().unwrap();
+                        if res.is_none() {
+                            *res = Some(PipeBytesResult::Exit(1));
+                        }
+                    }
+
+                    if nfinished_threads < 2 {
+                        let finished_waiting = common::sleep_unless(
+                            MAX_DETACH_WAIT_DUR,
+                            || {
+                                nfinished_threads = (stdin_to_sock_h.is_finished() as usize)
+                                    + (sock_to_stdout_h.is_finished() as usize);
+                                nfinished_threads >= 2
+                            },
+                            common::PollStrategy::Backoff {
+                                initial_interval: DETACH_BACKOFF_INITIAL_DUR,
+                                factor: 2.0,
+                                max_interval: DETACH_BACKOFF_MAX_STEP_DUR,
+                            },
+                        );
+
+                        if !finished_waiting {
+                            // Re-probe after timeout because thread state can change
+                            // during the final sleep inside sleep_unless.
+                            nfinished_threads = (stdin_to_sock_h.is_finished() as usize)
+                                + (sock_to_stdout_h.is_finished() as usize);
+                        }
+
+                        if nfinished_threads < 2 {
+                            // It should be impossible to get here because both
+                            // loops use poll() to wake up every so often to
+                            // check if they need to exit. Nevertheless, if
+                            // we somehow still have a stuck thread at this
+                            // point, we'll just exit.
+
+                            // If one of the worker threads is done and the
+                            // other is not exiting, we are likely blocked on
+                            // some IO. Fortunately, since there isn't much else
+                            // going on in the client process and the thing to do
+                            // is to shut down at this point, we can resolve this
+                            // by just hard-exiting the whole process. This allows
+                            // us to use simple blocking IO.
+                            warn!(
+                                "internal error: exiting due to a stuck IO thread stdin_to_sock_finished={} sock_to_stdout_finished={}",
+                                stdin_to_sock_h.is_finished(),
+                                sock_to_stdout_h.is_finished(),
+                            );
+                            // make sure that we restore the tty flags on the input
+                            // tty before exiting the process.
+                            drop(tty_guard);
+
+                            let res = result_slot.lock().unwrap();
+                            if let Some(PipeBytesResult::Exit(stat)) = *res {
+                                std::process::exit(stat);
+                            } else {
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                thread::sleep(consts::JOIN_POLL_DURATION);
+            }
+
+            match stdin_to_sock_h.join() {
+                Ok(v) => {
+                    if let Err(e) = v {
+                        info!("stdin->sock finished with err: {}", e);
+                    }
+                }
+                Err(panic_err) => std::panic::resume_unwind(panic_err),
+            }
+            match sock_to_stdout_h.join() {
+                Ok(v) => {
+                    if let Err(e) = v {
+                        info!("sock->stdout finished with err: {}", e);
+                    }
+                }
+                Err(panic_err) => {
+                    std::panic::resume_unwind(panic_err);
+                }
+            }
+
+            let mut ret = PipeBytesResult::Exit(1);
+            {
+                let res = result_slot.lock().unwrap();
+                if let Some(r) = res.clone() {
+                    ret = r;
+                }
+            }
+            Ok(ret)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub enum PipeBytesResult {
+    /// The attach proc should exit with the given exit status.
+    Exit(i32),
+    /// The on_maybe_switch callback has requested the client stop streaming
+    /// due to some change that requires a reconnect (almost certainly a
+    /// changed var in the session name template). The attach proc
+    /// should recompute any relevant templates and re-attach.
+    MaybeSwitch(shpool_protocol::MaybeSwitch),
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn chunk_round_trip() {
+        let data: Vec<u8> = vec![0, 0, 0, 1, 5, 6];
+        let cases = vec![
+            Chunk { kind: ChunkKind::Data, buf: data.as_slice() },
+            Chunk { kind: ChunkKind::Heartbeat, buf: &data[..0] },
+            Chunk { kind: ChunkKind::ExitStatus, buf: &data[..4] },
+        ];
+
+        let mut buf = vec![0; 256];
+        for c in cases {
+            let mut file_obj = io::Cursor::new(vec![0; 256]);
+            c.write_to(&mut file_obj).expect("write to suceed");
+            file_obj.set_position(0);
+            let round_tripped =
+                Chunk::read_into(&mut file_obj, &mut buf).expect("parse to succeed");
+            assert_eq!(c, round_tripped);
+        }
+    }
+
+    #[test]
+    fn version_ordering_noerr() {
+        use std::cmp::Ordering;
+
+        let cases = vec![
+            ("1.0.0", "1.0.0", Ordering::Equal),
+            ("1.0.0", "1.0.1", Ordering::Equal),
+            ("1.0.0", "1.1.0", Ordering::Equal),
+            ("1.0.0", "1.1.1", Ordering::Equal),
+            ("1.0.0", "1.100.100", Ordering::Equal),
+            ("1.0.0", "2.0.0", Ordering::Less),
+            ("1.0.0", "2.8.0", Ordering::Less),
+            ("1.199.0", "2.8.0", Ordering::Less),
+            ("2.0.0", "1.0.0", Ordering::Greater),
+            ("0.1.0", "0.1.0", Ordering::Equal),
+            ("0.1.1", "0.1.0", Ordering::Equal),
+            ("0.1.1", "0.1.99", Ordering::Equal),
+            ("0.1.0", "0.2.0", Ordering::Less),
+            ("0.1.99", "0.2.0", Ordering::Less),
+            ("0.2.0", "0.1.0", Ordering::Greater),
+        ];
+
+        for (lhs, rhs, ordering) in cases {
+            let actual_ordering =
+                Client::version_ord(lhs, rhs).expect("version strings to have an ordering");
+            assert_eq!(actual_ordering, ordering);
+        }
+    }
+
+    #[test]
+    fn version_ordering_err() {
+        let cases = vec![
+            ("1.0.0", "1.0.0.0", "got 4 parts, want 3"),
+            ("1.0.0.0", "1.0.0", "got 4 parts, want 3"),
+            ("foobar", "1.0.0", "invalid digit found in string"),
+            ("1.foobar", "1.0.0", "invalid digit found in string"),
+        ];
+
+        for (lhs, rhs, err_substr) in cases {
+            if let Err(e) = Client::version_ord(lhs, rhs) {
+                eprintln!("ERR: {e:?}");
+                eprintln!("EXPECTED SUBSTR: {err_substr}");
+                let errstr = format!("{e:?}");
+                assert!(errstr.contains(err_substr));
+            } else {
+                panic!("no error though we expected one");
+            }
+        }
+    }
+}

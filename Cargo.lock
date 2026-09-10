@@ -1226,8 +1226,6 @@ dependencies = [
 [[package]]
 name = "libshpool"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f8dfde78524fe35f897cd87451bf3dd7b7fd11e83cb8ab5ce744b945342cc7c"
 dependencies = [
  "anyhow",
  "byteorder",
