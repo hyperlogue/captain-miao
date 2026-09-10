@@ -197,10 +197,6 @@ fn codex_path(name: &str) -> Option<PathBuf> {
     Some(codex_home()?.join(name))
 }
 
-fn sessions_root() -> Option<PathBuf> {
-    codex_path("sessions")
-}
-
 fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -274,11 +270,18 @@ pub fn read_thread_titles(ids: &[String]) -> HashMap<String, String> {
     let Some(db) = state_db_path() else {
         return HashMap::new();
     };
+    read_thread_titles_at(&db, ids)
+}
+
+fn read_thread_titles_at(db: &Path, ids: &[String]) -> HashMap<String, String> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
     // Read-only so the live WAL DB is never written. URI + NO_MUTEX match
     // rusqlite's default open flags (we only swap READ_WRITE|CREATE for
     // READ_ONLY); the connection is single-threaded and short-lived.
     let Ok(conn) = Connection::open_with_flags(
-        &db,
+        db,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -545,12 +548,22 @@ fn parse_user_message(line: &str) -> Option<String> {
 }
 
 /// Scan `sessions/**/rollout-*.jsonl` for resumable Codex sessions. Returns up
-/// to `limit` candidates sorted by mtime (most recent first).
+/// to `limit` candidates sorted by mtime (most recent first). Titles come from
+/// the host's Codex store, just like the live-session overlay: rollouts do not
+/// carry renames, and a title must survive even when no prompt is in the header.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no codex home"))?;
+    let home = codex_home().ok_or_else(|| anyhow::anyhow!("no codex home"))?;
+    list_resumable_at(&home, limit)
+}
+
+fn list_resumable_at(home: &Path, limit: usize) -> Result<Vec<ResumeCandidate>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let root = home.join("sessions");
 
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for year in read_subdirs(&root) {
@@ -594,6 +607,11 @@ pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
         if out.len() == limit {
             break;
         }
+    }
+    let ids = out.iter().map(|c| c.session_id.clone()).collect::<Vec<_>>();
+    let titles = read_thread_titles_at(&home.join("state_5.sqlite"), &ids);
+    for candidate in &mut out {
+        candidate.custom_title = titles.get(&candidate.session_id).cloned();
     }
     Ok(out)
 }
@@ -1274,6 +1292,87 @@ mod tests {
         assert_eq!(h.git_branch.as_deref(), Some("main"));
         assert_eq!(h.first_prompt.as_deref(), Some("hello world"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resumable_codex_session_uses_its_stored_title_without_a_prompt() {
+        let home = scratch_home("resume-title");
+        let day = home.join("sessions/2026/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join("rollout-titled.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-titled\",\"cwd\":\"/work/repo\"}}\n",
+        )
+        .unwrap();
+        let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT);
+             INSERT INTO threads VALUES ('thread-titled', 'Auto title', 'Saved session title');",
+        )
+        .unwrap();
+
+        let candidates = list_resumable_at(&home, 10).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].first_prompt, None);
+        assert_eq!(
+            candidates[0].custom_title.as_deref(),
+            Some("Saved session title"),
+            "the picker needs the title or it falls back to (session XXXXXXXX)"
+        );
+
+        // The same scan must notice a subsequent rename without a rollout write.
+        conn.execute("UPDATE threads SET name = 'New session title'", [])
+            .unwrap();
+        assert_eq!(
+            list_resumable_at(&home, 10).unwrap()[0]
+                .custom_title
+                .as_deref(),
+            Some("New session title")
+        );
+        conn.execute("UPDATE threads SET name = NULL", []).unwrap();
+        assert_eq!(
+            list_resumable_at(&home, 10).unwrap()[0]
+                .custom_title
+                .as_deref(),
+            Some("Auto title")
+        );
+        drop(conn);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn resumable_codex_sessions_keep_the_prompt_when_the_title_store_is_unavailable() {
+        let home = scratch_home("resume-without-store");
+        let day = home.join("sessions/2026/01/01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join("rollout-prompt.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-prompt\",\"cwd\":\"/work/repo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Fix the parser\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = home.join("state_5.sqlite");
+        let check = || {
+            let candidates = list_resumable_at(&home, 1).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(
+                candidates[0].first_prompt.as_deref(),
+                Some("Fix the parser")
+            );
+            assert_eq!(candidates[0].custom_title, None);
+        };
+        check();
+        assert!(
+            !db.exists(),
+            "a resume scan must never create Codex's database"
+        );
+        std::fs::write(&db, "unreadable database").unwrap();
+        check();
+        assert!(list_resumable_at(&home, 0).unwrap().is_empty());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
