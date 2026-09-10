@@ -57,6 +57,92 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "codex";
 
+/// Codex 0.153.4 pushes keyboard enhancements before querying support, on the
+/// primary screen and regardless of TERM. Mirror its opt-out at launch, where
+/// the environment is still the agent's; an attaching client cannot recover
+/// that decision from its own environment. See upstream `tui/keyboard_modes.rs`.
+pub(crate) fn uses_kitty_keyboard() -> bool {
+    keyboard_enhancement_enabled(
+        std::env::var("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT")
+            .ok()
+            .as_deref(),
+        running_in_vscode_wsl,
+    )
+}
+
+fn keyboard_enhancement_enabled(disable: Option<&str>, vscode_wsl: impl FnOnce() -> bool) -> bool {
+    match disable.map(str::trim) {
+        Some(value)
+            if value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes") =>
+        {
+            false
+        }
+        Some(value)
+            if value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no") =>
+        {
+            true
+        }
+        _ => !vscode_wsl(),
+    }
+}
+
+fn running_in_vscode_wsl() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let wsl = std::fs::read_to_string("/proc/version")
+        .ok()
+        .is_some_and(|version| {
+            let version = version.to_ascii_lowercase();
+            version.contains("microsoft") || version.contains("wsl")
+        })
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some();
+    if !wsl {
+        return false;
+    }
+    if std::env::var("TERM_PROGRAM").is_ok_and(|term| term.eq_ignore_ascii_case("vscode")) {
+        return true;
+    }
+    // WSL interop can hide TERM_PROGRAM from the Linux environment. Codex
+    // also checks the Windows side; do so only at launch and only under WSL.
+    std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "set TERM_PROGRAM"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.trim_end_matches('\r')
+                    .strip_prefix("TERM_PROGRAM=")
+                    .is_some_and(|term| term.eq_ignore_ascii_case("vscode"))
+            })
+        })
+}
+
+/// The common keyboard flags Codex requests on every supported transport:
+/// disambiguate escape codes + report alternate keys (`CSI > 5 u`). Avoid
+/// report-event-types: Codex itself omits it for Ghostty, iTerm2 and tmux's
+/// xterm key format, and a reattach can land in a different emulator. This
+/// preserves modified keys without reproducing Codex's terminal detection or
+/// querying a tmux server on the attach path. Verified against 0.153.4 startup
+/// bytes and `tui/keyboard_modes.rs`; no mouse tracking belongs to its inline
+/// view. Reset modifyOtherKeys so it cannot compete with CSI-u reporting.
+pub(crate) fn reattach_prime(kitty_keyboard: bool) -> crate::state::ReattachPrime {
+    crate::state::ReattachPrime {
+        input_modes: true,
+        keyboard_flags: if kitty_keyboard { 5 } else { 0 },
+        reset_modify_other_keys: kitty_keyboard,
+        ..crate::state::ReattachPrime::default()
+    }
+}
+
 /// The one named-profile slot captain-miao reserves on managed Codex launches.
 const PROFILE_NAME: &str = "captain-miao";
 const PROFILE_FILE: &str = "captain-miao.config.toml";
@@ -1081,6 +1167,20 @@ fn event_msg_kind(line: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_reattach_honors_codex_opt_out() {
+        for value in ["1", "true", "YES", " True "] {
+            assert!(!keyboard_enhancement_enabled(Some(value), || false));
+        }
+        for value in ["0", "false", "NO", " False "] {
+            assert!(keyboard_enhancement_enabled(Some(value), || true));
+        }
+        for value in [None, Some(""), Some("unexpected")] {
+            assert!(keyboard_enhancement_enabled(value, || false));
+            assert!(!keyboard_enhancement_enabled(value, || true));
+        }
+    }
 
     fn write_tmp(name: &str, body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

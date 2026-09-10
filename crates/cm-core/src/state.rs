@@ -430,69 +430,95 @@ pub fn pooled_launcher_pids(states: &[LauncherState]) -> Vec<u32> {
 /// Never written on the create path, where the agent's own startup sets up
 /// this very terminal.
 ///
-/// The sequences mirror what Grok 1.0.5 emits at startup (probed on a
-/// scripted pty), in its order:
+/// The recipes live behind `AgentControl` and are verified against Grok 1.0.5
+/// and Codex 0.153.4 startup (probed on scripted ptys):
 ///
-/// * `alt_screen` — DECSET 1049 plus the input modes an alt-screen TUI runs
-///   with: mouse tracking in both grades and encodings (1000/1002/1003 +
-///   1015/1006 — without these the terminal turns a scrollwheel on the alt
-///   screen into arrow-key input), focus reporting (1004) and bracketed paste
-///   (2004). Leave resets them all, returns to the primary screen, and shows
-///   the cursor — DECTCEM is not in the 1049 save/restore, so a detach
-///   mid-frame would otherwise leave the shell's cursor hidden.
-/// * `kitty_keyboard` — the kitty keyboard protocol push (`ESC[>3u`:
-///   disambiguate escape codes + report event types), what lets Shift+Enter
-///   reach the agent as more than a bare CR. Pushed after the screen switch
-///   because kitty keeps a separate enhancement stack per screen; leave pops
-///   it from that same stack.
+/// * `alt_screen` — Grok's DECSET 1049 plus mouse tracking in both grades and
+///   encodings (1000/1002/1003 + 1015/1006 — without these the terminal turns
+///   a scrollwheel on the alt
+///   screen into arrow-key input). Codex's main view stays on the primary
+///   screen and consumes no mouse tracking, so it gets neither.
+/// * `input_modes` — focus reporting (1004) and bracketed paste (2004),
+///   restored for both agents independently of the screen switch.
+/// * `keyboard_flags` — the kitty keyboard protocol push: Grok's `ESC[>3u`,
+///   or Codex's portable subset `ESC[>5u` (see `agents::codex`). Pushed after
+///   the screen switch because kitty keeps a separate enhancement stack per
+///   screen; leave pops it from that same stack. Codex also resets
+///   modifyOtherKeys so it cannot compete with CSI-u reporting.
+///
+/// Leave resets the modes, returns from the alternate screen when entered,
+/// and shows the cursor. DECTCEM is not in the 1049 save/restore, and a detach
+/// mid-frame can leave the shell's cursor hidden on either screen.
 ///
 /// A duplicate of any of these is harmless: terminals guard the 1049 switch
 /// on their current buffer, DECSET/DECRST of a mode already in that state is
 /// a no-op, and a pop of an empty enhancement stack is ignored.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ReattachPrime {
-    pub alt_screen: bool,
-    pub kitty_keyboard: bool,
+    pub(crate) alt_screen: bool,
+    pub(crate) input_modes: bool,
+    pub(crate) keyboard_flags: u8,
+    pub(crate) reset_modify_other_keys: bool,
 }
 
 impl ReattachPrime {
     pub fn of(state: &LauncherState) -> Self {
-        Self {
-            alt_screen: state.alt_screen,
-            kitty_keyboard: state.kitty_keyboard,
-        }
+        state
+            .agent
+            .reattach_prime(state.alt_screen, state.kitty_keyboard)
     }
 
     /// Write the enter set to this process's stdout — the attach client's
     /// tty. Best-effort and tty-gated: a redirected stdout gets nothing, and
     /// the attach itself is left to succeed or fail on its own terms.
     pub fn enter(self) {
+        write_to_tty(&self.enter_sequence());
+    }
+
+    fn enter_sequence(self) -> Vec<u8> {
         let mut seq: Vec<u8> = Vec::new();
         if self.alt_screen {
             seq.extend_from_slice(
-                b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\
-                  \x1b[?1004h\x1b[?2004h",
+                b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h",
             );
         }
-        if self.kitty_keyboard {
-            seq.extend_from_slice(b"\x1b[>3u");
+        if self.input_modes {
+            seq.extend_from_slice(b"\x1b[?1004h\x1b[?2004h");
         }
-        write_to_tty(&seq);
+        if self.reset_modify_other_keys {
+            seq.extend_from_slice(b"\x1b[>4;0m");
+        }
+        if self.keyboard_flags != 0 {
+            seq.extend_from_slice(format!("\x1b[>{}u", self.keyboard_flags).as_bytes());
+        }
+        seq
     }
 
     /// Write the leave set: the enter set undone, in reverse.
     pub fn leave(self) {
+        write_to_tty(&self.leave_sequence());
+    }
+
+    fn leave_sequence(self) -> Vec<u8> {
         let mut seq: Vec<u8> = Vec::new();
-        if self.kitty_keyboard {
+        if self.keyboard_flags != 0 {
             seq.extend_from_slice(b"\x1b[<u");
+        }
+        if self.reset_modify_other_keys {
+            seq.extend_from_slice(b"\x1b[>4;0m");
+        }
+        if self.input_modes {
+            seq.extend_from_slice(b"\x1b[?2004l\x1b[?1004l");
         }
         if self.alt_screen {
             seq.extend_from_slice(
-                b"\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\
-                  \x1b[?1000l\x1b[?1049l\x1b[?25h",
+                b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l",
             );
         }
-        write_to_tty(&seq);
+        if self.alt_screen || self.input_modes {
+            seq.extend_from_slice(b"\x1b[?25h");
+        }
+        seq
     }
 }
 
@@ -1083,16 +1109,18 @@ pub struct LauncherState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub alt_screen: bool,
     /// Whether the agent pushed the **kitty keyboard protocol** at startup
-    /// (`ESC[>3u` — what makes a modified key like Shift+Enter reach it as
-    /// more than a bare CR), resolved once at launch
-    /// ([`crate::agent::AgentControl::uses_kitty_keyboard`]) from the same
-    /// `TERM` the agent's own gate reads — the launcher shares the pool pty's
-    /// env, so this is the post-rewrite value [`Self::terminfo`] records.
-    /// Stamped only alongside [`Self::alt_screen`] (the probed evidence
-    /// covers the fullscreen TUI; an inline agent's push, if any, stays
-    /// unprimed), read by the same attach guards, and carries the same
-    /// launch-time-snapshot caveat. Skipped when false so an old peer never
-    /// sees it.
+    /// (what makes Shift+Enter reach it as more than a bare CR), resolved once
+    /// at launch ([`crate::agent::AgentControl::uses_kitty_keyboard`]) in the
+    /// same environment the agent reads. Grok checks `TERM` and is primed only
+    /// in fullscreen; Codex pushes on the primary screen too, unless its env
+    /// opt-out or VS Code/WSL workaround disables enhancements. The attaching
+    /// process must use this recorded decision, never its own env. The agent
+    /// recipe supplies the flags to restore ([`ReattachPrime`]).
+    ///
+    /// Pooled only, read by the same attach guards, with the same snapshot
+    /// caveat. False from older launchers that did not record Codex's push:
+    /// those sessions need a restart to restore keyboard enhancements.
+    /// Skipped when false so an old peer never sees it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kitty_keyboard: bool,
     /// Per-session flags (pinned / follow-up) as the **owning host**
@@ -1536,6 +1564,67 @@ pub fn read_all_launcher_states() -> Vec<LauncherState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_reattach_restores_input_on_the_primary_screen() {
+        let state = LauncherState {
+            pool_session: Some("cm-codex-7-1".into()),
+            terminfo: Some("xterm-kitty".into()),
+            kitty_keyboard: true,
+            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
+        };
+        let prime = ReattachPrime::of(&state);
+        let enter = prime.enter_sequence();
+        assert_eq!(enter, b"\x1b[?1004h\x1b[?2004h\x1b[>4;0m\x1b[>5u");
+        assert_eq!(
+            prime.leave_sequence(),
+            b"\x1b[<u\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[?25h"
+        );
+        assert!(!prime.alt_screen, "Codex's main view is inline");
+    }
+
+    #[test]
+    fn codex_without_keyboard_enhancement_still_restores_paste_and_focus() {
+        let state = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let prime = ReattachPrime::of(&state);
+        assert_eq!(prime.enter_sequence(), b"\x1b[?1004h\x1b[?2004h");
+        assert_eq!(prime.leave_sequence(), b"\x1b[?2004l\x1b[?1004l\x1b[?25h");
+    }
+
+    #[test]
+    fn grok_reattach_keeps_its_fullscreen_protocols() {
+        let state = LauncherState {
+            alt_screen: true,
+            kitty_keyboard: true,
+            ..LauncherState::for_test(AgentControl::Grok, SessionStatus::Idle)
+        };
+        let prime = ReattachPrime::of(&state);
+        assert_eq!(
+            prime.enter_sequence(),
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\
+              \x1b[?1004h\x1b[?2004h\x1b[>3u"
+        );
+        assert_eq!(
+            prime.leave_sequence(),
+            b"\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?1003l\
+              \x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[?25h"
+        );
+    }
+
+    #[test]
+    fn an_unprimed_attach_emits_nothing() {
+        // The server's create path uses Default: the agent sets its own modes.
+        let create = ReattachPrime::default();
+        assert!(create.enter_sequence().is_empty());
+        assert!(create.leave_sequence().is_empty());
+        for &agent in AgentControl::ALL {
+            if agent == AgentControl::Codex {
+                continue;
+            }
+            let state = LauncherState::for_test(agent, SessionStatus::Idle);
+            assert_eq!(ReattachPrime::of(&state), create, "{agent:?}");
+        }
+    }
 
     /// The attach-guard predicate: only a state file whose `pool_session`
     /// matches AND whose launcher pid is alive counts — a matching name on a

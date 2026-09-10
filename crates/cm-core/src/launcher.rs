@@ -94,13 +94,10 @@ pub async fn run(
     // nothing ever primes a non-pool window.
     let alt_screen = pool_session.is_some() && agent.uses_alt_screen(agent_args);
     // …and whether it will push the kitty keyboard protocol, from the same
-    // `TERM` the agent's own gate is about to read. Only alongside the
-    // alt-screen flag: the probed evidence covers the fullscreen TUI, and the
-    // attach guards prime the two as one set.
-    let kitty_keyboard = alt_screen
-        && terminfo
-            .as_deref()
-            .is_some_and(|t| agent.uses_kitty_keyboard(t));
+    // environment the agent's own gate is about to read. Codex pushes on the
+    // primary screen too; Grok's verified recipe still requires fullscreen.
+    let kitty_keyboard = pool_session.is_some()
+        && agent.uses_kitty_keyboard(terminfo.as_deref().unwrap_or_default(), alt_screen);
 
     let mut launcher_state = LauncherState {
         agent,

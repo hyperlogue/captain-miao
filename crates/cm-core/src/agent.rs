@@ -48,7 +48,7 @@ use tokio::process::Command;
 
 use crate::agents;
 use crate::agents::{antigravity, claude, codex, grok, kimi, omp, opencode, pi, reasonix};
-use crate::state::{HookEvent, HookMessage, LauncherState};
+use crate::state::{HookEvent, HookMessage, LauncherState, ReattachPrime};
 
 // =============================================================================
 // Which backends exist, and what they can do
@@ -471,21 +471,24 @@ impl AgentControl {
         }
     }
 
-    /// Whether this launch will push the **kitty keyboard protocol**
-    /// (`ESC[>3u`), judged from the `TERM` the agent will see — the
+    /// Whether this launch will push the **kitty keyboard protocol**,
+    /// judged from the environment the agent will see — the
     /// companion to [`Self::uses_alt_screen`], and consumed in the same one
-    /// place ([`LauncherState::kitty_keyboard`]). Same bargain as there:
+    /// place ([`LauncherState::kitty_keyboard`]). Grok's verified recipe
+    /// requires `alt_screen`; Codex's input modes are independent of it.
+    /// Same bargain as there:
     /// `false` for any backend nobody has probed, because a missed push
     /// keeps reattach exactly as it is today while a wrong push feeds
     /// CSI-u key encodings to a parser that never opted into them.
-    pub fn uses_kitty_keyboard(self, term: &str) -> bool {
+    pub fn uses_kitty_keyboard(self, term: &str, alt_screen: bool) -> bool {
         match self {
             // Probed on 1.0.5: the push is gated purely on `TERM` (it goes
             // out before any terminal query could answer). The gate itself
             // lives with the rest of Grok's knowledge.
-            AgentControl::Grok => grok::uses_kitty_keyboard(term),
+            AgentControl::Grok => alt_screen && grok::uses_kitty_keyboard(term),
+            // Codex pushes on the primary screen too, without a TERM gate.
+            AgentControl::Codex => codex::uses_kitty_keyboard(),
             AgentControl::Claude
-            | AgentControl::Codex
             | AgentControl::Reasonix
             | AgentControl::Kimi
             | AgentControl::OpenCode
@@ -493,6 +496,20 @@ impl AgentControl {
             | AgentControl::Omp
             | AgentControl::Antigravity
             | AgentControl::Unknown => false,
+        }
+    }
+
+    /// Compose the attach-time recipe from the launcher's recorded decisions.
+    /// Input protocols are independent of the screen the agent renders on.
+    pub(crate) fn reattach_prime(self, alt_screen: bool, kitty_keyboard: bool) -> ReattachPrime {
+        match self {
+            AgentControl::Codex => codex::reattach_prime(kitty_keyboard),
+            _ => ReattachPrime {
+                alt_screen,
+                input_modes: alt_screen,
+                keyboard_flags: if kitty_keyboard { 3 } else { 0 },
+                ..ReattachPrime::default()
+            },
         }
     }
 
@@ -2250,14 +2267,17 @@ mod tests {
             );
             // Same guard for the keyboard push, and for the same reason —
             // even under the TERM that makes Grok push.
-            assert!(
-                !agent.uses_kitty_keyboard("xterm-kitty"),
-                "{agent:?} claims the kitty keyboard push; probe its startup \
-                 bytes and move it out of the unverified arm deliberately"
-            );
+            if agent != AgentControl::Codex {
+                assert!(
+                    !agent.uses_kitty_keyboard("xterm-kitty", true),
+                    "{agent:?} claims the kitty keyboard push; probe its startup \
+                     bytes and move it out of the unverified arm deliberately"
+                );
+            }
         }
         assert!(!AgentControl::Unknown.uses_alt_screen(&[]));
-        assert!(!AgentControl::Unknown.uses_kitty_keyboard("xterm-kitty"));
+        assert!(!AgentControl::Unknown.uses_kitty_keyboard("xterm-kitty", true));
+        assert!(!AgentControl::Grok.uses_kitty_keyboard("xterm-kitty", false));
     }
 
     /// **The test the declared matrix is worth having.** `capabilities()` is a
