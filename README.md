@@ -68,7 +68,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | Agent                                                            | Notes                                                                                                                                                                                                                                                                  |
 | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **[Claude Code](https://claude.com/claude-code)**                |                                                                                                                                                                                                                                                                        |
-| **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. No support for pasting in remote sessions, as Codex reads the clipboard in-process ([details](#pasting-a-screenshot-into-a-remote-session)). |
+| **[Codex](https://github.com/openai/codex)**                     | Uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is therefore reserved on managed launches. Use `!clipboard-paste` for remote images; native `Ctrl+V` bypasses the bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
 | **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
 | **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
 | **[Grok Build](https://github.com/xai-org/grok-build)**          | Hooks via `~/.grok/hooks/captain-miao.json` (no-op outside captain-miao). Token and model columns come off `signals.json`. Worktree name isn't shown on the row ([known limits](#grok-build-support)).                                                                 |
@@ -476,8 +476,11 @@ when it holds an image.
 Sharp edges worth knowing:
 
 - **Codex has no `Ctrl+V`** here: it reads the clipboard in-process, so no shim
-  can serve it. Run `clipboard-paste` in the session instead — it writes the image
-  beside the agent and prints the path to hand it.
+  can serve it. Codex 0.153.4 can report `clipboard unavailable` with an
+  `X11 server connection timed out` error even when the host's Clipboard field
+  is on. In Codex, type **`!clipboard-paste` and press Enter** — it runs the helper,
+  writes the image beside the agent, and prints the path to put in your prompt.
+  From a shell on that host, the same helper is `miao-server clipboard paste`.
 - **Claude Code and Antigravity are confirmed to work through the shim**, and
   only Codex is confirmed not to. Grok Build 1.0.5 reads the clipboard
   in-process (arboard) and only shells out to `wl-paste` when `WAYLAND_DISPLAY`
