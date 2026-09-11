@@ -1462,11 +1462,19 @@ decides what they mean**.
   trip between a keystroke and its echo.** Everything the picker handles is in
   the host-canonical `~` form, so what's shown is what's submitted and no
   machine's `$HOME` is involved.
-- **`Space H` — the default host**: the exact analog of `Space a`'s default
-  agent, persisted in `dashboard-overrides.json` and shown in the header
-  cluster (once more than one host exists). `O`, a bare `o`, and `r` target it;
-  `o` on a row keeps that row's host, and **fork follows the focused session's
-  host** — never the default.
+- **The first host in `Space h` is the default**. `J`/`K` moves the
+  selected host down/up, including the permanent localhost row; the selection
+  follows it. Reordering saves immediately without reconnecting hosts. The
+  order is stored as `prefs.host_order` in `dashboard-overrides.json`, with
+  `"local"` representing localhost; `hosts.json` still contains only remotes.
+  `O`, a bare `o`, and `r` target the first host; `o` on a row and a fork keep
+  that session's host. `Ctrl-h` in either picker cycles enabled hosts in panel
+  order. Suspending the default falls back to localhost; a temporarily
+  unreachable default retains its selection. Removing a host promotes the
+  next row. Without a saved order, localhost comes first, followed by remotes
+  in file order. Unknown labels are skipped and new hosts appended. An older
+  saved `default_host` migrates to the front once, unless an explicit order
+  already exists. Custom `default_host` key bindings now open the Hosts panel.
 - **`r` resume** lists **one host at a time**, named in the picker title, with
   in-picker `Ctrl-h` to switch. This replaced the cross-host union, whose scope
   was implicit and whose cost scaled with the host count. With that, **`b` (the

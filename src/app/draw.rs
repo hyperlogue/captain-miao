@@ -1645,6 +1645,9 @@ impl App {
                     // not exist.
                     let mut spans = hint_pair("a", "add");
                     spans.extend(hint_pair("e", "edit"));
+                    if host_edit.is_some_and(|h| h.cursor < h.rows.len() && h.rows.len() > 1) {
+                        spans.extend(hint_pair("J/K", "reorder"));
+                    }
                     // The two shortcuts into a *named* field, where `e` always
                     // lands on Label. Only worth a hint for the fields you'd open
                     // the editor specifically to change.

@@ -23,9 +23,9 @@ use crate::state::HostId;
 
 use super::draw::{one_line, vitals_spinner_glyph, wrap_ranges};
 use super::format::{ICON_SLOT_WIDTH, centered_rect, clear_overlay};
-use super::picker;
 use super::picker::{TextInput, TextInputEvent};
 use super::{Action, App};
+use super::{hosts, picker};
 
 /// Active hosts popup (`input_mode == InputMode::HostEdit`). A working copy of
 /// the host list edited in place; committed (and the backends rebuilt) on save,
@@ -83,6 +83,15 @@ pub(in crate::app) enum EditOrigin {
 }
 
 impl HostEditState {
+    /// Only committed, usable rows participate in the persisted order.
+    pub(in crate::app) fn host_order(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|r| r.is_local || r.config().is_some())
+            .map(|r| r.host().0)
+            .collect()
+    }
+
     /// Start editing the selected row on `focus`, recording what `Esc` restores.
     pub(in crate::app) fn begin_edit(&mut self, focus: HostField) {
         let Some(row) = self.rows.get(self.cursor) else {
@@ -217,6 +226,30 @@ pub(crate) struct HostRow {
 }
 
 impl HostRow {
+    /// Localhost is synthetic; incomplete rows and the reserved local label
+    /// never become remote connection records.
+    pub(in crate::app) fn config(&self) -> Option<hosts::HostConfig> {
+        let label = self.label.text().trim();
+        let target = self.target.text().trim();
+        if self.is_local
+            || label.is_empty()
+            || target.is_empty()
+            || label.eq_ignore_ascii_case("local")
+        {
+            return None;
+        }
+        let icon = self.icon.text().trim();
+        Some(hosts::HostConfig {
+            label: label.to_string(),
+            icon: (!icon.is_empty()).then(|| icon.to_string()),
+            socket: self.is_socket.then(|| target.to_string()),
+            ssh: (!self.is_socket).then(|| target.to_string()),
+            disabled: self.disabled,
+            clipboard: self.clipboard,
+            options: hosts::split_options(self.options.text()),
+        })
+    }
+
     /// The `HostId` this row configures — its label, trimmed exactly as
     /// [`App::apply_host_edits`] trims it on the way to disk, so a lookup
     /// against the live backends matches a row still being typed.
@@ -511,9 +544,10 @@ impl App {
         clear_overlay(frame, popup);
         // No key hints on the border: the footer bar already renders this
         // mode's bindings, and two copies of the same list disagree eventually.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" Hosts ", Style::default().bold()));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            " Hosts · first is default ",
+            Style::default().bold(),
+        ));
         let list_area = block.inner(popup);
         frame.render_widget(block, popup);
 
@@ -646,7 +680,16 @@ impl App {
         if let Some(message) = &state.message {
             lines.push(Line::from(message.clone()));
         }
-        frame.render_widget(Paragraph::new(lines), list_area);
+        let selected_line = if state.pending_remove.is_some()
+            || state.pending_upgrade.is_some()
+            || state.message.is_some()
+        {
+            lines.len().saturating_sub(1)
+        } else {
+            (state.cursor * 2 + 1).min(lines.len().saturating_sub(1))
+        };
+        let scroll = selected_line.saturating_sub(list_area.height.saturating_sub(1) as usize);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), list_area);
     }
 
     /// The selected row's fields, as a card floating over the list.
@@ -912,6 +955,10 @@ impl App {
             return None;
         }
 
+        // A settings result stays visible until the next interaction, then
+        // scrolling follows the selected host again instead of the old message.
+        self.host_edit.as_mut()?.message = None;
+
         // List-mode globals (in field-edit these are text / Esc-back).
         if !editing && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.close_host_edit();
@@ -1104,6 +1151,21 @@ impl App {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => state.cursor = state.cursor.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => state.cursor = (state.cursor + 1).min(n),
+                KeyCode::Char('J' | 'K') if state.cursor < n => {
+                    let next = if key.code == KeyCode::Char('J') {
+                        state.cursor + 1
+                    } else {
+                        state.cursor.wrapping_sub(1)
+                    };
+                    if next < n {
+                        state.rows.swap(state.cursor, next);
+                        state.cursor = next;
+                        self.extra_prefs.host_order = Some(state.host_order());
+                        // Ordering changes presentation and launch defaults only.
+                        // Keep every existing backend and connection in place.
+                        self.save_overrides();
+                    }
+                }
                 KeyCode::Char('a') => state.begin_new_row(),
                 KeyCode::Char('e') | KeyCode::Enter => {
                     if state.cursor == n {

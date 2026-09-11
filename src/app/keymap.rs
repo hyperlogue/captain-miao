@@ -259,8 +259,8 @@ pub(super) enum Command {
     EditDir,
     ToggleKeepAwake,
     DefaultAgent,
-    /// Set the persistent default *host* for new-session operations — the exact
-    /// analog of `DefaultAgent`, and what replaced the cross-host unions (§9).
+    /// Compatibility command for custom bindings; opens the Hosts panel,
+    /// where the first row now owns the default.
     DefaultHost,
     SessionsLayout,
     ManageHosts,
@@ -371,7 +371,7 @@ impl Command {
             // `ALL` only trades a wrong list for an unwieldy one, since this
             // grows to seven names. The picker it opens shows them all anyway.
             Command::DefaultAgent => "set default new-session backend",
-            Command::DefaultHost => "set default host for new sessions",
+            Command::DefaultHost => "reorder hosts to set the default",
             Command::StealAttach => "attach, kicking the client already attached",
             Command::AttachAll => "attach every free detached session",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",

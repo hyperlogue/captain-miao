@@ -109,3 +109,33 @@ pub(super) fn load_hosts() -> Vec<HostConfig> {
 pub(super) fn save_hosts(hosts: &[HostConfig]) {
     let _ = crate::state::write_json_atomic(&crate::state::hosts_path(), &hosts);
 }
+
+/// Resolve the panel order, including the synthetic localhost row. Unknown
+/// labels and duplicates are discarded; newly configured hosts go at the end.
+/// The old default is migrated only when no explicit order has been saved.
+pub(super) fn resolve_order(
+    hosts: &[HostConfig],
+    saved: Option<&[String]>,
+    legacy_default: Option<&str>,
+) -> Vec<String> {
+    let local = crate::state::HostId::local();
+    let available: Vec<&str> = std::iter::once(local.0.as_str())
+        .chain(
+            hosts
+                .iter()
+                .map(|h| h.label.as_str())
+                .filter(|label| !label.is_empty() && !label.eq_ignore_ascii_case("local")),
+        )
+        .collect();
+    let preferred: Vec<&str> = match saved {
+        Some(order) => order.iter().map(String::as_str).collect(),
+        None => legacy_default.into_iter().collect(),
+    };
+    let mut order = Vec::new();
+    for label in preferred.into_iter().chain(available.iter().copied()) {
+        if available.contains(&label) && !order.iter().any(|h| h == label) {
+            order.push(label.to_string());
+        }
+    }
+    order
+}

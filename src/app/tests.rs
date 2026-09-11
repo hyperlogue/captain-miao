@@ -5912,6 +5912,232 @@ fn format_coarse_age_has_minute_resolution() {
 // =============================================================================
 
 #[test]
+fn host_order_migrates_the_old_default_and_normalizes_saved_labels() {
+    use super::hosts::{HostConfig, resolve_order};
+    let configs: Vec<_> = ["alpha", "beta", "gamma"]
+        .into_iter()
+        .map(|label| HostConfig {
+            label: label.into(),
+            ..Default::default()
+        })
+        .collect();
+    assert_eq!(
+        resolve_order(&configs, None, None),
+        ["local", "alpha", "beta", "gamma"]
+    );
+    assert_eq!(
+        resolve_order(&configs, None, Some("beta")),
+        ["beta", "local", "alpha", "gamma"]
+    );
+    assert_eq!(
+        resolve_order(&configs, None, Some("removed")),
+        ["local", "alpha", "beta", "gamma"]
+    );
+    let saved = ["removed", "gamma", "gamma", "", "local"].map(String::from);
+    assert_eq!(
+        resolve_order(&configs, Some(&saved), Some("beta")),
+        ["gamma", "local", "alpha", "beta"]
+    );
+    assert_eq!(
+        resolve_order(&configs, Some(&[]), Some("beta")),
+        ["local", "alpha", "beta", "gamma"]
+    );
+
+    let mut old: super::DashboardOverrides = serde_json::from_value(serde_json::json!({
+        "default_host": "beta"
+    }))
+    .unwrap();
+    old.prefs.host_order = Some(resolve_order(
+        &configs,
+        old.prefs.host_order.as_deref(),
+        old.default_host.as_deref(),
+    ));
+    let saved = serde_json::to_value(&old).unwrap();
+    assert!(
+        saved.get("default_host").is_none(),
+        "migration must retire the old default"
+    );
+    assert_eq!(
+        saved["prefs"]["host_order"],
+        serde_json::json!(["beta", "local", "alpha", "gamma"])
+    );
+}
+
+#[test]
+fn host_order_follows_reordering_in_the_panel_and_both_pickers() {
+    use crate::state::HostId;
+    let mut d = dashboard_with_three_hosts(&["/work"], &["/work"], &["/work"]);
+    let configs: Vec<_> = ["box", "cloud"]
+        .into_iter()
+        .map(|label| super::hosts::HostConfig {
+            label: label.into(),
+            ssh: Some("test-target".into()),
+            ..Default::default()
+        })
+        .collect();
+    d.app.open_host_edit_from(configs.clone());
+    assert!(d.render().contains("first is default"));
+    assert!(d.render().contains("reorder"));
+    // Move localhost below both remotes; the backend at index zero must stay
+    // untouched, and no real dial may replace the simulated connections.
+    d.press(KeyCode::Char('J'));
+    d.press(KeyCode::Char('J'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 2);
+    assert!(d.app.host_edit.as_ref().unwrap().rows[2].is_local);
+    assert_eq!(
+        d.app.extra_prefs.host_order.as_ref().unwrap(),
+        &["box", "cloud", "local"]
+    );
+    assert_eq!(
+        d.app
+            .backends
+            .iter()
+            .map(|b| b.host_id().0)
+            .collect::<Vec<_>>(),
+        ["local", "box", "cloud"]
+    );
+    assert_eq!(d.app.default_host_or_local(), HostId("box".into()));
+    // Localhost retains its protection after moving, and list boundaries and
+    // modified keys cannot move it out of the list or reorder the add button.
+    for key in ['d', 'c', 'J'] {
+        d.press(KeyCode::Char(key));
+    }
+    d.press_ctrl(KeyCode::Char('K'));
+    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(!d.app.host_edit.as_ref().unwrap().rows[2].disabled);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 2);
+    d.press(KeyCode::Down);
+    d.press(KeyCode::Char('K'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 3);
+    d.press(KeyCode::Up);
+    d.press(KeyCode::Char('K'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().host_order(),
+        ["box", "local", "cloud"]
+    );
+    d.press(KeyCode::Up);
+    d.press(KeyCode::Char('K'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
+    // Uppercase letters belong to the text field while editing.
+    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('J'));
+    assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Esc);
+    for key in ['o', 'O'] {
+        d.press(KeyCode::Char(key));
+        assert!(
+            matches!(&d.app.picker.as_ref().unwrap().kind, super::PickerKind::Workdir { host, .. } if host.0 == "box")
+        );
+        for expected in ["local", "cloud", "box"] {
+            d.press_ctrl(KeyCode::Char('h'));
+            assert!(
+                matches!(&d.app.picker.as_ref().unwrap().kind, super::PickerKind::Workdir { host, .. } if host.0 == expected)
+            );
+        }
+        d.press(KeyCode::Esc);
+    }
+    assert!(
+        matches!(d.press(KeyCode::Char('r')), Some(Action::FetchResumeList { host, .. }) if host.0 == "box")
+    );
+    d.app.open_resume_picker(HostId("box".into()), Vec::new());
+    for expected in ["local", "cloud", "box"] {
+        assert!(
+            matches!(d.press_ctrl(KeyCode::Char('h')), Some(Action::SwitchResumeHost { host }) if host.0 == expected)
+        );
+        d.app
+            .reseed_resume_picker(HostId(expected.into()), Vec::new());
+    }
+
+    // Round-trip through the persisted schema and reopen from connection
+    // records in their original order; localhost never becomes such a record.
+    let saved = serde_json::to_vec(&super::DashboardOverrides {
+        prefs: d.app.extra_prefs.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let restored: super::DashboardOverrides = serde_json::from_slice(&saved).unwrap();
+    let mut reopened = dashboard_with_three_hosts(&[], &[], &[]);
+    reopened.app.extra_prefs = restored.prefs;
+    reopened.app.open_host_edit_from(configs);
+    assert_eq!(
+        reopened.app.host_edit.as_ref().unwrap().host_order(),
+        ["box", "local", "cloud"]
+    );
+    assert_eq!(reopened.app.default_host_or_local(), HostId("box".into()));
+}
+
+#[test]
+fn host_order_keeps_the_selected_row_visible_in_a_long_list() {
+    let mut d = TestDashboard::new(120, 20);
+    d.app.open_host_edit_from(
+        (0..15)
+            .map(|i| super::hosts::HostConfig {
+                label: format!("test-host-{i}"),
+                ssh: Some("test-target".into()),
+                ..Default::default()
+            })
+            .collect(),
+    );
+    for _ in 0..15 {
+        d.press(KeyCode::Char('J'));
+    }
+    let rendered = d.render();
+    assert!(rendered.contains("localhost"), "{rendered}");
+    assert!(d.app.host_edit.as_ref().unwrap().rows[15].is_local);
+    d.press(KeyCode::Down);
+    assert!(d.render().contains("+ add host"));
+    d.app.host_edit.as_mut().unwrap().message = Some("Codex settings updated".into());
+    assert!(d.render().contains("Codex settings updated"));
+    for _ in 0..16 {
+        d.press(KeyCode::Up);
+    }
+    assert!(d.render().contains("test-host-0"));
+    assert!(d.app.host_edit.as_ref().unwrap().message.is_none());
+}
+
+#[test]
+fn host_order_survives_rename_and_removing_the_default_promotes_the_next_row() {
+    let mut d = TestDashboard::new(120, 30);
+    // Suspended remotes exercise persistence without opening real connections.
+    let configs: Vec<_> = ["alpha", "beta"]
+        .into_iter()
+        .map(|label| super::hosts::HostConfig {
+            label: label.into(),
+            ssh: Some("test-target".into()),
+            disabled: true,
+            ..Default::default()
+        })
+        .collect();
+    d.app.extra_prefs.host_order = Some(vec!["alpha".into(), "beta".into(), "local".into()]);
+    d.app.open_host_edit_from(configs);
+    assert!(
+        d.app.default_host_or_local().is_local(),
+        "a suspended default falls back to this machine"
+    );
+    d.press(KeyCode::Enter);
+    d.press_ctrl(KeyCode::Char('u'));
+    for c in "renamed".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(
+        d.app.extra_prefs.host_order.as_ref().unwrap(),
+        &["renamed", "beta", "local"]
+    );
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('y'));
+    assert_eq!(
+        d.app.extra_prefs.host_order.as_ref().unwrap(),
+        &["beta", "local"]
+    );
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('y'));
+    assert_eq!(d.app.extra_prefs.host_order.as_ref().unwrap(), &["local"]);
+    assert!(d.app.default_host_or_local().is_local());
+}
+
+#[test]
 fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     use cm_core::agents::codex::{CodexConfig, CodexMode};
     let mut d = TestDashboard::new(120, 30);
@@ -7345,7 +7571,7 @@ async fn workdir_picker_ctrl_d_forgets_on_the_targeted_host() {
     // under test is that the dashboard *sends* it and stops drawing the row.
     remote.simulate_link_for_tests(ConnState::Connected, true);
     d.app.backends.push(Backend::Remote(remote));
-    d.app.default_host = host.clone();
+    d.app.extra_prefs.host_order = Some(vec![host.0.clone(), "local".into()]);
     // Seed the per-host cache the picker renders from, standing in for a
     // `ListRecentDirs` that has already come back.
     d.app.recent_dirs_cache.insert(
@@ -7383,7 +7609,7 @@ fn workdir_picker_ctrl_d_holds_when_the_host_is_unreachable() {
             host.clone(),
             Vec::new(),
         )));
-    d.app.default_host = host.clone();
+    d.app.extra_prefs.host_order = Some(vec![host.0.clone(), "local".into()]);
     d.app.recent_dirs_cache.insert(
         host.clone(),
         vec!["~/alpha".to_string(), "~/beta".to_string()],

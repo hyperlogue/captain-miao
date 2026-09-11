@@ -394,8 +394,6 @@ pub(super) enum PickerKind {
     },
     /// Set the persistent default backend for new sessions (Preferences).
     DefaultAgent,
-    /// Set the persistent default host for new sessions (Preferences).
-    DefaultHost,
     /// Pick an emoji to drop into the directory-mark editor's icon field.
     /// Opened with `Ctrl-E` from `Space i`; submit/cancel return to the editor
     /// (which stays live in `self.dir_edit`) rather than the normal view.
@@ -494,12 +492,8 @@ struct DashboardOverrides {
     /// `[terminal] sessions_layout` config value is kept in that case.
     #[serde(default)]
     sessions_layout: Option<String>,
-    /// Persisted default host for new-session operations, stored as the host
-    /// label. The exact analog of `default_agent`: `O`, a bare `o`, and `r` all
-    /// target it, so every picker's scope is explicit instead of an implicit
-    /// cross-host union (§9). `None` (or a label no longer configured) falls
-    /// back to localhost.
-    #[serde(default)]
+    /// Read-only migration input; host order now owns the default.
+    #[serde(default, skip_serializing)]
     default_host: Option<String>,
     #[serde(default, skip_serializing_if = "prefs::PrefsOverrides::is_empty")]
     prefs: prefs::PrefsOverrides,
@@ -1092,11 +1086,6 @@ pub(super) struct App {
     /// none configured falls back to a deterministic emoji derived from its
     /// label, so the column always reads as icons rather than truncated names.
     pub(super) host_icons: HashMap<HostId, String>,
-    /// The host every new-session operation targets by default — `O`, a bare
-    /// `o` with nothing selected, and `r`. `o` on a row and a fork still follow
-    /// *that row's* host; this is only the no-context default. Persisted in
-    /// `dashboard-overrides.json`.
-    pub(super) default_host: HostId,
     /// Per-host recent-dir cache for the workdir picker, seeded at connect and
     /// invalidated when a launch records a new cwd. The picker is cache-first
     /// (§9): switching hosts must render instantly, and the rule the whole
@@ -1662,7 +1651,6 @@ impl App {
             foreign_bindings: Vec::new(),
             next_launch_id: 0,
             host_icons: HashMap::new(),
-            default_host: HostId::local(),
             recent_dirs_cache: HashMap::new(),
             last_table_rect: None,
             last_preview_rect: None,
@@ -2064,7 +2052,6 @@ impl App {
         }
         overrides.prevent_sleep = self.extra_prefs.prevent_sleep;
         overrides.sessions_layout = self.extra_prefs.sessions_layout.clone();
-        overrides.default_host = Some(self.default_host.0.clone());
         overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
         overrides.prefs = self.extra_prefs.clone();
         let _ = state::write_json_atomic(&state::dashboard_overrides_path(), &overrides);
@@ -2102,11 +2089,14 @@ impl App {
         if let Some(v) = self.extra_prefs.prevent_sleep {
             self.prevent_sleep_enabled = v;
         }
-        if let Some(h) = overrides.default_host.filter(|h| !h.is_empty()) {
-            // Kept even when that host isn't currently configured — the user may
-            // re-add it. `default_host_or_local` resolves the fallback at use.
-            self.default_host = HostId(h);
-        }
+        let host_order = hosts::resolve_order(
+            &hosts::load_hosts(),
+            self.extra_prefs.host_order.as_deref(),
+            overrides.default_host.as_deref(),
+        );
+        let host_order_changed = self.extra_prefs.host_order.as_ref() != Some(&host_order)
+            || overrides.default_host.is_some();
+        self.extra_prefs.host_order = Some(host_order);
         let agents_missing = self.extra_prefs.agents.is_none();
         self.agent_order = prefs::resolve_agent_list(self.extra_prefs.agents.as_deref());
         if agents_missing {
@@ -2131,13 +2121,10 @@ impl App {
                     })
                     .collect(),
             );
-            self.save_overrides();
         }
         self.new_session_agent = prefs::first_enabled_agent(&self.agent_order);
-        if let Some(ref order) = self.extra_prefs.host_order
-            && let Some(first) = order.iter().find(|h| !h.is_empty())
-        {
-            self.default_host = HostId(first.clone());
+        if agents_missing || host_order_changed {
+            self.save_overrides();
         }
         self.reapply_live_config();
         // Startup: nothing is selected yet, and none of these reorder the list.
@@ -2266,35 +2253,6 @@ impl App {
         self.picker = Some(ActivePicker {
             picker,
             kind: PickerKind::DefaultAgent,
-        });
-        self.input_mode = InputMode::Picker;
-    }
-
-    /// Open the default-host picker. Every new-session operation with no row
-    /// context (`O`, a bare `o`, `r`) targets whatever this selects.
-    pub(super) fn open_default_host_picker(&mut self) {
-        let current = self.default_host_or_local();
-        let hosts: Vec<(HostId, ConnState)> = self.host_states();
-        let items: Vec<PickerItem> = hosts
-            .iter()
-            .map(|(host, state)| {
-                let mut item = PickerItem::new(host.0.clone()).with_payload(host.0.clone());
-                if !state.is_connected() {
-                    item = item.with_secondary(state.label().to_string());
-                }
-                item.with_prefix(
-                    self.host_icon(host),
-                    crate::config::get().colors.ui.title_fg,
-                )
-            })
-            .collect();
-        let mut picker = Picker::new("Default host for new sessions", items);
-        if let Some(idx) = hosts.iter().position(|(h, _)| h == &current) {
-            picker.cursor = idx;
-        }
-        self.picker = Some(ActivePicker {
-            picker,
-            kind: PickerKind::DefaultHost,
         });
         self.input_mode = InputMode::Picker;
     }
@@ -2726,7 +2684,12 @@ impl App {
     }
 
     pub(super) fn open_host_edit(&mut self) {
-        let mut rows = hosts::load_hosts()
+        self.open_host_edit_from(hosts::load_hosts());
+    }
+
+    fn open_host_edit_from(&mut self, configs: Vec<hosts::HostConfig>) {
+        let order = hosts::resolve_order(&configs, self.extra_prefs.host_order.as_deref(), None);
+        let mut rows = configs
             .into_iter()
             .map(|h| HostRow {
                 is_socket: h.socket.is_some(),
@@ -2749,6 +2712,13 @@ impl App {
                 ..HostRow::default()
             },
         );
+        rows.sort_by_key(|r| {
+            order
+                .iter()
+                .position(|h| h == &r.host().0)
+                .unwrap_or(usize::MAX)
+        });
+        self.extra_prefs.host_order = Some(order);
         self.host_edit = Some(HostEditState {
             message: None,
             cursor: 0,
@@ -2845,31 +2815,10 @@ impl App {
         let Some(state) = self.host_edit.as_ref() else {
             return;
         };
-        let configs: Vec<hosts::HostConfig> = state
-            .rows
-            .iter()
-            // Drop blank rows (a half-typed one being added) and any that alias
-            // the reserved `local` host.
-            .filter(|r| {
-                !r.is_local
-                    && !r.label.text().trim().is_empty()
-                    && !r.target.text().trim().is_empty()
-                    && !r.label.text().trim().eq_ignore_ascii_case("local")
-            })
-            .map(|r| {
-                let target = r.target.text().trim().to_string();
-                let icon = r.icon.text().trim().to_string();
-                hosts::HostConfig {
-                    icon: (!icon.is_empty()).then_some(icon),
-                    label: r.label.text().trim().to_string(),
-                    socket: r.is_socket.then(|| target.clone()),
-                    ssh: (!r.is_socket).then_some(target),
-                    disabled: r.disabled,
-                    clipboard: r.clipboard,
-                    options: hosts::split_options(r.options.text()),
-                }
-            })
-            .collect();
+        let configs: Vec<hosts::HostConfig> =
+            state.rows.iter().filter_map(HostRow::config).collect();
+        self.extra_prefs.host_order = Some(state.host_order());
+        self.save_overrides();
         hosts::save_hosts(&configs);
         // A host that just left the ssh set — deleted, suspended, renamed, or
         // switched to a socket — still holds its port forwards on the shared
@@ -3572,13 +3521,19 @@ impl App {
             .collect()
     }
 
-    /// Every configured host paired with its live connection state — the hosts
-    /// panel's rows, in `backends` order (this machine first).
-    pub(super) fn host_states(&self) -> Vec<(HostId, ConnState)> {
-        self.backends
-            .iter()
-            .map(|b| (b.host_id(), b.conn_state()))
-            .collect()
+    /// Enabled hosts in panel order for the launch/resume pickers. The backend
+    /// vector keeps its own order: index zero always owns this machine.
+    pub(super) fn ordered_hosts(&self) -> Vec<HostId> {
+        let mut hosts: Vec<_> = self.backends.iter().map(Backend::host_id).collect();
+        if let Some(order) = &self.extra_prefs.host_order {
+            hosts.sort_by_key(|host| {
+                order
+                    .iter()
+                    .position(|h| h == &host.0)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        hosts
     }
 
     /// Sessions currently on `host`, split into `(running, attached)` — the
@@ -5718,14 +5673,17 @@ impl App {
         }
     }
 
-    /// The default host for new-session operations, falling back to localhost
-    /// when the persisted one is no longer configured.
+    /// The first panel row owns the default for `O`, a bare `o`, and `r`.
+    /// A suspended or removed default falls back to this machine. A temporarily
+    /// unreachable host still has a backend and retains its default status.
     pub(super) fn default_host_or_local(&self) -> HostId {
-        if self.backend_for(&self.default_host).is_some() {
-            self.default_host.clone()
-        } else {
-            self.backends[0].host_id()
-        }
+        self.extra_prefs
+            .host_order
+            .as_ref()
+            .and_then(|order| order.first())
+            .map(|label| HostId(label.clone()))
+            .filter(|host| self.backend_for(host).is_some())
+            .unwrap_or_else(|| self.backends[0].host_id())
     }
 
     /// A host's recent dirs, **cache-first** (§9). A host switch must render

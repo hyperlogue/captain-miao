@@ -579,10 +579,6 @@ impl App {
                 self.open_default_agent_picker();
                 None
             }
-            Command::DefaultHost => {
-                self.open_default_host_picker();
-                None
-            }
             Command::StealAttach => {
                 let s = self.selected_session()?;
                 let Some(pool_session) = s.pool_session.clone() else {
@@ -631,7 +627,7 @@ impl App {
                 self.toggle_sessions_layout();
                 None
             }
-            Command::ManageHosts => {
+            Command::ManageHosts | Command::DefaultHost => {
                 if super::REMOTE_ENABLED {
                     self.open_host_edit();
                 } else {
@@ -796,6 +792,9 @@ impl App {
     // =============================================================================
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let host_cycle = (key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('h'))
+        .then(|| self.ordered_hosts());
         let Some(active) = self.picker.as_mut() else {
             self.input_mode = InputMode::Normal;
             return None;
@@ -924,7 +923,7 @@ impl App {
             return None;
         }
         // Ctrl-H in the workdir picker cycles the host this launch opens on —
-        // local, then each configured remote — a per-launch choice. A remote
+        // in the Hosts panel's order — a per-launch choice. A remote
         // host opens the session in its pty pool and attaches over ssh (§8), and
         // the picker re-seeds its recent dirs / completion / validation against
         // that machine (`reseed_workdir_for_host`).
@@ -932,7 +931,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('h'))
             && let PickerKind::Workdir { host, .. } = &mut active.kind
         {
-            let hosts: Vec<HostId> = self.backends.iter().map(|b| b.host_id()).collect();
+            let hosts = host_cycle.as_ref()?;
             let cur = hosts.iter().position(|h| h == host).unwrap_or(0);
             *host = hosts[(cur + 1) % hosts.len()].clone();
             // Drop the `active` borrow before the reseed (it re-borrows self).
@@ -947,7 +946,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('h'))
             && let PickerKind::Resume { host, .. } = &active.kind
         {
-            let hosts: Vec<HostId> = self.backends.iter().map(|b| b.host_id()).collect();
+            let hosts = host_cycle.as_ref()?;
             let cur = hosts.iter().position(|h| h == host).unwrap_or(0);
             let next = hosts[(cur + 1) % hosts.len()].clone();
             return Some(Action::SwitchResumeHost { host: next });
@@ -1042,20 +1041,6 @@ impl App {
                             }
                             self.persist_agent_order();
                             self.set_status(format!("Default backend: {}", a.label()), false);
-                        }
-                        None
-                    }
-                    PickerKind::DefaultHost => {
-                        let chosen = active
-                            .picker
-                            .items
-                            .get(idx)
-                            .and_then(|it| it.payload.clone());
-                        if let Some(label) = chosen {
-                            self.default_host = HostId(label);
-                            self.save_overrides();
-                            let host = self.default_host.0.clone();
-                            self.set_status(format!("Default host: {host}"), false);
                         }
                         None
                     }
