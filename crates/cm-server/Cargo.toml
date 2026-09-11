@@ -39,3 +39,6 @@ shell-words = { version = "1", optional = true }
 [features]
 default = ["pty-pool"]
 pty-pool = ["dep:libshpool", "dep:shpool-protocol", "dep:rmp-serde", "dep:shell-words"]
+
+[dev-dependencies]
+cm-core = { path = "../cm-core", features = ["test-support"] }

@@ -858,10 +858,27 @@ async fn handle_conn(
     let mut subscribed = false;
     let mut last_sent: HashMap<SessionKey, LauncherState> = HashMap::new();
 
+    // read_frame uses read_exact: cancelling it at a notification/completion
+    // can discard a partial length or payload. One reader owns that progress.
+    let (frames_tx, mut frames) = tokio::sync::mpsc::channel(32);
+    let reader = tokio::spawn(async move {
+        loop {
+            let frame = read_frame::<_, ClientFrame>(&mut rd).await;
+            let ended = !matches!(&frame, Ok(Some(_)));
+            if frames_tx.send(frame).await.is_err() || ended {
+                break;
+            }
+        }
+    });
+    let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = async {
     loop {
         tokio::select! {
-            frame = read_frame::<_, ClientFrame>(&mut rd) => {
-                let Some(frame) = frame? else { return Ok(()) };
+            Some(reply) = cleanup_rx.recv() => {
+                write_frame(&mut wr, &reply).await?;
+            }
+            frame = frames.recv() => {
+                let Some(Some(frame)) = frame.transpose()? else { return Ok(()) };
                 match frame {
                     ClientFrame::Hello { .. } => {} // already handshaken; ignore
                     ClientFrame::Subscribe => {
@@ -879,17 +896,13 @@ async fn handle_conn(
                         // The key is re-resolved to a live pid inside the
                         // backend, so a stale mirror can't make us signal a
                         // recycled pid.
-                        let result = tokio::task::block_in_place(|| LocalBackend::kill_session(&key));
-                        let (ok, error) = match result {
-                            Ok(ok) => (ok, None),
-                            Err(error) => {
-                                let home = cm_core::paths::host_home();
-                                let message = format!("{error:#}");
-                                let message = if home.len() > 1 { message.replace(&home, "~") } else { message };
-                                (false, Some(message))
-                            },
-                        };
-                        write_frame(&mut wr, &ServerFrame::Killed { req_id, ok, error }).await?;
+                        let tx = cleanup_tx.clone();
+                        // The operation remains owned by this host even if its
+                        // requesting dashboard disconnects before the reply.
+                        tokio::spawn(async move {
+                            let reply = kill_session_reply(req_id, key).await;
+                            let _ = tx.send(reply);
+                        });
                     }
                     ClientFrame::OpenSession { req_id, spec } => {
                         let reply = tokio::task::block_in_place(|| open_session_reply(req_id, spec));
@@ -958,6 +971,30 @@ async fn handle_conn(
             }
         }
     }
+    }.await;
+    reader.abort();
+    result
+}
+
+async fn kill_session_reply(req_id: u64, key: SessionKey) -> ServerFrame {
+    let result = tokio::task::spawn_blocking(move || LocalBackend::kill_session(&key))
+        .await
+        .context("session cleanup worker failed")
+        .and_then(|result| result);
+    let (ok, error) = match result {
+        Ok(ok) => (ok, None),
+        Err(error) => {
+            let home = cm_core::paths::host_home();
+            let message = format!("{error:#}");
+            let message = if home.len() > 1 {
+                message.replace(&home, "~")
+            } else {
+                message
+            };
+            (false, Some(message))
+        }
+    };
+    ServerFrame::Killed { req_id, ok, error }
 }
 
 /// Re-read the live sessions and push a `Delta` for each new/changed one and a
@@ -1038,6 +1075,162 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_cleanup_allows_updates_requests_and_fragmented_frames() {
+        use cm_core::agents::codex::CodexMode;
+        use tokio::io::AsyncWriteExt;
+        state::ensure_sessions_dir().unwrap();
+        let mut row = LauncherState::for_test(AgentControl::Codex, state::SessionStatus::Idle);
+        row.launcher_pid = std::process::id();
+        row.codex_mode = CodexMode::AppServer;
+        row.codex_control = true;
+        row.session_id = Some("test-thread".into());
+        row.write().unwrap();
+        let mut other_process = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut other = row.clone();
+        other.launcher_pid = other_process.id().unwrap();
+        other.codex_control = false;
+        other.write().unwrap();
+        let control_dir = state::runtime_dir().join("launchers");
+        state::create_dir_all_private(&control_dir).unwrap();
+        let control_path = control_dir.join(format!("{}.sock", row.launcher_pid));
+        let control = UnixListener::bind(&control_path).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let (mut stream, _) = control.accept().await.unwrap();
+            let request: String = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(request, "Stop");
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            #[derive(serde::Serialize)]
+            struct Reply {
+                error: Option<String>,
+            }
+            write_frame(&mut stream, &Reply { error: None })
+                .await
+                .unwrap();
+        });
+        let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
+        let (changes, rx) = broadcast::channel(16);
+        let server = tokio::spawn(handle_conn(
+            stream,
+            Arc::new(LocalBackend::new()),
+            Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
+            rx,
+            changes.clone(),
+            "test-host".into(),
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::Hello {
+                client_version: VERSION.into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Welcome { .. })
+        ));
+        write_frame(&mut dashboard, &ClientFrame::Subscribe)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Snapshot { .. })
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::KillSession {
+                req_id: 1,
+                key: row.key(),
+            },
+        )
+        .await
+        .unwrap();
+        started_rx.await.unwrap();
+        other.name = Some("Changed while cleanup waits".into());
+        other.write().unwrap();
+        changes.send(()).unwrap();
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::CheckDir {
+                req_id: 2,
+                path: "~".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let responsive = tokio::time::timeout(Duration::from_millis(250), async {
+            let (mut changed, mut checked) = (false, false);
+            while !changed || !checked {
+                match read_frame(&mut dashboard).await.unwrap().unwrap() {
+                    ServerFrame::Delta { state } if state.key() == other.key() => changed = true,
+                    ServerFrame::DirChecked { req_id: 2, .. } => checked = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        // Split the next request across cleanup completion: the reader must
+        // retain its prefix while the writer sends that unrelated reply.
+        let mut packet = Vec::new();
+        write_frame(
+            &mut packet,
+            &ClientFrame::CheckDir {
+                req_id: 3,
+                path: "~".into(),
+            },
+        )
+        .await
+        .unwrap();
+        dashboard.write_all(&packet[..2]).await.unwrap();
+        release_tx.send(()).unwrap();
+        assert!(
+            responsive.is_ok(),
+            "one pending cleanup stalled unrelated updates and requests"
+        );
+        loop {
+            if matches!(
+                read_frame(&mut dashboard).await.unwrap(),
+                Some(ServerFrame::Killed {
+                    req_id: 1,
+                    ok: true,
+                    ..
+                })
+            ) {
+                break;
+            }
+        }
+        dashboard.write_all(&packet[2..]).await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frame::<_, ServerFrame>(&mut dashboard),
+        )
+        .await;
+        assert!(
+            matches!(
+                reply,
+                Ok(Ok(Some(ServerFrame::DirChecked { req_id: 3, .. })))
+            ),
+            "fragmented request was lost across cleanup completion"
+        );
+        drop(dashboard);
+        server.await.unwrap().unwrap();
+        cleanup.await.unwrap();
+        other_process.kill().await.unwrap();
+        for pid in [row.launcher_pid, other.launcher_pid] {
+            std::fs::remove_file(state::sessions_dir().join(format!("{pid}.json"))).unwrap();
+        }
+        std::fs::remove_file(control_path).unwrap();
+    }
 
     /// Two properties of the on-demand probe, and both are why the client can
     /// poll bluntly: the *first* answer already carries a CPU figure (it primes
