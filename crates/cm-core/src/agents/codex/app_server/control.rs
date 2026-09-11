@@ -6,8 +6,6 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-const DEADLINE: Duration = Duration::from_secs(60);
-
 #[derive(Serialize, Deserialize)]
 enum Request {
     Stop,
@@ -71,7 +69,7 @@ pub(crate) fn request_stop(pid: u32) -> Result<()> {
         .join("launchers")
         .join(format!("{pid}.sock"));
     super::transport::blocking(async move {
-        tokio::time::timeout(DEADLINE, async {
+        tokio::time::timeout(super::CONTROL_TIMEOUT, async {
             let mut stream = UnixStream::connect(path)
                 .await
                 .context("connecting to Codex launcher control")?;

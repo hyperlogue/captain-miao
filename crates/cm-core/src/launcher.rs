@@ -394,27 +394,26 @@ async fn run_codex_app_server(
         .join(format!("{}-codex.sock", state.launcher_pid));
     let relay = app_server::Relay::start(config, &socket).await?;
     let mut command = app_server::command(cwd, args, &socket, shim)?;
+    let control = app_server::Control::start(listener);
+    state.codex_control = true;
+    // Publish control ownership before the TUI can create server-owned work.
+    // A failed initial save is still an ordinary failed launch.
+    state.write()?;
     let child = command
         .kill_on_drop(true)
         .spawn()
         .context("starting attached Codex TUI")?;
     state.child_pid = child.id();
-    let control = app_server::Control::start(listener);
-    state.codex_control = true;
-    state.write()?;
     supervise_codex_app_server(config, state, child, relay, control).await
 }
 
 async fn supervise_codex_app_server(
     config: &crate::agents::codex::CodexConfig,
     state: &mut LauncherState,
-    mut child: tokio::process::Child,
-    mut relay: crate::agents::codex::app_server::Relay,
-    mut control: crate::agents::codex::app_server::Control,
+    child: tokio::process::Child,
+    relay: crate::agents::codex::app_server::Relay,
+    control: crate::agents::codex::app_server::Control,
 ) -> Result<i32> {
-    use crate::agents::codex::app_server;
-    use futures_util::future::BoxFuture;
-    let mut monitor = app_server::Monitor::default();
     let pool = state.pool_session.clone();
     let shutdown = async {
         tokio::select! {
@@ -422,101 +421,8 @@ async fn supervise_codex_app_server(
             _ = wait_until_minting_daemon_gone(pool.as_deref()) => {}
         }
     };
-    tokio::pin!(shutdown);
-    let mut shutdown_seen = false;
-    let mut child_live = true;
-    let mut exit_code = 0;
-    let mut stopping: Option<BoxFuture<'static, Result<()>>> = None;
-    let mut reply: Option<app_server::StopRequest> = None;
-    loop {
-        let begin_stop = tokio::select! {
-            event = relay.events.recv() => {
-                let Some(event) = event else { anyhow::bail!("Codex relay stopped") };
-                let before = state.clone();
-                monitor.apply(state, event);
-                if *state != before {
-                    state.updated_at = LauncherState::now();
-                    state.write()?;
-                }
-                false
-            }
-            request = control.requests.recv() => {
-                let Some(request) = request else { anyhow::bail!("Codex launcher control stopped") };
-                if stopping.is_some() {
-                    request.reply(Some("Codex cleanup is already in progress; retry shortly".into())).await;
-                    false
-                } else {
-                    reply = Some(request);
-                    true
-                }
-            }
-            result = child.wait(), if child_live => {
-                child_live = false;
-                state.child_pid = None;
-                exit_code = result?.code().unwrap_or(1);
-                stopping.is_none()
-            }
-            _ = &mut shutdown, if !shutdown_seen => {
-                shutdown_seen = true;
-                exit_code = 143;
-                stopping.is_none()
-            }
-            result = async {
-                match stopping.as_mut() {
-                    Some(future) => future.await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                stopping = None;
-                match result {
-                    Ok(()) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        if let Some(reply) = reply.take() { reply.reply(None).await; }
-                        return Ok(exit_code);
-                    }
-                    Err(error) => {
-                        let message = format!("Codex cleanup failed: {error:#}");
-                        tracing::warn!("{message}");
-                        state.last_error = Some(message.clone());
-                        if !child_live {
-                            state.codex_connected = Some(false);
-                            state.status = SessionStatus::Starting;
-                            state.active_since = None;
-                        }
-                        state.updated_at = LauncherState::now();
-                        state.write()?;
-                        let _ = relay.pause_input(false).await;
-                        if let Some(reply) = reply.take() { reply.reply(Some(message)).await; }
-                        // Preserve the launcher and its state for a retry, including
-                        // when the TUI/window has already closed. Never resend input.
-                        false
-                    }
-                }
-            }
-        };
-        if begin_stop {
-            let pause = relay.pause_input(true).await;
-            // A lifecycle reply can already have reached the TUI while its
-            // observation is queued here. Adopt it before selecting cleanup's
-            // thread; the paused input gate prevents a new turn overtaking us.
-            while let Ok(event) = relay.events.try_recv() {
-                monitor.apply(state, event);
-            }
-            let config = config.clone();
-            let snapshot = state.clone();
-            let turn = monitor.turn.clone();
-            stopping = Some(Box::pin(async move {
-                pause?;
-                tokio::time::timeout(
-                    Duration::from_secs(35),
-                    app_server::stop(&config, &snapshot, turn.as_deref()),
-                )
-                .await
-                .context("Codex cleanup timed out")?
-            }));
-        }
-    }
+    crate::agents::codex::app_server::supervise(config, state, child, relay, control, shutdown)
+        .await
 }
 
 /// Resolve when the launcher is asked to terminate via SIGTERM or SIGHUP.
@@ -1948,12 +1854,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_cleanup_keeps_the_launcher_and_tui_alive_until_a_successful_retry() {
+        cleanup_retry_survives(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_cleanup_remains_retryable_when_state_cannot_be_written() {
+        cleanup_retry_survives(true).await;
+    }
+
+    async fn cleanup_retry_survives(block_state_write: bool) {
         use crate::agents::codex::{CodexConfig, CodexMode, app_server};
         use futures_util::{SinkExt, StreamExt};
         use serde_json::{Value, json};
         use tokio_tungstenite::tungstenite::Message;
         state::ensure_sessions_dir().unwrap();
-        let root = state::runtime_dir().join(format!("cleanup-test-{}", std::process::id()));
+        let root = state::runtime_dir().join(format!(
+            "cleanup-test-{}-{block_state_write}",
+            std::process::id()
+        ));
         state::create_dir_all_private(&root).unwrap();
         let upstream = root.join("server.sock");
         let listener = UnixListener::bind(&upstream).unwrap();
@@ -2007,7 +1925,11 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
-        row.launcher_pid = std::process::id() + 1;
+        row.launcher_pid = std::process::id() + 100 + u32::from(block_state_write);
+        let state_path = state::sessions_dir().join(format!("{}.json", row.launcher_pid));
+        if block_state_write {
+            std::fs::create_dir(&state_path).unwrap();
+        }
         row.child_pid = Some(pid);
         row.codex_mode = CodexMode::AppServer;
         row.codex_control = true;
@@ -2042,6 +1964,31 @@ mod tests {
                     state::is_process_alive(pid),
                     "a rejected stop must preserve the TUI"
                 );
+                if block_state_write {
+                    std::fs::remove_dir(&state_path).unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Ok(bytes) = std::fs::read(&state_path)
+                                && let Ok(saved) = serde_json::from_slice::<LauncherState>(&bytes)
+                            {
+                                assert!(saved.codex_control);
+                                assert!(
+                                    saved
+                                        .last_error
+                                        .as_deref()
+                                        .unwrap()
+                                        .contains("cleanup denied")
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect(
+                        "dirty state must persist after the store recovers, without another event",
+                    );
+                }
             } else {
                 assert!(reply["error"].is_null());
             }

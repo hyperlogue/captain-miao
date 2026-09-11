@@ -2,6 +2,7 @@ use super::{CodexConfig, monitor::Observation, transport};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::net::UnixListener;
@@ -11,7 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 pub(crate) struct Relay {
     pub(crate) events: mpsc::Receiver<Observation>,
     input_paused: watch::Sender<bool>,
-    pause_ack: watch::Receiver<bool>,
+    pause_ack: watch::Receiver<InputState>,
     path: PathBuf,
     task: tokio::task::JoinHandle<()>,
 }
@@ -27,14 +28,16 @@ impl Relay {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let (tx, events) = mpsc::channel(128);
         let (input_paused, mut pause_rx) = watch::channel(false);
-        let (ack_tx, pause_ack) = watch::channel(false);
+        let (ack_tx, pause_ack) = watch::channel(InputState::Running);
         let task = tokio::spawn(async move {
+            let mut gate = InputGate::default();
             loop {
+                gate.acknowledge(*pause_rx.borrow(), &ack_tx);
                 let accepted = tokio::select! {
                     biased;
                     changed = pause_rx.changed() => {
                         if changed.is_err() { break; }
-                        ack_tx.send_replace(*pause_rx.borrow_and_update());
+                        gate.acknowledge(*pause_rx.borrow_and_update(), &ack_tx);
                         continue;
                     }
                     accepted = listener.accept() => accepted,
@@ -52,7 +55,7 @@ impl Relay {
                             biased;
                             changed = pause_rx.changed() => {
                                 if changed.is_err() { break; }
-                                ack_tx.send_replace(*pause_rx.borrow_and_update());
+                                gate.acknowledge(*pause_rx.borrow_and_update(), &ack_tx);
                             }
                             frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
@@ -61,6 +64,7 @@ impl Relay {
                                     && let Ok(value) = serde_json::from_str::<Value>(text) {
                                     // Requests are reduced before crossing the channel;
                                     // environment/configuration never enters monitor state.
+                                    gate.request(&value);
                                     let request = serde_json::json!({"id":value["id"],"method":value["method"]});
                                     if tx.send(Observation::Client(request)).await.is_err() { break; }
                                 }
@@ -72,9 +76,13 @@ impl Relay {
                                 let Some(frame) = frame else { break };
                                 let frame = frame?;
                                 if let Message::Text(text) = &frame
-                                    && let Ok(value) = serde_json::from_str::<Value>(text)
-                                    && observable(&value)
-                                    && tx.send(Observation::Server(value)).await.is_err() { break; }
+                                    && let Ok(value) = serde_json::from_str::<Value>(text) {
+                                    // Settle after enqueueing metadata: a pause ACK
+                                    // must never overtake selection of its thread.
+                                    if observable(&value) && tx.send(Observation::Server(value.clone())).await.is_err() { break; }
+                                    gate.response(&value);
+                                    gate.acknowledge(*pause_rx.borrow(), &ack_tx);
+                                }
                                 let closed = frame.is_close();
                                 client.send(frame).await?;
                                 if closed { break; }
@@ -87,6 +95,8 @@ impl Relay {
                     // Transport errors can contain endpoint/authentication data.
                     tracing::debug!("Codex relay connection ended");
                 }
+                gate.disconnected();
+                gate.acknowledge(*pause_rx.borrow(), &ack_tx);
                 if tx.send(Observation::Disconnected).await.is_err() {
                     break;
                 }
@@ -100,20 +110,145 @@ impl Relay {
             task,
         })
     }
-    /// Confirm the relay has stopped forwarding new TUI requests before cleanup
-    /// starts. Replies/events continue flowing; a failed stop releases the gate.
-    pub(crate) async fn pause_input(&mut self, paused: bool) -> Result<()> {
-        self.input_paused
+    /// Fence new input and wait for already forwarded thread/turn operations.
+    /// The owned future lets the supervisor drain observations concurrently.
+    /// A lost response is uncertainty, never evidence that no work started.
+    pub(crate) fn pause_input(
+        &self,
+        paused: bool,
+    ) -> futures_util::future::BoxFuture<'static, Result<()>> {
+        let sent = self
+            .input_paused
             .send(paused)
+            .context("Codex relay stopped");
+        let mut ack = self.pause_ack.clone();
+        Box::pin(async move {
+            sent?;
+            let state = tokio::time::timeout(
+                transport::DEADLINE,
+                ack.wait_for(|state| {
+                    if paused {
+                        *state != InputState::Running
+                    } else {
+                        *state == InputState::Running
+                    }
+                }),
+            )
+            .await
+            .context("Codex relay still has pending requests; retry cleanup after they settle")?
             .context("Codex relay stopped")?;
-        tokio::time::timeout(
-            transport::DEADLINE,
-            self.pause_ack.wait_for(|ack| *ack == paused),
-        )
-        .await
-        .context("Codex relay did not acknowledge input pause")?
-        .context("Codex relay stopped")?;
-        Ok(())
+            anyhow::ensure!(
+                *state != InputState::Uncertain,
+                "Codex disconnected with an unresolved thread operation; reconnect that thread before retrying cleanup"
+            );
+            anyhow::ensure!(
+                *state != InputState::UnknownThread,
+                "Codex lost a thread-creation reply; cleanup cannot confirm which thread was created"
+            );
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    Running,
+    Paused,
+    Uncertain,
+    UnknownThread,
+}
+
+/// Only request identities cross this gate; prompts/configuration stay on the
+/// original stream. A successful lifecycle reply reestablishes which thread
+/// the TUI controls after a lost connection.
+#[derive(Default)]
+struct InputGate {
+    pending: HashMap<String, PendingOperation>,
+    uncertain: HashSet<Option<String>>,
+}
+struct PendingOperation {
+    selects_thread: bool,
+    thread: Option<String>,
+}
+impl InputGate {
+    fn request(&mut self, value: &Value) {
+        let Some(method) = value["method"].as_str() else {
+            return;
+        };
+        // Reads cannot start work. Only mutations fence cleanup or leave
+        // uncertain execution behind when their replies are lost.
+        let selects_thread = matches!(method, "thread/start" | "thread/resume" | "thread/fork");
+        if !selects_thread
+            && !matches!(
+                method,
+                "turn/start"
+                    | "turn/steer"
+                    | "thread/goal/set"
+                    | "thread/goal/clear"
+                    | "thread/rollback"
+                    | "thread/compact/start"
+            )
+        {
+            return;
+        }
+        if let Some(id) = value.get("id") {
+            let thread = if matches!(method, "thread/start" | "thread/fork") {
+                None
+            } else {
+                value["params"]["threadId"].as_str().map(str::to_owned)
+            };
+            self.pending.insert(
+                id.to_string(),
+                PendingOperation {
+                    selects_thread,
+                    thread,
+                },
+            );
+        }
+    }
+    fn response(&mut self, value: &Value) {
+        if value.get("method").is_some() {
+            return;
+        }
+        let Some(id) = value.get("id") else {
+            return;
+        };
+        if self
+            .pending
+            .remove(&id.to_string())
+            .is_some_and(|operation| operation.selects_thread)
+            && value["result"]["thread"]["parentThreadId"].is_null()
+            && let Some(thread) = value["result"]["thread"]["id"].as_str()
+        {
+            // Reconnecting B cannot settle lost work on A. A thread created
+            // without any returned identity cannot be guessed from a new one.
+            self.uncertain.remove(&Some(thread.to_owned()));
+        }
+    }
+    fn disconnected(&mut self) {
+        self.uncertain
+            .extend(self.pending.drain().map(|(_, operation)| operation.thread));
+    }
+    fn acknowledge(&self, paused: bool, ack: &watch::Sender<InputState>) {
+        let state = if !paused {
+            InputState::Running
+        } else if self.uncertain.contains(&None) {
+            InputState::UnknownThread
+        } else if !self.uncertain.is_empty() {
+            InputState::Uncertain
+        } else if self.pending.is_empty() {
+            InputState::Paused
+        } else {
+            InputState::Running
+        };
+        ack.send_if_modified(|previous| {
+            if *previous == state {
+                false
+            } else {
+                *previous = state;
+                true
+            }
+        });
     }
 }
 

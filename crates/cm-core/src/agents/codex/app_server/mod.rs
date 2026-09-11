@@ -3,6 +3,7 @@
 //! behavior. Only the launcher reduces observations into its own state file.
 //! No hook profile, rollout reader or SQLite connection belongs to this mode.
 mod control;
+mod lifecycle;
 mod monitor;
 mod relay;
 mod transport;
@@ -16,8 +17,17 @@ use super::CodexConfig;
 use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::LauncherState;
 pub(crate) use control::{Control, StopRequest, request_stop};
+pub(crate) use lifecycle::supervise;
 pub(crate) use monitor::Monitor;
 pub(crate) use relay::Relay;
+
+// One budget shared by launcher cleanup, host acknowledgement and replacement
+// handoff. Leave room for fencing input, error recovery and flushing a reply.
+pub(crate) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(35);
+pub(crate) const CONTROL_TIMEOUT: Duration =
+    CLEANUP_TIMEOUT.saturating_add(Duration::from_secs(25));
+pub(super) const HANDOFF_TIMEOUT: Duration =
+    CONTROL_TIMEOUT.saturating_add(Duration::from_secs(30));
 
 pub fn list_resumable(config: &CodexConfig, limit: usize) -> Result<Vec<ResumeCandidate>> {
     let path = config.socket_path()?;

@@ -19,6 +19,13 @@ pub use native::{
 pub use settings::{CodexConfig, CodexMode};
 pub(crate) use tui::{BIN, clipboard_paste_input, reattach_prime, uses_kitty_keyboard};
 
+/// A dashboard may retry cleanup against an already waiting replacement only
+/// during this initial window. Measured before opening it; never reset on retry.
+/// Keep a margin beyond the host's full confirmation budget.
+pub const RESTART_RETRY_WINDOW: std::time::Duration = app_server::HANDOFF_TIMEOUT
+    .saturating_sub(app_server::CONTROL_TIMEOUT)
+    .saturating_sub(std::time::Duration::from_secs(5));
+
 pub fn list_resumable(limit: usize) -> anyhow::Result<Vec<crate::agent::ResumeCandidate>> {
     let config = crate::config::read_codex()?;
     match config.mode {
@@ -47,7 +54,7 @@ async fn wait_for_handoff_with(
     else {
         return Ok(());
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    tokio::time::timeout(app_server::HANDOFF_TIMEOUT, async {
         loop {
             let owned = states().iter().any(|state|
                 state.launcher_pid != launcher_pid && state.agent == crate::agent::AgentControl::Codex
@@ -64,6 +71,24 @@ mod tests {
     use crate::agent::AgentControl;
     use crate::state::{LauncherState, SessionStatus};
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_handoff_outlasts_a_slow_successful_cleanup() {
+        let mut owner = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        owner.launcher_pid = 11;
+        owner.session_id = Some("resumed-thread".into());
+        let args = vec!["resume".into(), "resumed-thread".into()];
+        let start = tokio::time::Instant::now();
+        wait_for_handoff_with(&args, 12, || {
+            if start.elapsed() < Duration::from_secs(40) {
+                vec![owner.clone()]
+            } else {
+                vec![]
+            }
+        })
+        .await
+        .expect("a successful cleanup must finish before its replacement gives up");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn resume_waits_for_old_owner_but_ignores_self_and_other_threads() {
@@ -97,6 +122,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(now.elapsed(), Duration::from_secs(30));
+        assert_eq!(now.elapsed(), app_server::HANDOFF_TIMEOUT);
     }
 }

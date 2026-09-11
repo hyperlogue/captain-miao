@@ -526,3 +526,282 @@ fn live_app_server_supports_read_only_inventory() {
             .all(|c| c.agent == AgentControl::Codex && !c.session_id.is_empty())
     );
 }
+
+#[tokio::test]
+async fn pause_waits_for_forwarded_lifecycle_replies() {
+    for method in ["thread/resume", "turn/start", "thread/goal/set"] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("server.sock");
+        let proxy = scratch.0.join("relay.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let config = CodexConfig {
+            endpoint: format!("unix://{}", path.display()),
+            ..Default::default()
+        };
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut probe = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let init = receive(&mut probe).await;
+            send(&mut probe, &json!({"id":init["id"],"result":{}})).await;
+            assert_eq!(receive(&mut probe).await["method"], "initialized");
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive(&mut socket).await;
+            received_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            send(
+                &mut socket,
+                &json!({"id":request["id"],"result":{"thread":{
+                    "id":"resumed-thread","status":{"type":"idle"},"cwd":"/work"
+                }}}),
+            )
+            .await;
+            // Keep the connection alive through the pause acknowledgement.
+            let _ = socket.next().await;
+        });
+        let mut relay = Relay::start(&config, &proxy).await.unwrap();
+        let mut tui = transport::connect(&proxy).await.unwrap();
+        send(
+            &mut tui,
+            &json!({"id":1,"method":method,"params":{"threadId":"resumed-thread"}}),
+        )
+        .await;
+        received_rx.await.unwrap();
+        {
+            let pause = relay.pause_input(true);
+            tokio::pin!(pause);
+            let early = tokio::time::timeout(Duration::from_millis(30), &mut pause).await;
+            assert!(
+                early.is_err(),
+                "{method} is still in flight; cleanup must not select a stale thread or turn"
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), &mut pause)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let (mut monitor, mut row) = (Monitor::default(), state());
+        while let Ok(event) = relay.events.try_recv() {
+            monitor.apply(&mut row, event);
+        }
+        if method == "thread/resume" {
+            assert_eq!(row.session_id.as_deref(), Some("resumed-thread"));
+        }
+        drop(tui);
+        drop(relay);
+        server.abort();
+    }
+}
+
+async fn answer_probe(listener: &UnixListener) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    let init = receive(&mut socket).await;
+    send(&mut socket, &json!({"id":init["id"],"result":{}})).await;
+    assert_eq!(receive(&mut socket).await["method"], "initialized");
+}
+
+#[tokio::test]
+async fn lost_mutations_remain_uncertain_until_their_own_thread_is_reconnected() {
+    for (lost_method, reconnect, rejected) in [
+        ("turn/start", Some("thread-b"), true),
+        ("turn/start", Some("thread-a"), false),
+        ("thread/start", Some("thread-b"), true),
+        ("thread/read", None, false),
+    ] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("server.sock");
+        let proxy = scratch.0.join("relay.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let config = CodexConfig {
+            endpoint: format!("unix://{}", path.display()),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            answer_probe(&listener).await;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert_eq!(receive(&mut socket).await["method"], lost_method);
+            socket.close(None).await.unwrap();
+            drop(socket);
+            if let Some(thread) = reconnect {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = receive(&mut socket).await;
+                send(
+                    &mut socket,
+                    &json!({"id":request["id"],"result":{"thread":{
+                        "id":thread,"status":{"type":"idle"},"cwd":"/work"
+                    }}}),
+                )
+                .await;
+                let _ = socket.next().await;
+            }
+        });
+        let mut relay = Relay::start(&config, &proxy).await.unwrap();
+        let mut tui = transport::connect(&proxy).await.unwrap();
+        send(
+            &mut tui,
+            &json!({"id":1,"method":lost_method,"params":{"threadId":"thread-a"}}),
+        )
+        .await;
+        loop {
+            if matches!(relay.events.recv().await, Some(Observation::Disconnected)) {
+                break;
+            }
+        }
+        drop(tui);
+        let mut tui = None;
+        if let Some(thread) = reconnect {
+            let mut connection = transport::connect(&proxy).await.unwrap();
+            send(
+                &mut connection,
+                &json!({"id":2,"method":"thread/resume","params":{"threadId":thread}}),
+            )
+            .await;
+            assert_eq!(receive(&mut connection).await["id"], 2);
+            tui = Some(connection);
+        }
+        assert_eq!(
+            relay.pause_input(true).await.is_err(),
+            rejected,
+            "lost {lost_method}, reconnected {reconnect:?}"
+        );
+        drop(tui);
+        drop(relay);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn cleanup_waits_for_resume_identity_while_draining_a_full_observation_queue() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("server.sock");
+    let proxy = scratch.0.join("relay.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let config = CodexConfig {
+        endpoint: format!("unix://{}", path.display()),
+        ..Default::default()
+    };
+    let (forwarded_tx, forwarded_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        answer_probe(&listener).await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tui = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let request = receive(&mut tui).await;
+        forwarded_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        // More than the relay channel's capacity. Waiting for its fence while
+        // not draining these observations would deadlock until timeout.
+        for _ in 0..256 {
+            send(
+                &mut tui,
+                &json!({"method":"thread/status/changed","params":{
+                    "threadId":"unrelated-thread","status":{"type":"idle"}
+                }}),
+            )
+            .await;
+        }
+        send(
+            &mut tui,
+            &json!({"id":request["id"],"result":{"thread":{
+                "id":"resumed-thread","status":{"type":"active"},"cwd":"/work"
+            }}}),
+        )
+        .await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut cleanup = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let init = receive(&mut cleanup).await;
+        send(&mut cleanup, &json!({"id":init["id"],"result":{}})).await;
+        assert_eq!(receive(&mut cleanup).await["method"], "initialized");
+        for (method, result) in [
+            ("thread/goal/get", json!({"goal":{"status":"active"}})),
+            ("thread/goal/set", json!({})),
+            (
+                "thread/turns/list",
+                json!({"data":[{"id":"running-turn","status":"inProgress"}]}),
+            ),
+            ("turn/interrupt", json!({})),
+            ("thread/backgroundTerminals/clean", json!({})),
+        ] {
+            let request = receive(&mut cleanup).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(request["params"]["threadId"], "resumed-thread");
+            send(&mut cleanup, &json!({"id":request["id"],"result":result})).await;
+        }
+    });
+    let relay = Relay::start(&config, &proxy).await.unwrap();
+    let control_path = scratch.0.join("control.sock");
+    let control = Control::start(UnixListener::bind(&control_path).unwrap());
+    let child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let mut row = state();
+    row.launcher_pid = pid;
+    row.child_pid = Some(pid);
+    row.codex_control = true;
+    crate::state::ensure_sessions_dir().unwrap();
+    row.write().unwrap();
+    let state_path = crate::state::sessions_dir().join(format!("{pid}.json"));
+    // A later metadata write fails after durable control ownership exists.
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir(&state_path).unwrap();
+    let supervisor = tokio::spawn(async move {
+        supervise(
+            &config,
+            &mut row,
+            child,
+            relay,
+            control,
+            std::future::pending(),
+        )
+        .await
+    });
+    let mut tui = transport::connect(&proxy).await.unwrap();
+    send(
+        &mut tui,
+        &json!({"id":1,"method":"thread/resume","params":{"threadId":"resumed-thread"}}),
+    )
+    .await;
+    forwarded_rx.await.unwrap();
+    let mut stop = tokio::net::UnixStream::connect(&control_path)
+        .await
+        .unwrap();
+    crate::protocol::write_frame(&mut stop, &"Stop")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            crate::protocol::read_frame::<_, Value>(&mut stop)
+        )
+        .await
+        .is_err(),
+        "cleanup must not acknowledge success before learning the resumed thread"
+    );
+    release_tx.send(()).unwrap();
+    let reply: Value = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::protocol::read_frame(&mut stop),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(
+        reply["error"].is_null(),
+        "cleanup should survive failed state persistence: {reply}"
+    );
+    assert_eq!(supervisor.await.unwrap().unwrap(), 0);
+    assert!(!crate::state::is_process_alive(pid));
+    server.await.unwrap();
+    std::fs::remove_dir(state_path).unwrap();
+    let _ = std::fs::remove_file(crate::state::sessions_dir().join(format!("{pid}.tmp")));
+}
