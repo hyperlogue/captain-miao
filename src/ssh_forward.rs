@@ -222,19 +222,6 @@ impl Forward {
         Ok(())
     }
 
-    pub fn description(&self) -> String {
-        let Some(t) = self.tcp() else {
-            return self.to_string();
-        };
-        let listen = format!("{}:{}", bracket(&t.bind), t.port);
-        let dest = format!("{}:{}", bracket(&t.destination), t.destination_port);
-        match self.flag.as_str() {
-            "-R" => format!("Remote {listen} → This machine {dest}"),
-            "-D" => format!("This machine {listen} → SOCKS via remote"),
-            _ => format!("This machine {listen} → Remote {dest}"),
-        }
-    }
-
     pub fn conflicts(&self, other: &Self) -> bool {
         if (self.flag == "-R") != (other.flag == "-R") {
             return false;

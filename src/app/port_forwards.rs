@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
 };
@@ -96,6 +96,73 @@ const KINDS: [&str; 3] = [
     "Remote forwarding (-R)",
     "SOCKS proxy (-D)",
 ];
+
+/// Preserve endpoint/status colors and the row background across wrapped lines.
+fn wrap_forward_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let text = line.to_string();
+    super::draw::wrap_ranges(&text, width)
+        .into_iter()
+        .map(|range| {
+            let mut offset = 0;
+            let spans = line.spans.iter().filter_map(|span| {
+                let start = range.start.saturating_sub(offset);
+                let end = range.end.saturating_sub(offset).min(span.content.len());
+                offset += span.content.len();
+                (start < end).then(|| Span::styled(span.content[start..end].to_owned(), span.style))
+            });
+            let mut wrapped = Line::from(spans.collect::<Vec<_>>()).style(line.style);
+            if line.style.bg.is_some() {
+                wrapped
+                    .spans
+                    .push(Span::raw(" ".repeat(width.saturating_sub(wrapped.width()))));
+            }
+            wrapped
+        })
+        .collect()
+}
+
+fn forward_detail(forward: &Forward, endpoint_style: Style) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let Some(tcp) = forward.tcp() else {
+        return Line::from(vec![
+            Span::styled(format!("    {} ", forward.flag), dim),
+            Span::styled(forward.spec.clone(), endpoint_style),
+        ]);
+    };
+    let endpoint = |host: &str, port: &str| {
+        if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    };
+    let remote = forward.flag == "-R";
+    let mut spans = vec![
+        Span::styled(
+            if remote {
+                "    Remote "
+            } else {
+                "    This machine "
+            },
+            dim,
+        ),
+        Span::styled(endpoint(&tcp.bind, &tcp.port), endpoint_style),
+        Span::styled(" → ", dim),
+    ];
+    if forward.flag == "-D" {
+        spans.push(Span::styled("SOCKS via remote", dim));
+    } else {
+        spans.push(Span::styled(
+            if remote { "This machine " } else { "Remote " },
+            dim,
+        ));
+        spans.push(Span::styled(
+            endpoint(&tcp.destination, &tcp.destination_port),
+            endpoint_style,
+        ));
+    }
+    Line::from(spans)
+}
 
 impl Draft {
     fn direction_hint(&self) -> &'static str {
@@ -619,6 +686,12 @@ impl App {
     }
 
     pub(super) fn draw_port_forwards(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let cfg = crate::config::get();
+        let ui = &cfg.colors.ui;
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let accent = Style::default()
+            .fg(ui.title_fg)
+            .add_modifier(Modifier::BOLD);
         let state = self.host_edit.as_ref().unwrap();
         let view = state.forward_view.as_ref().unwrap();
         let row = &state.rows[state.cursor];
@@ -627,7 +700,10 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .padding(Padding::horizontal(1))
-            .title(format!(" Port forwards · {} ", row.label.text()));
+            .title(Span::styled(
+                format!(" Port forwards · {} ", row.label.text()),
+                accent,
+            ));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let width = inner.width as usize;
@@ -733,17 +809,26 @@ impl App {
                 if i == view.cursor {
                     focus_line = lines.len();
                 }
-                let status = match manager.as_ref().map(|m| m.status(&rule.forward)) {
-                    Some(Status::Failed(error)) => format!(
-                        "Failed{}: {error}",
-                        if rule.disabled { " to disable" } else { "" }
+                let waiting = Style::default().fg(ui.attention_fg);
+                let (status, status_style) = match manager.as_ref().map(|m| m.status(&rule.forward))
+                {
+                    Some(Status::Failed(error)) => (
+                        format!(
+                            "Failed{}: {error}",
+                            if rule.disabled { " to disable" } else { "" }
+                        ),
+                        Style::default()
+                            .fg(ui.error_fg)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Some(Status::Waiting | Status::Listening) if rule.disabled => {
-                        "Waiting to disable".into()
+                        ("Waiting to disable".into(), waiting)
                     }
-                    _ if rule.disabled => "Off".into(),
-                    Some(Status::Listening) => "Listening".into(),
-                    _ => "Waiting for host".into(),
+                    _ if rule.disabled => ("Off".into(), dim),
+                    Some(Status::Listening) => {
+                        ("Listening".into(), Style::default().fg(Color::Green))
+                    }
+                    _ => ("Waiting for host".into(), waiting),
                 };
                 let name = if rule.name.is_empty() {
                     rule.forward
@@ -763,28 +848,30 @@ impl App {
                 } else {
                     rule.name.clone()
                 };
-                let title = format!(
-                    "{} {} {}  {}",
-                    if i == view.cursor { "›" } else { " " },
-                    if rule.disabled { "·" } else { "✓" },
-                    name,
-                    status
-                );
                 let style = if i == view.cursor {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    Style::default().bg(ui.highlight_bg)
                 } else {
                     Style::default()
                 };
-                for range in super::draw::wrap_ranges(&title, width) {
-                    lines.push(Line::styled(
-                        title[range.start..range.end].to_owned(),
-                        style,
-                    ));
-                }
-                let detail = format!("    {}", rule.forward.description());
-                for range in super::draw::wrap_ranges(&detail, width) {
-                    lines.push(Line::from(detail[range.start..range.end].to_owned()));
-                }
+                let name_style = if rule.disabled { dim } else { accent };
+                let title = Line::from(vec![
+                    Span::styled(
+                        if i == view.cursor { "› " } else { "  " },
+                        Style::default()
+                            .fg(ui.selection_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(if rule.disabled { "· " } else { "✓ " }, status_style),
+                    Span::styled(name, name_style),
+                    Span::raw("  "),
+                    Span::styled(status, status_style),
+                ])
+                .style(style);
+                lines.extend(wrap_forward_line(title, width));
+                lines.extend(wrap_forward_line(
+                    forward_detail(&rule.forward, name_style).style(style),
+                    width,
+                ));
             }
         }
         help.push("Saves apply immediately; offline changes wait for the host.");
