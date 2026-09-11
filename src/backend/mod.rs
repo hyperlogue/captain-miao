@@ -847,7 +847,38 @@ pub(crate) enum KillOutcome {
     Failed(String),
 }
 
+/// A host's account of a launcher binding, before optimistic UI filtering.
+/// Unknown covers a disconnected host or one that has not sent a snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BindingPresence {
+    Unknown,
+    Missing,
+    Present(crate::state::SessionStatus),
+}
+
 impl Backend {
+    pub(crate) fn binding_presence(&self, token: &str) -> BindingPresence {
+        let status = match self {
+            Self::Local(host) => host
+                .inner
+                .list_sessions()
+                .into_iter()
+                .find(|row| row.binding_token() == Some(token))
+                .map(|row| row.status),
+            Self::Remote(remote) => {
+                let mirror = remote.mirror.lock().unwrap();
+                if !remote.mirrored.load(Ordering::Relaxed) {
+                    return BindingPresence::Unknown;
+                }
+                mirror
+                    .values()
+                    .find(|row| row.binding_token() == Some(token))
+                    .map(|row| row.status.clone())
+            }
+        };
+        status.map_or(BindingPresence::Missing, BindingPresence::Present)
+    }
+
     pub(crate) fn local() -> Self {
         let changed = Arc::new(AtomicBool::new(false));
         let sink = changed.clone();
@@ -2582,11 +2613,13 @@ async fn connection_task(
         // The mirror is now stale; clear it so the host shows no (misleading)
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
-        mirror.lock().unwrap().clear();
-        // Cleared *with* the mirror, always: the two answer the same question,
-        // and a `mirrored` left standing over an empty mirror is a host claiming
-        // to have reported no sessions when it has reported nothing at all.
-        mirrored.store(false, Ordering::Relaxed);
+        {
+            let mut mirror = mirror.lock().unwrap();
+            // Share the lock with binding_presence: a disconnect is unknown,
+            // never an authoritative report that a replacement disappeared.
+            mirrored.store(false, Ordering::Relaxed);
+            mirror.clear();
+        }
         // And with it every presumption: each one says "this row is on its way
         // out", which only means anything against rows we still have. Carrying
         // them across the gap would let one hide a session the reconnect's
@@ -3422,6 +3455,33 @@ mod tests {
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn binding_presence_uses_host_truth_without_optimistic_hides() {
+        let mut row = test_state(123);
+        row.pool_session = Some("replacement".into());
+        let remote =
+            RemoteBackend::unconnected_for_tests(HostId("test-host".into()), vec![row.clone()]);
+        remote.simulate_link_for_tests(ConnState::Connected, true);
+        let backend = Backend::Remote(remote.clone());
+        backend.presume_killed(&row.key());
+        assert!(remote.list_sessions().is_empty());
+        assert_eq!(
+            backend.binding_presence("replacement"),
+            BindingPresence::Present(crate::state::SessionStatus::Idle)
+        );
+        remote.simulate_link_for_tests(ConnState::Disconnected, false);
+        assert_eq!(
+            backend.binding_presence("replacement"),
+            BindingPresence::Unknown
+        );
+        remote.mirror.lock().unwrap().clear();
+        remote.simulate_link_for_tests(ConnState::Connected, true);
+        assert_eq!(
+            backend.binding_presence("replacement"),
+            BindingPresence::Missing
+        );
+    }
 
     /// The session table's "loading" line has to cover the *whole* window in
     /// which a host has yet to report, not just the dial. `Connected` is stored

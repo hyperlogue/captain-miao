@@ -41,6 +41,7 @@ mod messages;
 mod picker;
 mod prefs;
 mod render_backend;
+mod restart;
 mod run;
 
 /// The hosts panel's types stay reachable as `super::X` from every module
@@ -277,7 +278,7 @@ pub(super) struct RestartSpec {
     /// Status flags to re-apply once the relaunched session appears under its
     /// new launcher pid. Default (all-false) means nothing to carry over.
     pub(super) flags: SessionFlags,
-    /// Whether `restart_one` should SIGTERM the old `child_pid` and close
+    /// Whether restart should terminate the old `child_pid` and close
     /// `window_id` after relaunching. True for user-initiated restarts (the
     /// session is live, so the old child must be torn down). False for the
     /// crash-recovery path: the launcher_pid is already known dead, so the
@@ -461,7 +462,7 @@ pub(super) struct KillResult {
     pub(super) window: Option<KillWindow>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct KillWindow {
     pub(super) id: WindowId,
     pub(super) pid: Option<u32>,

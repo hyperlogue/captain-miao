@@ -9,7 +9,7 @@
 //!
 //! **This is where an [`Action`] becomes a side effect.** `keys.rs` decides
 //! *what* the user asked for and returns a description; the free functions here
-//! (`launch_agent`, `attach_pool_session`, `start_kill`, `restart_one`, …) are
+//! (`launch_agent`, `attach_pool_session`, `start_kill`, `advance_restart`, …) are
 //! what actually spawn a window, reach a host, or move a session. Anything that
 //! can block a host round-trip runs off the UI path or under
 //! `block_in_place`, because the loop is also what repaints.
@@ -119,6 +119,7 @@ struct LoopInboxes {
     /// belongs to, so two kills in flight can't be confused for one another.
     kill_rx: tokio::sync::mpsc::UnboundedReceiver<KillResult>,
     kill_tx: tokio::sync::mpsc::UnboundedSender<KillResult>,
+    restarts: super::restart::Restarts,
 }
 
 impl LoopInboxes {
@@ -134,6 +135,7 @@ impl LoopInboxes {
             upgrade_tx,
             kill_rx,
             kill_tx,
+            restarts: Default::default(),
         }
     }
 }
@@ -562,10 +564,7 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
     if matches!(outcome, KillOutcome::Signalled | KillOutcome::AlreadyGone)
         && let Some(window) = window
     {
-        if let Some(token) = window.binding_token {
-            app.retire_window_binding(&host, &token);
-        }
-        close_window_when_free(window.id, window.pid);
+        finish_kill_window(app, &host, window);
     }
     if origin == KillOrigin::WindowClosed {
         // Silent by design — `close_reported_sessions` says why. A restored row
@@ -582,6 +581,13 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
             app.set_status(format!("Kill failed: {} did not answer", host.0), true)
         }
     }
+}
+
+fn finish_kill_window(app: &mut App, host: &HostId, window: KillWindow) {
+    if let Some(token) = window.binding_token {
+        app.retire_window_binding(host, &token);
+    }
+    close_window_when_free(window.id, window.pid);
 }
 
 // =============================================================================
@@ -878,7 +884,7 @@ async fn launch_agent(
     // worktree it was already in (the agent tracks that binding), so asking for
     // one here would be a second, conflicting request.
     worktree: Option<String>,
-) {
+) -> Option<String> {
     // The cwd goes into the recent list of the host it lands on — never another
     // one's, so a mac path can't pollute a Linux box's picker.
     app.record_launch_cwd(host, cwd);
@@ -904,7 +910,7 @@ async fn launch_agent(
                 format!("{} failed: unknown host {}", copy.failed, host.0),
                 true,
             );
-            return;
+            return None;
         };
         tokio::task::block_in_place(|| backend.open_session(&open_spec))
     };
@@ -912,7 +918,7 @@ async fn launch_agent(
         Ok(plan) => plan,
         Err(e) => {
             app.set_status(format!("{} failed: {e}", copy.failed), true);
-            return;
+            return None;
         }
     };
     let mut argv = plan.argv().to_vec();
@@ -1001,13 +1007,13 @@ async fn launch_agent(
             // this path can't bind — surface it rather than proceed.
             let Some(id) = result.window else {
                 app.set_status(format!("{} failed: no window id", copy.failed), true);
-                return;
+                return None;
             };
             app.set_status(format!("{} (window {id})", copy.succeeded), false);
             // Bind the window to the session's token so the dashboard resolves it
             // (preview / focus / move-to-tab) and prunes it when the window dies —
             // local and remote uniformly (§6, §8).
-            app.record_window_binding(bind_host, bind_token, id.clone());
+            app.record_window_binding(bind_host, bind_token.clone(), id.clone());
             // Seed the display-only window→tab cache from the spawn itself when
             // the backend reported the tab (zellij does; kitty's `launch` prints
             // only a window id). Otherwise the next reload sees an unresolved
@@ -1019,8 +1025,12 @@ async fn launch_agent(
                 app.window_tab_cache.insert(id.clone(), tab);
             }
             app.pending_focus_window = Some((id, Instant::now()));
+            Some(bind_token)
         }
-        Err(e) => app.set_status(format!("{} failed: {e}", copy.failed), true),
+        Err(e) => {
+            app.set_status(format!("{} failed: {e}", copy.failed), true);
+            None
+        }
     }
 }
 
@@ -1251,7 +1261,8 @@ fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
 /// Replace one running session with a fresh launcher resumed at the same
 /// transcript, spawned into the current [`SessionsLayout`] (the shared
 /// `miao:sessions` tab in Stacked, its own tab in Per-tab) — this is how a layout
-/// switch migrates an existing session. Returns true on a successful relaunch.
+/// switch migrates an existing session. Returns whether one queued restart
+/// advanced; cleanup and its result are handled on later event-loop ticks.
 ///
 /// Order still matters on the reuse path: launch the replacement first, then
 /// close the old window, so a Stacked restart doesn't momentarily empty (and
@@ -1273,85 +1284,99 @@ fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
 /// recycled id would look like too, so it never guarded the collision its gate
 /// was named for. The real guard is `kill_old`, already false on every path
 /// where recycling is possible.
-async fn restart_one(app: &mut App, spec: RestartSpec) -> bool {
+async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts) -> bool {
+    let Some(mut job) = restarts.next() else {
+        return false;
+    };
+    let spec = job.spec.clone();
+    job.window = spec.window_id.clone().map(|id| KillWindow {
+        id,
+        pid: spec.window_pid,
+        binding_token: app
+            .sessions
+            .iter()
+            .find(|s| s.host == spec.host && s.key() == spec.key)
+            .and_then(|s| s.binding_token().map(str::to_owned)),
+    });
     let agent = spec.agent;
     let session_id = spec.session_id;
     let cwd = spec.cwd;
-    let window_id = spec.window_id;
     let host = spec.host;
     let key = spec.key;
     let flags = spec.flags;
     let kill_old = spec.kill_old;
 
-    // The replacement opens on the session's **own host** (§9): a remote restart
-    // lands in that host's pool and auto-attaches like any open, rather than
-    // silently relocating the session to the laptop. Its placement comes from
-    // the layout policy, not the old window, so no anchor is threaded.
-    launch_agent(
-        app,
-        agent,
-        &cwd,
-        Some((session_id.as_str(), false)),
-        &LAUNCH_COPY_RESTART,
-        &host,
-        // A restart resumes, and a resumed session is returned to whatever
-        // worktree it was in by the agent itself — so a restarted worktree
-        // session keeps its isolation without being asked for it again, and
-        // asking would create a *second* worktree beside the one it resumes to.
-        None,
-    )
-    .await;
-    // Detect launch failure: launch_agent flips `status_is_error` to true on
-    // failure. If it failed, leave the old session running rather than killing
-    // it — half-restarted is worse than not restarted.
-    if app.status_is_error {
-        return false;
-    }
+    if !job.reuse_replacement {
+        job.launched_at = Some(Instant::now());
+        // The replacement opens on the session's **own host** (§9): a remote restart
+        // lands in that host's pool and auto-attaches like any open, rather than
+        // silently relocating the session to the laptop. Its placement comes from
+        // the layout policy, not the old window, so no anchor is threaded.
+        let replacement_token = launch_agent(
+            app,
+            agent,
+            &cwd,
+            Some((session_id.as_str(), false)),
+            &LAUNCH_COPY_RESTART,
+            &host,
+            // A restart resumes, and a resumed session is returned to whatever
+            // worktree it was in by the agent itself — so a restarted worktree
+            // session keeps its isolation without being asked for it again, and
+            // asking would create a *second* worktree beside the one it resumes to.
+            None,
+        )
+        .await;
+        // Keep the old session if its replacement could not be opened.
+        let Some(replacement_token) = replacement_token else {
+            let error = app
+                .status_msg
+                .clone()
+                .unwrap_or_else(|| "Replacement launch failed".into());
+            restarts.finish(job, KillOutcome::Failed(error));
+            return true;
+        };
+        job.replacement_token = Some(replacement_token);
 
-    // Carry the old session's status flags onto the relaunched window so the
-    // restart preserves pinned / follow-up. `launch_agent` set
-    // `pending_focus_window` to the new window id on success; the actual flag
-    // copy happens in `reload_sessions` once the new launcher appears.
-    if !flags.is_default()
-        && let Some((new_wid, _)) = app.pending_focus_window.clone()
-    {
-        app.pending_flag_restores.insert(new_wid, flags);
+        // Carry the old session's status flags onto the relaunched window so the
+        // restart preserves pinned / follow-up. `launch_agent` set
+        // `pending_focus_window` to the new window id on success; the actual flag
+        // copy happens in `reload_sessions` once the new launcher appears.
+        if !flags.is_default()
+            && let Some((new_wid, _)) = app.pending_focus_window.clone()
+        {
+            app.pending_flag_restores.insert(new_wid, flags);
+        }
     }
-
     if kill_old {
-        // Live session we own: tear the old one down on its host, then close its
-        // local window. The kill names the session by key — the host re-resolves
-        // it to a live pid at signal time, which is where the old
-        // "is this pid still alive?" guard now lives (and it's a stronger guard
-        // there: the host reads the state file, we only had a mirror). The
-        // window close is best-effort; an already-closed window just errors, and
-        // a detached pooled session has no window at all.
-        if let Some(backend) = app.backend_for(&host) {
-            let outcome = backend
-                .kill_session(key.clone())
-                .await
-                .unwrap_or_else(|error| KillOutcome::Failed(error.to_string()));
-            if matches!(outcome, KillOutcome::Failed(_) | KillOutcome::Unreachable) {
-                apply_kill_result(
-                    app,
-                    KillResult {
-                        host: host.clone(),
-                        key: key.clone(),
-                        outcome,
-                        origin: KillOrigin::Asked,
-                        window: None,
-                    },
-                );
-                return false;
-            }
+        match app.backend_for(&host) {
+            Some(backend) => restarts.wait_for_cleanup(job, backend.kill_session(key)),
+            None => restarts.finish(job, KillOutcome::Failed(format!("Unknown host {}", host.0))),
         }
-        if let Some(window_id) = window_id {
-            close_window_when_free(window_id, spec.window_pid);
-        }
+        app.set_status("Restarting: waiting for cleanup".into(), false);
+    } else {
+        // Crash recovery owns no old process/window. Clear it before completion
+        // so a recycled window identifier can never be closed.
+        job.window = None;
+        restarts.finish(job, KillOutcome::AlreadyGone);
     }
-    // A crash-recovery window is left untouched: the old child is dead and may
-    // be recycled, and the window id may belong to an innocent live window.
     true
+}
+
+fn queue_restarts(app: &mut App, restarts: &mut super::restart::Restarts, specs: Vec<RestartSpec>) {
+    let count = restarts.enqueue(specs, |host, token| {
+        app.backend_for(host)
+            .map_or(crate::backend::BindingPresence::Unknown, |backend| {
+                backend.binding_presence(token)
+            })
+    });
+    app.set_status(
+        if count == 0 {
+            "A replacement is already pending; wait for it to finish before retrying restart".into()
+        } else {
+            format!("Restarting {count} {}", super::plural_sessions(count))
+        },
+        false,
+    );
 }
 
 // =============================================================================
@@ -1608,7 +1633,7 @@ async fn reload_pass(
         let (specs, survived) = app.take_upgrade_restores(&host);
         let n = specs.len();
         for spec in specs {
-            launch_agent(
+            let _ = launch_agent(
                 app,
                 spec.agent,
                 &spec.cwd,
@@ -1742,6 +1767,31 @@ async fn drain_background_results(
     // host is picked up by this iteration's reload rather than the next.
     while let Ok(result) = inboxes.kill_rx.try_recv() {
         apply_kill_result(app, result);
+        redraw = true;
+    }
+    inboxes.restarts.observe_pending(&app.sessions);
+    while let Some(result) = inboxes.restarts.try_recv() {
+        let (message, error) = inboxes.restarts.settle(&result);
+        if matches!(
+            result.outcome,
+            KillOutcome::Signalled | KillOutcome::AlreadyGone
+        ) && let Some(window) = result.job.window
+        {
+            finish_kill_window(app, &result.job.spec.host, window);
+        }
+        app.set_status(message, error);
+        arm_settle_reload(settle_reload_at);
+        redraw = true;
+    }
+    inboxes.restarts.observe_failed(|host, token| {
+        app.backend_for(host)
+            .map_or(crate::backend::BindingPresence::Unknown, |backend| {
+                backend.binding_presence(token)
+            })
+    });
+    // Advance one replacement per frame; cleanup waits own no App borrow.
+    if advance_restart(app, &mut inboxes.restarts).await {
+        arm_settle_reload(settle_reload_at);
         redraw = true;
     }
     // Take each backend's change signal and coalesce (§5). One uniform
@@ -2301,7 +2351,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         host,
                         worktree,
                     } => {
-                        launch_agent(
+                        let _ = launch_agent(
                             &mut app,
                             agent,
                             &cwd,
@@ -2503,14 +2553,14 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         fork,
                         host,
                     } => {
-                        launch_agent(
+                        let _ = launch_agent(
                             &mut app,
                             agent,
                             &cwd,
                             Some((session_id.as_str(), fork)),
                             &LAUNCH_COPY_RESUME,
                             &host,
-                            // As in `restart_one`: the agent re-enters the
+                            // As in `advance_restart`: the agent re-enters the
                             // session's own worktree on resume. (A `--fork-session`
                             // deliberately starts in the launch directory, which
                             // is the agent's call, not ours to override.)
@@ -2535,8 +2585,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         app.refresh_host_codex_settings();
                     }
                     Action::RestartSession(spec) => {
-                        let _ = restart_one(&mut app, spec).await;
-                        arm_settle_reload(&mut settle_reload_at);
+                        queue_restarts(&mut app, &mut inboxes.restarts, vec![spec]);
                     }
                     // The only "yes" that is just an answer. A refusal never
                     // reaches here: `handle_confirm_key` drops the action, and
@@ -2577,20 +2626,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     }
                     Action::UpgradeHost { host } => start_host_upgrade(&mut app, &inboxes, host),
                     Action::RestartAll { sessions } => {
-                        let total = sessions.len();
-                        let mut ok = 0usize;
-                        for spec in sessions {
-                            if restart_one(&mut app, spec).await {
-                                ok += 1;
-                            }
-                        }
-                        let msg = if ok == total {
-                            format!("Restarted {ok} sessions")
-                        } else {
-                            format!("Restarted {ok}/{total} sessions")
-                        };
-                        app.set_status(msg, ok != total);
-                        arm_settle_reload(&mut settle_reload_at);
+                        queue_restarts(&mut app, &mut inboxes.restarts, sessions);
                     }
                 }
             }

@@ -66,7 +66,14 @@ root row.
 Restart still opens the replacement terminal before closing the old one. Its
 launcher waits for the previous owner to finish before resuming the thread.
 This preserves terminal placement and prevents the previous controller's final
-interrupt from reaching newly resumed work.
+interrupt from reaching newly resumed work. The handoff deadline exceeds the
+complete cleanup budget. Cleanup runs outside the dashboard event loop and the
+host connection loop, so other sessions continue updating during a restart.
+Repeated commands share the pending restart. After a cleanup failure, an early
+retry reuses the waiting replacement. Once too little time remains for a full
+cleanup attempt, miao preserves both windows until the replacement reports
+`FailedToStart`, then permits a fresh restart. A confirmed removal of the
+replacement also permits a fresh attempt; a disconnected host does not.
 
 ## Lifecycle and operational differences
 
@@ -81,6 +88,17 @@ restores visibility; it does not reactivate a paused goal or restart an
 interrupted turn. Teardown addresses only the
 selected thread, preserves history, and never stops the shared daemon. Codex
 may retain an idle thread in memory after clients disconnect.
+
+Before cleanup, the relay stops forwarding new mutations and waits for already
+forwarded lifecycle, turn and goal requests to settle. Responses continue to
+flow while it waits. A lost response leaves cleanup uncertain: reconnecting a
+different thread cannot resolve it, and a lost creation reply without a thread
+ID cannot safely be guessed. Miao reports that uncertainty and retains control.
+Metadata and inventory reads do not create it.
+
+State-store failures also retain the launcher, TUI and cleanup controller.
+Writes retry on a paced timer and recreate a deleted session-state directory.
+Control ownership is persisted before the TUI can create server-owned work.
 
 Restarting the shared Codex daemon disconnects its clients and ends its loaded
 runtimes. Saved conversations remain resumable. Miao marks the connection as

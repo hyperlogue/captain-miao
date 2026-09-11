@@ -1038,7 +1038,9 @@ through the identical path.
   the lapse out. The terminal window is closed only after a successful result.
 - **RESTART / FORK**: kill + reopen **on the row's own host** (fork with
   `fork = true`), landing in that host's pool and auto-attaching like any open.
-  No longer local-only.
+  Restarts advance through a dashboard queue and account for completions;
+  cleanup never holds the dashboard event loop. A pending restart owns its
+  host/session pair so repeated commands cannot create competing replacements.
 
 ## 8. State: what lives where, who writes it
 
@@ -1113,7 +1115,9 @@ window binding. The host obtains that acknowledgement from the owning launcher
 through its private socket; only the launcher knows the session's selected
 app-server endpoint. `ok: false` with no error retains its older meaning of
 "already gone". This control exchange does not write session-state files from
-the backend or dashboard.
+the backend or dashboard. Cleanup runs in an independent task; its reply shares
+the connection writer with subscription updates and other replies. A dedicated
+reader retains partially received frames across those completions.
 
 The Hosts panel always includes **localhost**, even without a local pool. Its
 Codex editor writes this machine's `[codex]` section. Remote rows use additive
