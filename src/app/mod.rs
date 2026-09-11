@@ -39,6 +39,7 @@ mod keys;
 mod logo;
 mod messages;
 mod picker;
+mod port_forwards;
 mod prefs;
 mod render_backend;
 mod restart;
@@ -637,12 +638,9 @@ pub(in crate::app) struct ConnIdentity {
 /// The transport half of a [`ConnIdentity`], with everything an argv is
 /// assembled from *inside* the variant that assembles one.
 ///
-/// That placement is the point: `options` and `clipboard` reach ssh only as
-/// flags on the tunnel child, so an edit to either has to re-dial (nothing else
-/// re-runs `setup_ssh`, and a port forward that only took effect after some
-/// later unrelated reconnect would read as the field simply not working) — while
-/// on a socket host there is no ssh hop to carry them, and changing them must
-/// therefore drop nothing.
+/// Connection options and the clipboard bridge require `setup_ssh` to run
+/// again. User forwarding rules live outside this identity: their manager
+/// applies changes over the existing master without replacing the backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::app) enum HostTarget {
     /// A daemon socket on *this* machine: a manually-forwarded socket, or the
@@ -651,10 +649,7 @@ pub(in crate::app) enum HostTarget {
     /// An ssh target the dashboard forwards the server socket over.
     Ssh {
         target: String,
-        /// The arguments as typed. Raw rather than split into options +
-        /// forwards, because the dial is what re-runs the split — matching on
-        /// its *output* would miss an edit that only moves a token between the
-        /// two.
+        /// Connection arguments after legacy forwarding options are migrated.
         options: Vec<String>,
         clipboard: bool,
     },
@@ -2508,7 +2503,7 @@ impl App {
     /// Start one host's connection task. The mirror fills when its snapshot
     /// arrives; until then the host reads `Connecting` and contributes no rows,
     /// which is what the table's trailing "loading" line stands in for.
-    fn dial(identity: &ConnIdentity) -> Backend {
+    fn dial(identity: &ConnIdentity, forwards: Vec<crate::ssh_forward::Rule>) -> Backend {
         let host = HostId(identity.label.clone());
         let transport = match &identity.target {
             HostTarget::Socket(sock) => Transport::LocalSocket(std::path::PathBuf::from(sock)),
@@ -2525,6 +2520,7 @@ impl App {
                 // can ride only one of its calls), and everything else reaches
                 // every ssh this host takes.
                 options: options.clone(),
+                forwards,
                 clipboard: *clipboard,
             },
         };
@@ -2627,10 +2623,33 @@ impl App {
         // is what leaves this machine's backend in place.
         let live_ids = std::mem::take(&mut self.backend_identities);
         let mut live: Vec<Option<Backend>> = self.backends.drain(1..).map(Some).collect();
+        // Retired owners must yield their forward specs before a renamed or
+        // reconfigured host starts dialing the same shared SSH master.
+        for (i, backend) in live.iter().enumerate() {
+            if !plan.contains(&Some(i))
+                && let Some(Backend::Remote(remote)) = backend
+                && let Some(manager) = &remote.forwards
+            {
+                manager.retire();
+            }
+        }
         for (identity, slot) in want.iter().zip(&plan) {
-            let backend = slot
-                .and_then(|i| live[i].take())
-                .unwrap_or_else(|| Self::dial(identity));
+            let backend = slot.and_then(|i| live[i].take()).unwrap_or_else(|| {
+                Self::dial(
+                    identity,
+                    hosts
+                        .iter()
+                        .find(|h| h.label == identity.label)
+                        .map(|h| h.forwards.clone())
+                        .unwrap_or_default(),
+                )
+            });
+            if let Backend::Remote(remote) = &backend
+                && let Some(manager) = &remote.forwards
+                && let Some(host) = hosts.iter().find(|h| h.label == identity.label)
+            {
+                manager.configure(host.forwards.clone());
+            }
             self.backends.push(backend);
         }
         // Whatever no wanted host claimed is a connection that is going away:
@@ -2687,7 +2706,10 @@ impl App {
         self.open_host_edit_from(hosts::load_hosts());
     }
 
-    fn open_host_edit_from(&mut self, configs: Vec<hosts::HostConfig>) {
+    fn open_host_edit_from(&mut self, mut configs: Vec<hosts::HostConfig>) {
+        for config in &mut configs {
+            config.migrate_forwards();
+        }
         let order = hosts::resolve_order(&configs, self.extra_prefs.host_order.as_deref(), None);
         let mut rows = configs
             .into_iter()
@@ -2697,9 +2719,9 @@ impl App {
                 icon: picker::TextInput::with_text(h.icon.unwrap_or_default()),
                 disabled: h.disabled,
                 clipboard: h.clipboard,
-                // Round-trips exactly: a spec can hold neither a comma nor a
-                // space, so this join is the inverse of `parse_list`'s split.
-                options: picker::TextInput::with_text(h.options.join(" ")),
+                // Quote argv values so spaces survive reopening the editor.
+                options: picker::TextInput::with_text(shell_words::join(h.options)),
+                forwards: h.forwards,
                 label: picker::TextInput::with_text(h.label),
                 ..HostRow::default()
             })
@@ -2726,6 +2748,7 @@ impl App {
             pending_remove: None,
             pending_upgrade: None,
             log_view: None,
+            forward_view: None,
             rows,
         });
         self.input_mode = InputMode::HostEdit;
@@ -2812,11 +2835,19 @@ impl App {
     /// per-host, in [`Self::reconcile_backends_from`], which is also what keeps
     /// an edit to one host from blanking the rows of the others.
     pub(super) fn apply_host_edits(&mut self) {
-        let Some(state) = self.host_edit.as_ref() else {
+        let Some(state) = self.host_edit.as_mut() else {
             return;
         };
-        let configs: Vec<hosts::HostConfig> =
-            state.rows.iter().filter_map(HostRow::config).collect();
+        let configs: Vec<hosts::HostConfig> = state
+            .rows
+            .iter_mut()
+            .filter_map(|row| {
+                let config = row.config()?;
+                row.options.set_text(shell_words::join(&config.options));
+                row.forwards = config.forwards.clone();
+                Some(config)
+            })
+            .collect();
         self.extra_prefs.host_order = Some(state.host_order());
         self.save_overrides();
         hosts::save_hosts(&configs);

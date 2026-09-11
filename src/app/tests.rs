@@ -6241,7 +6241,12 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     );
     d.press(KeyCode::Char(' '));
     let rendered = d.render();
-    assert!(rendered.contains("Codex connection [app-server]"));
+    assert!(
+        rendered
+            .lines()
+            .any(|l| l.contains("Codex connection") && l.contains("[app-server]")),
+        "{rendered}"
+    );
     assert!(rendered.contains("Codex endpoint"));
     let Some(Action::ConfigureCodex { host, .. }) = d.press(KeyCode::Enter) else {
         panic!("expected host write")
@@ -6331,6 +6336,155 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(super::HostField::Icon)
     );
+}
+
+#[test]
+fn port_forward_editor_imports_adds_duplicates_toggles_and_cancels() {
+    use super::hosts::HostConfig;
+    let mut d = TestDashboard::new(120, 36);
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        options: shell_words::split("-L3000:localhost:3000 -D1080 -C").unwrap(),
+        ..Default::default()
+    }]);
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    let rules = |d: &TestDashboard| d.app.host_edit.as_ref().unwrap().rows[1].forwards.clone();
+    assert_eq!(rules(&d).len(), 2);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[1].options.text(),
+        "-C"
+    );
+    d.press(KeyCode::Char('f'));
+    assert!(d.render().contains("Port forwards · example"));
+    assert!(d.render().contains("Waiting for host"));
+    d.press(KeyCode::Char('a'));
+    for c in "8080".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(rules(&d).len(), 3, "{}", d.render());
+    assert_eq!(rules(&d)[2].forward.tcp().unwrap().destination_port, "8080");
+    d.press(KeyCode::Char('y'));
+    d.press_ctrl(KeyCode::Char('u'));
+    for c in "9090".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(rules(&d).len(), 4);
+    assert_eq!(rules(&d)[3].forward.tcp().unwrap().destination_port, "8080");
+    d.press(KeyCode::Char(' '));
+    assert!(rules(&d)[3].disabled);
+    assert!(d.render().contains("Off"));
+    d.press(KeyCode::Char('a'));
+    for c in "invalid".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert!(d.render().contains("Listen port must be between"));
+    d.press(KeyCode::Esc);
+    assert_eq!(rules(&d).len(), 4);
+    d.press(KeyCode::Char('i'));
+    d.app.paste_port_forward("5173\n6006");
+    assert_eq!(
+        rules(&d).len(),
+        4,
+        "pasting never implicitly applies a rule"
+    );
+    d.press(KeyCode::Enter);
+    assert_eq!(rules(&d).len(), 6);
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('n'));
+    assert_eq!(rules(&d).len(), 6);
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('y'));
+    assert_eq!(rules(&d).len(), 5);
+    d.press(KeyCode::Esc);
+    assert!(d.app.host_edit.as_ref().unwrap().forward_view.is_none());
+}
+
+#[test]
+fn forwarding_configuration_does_not_replace_a_hosts_connection() {
+    use super::hosts::HostConfig;
+    let host = HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        ..Default::default()
+    };
+    let old = App::dialled_identities(std::slice::from_ref(&host), &Default::default());
+    let changed = HostConfig {
+        forwards: crate::ssh_forward::import("3000 8080").unwrap(),
+        ..host
+    };
+    let new = App::dialled_identities(&[changed], &Default::default());
+    assert_eq!(App::plan_reconcile(&old, &new), vec![Some(0)]);
+}
+
+#[test]
+fn forwarding_manager_respects_modal_ownership_and_saved_host_edits() {
+    use super::hosts::HostConfig;
+    let mut d = TestDashboard::new(120, 36);
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        ..Default::default()
+    }]);
+    assert!(
+        !d.app.selected_host_has_forwards(),
+        "localhost has no SSH forwarding control"
+    );
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    d.press(KeyCode::Char('e'));
+    d.press(KeyCode::Char('x'));
+    d.app.open_port_forwards();
+    assert!(d.render().contains("Save the host changes"));
+    assert!(d.app.host_edit.as_ref().unwrap().forward_view.is_none());
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char('e'));
+    d.app.open_port_forwards();
+    d.press(KeyCode::Char('a'));
+    for c in "3000".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    d.press(KeyCode::Esc); // Back to host form.
+    d.press(KeyCode::Esc); // Cancel host form, keeping independently saved ports.
+    assert_eq!(d.app.host_edit.as_ref().unwrap().rows[1].forwards.len(), 1);
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('f')); // A removal prompt owns the key, not the list shortcut.
+    assert!(d.app.host_edit.as_ref().unwrap().forward_view.is_none());
+}
+
+#[test]
+fn forwarding_list_scrolls_and_socket_hosts_hide_ssh_controls() {
+    use super::hosts::HostConfig;
+    let mut d = TestDashboard::new(90, 24);
+    let ports = (3000..3016)
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        forwards: crate::ssh_forward::import(&ports).unwrap(),
+        ..Default::default()
+    }]);
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    d.press(KeyCode::Char('f'));
+    for _ in 0..15 {
+        d.press(KeyCode::Down);
+    }
+    assert!(d.render().contains("3015"));
+    d.press(KeyCode::Esc);
+    d.app.host_edit.as_mut().unwrap().rows[1].is_socket = true;
+    assert!(!d.app.selected_host_has_forwards());
+    d.press(KeyCode::Enter);
+    let rendered = d.render();
+    assert!(!rendered.contains("Advanced SSH options"));
+    assert!(!rendered.contains("Port forwards"));
 }
 
 /// A host offered the clipboard says so on its row.
@@ -6548,22 +6702,17 @@ fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
             .position(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("{needle} not drawn: {out}"))
     };
-    let opts_row = row_of("Options");
-    let cont = lines[opts_row + 1];
+    let opts_row = row_of("Advanced SSH options");
+    let icon_row = row_of("Icon");
+    let tail = lines[opts_row + 1..icon_row]
+        .iter()
+        .find(|line| line.contains("7891:localhost:7891"))
+        .expect("forward tail must wrap above the next field");
+    assert!(tail.find("7891:localhost:7891").unwrap() >= lines[opts_row].find("-L 8010").unwrap());
     assert!(
-        cont.contains("7891:localhost:7891"),
-        "the tail wraps onto the next line instead of being cut off: {out}"
+        icon_row > opts_row + 1,
+        "the field grows to show the full value"
     );
-    // Indented to the value column, so the second line reads as more of the same
-    // field rather than as a nameless one of its own.
-    assert_eq!(
-        cont.find("7891:localhost:7891"),
-        lines[opts_row].find("-L 8010"),
-        "the continuation lines up under the value: {out}"
-    );
-    // And the fields below it move down rather than being written over: the card
-    // is sized from the lines it actually draws.
-    assert_eq!(row_of("Icon"), opts_row + 2, "{out}");
     assert!(out.contains("Clipboard"), "the card still closes: {out}");
 }
 
@@ -8595,6 +8744,7 @@ fn only_a_changed_connection_string_reconnects() {
         icon: Some(icon.into()),
         disabled: false,
         options: Vec::new(),
+        forwards: Vec::new(),
         clipboard: false,
     };
     let none = HashSet::new();
@@ -8615,6 +8765,7 @@ fn only_a_changed_connection_string_reconnects() {
             icon: Some("🖥".into()),
             disabled: false,
             options: Vec::new(),
+            forwards: Vec::new(),
             clipboard: false,
         }])
     );
@@ -8679,6 +8830,7 @@ fn reconciling_hosts_touches_only_the_hosts_that_changed() {
         icon: None,
         disabled: false,
         options: Vec::new(),
+        forwards: Vec::new(),
         clipboard: false,
     };
     let none = HashSet::new();
@@ -8725,6 +8877,7 @@ fn the_clipboard_server_runs_only_when_a_host_wants_it() {
         icon: None,
         disabled,
         options: Vec::new(),
+        forwards: Vec::new(),
         clipboard,
     };
     assert!(!App::any_host_wants_clipboard(&[]));

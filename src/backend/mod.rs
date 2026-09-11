@@ -52,6 +52,7 @@ pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
 // `setup_ssh`, and it calls nothing back except `ConnLog` and the ssh
 // primitives below.
 mod codex_config;
+pub(crate) mod forwards;
 mod provision;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
 use provision::{Provisioning, UploadGate, incompatible_daemon_reason, resolve_remote_exe};
@@ -1392,11 +1393,9 @@ pub(crate) enum Transport {
     Ssh {
         target: String,
         local_sock: PathBuf,
-        /// The host's connection options, as the user typed them: ssh arguments,
-        /// verbatim, in order. Split by [`split_connection_options`] into the
-        /// options every ssh call for this host carries and the port forwards,
-        /// which exactly one call may.
+        /// Connection arguments; user forwards have their own live manager.
         options: Vec<String>,
+        forwards: Vec<crate::ssh_forward::Rule>,
         /// Offer this host the dashboard machine's clipboard — one synthesized
         /// `-R` alongside the user's own forwards. See
         /// [`clipboard_forward_for_home`].
@@ -1404,73 +1403,7 @@ pub(crate) enum Transport {
     },
 }
 
-/// One port forward lifted out of a host's connection options — the flag and its
-/// argument, kept apart so `-O cancel` can name the same forward later.
-///
-/// A forward is the one ssh argument that cannot simply ride
-/// [`ssh_common_opts`] with the rest. An option is a property of the connection
-/// and repeating it is free; a forward is a *resource the connection holds*, and
-/// repeating it collides:
-///
-/// * within [`setup_ssh`], the probe opens the master and registers it, and
-///   `daemon ensure` then re-requests it against a master that already has it;
-/// * the transport's own housekeeping is `ssh <opts> -O cancel -L <sock> target`,
-///   and `-O cancel` cancels **every** forward named on its command line — so a
-///   `-L` living in `opts` would be torn down by us, once per reconnect;
-/// * every attach window would ask for it again, one collision per window.
-///
-/// So it goes on the `ssh -N -L` tunnel child and nowhere else. That is also the
-/// child whose lifetime the user means by "while I'm connected to this host".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Forward {
-    flag: String,
-    spec: String,
-}
-
-impl std::fmt::Display for Forward {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.flag, self.spec)
-    }
-}
-
-/// Split a host's connection options into what every ssh call carries and the
-/// forwards, which only the tunnel child may (see [`Forward`]).
-///
-/// The only thing recognised is `-L`/`-R`/`-D`, glued or with its argument in
-/// the next token; everything else passes through untouched and unvalidated,
-/// which is the point of the field. Case matters — `-L` is a local forward,
-/// `-l` is the login name.
-///
-/// The glued form is normalised apart (`-D1080` → `-D` + `1080`) so the cancel
-/// names a forward the same way however it was typed. A trailing flag with no
-/// argument is **dropped**: it is a usage error on every ssh call that would
-/// carry it, and these reach `attach` and the `w` shell too. Pure.
-pub(crate) fn split_connection_options(args: &[String]) -> (Vec<String>, Vec<Forward>) {
-    let mut opts = Vec::new();
-    let mut forwards = Vec::new();
-    let mut rest = args.iter();
-    while let Some(a) = rest.next() {
-        // `get` rather than a slice: a token can be any UTF-8 the user typed, and
-        // byte 2 need not be a char boundary.
-        let glued = a.len() > 2 && matches!(a.get(..2), Some("-L" | "-R" | "-D"));
-        if glued {
-            forwards.push(Forward {
-                flag: a[..2].to_string(),
-                spec: a[2..].to_string(),
-            });
-        } else if matches!(a.as_str(), "-L" | "-R" | "-D") {
-            if let Some(spec) = rest.next() {
-                forwards.push(Forward {
-                    flag: a.clone(),
-                    spec: spec.clone(),
-                });
-            }
-        } else {
-            opts.push(a.clone());
-        }
-    }
-    (opts, forwards)
-}
+pub(crate) use crate::ssh_forward::{Forward, split_options as split_connection_options};
 
 /// One in-flight request the connection task must answer by `req_id`.
 struct PendingRequest {
@@ -1497,6 +1430,7 @@ pub(crate) struct RemoteBackend {
     /// safe to repeat, which is what lets an attach window and the `w` shell
     /// carry them too. Empty for a socket transport, which runs no ssh.
     ssh_options: Vec<String>,
+    pub(crate) forwards: Option<Arc<forwards::Manager>>,
     /// Whether this backend's transport is [`Transport::LocalSocket`], i.e. the
     /// daemon is on *this* machine. Distinguishes pooled-localhost (where a
     /// missing ssh target is correct and a shell is in-process) from a
@@ -1708,8 +1642,8 @@ impl RemoteBackend {
             Transport::Ssh { target, .. } => Some(target.clone()),
             Transport::LocalSocket(_) => None,
         };
-        // Forwards are dropped here on purpose: an attach window must not ask
-        // for one (see [`Forward`]). The tunnel child is the only carrier.
+        // An attach window must not request user forwards; their manager
+        // owns them on the shared master.
         let ssh_options = match &transport {
             Transport::Ssh { options, .. } => split_connection_options(options).0,
             Transport::LocalSocket(_) => Vec::new(),
@@ -1728,9 +1662,23 @@ impl RemoteBackend {
         let vitals = Arc::new(VitalsCell::default());
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
         let log = Arc::new(ConnLog::default());
+        let forwards = match transport {
+            Transport::Ssh {
+                target, forwards, ..
+            } => Some(forwards::Manager::new(
+                &host,
+                target,
+                &ssh_options,
+                forwards,
+                dirty.clone(),
+                log.clone(),
+            )),
+            Transport::LocalSocket(_) => None,
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = ConnectionShared {
             host: host.clone(),
+            forwards: forwards.clone(),
             mirror: mirror.clone(),
             presumed_dead: presumed_dead.clone(),
             presumed_attached: presumed_attached.clone(),
@@ -1752,6 +1700,7 @@ impl RemoteBackend {
             host,
             attach_target,
             ssh_options,
+            forwards,
             transport_is_local,
             mirror,
             presumed_dead,
@@ -2400,6 +2349,7 @@ enum ServeOutcome {
 /// into a struct rather than passed as seven positional `Arc`s, where the two
 /// `Arc<Mutex<Option<String>>>`s would be swappable at a call site.
 struct ConnectionShared {
+    forwards: Option<Arc<forwards::Manager>>,
     /// Which host this task serves. Needed so a download prompt can name it —
     /// the user may have several, and "may I download a server?" is not a
     /// question worth asking without saying for whom.
@@ -2431,6 +2381,7 @@ async fn connection_task(
     mut requests: mpsc::UnboundedReceiver<PendingRequest>,
 ) {
     let ConnectionShared {
+        forwards,
         host,
         mirror,
         presumed_dead,
@@ -2446,6 +2397,7 @@ async fn connection_task(
         reconnect_epoch,
         log,
     } = shared;
+    let _forward_lifetime = forwards::Lifetime(forwards.clone());
     // A connection-state change flips `dirty` alongside `conn` so the dashboard
     // reloads + redraws the header promptly on connect/disconnect, not only when
     // the mirror later changes.
@@ -2498,6 +2450,7 @@ async fn connection_task(
                 local_sock,
                 options,
                 clipboard,
+                ..
             } => {
                 log.info(format!("connecting to {target} over ssh"));
                 match setup_ssh(
@@ -2579,6 +2532,9 @@ async fn connection_task(
             reconnect_epoch.fetch_add(1, Ordering::Relaxed);
         }
         was_connected = true;
+        if let Some(forwards) = &forwards {
+            forwards.connected().await;
+        }
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
@@ -2608,6 +2564,9 @@ async fn connection_task(
             // server below the protocol floor is exactly what a fresh probe
             // turns into a deploy — so this is the last pass that may reuse one.
             probe_cache = None;
+        }
+        if let Some(forwards) = &forwards {
+            forwards.disconnected().await;
         }
         drop(ssh_child); // explicit: kill the ssh child once the connection ends
         // The mirror is now stale; clear it so the host shows no (misleading)
@@ -3675,11 +3634,9 @@ mod tests {
         assert_eq!(opts, ["-l", "deploy"]);
         assert!(fwd.is_empty());
 
-        // A trailing flag with no argument is dropped rather than passed on: it
-        // is a usage error on every call that would carry it, and these reach
-        // the attach window and the `w` shell too.
+        // Incomplete options stay visible in the editor for correction.
         let (opts, fwd) = split("-C -L");
-        assert_eq!(opts, ["-C"]);
+        assert_eq!(opts, ["-C", "-L"]);
         assert!(fwd.is_empty());
     }
 

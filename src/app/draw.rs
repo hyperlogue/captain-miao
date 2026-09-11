@@ -1617,7 +1617,9 @@ impl App {
             }
             InputMode::HostEdit => {
                 let host_edit = self.host_edit.as_ref();
-                if host_edit.is_some_and(|h| h.log_view.is_some()) {
+                if host_edit.is_some_and(|h| h.forward_view.is_some()) {
+                    vec![Span::raw(self.forward_hints())]
+                } else if host_edit.is_some_and(|h| h.log_view.is_some()) {
                     let mut spans = hint_pair("j/k", "scroll");
                     spans.extend(hint_pair("g/G", "top/bottom"));
                     spans.extend(hint_pair("Esc", "back"));
@@ -1634,8 +1636,12 @@ impl App {
                         spans.extend(hint_pair("^t", "ssh/socket"));
                         spans.extend(hint_pair("^e", "emoji"));
                     }
-                    spans.extend(hint_pair("Space", "toggle"));
-                    spans.extend(hint_pair("Enter", "save"));
+                    if host_edit.and_then(|h| h.focus()) == Some(super::HostField::Forwards) {
+                        spans.extend(hint_pair("Enter", "manage"));
+                    } else {
+                        spans.extend(hint_pair("Space", "toggle"));
+                        spans.extend(hint_pair("Enter", "save"));
+                    }
                     spans.extend(hint_pair("Esc", "cancel"));
                     spans
                 } else {
@@ -1645,6 +1651,9 @@ impl App {
                     // not exist.
                     let mut spans = hint_pair("a", "add");
                     spans.extend(hint_pair("e", "edit"));
+                    if self.selected_host_has_forwards() {
+                        spans.extend(hint_pair("f", "forwards"));
+                    }
                     if host_edit.is_some_and(|h| h.cursor < h.rows.len() && h.rows.len() > 1) {
                         spans.extend(hint_pair("J/K", "reorder"));
                     }

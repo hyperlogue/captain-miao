@@ -52,6 +52,7 @@ pub(crate) struct HostEditState {
     /// view entirely — it wants the whole popup, since the text it exists to
     /// show is what didn't fit on a row.
     pub(in crate::app) log_view: Option<HostLogView>,
+    pub(in crate::app) forward_view: Option<super::port_forwards::ForwardView>,
 }
 
 /// The hosts panel's row editor: which field has the keyboard, and what `Esc`
@@ -211,11 +212,9 @@ pub(crate) struct HostRow {
     pub(in crate::app) icon: picker::TextInput,
     /// Suspended — see [`hosts::HostConfig::disabled`]. Toggled with `c`.
     pub(in crate::app) disabled: bool,
-    /// ssh arguments as one line of text — see [`hosts::HostConfig::options`].
-    /// Edited as text rather than as a list of rows because the whole set is
-    /// nearly always one or two arguments, and a sub-list inside a popup row
-    /// would need its own cursor, its own add/remove keys and its own footer.
+    /// Advanced SSH arguments, parsed without shell expansion.
     pub(in crate::app) options: picker::TextInput,
+    pub(in crate::app) forwards: Vec<crate::ssh_forward::Rule>,
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
     /// A form field, toggled with `Space`: the panel's plain letters are for
     /// things you do *to* a row (connect, delete, upgrade), and this is part of
@@ -239,7 +238,7 @@ impl HostRow {
             return None;
         }
         let icon = self.icon.text().trim();
-        Some(hosts::HostConfig {
+        let mut config = hosts::HostConfig {
             label: label.to_string(),
             icon: (!icon.is_empty()).then(|| icon.to_string()),
             socket: self.is_socket.then(|| target.to_string()),
@@ -247,7 +246,10 @@ impl HostRow {
             disabled: self.disabled,
             clipboard: self.clipboard,
             options: hosts::split_options(self.options.text()),
-        })
+            forwards: self.forwards.clone(),
+        };
+        config.migrate_forwards();
+        Some(config)
     }
 
     /// The `HostId` this row configures — its label, trimmed exactly as
@@ -274,6 +276,7 @@ pub(crate) enum HostField {
     Clipboard,
     CodexMode,
     CodexEndpoint,
+    Forwards,
 }
 
 impl HostField {
@@ -285,7 +288,7 @@ impl HostField {
     /// `Clipboard` is last rather than beside `Options`, where it belongs by
     /// meaning: the four text fields keep the Tab positions fingers already know,
     /// and `^e`'s "open the editor on Icon" stays the fourth stop it names.
-    const ORDER: [HostField; 7] = [
+    const ORDER: [HostField; 8] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
@@ -293,13 +296,15 @@ impl HostField {
         HostField::Clipboard,
         HostField::CodexMode,
         HostField::CodexEndpoint,
+        HostField::Forwards,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Label => "Label",
             Self::Target => "Target",
-            Self::Options => "Options",
+            Self::Options => "Advanced SSH options",
+            Self::Forwards => "Port forwards",
             Self::Icon => "Icon",
             Self::Clipboard => "Clipboard",
             Self::CodexMode => "Codex connection",
@@ -309,6 +314,8 @@ impl HostField {
 
     fn visible_for(self, row: &HostRow) -> bool {
         match self {
+            Self::Forwards => !row.is_local && !row.is_socket && row.config().is_some(),
+            Self::Options => !row.is_local && !row.is_socket,
             Self::CodexMode => row.codex.is_some(),
             Self::CodexEndpoint => row
                 .codex
@@ -460,7 +467,9 @@ impl App {
         let Some(state) = self.host_edit.as_ref() else {
             return;
         };
-        if state.log_view.is_some() {
+        if state.forward_view.is_some() {
+            self.draw_port_forwards(frame, area);
+        } else if state.log_view.is_some() {
             self.draw_host_log(frame, area);
         } else {
             self.draw_host_list(frame, area);
@@ -628,6 +637,9 @@ impl App {
             }
             // Appended after the trim, so a host with no options gets one space
             // before the marker rather than two.
+            if !r.forwards.is_empty() {
+                detail.push_str(&format!("  {} port forwards", r.forwards.len()));
+            }
             if r.clipboard {
                 detail.push_str(" \u{1f4cb}");
             }
@@ -813,7 +825,9 @@ impl App {
             ];
             let mut form_lines = field_rows(HostField::Label, label_lines);
             form_lines.extend(field_rows(HostField::Target, target_lines));
-            form_lines.extend(field_rows(HostField::Options, options_lines));
+            if HostField::Options.visible_for(r) {
+                form_lines.extend(field_rows(HostField::Options, options_lines));
+            }
             form_lines.extend(field_rows(HostField::Icon, icon_lines));
             form_lines.extend(field_rows(HostField::Clipboard, vec![clipboard_line]));
             if r.is_local {
@@ -839,6 +853,16 @@ impl App {
                     r.codex_error
                         .clone()
                         .unwrap_or_else(|| "Loading Codex settings…".into()),
+                ));
+            }
+            if HostField::Forwards.visible_for(r) {
+                form_lines.extend(field_rows(
+                    HostField::Forwards,
+                    vec![vec![Span::raw(format!(
+                        "{} enabled · {} total  [manage]",
+                        r.forwards.iter().filter(|f| !f.disabled).count(),
+                        r.forwards.len()
+                    ))]],
                 ));
             }
             // The field rows — one per field until a value wraps — a blank, the
@@ -885,13 +909,32 @@ impl App {
             // The blank goes in whether or not this field has a hint, so the one
             // line the card reserves for it doesn't shunt the fields up and down.
             form_lines.push(Line::from(""));
-            if let Some(hint) = host_field_hint(focus) {
+            if let Some(hint) = state.message.as_deref().or_else(|| host_field_hint(focus)) {
                 form_lines.push(Line::from(Span::styled(
                     hint,
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
-            frame.render_widget(Paragraph::new(form_lines), inner);
+            let focus_line = form_lines
+                .iter()
+                .rposition(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                })
+                .or_else(|| {
+                    form_lines.iter().position(|line| {
+                        line.spans
+                            .first()
+                            .is_some_and(|span| span.content.starts_with('❯'))
+                    })
+                })
+                .unwrap_or(0);
+            let scroll = focus_line.saturating_sub(inner.height.saturating_sub(2) as usize);
+            frame.render_widget(
+                Paragraph::new(form_lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+                inner,
+            );
         }
     }
 }
@@ -922,6 +965,23 @@ impl App {
         let has_log = self.selected_host_has_log();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.host_edit.as_ref()?.forward_view.is_some() {
+            self.handle_port_forward_key(key);
+            return None;
+        }
+        if (!ctrl
+            && !alt
+            && key.code == KeyCode::Char('f')
+            && self.host_edit.as_ref()?.edit.is_none()
+            && self.host_edit.as_ref()?.log_view.is_none()
+            && self.host_edit.as_ref()?.pending_remove.is_none()
+            && self.host_edit.as_ref()?.pending_upgrade.is_none())
+            || (matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+                && self.host_edit.as_ref()?.focus() == Some(HostField::Forwards))
+        {
+            self.open_port_forwards();
+            return None;
+        }
         let editing = self.host_edit.as_ref()?.edit.is_some();
 
         // The log view owns the keyboard while it's open — it replaces the list,
@@ -1030,6 +1090,10 @@ impl App {
                 // Committing a row applies it: persist + reconnect right away.
                 KeyCode::Enter => {
                     let row = state.rows.get(state.cursor)?;
+                    if let Err(error) = shell_words::split(row.options.text()) {
+                        state.message = Some(format!("Invalid SSH options: {error}"));
+                        return None;
+                    }
                     let config = row.codex.clone().map(|mut config| {
                         config.endpoint = row.codex_endpoint.text().trim().to_owned();
                         config
@@ -1123,7 +1187,7 @@ impl App {
                 // Nothing to type into: its own keys are handled above, and a key
                 // none of them claim is dropped rather than falling through to a
                 // `TextInput` this field does not have.
-                HostField::Clipboard | HostField::CodexMode => {}
+                HostField::Clipboard | HostField::CodexMode | HostField::Forwards => {}
                 HostField::CodexEndpoint => {
                     r.codex_endpoint.handle_key(key);
                 }
@@ -1307,9 +1371,8 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         // An example of the one thing this field is really for, and a pointer to
         // where the rest belongs — which is the question the field raises rather
         // than answers.
-        HostField::Options => {
-            Some("  ssh args, e.g. -L 8080:localhost:3000   host setup: ~/.ssh/config")
-        }
+        HostField::Options => Some("  SSH arguments with quoting; host setup: ~/.ssh/config"),
+        HostField::Forwards => Some("  Enter manage forwards   save host changes before opening"),
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Names the key, then the direction — "clipboard" on a host row could as
         // easily mean the host's own, and *whose* it is is the whole point. It is
@@ -1334,7 +1397,11 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
 /// `-L` forwards outrun the card, and the tail the frame cut off was still there
 /// on save, editable by a cursor nothing on screen could show. Always yields at
 /// least one line, so an empty field still has a row. Pure.
-fn text_field_lines(input: &TextInput, focused: bool, width: usize) -> Vec<Vec<Span<'static>>> {
+pub(super) fn text_field_lines(
+    input: &TextInput,
+    focused: bool,
+    width: usize,
+) -> Vec<Vec<Span<'static>>> {
     let text = input.text();
     // `TextInput` keeps the cursor on a char boundary, so no split below can cut
     // a multi-byte glyph.

@@ -1229,90 +1229,62 @@ decides what they mean**.
     duplicate. The residual case (stop succeeded, `mv` did not) loses the
     automatic restore, says so, and leaves those sessions in the resume picker,
     since a killed pool session's transcript on the host is untouched.
-- **`Options` — per-host ssh arguments** (`hosts::split_options`,
-  `backend::split_connection_options`). Passed through verbatim to every ssh
-  captain-miao runs for that host, with no grammar of our own on top.
-
-  The feature has exactly two coherent shapes — a raw argument string, or a
-  structured editor where a forward is a row with a type and two endpoints — and
-  anything in between is a bespoke syntax to learn *and* a ceiling to hit. This
-  is the raw one. An earlier pass built the middle (a `Ports` field with `3000` /
-  `8080:3000` shorthands, canonicalisation, per-spec validation, plus a second
-  field for everything else) and it was more machinery than the problem.
-  - **What it is really for is forwards.** Host identity — port, `ProxyJump`,
-    `IdentityFile` — belongs in a `~/.ssh/config` `Host` block, which covers the
-    attach windows and the `w` shell too, since captain-miao reaches a host by
-    plain `ssh <target>`. What ssh_config *can't* express is anything scoped to
-    our connection alone, and a forward is not a property of the machine at all:
-    it is something you want up while working on that host and gone when you
-    aren't. That lifecycle is what the field adds over a hand-run `ssh -L`.
-  - **A forward can't ride `ssh_common_opts` with the rest**, which is the one
-    piece of real machinery left. An option is a property of the connection and
-    repeating it is free; a forward is a *resource the connection holds*, and
-    repeating it collides three ways: `daemon ensure` re-requests what the probe
-    already registered; the transport's own `ssh <opts> -O cancel -L <sock>
-    target` would name it too, and `-O cancel` cancels every forward on its
-    command line, so we would tear it down once per reconnect; and every attach
-    window would ask for it again. So `split_connection_options` lifts
-    `-L`/`-R`/`-D` (glued or separated, normalised apart) onto the `ssh -N -L`
-    tunnel child, and nothing else carries them. `ExitOnForwardFailure` stays at
-    its default `no`: a port already in use must cost that one forward, not the
-    link to the host.
-  - **The field is no longer the only source of forwards.** The `Clipboard`
-    field (below) synthesizes a `-R` the user never typed, and it joins the same `Forward` list,
-    the same lift onto the tunnel child, and the same `REQUESTED_FORWARDS`
-    bookkeeping — so everything in this bullet holds for it unchanged. Two
-    consequences worth naming: `-O cancel` cancels *every* forward on its command
-    line, so the clipboard's rides the one existing cancel-then-request pass
-    rather than a second one; and `ExitOnForwardFailure=no` means a clipboard
-    socket that won't bind costs the paste, never the link to the host.
-  - **The user's arguments go first**, because ssh keeps the first value it
-    obtains for an option. Ours first would make the field inert for exactly its
-    motivating settings — `ConnectTimeout`, `ServerAliveInterval` and
-    `ControlPersist` are all set by `ssh_common_opts`. The price is that
-    `ControlPath`, `ControlMaster` and `BatchMode` are overridable and each
-    breaks something real: the first two split the multiplexing this depends on
-    (including the `-O cancel` that retires forwards), the third lets ssh prompt
-    on a child whose stdin is `/dev/null`.
-  - **Editing them retires the master first**, or they would not take effect at
-    all. An options edit is already a drop-and-dial (`ConnIdentity` carries
-    them), and that does kill the `-N -L` tunnel — but the tunnel is a mux
-    *slave*. The master was minted by the previous connect's probe and
-    backgrounded itself under `ControlPersist`, `ssh_control_path` hashes the
-    **target alone**, so the fresh dial's probe joins that same master and every
-    connection-scoped option (`Port`, `User`, `IdentityFile`, `ProxyJump`, the
-    ciphers, and the three settings above) is inert against a connection that
-    already exists — indefinitely, since an open attach window keeps refreshing
-    it. So `options_changed_since_last_dial` memoizes `extra` and `setup_ssh`
-    runs `-O exit` before the probe when it has moved. **A row we have dialled
-    before is judged by its own history; one we have not, by the master's**, and
-    neither angle works alone: judge a known row by the master and two rows on
-    one machine exit each other's forever, judge an unknown one by its own empty
-    history and a rename slips through — the panel commits every field on one
-    `Enter`, so relabelling a host while changing its options is a single edit,
-    and delete-then-re-add is the same shape. A new row therefore costs at most
-    one extra exit, never a flap. Forwards are excluded — those are re-requested
-    through the master every pass anyway — and a first sighting on a target
-    nothing has dialled is a no-op, so a dashboard restart keeps its attach
-    windows. Retiring a master takes down every row on that target, including
-    their attach windows; benign, since ssh's 255 reads as a dropped link rather
-    than a user close and the re-attach sweep restores them, but it is why the
-    gate is this tight.
-  - **`-O cancel` before every request**, and on every host that leaves the ssh
-    set. A forward requested by a multiplexed client is registered with the
-    *master*, so one deleted from the field would hold its port for as long as
-    the master lives, and one still in the field would make the re-request fail.
-    Nothing enumerates a master's forwards, so `REQUESTED_FORWARDS` remembers
-    what this process asked each `(label, target)` for and cancels that set ∪ the
-    new one before requesting; `retire_unlisted_forwards` covers the host that
-    was deleted, suspended, renamed or switched to a socket, whose forwards would
-    otherwise outlive a row the panel calls disconnected.
-  - **Nothing is validated**, which is what verbatim means. A bad argument is
-    still diagnosable rather than a silent flap: it reaches `daemon ensure`
-    before the tunnel child, and that call captures stderr into the `Failed`
-    reason the panel shows. The one exception is a trailing `-L` with no
-    argument, dropped because it is a usage error on *every* call that would
-    carry it — including the attach window.
+- **Port forwards** (`f` on an SSH host, or the host form's `Port forwards`
+  summary) have their own list and draft editor. `a` adds, `Enter` edits,
+  `Space` enables/disables, `y` duplicates, `d` deletes after confirmation,
+  `i` imports ports or SSH forwarding arguments, and `r` retries failed rules.
+  Pasting into the list opens the importer; newlines become spaces and never
+  apply anything by themselves. The form supports local (`-L`), remote (`-R`),
+  and SOCKS (`-D`) forwarding, defaults new listeners to `localhost`, and links
+  the destination port to the listen port until the destination is edited.
+  `Ctrl-r` switches between TCP fields and a raw SSH specification. Socket
+  forwards and other specs the form cannot represent open in raw mode.
+  - **Saved rules apply independently.** Escape cancels the current draft or
+    leaves the list; it does not undo already applied rules. Unsaved general
+    host edits must be saved or cancelled before opening the manager. Saving a
+    forward updates the host form's original snapshot too, so cancelling that
+    form cannot resurrect an old forwarding configuration.
+  - **Three modules carry the behavior.** `ssh_forward` owns the persisted
+    rules, lossless SSH argument extraction, TCP form conversion, import and
+    listener validation. `app::port_forwards` owns interaction and drawing.
+    `backend::forwards` owns the acknowledged operations, runtime status and
+    connection lifetime. Forwarding rules are separate from `ConnIdentity`;
+    changing them preserves the daemon tunnel, session mirror and attach links.
+  - **The existing SSH master owns the listeners.** A serialized manager sends
+    one `ssh -O forward` or `ssh -O cancel` per changed rule. Control commands
+    suppress ssh_config and unrelated arguments, so cancelling a miao rule
+    cannot also cancel a forward inherited from the user's SSH configuration.
+    OpenSSH may exit zero after a refused cancellation: the manager checks the
+    mux diagnostic as well as the exit status. A listener already absent is an
+    acknowledged removal. Each request is bounded by the mux control timeout.
+  - **Failures remain visible.** An online edit persists only after SSH accepts
+    it. On rejection, the old desired rules remain and removed listeners are
+    restored where possible; failed restoration is reported explicitly. A file
+    write failure also attempts to restore the prior runtime configuration.
+    Offline edits persist as `Waiting for host`, and reconnect retries enabled
+    rules. A listener disabled offline reads `Waiting to disable` until its
+    retirement succeeds; failed cleanup stays visible and retryable.
+    `Listening` means SSH accepted the listener, not that the destination
+    application is healthy. Automatic remote port allocation (`-R 0:…`) is
+    rejected because cancelling it requires its allocated port; fixed-port and
+    socket specifications remain available through the raw editor.
+  - **Cleanup cannot overtake a replacement.** The manager remembers requested
+    specs, including uncertain requests, and retires them when its backend ends.
+    A per-spec ownership generation prevents late cleanup from an old backend
+    cancelling listeners acquired by its replacement. Normal dashboard exit
+    waits for listener cleanup before shutting down the async runtime.
+  - **Legacy configuration migrates on read.** Glued or separate `-L`/`-R`/`-D`
+    options become named, independently disabled rows in `hosts.json`. Specs
+    retain their exact string; unknown SSH options and quoted argument values
+    survive. Opening the panel alone writes nothing. The next explicit edit
+    saves the additive `forwards` field. The clipboard bridge remains owned by
+    the daemon tunnel's existing forwarding path and is not an editable user row.
+- **Advanced SSH options** retain ordinary connection arguments, with shell
+  quoting but no shell expansion or execution. Machine identity, `ProxyJump`
+  and `IdentityFile` normally belong in `~/.ssh/config`. Invalid quoting stays
+  in the form with an error. Changing actual connection options still replaces
+  the connection and, when necessary, retires the shared master so the new
+  options take effect. Forward-only edits use the live manager instead.
 - **The `Clipboard` field — offer this machine's clipboard to the host**
   (`clipboard` in `hosts.json`, off by default, `📋` on the row when on). What
   it buys is pasting a screenshot into an agent running somewhere else: the

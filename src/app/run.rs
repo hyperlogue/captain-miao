@@ -22,9 +22,9 @@
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::time::{Duration, Instant};
@@ -1418,6 +1418,7 @@ fn leave_terminal_modes(kb_enhanced: bool) {
     if kb_enhanced {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = execute!(std::io::stdout(), DisableFocusChange);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
 }
@@ -1820,6 +1821,7 @@ async fn drain_background_results(
     // in.
     let panel_open = app.host_edit.is_some();
     if panel_open {
+        redraw |= app.poll_forward_edits();
         if !*hosts_panel_open {
             for backend in &app.backends {
                 backend.invalidate_vitals();
@@ -2071,6 +2073,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // Whether the hosts panel was open on the previous pass, so its *opening*
     // can be acted on (see the utilisation block).
     let mut hosts_panel_open = false;
+    let mut forwarding_paste = false;
     // The tab label last pushed to the terminal, so the count is only re-sent
     // when it actually moves.
     let mut last_tab_title: Option<String> = None;
@@ -2083,6 +2086,19 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // them terminal-side.
     let mut logo_recompose_at: Option<Instant> = None;
     loop {
+        let wants_paste = app.input_mode == InputMode::HostEdit
+            && app
+                .host_edit
+                .as_ref()
+                .is_some_and(|s| s.forward_view.is_some());
+        if wants_paste != forwarding_paste {
+            if wants_paste {
+                let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+            } else {
+                let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+            }
+            forwarding_paste = wants_paste;
+        }
         // A settle deadline that has come due forces the next reload: re-arm
         // `fs_dirty` and clear `last_reload` so the debounce doesn't defer it.
         if settle_reload_at.is_some_and(|t| Instant::now() >= t) {
@@ -2235,6 +2251,10 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     super::keybind_log::record(mode_before, key, action.as_ref());
                     action
                 }
+                Event::Paste(text) => {
+                    app.paste_port_forward(&text);
+                    None
+                }
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 Event::FocusGained => {
                     app.focused = true;
@@ -2271,7 +2291,6 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     arm_logo_recompose(&mut logo_recompose_at);
                     None
                 }
-                _ => None,
             };
             if let Some(action) = maybe_action {
                 // An attach is the slowest action here — it spawns a window and,
@@ -2636,6 +2655,20 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             break;
         }
     }
+
+    // Retire user listeners before the runtime shuts its tasks down. Attached
+    // sessions keep the shared SSH master alive after the dashboard exits.
+    let mut forward_cleanup = tokio::task::JoinSet::new();
+    for backend in &app.backends {
+        if let Backend::Remote(remote) = backend
+            && let Some(manager) = remote.forwards.clone()
+        {
+            forward_cleanup.spawn(async move {
+                manager.shutdown().await;
+            });
+        }
+    }
+    while forward_cleanup.join_next().await.is_some() {}
 
     // Free the paw image from kitty before we drop the alt screen.
     app.clear_logo_graphics();

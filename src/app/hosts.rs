@@ -6,9 +6,9 @@
 //! said the same thing, the icon says it better (an emoji is self-coloured and
 //! distinguishes far more than a palette of eight), and one affordance per
 //! concept is one fewer field to Tab past. `serde` ignores the leftover key, so
-//! an older `hosts.json` still loads — the colour is simply forgotten. The same
-//! is true of the short-lived `forwards`/`ssh_args` pair that [`HostConfig::options`]
-//! replaced before either shipped.
+//! an older `hosts.json` still loads — the colour is simply forgotten.
+//! Legacy forwarding switches in `options` migrate into structured rows in
+//! memory; the next explicit edit persists them.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,30 +45,12 @@ pub(super) struct HostConfig {
     /// upgrade.
     #[serde(default)]
     pub disabled: bool,
-    /// ssh arguments for this host's connection, as the user typed them: passed
-    /// through verbatim and in order, with no grammar of our own on top.
-    ///
-    /// This is a raw escape hatch on purpose. There are only two coherent shapes
-    /// for the feature — a raw argument string, or a structured editor where a
-    /// forward is a row with a type and two endpoints — and anything between the
-    /// two is a bespoke syntax the user has to learn *and* a ceiling they hit
-    /// anyway. Raw is the one that stays small.
-    ///
-    /// Most of what you'd reach for belongs in `~/.ssh/config` instead: a port,
-    /// `ProxyJump`, an `IdentityFile` are properties of the machine, and a
-    /// `Host` block there covers the attach windows and the `w` shell too. What
-    /// this field adds is what ssh_config can't scope to captain-miao alone —
-    /// tuning for *our* connection (`-C`, keepalives) and, above all, **port
-    /// forwards**, which are not a property of the machine at all: they are
-    /// something you want up while working on that host and gone when you're
-    /// not. A `-L`/`-R`/`-D` here is lifted onto the tunnel child by
-    /// [`crate::backend::split_connection_options`] so it lives and dies with
-    /// the connection.
-    ///
-    /// Ignored for a `socket` host — there is no ssh hop there to carry any of
-    /// it.
+    /// Advanced SSH arguments. Forwarding switches migrate into `forwards` on
+    /// load; only connection options belong here.
     #[serde(default)]
     pub options: Vec<String>,
+    #[serde(default)]
+    pub forwards: Vec<crate::ssh_forward::Rule>,
     /// Offer this host the dashboard machine's clipboard, so an agent in a
     /// pooled session there can paste a screenshot. The row editor's `Clipboard`
     /// field.
@@ -87,27 +69,48 @@ pub(super) struct HostConfig {
     pub clipboard: bool,
 }
 
-/// Split the panel's `Options` field into tokens.
-///
-/// Whitespace only, with no quoting. The one common ssh option whose value
-/// contains a space is `ProxyCommand`, which is exactly the kind that belongs in
-/// `~/.ssh/config` — so a quoting grammar here would exist to serve the case the
-/// field is documented as not being for, at the price of being one more syntax
-/// to get wrong. Pure.
+impl HostConfig {
+    /// Normalize legacy hosts without writing on read. Unknown options retain
+    /// their original argv, including arguments containing spaces.
+    pub fn migrate_forwards(&mut self) {
+        let (options, forwards) = crate::ssh_forward::split_options(&self.options);
+        self.options = options;
+        for forward in forwards {
+            if !self.forwards.iter().any(|rule| rule.forward == forward) {
+                self.forwards.push(forward.into());
+            }
+        }
+    }
+}
+
 pub(super) fn split_options(text: &str) -> Vec<String> {
-    text.split_whitespace().map(str::to_string).collect()
+    shell_words::split(text).unwrap_or_else(|_| vec![text.to_owned()])
 }
 
 /// Load the configured hosts, or an empty list if none / unreadable.
 pub(super) fn load_hosts() -> Vec<HostConfig> {
-    crate::state::read_json::<Vec<HostConfig>>(&crate::state::hosts_path()).unwrap_or_default()
+    let mut hosts =
+        crate::state::read_json::<Vec<HostConfig>>(&crate::state::hosts_path()).unwrap_or_default();
+    for host in &mut hosts {
+        host.migrate_forwards();
+    }
+    hosts
 }
 
 /// Persist the host list. Called from the hosts panel whenever it mutates —
 /// adding a host persists (and connects) immediately, edits apply on commit,
 /// removal after its confirm — so there is no separate Save step to forget.
 pub(super) fn save_hosts(hosts: &[HostConfig]) {
-    let _ = crate::state::write_json_atomic(&crate::state::hosts_path(), &hosts);
+    let _ = try_save_hosts(hosts);
+}
+
+/// Rule acknowledgements save on a background task; ordinary host edits save
+/// on the UI thread. Serialize access to the atomic writer's temporary file.
+pub(super) fn try_save_hosts(hosts: &[HostConfig]) -> anyhow::Result<()> {
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write = WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    crate::state::create_dir_all_private(&crate::state::state_dir())?;
+    crate::state::write_json_atomic(&crate::state::hosts_path(), &hosts)
 }
 
 /// Resolve the panel order, including the synthetic localhost row. Unknown
@@ -138,4 +141,33 @@ pub(super) fn resolve_order(
         }
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_forward_migration_keeps_quoted_arguments_and_disabled_rules() {
+        let mut host: HostConfig = serde_json::from_value(serde_json::json!({
+            "label": "example", "ssh": "example-target",
+            "options": ["-o", "ProxyCommand=helper with spaces", "-L3000:localhost:3000", "-R", "/path/to/remote socket:/path/to/local socket"],
+            "forwards": [{"name": "Web", "disabled": true, "flag": "-L", "spec": "3000:localhost:3000"}]
+        })).unwrap();
+        host.migrate_forwards();
+        assert_eq!(host.options, ["-o", "ProxyCommand=helper with spaces"]);
+        assert_eq!(host.forwards.len(), 2);
+        assert!(host.forwards[0].disabled);
+        assert_eq!(
+            host.forwards[1].forward.spec,
+            "/path/to/remote socket:/path/to/local socket"
+        );
+        assert_eq!(
+            split_options(&shell_words::join(&host.options)),
+            host.options
+        );
+        let saved = serde_json::to_value(&host).unwrap();
+        host.migrate_forwards();
+        assert_eq!(serde_json::to_value(host).unwrap(), saved);
+    }
 }

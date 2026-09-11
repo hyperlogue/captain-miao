@@ -303,7 +303,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
 | `,` (Agents) / `Space h` | Reorder agents / hosts to choose the default for new sessions                                                                                                                    |
 | `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                          |
-| `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
+| `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — the footer's status messages, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
 | `?`                   | Show the full key list (help overlay)                                                                                                                                      |
@@ -458,9 +458,17 @@ full connection log, `c` suspends it, `u` upgrades its server.
 - **Closing a session's window ends it**, the same as `x`; set `on_window_close =
 "detach"` under `[remote]` for the opposite. A window lost to a dropped link
   detaches instead, so a flaky network never costs you a session.
-- **`Options`** takes verbatim ssh arguments, mainly port forwards
-  (`-L 8080:localhost:3000`), which come up and go away with the connection.
-  Everything else belongs in `~/.ssh/config`.
+- **Port forwards** — press `f` on an SSH host to add, edit, duplicate (`y`),
+  enable/disable (`Space`), or delete (`d`) individual forwards. Local, remote,
+  and SOCKS forwarding have dedicated fields; `Ctrl-r` opens the raw spec editor
+  for socket forwards. Import (`i`) accepts ports such as `3000 5173 8080` or
+  existing `-L`/`-R`/`-D` arguments. Saved changes apply without reconnecting the
+  host; failures appear in the manager and leave the previous configuration in
+  place. Offline rules wait for the host. Escape cancels an unfinished edit.
+  Existing forwarding options migrate automatically into rows.
+- **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
+  belongs in `~/.ssh/config`. Changing these connection options can reconnect
+  the host. The forwarding list manages ports independently.
 - **Terminfo** — a host with no entry for your `TERM` is offered yours, so
   sessions there stop falling back to `xterm-256color`. It asks first.
 - **The daemon** is either your own on `PATH` or one the dashboard deploys.

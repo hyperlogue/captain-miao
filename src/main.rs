@@ -12,6 +12,7 @@ mod backend;
 mod config;
 mod server_payload;
 mod sleep;
+mod ssh_forward;
 mod terminal;
 
 // Core modules re-exported at the crate root so the dashboard's `crate::state`,
