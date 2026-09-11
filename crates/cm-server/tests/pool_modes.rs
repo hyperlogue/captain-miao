@@ -106,6 +106,7 @@ done
             send(
                 &stream,
                 &ConnectHeader::Attach(AttachHeader {
+                    name_template: "mode-test".into(),
                     name: "mode-test".into(),
                     local_tty_size: TtySize {
                         rows: 24,

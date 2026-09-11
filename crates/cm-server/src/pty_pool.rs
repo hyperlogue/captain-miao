@@ -750,6 +750,7 @@ mod tests {
                 last_connected_at_unix_ms: None,
                 last_disconnected_at_unix_ms: None,
                 status: SessionStatus::Attached,
+                attachments: Vec::new(),
             }],
         };
         let mut buf: Vec<u8> = Vec::new();

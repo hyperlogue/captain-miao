@@ -22,4 +22,4 @@
 # rust-src from the flake; listing them here would only make the release matrix
 # install two tools it never runs.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"

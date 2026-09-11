@@ -13,9 +13,8 @@ version = "0.8.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyperlogue/captain-miao"
-# 1.88 is the real floor: ratatui 0.30 declares it, and `logo.rs` uses
-# `u32::is_multiple_of` (stable 1.87). Edition 2024 alone would only need 1.85.
-rust-version = "1.88"
+# libsqlite3-sys uses `cfg_select!`, stabilized in Rust 1.95.
+rust-version = "1.95"
 
 [package]
 name = "captain-miao"
@@ -54,15 +53,15 @@ async-trait = "0.1"
 # typo'd subcommand earning a "did you mean" costs only strsim.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 tracing = "0.1"
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 notify = "8"
 toml = "1.1"
 unicode-width = "0.2"
-emojis = "0.6"
+emojis = "0.9"
 # Encodes raw-RGBA image payloads into kitty graphics-protocol escapes for the
-# header paw + cat. Already in the tree transitively; pinned here as a direct dep.
-base64 = "0.22"
+# header paw + cat.
+base64 = "0.23"
 # Inflates the embedded `miao-server` payloads before uploading them to a
 # remote host (src/server_payload.rs), and the ones downloaded from a release.
 #
@@ -102,7 +101,7 @@ remote = []
 # embeds the finished `.gray` masks (the `.png` outputs are eyeball previews).
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-tiny-skia = "0.11"
+tiny-skia = "0.12"
 # The same `cm-core`, plus `LauncherState::for_test`. Listing it here rather than
 # on the normal dependency keeps the helper out of every non-test build: dev-
 # dependency features are not unified into one under the v2+ resolver.

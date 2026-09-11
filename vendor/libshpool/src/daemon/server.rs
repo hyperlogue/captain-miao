@@ -35,11 +35,11 @@ use anyhow::{anyhow, Context};
 use nix::unistd;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use shpool_protocol::{
-    AttachHeader, AttachReplyHeader, AttachStatus, ConnectHeader, DetachReply, DetachRequest,
-    KillReply, KillRequest, ListReply, LogLevel, MaybeSwitch, ModifyVarReply, ModifyVarRequest,
-    ResizeReply, Session, SessionMessageDetachReply, SessionMessageReply, SessionMessageRequest,
-    SessionMessageRequestPayload, SessionStatus, SetLogLevelReply, SetLogLevelRequest,
-    VersionHeader,
+    AttachHeader, AttachReplyHeader, AttachStatus, Attachment, ConnectHeader, DetachReply,
+    DetachRequest, KillReply, KillRequest, ListReply, LogLevel, MaybeSwitch, ModifyVarReply,
+    ModifyVarRequest, ResizeReply, Session, SessionMessageDetachReply, SessionMessageReply,
+    SessionMessageRequest, SessionMessageRequestPayload, SessionStatus, SetLogLevelReply,
+    SetLogLevelRequest, VersionHeader,
 };
 use tracing::{debug, error, info, instrument, span, warn, Level};
 
@@ -206,15 +206,18 @@ impl Server {
 
         let header = parse_connect_header(&mut stream).context("parsing connect header")?;
 
-        if let Err(err) = check_peer(&stream) {
-            if let ConnectHeader::Attach(_) = header {
-                write_reply(
-                    &mut stream,
-                    AttachReplyHeader { status: AttachStatus::Forbidden(format!("{err:?}")) },
-                )?;
+        let peer_pid = match check_peer(&stream) {
+            Ok(peer_pid) => peer_pid,
+            Err(err) => {
+                if let ConnectHeader::Attach(_) = header {
+                    write_reply(
+                        &mut stream,
+                        AttachReplyHeader { status: AttachStatus::Forbidden(format!("{err:?}")) },
+                    )?;
+                }
+                stream.shutdown(net::Shutdown::Both).context("closing stream")?;
+                return Err(err);
             }
-            stream.shutdown(net::Shutdown::Both).context("closing stream")?;
-            return Err(err);
         };
 
         // Unset the read timeout before we pass things off to a
@@ -224,7 +227,7 @@ impl Server {
         stream.set_read_timeout(None).context("unsetting read timout on inbound session")?;
 
         match header {
-            ConnectHeader::Attach(h) => self.handle_attach(stream, conn_id, h),
+            ConnectHeader::Attach(h) => self.handle_attach(stream, conn_id, h, peer_pid),
             ConnectHeader::Detach(r) => self.handle_detach(stream, r),
             ConnectHeader::Kill(r) => self.handle_kill(stream, r),
             ConnectHeader::List => self.handle_list(stream),
@@ -241,6 +244,7 @@ impl Server {
         mut stream: UnixStream,
         conn_id: usize,
         header: AttachHeader,
+        peer_pid: libc::pid_t,
     ) -> anyhow::Result<()> {
         if header.name.chars().any(|c| '/' == c || c.is_whitespace())
             || header.name == "."
@@ -263,19 +267,20 @@ impl Server {
         let shell_env = self.build_shell_env(&user_info, &header).context("building shell env")?;
 
         test_hooks::emit("handle-attach-before-select-shell");
-        let (shell_results, status) =
-            match self.select_shell_desc(stream, conn_id, &header, &user_info, &shell_env) {
-                Ok(t) => t,
-                Err(err)
-                    if err
-                        .downcast_ref::<ShellSelectionError>()
-                        .map(|e| e == &ShellSelectionError::BusyShellSession)
-                        .unwrap_or(false) =>
-                {
-                    return Ok(());
-                }
-                Err(err) => return Err(err)?,
-            };
+        let (shell_results, status) = match self
+            .select_shell_desc(stream, conn_id, &header, &user_info, &shell_env, peer_pid)
+        {
+            Ok(t) => t,
+            Err(err)
+                if err
+                    .downcast_ref::<ShellSelectionError>()
+                    .map(|e| e == &ShellSelectionError::BusyShellSession)
+                    .unwrap_or(false) =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err)?,
+        };
 
         self.link_ssh_auth_sock(&header).context("linking SSH_AUTH_SOCK")?;
         self.populate_session_env_file(&header).context("populating session env file")?;
@@ -379,8 +384,7 @@ impl Server {
                     let _s = span!(Level::INFO, "disconnect_lock(shells)").entered();
                     let shells = self.shells.lock();
                     if let Some(session) = shells.get(&header.name) {
-                        session.lifecycle_timestamps.lock().last_disconnected_at =
-                            Some(time::SystemTime::now());
+                        session.lifecycle.record_detached();
                         self.events_bus.publish(&events::Event::SessionDetached);
                     }
                 }
@@ -405,6 +409,7 @@ impl Server {
         header: &AttachHeader,
         user_info: &user::Info,
         shell_env: &[(OsString, OsString)],
+        peer_pid: libc::pid_t,
     ) -> anyhow::Result<(
         Option<(
             Arc<ExitNotifier>,
@@ -444,8 +449,10 @@ impl Server {
                             // the channel is still open so the subshell is still running
                             info!("taking over existing session inner");
                             inner.client_stream = Some(stream.try_clone()?);
-                            session.lifecycle_timestamps.lock().last_connected_at =
-                                Some(time::SystemTime::now());
+                            session.lifecycle.record_attached(Attachment {
+                                session_name_template: header.name_template.clone(),
+                                pid: peer_pid,
+                            });
 
                             if inner
                                 .shell_to_client_join_h
@@ -530,7 +537,10 @@ impl Server {
             matches!(motd, MotdDisplayMode::Dump),
         )?;
 
-        session.lifecycle_timestamps.lock().last_connected_at = Some(time::SystemTime::now());
+        session.lifecycle.record_attached(Attachment {
+            session_name_template: header.name_template.clone(),
+            pid: peer_pid,
+        });
         {
             let _s = span!(Level::INFO, "select_shell_lock_2(shells)").entered();
             let mut shells = self.shells.lock();
@@ -620,34 +630,72 @@ impl Server {
     fn handle_detach(&self, mut stream: UnixStream, request: DetachRequest) -> anyhow::Result<()> {
         let mut not_found_sessions = vec![];
         let mut not_attached_sessions = vec![];
+
+        // Resolve the requested names to control handles while the shells lock
+        // is held, then drop it. The ctl handshake below MUST NOT run under
+        // that lock: client_connection and client_connection_ack are both
+        // rendezvous channels (bounded(0)), so each half only completes when
+        // the shell->client thread is sitting in its select loop. A client
+        // whose socket has stopped draining (a stalled ssh window, a suspended
+        // laptop) leaves that thread blocked in write() instead, and an
+        // unbounded exchange here then parks the global shells lock forever --
+        // every list, attach, detach and kill in the daemon wedges behind a
+        // single unresponsive session. Holding only an Arc keeps the ctl alive
+        // if the session is removed while we talk to it.
+        let mut targets = Vec::with_capacity(request.sessions.len());
         {
             let _s = span!(Level::INFO, "lock(shells)").entered();
             let shells = self.shells.lock();
             for session in request.sessions.into_iter() {
                 if let Some(s) = shells.get(&session) {
-                    let _s = span!(Level::INFO, "lock(shell_to_client_ctl)", s = session).entered();
-                    let shell_to_client_ctl = s.shell_to_client_ctl.lock();
-                    shell_to_client_ctl
-                        .client_connection
-                        .send(shell::ClientConnectionMsg::Disconnect)
-                        .context("sending client detach to shell->client")?;
-                    let status = shell_to_client_ctl
-                        .client_connection_ack
-                        .recv()
-                        .context("getting client conn ack")?;
-                    info!("detached session({}), status = {:?}", session, status);
-                    if let shell::ClientConnectionStatus::DetachNone = status {
-                        not_attached_sessions.push(session);
-                    } else {
-                        // The bidi-loop unwind in handle_attach owns the
-                        // SessionDetached publish; we just update
-                        // last_disconnected_at eagerly so a concurrent list()
-                        // reflects the detach immediately.
-                        s.lifecycle_timestamps.lock().last_disconnected_at =
-                            Some(time::SystemTime::now());
-                    }
+                    targets.push((session, Arc::clone(&s.shell_to_client_ctl)));
                 } else {
                     not_found_sessions.push(session);
+                }
+            }
+        }
+
+        // Both halves are bounded, matching the session-message detach path.
+        // A session that cannot complete the handshake in time is reported as
+        // not attached rather than being allowed to stall the daemon.
+        let mut detached_sessions = Vec::with_capacity(targets.len());
+        for (session, shell_to_client_ctl) in targets.into_iter() {
+            let _s = span!(Level::INFO, "lock(shell_to_client_ctl)", s = session).entered();
+            let shell_to_client_ctl = shell_to_client_ctl.lock();
+            if let Err(err) = shell_to_client_ctl
+                .client_connection
+                .send_timeout(shell::ClientConnectionMsg::Disconnect, SESSION_MSG_TIMEOUT)
+            {
+                error!("sending client detach to shell->client for {}: {:?}", session, err);
+                not_attached_sessions.push(session);
+                continue;
+            }
+            let status =
+                match shell_to_client_ctl.client_connection_ack.recv_timeout(SESSION_MSG_TIMEOUT) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        error!("getting client conn ack for {}: {:?}", session, err);
+                        not_attached_sessions.push(session);
+                        continue;
+                    }
+                };
+            info!("detached session({}), status = {:?}", session, status);
+            if let shell::ClientConnectionStatus::DetachNone = status {
+                not_attached_sessions.push(session);
+            } else {
+                detached_sessions.push(session);
+            }
+        }
+
+        // The bidi-loop unwind in handle_attach owns the SessionDetached
+        // publish; we just update the lifecycle state eagerly so a concurrent
+        // list() reflects the detach immediately.
+        if !detached_sessions.is_empty() {
+            let _s = span!(Level::INFO, "hook_lock(shells)").entered();
+            let shells = self.shells.lock();
+            for session in detached_sessions.iter() {
+                if let Some(s) = shells.get(session) {
+                    s.lifecycle.record_detached();
                 }
             }
         }
@@ -777,12 +825,12 @@ impl Server {
                     None => SessionStatus::Attached,
                 };
 
-                let timestamps = v.lifecycle_timestamps.lock();
-                let last_connected_at_unix_ms = timestamps
+                let lifecycle_state = v.lifecycle.snapshot();
+                let last_connected_at_unix_ms = lifecycle_state
                     .last_connected_at
                     .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
                     .transpose()?;
-                let last_disconnected_at_unix_ms = timestamps
+                let last_disconnected_at_unix_ms = lifecycle_state
                     .last_disconnected_at
                     .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
                     .transpose()?;
@@ -794,6 +842,7 @@ impl Server {
                     last_connected_at_unix_ms,
                     last_disconnected_at_unix_ms,
                     status,
+                    attachments: lifecycle_state.attachment.into_iter().collect(),
                 })
             })
             .collect();
@@ -895,7 +944,7 @@ impl Server {
         }
     }
 
-    /// Spawn a subshell and return the sessession descriptor for it. The
+    /// Spawn a subshell and return the session descriptor for it. The
     /// session is wrapped in an Arc so the inner session can hold a Weak
     /// back-reference to the session.
     #[instrument(skip_all)]
@@ -1042,7 +1091,7 @@ impl Server {
             let mut status = 0;
             let mut unpacked_status = None;
             loop {
-                // Saftey: all basic ffi, the pid is valid before this returns.
+                // Safety: all basic ffi, the pid is valid before this returns.
                 unsafe {
                     match libc::waitpid(waitable_child_pid, &mut status, 0) {
                         0 => continue,
@@ -1107,13 +1156,18 @@ impl Server {
         let (tty_size_change_ack_tx, tty_size_change_ack_rx) = crossbeam_channel::bounded(0);
 
         let (heartbeat_tx, heartbeat_rx) = crossbeam_channel::bounded(0);
-        let (heartbeat_ack_tx, heartbeat_ack_rx) = crossbeam_channel::bounded(0);
+        // One slot rather than a rendezvous, so the shell->client thread can
+        // always deposit an ack and get back to its select loop. If the
+        // heartbeat thread gave up waiting, the ack it abandoned sits here and
+        // is discarded by request id on the next pass.
+        let (heartbeat_ack_tx, heartbeat_ack_rx) = crossbeam_channel::bounded(1);
 
         // We make this buffered to avoid blocking during a broadcast. There is
         // no ack chan so we can afford to buffer a bit.
         let (maybe_switch_tx, maybe_switch_rx) = crossbeam_channel::bounded(10);
 
         let shell_to_client_ctl = Arc::new(Mutex::new(shell::ShellToClientCtl {
+            next_heartbeat_id: std::sync::atomic::AtomicU64::new(0),
             client_connection: client_connection_tx,
             client_connection_ack: client_connection_ack_rx,
             tty_size_change: tty_size_change_tx,
@@ -1172,7 +1226,7 @@ impl Server {
             child_pid,
             child_exit_notifier,
             started_at: time::SystemTime::now(),
-            lifecycle_timestamps: Mutex::new(shell::SessionLifecycleTimestamps::default()),
+            lifecycle: shell::SessionLifecycle::default(),
             inner: Arc::new(Mutex::new(session_inner)),
         })
     }
@@ -1327,11 +1381,12 @@ where
     Ok(())
 }
 
-/// check_peer makes sure that a process dialing in on the shpool
-/// control socket has the same UID as the current user and that
-/// both have the same executable path.
+/// check_peer makes sure that a process dialing in on the shpool control socket
+/// has the same UID as the current user and that both have the same executable
+/// path. Returns the peer's pid, which the kernel captures at connect time and
+/// keeps fixed for the life of the connection.
 #[cfg(target_os = "linux")]
-fn check_peer(sock: &UnixStream) -> anyhow::Result<()> {
+fn check_peer(sock: &UnixStream) -> anyhow::Result<libc::pid_t> {
     use nix::sys::socket;
 
     let peer_creds = socket::getsockopt(sock, socket::sockopt::PeerCredentials)
@@ -1350,11 +1405,11 @@ fn check_peer(sock: &UnixStream) -> anyhow::Result<()> {
         warn!("attach binary differs from daemon binary");
     }
 
-    Ok(())
+    Ok(peer_creds.pid())
 }
 
 #[cfg(target_os = "macos")]
-fn check_peer(sock: &UnixStream) -> anyhow::Result<()> {
+fn check_peer(sock: &UnixStream) -> anyhow::Result<libc::pid_t> {
     use std::os::unix::io::AsRawFd;
 
     let mut peer_uid: libc::uid_t = 0;
@@ -1393,15 +1448,15 @@ fn check_peer(sock: &UnixStream) -> anyhow::Result<()> {
         }
     }
 
-    let peer_pid = unistd::Pid::from_raw(peer_pid);
     let self_pid = unistd::Pid::this();
-    let peer_exe = exe_for_pid(peer_pid).context("could not resolve exe from the pid")?;
+    let peer_exe = exe_for_pid(unistd::Pid::from_raw(peer_pid))
+        .context("could not resolve exe from the pid")?;
     let self_exe = exe_for_pid(self_pid).context("could not resolve our own exe")?;
     if peer_exe != self_exe {
         warn!("attach binary differs from daemon binary");
     }
 
-    Ok(())
+    Ok(peer_pid)
 }
 
 #[cfg(target_os = "linux")]

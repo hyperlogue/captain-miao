@@ -34,22 +34,17 @@ tracing = "0.1"
 # without a regex engine) and no `ansi` — both layers set `.with_ansi(false)`,
 # since these logs are files, never a terminal.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 notify = "8"
 toml = "1.1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 futures-util = { version = "0.3", features = ["sink"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # `bundled` statically compiles SQLite into the binary, so reading Codex's
 # state_5.sqlite for session renames needs no `sqlite3` CLI at runtime.
-# Capped at 0.39 because 0.40 pulls libsqlite3-sys 0.38, whose build script used
-# `cfg_select!` while it was still unstable. That blocker is gone as of the 1.97
-# toolchain — 0.40.2 checks clean here with no code changes — so what remains is
-# an unmade decision, not an obstacle: lifting the cap ships a different bundled
-# SQLite, which wants its own test pass rather than riding along with a
-# toolchain bump.
-rusqlite = { version = "0.39", features = ["bundled"] }
+# libsqlite3-sys uses `cfg_select!`, setting the workspace's Rust 1.95 floor.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 # Exercise deferred title refreshes with a paused clock, without wall sleeps.

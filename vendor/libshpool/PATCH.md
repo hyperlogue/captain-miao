@@ -1,6 +1,6 @@
 # Local libshpool extension
 
-Source: the crates.io `libshpool` 0.11.0 package, under Apache-2.0 (`LICENSE`).
+Source: the crates.io `libshpool` 0.11.4 package, under Apache-2.0 (`LICENSE`).
 The manifest is the registry's normalized manifest; upstream source and its
 copyright notices are retained.
 Two upstream TODO author labels are omitted from comments.

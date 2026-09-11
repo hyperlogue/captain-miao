@@ -921,7 +921,7 @@ mod tests {
         };
         let args = ServerArgs {
             source: "build".into(),
-            files: vec![format!("x86_64-unknown-linux-gnuu=/tmp/a")],
+            files: vec!["x86_64-unknown-linux-gnuu=/tmp/a".to_string()],
             release_base: server::RELEASE_BASE.into(),
         };
         let wanted: BTreeSet<&str> = [X86].into_iter().collect();

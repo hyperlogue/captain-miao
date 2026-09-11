@@ -29,7 +29,7 @@ use std::{
 use anyhow::{anyhow, Context};
 use nix::{poll, poll::PollFlags, sys::signal, unistd::Pid};
 use parking_lot::Mutex;
-use shpool_protocol::{Chunk, ChunkKind, MaybeSwitch, TtySize};
+use shpool_protocol::{Attachment, Chunk, ChunkKind, MaybeSwitch, TtySize};
 use tracing::{debug, error, info, instrument, span, trace, warn, Level};
 
 use crate::{
@@ -63,19 +63,54 @@ const SHELL_TO_CLIENT_POLL_MS: u16 = 50;
 // shell->client thread.
 const SHELL_TO_CLIENT_CTL_TIMEOUT: time::Duration = time::Duration::from_millis(300);
 
-/// Timestamps tracking when sessions were last connected/disconnected.
-/// Combined behind a single lock to avoid taking multiple locks.
+/// Lifecycle state tracking when sessions were last connected/disconnected and
+/// by whom. The fields update in lockstep, so they live behind a single private
+/// lock that only this type's methods take, exactly once per update or read.
 #[derive(Debug, Default)]
-pub struct SessionLifecycleTimestamps {
+pub struct SessionLifecycle {
+    state: Mutex<SessionLifecycleState>,
+}
+
+impl SessionLifecycle {
+    /// Record a client attaching to the session.
+    pub fn record_attached(&self, attachment: Attachment) {
+        let mut state = self.state.lock();
+        state.last_connected_at = Some(time::SystemTime::now());
+        state.attachment = Some(attachment);
+    }
+
+    /// Record the attached client going away.
+    pub fn record_detached(&self) {
+        let mut state = self.state.lock();
+        state.last_disconnected_at = Some(time::SystemTime::now());
+        state.attachment = None;
+    }
+
+    /// Return a copy of the current lifecycle state.
+    pub fn snapshot(&self) -> SessionLifecycleState {
+        self.state.lock().clone()
+    }
+}
+
+/// A session's lifecycle data, handed out by value via
+/// [`SessionLifecycle::snapshot`].
+#[derive(Clone, Debug, Default)]
+pub struct SessionLifecycleState {
     pub last_connected_at: Option<time::SystemTime>,
     pub last_disconnected_at: Option<time::SystemTime>,
+    /// This session's attachment, if any. An `Option` here, but reported by
+    /// `handle_list` as a list so the wire can grow to multiple attachments
+    /// without a breaking change. Kept here rather than in `inner` because a
+    /// client holds `inner` while attached, which would otherwise prevent
+    /// `handle_list` from reading it while a client is attached.
+    pub attachment: Option<Attachment>,
 }
 
 /// Session represent a shell session
 #[derive(Debug)]
 pub struct Session {
     pub started_at: time::SystemTime,
-    pub lifecycle_timestamps: Mutex<SessionLifecycleTimestamps>,
+    pub lifecycle: SessionLifecycle,
     pub child_pid: libc::pid_t,
     pub child_exit_notifier: Arc<ExitNotifier>,
     pub shell_to_client_ctl: Arc<Mutex<ShellToClientCtl>>,
@@ -95,13 +130,21 @@ impl Session {
         // from a process. We can't use the normal SIGTERM graceful-shutdown
         // signal since shells just forward those to their child process,
         // but for shells SIGHUP serves as the graceful shutdown signal.
-        signal::kill(Pid::from_raw(self.child_pid), Some(signal::Signal::SIGHUP))
-            .context("sending SIGHUP to child proc")?;
+        match signal::kill(Pid::from_raw(self.child_pid), Some(signal::Signal::SIGHUP)) {
+            // ESRCH means "no such process", so the child is already gone and
+            // there is nothing left to kill.
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            res => res.context("sending SIGHUP to child proc")?,
+        }
 
         if self.child_exit_notifier.wait(Some(SHELL_KILL_TIMEOUT)).is_none() {
             info!("child failed to exit within kill timeout, no longer being polite");
-            signal::kill(Pid::from_raw(self.child_pid), Some(signal::Signal::SIGKILL))
-                .context("sending SIGKILL to child proc")?;
+            match signal::kill(Pid::from_raw(self.child_pid), Some(signal::Signal::SIGKILL)) {
+                // ESRCH means "no such process", so the child exited on its own
+                // between the SIGHUP and now.
+                Err(nix::errno::Errno::ESRCH) => return Ok(()),
+                res => res.context("sending SIGKILL to child proc")?,
+            }
         }
 
         Ok(())
@@ -211,10 +254,12 @@ pub struct ShellToClientArgs {
     pub client_connection_ack: crossbeam_channel::Sender<ClientConnectionStatus>,
     pub tty_size_change: crossbeam_channel::Receiver<TtySize>,
     pub tty_size_change_ack: crossbeam_channel::Sender<()>,
-    pub heartbeat: crossbeam_channel::Receiver<()>,
+    // Carries the request id that the ack must echo back.
+    pub heartbeat: crossbeam_channel::Receiver<u64>,
     pub maybe_switch: crossbeam_channel::Receiver<MaybeSwitch>,
-    // true if the client is still live, false if it has hung up on us
-    pub heartbeat_ack: crossbeam_channel::Sender<bool>,
+    // The request id of the heartbeat this ack answers, and a flag that is
+    // true if the client is still live, false if it has hung up on us.
+    pub heartbeat_ack: crossbeam_channel::Sender<(u64, bool)>,
     pub child_exit_notifier: Arc<ExitNotifier>,
 }
 
@@ -247,7 +292,7 @@ impl SessionInner {
 
             let mut output_spool = match args.session_spool {
                 Some(spool) => spool as Box<dyn session_restore::SessionSpool>,
-                None => session_restore::new(config, &args.tty_size, args.scrollback_lines),
+                None => session_restore::new(config, &args.tty_size, args.scrollback_lines, &name),
             };
             let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
             let mut poll_fds = [poll::PollFd::new(
@@ -378,7 +423,7 @@ impl SessionInner {
                             }
                         }
                     }
-                    recv(args.heartbeat) -> _ => {
+                    recv(args.heartbeat) -> request_id => {
                         let client_present = if let ClientConnectionMsg::New(conn) = &mut client_conn {
                             let chunk = Chunk { kind: ChunkKind::Heartbeat, buf: &[] };
                             match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
@@ -399,7 +444,9 @@ impl SessionInner {
                             false
                         };
 
-                        args.heartbeat_ack.send(client_present)
+                        test_hooks::emit("daemon-wrote-heartbeat");
+
+                        args.heartbeat_ack.send((request_id.unwrap_or(0), client_present))
                             .context("sending heartbeat ack")?;
                     }
                     recv(args.maybe_switch) -> maybe_switch => {
@@ -951,7 +998,7 @@ impl SessionInner {
             .spawn_scoped(scope, move || -> anyhow::Result<()> {
                 let _s1 = span!(Level::INFO, "heartbeat", s = self.name, cid = conn_id).entered();
 
-                loop {
+                'heartbeat: loop {
                     trace!("checking stop_rx");
                     let stop_early = common::sleep_unless(
                         consts::HEARTBEAT_DURATION,
@@ -964,9 +1011,13 @@ impl SessionInner {
                     }
                     {
                         let shell_to_client_ctl = self.shell_to_client_ctl.lock();
+
+                        let request_id =
+                            shell_to_client_ctl.next_heartbeat_id.fetch_add(1, Ordering::Relaxed);
+
                         match shell_to_client_ctl
                             .heartbeat
-                            .send_timeout((), SHELL_TO_CLIENT_CTL_TIMEOUT)
+                            .send_timeout(request_id, SHELL_TO_CLIENT_CTL_TIMEOUT)
                         {
                             // If the channel is disconnected, it means that the shell exited and
                             // the shell->client process exited cleanly. We should not raise a
@@ -984,16 +1035,28 @@ impl SessionInner {
                             }
                             _ => {}
                         }
-                        let client_present = match shell_to_client_ctl
-                            .heartbeat_ack
-                            .recv_timeout(SHELL_TO_CLIENT_CTL_TIMEOUT)
-                        {
-                            // If the channel is disconnected, it means that the shell exited and
-                            // the shell->client process exited cleanly. We should not raise a
-                            // ruckus.
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-                            Err(e) => return Err(e).context("waiting for heartbeat ack"),
-                            Ok(client_present) => client_present,
+                        let client_present = loop {
+                            match shell_to_client_ctl
+                                .heartbeat_ack
+                                .recv_timeout(SHELL_TO_CLIENT_CTL_TIMEOUT)
+                            {
+                                // If the channel is disconnected, it means that the shell exited
+                                // and the shell->client process exited cleanly. We should not
+                                // raise a ruckus.
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                    return Ok(())
+                                }
+                                // Like the send timeout above, a slow ack just means
+                                // the shell->client thread is busy, not that the
+                                // client is gone. A dead client still gets noticed
+                                // when the write to it fails.
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                    continue 'heartbeat
+                                }
+                                // An ack for a request we already gave up on.
+                                Ok((ack_id, _)) if ack_id != request_id => continue,
+                                Ok((_, client_present)) => break client_present,
+                            }
                         };
                         if !client_present {
                             // Bail from the thread to get the rest of the
@@ -1095,11 +1158,19 @@ pub struct ShellToClientCtl {
     pub tty_size_change_ack: crossbeam_channel::Receiver<()>,
 
     // A control channel telling the shell->client thread to issue
-    // a heartbeat to check if the client is still listening.
-    pub heartbeat: crossbeam_channel::Sender<()>,
-    // True if the client is still listening, false if it has hung up
-    // on us.
-    pub heartbeat_ack: crossbeam_channel::Receiver<bool>,
+    // a heartbeat to check if the client is still listening. The payload
+    // is a request id, which the ack echoes back.
+    pub heartbeat: crossbeam_channel::Sender<u64>,
+    // The request id of the heartbeat this ack answers, and a flag that is
+    // true if the client is still listening, false if it has hung up on us.
+    //
+    // The heartbeat thread gives up waiting for an ack that takes too long,
+    // so a late ack can still turn up afterwards. The id is what lets the
+    // next read tell that ack apart from its own and discard it.
+    pub heartbeat_ack: crossbeam_channel::Receiver<(u64, bool)>,
+
+    /// The id to give the next heartbeat request.
+    pub next_heartbeat_id: std::sync::atomic::AtomicU64,
 
     /// A control channel telling the shell->client thread to
     /// broadcast the given MaybeSwitch. There is no ack channel
