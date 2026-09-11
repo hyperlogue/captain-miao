@@ -1368,11 +1368,11 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
             Some("  Unix socket on this host; unix:// uses the Codex default")
         }
         HostField::Target => Some("  ^t toggle ssh / socket"),
-        // An example of the one thing this field is really for, and a pointer to
-        // where the rest belongs — which is the question the field raises rather
-        // than answers.
-        HostField::Options => Some("  SSH arguments with quoting; host setup: ~/.ssh/config"),
-        HostField::Forwards => Some("  Enter manage forwards   save host changes before opening"),
+        // Point port setup toward the dedicated manager beside this field.
+        HostField::Options => Some("  Quoted SSH arguments; use Port forwards below for tunnels"),
+        HostField::Forwards => {
+            Some("  Enter manage ports or import -L/-R/-D; save host edits first")
+        }
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Names the key, then the direction — "clipboard" on a host row could as
         // easily mean the host's own, and *whose* it is is the whole point. It is

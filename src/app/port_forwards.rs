@@ -98,6 +98,46 @@ const KINDS: [&str; 3] = [
 ];
 
 impl Draft {
+    fn direction_hint(&self) -> &'static str {
+        match self.kind {
+            1 => "Remote: listen on the SSH host; reach the destination from this machine.",
+            2 => "SOCKS: apps on this machine use a proxy through the SSH host.",
+            _ => "Local: listen on this machine; reach the destination from the SSH host.",
+        }
+    }
+
+    fn field_hint(&self) -> &'static str {
+        match self.focus {
+            Field::Name => "Optional label, e.g. Web app. Leave blank to use the type and port.",
+            Field::Kind => "Space or ←/→ changes type: Local (-L), Remote (-R), SOCKS (-D).",
+            Field::Port if self.linked_port && self.kind != 2 => {
+                "Enter a port, e.g. 3000. Destination port follows until you edit it."
+            }
+            Field::Port => "Port to listen on: 1–65535. Choose a free port to avoid conflicts.",
+            Field::Destination if self.kind == 1 => {
+                "Destination host as reached from this machine; localhost means this machine."
+            }
+            Field::Destination => {
+                "Destination host as reached from the SSH host; localhost means the SSH host."
+            }
+            Field::DestinationPort => {
+                "Port where the destination app runs; it may differ from the listening port."
+            }
+            Field::Bind => {
+                "localhost accepts loopback connections only; * accepts all interfaces (SSH policy applies)."
+            }
+            Field::Raw if self.kind == 2 => {
+                "SOCKS specification: [bind_address:]port, e.g. localhost:1080."
+            }
+            Field::Raw => {
+                "Specification only; Type supplies -L/-R/-D. Raw mode also accepts UNIX socket paths."
+            }
+            Field::Enabled => {
+                "Space or ←/→ toggles forwarding. Off keeps the saved rule for later."
+            }
+        }
+    }
+
     fn new(rule: Option<&Rule>, index: Option<usize>) -> Self {
         let tcp = rule.and_then(|r| r.forward.tcp());
         Self {
@@ -567,12 +607,14 @@ impl App {
             .unwrap();
         if view.pending.is_some() {
             "Applying forwarding changes…"
+        } else if view.remove {
+            "y Delete and apply   Any other key Cancel"
         } else if view.import.is_some() {
             "Enter Import and apply   Esc Cancel"
         } else if view.edit.is_some() {
-            "Tab/↑↓ Field   ^r Raw/form   Enter Save and apply   Esc Cancel"
+            "Tab/↑↓ Field   Ctrl-r Raw/form   Enter Save and apply   Esc Cancel draft"
         } else {
-            "a Add   Enter Edit   Space Toggle   y Duplicate   i Import   d Delete   r Retry   Esc Back"
+            "a Add   Enter Edit   i Import   Esc Back (keeps saved rules)"
         }
     }
 
@@ -589,7 +631,14 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let width = inner.width as usize;
+        let wrapped = |text: &str| -> Vec<Line<'static>> {
+            super::draw::wrap_ranges(text, width)
+                .into_iter()
+                .map(|r| Line::from(text[r.start..r.end].to_owned()))
+                .collect()
+        };
         let mut lines = Vec::new();
+        let mut help = Vec::new();
         let mut focus_line = 0;
         if let Some(edit) = &view.edit {
             lines.push(Line::from(if edit.index.is_some() {
@@ -638,35 +687,45 @@ impl App {
                     lines.push(Line::from(spans));
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(match edit.kind {
-                1 => "Remote listens; destination is reached from this machine.",
-                2 => "This machine provides a SOCKS proxy through the remote host.",
-                _ => "This machine listens; destination is reached from the remote host.",
-            }));
-            if edit.focus == Field::Bind {
-                lines.push(Line::from(
-                    "localhost: loopback only · *: all interfaces (remote SSH policy applies)",
-                ));
-            }
+            help.push(edit.field_hint());
+            help.push(edit.direction_hint());
         } else if let Some(input) = &view.import {
-            lines.push(Line::from("Import ports or SSH forwarding arguments"));
-            lines.push(Line::from(
-                "Examples: 3000 5173 8080   or   -L 8080:localhost:3000 -D1080",
-            ));
+            for text in [
+                "Paste ports separated by spaces or newlines: 3000 5173 8080",
+                "Each creates a local forward to the same port on remote localhost.",
+                "Or paste SSH forwarding arguments (combine them with spaces):",
+                "  -L 8080:localhost:3000   This machine's 8080 → remote app's 3000",
+                "  -R 9000:localhost:3000   Remote 9000 → this machine's app on 3000",
+                "  -D 1080                 SOCKS proxy on this machine's port 1080",
+            ] {
+                lines.extend(wrapped(text));
+            }
             lines.push(Line::from(""));
+            lines.push(Line::from("Import >"));
             lines.extend(
                 text_field_lines(input, true, width)
                     .into_iter()
                     .map(Line::from),
             );
             focus_line = lines.len().saturating_sub(1);
+            help.push("Enter imports; paste alone does not apply. Esc cancels the import.");
+            help.push("Rules are appended. Conflicting ports reject the entire import.");
         } else {
             let manager = self.forward_manager();
             if row.forwards.is_empty() {
-                lines.push(Line::from(
-                    "No port forwards. Press a to add one or i to import ports.",
-                ));
+                for text in [
+                    "No port forwards yet.",
+                    "Reach an app on the SSH host from this machine through a local port.",
+                    "Press a, enter 3000, then Enter to forward localhost:3000 on both sides.",
+                    "For several ports, press i and paste e.g. 3000 5173 8080.",
+                ] {
+                    lines.extend(wrapped(text));
+                }
+                help.push("a Add one forward   i Import several (or paste here)");
+            } else {
+                help.push("↑/↓ or j/k Select   a Add   Enter Edit   Space Enable/disable");
+                help.push("y Duplicate   i Import (or paste)   d Delete   r Retry failures");
+                help.push("Listening means SSH accepted the port; app health is unchecked.");
             }
             // Two lines per rule keep both endpoints readable on narrow TUI
             // windows and leave errors beside the rule that produced them.
@@ -728,6 +787,12 @@ impl App {
                 }
             }
         }
+        help.push("Saves apply immediately; offline changes wait for the host.");
+        help.push("Esc keeps saved rules. No session restart is needed.");
+        // Keep the controls and focused field's explanation visible while the
+        // list or a long specification scrolls. Leave room for the actual input.
+        let help_lines: Vec<Line> = help.into_iter().flat_map(wrapped).collect();
+        let help_height = (help_lines.len() as u16).min(inner.height / 2);
         let message = if view.pending.is_some() {
             Some("Applying forwarding changes…")
         } else if view.remove {
@@ -735,19 +800,15 @@ impl App {
         } else {
             view.message.as_deref()
         };
-        let message_lines: Vec<Line> = message
-            .map(|message| {
-                super::draw::wrap_ranges(message, width)
-                    .into_iter()
-                    .map(|r| Line::from(message[r.start..r.end].to_owned()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let footer_height = (message_lines.len() as u16).min(inner.height.saturating_sub(2));
+        let message_lines = message.map(wrapped).unwrap_or_default();
+        let footer_height =
+            (message_lines.len() as u16).min(inner.height.saturating_sub(help_height + 4));
         let body_height = inner
             .height
-            .saturating_sub(footer_height + u16::from(footer_height > 0));
-        let scroll = focus_line.saturating_sub(body_height.saturating_sub(3) as usize);
+            .saturating_sub(help_height + 1 + footer_height + u16::from(footer_height > 0));
+        let scroll = focus_line
+            .saturating_sub(body_height.saturating_sub(3) as usize)
+            .min(lines.len().saturating_sub(body_height as usize));
         frame.render_widget(
             Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             Rect {
@@ -760,12 +821,20 @@ impl App {
                 Paragraph::new(message_lines)
                     .style(Style::default().fg(crate::config::get().colors.ui.attention_fg)),
                 Rect {
-                    y: inner.y + inner.height - footer_height,
+                    y: inner.y + inner.height - help_height - footer_height - 1,
                     height: footer_height,
                     ..inner
                 },
             );
         }
+        frame.render_widget(
+            Paragraph::new(help_lines).style(Style::default().add_modifier(Modifier::DIM)),
+            Rect {
+                y: inner.y + inner.height - help_height,
+                height: help_height,
+                ..inner
+            },
+        );
     }
 }
 
