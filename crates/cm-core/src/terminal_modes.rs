@@ -498,8 +498,10 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    // macOS declares these mutable; Linux accepts the coercion
+                    // to const pointers for the same optional arguments.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
