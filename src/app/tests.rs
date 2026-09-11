@@ -5937,7 +5937,18 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(super::HostField::CodexMode)
     );
+    let rendered = d.render();
+    assert!(rendered.contains("Codex connection [native]"));
+    assert!(!rendered.contains("Codex endpoint"));
+    for key in [KeyCode::Tab, KeyCode::BackTab] {
+        d.press(key);
+        assert_eq!(
+            d.app.host_edit.as_ref().unwrap().focus(),
+            Some(super::HostField::CodexMode)
+        );
+    }
     d.press(KeyCode::Char(' '));
+    assert!(d.render().contains("Codex endpoint"));
     d.press(KeyCode::Esc);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().rows[0]
@@ -5991,7 +6002,21 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::CodexMode)
     );
+    assert!(!d.render().contains("Codex endpoint"));
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::Label)
+    );
+    d.press(KeyCode::BackTab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::CodexMode)
+    );
     d.press(KeyCode::Char(' '));
+    let rendered = d.render();
+    assert!(rendered.contains("Codex connection [app-server]"));
+    assert!(rendered.contains("Codex endpoint"));
     let Some(Action::ConfigureCodex { host, .. }) = d.press(KeyCode::Enter) else {
         panic!("expected host write")
     };

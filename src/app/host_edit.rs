@@ -262,6 +262,29 @@ impl HostField {
         HostField::CodexEndpoint,
     ];
 
+    fn label(self) -> &'static str {
+        match self {
+            Self::Label => "Label",
+            Self::Target => "Target",
+            Self::Options => "Options",
+            Self::Icon => "Icon",
+            Self::Clipboard => "Clipboard",
+            Self::CodexMode => "Codex connection",
+            Self::CodexEndpoint => "Codex endpoint",
+        }
+    }
+
+    fn visible_for(self, row: &HostRow) -> bool {
+        match self {
+            Self::CodexMode => row.codex.is_some(),
+            Self::CodexEndpoint => row
+                .codex
+                .as_ref()
+                .is_some_and(|config| !config.mode.is_native()),
+            _ => !row.is_local,
+        }
+    }
+
     /// The next field, forwards or back. Wraps: the form is a ring, so
     /// overshooting the last field costs one more press either way.
     pub(in crate::app) fn step(self, forward: bool) -> Self {
@@ -666,11 +689,21 @@ impl App {
             // frame and its padding are two cells a side — less the fixed
             // columns ahead of the value, less one cell for the end-of-text
             // cursor, which needs somewhere to sit on an otherwise full line.
-            let value_w = (width as usize).saturating_sub(4 + HOST_VALUE_COL + 1);
+            let label_w = HostField::ORDER
+                .iter()
+                .filter(|field| field.visible_for(r))
+                .map(|field| field.label().len())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let value_col = 2 + label_w;
+            let value_w = (width as usize).saturating_sub(4 + value_col + 1);
             // A field's rows: the mark and label on the first, continuation lines
             // indented to the value column so a value that wrapped still reads as
             // one field rather than as a nameless new one.
-            let field_rows = |focused: bool, label: &str, values: Vec<Vec<Span<'static>>>| {
+            let field_rows = |field: HostField, values: Vec<Vec<Span<'static>>>| {
+                let focused = focus == field;
+                let label = field.label();
                 values
                     .into_iter()
                     .enumerate()
@@ -682,16 +715,14 @@ impl App {
                                 } else {
                                     Span::raw("  ")
                                 },
-                                // 10, not 9: `Clipboard` is exactly nine cells,
-                                // and a label that fills its own column runs into
-                                // the value.
+                                // Reserve a gap after the widest visible label.
                                 Span::styled(
-                                    format!("{label:<10}"),
+                                    format!("{label:<label_w$}"),
                                     Style::default().add_modifier(Modifier::DIM),
                                 ),
                             ]
                         } else {
-                            vec![Span::raw(" ".repeat(HOST_VALUE_COL))]
+                            vec![Span::raw(" ".repeat(value_col))]
                         };
                         spans.extend(value);
                         Line::from(spans)
@@ -737,41 +768,29 @@ impl App {
                 ),
                 Span::raw(if r.clipboard { "\u{1f4cb}" } else { "" }),
             ];
-            let mut form_lines = field_rows(focus == HostField::Label, "Label", label_lines);
-            form_lines.extend(field_rows(
-                focus == HostField::Target,
-                "Target",
-                target_lines,
-            ));
-            form_lines.extend(field_rows(
-                focus == HostField::Options,
-                "Options",
-                options_lines,
-            ));
-            form_lines.extend(field_rows(focus == HostField::Icon, "Icon", icon_lines));
-            form_lines.extend(field_rows(
-                focus == HostField::Clipboard,
-                "Clipboard",
-                vec![clipboard_line],
-            ));
+            let mut form_lines = field_rows(HostField::Label, label_lines);
+            form_lines.extend(field_rows(HostField::Target, target_lines));
+            form_lines.extend(field_rows(HostField::Options, options_lines));
+            form_lines.extend(field_rows(HostField::Icon, icon_lines));
+            form_lines.extend(field_rows(HostField::Clipboard, vec![clipboard_line]));
             if r.is_local {
                 form_lines.clear();
             }
             if let Some(codex) = &r.codex {
                 form_lines.extend(field_rows(
-                    focus == HostField::CodexMode,
-                    "Codex",
+                    HostField::CodexMode,
                     vec![vec![Span::raw(format!("[{}]", codex.mode.label()))]],
                 ));
-                form_lines.extend(field_rows(
-                    focus == HostField::CodexEndpoint,
-                    "Endpoint",
-                    text_field_lines(
-                        &r.codex_endpoint,
-                        focus == HostField::CodexEndpoint,
-                        value_w,
-                    ),
-                ));
+                if HostField::CodexEndpoint.visible_for(r) {
+                    form_lines.extend(field_rows(
+                        HostField::CodexEndpoint,
+                        text_field_lines(
+                            &r.codex_endpoint,
+                            focus == HostField::CodexEndpoint,
+                            value_w,
+                        ),
+                    ));
+                }
             } else if r.is_local {
                 form_lines.push(Line::from(
                     r.codex_error
@@ -951,11 +970,7 @@ impl App {
                     let row = &state.rows[state.cursor];
                     let mut next = focus.step(forward);
                     for _ in 0..HostField::ORDER.len() {
-                        let codex_field =
-                            matches!(next, HostField::CodexMode | HostField::CodexEndpoint);
-                        if (row.is_local && codex_field)
-                            || (!row.is_local && (!codex_field || row.codex.is_some()))
-                        {
+                        if next.visible_for(row) {
                             break;
                         }
                         next = next.step(forward);
@@ -1242,11 +1257,6 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         }
     }
 }
-
-/// Where a hosts-editor field's value starts: the focus mark (2) and the label
-/// column (10). Continuation lines indent to it, and it is what the wrap width
-/// is measured back from.
-const HOST_VALUE_COL: usize = 12;
 
 /// One form field's value, wrapped to `width` cells, with the cursor drawn where
 /// it actually is.
