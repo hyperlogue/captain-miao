@@ -5,9 +5,37 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub(crate) enum Observation {
-    Client(Value),
+    Client { id: String, method: String },
     Server(Value),
     Disconnected,
+}
+
+impl Observation {
+    /// Retain only metadata request identities. Codex also starts root threads
+    /// for internal features (such as recaps) on the TUI's connection; neither
+    /// their replies nor their errors belong to the managed conversation.
+    pub(crate) fn client(value: &Value) -> Option<Self> {
+        let method = value["method"].as_str()?;
+        if !matches!(
+            method,
+            "thread/start" | "thread/resume" | "thread/fork" | "thread/read"
+        ) || background_thread(&value["params"])
+        {
+            return None;
+        }
+        Some(Self::Client {
+            id: value.get("id")?.to_string(),
+            method: method.into(),
+        })
+    }
+}
+
+fn background_thread(value: &Value) -> bool {
+    // Older threads can lack this classification. Ephemeral alone is not a
+    // background marker: the user can start a genuine ephemeral conversation.
+    value["threadSource"]
+        .as_str()
+        .is_some_and(|source| source != "user")
 }
 
 #[derive(Default)]
@@ -31,20 +59,11 @@ impl Monitor {
                     Some("Codex app-server disconnected; reconnect in the Codex terminal".into());
                 transition(state, SessionStatus::Starting);
             }
-            Observation::Client(value) => {
-                let method = value["method"].as_str().unwrap_or_default();
-                if matches!(
-                    method,
-                    "thread/start" | "thread/resume" | "thread/fork" | "thread/read"
-                ) && let Some(id) = value.get("id")
-                {
-                    // Only outstanding metadata requests are retained, never prompts,
-                    // tool arguments or configuration (which may include secrets).
-                    if self.pending.len() >= 128 {
-                        self.pending.clear();
-                    }
-                    self.pending.insert(id.to_string(), method.into());
+            Observation::Client { id, method } => {
+                if self.pending.len() >= 128 {
+                    self.pending.clear();
                 }
+                self.pending.insert(id, method);
             }
             Observation::Server(value) => {
                 self.server(state, value);
@@ -68,6 +87,7 @@ impl Monitor {
             let thread = &result["thread"];
             if thread["id"].as_str().is_some()
                 && thread["parentThreadId"].is_null()
+                && !background_thread(thread)
                 && (method != "thread/read" || thread["id"].as_str() == state.session_id.as_deref())
             {
                 state.last_error = None;
@@ -96,7 +116,7 @@ impl Monitor {
         let method = value["method"].as_str().unwrap_or_default();
         let params = &value["params"];
         // A connection can observe many threads. Only a successful TUI lifecycle
-        // response selects the row; background subagents never take it over.
+        // response selects the row; subagents and feature threads never take it over.
         if params["threadId"].as_str() != state.session_id.as_deref() || state.session_id.is_none()
         {
             return;

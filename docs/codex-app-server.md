@@ -60,8 +60,12 @@ subscribe to threads.
 The launcher remains the sole writer of its session state. The dashboard and
 remote session subscription consume that state as before. App-server sessions
 never enter the native title overlay. Thread identity uses `thread.id`, not the
-`sessionId` shared by a root and its subagents; child events cannot replace the
-root row.
+`sessionId` shared by a root and its subagents. Lifecycle requests and responses
+also exclude non-user `threadSource` values: Codex's internal features, such as
+catch-up summaries, create temporary root threads on the same connection.
+Their prompts, context usage and closure cannot replace or disconnect the
+managed conversation. User conversations still support ephemeral mode, and
+older threads without source metadata remain supported.
 
 Restart still opens the replacement terminal before closing the old one. Its
 launcher waits for the previous owner to finish before resuming the thread.

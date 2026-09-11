@@ -34,7 +34,12 @@ fn state() -> LauncherState {
     }
 }
 fn request(m: &mut Monitor, s: &mut LauncherState, id: u64, method: &str) {
-    m.apply(s, Observation::Client(json!({"id":id,"method":method})));
+    observe_request(m, s, json!({"id":id,"method":method}));
+}
+fn observe_request(m: &mut Monitor, s: &mut LauncherState, value: Value) {
+    if let Some(observation) = Observation::client(&value) {
+        m.apply(s, observation);
+    }
 }
 fn notify(m: &mut Monitor, s: &mut LauncherState, method: &str, params: Value) {
     m.apply(
@@ -149,6 +154,129 @@ fn subagents_and_inventory_reads_never_replace_the_selected_root() {
         ),
     );
     assert_eq!(s, before);
+}
+
+#[test]
+fn catchup_thread_cannot_replace_the_managed_conversation() {
+    let (mut m, mut s) = (Monitor::default(), state());
+    resume(&mut m, &mut s);
+    notify(
+        &mut m,
+        &mut s,
+        "item/started",
+        json!({"threadId":"thread-root","item":{"type":"userMessage","content":[{"type":"text","text":"Actual user prompt"}]}}),
+    );
+    notify(
+        &mut m,
+        &mut s,
+        "turn/started",
+        json!({"threadId":"thread-root","turn":{"id":"user-turn"}}),
+    );
+    let before = s.clone();
+    observe_request(
+        &mut m,
+        &mut s,
+        json!({"id":2,"method":"thread/start","params":{"ephemeral":true,"threadSource":"system"}}),
+    );
+    m.apply(
+        &mut s,
+        Observation::Server(json!({"id":2,"result":{"thread":{
+            "id":"catchup-thread","parentThreadId":null,"ephemeral":true,"threadSource":"system",
+            "name":null,"preview":"","status":{"type":"idle"}
+        }}})),
+    );
+    notify(
+        &mut m,
+        &mut s,
+        "item/started",
+        json!({"threadId":"catchup-thread","item":{"type":"userMessage","content":[{"type":"text","text":"Write a brief catch-up"}]}}),
+    );
+    notify(
+        &mut m,
+        &mut s,
+        "thread/tokenUsage/updated",
+        json!({"threadId":"catchup-thread","tokenUsage":{"last":{"totalTokens":8000}}}),
+    );
+    notify(
+        &mut m,
+        &mut s,
+        "thread/closed",
+        json!({"threadId":"catchup-thread"}),
+    );
+    assert_eq!(s, before);
+    assert_eq!(m.turn.as_deref(), Some("user-turn"));
+}
+
+#[test]
+fn background_thread_snapshots_and_failed_starts_leave_the_row_unchanged() {
+    let (mut m, mut s) = (Monitor::default(), state());
+    resume(&mut m, &mut s);
+    s.last_error = Some("Existing conversation error".into());
+    let before = s.clone();
+    // A read/resume request need not carry the source; the response still must
+    // identify a user conversation before it can replace the row.
+    for source in [
+        "system",
+        "subagent",
+        "guardian_review",
+        "memory_consolidation",
+    ] {
+        for method in [
+            "thread/start",
+            "thread/resume",
+            "thread/fork",
+            "thread/read",
+        ] {
+            request(&mut m, &mut s, 2, method);
+            m.apply(
+                &mut s,
+                Observation::Server(json!({"id":2,"result":{"thread":{
+                    "id":"thread-root","threadSource":source,"parentThreadId":null,
+                    "name":"Internal task","status":{"type":"idle"}
+                }}})),
+            );
+            assert_eq!(s, before, "{source} {method}");
+        }
+        observe_request(
+            &mut m,
+            &mut s,
+            json!({"id":"helper","method":"thread/start","params":{"threadSource":source}}),
+        );
+        m.apply(
+            &mut s,
+            Observation::Server(
+                json!({"id":"helper","error":{"code":-32600,"message":"Internal task failed"}}),
+            ),
+        );
+        assert_eq!(s, before, "{source} error");
+    }
+}
+
+#[test]
+fn user_and_legacy_lifecycle_responses_can_select_ephemeral_conversations() {
+    for source in [json!("user"), Value::Null] {
+        for ephemeral in [true, false] {
+            for method in ["thread/start", "thread/resume", "thread/fork"] {
+                let (mut m, mut s) = (Monitor::default(), state());
+                resume(&mut m, &mut s);
+                m.apply(&mut s, Observation::Disconnected);
+                observe_request(
+                    &mut m,
+                    &mut s,
+                    json!({"id":2,"method":method,"params":{"threadSource":source,"ephemeral":ephemeral}}),
+                );
+                m.apply(&mut s, Observation::Server(json!({"id":2,"result":{"thread":{
+                    "id":"selected-thread","threadSource":source,"ephemeral":ephemeral,
+                    "name":"Selected conversation","preview":"Selected prompt","status":{"type":"idle"}
+                }}})));
+                assert_eq!(s.session_id.as_deref(), Some("selected-thread"));
+                assert_eq!(s.name.as_deref(), Some("Selected conversation"));
+                assert_eq!(s.codex_connected, Some(true));
+                assert_eq!(s.status, S::Idle);
+                assert!(s.last_error.is_none());
+            }
+        }
+    }
 }
 
 #[test]
@@ -320,7 +448,10 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
             );
             send(
                 &mut ws,
-                &json!({"id":8,"result":{"thread":{"id":"thread-root","status":{"type":"idle"}}}}),
+                &json!({"id":8,"result":{"thread":{
+                    "id":"thread-root","name":"Saved title","status":{"type":"idle"},
+                    "turns":[{"items":[{"type":"userMessage","content":[{"type":"text","text":"Actual user prompt"}]}]}]
+                }}}),
             )
             .await;
             send(&mut ws,&json!({"id":"approval","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-root","command":"build"}})).await;
@@ -328,6 +459,22 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
                 receive(&mut ws).await,
                 json!({"id":"approval","result":{"decision":"decline"}})
             );
+            // Helper traffic must reach Codex unchanged, but never select the
+            // row. Omit response classification to exercise request filtering
+            // through the real relay (where parameters used to be stripped).
+            assert_eq!(
+                receive(&mut ws).await,
+                json!({"id":"temporary-structured","method":"thread/start","params":{
+                    "threadSource":"system","ephemeral":true,"config":{"futureField":true}
+                }})
+            );
+            for frame in [
+                json!({"id":"temporary-structured","result":{"thread":{"id":"catchup-thread","status":{"type":"idle"}}}}),
+                json!({"method":"item/started","params":{"threadId":"catchup-thread","item":{"type":"userMessage","content":[{"type":"text","text":"Write a brief catch-up"}]}}}),
+                json!({"method":"thread/closed","params":{"threadId":"catchup-thread"}}),
+            ] {
+                send(&mut ws, &frame).await;
+            }
             send(
                 &mut ws,
                 &json!({"method":"future/notification","params":{"new":"field"}}),
@@ -360,6 +507,16 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
             &json!({"id":"approval","result":{"decision":"decline"}}),
         )
         .await;
+        send(
+            &mut tui,
+            &json!({"id":"temporary-structured","method":"thread/start","params":{
+                "threadSource":"system","ephemeral":true,"config":{"futureField":true}
+            }}),
+        )
+        .await;
+        assert_eq!(receive(&mut tui).await["id"], "temporary-structured");
+        assert_eq!(receive(&mut tui).await["method"], "item/started");
+        assert_eq!(receive(&mut tui).await["method"], "thread/closed");
         assert_eq!(receive(&mut tui).await["method"], "future/notification");
         loop {
             let observation = tokio::time::timeout(Duration::from_secs(2), relay.events.recv())
@@ -373,6 +530,8 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
             }
         }
         assert_eq!(state.session_id.as_deref(), Some("thread-root"));
+        assert_eq!(state.name.as_deref(), Some("Saved title"));
+        assert_eq!(state.last_prompt.as_deref(), Some("Actual user prompt"));
         assert_eq!(state.codex_connected, Some(false));
     }
     server.await.unwrap();

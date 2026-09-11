@@ -65,8 +65,8 @@ impl Relay {
                                     // Requests are reduced before crossing the channel;
                                     // environment/configuration never enters monitor state.
                                     gate.request(&value);
-                                    let request = serde_json::json!({"id":value["id"],"method":value["method"]});
-                                    if tx.send(Observation::Client(request)).await.is_err() { break; }
+                                    if let Some(request) = Observation::client(&value)
+                                        && tx.send(request).await.is_err() { break; }
                                 }
                                 let closed = frame.is_close();
                                 server.send(frame).await?;
