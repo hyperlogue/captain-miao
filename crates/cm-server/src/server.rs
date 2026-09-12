@@ -892,7 +892,7 @@ async fn handle_conn(
                             tokio::task::block_in_place(|| backend.list_resumable(limit));
                         write_frame(&mut wr, &ServerFrame::Resumable { req_id, candidates, errors }).await?;
                     }
-                    ClientFrame::KillSession { req_id, key } => {
+                    ClientFrame::KillSession { req_id, key, cleanup } => {
                         // The key is re-resolved to a live pid inside the
                         // backend, so a stale mirror can't make us signal a
                         // recycled pid.
@@ -900,7 +900,7 @@ async fn handle_conn(
                         // The operation remains owned by this host even if its
                         // requesting dashboard disconnects before the reply.
                         tokio::spawn(async move {
-                            let reply = kill_session_reply(req_id, key).await;
+                            let reply = kill_session_reply(req_id, key, cleanup).await;
                             let _ = tx.send(reply);
                         });
                     }
@@ -976,8 +976,12 @@ async fn handle_conn(
     result
 }
 
-async fn kill_session_reply(req_id: u64, key: SessionKey) -> ServerFrame {
-    let result = tokio::task::spawn_blocking(move || LocalBackend::kill_session(&key))
+async fn kill_session_reply(
+    req_id: u64,
+    key: SessionKey,
+    cleanup: cm_core::backend::CleanupPolicy,
+) -> ServerFrame {
+    let result = tokio::task::spawn_blocking(move || LocalBackend::kill_session(&key, cleanup))
         .await
         .context("session cleanup worker failed")
         .and_then(|result| result);
@@ -1151,6 +1155,7 @@ mod tests {
             &ClientFrame::KillSession {
                 req_id: 1,
                 key: row.key(),
+                cleanup: cm_core::backend::CleanupPolicy::Required,
             },
         )
         .await

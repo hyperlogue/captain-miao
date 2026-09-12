@@ -1109,13 +1109,21 @@ decide them. That is deliberate, and it is what makes the name validation in
 `cm_core::config::is_valid_env_name` worth anything: one writer means one place
 a name can enter, so there is no second path to also police.
 
-`Killed` replies may include an additive `error` field. A rejected Codex
-app-server cleanup restores the dashboard's optimistic hide and preserves the
-window binding. The host obtains that acknowledgement from the owning launcher
+`KillSession` carries an additive `cleanup` policy: `required` is the default
+for older peers and is always used for restart; explicit Kill sends
+`force_if_unavailable`. Under that policy the host also removes a Codex launcher
+when its app-server is unreachable or reports that the selected thread is
+missing. It first asks a capable launcher to kill and reap the TUI; older
+launchers require signals followed by removal of their state and runtime files.
+The shared app-server and saved conversation history are never deleted.
+
+`Killed` replies may include an additive `error` field. Other rejected Codex
+cleanup restores the dashboard's optimistic hide and preserves the
+window binding. The host obtains acknowledgement from the owning launcher
 through its private socket; only the launcher knows the session's selected
 app-server endpoint. `ok: false` with no error retains its older meaning of
-"already gone". This control exchange does not write session-state files from
-the backend or dashboard. Cleanup runs in an independent task; its reply shares
+"already gone". Only a launcher writes its state; the host can remove that file
+after forced termination. Cleanup runs in an independent task; its reply shares
 the connection writer with subscription updates and other replies. A dedicated
 reader retains partially received frames across those completions.
 

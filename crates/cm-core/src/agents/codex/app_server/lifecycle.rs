@@ -113,6 +113,15 @@ pub(crate) async fn supervise(
                     control_live = false;
                     continue;
                 };
+                if request.force {
+                    // Explicit Kill already received a qualifying cleanup
+                    // failure. End and reap our child before giving up control.
+                    let _ = child.start_kill();
+                    let result = child.wait().await.context("waiting for Codex TUI to exit");
+                    request.reply(result.as_ref().err().map(|error| format!("{error:#}"))).await;
+                    result?;
+                    return Ok(exit_code);
+                }
                 if stopping.is_some() {
                     request.reply(Some("Codex cleanup is already in progress; retry shortly".into())).await;
                     false
@@ -164,7 +173,10 @@ pub(crate) async fn supervise(
                         state.updated_at = LauncherState::now();
                         persistence.write(state);
                         let _ = quiesce(false, &mut relay, &mut monitor, state, &mut persistence).await;
-                        if let Some(reply) = reply.take() { reply.reply(Some(message)).await; }
+                        if let Some(reply) = reply.take() {
+                            let reason = super::kill::force_removal_reason(config, &error, state.session_id.as_deref()).await;
+                            reply.respond(Some(message), Some(reason.unwrap_or(super::control::ForceRemoval::Denied))).await;
+                        }
                         // Preserve the launcher and its state for a retry, including
                         // when the TUI/window has already closed. Never resend input.
                         false

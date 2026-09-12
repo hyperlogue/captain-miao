@@ -1,6 +1,6 @@
 //! Private Unix WebSocket transport. The relay never answers approvals or
 //! retries user requests: the Codex TUI owns both, including reconnect policy.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -13,6 +13,49 @@ use tokio_tungstenite::{
 
 pub(super) type Socket = WebSocketStream<UnixStream>;
 pub(super) const DEADLINE: Duration = Duration::from_secs(5);
+
+/// An endpoint that cannot be reached is distinct from a rejected RPC or an
+/// invalid protocol response. Only the former permits explicit force removal.
+#[derive(Debug)]
+pub(super) struct Unavailable;
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Codex app-server is unreachable")
+    }
+}
+impl std::error::Error for Unavailable {}
+
+fn classify_transport(error: anyhow::Error) -> anyhow::Error {
+    let io = error.downcast_ref::<std::io::Error>().or_else(|| {
+        match error.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+            Some(tokio_tungstenite::tungstenite::Error::Io(io)) => Some(io),
+            _ => None,
+        }
+    });
+    if io.is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }) || matches!(
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                | tokio_tungstenite::tungstenite::Error::AlreadyClosed
+        )
+    ) {
+        error.context(Unavailable)
+    } else {
+        error
+    }
+}
 
 pub(super) fn limits() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -32,14 +75,16 @@ pub(super) async fn connect(path: &Path) -> Result<Socket> {
         Ok(socket)
     })
     .await
-    .context("Codex app-server connection timed out")?
+    .context("Codex app-server connection timed out")
+    .map_err(|error| error.context(Unavailable))?
+    .map_err(classify_transport)
 }
 
 /// Preserve the protocol error code so callers can distinguish an unavailable
 /// optional feature from a failed operation without parsing formatted errors.
 #[derive(Debug)]
 pub(super) struct RpcError {
-    method: String,
+    pub(super) method: String,
     pub(super) code: Option<i64>,
     pub(super) message: String,
 }
@@ -70,13 +115,25 @@ impl Client {
                     "capabilities": {"experimentalApi": true}
                 }),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<tokio::time::error::Elapsed>()
+                    .is_some()
+                {
+                    error.context(Unavailable)
+                } else {
+                    error
+                }
+            })?;
         client
             .socket
             .send(Message::Text(
                 json!({"method":"initialized"}).to_string().into(),
             ))
-            .await?;
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(classify_transport)?;
         Ok(client)
     }
 
@@ -118,10 +175,11 @@ impl Client {
                     _ => {}
                 }
             }
-            bail!("Codex app-server disconnected")
+            Err(anyhow::anyhow!("Codex app-server disconnected").context(Unavailable))
         })
         .await
         .with_context(|| format!("Codex {method} timed out"))?
+        .map_err(classify_transport)
     }
 }
 

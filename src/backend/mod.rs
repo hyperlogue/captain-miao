@@ -44,7 +44,7 @@ use cm_core::vitals::HostVitals;
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
 // re-exported so `crate::backend::…` paths across the dashboard resolve unchanged.
-pub use cm_core::backend::{LaunchPlan, LocalBackend, OpenSpec};
+pub use cm_core::backend::{CleanupPolicy, LaunchPlan, LocalBackend, OpenSpec};
 
 // Probe a host, deploy a `miao-server` if it needs one, and resolve the command
 // to invoke. Split out because it is a self-contained subsystem that runs
@@ -1117,18 +1117,24 @@ impl Backend {
     /// signalling, so a mirror lagging the session's exit can't make it SIGTERM
     /// a recycled pid (§3). Both transports run off the UI thread: a direct
     /// local Codex session also waits for its launcher to confirm cleanup.
-    pub(crate) fn kill_session(&self, key: SessionKey) -> tokio::task::JoinHandle<KillOutcome> {
+    pub(crate) fn kill_session(
+        &self,
+        key: SessionKey,
+        cleanup: CleanupPolicy,
+    ) -> tokio::task::JoinHandle<KillOutcome> {
         match self {
             Self::Local(_) => {
-                tokio::task::spawn_blocking(move || match LocalBackend::kill_session(&key) {
-                    Ok(true) => KillOutcome::Signalled,
-                    Ok(false) => KillOutcome::AlreadyGone,
-                    Err(error) => KillOutcome::Failed(format!("{error:#}")),
+                tokio::task::spawn_blocking(move || {
+                    match LocalBackend::kill_session(&key, cleanup) {
+                        Ok(true) => KillOutcome::Signalled,
+                        Ok(false) => KillOutcome::AlreadyGone,
+                        Err(error) => KillOutcome::Failed(format!("{error:#}")),
+                    }
                 })
             }
             Self::Remote(remote) => {
                 let remote = remote.clone();
-                tokio::task::spawn_blocking(move || remote.kill_session(&key))
+                tokio::task::spawn_blocking(move || remote.kill_session(&key, cleanup))
             }
         }
     }
@@ -1895,9 +1901,13 @@ impl RemoteBackend {
     ///
     /// [`list_resumable`]: Self::list_resumable
     /// [`presume_dead`]: Self::presume_dead
-    pub(crate) fn kill_session(&self, key: &SessionKey) -> KillOutcome {
+    pub(crate) fn kill_session(&self, key: &SessionKey, cleanup: CleanupPolicy) -> KillOutcome {
         let key = key.clone();
-        match self.request(|req_id| ClientFrame::KillSession { req_id, key }) {
+        match self.request(|req_id| ClientFrame::KillSession {
+            req_id,
+            key,
+            cleanup,
+        }) {
             Some(ServerFrame::Killed {
                 error: Some(error), ..
             }) => KillOutcome::Failed(error),
@@ -4874,7 +4884,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                ClientFrame::KillSession { req_id, key } => {
+                ClientFrame::KillSession { req_id, key, .. } => {
                     write_frame(
                         &mut wr,
                         &ServerFrame::Killed {
@@ -4976,7 +4986,7 @@ mod tests {
             HostId("test-host".into()),
         );
         let task = tokio::task::spawn_blocking(move || {
-            remote.kill_session(&SessionKey::from_launcher_pid(123))
+            remote.kill_session(&SessionKey::from_launcher_pid(123), CleanupPolicy::Required)
         });
         let request = requests.recv().await.unwrap();
         request.reply.send(serde_json::from_value(serde_json::json!({
@@ -5023,9 +5033,8 @@ mod tests {
         let (cands, errs) = tokio::task::block_in_place(|| backend.list_resumable(5));
         assert!(cands.is_empty() && errs.is_empty());
         assert_eq!(
-            tokio::task::block_in_place(
-                || backend.kill_session(&SessionKey::from_launcher_pid(999))
-            ),
+            tokio::task::block_in_place(|| backend
+                .kill_session(&SessionKey::from_launcher_pid(999), CleanupPolicy::Required)),
             KillOutcome::Signalled
         );
 
@@ -5047,7 +5056,7 @@ mod tests {
         backend.presume_dead(&doomed);
         assert_eq!(backend.list_sessions().len(), 1);
         assert_eq!(
-            tokio::task::block_in_place(|| backend.kill_session(&doomed)),
+            tokio::task::block_in_place(|| backend.kill_session(&doomed, CleanupPolicy::Required)),
             KillOutcome::Signalled
         );
         let mut tries = 0;

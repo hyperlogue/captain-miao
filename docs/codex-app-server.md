@@ -84,9 +84,18 @@ replacement also permits a fresh attempt; a disconnected host does not.
 The app-server owns execution; the TUI is a client. Closing an attached terminal
 through miao requests cleanup of that managed session's work, while detaching
 from a pooled terminal keeps its launcher and work running. The host waits for
-the launcher to acknowledge cleanup before reporting success. Miao restores an
-optimistically hidden row on failure, reports the error, and keeps its terminal
-binding. It closes the terminal only after successful cleanup. The launcher
+the launcher to acknowledge cleanup before reporting success. Explicit **Kill**
+also removes the session when the app-server is unreachable or reports that the
+selected thread is missing. New launchers kill and reap their TUI; the host uses
+signals for older launchers, then removes their state, sockets and pasted images.
+An unreachable app-server may still be running work: removing its client cannot
+guarantee that server-side turns, goals or background commands have ended.
+
+Other cleanup failures, including a slow RPC when the server still answers a
+fresh connection check, restore the optimistically hidden row, report the error,
+and keep its terminal binding. It closes the terminal only after cleanup or
+forced removal succeeds. **Restart** always requires confirmed cleanup before
+resuming the saved thread; it never uses the unreachable-server fallback. The launcher
 remains available for retry even if the terminal has already exited. A rollback
 restores visibility; it does not reactivate a paused goal or restart an
 interrupted turn. Teardown addresses only the
@@ -117,8 +126,10 @@ Disconnected app-server rows also support **x**, **Space e** (restart selected)
 and **Space E** (restart all). Restart preserves the saved thread ID and waits
 for acknowledged cleanup before resuming it. If cleanup reports an error, miao
 checks the daemon's loaded-thread inventory: a thread confirmed absent is
-already stopped. A connection failure or failed inventory read keeps the row
-available for retry; disconnection alone does not prove that work has ended.
+already stopped. For restart, a connection failure or failed inventory read
+keeps the row available for retry. Explicit Kill can force removal under the
+conditions above. Losing the dashboard's connection to the host itself still
+restores the row: only that host can terminate its processes and remove its state.
 
 Execution environment is an inherent difference: server-side tools and services
 run in the daemon's environment. A launcher-side `direnv` environment is not
@@ -136,6 +147,11 @@ the monitor ignores fields and events it does not understand. See the
 Miao still reads its own configuration and session-state files. This adapter
 parses protocol messages rather than Codex-owned rollout files, hook payloads,
 or SQLite databases. Codex's TUI and daemon continue to manage their own files.
+
+The force-removal policy requires an updated dashboard and host server. Older
+clients and servers retain strict cleanup behavior, including during restart.
+The host recognizes the specific unreachable-server and missing-thread cleanup
+errors emitted by older app-server launchers.
 
 Acknowledged cleanup requires an updated dashboard, host server, and launcher.
 An older app-server launcher without control support is refused by the new

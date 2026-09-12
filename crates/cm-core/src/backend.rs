@@ -38,6 +38,17 @@ use crate::agents::codex;
 use crate::paths;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus};
 
+/// Restart must confirm server-owned work ended before resuming it. Explicit
+/// Kill may abandon control when Codex is unreachable or the thread is absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPolicy {
+    ForceIfUnavailable,
+    #[default]
+    #[serde(other)]
+    Required,
+}
+
 /// What to open: which agent, where, and whether it's a fresh session or a
 /// resume/fork of an existing one. This is §3's `SpawnSpec`, renamed to
 /// avoid colliding with `terminal::SpawnSpec` (which describes the *window*).
@@ -431,7 +442,7 @@ impl LocalBackend {
     /// Falls back to the launcher pid when the row carries no `child_pid` (a
     /// `FailedToStart` launcher holding its error), matching the client's own
     /// kill target.
-    pub fn kill_session(key: &SessionKey) -> anyhow::Result<bool> {
+    pub fn kill_session(key: &SessionKey, policy: CleanupPolicy) -> anyhow::Result<bool> {
         let Some(state) = state::read_all_launcher_states()
             .into_iter()
             .find(|s| &s.key() == key)
@@ -445,7 +456,7 @@ impl LocalBackend {
         let pid = if state.codex_mode.is_native() {
             state.child_pid.unwrap_or(state.launcher_pid)
         } else if state.codex_control {
-            crate::agents::codex::app_server::request_stop(state.launcher_pid)?;
+            crate::agents::codex::app_server::kill(&state, policy)?;
             return Ok(true);
         } else if state.status == crate::state::SessionStatus::FailedToStart {
             state.launcher_pid

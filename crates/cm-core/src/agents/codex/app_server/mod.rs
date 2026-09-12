@@ -3,6 +3,7 @@
 //! behavior. Only the launcher reduces observations into its own state file.
 //! No hook profile, rollout reader or SQLite connection belongs to this mode.
 mod control;
+mod kill;
 mod lifecycle;
 mod monitor;
 mod relay;
@@ -16,7 +17,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::CodexConfig;
 use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::LauncherState;
-pub(crate) use control::{Control, StopRequest, request_stop};
+pub(crate) use control::{Control, StopRequest};
+pub(crate) use kill::kill;
 pub(crate) use lifecycle::supervise;
 pub(crate) use monitor::Monitor;
 pub(crate) use relay::Relay;
@@ -241,3 +243,6 @@ mod tests;
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod kill_tests;

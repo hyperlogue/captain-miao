@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::agent::ResumeCandidate;
-use crate::backend::OpenSpec;
+use crate::backend::{CleanupPolicy, OpenSpec};
 use crate::state::{LauncherState, SessionFlags, SessionKey};
 use crate::vitals::HostVitals;
 
@@ -64,7 +64,13 @@ pub enum ClientFrame {
     /// Tear the session down. The server re-resolves `key` → the *current* agent
     /// pid from the live state file before signalling, so a stale mirror can
     /// never make it signal a recycled pid.
-    KillSession { req_id: u64, key: SessionKey },
+    KillSession {
+        req_id: u64,
+        key: SessionKey,
+        /// Missing on older clients, which also use this request for restart.
+        #[serde(default)]
+        cleanup: CleanupPolicy,
+    },
     /// Start a launcher inside the host's pty pool. The server creates the pool
     /// session, then replies `Opened` with its name.
     OpenSession { req_id: u64, spec: OpenSpec },
@@ -278,6 +284,7 @@ mod tests {
             ClientFrame::KillSession {
                 req_id: 8,
                 key: SessionKey::from_launcher_pid(4242),
+                cleanup: CleanupPolicy::Required,
             },
             ClientFrame::SetSessionFlags {
                 req_id: 9,
@@ -346,6 +353,29 @@ mod tests {
         // The extra field is skipped, not fatal, and the frame still routes.
         assert!(matches!(got, ServerFrame::Killed { ok: true, .. }));
         assert_eq!(got.req_id(), Some(7));
+    }
+
+    #[test]
+    fn older_kill_requests_keep_restart_cleanup_strict() {
+        for field in ["", r#", "cleanup":"future_policy""#] {
+            let request = format!(r#"{{"frame":"KillSession","req_id":1,"key":"opaque"{field}}}"#);
+            assert!(matches!(
+                serde_json::from_str::<ClientFrame>(&request).unwrap(),
+                ClientFrame::KillSession {
+                    cleanup: CleanupPolicy::Required,
+                    ..
+                }
+            ));
+        }
+        let request = ClientFrame::KillSession {
+            req_id: 1,
+            key: SessionKey("opaque".into()),
+            cleanup: CleanupPolicy::ForceIfUnavailable,
+        };
+        assert_eq!(
+            serde_json::from_value::<ClientFrame>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
     }
 
     #[test]

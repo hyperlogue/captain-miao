@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use super::render_backend::DashboardTerminal;
 use crate::agent::AgentControl;
-use crate::backend::{Backend, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
+use crate::backend::{Backend, CleanupPolicy, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId, SessionKey};
 use crate::terminal::{
@@ -526,7 +526,7 @@ fn start_kill(
             .and_then(|s| s.binding_token().map(str::to_owned)),
     });
     backend.presume_killed(&key);
-    let task = backend.kill_session(key.clone());
+    let task = backend.kill_session(key.clone(), CleanupPolicy::ForceIfUnavailable);
     let tx = inboxes.kill_tx.clone();
     tokio::spawn(async move {
         let outcome = task
@@ -1349,7 +1349,9 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
     }
     if kill_old {
         match app.backend_for(&host) {
-            Some(backend) => restarts.wait_for_cleanup(job, backend.kill_session(key)),
+            Some(backend) => {
+                restarts.wait_for_cleanup(job, backend.kill_session(key, CleanupPolicy::Required))
+            }
             None => restarts.finish(job, KillOutcome::Failed(format!("Unknown host {}", host.0))),
         }
         app.set_status("Restarting: waiting for cleanup".into(), false);
