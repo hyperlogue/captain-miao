@@ -302,6 +302,18 @@ impl Monitor {
                     SessionStatus::Compacted
                 },
             ),
+            // Compaction can finish mid-turn without another turn/started or
+            // thread/status/changed. Resumed model output clears its label,
+            // even if no tool runs next. Completed history is not new activity.
+            "reasoning" | "agentMessage" | "plan"
+                if started
+                    && matches!(
+                        state.status,
+                        SessionStatus::Compacting | SessionStatus::Compacted
+                    ) =>
+            {
+                transition(state, SessionStatus::Active);
+            }
             "commandExecution"
             | "fileChange"
             | "mcpToolCall"

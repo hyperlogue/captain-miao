@@ -134,6 +134,75 @@ fn status_approvals_tools_compaction_and_queued_turns_follow_server_events() {
 }
 
 #[test]
+fn model_output_after_compaction_restores_active_status() {
+    for kind in ["reasoning", "agentMessage", "plan"] {
+        for completed in [false, true] {
+            let (mut m, mut s) = (Monitor::default(), state());
+            resume(&mut m, &mut s);
+            notify(
+                &mut m,
+                &mut s,
+                "turn/started",
+                json!({"threadId":"thread-root","turn":{"id":"turn-one"}}),
+            );
+            notify(
+                &mut m,
+                &mut s,
+                "item/started",
+                json!({"threadId":"thread-root","turnId":"turn-one","item":{"id":"compact-one","type":"contextCompaction"}}),
+            );
+            assert_eq!(s.status, S::Compacting);
+            if completed {
+                notify(
+                    &mut m,
+                    &mut s,
+                    "item/completed",
+                    json!({"threadId":"thread-root","turnId":"turn-one","item":{"id":"compact-one","type":"contextCompaction"}}),
+                );
+                assert_eq!(s.status, S::Compacted);
+            }
+            notify(
+                &mut m,
+                &mut s,
+                "item/started",
+                json!({"threadId":"thread-root","turnId":"turn-one","item":{"id":"output-one","type":kind}}),
+            );
+            assert_eq!(s.status, S::Active, "{kind}, completed={completed}");
+            assert!(s.last_tool.is_none());
+        }
+    }
+}
+
+#[test]
+fn model_output_does_not_hide_pending_requests() {
+    for (method, expected) in [
+        (
+            "item/commandExecution/requestApproval",
+            S::WaitingForApproval,
+        ),
+        ("item/tool/requestUserInput", S::WaitingForDecision),
+    ] {
+        let (mut m, mut s) = (Monitor::default(), state());
+        resume(&mut m, &mut s);
+        m.apply(
+            &mut s,
+            Observation::Server(
+                json!({"id":"request-one","method":method,"params":{"threadId":"thread-root"}}),
+            ),
+        );
+        for kind in ["reasoning", "agentMessage", "plan"] {
+            notify(
+                &mut m,
+                &mut s,
+                "item/started",
+                json!({"threadId":"thread-root","item":{"id":"output-one","type":kind}}),
+            );
+            assert_eq!(s.status, expected, "{kind}, {method}");
+        }
+    }
+}
+
+#[test]
 fn subagents_and_inventory_reads_never_replace_the_selected_root() {
     let (mut m, mut s) = (Monitor::default(), state());
     resume(&mut m, &mut s);
