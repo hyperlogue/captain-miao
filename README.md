@@ -449,8 +449,10 @@ sessions, and reconnecting brings them back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
 
 The panel is where each host reports in: connection state and the reason when it
-failed, session counts, daemon version, latency, and CPU + memory. `l` opens its
-full connection log, `c` suspends it, `u` upgrades its server.
+failed, session counts, daemon version, latency, and CPU, memory, and disk usage.
+Disk measures space used on the host's home filesystem. All three percentages
+use the attention color at 80% and the error color at 90% (yellow and red by
+default). `l` opens its full connection log, `c` suspends it, `u` upgrades its server.
 
 - **Detached rows** — running there, no window here — are dimmed and marked 🙈
   when free or 👀 when another client is holding one. `Enter` attaches, `Space A`

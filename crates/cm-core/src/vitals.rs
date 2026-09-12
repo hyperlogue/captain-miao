@@ -1,4 +1,4 @@
-//! Whole-host CPU and memory utilisation — the two numbers that say whether a
+//! Host CPU, memory and home-filesystem utilisation — readings that say whether a
 //! host is worth starting another session on, measured by the process that *is*
 //! the host (the daemon) and answered on request.
 //!
@@ -6,7 +6,7 @@
 //! poll is a process per poll per host, it can't answer for a socket transport
 //! (pooled-localhost has no ssh hop at all), and its numbers would be the
 //! *link's* view rather than the host's. The daemon already holds the
-//! connection, so the sample costs two small file reads.
+//! connection, so Linux sampling costs two small file reads and a filesystem query.
 //!
 //! Two properties shape the API:
 //!
@@ -35,6 +35,8 @@ use serde::{Deserialize, Serialize};
 /// and they are what a later surface would need to say `9.8/16G` without a
 /// protocol change. Additive by construction (`#[serde(default)]` throughout),
 /// so an older daemon that omits a field still decodes.
+/// Disk crosses as used/available bytes: its percentage excludes reserved space,
+/// matching `df`, and describes the filesystem containing the host user's home.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostVitals {
     /// Share of the sampling window the host spent busy across all cores,
@@ -47,6 +49,12 @@ pub struct HostVitals {
     /// Physical memory the host has.
     #[serde(default)]
     pub mem_total_bytes: Option<u64>,
+    /// Allocated space on the filesystem containing the host user's home.
+    #[serde(default)]
+    pub disk_used_bytes: Option<u64>,
+    /// Space available to that user, excluding privileged reserved blocks.
+    #[serde(default)]
+    pub disk_available_bytes: Option<u64>,
 }
 
 impl HostVitals {
@@ -57,6 +65,13 @@ impl HostVitals {
         (total > 0).then(|| (used as f64 / total as f64 * 100.0) as f32)
     }
 
+    /// Used share of the home filesystem's usable capacity, as in `df`.
+    pub fn disk_percent(&self) -> Option<f32> {
+        let used = self.disk_used_bytes?;
+        let total = used.checked_add(self.disk_available_bytes?)?;
+        (total > 0).then(|| (used as f64 / total as f64 * 100.0) as f32)
+    }
+
     /// Whether nothing at all was sampled — an unsupported OS, or a host whose
     /// counters are unreadable. Such a host reports absence rather than a
     /// reading of zeros.
@@ -64,6 +79,8 @@ impl HostVitals {
         self.cpu_percent.is_none()
             && self.mem_used_bytes.is_none()
             && self.mem_total_bytes.is_none()
+            && self.disk_used_bytes.is_none()
+            && self.disk_available_bytes.is_none()
     }
 }
 
@@ -129,12 +146,50 @@ impl VitalsSampler {
             self.prev = Some((now, cur));
         }
         let (mem_used_bytes, mem_total_bytes) = read_memory();
+        let disk = dirs::home_dir().and_then(|home| read_disk(&home));
         HostVitals {
             cpu_percent,
             mem_used_bytes,
             mem_total_bytes,
+            disk_used_bytes: disk.map(|(used, _)| used),
+            disk_available_bytes: disk.map(|(_, available)| available),
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)] // Darwin block counters are u32; Linux uses u64.
+fn read_disk(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the path is NUL-terminated and the output has the required size.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs initialized the output on success.
+    let stats = unsafe { stats.assume_init() };
+    disk_bytes(
+        stats.f_blocks as u64,
+        stats.f_bfree as u64,
+        stats.f_bavail as u64,
+        stats.f_frsize as u64,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_disk(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+fn disk_bytes(blocks: u64, free: u64, available: u64, block_size: u64) -> Option<(u64, u64)> {
+    if block_size == 0 || available > free {
+        return None;
+    }
+    Some((
+        blocks.checked_sub(free)?.checked_mul(block_size)?,
+        available.checked_mul(block_size)?,
+    ))
 }
 
 /// The CPU figure for `cur` given whatever previous reading is held: `None`
@@ -389,6 +444,7 @@ mod tests {
             cpu_percent: None,
             mem_used_bytes: used,
             mem_total_bytes: total,
+            ..Default::default()
         };
         assert_eq!(vitals.mem_percent(), Some(50.0));
     }
@@ -410,12 +466,47 @@ mod tests {
     fn an_unsampled_host_is_empty_not_idle() {
         assert!(HostVitals::default().is_empty());
         assert_eq!(HostVitals::default().mem_percent(), None);
+        assert_eq!(HostVitals::default().disk_percent(), None);
         assert!(
             !HostVitals {
                 cpu_percent: Some(0.0),
                 ..Default::default()
             }
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn disk_usage_excludes_reserved_space_from_usable_capacity() {
+        let (used, available) = disk_bytes(100, 30, 20, 4096).unwrap();
+        assert_eq!((used, available), (70 * 4096, 20 * 4096));
+        let mut vitals = HostVitals {
+            disk_used_bytes: Some(used),
+            disk_available_bytes: Some(available),
+            ..Default::default()
+        };
+        assert!(!vitals.is_empty());
+        assert!((vitals.disk_percent().unwrap() - 77.77778).abs() < 0.001);
+        vitals.disk_available_bytes = Some(0);
+        assert_eq!(vitals.disk_percent(), Some(100.0));
+        vitals.disk_used_bytes = Some(0);
+        assert_eq!(vitals.disk_percent(), None);
+        vitals.disk_used_bytes = None;
+        assert_eq!(vitals.disk_percent(), None);
+        assert_eq!(disk_bytes(100, 101, 20, 4096), None);
+        assert_eq!(disk_bytes(100, 30, 31, 4096), None);
+        assert_eq!(disk_bytes(100, 30, 20, 0), None);
+        assert_eq!(disk_bytes(u64::MAX, 0, 0, 4096), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn disk_query_reads_a_filesystem_and_preserves_failures() {
+        let (used, available) = read_disk(&std::env::temp_dir()).unwrap();
+        assert!(used > 0 || available > 0);
+        assert_eq!(
+            read_disk(std::path::Path::new("/dev/null/not-a-directory")),
+            None
         );
     }
 

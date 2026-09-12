@@ -1021,7 +1021,7 @@ impl Backend {
         }
     }
 
-    /// Where this host's CPU/memory figures stand — see [`VitalsView`].
+    /// Where this host's CPU/memory/disk figures stand — see [`VitalsView`].
     ///
     /// `None` for a host that has none coming: a local backend (there is no
     /// daemon on this side of the seam, and the dashboard deliberately measures
@@ -5027,6 +5027,8 @@ mod tests {
                             cpu_percent: Some(42.0),
                             mem_used_bytes: Some(4 << 30),
                             mem_total_bytes: Some(16 << 30),
+                            disk_used_bytes: Some(900 << 30),
+                            disk_available_bytes: Some(100 << 30),
                         },
                     },
                 )
@@ -5299,6 +5301,7 @@ mod tests {
             cpu_percent: Some(12.0),
             mem_used_bytes: Some(4),
             mem_total_bytes: Some(8),
+            ..Default::default()
         };
         // An answer is the only thing that puts figures on the row...
         assert!(cell.claim_poll(interval));
@@ -5355,6 +5358,7 @@ mod tests {
         };
         assert_eq!(vitals.cpu_percent, Some(42.0));
         assert_eq!(vitals.mem_percent(), Some(25.0));
+        assert_eq!(vitals.disk_percent(), Some(90.0));
         // Fresh once, then clear until the next reply.
         assert!(events.take_vitals());
         assert!(!events.take_vitals());

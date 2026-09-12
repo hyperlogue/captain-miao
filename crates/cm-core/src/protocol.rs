@@ -95,7 +95,7 @@ pub enum ClientFrame {
     /// Whether `path` is a directory on the host's filesystem — the picker's
     /// submit-time validation. Reply: `DirChecked`.
     CheckDir { req_id: u64, path: String },
-    /// The host's CPU/memory utilisation right now. Reply: `Vitals`. Asked only
+    /// The host's CPU/memory/disk usage right now. Reply: `Vitals`. Asked only
     /// while a client is *showing* the answer (the hosts panel), which is why it
     /// is a request at all — see [`ServerFrame::Vitals`].
     GetVitals { req_id: u64 },
@@ -131,7 +131,7 @@ pub enum ServerFrame {
     Delta { state: Box<LauncherState> },
     /// A session is gone (its launcher exited / its state file went away).
     Removed { key: SessionKey },
-    /// Reply to `GetVitals`: the host's own CPU/memory utilisation (see
+    /// Reply to `GetVitals`: the host's own CPU/memory/disk usage (see
     /// [`crate::vitals`]).
     ///
     /// Pulled rather than pushed. Utilisation is only ever *displayed* by the
@@ -431,6 +431,8 @@ mod tests {
                 cpu_percent: Some(37.5),
                 mem_used_bytes: Some(8 << 30),
                 mem_total_bytes: Some(16 << 30),
+                disk_used_bytes: Some(750 << 30),
+                disk_available_bytes: Some(250 << 30),
             },
         };
         let buf = encode_frame(&frame).unwrap();
@@ -441,6 +443,7 @@ mod tests {
                 assert_eq!(req_id, 5);
                 assert_eq!(vitals.cpu_percent, Some(37.5));
                 assert_eq!(vitals.mem_percent(), Some(50.0));
+                assert_eq!(vitals.disk_percent(), Some(75.0));
             }
             other => panic!("wrong frame: {other:?}"),
         }
@@ -455,6 +458,7 @@ mod tests {
             ServerFrame::Vitals { vitals, .. } => {
                 assert_eq!(vitals.cpu_percent, Some(12.0));
                 assert_eq!(vitals.mem_percent(), None);
+                assert_eq!(vitals.disk_percent(), None);
             }
             other => panic!("wrong frame: {other:?}"),
         }

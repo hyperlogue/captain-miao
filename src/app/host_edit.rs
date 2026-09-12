@@ -339,6 +339,34 @@ impl HostField {
 // Drawing
 // =============================================================================
 
+fn utilisation_style(percent: f32, ui: &config::UiColors) -> Style {
+    if percent >= 90.0 {
+        Style::default().fg(ui.error_fg).bold()
+    } else if percent >= 80.0 {
+        Style::default().fg(ui.attention_fg).bold()
+    } else {
+        Style::default().dim()
+    }
+}
+
+fn vitals_spans(vitals: cm_core::vitals::HostVitals, ui: &config::UiColors) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if !vitals.is_empty() {
+        for (label, percent) in [
+            ("cpu", vitals.cpu_percent),
+            ("mem", vitals.mem_percent()),
+            ("disk", vitals.disk_percent()),
+        ] {
+            spans.push(Span::styled(format!("  {label} "), Style::default().dim()));
+            spans.push(match percent.filter(|value| value.is_finite()) {
+                Some(value) => Span::styled(format!("{value:.0}%"), utilisation_style(value, ui)),
+                None => Span::styled("n/a", Style::default().dim()),
+            });
+        }
+    }
+    spans
+}
+
 impl App {
     /// The live status spans for one host row in the panel: connection state
     /// (green when connected, the `Failed` reason verbatim when there is one),
@@ -364,18 +392,13 @@ impl App {
         let mut spans = vec![Span::styled(one_line(state.label(), max_width), style)];
         if state.is_connected() {
             let (running, attached) = self.host_session_counts(host);
-            spans.push(Span::styled(
-                format!(
-                    "  {running} {}, {attached} attached",
-                    super::plural_sessions(running)
-                ),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            // The trailer is one dim run of annotations, accumulated as a string
-            // and pushed as a span — except where a failed probe has to carry
-            // its own colour, which closes the run early and opens another.
+            // Keep utilisation before the dim annotations so high readings
+            // remain visible even when the panel clips a long host row.
             let dim = Style::default().add_modifier(Modifier::DIM);
-            let mut trailer = String::new();
+            let mut trailer = format!(
+                "  {running} {}, {attached} attached",
+                super::plural_sessions(running)
+            );
             if let Some(v) = backend.daemon_version() {
                 trailer.push_str(&format!("  v{v}"));
                 match backend.upgrade_offer() {
@@ -403,7 +426,7 @@ impl App {
             // starts. Percentages rather than absolutes because the row is a
             // scannable line, not a monitor — `l` is where detail goes.
             //
-            // All three numbers stand or fall together, and none of them is ever
+            // These numbers stand or fall together, and none of them is ever
             // a held one (see [`VitalsView`]): they arrive with a reading — the
             // poll refreshes the latency sample on its way through — and until
             // one does, a spinner sits in their place. A row that has none
@@ -411,16 +434,7 @@ impl App {
             // neither, spinner included.
             match backend.vitals() {
                 Some(VitalsView::Reading(v)) => {
-                    if let Some(cpu) = v.cpu_percent {
-                        trailer.push_str(&format!("  cpu {cpu:.0}%"));
-                    }
-                    if let Some(mem) = v.mem_percent() {
-                        trailer.push_str(&format!("  mem {mem:.0}%"));
-                    }
-                    // Labelled, unlike the bare `12ms` it used to be: three
-                    // numbers in a row need saying which is which, and a
-                    // duration on its own beside two percentages reads as
-                    // whatever the eye guesses.
+                    spans.extend(vitals_spans(v, ui));
                     if let Some(rtt) = backend.latency() {
                         trailer.push_str(&format!("  latency {}ms", rtt.as_millis()));
                     }
@@ -430,19 +444,15 @@ impl App {
                 // and on a host that has stopped answering it turns until the
                 // poll's deadline hands it to the arm below.
                 Some(VitalsView::Loading) => {
-                    trailer.push_str(&format!("  {}", vitals_spinner_glyph()));
+                    spans.push(Span::styled(format!("  {}", vitals_spinner_glyph()), dim));
                 }
                 // Said rather than left blank, and in the attention colour: the
                 // host is connected and everything else about it is on the row,
                 // so numbers quietly missing reads as "nothing worth mentioning"
-                // rather than "we asked and got nothing back". The one span here
-                // that isn't dim, which is why the run is closed early.
+                // rather than "we asked and got nothing back".
                 Some(VitalsView::Unavailable) => {
-                    if !trailer.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut trailer), dim));
-                    }
                     spans.push(Span::styled(
-                        "  cpu/mem unavailable".to_string(),
+                        "  cpu/mem/disk unavailable".to_string(),
                         Style::default().fg(ui.attention_fg),
                     ));
                 }
@@ -553,10 +563,20 @@ impl App {
         clear_overlay(frame, popup);
         // No key hints on the border: the footer bar already renders this
         // mode's bindings, and two copies of the same list disagree eventually.
-        let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            " Hosts · first is default ",
-            Style::default().bold(),
-        ));
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " Hosts · first is default ",
+                Style::default().bold(),
+            ))
+            .title_bottom(Line::from(vec![
+                Span::styled(" Disk: home · ", Style::default().dim()),
+                Span::styled("≥80% high", utilisation_style(80.0, ui)),
+                Span::raw(" · "),
+                Span::styled("≥90% critical ", utilisation_style(90.0, ui)),
+            ]));
         let list_area = block.inner(popup);
         frame.render_widget(block, popup);
 

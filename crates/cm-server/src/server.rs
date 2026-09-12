@@ -707,23 +707,32 @@ impl VitalsProbe {
         }
     }
 
-    /// The current reading — cached, or freshly taken. `await`s only in the
-    /// priming case, and the caller holds the lock throughout so concurrent
-    /// askers queue behind one probe and then read its result from the cache.
+    /// The current reading — cached, or sampled on a worker. The caller holds
+    /// the lock throughout so concurrent askers queue behind one probe and
+    /// then read its result from the cache.
     async fn get(&mut self) -> HostVitals {
         if let Some((at, vitals)) = self.last
             && at.elapsed() < VITALS_CACHE
         {
             return vitals;
         }
-        let mut vitals = self.sampler.sample();
-        // No CPU figure but the counters *are* readable: this is the first poll
-        // (or the first after `MAX_CPU_WINDOW` of quiet), so the reading just
-        // taken is the anchor and a second one a beat later completes it.
-        if vitals.cpu_percent.is_none() && self.sampler.has_reading() {
-            tokio::time::sleep(VITALS_PRIME_GAP).await;
-            vitals = self.sampler.sample();
-        }
+        let mut sampler = std::mem::take(&mut self.sampler);
+        // A filesystem query can wait on storage. Keep both it and CPU priming
+        // off Tokio's workers; the probe lock still coalesces concurrent asks.
+        let Ok((sampler, vitals)) = tokio::task::spawn_blocking(move || {
+            let mut vitals = sampler.sample();
+            // The first reading (or one after a long gap) only primes CPU.
+            if vitals.cpu_percent.is_none() && sampler.has_reading() {
+                std::thread::sleep(VITALS_PRIME_GAP);
+                vitals = sampler.sample();
+            }
+            (sampler, vitals)
+        })
+        .await
+        else {
+            return HostVitals::default();
+        };
+        self.sampler = sampler;
         self.last = Some((Instant::now(), vitals));
         vitals
     }
@@ -944,8 +953,12 @@ async fn handle_conn(
                     ClientFrame::GetVitals { req_id } => {
                         // Cached across every connection, so a host watched by
                         // three dashboards is still probed once per window.
-                        let vitals = vitals.lock().await.get().await;
-                        write_frame(&mut wr, &ServerFrame::Vitals { req_id, vitals }).await?;
+                        let probe = vitals.clone();
+                        let tx = replies_tx.clone();
+                        tokio::spawn(async move {
+                            let vitals = probe.lock().await.get().await;
+                            let _ = tx.send(ServerFrame::Vitals { req_id, vitals });
+                        });
                     }
                     ClientFrame::GetCodexConfig { req_id } => {
                         let result = cm_core::config::read_codex();
@@ -1085,6 +1098,70 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_vitals_does_not_delay_host_requests() {
+        let probe = Arc::new(tokio::sync::Mutex::new(VitalsProbe::new()));
+        // Model a sample already waiting on storage. The next request must
+        // remain serviceable while GetVitals waits for this shared probe.
+        let held = probe.lock().await;
+        let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
+        let (changes, rx) = broadcast::channel(16);
+        let server = tokio::spawn(handle_conn(
+            stream,
+            Arc::new(LocalBackend::new()),
+            probe.clone(),
+            rx,
+            changes,
+            "test-host".into(),
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::Hello {
+                client_version: VERSION.into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Welcome { .. })
+        ));
+        write_frame(&mut dashboard, &ClientFrame::GetVitals { req_id: 1 })
+            .await
+            .unwrap();
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::CheckDir {
+                req_id: 2,
+                path: "/".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut dashboard)).await;
+        drop(held);
+        assert!(
+            matches!(
+                answer,
+                Ok(Ok(Some(ServerFrame::DirChecked {
+                    req_id: 2,
+                    exists: true
+                })))
+            ),
+            "pending vitals delayed the following request: {answer:?}"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut dashboard))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(ServerFrame::Vitals { req_id: 1, .. })
+        ));
+        drop(dashboard);
+        server.await.unwrap().unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_inventory_allows_updates_and_cleanup() {

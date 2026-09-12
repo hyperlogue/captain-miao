@@ -1143,7 +1143,7 @@ decides what they mean**.
 - **`Space h` — the hosts panel**: a list view, not a staged edit form. Each
   host shows live connection state (including the `Failed` reason verbatim),
   running/attached session counts, the daemon version from `Welcome`, its
-  **CPU/memory utilisation**, and a latency sample; its ssh/socket target sits
+  **CPU/memory/disk utilisation**, and a latency sample; its ssh/socket target sits
   on a dim second line.
   - **Utilisation is the host's own measurement**, asked for over the protocol
     while the panel is open (§3) rather than measured from here: only the host
@@ -1151,9 +1151,14 @@ decides what they mean**.
     be a process per poll per host reporting the *link's* view anyway. It sits
     beside the latency because the two together are the launch decision —
     reachable, and with room; and because the poll refreshes the latency sample
-    too, the whole line goes live while it is being read. Rendered as two
-    percentages, no absolutes and no colour threshold: the row is a scannable
-    line, and a pegged CPU on a build box is normal rather than an alert.
+    too, the whole line goes live while it is being read. The three percentages
+    precede the longer session/version annotations to stay visible in a narrow
+    panel. At 80% they use the attention colour; at 90% the error colour, both
+    bold (yellow and red by default). Disk is space used on the filesystem
+    containing the host user's home, excluding privileged reserved space from
+    usable capacity as `df` does. It measures capacity, not I/O activity. A
+    border hint names the disk scope and both thresholds. Filesystem sampling
+    runs on a blocking worker outside the host connection loop.
   - **Nothing on that line is ever a held number.** Utilisation and latency
     arrive together with a poll's answer and are dropped the moment they stop
     describing the present — the panel opening (the previous answer is from
@@ -1163,12 +1168,13 @@ decides what they mean**.
     and the ask is re-armed with it so that wait is one round trip rather than
     the rest of the poll interval. A probe that comes back with nothing — a
     daemon too old to know the frame, a host that missed the deadline — ends the
-    spin on `cpu/mem unavailable` in the attention colour, which is the third
+    spin on `cpu/mem/disk unavailable` in the attention colour, which is the third
     state and the one that keeps the other two honest: a row says the figures
     are current, on their way, or not coming, and never nothing at all. (A host
     that *answers* with nothing to say — an OS we can't read — shows no figures
-    rather than zeros, which on a utilisation display would read as a
-    definitely-idle host; a disconnected one shows neither figures nor spinner,
+    rather than zeros; a partial answer shows `n/a` for missing metrics, including
+    disk on older servers. Zeros on a utilisation display would read as a
+    definitely-idle host. A disconnected one shows neither figures nor spinner,
     its row having already said `disconnected`.) Editing a
   row exposes label / target (`^t` toggles ssh↔socket) / **options** (below) /
   **icon** (`^e` opens the same searchable emoji picker as `Space i`). There is
