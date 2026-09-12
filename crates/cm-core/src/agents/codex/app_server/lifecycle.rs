@@ -113,7 +113,7 @@ pub(crate) async fn supervise(
                     control_live = false;
                     continue;
                 };
-                if request.force {
+                if request.is_forced() {
                     // Explicit Kill already received a qualifying cleanup
                     // failure. End and reap our child before giving up control.
                     let _ = child.start_kill();
@@ -195,9 +195,12 @@ pub(crate) async fn supervise(
             let config = config.clone();
             let snapshot = state.clone();
             let turn = monitor.turn.clone();
+            let allow_internal_creations = reply
+                .as_ref()
+                .is_some_and(|request| request.allows_internal_creations());
             stopping = Some(Box::pin(async move {
                 tokio::time::timeout(super::CLEANUP_TIMEOUT, async {
-                    super::confirm_quiescence(&config, pause).await?;
+                    super::confirm_quiescence(&config, pause, allow_internal_creations).await?;
                     app_server::stop(&config, &snapshot, turn.as_deref()).await
                 })
                 .await

@@ -905,6 +905,202 @@ async fn lost_mutations_remain_uncertain_until_their_own_thread_is_reconnected()
 }
 
 #[tokio::test]
+async fn lost_internal_creation_allows_kill_only_after_main_thread_cleanup() {
+    use crate::backend::CleanupPolicy;
+
+    for (source, ephemeral, other_mutation, reject_cleanup, removes) in [
+        (json!("system"), true, false, false, true),
+        (json!("system"), true, false, true, false),
+        (json!("user"), true, false, false, false),
+        (Value::Null, true, false, false, false),
+        (json!("future-source"), true, false, false, false),
+        (json!("system"), false, false, false, false),
+        (json!("system"), true, true, false, false),
+    ] {
+        let scratch = Scratch::new();
+        let socket = scratch.0.join("server.sock");
+        let proxy = scratch.0.join("relay.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let config = CodexConfig {
+            endpoint: format!("unix://{}", socket.display()),
+            ..Default::default()
+        };
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            answer_probe(&listener).await;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert_eq!(receive(&mut socket).await["method"], "thread/start");
+            if other_mutation {
+                assert_eq!(receive(&mut socket).await["method"], "turn/start");
+            }
+            // Codex accepted creation, but the TUI never learns the helper ID.
+            socket.close(None).await.unwrap();
+            drop(socket);
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let init = receive(&mut socket).await;
+                send(&mut socket, &json!({"id":init["id"],"result":{}})).await;
+                assert_eq!(receive(&mut socket).await["method"], "initialized");
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "thread/loaded/list" => {
+                            json!({"data":["thread-root","helper","other-thread"]})
+                        }
+                        "thread/goal/get" => json!({"goal":{"status":"active"}}),
+                        "thread/goal/set" => {
+                            assert_eq!(request["params"]["status"], "paused");
+                            json!({})
+                        }
+                        "thread/turns/list" => {
+                            json!({"data":[{"id":"main-turn","status":"inProgress"}]})
+                        }
+                        "turn/interrupt" => {
+                            assert_eq!(request["params"]["turnId"], "main-turn");
+                            json!({})
+                        }
+                        "thread/backgroundTerminals/clean" => json!({}),
+                        method => panic!("unexpected cleanup method {method}"),
+                    };
+                    if request["method"] != "thread/loaded/list" {
+                        assert_eq!(request["params"]["threadId"], "thread-root");
+                        calls_tx
+                            .send(request["method"].as_str().unwrap().to_owned())
+                            .unwrap();
+                    }
+                    let reply = if reject_cleanup
+                        && request["method"] == "thread/backgroundTerminals/clean"
+                    {
+                        json!({"id":request["id"],"error":{"code":-32603,"message":"cleanup denied"}})
+                    } else {
+                        json!({"id":request["id"],"result":result})
+                    };
+                    send(&mut socket, &reply).await;
+                }
+            }
+        });
+        let mut relay = Relay::start(&config, &proxy).await.unwrap();
+        let mut tui = transport::connect(&proxy).await.unwrap();
+        send(
+            &mut tui,
+            &json!({"id":1,"method":"thread/start","params":{
+                "threadSource":source,"ephemeral":ephemeral
+            }}),
+        )
+        .await;
+        if other_mutation {
+            send(
+                &mut tui,
+                &json!({"id":2,"method":"turn/start","params":{"threadId":"other-thread"}}),
+            )
+            .await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(relay.events.recv().await, Some(Observation::Disconnected)) {}
+        })
+        .await
+        .unwrap();
+        drop(tui);
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let runtime = crate::state::runtime_dir().join("launchers");
+        crate::state::create_dir_all_private(&runtime).unwrap();
+        let control_path = runtime.join(format!("{pid}.sock"));
+        let control = Control::start(UnixListener::bind(&control_path).unwrap());
+        let mut row = state();
+        row.launcher_pid = pid;
+        row.child_pid = Some(pid);
+        row.session_id = Some("thread-root".into());
+        row.codex_control = true;
+        crate::state::ensure_sessions_dir().unwrap();
+        row.write().unwrap();
+        let snapshot = row.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise(
+                &config,
+                &mut row,
+                child,
+                relay,
+                control,
+                std::future::pending(),
+            )
+            .await
+        });
+        let strict = snapshot.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || kill(&strict, CleanupPolicy::Required))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            crate::state::is_process_alive(pid),
+            "Restart must retain control"
+        );
+        assert!(
+            calls_rx.try_recv().is_err(),
+            "uncertain Restart must not bypass the fence"
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || kill(&snapshot, CleanupPolicy::ForceIfUnavailable)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut calls = Vec::new();
+        while let Ok(call) = calls_rx.try_recv() {
+            calls.push(call);
+        }
+        if result.is_ok() {
+            supervisor.await.unwrap().unwrap();
+            assert!(
+                !crate::state::is_process_alive(pid),
+                "Kill must reap the TUI"
+            );
+        } else {
+            assert!(
+                crate::state::is_process_alive(pid),
+                "a rejected cleanup must retain the TUI"
+            );
+            supervisor.abort();
+            let _ = supervisor.await;
+        }
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(control_path);
+        let _ = std::fs::remove_file(crate::state::sessions_dir().join(format!("{pid}.json")));
+        assert_eq!(
+            result.is_ok(),
+            removes,
+            "{source:?}, ephemeral={ephemeral}, other_mutation={other_mutation}, reject_cleanup={reject_cleanup}: {result:?}"
+        );
+        if removes || reject_cleanup {
+            assert_eq!(
+                calls,
+                [
+                    "thread/goal/get",
+                    "thread/goal/set",
+                    "thread/turns/list",
+                    "turn/interrupt",
+                    "thread/backgroundTerminals/clean"
+                ]
+            );
+        } else {
+            assert!(calls.is_empty(), "unknown work must still prevent cleanup");
+        }
+    }
+}
+
+#[tokio::test]
 async fn cleanup_waits_for_resume_identity_while_draining_a_full_observation_queue() {
     let scratch = Scratch::new();
     let path = scratch.0.join("server.sock");

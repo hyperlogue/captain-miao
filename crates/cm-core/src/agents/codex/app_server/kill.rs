@@ -13,6 +13,12 @@ pub(super) async fn force_removal_reason(
     error: &anyhow::Error,
     id: Option<&str>,
 ) -> Option<ForceRemoval> {
+    if error
+        .downcast_ref::<super::relay::UnsettledThreads>()
+        .is_some_and(|threads| threads.only_internal_creations())
+    {
+        return Some(ForceRemoval::InternalCreation);
+    }
     if error.downcast_ref::<transport::Unavailable>().is_some() {
         return Some(ForceRemoval::Unreachable);
     }
@@ -57,15 +63,30 @@ fn legacy_force_removal(message: &str, id: Option<&str>) -> bool {
 }
 
 pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<()> {
-    let Err(error) = control::request_stop(snapshot.launcher_pid) else {
+    let Err(mut error) = control::request_stop(snapshot.launcher_pid) else {
         return Ok(());
     };
+    if policy == CleanupPolicy::ForceIfUnavailable
+        && error.downcast_ref::<StopFailure>().is_some_and(|failure| {
+            matches!(failure.force_removal, Some(ForceRemoval::InternalCreation))
+        })
+    {
+        let Some(current) = current_owner(snapshot)? else {
+            return Ok(());
+        };
+        // Re-fence input and clean the main thread under the explicit Kill
+        // policy. This hint must never authorize signals that bypass cleanup.
+        match control::request_kill(current.launcher_pid) {
+            Ok(()) => return Ok(()),
+            Err(retry) => error = retry,
+        }
+    }
     let Some(failure) = error.downcast_ref::<StopFailure>() else {
         return Err(error);
     };
     let allowed = match failure.force_removal {
         Some(ForceRemoval::Unreachable | ForceRemoval::ThreadMissing) => true,
-        Some(ForceRemoval::Denied) => false,
+        Some(ForceRemoval::Denied | ForceRemoval::InternalCreation) => false,
         None => legacy_force_removal(&failure.message, snapshot.session_id.as_deref()),
     };
     if policy != CleanupPolicy::ForceIfUnavailable || !allowed {

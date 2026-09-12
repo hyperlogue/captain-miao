@@ -5,6 +5,7 @@
 mod control;
 mod kill;
 mod lifecycle;
+mod listener;
 mod monitor;
 mod relay;
 mod transport;
@@ -141,7 +142,11 @@ async fn loaded_threads(
     }
 }
 
-async fn confirm_quiescence(config: &CodexConfig, paused: Result<()>) -> Result<()> {
+async fn confirm_quiescence(
+    config: &CodexConfig,
+    paused: Result<()>,
+    allow_internal_creations: bool,
+) -> Result<()> {
     let Err(error) = paused else {
         return Ok(());
     };
@@ -149,6 +154,11 @@ async fn confirm_quiescence(config: &CodexConfig, paused: Result<()>) -> Result<
         // A timeout or a stopped relay has not acknowledged fencing new input.
         return Err(error);
     };
+    if allow_internal_creations && unsettled.only_internal_creations() {
+        // Input is fenced; only an internal helper's creation reply was lost.
+        // The caller must still stop the selected main thread before removal.
+        return Ok(());
+    }
     let mut client = transport::Client::connect(&config.socket_path()?).await?;
     if unsettled.may_be_running(&loaded_threads(&mut client).await?) {
         return Err(error);
@@ -246,3 +256,6 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod kill_tests;
+
+#[cfg(test)]
+mod startup_tests;

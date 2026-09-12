@@ -210,7 +210,10 @@ pub async fn run(
     };
 
     if let Some(config) = codex_config {
-        if let Err(error) = crate::agents::codex::wait_for_handoff(agent_args, launcher_pid).await {
+        if config.mode.is_native()
+            && let Err(error) =
+                crate::agents::codex::wait_for_handoff(agent_args, launcher_pid).await
+        {
             hold_failed_launch(
                 launcher_pid,
                 &sock_path,
@@ -392,37 +395,46 @@ async fn run_codex_app_server(
     let socket = state::runtime_dir()
         .join("launchers")
         .join(format!("{}-codex.sock", state.launcher_pid));
-    let relay = app_server::Relay::start(config, &socket).await?;
-    let mut command = app_server::command(cwd, args, &socket, shim)?;
-    let control = app_server::Control::start(listener);
+    let mut control = app_server::Control::start(listener);
     state.codex_control = true;
-    // Publish control ownership before the TUI can create server-owned work.
-    // A failed initial save is still an ordinary failed launch.
-    state.write()?;
+    let pool = state.pool_session.clone();
+    let shutdown = codex_shutdown(pool.as_deref());
+    tokio::pin!(shutdown);
+    // Control precedes both handoff and preflight. Acknowledging Stop here is
+    // safe: the TUI has not started and cannot have created server-owned work.
+    let (relay, mut command) = tokio::select! {
+        biased;
+        request = control.requests.recv() => {
+            if let Some(request) = request {
+                request.reply(None).await;
+                return Ok(0);
+            }
+            Err(anyhow::anyhow!("Codex launcher control stopped during startup"))
+        }
+        _ = &mut shutdown => return Ok(143),
+        prepared = async {
+            state.write()?;
+            crate::agents::codex::wait_for_handoff(args, state.launcher_pid).await?;
+            let relay = app_server::Relay::start(config, &socket).await?;
+            let command = app_server::command(cwd, args, &socket, shim)?;
+            Ok((relay, command))
+        } => prepared,
+    }?;
+    // The caller's FailedToStart handler clears control ownership on any
+    // preparation/spawn error and retains its ordinary signal removal path.
     let child = command
         .kill_on_drop(true)
         .spawn()
         .context("starting attached Codex TUI")?;
     state.child_pid = child.id();
-    supervise_codex_app_server(config, state, child, relay, control).await
+    app_server::supervise(config, state, child, relay, control, shutdown).await
 }
 
-async fn supervise_codex_app_server(
-    config: &crate::agents::codex::CodexConfig,
-    state: &mut LauncherState,
-    child: tokio::process::Child,
-    relay: crate::agents::codex::app_server::Relay,
-    control: crate::agents::codex::app_server::Control,
-) -> Result<i32> {
-    let pool = state.pool_session.clone();
-    let shutdown = async {
-        tokio::select! {
-            _ = wait_for_termination_signal() => {}
-            _ = wait_until_minting_daemon_gone(pool.as_deref()) => {}
-        }
-    };
-    crate::agents::codex::app_server::supervise(config, state, child, relay, control, shutdown)
-        .await
+async fn codex_shutdown(pool: Option<&str>) {
+    tokio::select! {
+        _ = wait_for_termination_signal() => {}
+        _ = wait_until_minting_daemon_gone(pool) => {}
+    }
 }
 
 /// Resolve when the launcher is asked to terminate via SIGTERM or SIGHUP.
@@ -1940,7 +1952,16 @@ mod tests {
             settings_path: root.join("unused.json"),
         };
         let supervisor = tokio::spawn(async move {
-            supervise_codex_app_server(&config, &mut row, child, relay, control).await
+            let pool = row.pool_session.clone();
+            app_server::supervise(
+                &config,
+                &mut row,
+                child,
+                relay,
+                control,
+                codex_shutdown(pool.as_deref()),
+            )
+            .await
         });
         for attempt in 0..2 {
             let mut stream = tokio::net::UnixStream::connect(&control_path)

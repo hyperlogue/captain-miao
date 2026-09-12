@@ -26,6 +26,7 @@ impl Relay {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).context("binding Codex TUI relay")?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let mut listener = super::listener::Listener::new(listener);
         let (tx, events) = mpsc::channel(128);
         let (input_paused, mut pause_rx) = watch::channel(false);
         let (ack_tx, pause_ack) = watch::channel(InputState::Running);
@@ -42,7 +43,7 @@ impl Relay {
                     }
                     accepted = listener.accept() => accepted,
                 };
-                let Ok((stream, _)) = accepted else {
+                let Ok(stream) = accepted else {
                     break;
                 };
                 let result = async {
@@ -156,20 +157,31 @@ enum InputState {
 /// Preserve their identities so the supervisor can prove they no longer run
 /// after a daemon restart without guessing from the currently displayed row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct UnsettledThreads(HashSet<Option<String>>);
+pub(super) struct UnsettledThreads(HashSet<UnsettledThread>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum UnsettledThread {
+    Known(String),
+    Unknown,
+    InternalCreation,
+}
 
 impl UnsettledThreads {
+    pub(super) fn only_internal_creations(&self) -> bool {
+        self.0.len() == 1 && self.0.contains(&UnsettledThread::InternalCreation)
+    }
+
     pub(super) fn may_be_running(&self, loaded: &HashSet<String>) -> bool {
         self.0.iter().any(|thread| match thread {
-            Some(id) => loaded.contains(id),
-            None => !loaded.is_empty(),
+            UnsettledThread::Known(id) => loaded.contains(id),
+            UnsettledThread::Unknown | UnsettledThread::InternalCreation => !loaded.is_empty(),
         })
     }
 }
 
 impl std::fmt::Display for UnsettledThreads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.contains(&None) {
+        f.write_str(if self.0.iter().any(|thread| !matches!(thread, UnsettledThread::Known(_))) {
             "Codex lost a thread-creation reply; cleanup cannot confirm which thread was created"
         } else {
             "Codex disconnected with an unresolved thread operation; reconnect that thread before retrying cleanup"
@@ -184,11 +196,11 @@ impl std::error::Error for UnsettledThreads {}
 #[derive(Default)]
 struct InputGate {
     pending: HashMap<String, PendingOperation>,
-    uncertain: HashSet<Option<String>>,
+    uncertain: HashSet<UnsettledThread>,
 }
 struct PendingOperation {
     selects_thread: bool,
-    thread: Option<String>,
+    thread: UnsettledThread,
 }
 impl InputGate {
     fn request(&mut self, value: &Value) {
@@ -212,10 +224,21 @@ impl InputGate {
             return;
         }
         if let Some(id) = value.get("id") {
-            let thread = if matches!(method, "thread/start" | "thread/fork") {
-                None
+            let thread = if method == "thread/start"
+                && value["params"]["ephemeral"] == true
+                && value["params"]["threadSource"] == "system"
+            {
+                // Codex's recap/title helpers submit their prompt only after
+                // receiving this creation reply. Keep this narrow: ephemeral
+                // user threads, forks and lost turn replies are still strict.
+                UnsettledThread::InternalCreation
+            } else if matches!(method, "thread/start" | "thread/fork") {
+                UnsettledThread::Unknown
             } else {
-                value["params"]["threadId"].as_str().map(str::to_owned)
+                value["params"]["threadId"]
+                    .as_str()
+                    .map(|id| UnsettledThread::Known(id.to_owned()))
+                    .unwrap_or(UnsettledThread::Unknown)
             };
             self.pending.insert(
                 id.to_string(),
@@ -242,7 +265,8 @@ impl InputGate {
         {
             // Reconnecting B cannot settle lost work on A. A thread created
             // without any returned identity cannot be guessed from a new one.
-            self.uncertain.remove(&Some(thread.to_owned()));
+            self.uncertain
+                .remove(&UnsettledThread::Known(thread.to_owned()));
         }
     }
     fn disconnected(&mut self) {

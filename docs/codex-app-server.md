@@ -69,10 +69,15 @@ older threads without source metadata remain supported.
 
 Restart still opens the replacement terminal before closing the old one. Its
 launcher waits for the previous owner to finish before resuming the thread.
+The waiting replacement already serves launcher control: Kill cancels it
+without contacting Codex or affecting the previous owner. Connection setup is
+cancellable the same way, before the new TUI starts.
 This preserves terminal placement and prevents the previous controller's final
 interrupt from reaching newly resumed work. The handoff deadline exceeds the
 complete cleanup budget. Cleanup runs outside the dashboard event loop and the
 host connection loop, so other sessions continue updating during a restart.
+Resume inventory also runs outside the host connection loop; a slow history
+read does not delay session updates or cleanup requests.
 Repeated commands share the pending restart. After a cleanup failure, an early
 retry reuses the waiting replacement. Once too little time remains for a full
 cleanup attempt, miao preserves both windows until the replacement reports
@@ -112,9 +117,29 @@ every affected thread is absent from the daemon's loaded-thread inventory. A
 lost creation reply with no identity requires that inventory to be empty.
 Metadata and inventory reads do not create uncertainty.
 
+Explicit **Kill** makes one narrow exception: a lost `thread/start` reply for
+an internal, ephemeral `system` helper does not block main-thread cleanup.
+Miao still pauses the main thread's goal, interrupts its turn, and cleans its
+background terminals before removing the launcher. Other cleanup errors still
+retain control unless the server is unreachable or the main thread is missing.
+**Restart**, user-created ephemeral threads, unknown thread sources, and lost
+turn replies retain the strict checks above. This exception requires an updated
+host backend and launcher; older launchers retain strict behavior.
+
+Codex submits a recap/title helper's prompt only after receiving its creation
+reply, so a lost creation reply leaves no helper generation to interrupt.
+Already-running helpers are separate threads: main-thread cleanup does not
+cancel them. Codex's remote client makes a best-effort unsubscribe attempt;
+unsubscribing does not interrupt an active turn. Miao does not claim that
+removing a launcher stops every internal helper on the shared daemon.
+
 State-store failures also retain the launcher, TUI and cleanup controller.
 Writes retry on a paced timer and recreate a deleted session-state directory.
 Control ownership is persisted before the TUI can create server-owned work.
+The launcher restores a deleted or replaced control socket, recreating its
+private directory when needed. Relay listeners also recover their socket while
+waiting for a TUI connection. Recovery preserves the normal cleanup checks;
+an unavailable launcher socket alone does not authorize forced removal.
 
 Restarting the shared Codex daemon disconnects its clients and ends its loaded
 runtimes. Saved conversations remain resumable. Miao marks the connection as

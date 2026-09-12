@@ -40,6 +40,8 @@ use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus}
 
 /// Restart must confirm server-owned work ended before resuming it. Explicit
 /// Kill may abandon control when Codex is unreachable or the thread is absent.
+/// It also permits main-thread cleanup despite a lost internal-helper creation
+/// reply; that exception still requires cleanup of the selected user thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupPolicy {
