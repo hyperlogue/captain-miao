@@ -245,7 +245,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "captain-miao"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "captain-miao-client"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "captain-miao-server"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -409,7 +409,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cm-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3424,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",

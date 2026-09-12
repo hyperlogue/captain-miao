@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-12
+
+### Added
+
+- **The Hosts panel shows disk usage alongside CPU and memory**, measuring the
+  host's home filesystem and highlighting all three percentages at 80% and 90%
+  (yellow and red by default).
+
+### Fixed
+
+- **Fixed high-impact bugs in the Codex app-server integration:**
+  - Disconnected sessions can be restarted after a daemon restart, preserving
+    their saved conversations.
+  - Kill removes stale sessions when the server is unreachable or the thread is
+    missing; lost internal-helper creation replies no longer block main-thread
+    cleanup.
+  - Sessions remain removable during startup and after launcher-control sockets
+    disappear, so failed launches and lost sockets do not strand rows.
+  - Sessions no longer stay stuck in compaction after generation resumes.
+- **Host connections stay responsive during session-history and system-metric
+  requests**, and sending commands while a reply is arriving no longer causes
+  false disconnects.
+
 ## [0.9.0] - 2026-09-11
 
 ### Added
@@ -562,7 +585,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hyperlogue/captain-miao/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/hyperlogue/captain-miao/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...v0.8.0
