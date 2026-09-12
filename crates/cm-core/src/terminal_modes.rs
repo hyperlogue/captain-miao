@@ -359,7 +359,7 @@ extern "C" fn cleanup_terminal() {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::process::{Command, Stdio};
 
     fn observe(bytes: &[u8]) -> TerminalModes {
@@ -517,23 +517,37 @@ mod tests {
             .env("CM_TEST_TERMINAL_EXIT", "1")
             .stdin(Stdio::null())
             .stdout(slave.try_clone().unwrap())
-            .stderr(slave)
+            .stderr(slave.try_clone().unwrap())
             .spawn()
             .unwrap();
+        // Keep a slave handle open until capture finishes: macOS flushes unread
+        // output on the last slave close. The child writes only a short trace,
+        // so it can finish before we drain without filling the PTY buffer.
         assert_eq!(child.wait().unwrap().code(), Some(7));
+        // The retained slave prevents EOF. With the child reaped, drain all
+        // queued bytes without waiting for another write that cannot arrive.
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
         let mut output = Vec::new();
         let mut buf = [0; 4096];
         loop {
             match master.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => panic!("read cleanup PTY: {error}"),
             }
         }
+        drop(slave);
         assert!(
             output.ends_with(RESET),
-            "exit must end with terminal cleanup"
+            "exit must end with terminal cleanup; got {output:?}"
         );
         assert_eq!(observe(&output).modes, Modes::default());
     }
