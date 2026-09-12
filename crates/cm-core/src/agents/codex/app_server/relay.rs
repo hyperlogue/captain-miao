@@ -137,26 +137,46 @@ impl Relay {
             .await
             .context("Codex relay still has pending requests; retry cleanup after they settle")?
             .context("Codex relay stopped")?;
-            anyhow::ensure!(
-                *state != InputState::Uncertain,
-                "Codex disconnected with an unresolved thread operation; reconnect that thread before retrying cleanup"
-            );
-            anyhow::ensure!(
-                *state != InputState::UnknownThread,
-                "Codex lost a thread-creation reply; cleanup cannot confirm which thread was created"
-            );
+            if let InputState::Uncertain(threads) = &*state {
+                return Err(threads.clone().into());
+            }
             Ok(())
         })
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum InputState {
     Running,
     Paused,
-    Uncertain,
-    UnknownThread,
+    Uncertain(UnsettledThreads),
 }
+
+/// Input is fenced, but lost replies leave these runtimes unaccounted for.
+/// Preserve their identities so the supervisor can prove they no longer run
+/// after a daemon restart without guessing from the currently displayed row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct UnsettledThreads(HashSet<Option<String>>);
+
+impl UnsettledThreads {
+    pub(super) fn may_be_running(&self, loaded: &HashSet<String>) -> bool {
+        self.0.iter().any(|thread| match thread {
+            Some(id) => loaded.contains(id),
+            None => !loaded.is_empty(),
+        })
+    }
+}
+
+impl std::fmt::Display for UnsettledThreads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.contains(&None) {
+            "Codex lost a thread-creation reply; cleanup cannot confirm which thread was created"
+        } else {
+            "Codex disconnected with an unresolved thread operation; reconnect that thread before retrying cleanup"
+        })
+    }
+}
+impl std::error::Error for UnsettledThreads {}
 
 /// Only request identities cross this gate; prompts/configuration stay on the
 /// original stream. A successful lifecycle reply reestablishes which thread
@@ -230,16 +250,15 @@ impl InputGate {
             .extend(self.pending.drain().map(|(_, operation)| operation.thread));
     }
     fn acknowledge(&self, paused: bool, ack: &watch::Sender<InputState>) {
-        let state = if !paused {
+        // Inventory can settle a lost reply only after every newer forwarded
+        // operation has replied too; otherwise a resume could still load work
+        // just after the inventory reported it absent.
+        let state = if !paused || !self.pending.is_empty() {
             InputState::Running
-        } else if self.uncertain.contains(&None) {
-            InputState::UnknownThread
         } else if !self.uncertain.is_empty() {
-            InputState::Uncertain
-        } else if self.pending.is_empty() {
-            InputState::Paused
+            InputState::Uncertain(UnsettledThreads(self.uncertain.clone()))
         } else {
-            InputState::Running
+            InputState::Paused
         };
         ack.send_if_modified(|previous| {
             if *previous == state {

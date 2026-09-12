@@ -1264,6 +1264,17 @@ impl std::fmt::Display for SessionKey {
 }
 
 impl LauncherState {
+    /// Disconnected app-server clients can be explicitly restarted even though
+    /// their last observation maps to Starting. The owning launcher must still
+    /// acknowledge cleanup before the replacement resumes the saved thread.
+    pub fn is_restartable(&self) -> bool {
+        self.status.is_restartable()
+            || (self.agent == AgentControl::Codex
+                && self.codex_mode == crate::agents::codex::CodexMode::AppServer
+                && self.codex_connected == Some(false)
+                && self.codex_control)
+    }
+
     /// The resolved mode stays visible while a host migrates existing sessions.
     pub fn agent_label(&self) -> &'static str {
         if self.agent == AgentControl::Codex {

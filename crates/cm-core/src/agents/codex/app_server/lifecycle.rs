@@ -184,11 +184,10 @@ pub(crate) async fn supervise(
             let snapshot = state.clone();
             let turn = monitor.turn.clone();
             stopping = Some(Box::pin(async move {
-                pause?;
-                tokio::time::timeout(
-                    super::CLEANUP_TIMEOUT,
-                    app_server::stop(&config, &snapshot, turn.as_deref()),
-                )
+                tokio::time::timeout(super::CLEANUP_TIMEOUT, async {
+                    super::confirm_quiescence(&config, pause).await?;
+                    app_server::stop(&config, &snapshot, turn.as_deref()).await
+                })
                 .await
                 .context("Codex cleanup timed out")?
             }));

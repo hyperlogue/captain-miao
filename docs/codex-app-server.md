@@ -98,7 +98,10 @@ forwarded lifecycle, turn and goal requests to settle. Responses continue to
 flow while it waits. A lost response leaves cleanup uncertain: reconnecting a
 different thread cannot resolve it, and a lost creation reply without a thread
 ID cannot safely be guessed. Miao reports that uncertainty and retains control.
-Metadata and inventory reads do not create it.
+After a daemon restart, cleanup can also resolve lost replies by verifying that
+every affected thread is absent from the daemon's loaded-thread inventory. A
+lost creation reply with no identity requires that inventory to be empty.
+Metadata and inventory reads do not create uncertainty.
 
 State-store failures also retain the launcher, TUI and cleanup controller.
 Writes retry on a paced timer and recreate a deleted session-state directory.
@@ -109,6 +112,13 @@ runtimes. Saved conversations remain resumable. Miao marks the connection as
 disconnected and observes Codex's subsequent reconnect/resume, which restores
 metadata and context usage. It does not resend a prompt. Forced shutdown can
 interrupt active work. Native sessions do not depend on this daemon.
+
+Disconnected app-server rows also support **x**, **Space e** (restart selected)
+and **Space E** (restart all). Restart preserves the saved thread ID and waits
+for acknowledged cleanup before resuming it. If cleanup reports an error, miao
+checks the daemon's loaded-thread inventory: a thread confirmed absent is
+already stopped. A connection failure or failed inventory read keeps the row
+available for retry; disconnection alone does not prove that work has ended.
 
 Execution environment is an inherent difference: server-side tools and services
 run in the daemon's environment. A launcher-side `direnv` environment is not

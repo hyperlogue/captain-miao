@@ -7820,6 +7820,69 @@ fn picker_readline_alt_b_and_f_word_motion() {
 // Restart: confirming, rejecting, restart-all
 // =============================================================================
 
+#[test]
+fn disconnected_codex_sessions_can_restart_selected_and_all() {
+    use cm_core::agents::codex::CodexMode;
+
+    for key in ['e', 'E'] {
+        let mut d = TestDashboard::new(120, 20);
+        let mut row = session(1, "/path/to/project", SessionStatus::Starting);
+        row.agent = crate::agent::AgentControl::Codex;
+        row.codex_mode = CodexMode::AppServer;
+        row.codex_connected = Some(false);
+        row.codex_control = true;
+        d.set_sessions(vec![row]);
+        assert_eq!(d.app.upgrade_blocker(&crate::state::HostId::local()), None);
+        d.press(KeyCode::Char(' '));
+        d.press(KeyCode::Char(key));
+        assert_eq!(
+            d.app.input_mode,
+            InputMode::Confirm,
+            "Space {key} must allow recovering a disconnected Codex session"
+        );
+        let specs = match d.press(KeyCode::Enter) {
+            Some(Action::RestartSession(spec)) => vec![spec],
+            Some(Action::RestartAll { sessions }) => sessions,
+            other => panic!("expected restart action, got {other:?}"),
+        };
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].session_id, "sess-1");
+        assert!(
+            specs[0].kill_old,
+            "cleanup must precede resuming the thread"
+        );
+    }
+}
+
+#[test]
+fn codex_restarts_still_require_disconnection_identity_and_cleanup_control() {
+    use cm_core::agents::codex::CodexMode;
+
+    for key in ['e', 'E'] {
+        for missing in ["disconnection", "identity", "control", "app-server mode"] {
+            let mut d = TestDashboard::new(120, 20);
+            let mut row = session(1, "/path/to/project", SessionStatus::Starting);
+            row.agent = crate::agent::AgentControl::Codex;
+            row.codex_mode = CodexMode::AppServer;
+            row.codex_connected = Some(false);
+            row.codex_control = true;
+            match missing {
+                "disconnection" => row.codex_connected = Some(true),
+                "identity" => row.session_id = None,
+                "control" => row.codex_control = false,
+                "app-server mode" => row.codex_mode = CodexMode::Native,
+                _ => unreachable!(),
+            }
+            d.set_sessions(vec![row]);
+            d.press(KeyCode::Char(' '));
+            d.press(KeyCode::Char(key));
+            assert_eq!(d.app.input_mode, InputMode::Normal, "missing {missing}");
+            assert!(d.app.pending_confirm.is_none(), "missing {missing}");
+            assert!(d.app.status_is_error, "missing {missing}");
+        }
+    }
+}
+
 /// `Space e` on an idle session opens a confirmation dialog without firing
 /// the action. `y` then yields a RestartSession action carrying the session
 /// metadata; the dashboard returns to Normal mode.

@@ -95,6 +95,66 @@ pub(crate) async fn stop(
         return Ok(());
     };
     let mut client = transport::Client::connect(&config.socket_path()?).await?;
+    let result = stop_loaded(&mut client, id, turn).await;
+    if result.is_err()
+        && loaded_threads(&mut client)
+            .await
+            .is_ok_and(|loaded| !loaded.contains(id))
+    {
+        // A daemon restart ends its loaded runtimes, but the saved thread id
+        // remains on the launcher. Positive absence makes cleanup idempotent;
+        // a disconnected socket or a failed inventory read proves nothing.
+        return Ok(());
+    }
+    result
+}
+
+async fn loaded_threads(
+    client: &mut transport::Client,
+) -> Result<std::collections::HashSet<String>> {
+    let mut loaded = std::collections::HashSet::new();
+    let mut cursors = std::collections::HashSet::new();
+    let mut cursor = None;
+    loop {
+        let page = client
+            .request("thread/loaded/list", json!({"cursor":cursor}))
+            .await?;
+        for id in page["data"]
+            .as_array()
+            .context("invalid Codex loaded-thread list")?
+        {
+            loaded.insert(
+                id.as_str()
+                    .context("invalid Codex loaded-thread id")?
+                    .to_owned(),
+            );
+        }
+        match &page["nextCursor"] {
+            serde_json::Value::Null => return Ok(loaded),
+            serde_json::Value::String(next) if cursors.insert(next.clone()) => {
+                cursor = Some(next.clone());
+            }
+            _ => anyhow::bail!("invalid Codex loaded-thread cursor"),
+        }
+    }
+}
+
+async fn confirm_quiescence(config: &CodexConfig, paused: Result<()>) -> Result<()> {
+    let Err(error) = paused else {
+        return Ok(());
+    };
+    let Some(unsettled) = error.downcast_ref::<relay::UnsettledThreads>() else {
+        // A timeout or a stopped relay has not acknowledged fencing new input.
+        return Err(error);
+    };
+    let mut client = transport::Client::connect(&config.socket_path()?).await?;
+    if unsettled.may_be_running(&loaded_threads(&mut client).await?) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn stop_loaded(client: &mut transport::Client, id: &str, turn: Option<&str>) -> Result<()> {
     // A goal can start another turn after an interrupt. Pause its continuation
     // before ending the turn, preserving its objective and budget for resume.
     let goal = client
@@ -178,3 +238,6 @@ pub(crate) fn command(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests;
