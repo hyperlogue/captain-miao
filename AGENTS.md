@@ -1,285 +1,91 @@
 # captain-miao
 
-TUI dashboard to monitor and manage multiple Claude Code / Codex sessions across
-Kitty, Ghostty, iTerm2, zellij and tmux.
+TUI dashboard for coding-agent sessions across terminal emulators and pooled
+hosts. The launcher owns session state; the dashboard watches its state files.
 
-This file is the **map and the house rules**: where things live, and the
-constraints you can't discover by reading the file you're editing. Design
-rationale lives in the module docs (dense on purpose) and in `docs/`;
-user-facing behaviour lives in the README. Don't grow this file with either —
-put it where the code is.
+## Working agreement
 
----
+- Carry the requested change through implementation, relevant verification and
+  the commit below. Resolve routine choices from the code and session context;
+  ask when missing information would change the result or authorized scope.
+- Follow explicit user instructions over skill guidance. If a repository rule
+  or skill blocks completion, cite its file and the exact requirement, explain
+  the blocker, and finish independent work before asking for a decision.
+- Keep status updates and the final report concise: outcome, checks, and any
+  remaining blocker. State assumptions that affect the result.
 
-## Map
+## Map and task-specific rules
 
-Unidirectional. The launcher is the single source of truth; the dashboard is a
-pure viewer that re-reads state files on `notify` events and does no IPC.
+| Location | Responsibility |
+| --- | --- |
+| `crates/cm-core` | Shared agent, launcher, state and protocol logic; no ratatui or libshpool. |
+| `src/` | `miao`: dashboard, terminal control, launch/hook/focus; no pty pool. |
+| `crates/cm-server` | `miao-server`: per-host daemon and pty pool. |
+| `crates/cm-client` | `miao-client`: CLI over the local pool socket. |
+| `xtask` | Obtain server payloads and build distribution variants. |
 
-```
-Claude/Codex hook → miao hook → launcher (Unix socket)
-                                    ↓ writes ~/.local/state/captain-miao/sessions/{pid}.json
-                                dashboard (notify watcher) reads it
-```
+Read the guide for the behavior being changed, including changes in callers
+outside the named directories:
 
-| Crate | Binary | What |
-| --- | --- | --- |
-| `crates/cm-core` | — | Shared logic + data. No ratatui, no libshpool, so it cross-compiles into the server. |
-| `.` (root) | **`miao`** | The TUI (`src/app/`, `src/terminal/`), plus `launch`/`hook`/`focus`. No pty pool. |
-| `crates/cm-server` | **`miao-server`** | Headless per-host daemon + pty pool. Cross-compiled to Linux and deployed to remotes. |
-| `crates/cm-client` | **`miao-client`** | Thin CLI over the *local* pool socket: `list`, `attach`. |
-| `xtask` | — | `prepare-servers` (obtain) and `dist` (build variants). |
+- **Dashboard, keybindings, terminal control, previews or attach/detach:**
+  [dashboard rules](docs/agent-guides/dashboard.md). `Keymap` lives in
+  `src/app/keymap.rs`; `run_command` in `src/app/keys.rs` owns command effects.
+- **Agent CLIs, hooks, session status, persistence, hosts or transports:**
+  [session rules](docs/agent-guides/sessions.md).
+  `AgentControl` is in `crates/cm-core/src/agent.rs`; `Backend` is in
+  `src/backend/mod.rs`, sharing `LocalBackend` with the server.
+- **Build scripts, packaging, CI or releases:**
+  [distribution rules](docs/agent-guides/distribution.md).
+- **Remote architecture or wire protocol design:**
+  [remote sessions](docs/remote-sessions.md). For crate boundaries or embedded
+  payload design, use [crate split](docs/crate-split.md).
+- **Changelog, version bump or release execution:**
+  [release skill](.claude/skills/release/SKILL.md), shared with Codex through
+  `.agents/skills/release`. Use only the workflow the user requested.
 
-Four seams carry the whole design; each is documented at its definition.
+Module docs own local constraints and rationale; the README owns user-facing
+behavior. Keep this file to shared working rules and conditional pointers.
 
-- **`AgentControl`** (`cm-core/agent.rs`) — which coding-agent CLI a session
-  runs. A feature one agent lacks returns `None`/empty from its method; a
-  *structural* limit the UI has to gate on is a field on `capabilities()`
-  instead, the same shape as `Terminal`'s. That table is declared (it is read
-  while drawing) and every entry is checked against the code that owns it, so a
-  capability can only change by changing an argv or a hook config.
-- **`Backend`** (`src/backend.rs`) — where sessions run. `LocalBackend`
-  (`cm-core/backend.rs`) is also the server-core.
-- **`Terminal`** (`src/terminal/`) — per-emulator control. One `capabilities()`
-  query is the whole capability seam: a new backend limitation is a new *field*
-  there, not a new trait method. Ghostty is the worked example: it can't read a
-  window at all, and that became `capture`.
-- **`Keymap`** (`src/app/keymap.rs`) — every Normal-mode command is remappable;
-  `run_command` (`src/app/keys.rs`) is the one place a `Command` becomes a side
-  effect.
+## Verification
 
-`docs/remote-sessions.md` is the authority on remote hosts and the wire
-protocol; `docs/crate-split.md` on the crate split and server payloads. The
-`/release` skill has the release procedure.
+Use the toolchain in `nix develop`, as CI does. For Rust or Cargo changes, run
+`cargo fmt --all` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings` before staging,
+plus tests covering the changed behavior. `cargo test --workspace --locked` is
+the full suite; broader checks are warranted by cross-crate changes or release
+preparation. Rerun affected checks after fixes; a passing check needs repeating
+only if subsequent changes affect it.
 
-### State files
+For documentation or skill-only changes, check links, examples, instruction
+consistency and skill frontmatter; Rust tests add no coverage to prose. Changes
+to executable scripts or CI need checks of their actual behavior.
 
-`~/.local/state/captain-miao/` (paths in `cm-core/state.rs`), **owner-only** —
-dirs `0700`, JSON `0600`, because state records the user's prompt text and cwds.
-Write through `create_dir_all_private` / `write_json_atomic`, never `fs::write`.
-All of it is safe to delete; each file regenerates or resets. Runtime sockets
-live under `$XDG_RUNTIME_DIR/captain-miao/`, falling back to
-`~/.local/state/captain-miao/run/` where that is unset (macOS) — **never
-`$TMPDIR`**, which macOS reaps out from under a long-lived session. ssh's own
-sockets are the documented exception (`ssh_sock_dir`).
-
----
-
-## Invariants
-
-Constraints that bite from a *different* file than the one that defines them.
-Anything local to one module is in that module's doc instead.
-
-### Never
-
-- **`git add -A` / `.` / `-u`, `git commit -a` / `-am`, or a bare index-wide
-  `git commit`.** Other agent sessions run in this same tree; each sweeps their
-  work into your commit. Stage *and* commit by path — see Committing.
-- **Snapshot the terminal from the launcher.** Window/tab lookup is
-  presentation-only and a launcher may be headless or remote. The launcher only
-  ever self-reports its own window from the env (`current_window`).
-- **Parse a `SessionKey`** above the backend seam. It is opaque; the owning host
-  re-resolves it to a pid at signal time.
-- **Put `$HOME` on the wire.** Paths cross in the host-canonical `~` form
-  (`cm_core::paths`); expand on receipt, collapse on return. A `~` path spliced
-  into a *shell* command goes through `paths::shell_quote_host_path`.
-- **Call `mark_dirty` before the mutation lands.** It reads the sort anchor from
-  the current rows; running it early caches the stale order under the new
-  version and panics the next reload.
-- **Write hooks into `~/.claude/settings.json`.** They are injected per-session
-  via `--settings` and torn down on exit.
-- **Let zellij's `list-panes` onto a hot path** (~20ms *per pane* server-side) —
-  never on focus, spawn, or restart. tmux's is cheap; don't generalize either
-  way.
-- **Ask the terminal to `hold` a window you want to read after its command
-  dies.** kitty's `--hold` starts the user's login shell when the command exits,
-  so a dropped ssh leaves a live local shell wearing a session's title. The
-  attach wrapper does its own holding (`ATTACH_REPORT_SCRIPT`).
-- **Fold the attach wrapper's `HUP` trap back into the `EXIT` one.**
-  `trap 'r 129' HUP` is separate on purpose: a terminal that ends a window by
-  closing the pty master (rather than `killpg`-ing the group) signals only the
-  session leader, so ssh is left to exit **255** on its own — and a trap
-  inheriting `$?` then reports a deliberate close as a dropped link, silently
-  disabling `[remote] on_window_close`.
-- **Add a 9th `kitten @` command** without updating the README's rc allowlist —
-  every user on the recommended config gets a hard denial on it.
-- **Pass Claude's `--tmux`.** It makes its own tmux session on the same server,
-  so the identity matches, the binding isn't classified foreign, and it then
-  never resolves.
-
-### Always
-
-- **Give `App::mark_dirty` an explicit `Cursor`.** There is deliberately no
-  default — invalidating the order says nothing about the index derived from it.
-  `FollowSession` is the common case; `Follow(key)` to advance to one named
-  *before* the mutation; `HoldIndex` when only rendering changed; `Top` for
-  search.
-- **Route every window-binding change through the `App` methods**
-  (`record_window_binding`, `retire_window_binding`, `prune_detached_sessions`,
-  `apply_detach_reports`) — never `window_bindings` directly. They mark dirty
-  *and* re-anchor the cursor, both of which a raw write misses.
-- **Retire a binding before closing the window yourself.** A detach report for a
-  binding we still hold reads as the *user* closing that window, which ends the
-  session under `[remote] on_window_close` (default `close`). Only status `129`
-  counts as a user close — ssh's 255 (dropped link) and an in-session detach's 0
-  must keep the session, or a flaky network becomes lost work — and a report
-  drained at **startup** never ends anything, since a quitting terminal SIGHUPs
-  every attach window on its way out.
-- **Branch on host, capability, or connection state — never on locality.**
-  `capabilities() -> {pooled, shell}` is what detach/steal/the detached tier key
-  on, which is why they work under pooled-localhost.
-- **Keep protocol changes additive** (`#[serde(default)]`). v4 is meant to be the
-  last refusing bump; unknown frames decode to `Unknown` and are ignored.
-- **Hide an unsupported affordance, don't offer a key that only errors.** `t` on
-  zellij, Ghostty and iTerm2, `Space l` on tmux, Ghostty and iTerm2, `Ctrl-g` on
-  Codex all do this. Render bindings via `keys_for`/`primary_key` so a remap
-  shows through without touching `draw.rs`. A capability that gates a
-  *recurring* read needs
-  the gate at the call site too, not just in the UI: the preview loop treats a
-  failed `capture_text` as evidence the binding is stale, so `capture: false`
-  has to stop the fetch rather than let it error.
-- **Don't render an absence that looks like a pending value, either.** The same
-  rule one level down: an empty Context cell means "no number yet", so a backend
-  that persists none reads `n/a`, and "No sessions need attention" names the
-  backend that has no approval prompt to report rather than claiming the sweep
-  was exhaustive. Both gate on `AgentControl::capabilities()`.
-- **Wrap anything sent over ssh in `/bin/sh -c '<script>'`** (`login_shell_safe`)
-  — the account's login shell is routinely fish. Such a script may contain **no
-  single quote and no backslash**.
-- **Namespace every persisted window id by the instance that minted it**
-  (`zellij:<session>` / `tmux:<socket>,<server-pid>` / `kitty:<socket|pid>`) —
-  those id spaces overlap. A row stamped with another instance is *foreign*:
-  drawn dimmed, window ops inert, bindings carried verbatim through every
-  rewrite so switching backends loses nothing. Ghostty is the one identity that
-  is **not** instance-granular, and `ghostty_identity` states why: its surface
-  ids are UUIDs, so nothing overlaps and there is nothing to disambiguate.
-- **Treat Claude's own session file as authoritative** on the
-  working/idle/background-shell axis; mirror it, no edge-tracking. An unreadable
-  or unrecognized read maps to `None` (leave unchanged), never a definite state.
-  Refinement is **demote-only except from `Idle`**, which the file also promotes
-  to `Active`: hooks cannot own rest→`Active` for a *queued* prompt, whose
-  `UserPromptSubmit` fires when it is queued (mid-turn, row already `Active`)
-  and never when it is dequeued — so the turn a flushed queue starts announces
-  itself only in that file, whose turn boundary is a ~20ms `idle` blip followed
-  by `busy`. Every other promotion needs corroboration from outside the file:
-  `promote_stale_background` fires only when the **process tree** disproves a
-  background status, never on the session file alone.
-- **Leave worktrees entirely to the agent.** captain-miao creates, names and
-  cleans up nothing: `worktree_args` contributes `--worktree [name]` and the
-  agent owns the branch, base ref, enforcement and cleanup. Resume and restart
-  never pass the flag — the agent re-enters the session's own worktree.
-- **When using a synthetic home, never let a file captain-miao writes reach the
-  agent's real home.** A synthetic home mirrors the user's, and one thing
-  travels back out of it: an entry the *agent* minted there because the real
-  home had no such name to mirror (a first login's credentials).
-  `SynthHome::adopted` names those, and anything in `owned` or `copied` is
-  refused — those carry our hook config, and installing it in the real home
-  would fire our hooks in every session the user runs *outside* captain-miao,
-  against a socket that isn't there. Where the agent's state is a
-  **directory**, seed it in the real home instead (Kimi's `credentials/`): the
-  agent's temp file and its rename both land inside the real directory, so no
-  shadow can form at all.
-- **Let per-session flags be host-owned** for a pooled host (`session-flags.json`
-  sidecar, never the launcher's state file — single-writer rule).
-- **Keep `CM_SERVER_PAYLOAD_MANIFEST` the only switch for embedded servers.**
-  Unset (every ordinary build) the table is empty; set *and wrong* is a hard
-  build error, never a quiet empty table. `build.rs` watches each archive, so
-  never rewrite one with identical bytes — it forces a full LTO relink.
-- **Land a built executable on a fresh inode** (`xtask`'s `install`), never by
-  copying over the file already there. macOS binds a signature to the vnode an
-  executable ran from, and a path rewritten in place then dies on every exec with
-  `SIGKILL (Code Signature Invalid)` while the same bytes run fine elsewhere.
-- **Drop the `captain-` prefix on shipping binaries and keep it everywhere
-  else** — Cargo/npm packages, nix attrs, `~/.config` + `~/.local/state` +
-  `~/.cache` dirs. `xtask/src/server.rs` carries both `SERVER_PKG` and
-  `SERVER_BIN` because conflating them builds fine and then can't find the
-  binary. Release *tarballs* follow the binary, not the project, and three of
-  them now differ only by an infix — `miao-v…`, `miao-bundled-all-server-v…`,
-  `miao-server-v…`. `stage-npm-packages.sh` picks the first by **exact string**
-  for that reason; loosen it to a glob and a publish stages the daemon as the
-  dashboard. Upload-*artifact* names keep the `captain-miao-` prefix regardless,
-  because the release job collects them with `pattern: captain-miao-*`.
-- **Publish only bundled dashboards.** Every release artifact and all four npm
-  packages are built from `SHIPPING_VARIANT` (one x86-64 glibc server);
-  `ALL_SERVER_VARIANT` is the extra GitHub-only download carrying all four. A
-  plain build is still what `cargo build` gives you, but shipping one under the
-  `miao-v…` name silently removes the deploy path from whoever grabbed it — which
-  is why `no_default_variant_is_the_plain_build` exists.
-- **Bump `[workspace.package] version` before you tag** (CI's `verify` fails
-  otherwise) and refresh `Cargo.lock` with it. Tags are plain SemVer. **No
-  `run:` body may interpolate a `${{ }}` expression** — values reach the shell
-  through `env:`.
-
----
+The ignored `drives_a_real_tmux_server` test starts an isolated local tmux
+server; run it when changing tmux integration. Remote provisioning tests need a
+user-designated disposable host and a server payload; see the recipe in
+`src/backend/provision.rs`. Selecting a remote test is not permission to deploy
+to an arbitrary configured host.
 
 ## Committing
 
-- **Run `cargo fmt --all` and `cargo clippy --workspace --all-targets --locked
-  -- -D warnings` before you stage.** CI's first job is both; there is no local
-  hook.
-- **Work on `main` directly.** No feature branches, no PRs for routine work.
-- **Before you stage, check for a concurrent committer.** captain-miao's whole
-  premise is running many agent sessions at once, so another one may be
-  mid-commit in this same tree. The workflow is _stage, then commit_, so a
-  non-empty index you didn't create means someone else is inside their
-  stage→commit window. Run `git diff --cached --name-only` first; if it lists
-  anything, back off and re-check on a 5s → 10s → 30s schedule until the index
-  is empty. If files are _still_ staged after the 30s wait, **stop and report to
-  the user** — never commit over another agent's staged work.
-- **Commit only what you changed — stage _and_ commit by path.** `git add
-  <path>…` then `git commit -- <path>…`; verify with `git diff --cached
-  --name-only` that the staged set is _only_ yours. If staging or committing
-  hits a blocker, pause and ask.
-- **Commit once the work is fully complete.** With no open decision left for the
-  user, commit it yourself (commit only; pushing waits for the user). If there's
-  still an open question or an unexpected tradeoff, finish the work but leave
-  `git add` / `commit` / `push` to the user.
-- **Prefer several small, self-contained commits over one large one.** Split
-  along the seams the work already has: a refactor lands ahead of the change it
-  makes room for, a fix travels with the test that pins it, a doc update rides
-  with the behaviour it describes. Each piece must build with its tests passing
-  and name one thing in its subject. Where that pulls against self-containment,
-  **self-contained wins**: one logical change spanning several crates stays one
-  commit rather than three that don't compile in sequence. Re-run the
-  concurrent-committer check before each one.
+- Work on `main` directly for routine work; no feature branches or PRs.
+- Other sessions share this tree. Before **each** staging operation, run
+  `git diff --cached --name-only`. If another session has staged files, wait
+  5s, then 10s, then 30s, rechecking after each wait. If the index is still
+  occupied after the last wait, stop and report it; leave those files alone.
+- Stage **and** commit only your paths: `git add <path>…`, verify the staged
+  names are only yours, then `git commit -- <path>…`. Never use `git add -A`,
+  `git add .`, `git add -u`, `git commit -a` / `-am`, or an index-wide commit.
+  If staging or committing is blocked, preserve the work and report the blocker.
+- Commit when the work is complete and no user decision remains. An open
+  question or unexpected tradeoff leaves staging and committing to the user.
+  Push only when the user requests it.
+- Prefer small, self-contained commits that each build and pass their relevant
+  tests; one logical change spanning crates stays together. Recheck the index
+  before each commit's staging step.
 
-**Message format** — subject: capitalized imperative, ≤72 chars, no trailing
-period, no forced scope (a `doc:` prefix is fine for docs-only commits). Body
-(blank line, wrapped ~72) whenever the _why_ isn't obvious from subject + diff:
-the motivation or the non-obvious constraint, not a narration of the diff; close
-with a short verification note when you ran one. **No `Co-Authored-By` trailer**
-— strip it if the harness appends one.
-
----
-
-## Dev commands
-
-```sh
-cargo run                    # run TUI dashboard
-cargo run -- launch claude . # launch Claude in current dir with hooks
-cargo run -- focus --window-id $KITTY_WINDOW_ID
-                             # focus dashboard AND ring this window's bell
-cargo build --workspace
-cargo build --no-default-features   # strictly local-only dashboard (no remote hosts)
-cargo test --workspace
-
-cargo run -p captain-miao-server -- daemon ensure|status|stop
-cargo run -p captain-miao-client -- list | attach <name> [--force]
-
-# Embedded server payloads. A plain `cargo build` bundles nothing.
-cargo xtask dist [--list|--target <triple>|--from release|--server <target>=<path>]
-                             # no --variant: builds exactly what a release ships
-cargo xtask prepare-servers --out dist/servers   # what release CI runs
-miao --version                                   # what a built binary embeds
-
-# Ignored tests that need a live host / server. The payload reaches the test
-# binary through the manifest env var, never a cargo feature — there is no
-# `bundle-*` feature, and without a manifest there is nothing to deploy:
-CM_SERVER_PAYLOAD_MANIFEST=target/cm-server-payloads/bundle-linux-x86_64.tsv \
-  CM_TEST_SSH_TARGET=box \
-  cargo test -p captain-miao -- --ignored provisions_a_real_host
-#   (`cargo xtask dist` writes that manifest as a side effect — one TSV per
-#    variant; src/backend.rs's test doc has the full recipe)
-# Also run by CI on both matrix legs — tmux is in the dev shell for it.
-cargo test -p captain-miao -- --ignored drives_a_real_tmux_server
-```
+Commit subjects are capitalized imperatives, at most 72 characters, with no
+trailing period or forced scope (`doc:` is fine for documentation). Add a body,
+wrapped around 72 columns, when the motivation or constraint is not clear from
+the subject and diff; include a short verification note when checks ran.
+Use no `Co-Authored-By` trailer, including one added by a harness.

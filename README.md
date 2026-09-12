@@ -533,7 +533,7 @@ captain-miao is built around a strict unidirectional data flow:
 - **Hooks** are thin forwarders: they parse the agent's hook payload from stdin and send it to the launcher socket.
 - The **dashboard** is a pure viewer. It watches the session state directory and per-backend transcript dirs with `notify` (FSEvents on macOS, inotify on Linux) and re-reads files when they change. It performs no IPC of its own.
 
-State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For a deeper tour of the architecture, module layout, hook wiring, and data files, see [AGENTS.md](AGENTS.md).
+State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For implementation rules and architecture references, see [AGENTS.md](AGENTS.md).
 
 ## License
 
