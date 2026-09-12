@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-11
+
+### Added
+
+- **Codex app-server support** provides faster status updates and can be enabled
+  per host, including localhost ([extra setup](docs/codex-app-server.md) is
+  required, so native mode remains the default).
+- **An SSH port-forwarding manager** (`Space h`, then `f`) lets you add, edit,
+  duplicate, toggle, and bulk-import local, remote, and SOCKS forwards, with
+  live status and changes that apply without reconnecting the host.
+- **`Ctrl+V` attaches images in remote Codex sessions** when the host's Clipboard
+  option is enabled.
+- **The first host in the Hosts panel is now the launch default**, with `J` / `K`
+  to reorder hosts and existing defaults preserved during migration.
+
+### Fixed
+
+- **Codex integration fixes:**
+  - **Codex titles and session IDs refresh on resume and restart**, so idle
+    sessions leave `Starting` without a prompt and renamed sessions appear
+    correctly in the dashboard and resume picker.
+  - **Codex catch-up summaries no longer replace session names or last prompts**
+    or report false disconnects in app-server mode.
+  - **Pooled sessions restore their current keyboard, mouse, and paste modes on
+    reattach**, including Codex input.
+- **Closing a session window reliably closes or detaches the session** according
+  to your settings.
+- **Closing or restarting app-server sessions no longer freezes the dashboard**,
+  and failures leave the session visible so you can retry.
+
 ## [0.8.1] - 2026-09-04
 
 ### Fixed
@@ -532,6 +562,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/hyperlogue/captain-miao/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/hyperlogue/captain-miao/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/hyperlogue/captain-miao/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hyperlogue/captain-miao/compare/v0.6.0...v0.7.0
