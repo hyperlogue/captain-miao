@@ -28,23 +28,22 @@ fn receive<T: DeserializeOwned>(stream: &UnixStream) -> T {
 }
 
 struct Pool {
-    root: PathBuf,
+    root: tempfile::TempDir,
     daemon: Child,
 }
 
 impl Pool {
     fn new() -> Self {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("cm-mode-pool-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        // Clock readings can repeat across parallel tests. Reserve a private
+        // directory atomically, under a short path for macOS's Unix sockets.
+        let root = tempfile::Builder::new()
+            .prefix("cm-pool-")
+            .tempdir_in("/tmp")
+            .unwrap();
         // Keyboard stacks differ on purpose: returning from the alternate
         // screen must recover the primary screen's flags too.
         std::fs::write(
-            root.join("app.sh"),
+            root.path().join("app.sh"),
             r"stty -echo
 printf '\033[>7u\033[?2004hREADY'
 while :; do
@@ -61,17 +60,17 @@ done
         .unwrap();
         assert!(
             Command::new("mkfifo")
-                .arg(root.join("control"))
+                .arg(root.path().join("control"))
                 .status()
                 .unwrap()
                 .success()
         );
         let daemon = Command::new(env!("CARGO_BIN_EXE_miao-server"))
             .arg("pty-daemon")
-            .env("HOME", &root)
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_STATE_HOME", root.join("state"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -87,7 +86,7 @@ done
     }
 
     fn socket(&self) -> PathBuf {
-        self.root.join("run/captain-miao/pty-pool.sock")
+        self.root.path().join("run/captain-miao/pty-pool.sock")
     }
 
     fn connect(&self) -> UnixStream {
@@ -117,7 +116,7 @@ done
                     local_env: vec![("TERM".into(), "xterm-256color".into())],
                     ttl_secs: None,
                     cmd: create.then(|| "/bin/sh app.sh".into()),
-                    dir: Some(self.root.to_string_lossy().into_owned()),
+                    dir: Some(self.root.path().to_string_lossy().into_owned()),
                     start_cmd: None,
                 }),
             );
@@ -160,10 +159,12 @@ done
                 .find_map(|dir| dir.canonicalize().ok().map(|dir| dir.join(name)))
                 .expect("tool on test PATH")
         };
+        // GNU stty's raw mode leaves IEXTEN set; macOS still interprets Ctrl+V
+        // as literal-next with that flag, even when canonical mode is off.
         std::fs::write(
-            self.root.join("app.sh"),
+            self.root.path().join("app.sh"),
             format!(
-                "{} raw -echo\nprintf READY\nexec {}\n",
+                "{} raw -echo -iexten\nprintf READY\nexec {}\n",
                 shell_words::quote(&tool("stty").to_string_lossy()),
                 shell_words::quote(&tool("cat").to_string_lossy())
             ),
@@ -180,6 +181,7 @@ done
         }
         let path = self
             .root
+            .path()
             .join("state/captain-miao/sessions")
             .join(format!("{}.json", std::process::id()));
         cm_core::state::create_dir_all_private(path.parent().unwrap()).unwrap();
@@ -199,11 +201,12 @@ done
     }
 
     fn clipboard(&self) -> UnixListener {
-        UnixListener::bind(self.root.join("run/captain-miao/clipboard.sock")).unwrap()
+        UnixListener::bind(self.root.path().join("run/captain-miao/clipboard.sock")).unwrap()
     }
 
     fn images(&self) -> PathBuf {
         self.root
+            .path()
             .join("run/captain-miao/launchers")
             .join(format!("{}-images", std::process::id()))
     }
@@ -223,7 +226,6 @@ impl Drop for Pool {
         }
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -298,7 +300,7 @@ fn reattach_restores_an_active_alternate_screen_before_live_output() {
     drop(second);
     std::fs::OpenOptions::new()
         .write(true)
-        .open(pool.root.join("control"))
+        .open(pool.root.path().join("control"))
         .unwrap()
         .write_all(b"primary\n")
         .unwrap();

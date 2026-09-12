@@ -42,3 +42,4 @@ pty-pool = ["dep:libshpool", "dep:shpool-protocol", "dep:rmp-serde", "dep:shell-
 
 [dev-dependencies]
 cm-core = { path = "../cm-core", features = ["test-support"] }
+tempfile = "3"

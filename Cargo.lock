@@ -298,6 +298,7 @@ dependencies = [
  "serde",
  "shell-words",
  "shpool-protocol",
+ "tempfile",
  "tokio",
  "tracing",
 ]
