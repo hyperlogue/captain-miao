@@ -3316,86 +3316,93 @@ async fn serve(
 
     let mut pending: HashMap<u64, oneshot::Sender<ServerFrame>> = HashMap::new();
     loop {
-        tokio::select! {
-            frame = read_frame::<_, ServerFrame>(&mut rd) => {
-                let frame = match frame {
-                    Ok(Some(f)) => f,
-                    Ok(None) => { tracing::debug!(target: "captain_miao::ssh", "server closed the stream (EOF)"); return ServeOutcome::ConnectionLost; }
-                    Err(e) => { tracing::warn!(target: "captain_miao::ssh", "frame read/parse error: {e}"); return ServeOutcome::ConnectionLost; }
-                };
-                match frame {
-                    ServerFrame::Snapshot { sessions } => {
-                        tracing::debug!(target: "captain_miao::ssh", "snapshot: {} sessions", sessions.len());
-                        let mut m = mirror.lock().unwrap();
-                        m.clear();
-                        for s in sessions {
-                            m.insert(s.key(), s);
+        // read_frame owns partially consumed length/payload bytes. Keep that
+        // same future across outgoing requests until the whole frame arrives.
+        let read = read_frame::<_, ServerFrame>(&mut rd);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                frame = &mut read => {
+                    let frame = match frame {
+                        Ok(Some(f)) => f,
+                        Ok(None) => { tracing::debug!(target: "captain_miao::ssh", "server closed the stream (EOF)"); return ServeOutcome::ConnectionLost; }
+                        Err(e) => { tracing::warn!(target: "captain_miao::ssh", "frame read/parse error: {e}"); return ServeOutcome::ConnectionLost; }
+                    };
+                    match frame {
+                        ServerFrame::Snapshot { sessions } => {
+                            tracing::debug!(target: "captain_miao::ssh", "snapshot: {} sessions", sessions.len());
+                            let mut m = mirror.lock().unwrap();
+                            m.clear();
+                            for s in sessions {
+                                m.insert(s.key(), s);
+                            }
+                            // A full account of the host supersedes every guess we
+                            // were making about it (see `presumed_dead`).
+                            presumed_dead.lock().unwrap().clear();
+                            presumed_attached.lock().unwrap().clear();
+                            // The mirror now *is* the host's account of itself, so
+                            // the dashboard can stop saying rows are on their way.
+                            mirrored.store(true, Ordering::Relaxed);
+                            // The mirror changed off-thread; wake the dashboard loop.
+                            dirty.store(true, Ordering::Relaxed);
                         }
-                        // A full account of the host supersedes every guess we
-                        // were making about it (see `presumed_dead`).
-                        presumed_dead.lock().unwrap().clear();
-                        presumed_attached.lock().unwrap().clear();
-                        // The mirror now *is* the host's account of itself, so
-                        // the dashboard can stop saying rows are on their way.
-                        mirrored.store(true, Ordering::Relaxed);
-                        // The mirror changed off-thread; wake the dashboard loop.
-                        dirty.store(true, Ordering::Relaxed);
-                    }
-                    // Deliberately does *not* withdraw a *dead* presumption. A
-                    // delta says only that the state file moved, which a session
-                    // on its way out can still do — a last hook, a status
-                    // mirrored from the agent's own file as it exits. `Removed`
-                    // is the frame that means gone; treating a delta as evidence
-                    // of life would flash the row back for the frame or two
-                    // before one arrives.
-                    //
-                    // It does end an *attached* presumption, and that asymmetry
-                    // is the point: a delta carries the attached bit, so it is
-                    // the host's own account of the very thing being presumed,
-                    // arriving whether it agrees or not. Nothing else ends one —
-                    // a session stays attached for as long as its user is
-                    // working, so a timer would only restore the stale value the
-                    // presumption was correcting.
-                    ServerFrame::Delta { state } => {
-                        let key = state.key();
-                        presumed_attached.lock().unwrap().remove(&key);
-                        mirror.lock().unwrap().insert(key, *state);
-                        dirty.store(true, Ordering::Relaxed);
-                    }
-                    ServerFrame::Removed { key } => {
-                        mirror.lock().unwrap().remove(&key);
-                        // The host has now said what we were presuming, so the
-                        // presumption has nothing left to do. Dropping it here
-                        // rather than letting it lapse keeps a recycled key (a
-                        // launcher pid the host reuses within the window) from
-                        // inheriting the hide meant for its predecessor.
-                        presumed_dead.lock().unwrap().remove(&key);
-                        // Nothing to hold a bit about any more, and a launcher
-                        // pid the host recycles must not inherit it.
-                        presumed_attached.lock().unwrap().remove(&key);
-                        dirty.store(true, Ordering::Relaxed);
-                    }
-                    // Every reply routes by `req_id` through one accessor, so a
-                    // future reply variant needs no change here (§3 tolerance).
-                    // `None` covers the pushed stream and an unknown frame from
-                    // a newer peer, both of which are simply ignored.
-                    _ => {
-                        if let Some(tx) = frame.req_id().and_then(|id| pending.remove(&id)) {
-                            let _ = tx.send(frame);
+                        // Deliberately does *not* withdraw a *dead* presumption. A
+                        // delta says only that the state file moved, which a session
+                        // on its way out can still do — a last hook, a status
+                        // mirrored from the agent's own file as it exits. `Removed`
+                        // is the frame that means gone; treating a delta as evidence
+                        // of life would flash the row back for the frame or two
+                        // before one arrives.
+                        //
+                        // It does end an *attached* presumption, and that asymmetry
+                        // is the point: a delta carries the attached bit, so it is
+                        // the host's own account of the very thing being presumed,
+                        // arriving whether it agrees or not. Nothing else ends one —
+                        // a session stays attached for as long as its user is
+                        // working, so a timer would only restore the stale value the
+                        // presumption was correcting.
+                        ServerFrame::Delta { state } => {
+                            let key = state.key();
+                            presumed_attached.lock().unwrap().remove(&key);
+                            mirror.lock().unwrap().insert(key, *state);
+                            dirty.store(true, Ordering::Relaxed);
+                        }
+                        ServerFrame::Removed { key } => {
+                            mirror.lock().unwrap().remove(&key);
+                            // The host has now said what we were presuming, so the
+                            // presumption has nothing left to do. Dropping it here
+                            // rather than letting it lapse keeps a recycled key (a
+                            // launcher pid the host reuses within the window) from
+                            // inheriting the hide meant for its predecessor.
+                            presumed_dead.lock().unwrap().remove(&key);
+                            // Nothing to hold a bit about any more, and a launcher
+                            // pid the host recycles must not inherit it.
+                            presumed_attached.lock().unwrap().remove(&key);
+                            dirty.store(true, Ordering::Relaxed);
+                        }
+                        // Every reply routes by `req_id` through one accessor, so a
+                        // future reply variant needs no change here (§3 tolerance).
+                        // `None` covers the pushed stream and an unknown frame from
+                        // a newer peer, both of which are simply ignored.
+                        _ => {
+                            if let Some(tx) = frame.req_id().and_then(|id| pending.remove(&id)) {
+                                let _ = tx.send(frame);
+                            }
                         }
                     }
+                    break;
                 }
-            }
-            req = requests.recv() => {
-                let Some(req) = req else { return ServeOutcome::BackendDropped };
-                // Drop the entries whose caller has given up (a `request_within`
-                // that timed out). A server that never answers a frame it can't
-                // decode would otherwise leave one behind per attempt, for as
-                // long as the connection lasts.
-                pending.retain(|_, tx| !tx.is_closed());
-                pending.insert(req.req_id, req.reply);
-                if write_frame(&mut wr, &req.frame).await.is_err() {
-                    return ServeOutcome::ConnectionLost;
+                req = requests.recv() => {
+                    let Some(req) = req else { return ServeOutcome::BackendDropped };
+                    // Drop the entries whose caller has given up (a `request_within`
+                    // that timed out). A server that never answers a frame it can't
+                    // decode would otherwise leave one behind per attempt, for as
+                    // long as the connection lasts.
+                    pending.retain(|_, tx| !tx.is_closed());
+                    pending.insert(req.req_id, req.reply);
+                    if write_frame(&mut wr, &req.frame).await.is_err() {
+                        return ServeOutcome::ConnectionLost;
+                    }
                 }
             }
         }
@@ -3424,6 +3431,116 @@ mod tests {
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn outgoing_requests_preserve_fragmented_responses() {
+        use tokio::io::AsyncWriteExt;
+        // Split inside the length, at the body boundary, and inside the JSON.
+        for split in [2, 4, 12] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (mut rd, mut wr) = server.into_split();
+            let mirror = Arc::new(Mutex::new(HashMap::new()));
+            let presumed_dead = Arc::new(Mutex::new(HashMap::new()));
+            let presumed_attached = Arc::new(Mutex::new(HashMap::new()));
+            let dirty = Arc::new(AtomicBool::new(false));
+            let mirrored = Arc::new(AtomicBool::new(false));
+            let server_version = Arc::new(Mutex::new(None));
+            let (tx, mut requests) = mpsc::unbounded_channel();
+            let connection = serve(
+                client,
+                MirrorCells {
+                    mirror: &mirror,
+                    presumed_dead: &presumed_dead,
+                    presumed_attached: &presumed_attached,
+                    dirty: &dirty,
+                    mirrored: &mirrored,
+                    server_version: &server_version,
+                },
+                &mut requests,
+            );
+            tokio::pin!(connection);
+            write_frame(
+                &mut wr,
+                &ServerFrame::Welcome {
+                    host: "test-host".into(),
+                    server_version: env!("CARGO_PKG_VERSION").into(),
+                    protocol: PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+            // Poll the real connection through each boundary, retaining its
+            // future between polls. No background task races the test driver.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut connection)
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                read_frame::<_, ClientFrame>(&mut rd).await.unwrap(),
+                Some(ClientFrame::Hello { .. })
+            ));
+            assert!(matches!(
+                read_frame::<_, ClientFrame>(&mut rd).await.unwrap(),
+                Some(ClientFrame::Subscribe)
+            ));
+            let snapshot = cm_core::protocol::encode_frame(&ServerFrame::Snapshot {
+                sessions: vec![test_state(42)],
+            })
+            .unwrap();
+            wr.write_all(&snapshot[..split]).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut connection)
+                    .await
+                    .is_err()
+            );
+            let (reply, mut response) = oneshot::channel();
+            tx.send(PendingRequest {
+                req_id: 1,
+                frame: ClientFrame::CheckDir {
+                    req_id: 1,
+                    path: "~".into(),
+                },
+                reply,
+            })
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut connection)
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                read_frame::<_, ClientFrame>(&mut rd).await.unwrap(),
+                Some(ClientFrame::CheckDir { req_id: 1, .. })
+            ));
+            wr.write_all(&snapshot[split..]).await.unwrap();
+            write_frame(
+                &mut wr,
+                &ServerFrame::DirChecked {
+                    req_id: 1,
+                    exists: true,
+                },
+            )
+            .await
+            .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_millis(20), &mut connection).await;
+            assert!(
+                outcome.is_err(),
+                "request discarded response bytes at split {split}: {outcome:?}"
+            );
+            assert!(mirrored.load(Ordering::Relaxed));
+            assert!(mirror.lock().unwrap().contains_key(&test_state(42).key()));
+            assert!(matches!(
+                response.try_recv(),
+                Ok(ServerFrame::DirChecked {
+                    req_id: 1,
+                    exists: true
+                })
+            ));
+            drop(tx);
+            assert_eq!(connection.await, ServeOutcome::BackendDropped);
+        }
+    }
 
     #[test]
     fn binding_presence_uses_host_truth_without_optimistic_hides() {
