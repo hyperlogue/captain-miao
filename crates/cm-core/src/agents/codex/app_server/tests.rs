@@ -946,14 +946,20 @@ async fn cleanup_waits_for_resume_identity_while_draining_a_full_observation_que
         "cleanup must not acknowledge success before learning the resumed thread"
     );
     release_tx.send(()).unwrap();
-    let reply: Value = tokio::time::timeout(
-        Duration::from_secs(2),
-        crate::protocol::read_frame(&mut stop),
-    )
+    // A real TUI keeps reading while cleanup fences its input. Without this
+    // reader, small Unix socket buffers block the relay before the resume
+    // response, independently of whether observations are being drained.
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(crate::protocol::read_frame::<_, Value>(&mut stop), async {
+            for _ in 0..256 {
+                assert_eq!(receive(&mut tui).await["method"], "thread/status/changed");
+            }
+            assert_eq!(receive(&mut tui).await["id"], 1);
+        })
+    })
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
+    let reply = reply.unwrap().unwrap();
     assert!(
         reply["error"].is_null(),
         "cleanup should survive failed state persistence: {reply}"
