@@ -870,11 +870,11 @@ async fn handle_conn(
             }
         }
     });
-    let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (replies_tx, mut replies_rx) = tokio::sync::mpsc::unbounded_channel();
     let result = async {
     loop {
         tokio::select! {
-            Some(reply) = cleanup_rx.recv() => {
+            Some(reply) = replies_rx.recv() => {
                 write_frame(&mut wr, &reply).await?;
             }
             frame = frames.recv() => {
@@ -888,15 +888,21 @@ async fn handle_conn(
                         subscribed = true;
                     }
                     ClientFrame::ListResumable { req_id, limit } => {
-                        let (candidates, errors) =
-                            tokio::task::block_in_place(|| backend.list_resumable(limit));
-                        write_frame(&mut wr, &ServerFrame::Resumable { req_id, candidates, errors }).await?;
+                        let backend = backend.clone();
+                        let tx = replies_tx.clone();
+                        // Inventory can wait on an agent's daemon or history
+                        // store. Keep host control and pushed updates flowing.
+                        tokio::spawn(async move {
+                            let (candidates, errors) = tokio::task::spawn_blocking(move || backend.list_resumable(limit))
+                                .await.unwrap_or_else(|error| (Vec::new(), vec![format!("Resume inventory worker failed: {error}")]));
+                            let _ = tx.send(ServerFrame::Resumable { req_id, candidates, errors });
+                        });
                     }
                     ClientFrame::KillSession { req_id, key, cleanup } => {
                         // The key is re-resolved to a live pid inside the
                         // backend, so a stale mirror can't make us signal a
                         // recycled pid.
-                        let tx = cleanup_tx.clone();
+                        let tx = replies_tx.clone();
                         // The operation remains owned by this host even if its
                         // requesting dashboard disconnects before the reply.
                         tokio::spawn(async move {
@@ -1079,6 +1085,148 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_inventory_allows_updates_and_cleanup() {
+        const TEST: &str = "server::tests::pending_inventory_allows_updates_and_cleanup";
+        if std::env::var_os("CM_TEST_PENDING_INVENTORY").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("CM_TEST_PENDING_INVENTORY", "1")
+                .env("XDG_CONFIG_HOME", root.path())
+                .env("XDG_STATE_HOME", root.path())
+                .env("XDG_RUNTIME_DIR", root.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        state::ensure_sessions_dir().unwrap();
+        let endpoint = state::runtime_dir().join("codex.sock");
+        state::create_dir_all_private(endpoint.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        cm_core::config::write_codex(&cm_core::agents::codex::CodexConfig {
+            mode: cm_core::agents::codex::CodexMode::AppServer,
+            endpoint: format!("unix://{}", endpoint.display()),
+        })
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let codex = tokio::spawn(async move {
+            // Hold the handshake to keep inventory pending, without executing
+            // any Codex work or depending on a particular agent installation.
+            let (stream, _) = listener.accept().await.unwrap();
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(stream);
+        });
+        let mut row = LauncherState::for_test(AgentControl::Codex, state::SessionStatus::Idle);
+        row.launcher_pid = std::process::id();
+        row.write().unwrap();
+        let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
+        let (changes, rx) = broadcast::channel(16);
+        let server = tokio::spawn(handle_conn(
+            stream,
+            Arc::new(LocalBackend::new()),
+            Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
+            rx,
+            changes.clone(),
+            "test-host".into(),
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::Hello {
+                client_version: VERSION.into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Welcome { .. })
+        ));
+        write_frame(&mut dashboard, &ClientFrame::Subscribe)
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Snapshot { .. })
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::ListResumable {
+                req_id: 1,
+                limit: 1,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        row.name = Some("Changed during inventory".into());
+        row.write().unwrap();
+        changes.send(()).unwrap();
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::KillSession {
+                req_id: 2,
+                key: SessionKey::from_launcher_pid(0),
+                cleanup: cm_core::backend::CleanupPolicy::Required,
+            },
+        )
+        .await
+        .unwrap();
+        let responsive = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut delta, mut killed) = (false, false);
+            while !delta || !killed {
+                match read_frame(&mut dashboard).await.unwrap().unwrap() {
+                    ServerFrame::Delta { state } if state.key() == row.key() => delta = true,
+                    ServerFrame::Killed {
+                        req_id: 2,
+                        ok: false,
+                        error: None,
+                    } => killed = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        codex.await.unwrap();
+        // Both success and failure must eventually answer the inventory caller.
+        let inventory = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ServerFrame::Resumable {
+                    req_id: 1, errors, ..
+                } = read_frame(&mut dashboard).await.unwrap().unwrap()
+                {
+                    assert!(errors.iter().any(|error| error.starts_with("Codex:")));
+                    break;
+                }
+            }
+        })
+        .await;
+        drop(dashboard);
+        let _ = server.await;
+        assert!(
+            responsive.is_ok(),
+            "pending inventory stalled host updates and cleanup"
+        );
+        assert!(
+            inventory.is_ok(),
+            "inventory caller never received its failure"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_cleanup_allows_updates_requests_and_fragmented_frames() {
