@@ -156,6 +156,9 @@ pub enum ServerFrame {
     Killed {
         req_id: u64,
         ok: bool,
+        /// Removal succeeded, but the launcher could not acknowledge cleanup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forced: Option<crate::backend::ForcedRemoval>,
         /// A live session refused cleanup. Absent preserves old peers' meaning
         /// of ok:false (already gone); new clients must undo their optimistic hide.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +379,32 @@ mod tests {
             serde_json::from_value::<ClientFrame>(serde_json::to_value(&request).unwrap()).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn forced_removal_replies_preserve_old_and_future_peer_compatibility() {
+        use crate::backend::ForcedRemoval;
+        for (field, expected) in [
+            ("", None),
+            (
+                r#", "forced":"app_server_unreachable""#,
+                Some(ForcedRemoval::AppServerUnreachable),
+            ),
+            (
+                r#", "forced":"thread_missing""#,
+                Some(ForcedRemoval::ThreadMissing),
+            ),
+            (
+                r#", "forced":"future_reason""#,
+                Some(ForcedRemoval::Unknown),
+            ),
+        ] {
+            let json = format!(r#"{{"frame":"Killed","req_id":1,"ok":true{field}}}"#);
+            let reply = serde_json::from_str::<ServerFrame>(&json).unwrap();
+            assert!(
+                matches!(reply, ServerFrame::Killed { forced, error: None, .. } if forced == expected)
+            );
+        }
     }
 
     #[test]

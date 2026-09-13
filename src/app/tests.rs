@@ -5484,6 +5484,12 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     // Created from Kitty onto a host with no kitty terminfo: the pool wrapper
     // rewrote it, and every window since has inherited the rewrite.
     pooled.terminfo = Some("xterm-256color".into());
+    let remote = crate::backend::RemoteBackend::unconnected_for_tests(
+        pooled.host.clone(),
+        vec![pooled.clone()],
+    );
+    remote.simulate_link_for_tests(crate::backend::ConnState::Connected, true);
+    d.app.backends.push(crate::backend::Backend::Remote(remote));
     let mut here = session(2, "/home/test/here", SessionStatus::Idle);
     here.terminfo = Some("xterm-kitty".into());
     d.set_sessions(vec![pooled, here]);
@@ -9091,6 +9097,114 @@ fn the_backend_cycle_survives_an_agent_it_cannot_see() {
         AgentControl::ALL[1],
         "an empty available set must still advance through ALL"
     );
+}
+
+#[test]
+fn detail_explains_disconnection_and_advertises_the_remapped_full_id_copy() {
+    use crate::agent::AgentControl;
+    use crate::config::KeyBinding;
+    let mut d = TestDashboard::new(160, 30);
+    d.app.detail_visible = true;
+    d.app.detail_width = 75;
+    let id = "12345678-abcd-4321-abcd-123456789abc";
+    let mut row = session(543, "~/project", SessionStatus::Starting);
+    row.agent = AgentControl::Codex;
+    row.session_id = Some(id.into());
+    row.codex_mode = cm_core::agents::codex::CodexMode::AppServer;
+    row.codex_connected = Some(false);
+    row.codex_control = true;
+    row.child_pid = Some(544);
+    d.set_sessions(vec![row]);
+    d.app.keymap = super::keymap::Keymap::from_config(&std::collections::HashMap::from([(
+        "copy_id".into(),
+        KeyBinding::One("Y".into()),
+    )]))
+    .0;
+    let rendered = d.render();
+    assert!(
+        rendered.contains("Codex app-server disconnected"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Reconnect in the Codex terminal"),
+        "{rendered}"
+    );
+    assert!(rendered.contains(id), "{rendered}");
+    assert!(rendered.contains("Y: copy full ID"), "{rendered}");
+    assert!(
+        matches!(d.press(KeyCode::Char('Y')), Some(Action::CopySessionId(copied)) if copied == id)
+    );
+}
+
+#[test]
+fn narrow_detail_prioritizes_cleanup_failure_and_retry() {
+    let mut d = TestDashboard::new(78, 28);
+    d.app.detail_visible = true;
+    let mut row = session(543, "~/project", SessionStatus::Idle);
+    row.cleanup = Some(crate::state::CleanupStatus::Failed {
+        message: "Background cleanup refused".into(),
+    });
+    d.set_sessions(vec![row]);
+    let rendered = d.render();
+    assert!(rendered.contains("retry Kill"), "{rendered}");
+    assert!(
+        rendered.contains("Background cleanup refused"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn forced_removal_keeps_the_row_hidden_and_reports_execution_uncertainty() {
+    use super::{KillOrigin, KillResult};
+    use crate::backend::{Backend, ForcedRemoval, KillOutcome, RemoteBackend};
+    use crate::state::HostId;
+    for (reason, expected) in [
+        (
+            ForcedRemoval::AppServerUnreachable,
+            "Server-side work may still be running",
+        ),
+        (ForcedRemoval::ThreadMissing, "thread was not found"),
+        (ForcedRemoval::Unknown, "cleanup was not confirmed"),
+    ] {
+        let mut d = TestDashboard::new(120, 20);
+        let host = HostId("test-host".into());
+        let mut row = session(321, "~/project", SessionStatus::Starting);
+        row.host = host.clone();
+        let key = row.key();
+        let remote = RemoteBackend::unconnected_for_tests(host.clone(), vec![row]);
+        d.app.backends.push(Backend::Remote(remote));
+        d.app.backends.last().unwrap().presume_killed(&key);
+        super::run::apply_kill_result(
+            &mut d.app,
+            KillResult {
+                host,
+                key,
+                outcome: KillOutcome::Forced(reason),
+                origin: KillOrigin::Asked,
+                window: None,
+            },
+        );
+        assert!(
+            d.app
+                .backends
+                .last_mut()
+                .unwrap()
+                .list_sessions()
+                .is_empty()
+        );
+        assert!(d.app.status_msg.as_deref().unwrap().contains(expected));
+        assert!(
+            !d.app
+                .status_msg
+                .as_deref()
+                .unwrap()
+                .contains("Session terminated")
+        );
+        assert_eq!(
+            d.app.status_is_error,
+            reason != ForcedRemoval::ThreadMissing
+        );
+    }
 }
 
 #[test]

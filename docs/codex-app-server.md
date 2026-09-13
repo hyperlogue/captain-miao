@@ -1,8 +1,9 @@
 # Codex execution modes
 
 Each execution host chooses how miao runs Codex. Open **Space h**, select the
-host, press **e**, and edit **Codex** and **Endpoint**. The permanent **localhost**
-entry configures this machine, including when its sessions use the local pool.
+host, press **e**, and edit **Codex connection** and **Codex endpoint**. The
+permanent **localhost** entry configures this machine, including when its
+sessions use the local pool.
 It cannot be removed or disconnected. Remote settings require a connected
 `miao-server` that supports the setting; an older server shows an explicit
 unavailable message.
@@ -86,6 +87,19 @@ replacement also permits a fresh attempt; a disconnected host does not.
 
 ## Lifecycle and operational differences
 
+The **Detail** panel shows the full session ID; **y** copies it, and the panel's
+bottom border shows the current copy binding if you remap it. App-server rows
+also show their connection state. When disconnected, the panel offers the
+available restart/removal keys and explains whether the Codex terminal is still
+running. A host connection failure takes precedence over cached agent health.
+An idle session's old update time alone does not imply a broken connection.
+
+During cleanup, an updated launcher reports that it is waiting for the agent's
+confirmation. If cleanup fails, the panel keeps the failure and a retry hint
+even when subsequent agent events update the row. Narrow layouts prioritize
+these diagnostics over model and context details. This progress information
+requires an updated launcher; older launchers still show their last error.
+
 The app-server owns execution; the TUI is a client. Closing an attached terminal
 through miao requests cleanup of that managed session's work, while detaching
 from a pooled terminal keeps its launcher and work running. The host waits for
@@ -95,6 +109,11 @@ selected thread is missing. New launchers kill and reap their TUI; the host uses
 signals for older launchers, then removes their state, sockets and pasted images.
 An unreachable app-server may still be running work: removing its client cannot
 guarantee that server-side turns, goals or background commands have ended.
+With an updated host backend, the result explicitly says **Session removed**
+and identifies the unreachable app-server or missing thread. An unreachable
+server also produces a warning that server-side work may still be running.
+These results remain available in the message log (**Space m**). Older host
+backends cannot report the distinction and retain their generic success reply.
 
 Other cleanup failures, including a slow RPC when the server still answers a
 fresh connection check, restore the optimistically hidden row, report the error,

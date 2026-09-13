@@ -51,6 +51,24 @@ pub enum CleanupPolicy {
     Required,
 }
 
+/// Why explicit Kill removed a launcher without an acknowledged cleanup.
+/// Unknown future reasons remain visibly unconfirmed on older dashboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForcedRemoval {
+    AppServerUnreachable,
+    ThreadMissing,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRemoval {
+    Signalled,
+    AlreadyGone,
+    Forced(ForcedRemoval),
+}
+
 /// What to open: which agent, where, and whether it's a fresh session or a
 /// resume/fork of an existing one. This is §3's `SpawnSpec`, renamed to
 /// avoid colliding with `terminal::SpawnSpec` (which describes the *window*).
@@ -265,6 +283,14 @@ impl LocalBackend {
         // display it verbatim and hand it straight back (§3).
         for s in sessions.iter_mut() {
             s.cwd = paths::collapse_home(&s.cwd, &self.home);
+            if self.home.len() > 1 {
+                if let Some(error) = &mut s.last_error {
+                    *error = error.replace(&self.home, "~");
+                }
+                if let Some(state::CleanupStatus::Failed { message }) = &mut s.cleanup {
+                    *message = message.replace(&self.home, "~");
+                }
+            }
         }
         if self.serve_host_state {
             self.overlay_host_state(&mut sessions);
@@ -444,7 +470,7 @@ impl LocalBackend {
     /// Falls back to the launcher pid when the row carries no `child_pid` (a
     /// `FailedToStart` launcher holding its error), matching the client's own
     /// kill target.
-    pub fn kill_session(key: &SessionKey, policy: CleanupPolicy) -> anyhow::Result<bool> {
+    pub fn kill_session(key: &SessionKey, policy: CleanupPolicy) -> anyhow::Result<SessionRemoval> {
         let Some(state) = state::read_all_launcher_states()
             .into_iter()
             .find(|s| &s.key() == key)
@@ -453,24 +479,23 @@ impl LocalBackend {
                 target: "captain_miao::backend",
                 "kill refused: no live session for key {key}"
             );
-            return Ok(false);
+            return Ok(SessionRemoval::AlreadyGone);
         };
         let pid = if state.codex_mode.is_native() {
             state.child_pid.unwrap_or(state.launcher_pid)
         } else if state.codex_control {
-            crate::agents::codex::app_server::kill(&state, policy)?;
-            return Ok(true);
+            return crate::agents::codex::app_server::kill(&state, policy);
         } else if state.status == crate::state::SessionStatus::FailedToStart {
             state.launcher_pid
         } else {
             anyhow::bail!("This Codex launcher cannot confirm cleanup yet; use an updated launcher")
         };
         if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
-            Ok(true)
+            Ok(SessionRemoval::Signalled)
         } else {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(false)
+                Ok(SessionRemoval::AlreadyGone)
             } else {
                 Err(error.into())
             }

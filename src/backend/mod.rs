@@ -44,7 +44,9 @@ use cm_core::vitals::HostVitals;
 
 // `LocalBackend` (the server-core), `OpenSpec`, and `LaunchPlan` live in cm-core;
 // re-exported so `crate::backend::…` paths across the dashboard resolve unchanged.
-pub use cm_core::backend::{CleanupPolicy, LaunchPlan, LocalBackend, OpenSpec};
+pub use cm_core::backend::{
+    CleanupPolicy, ForcedRemoval, LaunchPlan, LocalBackend, OpenSpec, SessionRemoval,
+};
 
 // Probe a host, deploy a `miao-server` if it needs one, and resolve the command
 // to invoke. Split out because it is a self-contained subsystem that runs
@@ -840,6 +842,8 @@ pub(crate) enum KillOutcome {
     /// The host had no live session under that key — it had already ended, so
     /// the row leaving was right even though the signal never went out.
     AlreadyGone,
+    /// The launcher was removed without an acknowledged app-server cleanup.
+    Forced(ForcedRemoval),
     /// No answer: the host is unreachable, or too old to know the frame (it
     /// ignores what it can't decode, §3). Nothing was signalled and the session
     /// may still be running, so its optimistic hide must unwind.
@@ -1126,8 +1130,9 @@ impl Backend {
             Self::Local(_) => {
                 tokio::task::spawn_blocking(move || {
                     match LocalBackend::kill_session(&key, cleanup) {
-                        Ok(true) => KillOutcome::Signalled,
-                        Ok(false) => KillOutcome::AlreadyGone,
+                        Ok(SessionRemoval::Signalled) => KillOutcome::Signalled,
+                        Ok(SessionRemoval::AlreadyGone) => KillOutcome::AlreadyGone,
+                        Ok(SessionRemoval::Forced(reason)) => KillOutcome::Forced(reason),
                         Err(error) => KillOutcome::Failed(format!("{error:#}")),
                     }
                 })
@@ -1911,6 +1916,11 @@ impl RemoteBackend {
             Some(ServerFrame::Killed {
                 error: Some(error), ..
             }) => KillOutcome::Failed(error),
+            Some(ServerFrame::Killed {
+                ok: true,
+                forced: Some(reason),
+                ..
+            }) => KillOutcome::Forced(reason),
             Some(ServerFrame::Killed { ok: true, .. }) => KillOutcome::Signalled,
             Some(ServerFrame::Killed { ok: false, .. }) => KillOutcome::AlreadyGone,
             // No reply at all — `request` fails fast on a known-down host and
@@ -5007,6 +5017,7 @@ mod tests {
                         &ServerFrame::Killed {
                             req_id,
                             ok: true,
+                            forced: None,
                             error: None,
                         },
                     )

@@ -195,7 +195,7 @@ impl Restarts {
             .is_some_and(|(_, seen)| seen);
         if matches!(
             result.outcome,
-            KillOutcome::Failed(_) | KillOutcome::Unreachable
+            KillOutcome::Failed(_) | KillOutcome::Unreachable | KillOutcome::Forced(_)
         ) && result.job.replacement_token.is_some()
         {
             let mut job = result.job.clone();
@@ -213,6 +213,11 @@ impl Restarts {
             KillOutcome::Failed(error) => batch.error = Some(error.clone()),
             KillOutcome::Unreachable => {
                 batch.error = Some(format!("{} did not answer", result.job.spec.host.0))
+            }
+            KillOutcome::Forced(_) => {
+                batch.error = Some(
+                    "Session removed without confirmed cleanup; restart was not confirmed".into(),
+                );
             }
         }
         let failed = batch.error.is_some();

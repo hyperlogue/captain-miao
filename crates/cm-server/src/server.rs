@@ -1004,8 +1004,11 @@ async fn kill_session_reply(
         .await
         .context("session cleanup worker failed")
         .and_then(|result| result);
-    let (ok, error) = match result {
-        Ok(ok) => (ok, None),
+    use cm_core::backend::SessionRemoval;
+    let (ok, forced, error) = match result {
+        Ok(SessionRemoval::Signalled) => (true, None, None),
+        Ok(SessionRemoval::AlreadyGone) => (false, None, None),
+        Ok(SessionRemoval::Forced(reason)) => (true, Some(reason), None),
         Err(error) => {
             let home = cm_core::paths::host_home();
             let message = format!("{error:#}");
@@ -1014,10 +1017,15 @@ async fn kill_session_reply(
             } else {
                 message
             };
-            (false, Some(message))
+            (false, None, Some(message))
         }
     };
-    ServerFrame::Killed { req_id, ok, error }
+    ServerFrame::Killed {
+        req_id,
+        ok,
+        forced,
+        error,
+    }
 }
 
 /// Re-read the live sessions and push a `Delta` for each new/changed one and a
@@ -1272,6 +1280,7 @@ mod tests {
                         req_id: 2,
                         ok: false,
                         error: None,
+                        ..
                     } => killed = true,
                     _ => {}
                 }

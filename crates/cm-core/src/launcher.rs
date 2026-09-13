@@ -118,6 +118,7 @@ pub async fn run(
         last_prompt: None,
         child_pid: None,
         last_error: None,
+        cleanup: None,
         context_tokens: None,
         context_window: None,
         model: None,

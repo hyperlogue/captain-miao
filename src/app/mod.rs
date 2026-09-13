@@ -28,6 +28,7 @@
 //! marking dirty.
 
 mod bindings;
+mod diagnostics;
 mod dir_edit;
 mod draw;
 mod format;

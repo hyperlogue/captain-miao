@@ -238,7 +238,8 @@ impl App {
     /// The detail panel is a fixed, compact height; the preview takes whatever's
     /// left and is dropped entirely when the viewport is too short to spare it.
     fn draw_narrow_body(&mut self, frame: &mut ratatui::Frame, body: Rect) {
-        // Compact detail: border (2 rows) + the four fields it shows.
+        // Healthy compact detail: border (2 rows) + four fields. Failures may
+        // use additional rows while leaving room for the session list.
         const DETAIL_H: u16 = 6;
         // Keep the session list usable before spending rows on the preview.
         const TABLE_MIN: u16 = 6;
@@ -246,7 +247,17 @@ impl App {
         const PREVIEW_MIN: u16 = 6;
 
         let detail_h = if self.detail_visible {
-            DETAIL_H.min(body.height)
+            let troubled = self.selected_session_ref().is_some_and(|s| {
+                s.codex_connected == Some(false)
+                    || s.cleanup.is_some()
+                    || s.status == SessionStatus::FailedToStart
+            });
+            let wanted = if troubled {
+                10.min(body.height.saturating_sub(TABLE_MIN)).max(DETAIL_H)
+            } else {
+                DETAIL_H
+            };
+            wanted.min(body.height)
         } else {
             0
         };
@@ -521,9 +532,16 @@ impl App {
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let narrow = self.narrow_layout;
         self.last_detail_rect = Some(area);
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" Detail ", Style::default().bold()));
+        if self
+            .selected_session_ref()
+            .is_some_and(|s| self.index_of(s).live_session_id(s).is_some())
+            && let Some(key) = self.keymap.primary_key(Command::CopySessionId)
+        {
+            block = block.title_bottom(format!(" {key}: copy full ID "));
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -560,6 +578,30 @@ impl App {
             .map(|t| context_pressure_style(t, s.context_window))
             .unwrap_or_default();
         let elapsed = format_elapsed(LauncherState::now().saturating_sub(s.updated_at));
+        let diagnostics = super::diagnostics::session_diagnostics(
+            s,
+            self.backend_for(&s.host)
+                .map_or(crate::backend::ConnState::Disconnected, |b| b.conn_state()),
+            &self.keymap,
+        );
+        let diagnostic_lines = || {
+            diagnostics
+                .iter()
+                .map(|d| {
+                    Line::from(vec![
+                        Span::styled(format!("{:<9}", d.label), Style::default().dim()),
+                        Span::styled(
+                            d.message.clone(),
+                            if d.attention {
+                                Style::default().fg(config::get().colors.ui.attention_fg)
+                            } else {
+                                Style::default().dim()
+                            },
+                        ),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        };
 
         let label = |k: &'static str| {
             Span::styled(
@@ -568,16 +610,20 @@ impl App {
             )
         };
 
-        // In the narrow stack the detail panel is a fixed, compact height, so it
-        // shows only the four fields that don't fit in the trimmed table row.
+        // A healthy narrow panel shows fields omitted from its table. Recovery
+        // information takes priority when either the host or session fails.
         if narrow {
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(vec![label("Agent"), Span::raw(s.agent_label())]),
                 Line::from(vec![label("Model"), Span::styled(model, model_style)]),
                 Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
                 Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
             ];
-            frame.render_widget(Paragraph::new(lines), inner);
+            if diagnostics.iter().any(|d| d.attention) {
+                lines.truncate(1);
+                lines.extend(diagnostic_lines());
+            }
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
             return;
         }
 
@@ -590,9 +636,7 @@ impl App {
         let ui = &cfg.colors.ui;
         let status_fg = super::format::status_fg(&s.status, self.is_follow_up(&super::flag_key(s)));
         let live_sid = self.index_of(s).live_session_id(s);
-        let sid_short = live_sid
-            .map(|sid| sid.split('-').next().unwrap_or(sid).to_string())
-            .unwrap_or_else(|| "—".to_string());
+        let sid = live_sid.unwrap_or("—").to_string();
         // A worktree row's cwd ends in `.claude/worktrees/<name>`, so the name is
         // already here — as the tail of a path that wraps over three lines in the
         // default 36-column panel, which is where the eye goes last. Lift it onto
@@ -698,13 +742,16 @@ impl App {
                 label("Status"),
                 Span::styled(status_text, Style::default().fg(status_fg)),
             ]),
-            Line::from(vec![label("Session"), Span::raw(sid_short)]),
+            Line::from(vec![label("Session"), Span::raw(sid)]),
+        ];
+        lines.extend(diagnostic_lines());
+        lines.extend([
             Line::from(vec![
                 label("PID"),
                 Span::raw(format!("{child} (win {window}, tab {tab})")),
             ]),
             Line::from(vec![label("Terminfo"), terminfo]),
-        ];
+        ]);
         lines.extend(terminfo_mismatch);
         lines.extend([
             Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
@@ -713,7 +760,9 @@ impl App {
         ]);
         lines.extend(worktree);
 
-        if let Some(err) = &s.last_error {
+        if let Some(err) = &s.last_error
+            && !matches!(&s.cleanup, Some(crate::state::CleanupStatus::Failed { message }) if message == err)
+        {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Last error",

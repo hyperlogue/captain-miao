@@ -561,8 +561,10 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
             backend.unpresume_killed(&key);
         }
     }
-    if matches!(outcome, KillOutcome::Signalled | KillOutcome::AlreadyGone)
-        && let Some(window) = window
+    if matches!(
+        outcome,
+        KillOutcome::Signalled | KillOutcome::AlreadyGone | KillOutcome::Forced(_)
+    ) && let Some(window) = window
     {
         finish_kill_window(app, &host, window);
     }
@@ -576,6 +578,19 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
         KillOutcome::Signalled => app.set_status("Session terminated".to_string(), false),
         // Not an error: the row leaving is what `x` was for, and it has.
         KillOutcome::AlreadyGone => app.set_status("Session had already ended".to_string(), false),
+        KillOutcome::Forced(reason) => {
+            use crate::backend::ForcedRemoval;
+            let message = match reason {
+                ForcedRemoval::AppServerUnreachable => {
+                    "Session removed; Codex app-server unreachable. Server-side work may still be running."
+                }
+                ForcedRemoval::ThreadMissing => {
+                    "Session removed; thread was not found on this Codex app-server."
+                }
+                ForcedRemoval::Unknown => "Session removed; server-side cleanup was not confirmed.",
+            };
+            app.set_status(message.to_string(), reason != ForcedRemoval::ThreadMissing);
+        }
         KillOutcome::Failed(error) => app.set_status(format!("Kill failed: {error}"), true),
         KillOutcome::Unreachable => {
             app.set_status(format!("Kill failed: {} did not answer", host.0), true)

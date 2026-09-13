@@ -983,6 +983,19 @@ pub struct HookMessage {
 // Launcher state file
 // =============================================================================
 
+/// Launcher-owned cleanup progress. Transport notifications cannot erase a
+/// failed operation before the user has a chance to retry it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CleanupStatus {
+    InProgress,
+    Failed {
+        message: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// One session, as its launcher last wrote it — the record the whole dashboard
 /// is a view of.
@@ -1030,6 +1043,8 @@ pub struct LauncherState {
     pub child_pid: Option<u32>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupStatus>,
     /// Session ids this launcher has seen proven to be **subagent children** of
     /// another session ([`HookMessage::session_is_child`]), so later events
     /// naming one by bare id can be ignored. Only a backend whose event stream
@@ -1196,6 +1211,7 @@ impl LauncherState {
             last_prompt: None,
             child_pid: None,
             last_error: None,
+            cleanup: None,
             context_tokens: None,
             context_window: None,
             model: None,
@@ -1343,6 +1359,12 @@ impl LauncherState {
         LauncherState {
             last_prompt: cap(&self.last_prompt, 500),
             last_error: cap(&self.last_error, 1000),
+            cleanup: self.cleanup.as_ref().map(|cleanup| match cleanup {
+                CleanupStatus::Failed { message } => CleanupStatus::Failed {
+                    message: snippet(message, 1000),
+                },
+                other => other.clone(),
+            }),
             name: cap(&self.name, 120),
             first_prompt: cap(&self.first_prompt, 120),
             ..self.clone()
@@ -1788,6 +1810,28 @@ mod tests {
     /// from an old writer they decode `false` (no priming — today's
     /// behavior), skipped when `false` so an old peer never sees them, and a
     /// `true` survives the round trip.
+    #[test]
+    fn cleanup_diagnostics_are_optional_tolerant_and_bounded() {
+        let row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("cleanup").is_none());
+        json["cleanup"] = serde_json::json!({"state":"future_cleanup_phase"});
+        assert_eq!(
+            serde_json::from_value::<LauncherState>(json)
+                .unwrap()
+                .cleanup,
+            Some(CleanupStatus::Unknown)
+        );
+        let mut row = row;
+        row.cleanup = Some(CleanupStatus::Failed {
+            message: "error ".repeat(500),
+        });
+        let Some(CleanupStatus::Failed { message }) = row.capped().cleanup else {
+            panic!("missing cleanup error")
+        };
+        assert!(message.len() <= 1003);
+    }
+
     #[test]
     fn a_state_without_alt_screen_still_decodes() {
         let old = r#"{"agent":"grok","launcher_pid":7,"cwd":"/home/miao/p",

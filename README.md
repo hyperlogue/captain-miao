@@ -312,6 +312,13 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
 
+The **Detail** panel shows the full session ID and its copy shortcut. Troubled
+sessions show connection or cleanup information with available recovery keys;
+narrow layouts prioritize those hints. For Codex app-server sessions, a forced
+removal reports whether the thread was missing or the server was unreachable,
+and warns when server-side work could still be running. Results stay in the
+message log (`Space m`). See [Codex lifecycle details](docs/codex-app-server.md).
+
 In Kitty, new work tabs opened with `w` follow the dashboard, `miao:sessions`
 (when present), and earlier work tabs, keeping them together before other tabs.
 Pressing `w` again for the same cwd switches to its existing work tab.

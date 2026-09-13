@@ -165,6 +165,7 @@ pub(crate) async fn supervise(
                         let message = format!("Codex cleanup failed: {error:#}");
                         tracing::warn!("{message}");
                         state.last_error = Some(message.clone());
+                        state.cleanup = Some(crate::state::CleanupStatus::Failed { message: message.clone() });
                         if !child_live {
                             state.codex_connected = Some(false);
                             state.status = SessionStatus::Starting;
@@ -185,6 +186,9 @@ pub(crate) async fn supervise(
             }
         };
         if begin_stop {
+            state.cleanup = Some(crate::state::CleanupStatus::InProgress);
+            state.updated_at = LauncherState::now();
+            persistence.write(state);
             let pause = quiesce(true, &mut relay, &mut monitor, state, &mut persistence).await;
             // A lifecycle reply can already have reached the TUI while its
             // observation is queued here. Adopt it before selecting cleanup's

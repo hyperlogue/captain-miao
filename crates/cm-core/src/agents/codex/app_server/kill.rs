@@ -2,7 +2,7 @@
 //! that cannot exit after a failed cleanup. Restart never enters this fallback.
 use super::control::{self, ForceRemoval, StopFailure};
 use super::transport;
-use crate::backend::CleanupPolicy;
+use crate::backend::{CleanupPolicy, ForcedRemoval, SessionRemoval};
 use crate::state::{self, LauncherState};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -46,25 +46,24 @@ pub(super) async fn force_removal_reason(
 /// Older control replies carry only the formatted error. Match the exact
 /// errors their adapter emitted, including the selected thread's identity;
 /// generic RPC failures and launcher-control timeouts never authorize removal.
-fn legacy_force_removal(message: &str, id: Option<&str>) -> bool {
-    let Some(message) = message.strip_prefix("Codex cleanup failed: ") else {
-        return false;
-    };
+fn legacy_force_removal(message: &str, id: Option<&str>) -> Option<ForcedRemoval> {
+    let message = message.strip_prefix("Codex cleanup failed: ")?;
     if message.starts_with("connecting to Codex app-server socket: ")
         || message.starts_with("Codex app-server connection timed out: ")
         || message == "Codex initialize timed out: deadline has elapsed"
         || message == "Codex app-server disconnected"
     {
-        return true;
+        return Some(ForcedRemoval::AppServerUnreachable);
     }
     id.is_some_and(|id| {
         message == format!("Codex thread/backgroundTerminals/clean: thread not found: {id}")
     })
+    .then_some(ForcedRemoval::ThreadMissing)
 }
 
-pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<()> {
+pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<SessionRemoval> {
     let Err(mut error) = control::request_stop(snapshot.launcher_pid) else {
-        return Ok(());
+        return Ok(SessionRemoval::Signalled);
     };
     if policy == CleanupPolicy::ForceIfUnavailable
         && error.downcast_ref::<StopFailure>().is_some_and(|failure| {
@@ -72,30 +71,31 @@ pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<()
         })
     {
         let Some(current) = current_owner(snapshot)? else {
-            return Ok(());
+            return Ok(SessionRemoval::AlreadyGone);
         };
         // Re-fence input and clean the main thread under the explicit Kill
         // policy. This hint must never authorize signals that bypass cleanup.
         match control::request_kill(current.launcher_pid) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(SessionRemoval::Signalled),
             Err(retry) => error = retry,
         }
     }
     let Some(failure) = error.downcast_ref::<StopFailure>() else {
         return Err(error);
     };
-    let allowed = match failure.force_removal {
-        Some(ForceRemoval::Unreachable | ForceRemoval::ThreadMissing) => true,
-        Some(ForceRemoval::Denied | ForceRemoval::InternalCreation) => false,
+    let reason = match failure.force_removal {
+        Some(ForceRemoval::Unreachable) => Some(ForcedRemoval::AppServerUnreachable),
+        Some(ForceRemoval::ThreadMissing) => Some(ForcedRemoval::ThreadMissing),
+        Some(ForceRemoval::Denied | ForceRemoval::InternalCreation) => None,
         None => legacy_force_removal(&failure.message, snapshot.session_id.as_deref()),
     };
-    if policy != CleanupPolicy::ForceIfUnavailable || !allowed {
+    let Some(reason) = reason.filter(|_| policy == CleanupPolicy::ForceIfUnavailable) else {
         return Err(error);
-    }
+    };
 
     tracing::warn!("Forcing Codex session removal after cleanup failed: {error:#}");
     let Some(current) = current_owner(snapshot)? else {
-        return Ok(());
+        return Ok(SessionRemoval::Forced(reason));
     };
     // A structured reason also identifies launchers that implement ForceStop.
     // Let them reap their TUI and run normal destructors before using signals.
@@ -103,7 +103,7 @@ pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<()
         wait_for_exit(current.launcher_pid)?;
     } else {
         let Some(current) = current_owner(snapshot)? else {
-            return Ok(());
+            return Ok(SessionRemoval::Forced(reason));
         };
         if let Some(pid) = current.child_pid {
             signal_kill(pid)?;
@@ -116,7 +116,8 @@ pub(crate) fn kill(snapshot: &LauncherState, policy: CleanupPolicy) -> Result<()
     // Normal exit may already have unlinked the state. If a new launcher now
     // owns the same pid, never remove its freshly created files.
     current_owner(snapshot)?;
-    remove_runtime(snapshot.launcher_pid)
+    remove_runtime(snapshot.launcher_pid)?;
+    Ok(SessionRemoval::Forced(reason))
 }
 
 fn current_owner(snapshot: &LauncherState) -> Result<Option<LauncherState>> {
