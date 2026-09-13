@@ -200,3 +200,6 @@ errors emitted by older app-server launchers.
 Acknowledged cleanup requires an updated dashboard, host server, and launcher.
 An older app-server launcher without control support is refused by the new
 backend rather than reported as successfully stopped.
+
+The [session lifecycle tests](testing-sessions.md) exercise connection loss,
+cleanup failures and recovery with isolated processes and a scripted Codex peer.
