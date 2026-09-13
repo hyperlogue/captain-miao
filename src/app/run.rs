@@ -2509,16 +2509,24 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                     .map(|_| "Switched to work tab")
                             } else {
                                 let title = app.work_tab_title(&host, &cwd);
+                                let work_tabs: Vec<_> = app
+                                    .work_tabs
+                                    .values()
+                                    .map(|work| work.tab_id.clone())
+                                    .collect();
                                 match terminal::get()
-                                    .spawn(SpawnSpec {
-                                        cwd: spawn_cwd.clone(),
-                                        target: SpawnTarget::NewTab,
-                                        command,
-                                        title: Some(title),
-                                        hold: false,
-                                        take_focus: true,
-                                        stack: false,
-                                    })
+                                    .spawn_work_tab(
+                                        SpawnSpec {
+                                            cwd: spawn_cwd.clone(),
+                                            target: SpawnTarget::NewTab,
+                                            command,
+                                            title: Some(title),
+                                            hold: false,
+                                            take_focus: true,
+                                            stack: false,
+                                        },
+                                        &work_tabs,
+                                    )
                                     .await
                                 {
                                     Ok(result) => {

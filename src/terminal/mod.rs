@@ -292,6 +292,13 @@ pub trait Terminal: Send + Sync {
     /// window/tab it created (see [`SpawnResult`]).
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnResult>;
 
+    /// Open a cwd's work tab. `work_tabs` identifies previously opened work
+    /// tabs, including persisted ones. Kitty uses these to append to the
+    /// dashboard's tab group; other backends use their native placement.
+    async fn spawn_work_tab(&self, spec: SpawnSpec, _work_tabs: &[TabId]) -> Result<SpawnResult> {
+        self.spawn(spec).await
+    }
+
     /// Focus the window `id`.
     async fn focus_window(&self, id: &WindowId) -> Result<()>;
 

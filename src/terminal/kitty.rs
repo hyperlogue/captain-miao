@@ -75,6 +75,50 @@ async fn kitten_cmd(args: &[&str]) -> Result<String> {
     super::run_capture("kitten @", kitten_command()?, args).await
 }
 
+async fn launch(args: &[String]) -> Result<WindowId> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    kitten_cmd(&arg_refs)
+        .await?
+        .trim()
+        .parse::<u64>()
+        .map(WindowId::from)
+        .context("Failed to parse window ID from launch output")
+}
+
+/// Keep work tabs in the dashboard's OS window, after its shared sessions tab
+/// and adjacent work tabs. Stop at the first unrelated tab so an old work tab
+/// at the end of the bar cannot pull new tabs out of the group. Missing/stale
+/// work IDs are inert.
+fn work_tab_anchor(
+    data: &serde_json::Value,
+    dashboard: &WindowId,
+    work_tabs: &[TabId],
+) -> Option<TabId> {
+    let owns_dashboard = |tab: &serde_json::Value| {
+        tab["windows"].as_array().is_some_and(|windows| {
+            windows
+                .iter()
+                .any(|window| window["id"].as_u64().map(WindowId::from).as_ref() == Some(dashboard))
+        })
+    };
+    let tabs = data.as_array()?.iter().find_map(|os_window| {
+        os_window["tabs"]
+            .as_array()
+            .filter(|tabs| tabs.iter().any(&owns_dashboard))
+    })?;
+    let dashboard_index = tabs.iter().position(owns_dashboard)?;
+    tabs[dashboard_index..]
+        .iter()
+        .map_while(|tab| {
+            let id = TabId::from(tab["id"].as_u64()?);
+            (tab["title"].as_str() == Some(SESSIONS_TAB)
+                || work_tabs.contains(&id)
+                || owns_dashboard(tab))
+            .then_some(id)
+        })
+        .last()
+}
+
 /// Validate a window/tab id before it is interpolated into a kitty `--match`
 /// value (`id:<n>` / `window_id:<n>` / `--target-tab id:<n>`).
 ///
@@ -97,12 +141,15 @@ fn match_id(id: &str) -> Result<&str> {
 /// shared tab (Stacked join); `dashboard` is this process's own window, used
 /// only when *creating* the shared tab so kitty puts it in the dashboard's OS
 /// window. `path` is the `--env=PATH=` value, threaded in so tests don't depend
-/// on the process environment.
+/// on the process environment. `after` is a work-tab anchor that the caller
+/// must focus first: Kitty's tab placement is relative to the active tab, and
+/// `-m` only selects its OS window when launching a new tab.
 fn launch_argv(
     spec: &SpawnSpec,
     join: Option<&WindowId>,
     dashboard: Option<&WindowId>,
     path: Option<&str>,
+    after: Option<&TabId>,
 ) -> Result<Vec<String>> {
     let window_type = match &spec.target {
         SpawnTarget::NewTab => "tab",
@@ -137,6 +184,11 @@ fn launch_argv(
         SpawnTarget::NewTab => {
             if let Some(title) = &spec.title {
                 args.push(format!("--tab-title={title}"));
+            }
+            if let Some(after) = after {
+                args.push("--location=after".into());
+                args.push("-m".into());
+                args.push(format!("id:{}", match_id(after.as_str())?));
             }
         }
         SpawnTarget::SharedStackTab => {
@@ -376,15 +428,9 @@ impl Terminal for KittyTerminal {
             shared_tab.as_ref().map(|(_, w)| w),
             dashboard.as_ref(),
             path.as_deref(),
+            None,
         )?;
-
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let stdout = kitten_cmd(&arg_refs).await?;
-        let window_id: WindowId = stdout
-            .trim()
-            .parse::<u64>()
-            .context("Failed to parse window ID from launch output")?
-            .into();
+        let window_id = launch(&args).await?;
 
         // A fresh tab starts with one window; default it to the stack layout so
         // that as more windows get added to the tab they stack — one full-size
@@ -417,6 +463,32 @@ impl Terminal for KittyTerminal {
             window: Some(window_id),
             tab: shared_tab.map(|(t, _)| t),
         })
+    }
+
+    async fn spawn_work_tab(&self, spec: SpawnSpec, work_tabs: &[TabId]) -> Result<SpawnResult> {
+        let Some(dashboard) = self.current_window() else {
+            return self.spawn(spec).await;
+        };
+        let data = serde_json::from_str(&kitten_cmd(&["ls"]).await?)?;
+        let Some(after) = work_tab_anchor(&data, &dashboard, work_tabs) else {
+            return self.spawn(spec).await;
+        };
+        let path = std::env::var("PATH").ok();
+        let args = launch_argv(&spec, None, Some(&dashboard), path.as_deref(), Some(&after))?;
+        // `--location=after` uses the active tab even with `-m`. Select the
+        // anchor first; the new work tab then takes focus as usual.
+        self.focus_tab(&after).await?;
+        match launch(&args).await {
+            Ok(window) => Ok(SpawnResult {
+                window: Some(window),
+                tab: None,
+            }),
+            Err(error) => {
+                // A failed launch must not leave the user on the anchor tab.
+                let _ = self.focus_window(&dashboard).await;
+                Err(error)
+            }
+        }
     }
 
     async fn focus_window(&self, id: &WindowId) -> Result<()> {
@@ -461,8 +533,8 @@ impl Terminal for KittyTerminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProbeOutcome, SpawnCommand, SpawnSpec, SpawnTarget, WindowId, diagnose, launch_argv,
-        match_id,
+        ProbeOutcome, SpawnCommand, SpawnSpec, SpawnTarget, TabId, WindowId, diagnose, launch_argv,
+        match_id, work_tab_anchor,
     };
 
     fn spec(target: SpawnTarget) -> SpawnSpec {
@@ -558,8 +630,14 @@ mod tests {
     #[test]
     fn creating_sessions_tab_sits_after_the_dashboard() {
         let dash = WindowId::from(7);
-        let args =
-            launch_argv(&spec(SpawnTarget::SharedStackTab), None, Some(&dash), None).unwrap();
+        let args = launch_argv(
+            &spec(SpawnTarget::SharedStackTab),
+            None,
+            Some(&dash),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(contains(&args, "--type=tab"), "{args:?}");
         assert!(contains(&args, "--tab-title=miao:sessions"), "{args:?}");
         assert!(contains(&args, "--location=after"), "{args:?}");
@@ -575,7 +653,7 @@ mod tests {
     /// bar. The `-m` pin is what we lose, not the neighbor placement.
     #[test]
     fn creating_sessions_tab_without_dashboard_id_still_neighbors() {
-        let args = launch_argv(&spec(SpawnTarget::SharedStackTab), None, None, None).unwrap();
+        let args = launch_argv(&spec(SpawnTarget::SharedStackTab), None, None, None, None).unwrap();
         assert!(contains(&args, "--location=after"), "{args:?}");
         assert!(contains(&args, "--tab-title=miao:sessions"), "{args:?}");
         assert!(pair(&args, "-m").is_none(), "{args:?}");
@@ -593,6 +671,7 @@ mod tests {
             Some(&existing),
             Some(&dash),
             None,
+            None,
         )
         .unwrap();
         assert!(contains(&args, "--type=window"), "{args:?}");
@@ -608,10 +687,134 @@ mod tests {
     #[test]
     fn new_tab_spawn_is_not_forced_next_to_the_dashboard() {
         let dash = WindowId::from(7);
-        let args = launch_argv(&spec(SpawnTarget::NewTab), None, Some(&dash), None).unwrap();
+        let args = launch_argv(&spec(SpawnTarget::NewTab), None, Some(&dash), None, None).unwrap();
         assert!(contains(&args, "--type=tab"), "{args:?}");
         assert!(contains(&args, "--tab-title=proj"), "{args:?}");
         assert!(!contains(&args, "--location=after"), "{args:?}");
         assert!(pair(&args, "-m").is_none(), "{args:?}");
+    }
+
+    #[test]
+    fn work_tab_does_not_append_after_unrelated_tabs() {
+        let dash = WindowId::from(7);
+        let mut work = spec(SpawnTarget::NewTab);
+        work.hold = false;
+        work.take_focus = true;
+        for unrelated_count in [0, 1, 10, 100] {
+            let mut tabs = vec![
+                kitty_tab(10, "miao (2)", 7),
+                kitty_tab(20, "miao:sessions", 8),
+            ];
+            tabs.extend((0..unrelated_count).map(|i| kitty_tab(100 + i, "other", 1000 + i)));
+            let mut data = serde_json::json!([{ "tabs": tabs }]);
+            let mut work_tabs = Vec::new();
+            for id in [90, 80, 70] {
+                let after = work_tab_anchor(&data, &dash, &work_tabs).unwrap();
+                assert_eq!(after, work_tabs.last().cloned().unwrap_or(TabId::from(20)));
+                let args = launch_argv(&work, None, Some(&dash), None, Some(&after)).unwrap();
+                assert!(contains(&args, "--location=after"), "{args:?}");
+                assert_eq!(pair(&args, "-m"), Some(format!("id:{after}").as_str()));
+                assert!(!contains(&args, "--dont-take-focus"), "{args:?}");
+                // Apply the placement Kitty uses after focusing the anchor.
+                let tabs = data[0]["tabs"].as_array_mut().unwrap();
+                let after_id = after.as_str().parse::<u64>().unwrap();
+                let index = tabs
+                    .iter()
+                    .position(|tab| tab["id"].as_u64() == Some(after_id))
+                    .unwrap();
+                tabs.insert(index + 1, kitty_tab(id, "proj", id + 1000));
+                work_tabs.push(TabId::from(id));
+            }
+            let ids: Vec<_> = data[0]["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tab| tab["id"].as_u64().unwrap())
+                .collect();
+            let expected: Vec<_> = [10, 20, 90, 80, 70]
+                .into_iter()
+                .chain((0..unrelated_count).map(|i| 100 + i))
+                .collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    fn kitty_tab(id: u64, title: &str, window: u64) -> serde_json::Value {
+        serde_json::json!({ "id": id, "title": title, "windows": [{ "id": window }] })
+    }
+
+    #[test]
+    fn work_tab_anchor_uses_only_the_dashboard_os_window() {
+        let data = serde_json::json!([
+            { "tabs": [kitty_tab(1, "miao:sessions", 100), kitty_tab(2, "proj", 101)] },
+            { "tabs": [kitty_tab(3, "miao", 7), kitty_tab(4, "other", 102)] },
+            { "tabs": [kitty_tab(5, "miao:sessions", 103), kitty_tab(6, "proj", 104)] }
+        ]);
+        // Recorded work tabs can be dragged to another OS window; neither
+        // they nor another dashboard's shared sessions tab are valid anchors.
+        assert_eq!(
+            work_tab_anchor(&data, &WindowId::from(7), &[TabId::from(2), TabId::from(6)]),
+            Some(TabId::from(3))
+        );
+        assert_eq!(work_tab_anchor(&data, &WindowId::from(999), &[]), None);
+    }
+
+    #[test]
+    fn work_tab_anchor_ignores_closed_tabs_and_unrelated_matching_titles() {
+        let data = serde_json::json!([{ "tabs": [
+            kitty_tab(1, "proj", 10), kitty_tab(2, "miao", 7),
+            kitty_tab(3, "proj", 11), kitty_tab(4, "proj", 12)
+        ] }]);
+        assert_eq!(
+            work_tab_anchor(
+                &data,
+                &WindowId::from(7),
+                &[TabId::from(1), TabId::from(99)]
+            ),
+            Some(TabId::from(2))
+        );
+        // Without a shared sessions tab, earlier work tabs still form a group.
+        assert_eq!(
+            work_tab_anchor(
+                &data,
+                &WindowId::from(7),
+                &[TabId::from(3), TabId::from(99)]
+            ),
+            Some(TabId::from(3))
+        );
+    }
+
+    #[test]
+    fn work_tab_at_the_end_of_the_bar_cannot_pull_new_tabs_past_other_tabs() {
+        let data = serde_json::json!([{ "tabs": [
+            kitty_tab(1, "miao", 7), kitty_tab(2, "miao:sessions", 10),
+            kitty_tab(3, "proj", 11), kitty_tab(4, "other", 12),
+            kitty_tab(5, "old work tab", 13)
+        ] }]);
+        assert_eq!(
+            work_tab_anchor(&data, &WindowId::from(7), &[TabId::from(3), TabId::from(5)]),
+            Some(TabId::from(3))
+        );
+    }
+
+    #[test]
+    fn remote_work_tab_placement_flags_precede_the_command() {
+        let mut work = spec(SpawnTarget::NewTab);
+        let command = vec!["ssh".into(), "example.invalid".into(), "exec sh".into()];
+        work.command = SpawnCommand::Exec(command.clone());
+        let args = launch_argv(&work, None, None, None, Some(&TabId::from(20))).unwrap();
+        assert!(args.ends_with(&command), "{args:?}");
+        assert!(contains(&args, "--location=after"), "{args:?}");
+        assert_eq!(pair(&args, "-m"), Some("id:20"));
+        assert!(
+            launch_argv(
+                &work,
+                None,
+                None,
+                None,
+                Some(&TabId("1 or title:.*".into()))
+            )
+            .is_err()
+        );
     }
 }
