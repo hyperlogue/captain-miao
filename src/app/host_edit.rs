@@ -563,20 +563,10 @@ impl App {
         clear_overlay(frame, popup);
         // No key hints on the border: the footer bar already renders this
         // mode's bindings, and two copies of the same list disagree eventually.
-        let cfg = config::get();
-        let ui = &cfg.colors.ui;
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " Hosts · first is default ",
-                Style::default().bold(),
-            ))
-            .title_bottom(Line::from(vec![
-                Span::styled(" Disk: home · ", Style::default().dim()),
-                Span::styled("≥80% high", utilisation_style(80.0, ui)),
-                Span::raw(" · "),
-                Span::styled("≥90% critical ", utilisation_style(90.0, ui)),
-            ]));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            " Hosts · first is default ",
+            Style::default().bold(),
+        ));
         let list_area = block.inner(popup);
         frame.render_widget(block, popup);
 
