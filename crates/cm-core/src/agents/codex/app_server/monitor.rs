@@ -5,7 +5,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub(crate) enum Observation {
-    Client { id: String, method: String },
+    Client {
+        id: String,
+        method: String,
+        ephemeral_fork_parent: Option<String>,
+    },
     Server(Value),
     Disconnected,
 }
@@ -26,6 +30,10 @@ impl Observation {
         Some(Self::Client {
             id: value.get("id")?.to_string(),
             method: method.into(),
+            ephemeral_fork_parent: (method == "thread/fork"
+                && value["params"]["ephemeral"] == true)
+                .then(|| value["params"]["threadId"].as_str().map(str::to_owned))
+                .flatten(),
         })
     }
 }
@@ -59,7 +67,22 @@ impl Monitor {
                     Some("Codex app-server disconnected; reconnect in the Codex terminal".into());
                 transition(state, SessionStatus::Starting);
             }
-            Observation::Client { id, method } => {
+            Observation::Client {
+                id,
+                method,
+                ephemeral_fork_parent,
+            } => {
+                // /btw forks the managed conversation with ephemeral=true and
+                // threadSource=user. Its reply (including errors) belongs to
+                // the side conversation; returning to the parent can be a
+                // local TUI switch with no resume reply to restore our identity.
+                // An initial ephemeral fork still selects a new launcher's row.
+                if ephemeral_fork_parent
+                    .as_deref()
+                    .is_some_and(|parent| Some(parent) == state.session_id.as_deref())
+                {
+                    return;
+                }
                 if self.pending.len() >= 128 {
                     self.pending.clear();
                 }
@@ -85,9 +108,15 @@ impl Monitor {
             };
             let result = &value["result"];
             let thread = &result["thread"];
+            let side_fork = method == "thread/fork"
+                && thread["ephemeral"] == true
+                && thread["forkedFromId"]
+                    .as_str()
+                    .is_some_and(|parent| Some(parent) == state.session_id.as_deref());
             if thread["id"].as_str().is_some()
                 && thread["parentThreadId"].is_null()
                 && !background_thread(thread)
+                && !side_fork
                 && (method != "thread/read" || thread["id"].as_str() == state.session_id.as_deref())
             {
                 state.last_error = None;

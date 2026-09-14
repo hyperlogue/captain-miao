@@ -68,6 +68,12 @@ Their prompts, context usage and closure cannot replace or disconnect the
 managed conversation. User conversations still support ephemeral mode, and
 older threads without source metadata remain supported.
 
+`/btw` and `/side` create ephemeral forks classified as user threads. Miao keeps
+tracking the managed parent conversation when it observes such a fork, so a
+finished side question cannot leave the main session stuck at Idle. Side-thread
+metadata and errors do not replace the parent's row or cleanup target. Starting
+a launcher directly with an ephemeral conversation or fork remains supported.
+
 Restart still opens the replacement terminal before closing the old one. Its
 launcher waits for the previous owner to finish before resuming the thread.
 The waiting replacement already serves launcher control: Kill cancels it

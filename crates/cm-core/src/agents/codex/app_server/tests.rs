@@ -277,6 +277,120 @@ fn catchup_thread_cannot_replace_the_managed_conversation() {
 }
 
 #[test]
+fn btw_fork_cannot_leave_the_main_conversation_stale_at_idle() {
+    let (mut m, mut s) = (Monitor::default(), state());
+    resume(&mut m, &mut s);
+    notify(
+        &mut m,
+        &mut s,
+        "turn/started",
+        json!({"threadId":"thread-root","turn":{"id":"main-turn"}}),
+    );
+    observe_request(
+        &mut m,
+        &mut s,
+        json!({"id":2,"method":"thread/fork","params":{
+            "threadId":"thread-root","ephemeral":true,"threadSource":"user","excludeTurns":true
+        }}),
+    );
+    m.apply(
+        &mut s,
+        Observation::Server(json!({"id":2,"result":{"thread":{
+            "id":"side-thread","forkedFromId":"thread-root","parentThreadId":null,
+            "ephemeral":true,"threadSource":"user","status":{"type":"idle"}
+        }}})),
+    );
+    for (method, params) in [
+        ("turn/started", json!({"turn":{"id":"side-turn"}})),
+        (
+            "turn/completed",
+            json!({"turn":{"id":"side-turn","status":"completed"}}),
+        ),
+        ("thread/status/changed", json!({"status":{"type":"idle"}})),
+    ] {
+        let mut params = params;
+        params["threadId"] = json!("side-thread");
+        notify(&mut m, &mut s, method, params);
+    }
+    notify(
+        &mut m,
+        &mut s,
+        "item/started",
+        json!({"threadId":"thread-root","item":{"type":"commandExecution"}}),
+    );
+    assert_eq!(
+        s.status,
+        S::Active,
+        "main-thread activity must still reach the row"
+    );
+    assert_eq!(s.session_id.as_deref(), Some("thread-root"));
+    assert_eq!(m.turn.as_deref(), Some("main-turn"));
+    notify(
+        &mut m,
+        &mut s,
+        "turn/completed",
+        json!({"threadId":"thread-root","turn":{"id":"main-turn","status":"completed"}}),
+    );
+    assert_eq!(s.status, S::Idle);
+    assert!(m.turn.is_none());
+}
+
+#[test]
+fn btw_fork_request_or_response_metadata_preserves_the_main_row() {
+    for (request_ephemeral, response_ephemeral) in [(true, false), (false, true)] {
+        let (mut m, mut s) = (Monitor::default(), state());
+        resume(&mut m, &mut s);
+        let before = s.clone();
+        observe_request(
+            &mut m,
+            &mut s,
+            json!({"id":2,"method":"thread/fork","params":{
+                "threadId":"thread-root","ephemeral":request_ephemeral,"threadSource":"user"
+            }}),
+        );
+        m.apply(
+            &mut s,
+            Observation::Server(json!({"id":2,"result":{"model":"side-model","thread":{
+                "id":"side-thread","forkedFromId":"thread-root","ephemeral":response_ephemeral,
+                "status":{"type":"idle"},"name":"Side title","preview":"Side prompt"
+            }}})),
+        );
+        for (method, params) in [
+            (
+                "thread/tokenUsage/updated",
+                json!({"tokenUsage":{"last":{"totalTokens":8000}}}),
+            ),
+            ("thread/closed", json!({})),
+        ] {
+            let mut params = params;
+            params["threadId"] = json!("side-thread");
+            notify(&mut m, &mut s, method, params);
+        }
+        assert_eq!(s, before);
+    }
+}
+
+#[test]
+fn failed_btw_fork_does_not_replace_the_main_error() {
+    let (mut m, mut s) = (Monitor::default(), state());
+    resume(&mut m, &mut s);
+    s.last_error = Some("Main conversation error".into());
+    let before = s.clone();
+    observe_request(
+        &mut m,
+        &mut s,
+        json!({"id":2,"method":"thread/fork","params":{
+            "threadId":"thread-root","ephemeral":true,"threadSource":"user"
+        }}),
+    );
+    m.apply(
+        &mut s,
+        Observation::Server(json!({"id":2,"error":{"code":-32600,"message":"Side fork failed"}})),
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
 fn background_thread_snapshots_and_failed_starts_leave_the_row_unchanged() {
     let (mut m, mut s) = (Monitor::default(), state());
     resume(&mut m, &mut s);
@@ -322,20 +436,21 @@ fn background_thread_snapshots_and_failed_starts_leave_the_row_unchanged() {
 }
 
 #[test]
-fn user_and_legacy_lifecycle_responses_can_select_ephemeral_conversations() {
+fn user_and_legacy_lifecycle_responses_can_start_ephemeral_conversations() {
     for source in [json!("user"), Value::Null] {
         for ephemeral in [true, false] {
             for method in ["thread/start", "thread/resume", "thread/fork"] {
                 let (mut m, mut s) = (Monitor::default(), state());
-                resume(&mut m, &mut s);
-                m.apply(&mut s, Observation::Disconnected);
                 observe_request(
                     &mut m,
                     &mut s,
-                    json!({"id":2,"method":method,"params":{"threadSource":source,"ephemeral":ephemeral}}),
+                    json!({"id":2,"method":method,"params":{
+                        "threadId":"thread-root","threadSource":source,"ephemeral":ephemeral
+                    }}),
                 );
                 m.apply(&mut s, Observation::Server(json!({"id":2,"result":{"thread":{
                     "id":"selected-thread","threadSource":source,"ephemeral":ephemeral,
+                    "forkedFromId":"thread-root",
                     "name":"Selected conversation","preview":"Selected prompt","status":{"type":"idle"}
                 }}})));
                 assert_eq!(s.session_id.as_deref(), Some("selected-thread"));
@@ -544,6 +659,28 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
             ] {
                 send(&mut ws, &frame).await;
             }
+            assert_eq!(
+                receive(&mut ws).await,
+                json!({"id":"side-fork","method":"thread/fork","params":{
+                    "threadId":"thread-root","threadSource":"user","ephemeral":true
+                }})
+            );
+            // The request carries the side-fork identity even if an older
+            // response omits its ephemeral and forkedFromId fields.
+            send(
+                &mut ws,
+                &json!({"id":"side-fork","result":{"thread":{
+                    "id":"side-thread","threadSource":"user","status":{"type":"idle"}
+                }}}),
+            )
+            .await;
+            send(
+                &mut ws,
+                &json!({"method":"turn/completed","params":{
+                    "threadId":"side-thread","turn":{"id":"side-turn","status":"completed"}
+                }}),
+            )
+            .await;
             send(
                 &mut ws,
                 &json!({"method":"future/notification","params":{"new":"field"}}),
@@ -586,6 +723,15 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
         assert_eq!(receive(&mut tui).await["id"], "temporary-structured");
         assert_eq!(receive(&mut tui).await["method"], "item/started");
         assert_eq!(receive(&mut tui).await["method"], "thread/closed");
+        send(
+            &mut tui,
+            &json!({"id":"side-fork","method":"thread/fork","params":{
+                "threadId":"thread-root","threadSource":"user","ephemeral":true
+            }}),
+        )
+        .await;
+        assert_eq!(receive(&mut tui).await["id"], "side-fork");
+        assert_eq!(receive(&mut tui).await["method"], "turn/completed");
         assert_eq!(receive(&mut tui).await["method"], "future/notification");
         loop {
             let observation = tokio::time::timeout(Duration::from_secs(2), relay.events.recv())
