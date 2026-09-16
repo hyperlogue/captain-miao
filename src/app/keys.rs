@@ -774,17 +774,31 @@ impl App {
         })
     }
 
-    /// Build the `ResumeSession` action shared by the resume picker and the
-    /// browser's resumable rows: resume `c` on `host`, no fork. The resumed
-    /// session lands per the current layout (`resolve_spawn_target`).
-    fn resume_action(&self, host: HostId, c: ResumeCandidate) -> Action {
-        Action::ResumeSession {
+    /// Resume a picker candidate unless this host already manages its Codex
+    /// thread. Check at selection time: the owner can appear after the list was
+    /// fetched. Restart has its own action and needs the launcher's handoff wait.
+    fn resume_action(&mut self, host: HostId, c: ResumeCandidate) -> Option<Action> {
+        if c.agent == AgentControl::Codex
+            && self.sessions.iter().any(|s| {
+                s.host == host
+                    && s.agent == c.agent
+                    && s.session_id.as_deref() == Some(c.session_id.as_str())
+            })
+        {
+            self.set_status(
+                "Codex conversation is already managed on this host; use its existing row to attach or restart"
+                    .into(),
+                true,
+            );
+            return None;
+        }
+        Some(Action::ResumeSession {
             agent: c.agent,
             cwd: c.cwd,
             session_id: c.session_id,
             fork: false,
             host,
-        }
+        })
     }
 
     // =============================================================================
@@ -1022,7 +1036,7 @@ impl App {
                             return None;
                         }
                         let c = candidates.swap_remove(idx);
-                        Some(self.resume_action(host, c))
+                        self.resume_action(host, c)
                     }
                     // Handled above via `submit_workdir` before the take.
                     PickerKind::Workdir { .. } => None,

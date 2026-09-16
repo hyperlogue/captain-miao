@@ -991,6 +991,110 @@ fn resume_picker_names_the_host_it_lists() {
     );
 }
 
+#[test]
+fn resume_picker_rejects_an_already_managed_codex_thread() {
+    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::state::HostId;
+    use cm_core::agents::codex::CodexMode;
+
+    for host in [HostId::local(), HostId("test-host".into())] {
+        for mode in [CodexMode::Native, CodexMode::AppServer] {
+            for status in [
+                SessionStatus::Idle,
+                SessionStatus::Active,
+                SessionStatus::Starting,
+            ] {
+                let mut d = TestDashboard::new(140, 20);
+                d.app.open_resume_picker(
+                    host.clone(),
+                    vec![ResumeCandidate {
+                        agent: AgentControl::Codex,
+                        session_id: "managed-thread".into(),
+                        cwd: "/tmp/project".into(),
+                        first_prompt: None,
+                        custom_title: None,
+                        git_branch: None,
+                        mtime: std::time::SystemTime::UNIX_EPOCH,
+                    }],
+                );
+                // The owner can appear after the inventory was fetched. Even a
+                // detached or disconnected session still owns its conversation.
+                let mut owner = LauncherState::for_test(AgentControl::Codex, status);
+                owner.host = host.clone();
+                owner.codex_mode = mode;
+                owner.codex_connected = Some(false);
+                owner.session_id = Some("managed-thread".into());
+                d.set_sessions(vec![owner]);
+
+                assert!(
+                    d.press(KeyCode::Enter).is_none(),
+                    "Resume must not open a duplicate that waits for its owner"
+                );
+                assert!(d.app.status_is_error);
+                let message = d.app.status_msg.as_deref().unwrap();
+                assert!(message.contains("already managed"), "{message}");
+                assert!(message.contains("attach or restart"), "{message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn resume_picker_scopes_ownership_to_the_codex_thread_and_host() {
+    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::state::HostId;
+
+    for (candidate_agent, owner_agent, owner_host, owner_id) in [
+        (
+            AgentControl::Codex,
+            AgentControl::Codex,
+            HostId("test-host".into()),
+            "saved-thread",
+        ),
+        (
+            AgentControl::Codex,
+            AgentControl::Claude,
+            HostId::local(),
+            "saved-thread",
+        ),
+        (
+            AgentControl::Codex,
+            AgentControl::Codex,
+            HostId::local(),
+            "other-thread",
+        ),
+        (
+            AgentControl::Claude,
+            AgentControl::Claude,
+            HostId::local(),
+            "saved-thread",
+        ),
+    ] {
+        let mut d = TestDashboard::new(140, 20);
+        let mut owner = LauncherState::for_test(owner_agent, SessionStatus::Idle);
+        owner.host = owner_host;
+        owner.session_id = Some(owner_id.into());
+        d.set_sessions(vec![owner]);
+        d.app.open_resume_picker(
+            HostId::local(),
+            vec![ResumeCandidate {
+                agent: candidate_agent,
+                session_id: "saved-thread".into(),
+                cwd: "/tmp/project".into(),
+                first_prompt: None,
+                custom_title: None,
+                git_branch: None,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+            }],
+        );
+        assert!(matches!(
+            d.press(KeyCode::Enter),
+            Some(Action::ResumeSession { agent, session_id, fork: false, host, .. })
+                if agent == candidate_agent && session_id == "saved-thread" && host.is_local()
+        ));
+    }
+}
+
 /// The picker's live settings belong to the picker, not to the dashboard's
 /// footer ribbon: `Ctrl-t` has to visibly do something *inside* the popup the
 /// user is looking at. The ribbon keeps the static labels only.

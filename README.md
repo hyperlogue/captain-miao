@@ -176,6 +176,10 @@ From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. 
 | `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                       |
 | `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                                 |
 
+If a Codex conversation is already listed on the selected host, the resume
+picker reports the conflict immediately without opening another session. Use
+the existing row to attach, or restart it with `Space e`.
+
 Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that tracks their activity, so they show up in the dashboard automatically. Nothing is written to your global `~/.claude/settings.json` or `~/.codex/hooks.json`. For native Codex, captain-miao writes one owner-only integration file: `~/.codex/captain-miao.config.toml` (or the same file under `$CODEX_HOME`), loaded only for managed sessions through `--profile captain-miao`. Because Codex selects only one named profile, forwarding your own `--profile` / `-p` is unsupported; move settings needed in managed sessions into the base `config.toml`. Codex writes its own answers into whichever profile it was launched with, so a directory you trust inside a managed session is trusted for managed sessions, not for a bare `codex` run. App-server mode observes the Codex protocol and uses no managed hook profile. Launching in a bare Ghostty window is refused — see [Ghostty setup](#ghostty-setup).
 
 ### Per-agent limits
