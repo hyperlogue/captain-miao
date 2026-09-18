@@ -189,10 +189,10 @@ pub async fn run(
     } else {
         "{}".into()
     };
-    state::write_json_atomic(
-        &settings_path,
-        &serde_json::from_str::<serde_json::Value>(&hooks_settings_json)?,
-    )?;
+    // The settings file carries backend-specific formats (JSON, TOML,
+    // JavaScript, TypeScript), so write it through verbatim: parsing it as
+    // JSON here breaks every non-JSON backend's launch.
+    state::write_private(&settings_path, &hooks_settings_json)?;
     launcher_state.write()?;
 
     // The clipboard shims, for a pooled session only. Minted here rather than by
@@ -3028,5 +3028,51 @@ mod tests {
         active.last_prompt = Some("make it darker".into());
         assert!(!apply_transcript_data(&mut active, &recap));
         assert_eq!(active.last_prompt.as_deref(), Some("make it darker"));
+    }
+
+    /// The settings file carries every backend's format, so it must be
+    /// written through verbatim. Guards against a JSON round-trip here
+    /// breaking non-JSON backends' launches.
+    #[test]
+    fn settings_transport_carries_every_backend_payload_verbatim() {
+        let dir =
+            std::env::temp_dir().join(format!("cm-settings-transport-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for agent in AgentControl::ALL {
+            let payload = agent.hooks_settings_json("/run/user/1000/launcher.sock");
+            let path = dir.join("settings.json");
+            state::write_private(&path, &payload).unwrap();
+            let back = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                back, payload,
+                "{agent:?}'s payload must survive the transport"
+            );
+            // The payload must stay readable by the consumer the launcher's
+            // `build_launch_command` hands it to.
+            match agent {
+                AgentControl::Claude
+                | AgentControl::Codex
+                | AgentControl::Reasonix
+                | AgentControl::Grok
+                | AgentControl::Antigravity => {
+                    serde_json::from_str::<serde_json::Value>(&back)
+                        .unwrap_or_else(|e| panic!("{agent:?}'s payload must be JSON: {e}"));
+                }
+                AgentControl::Kimi => {
+                    back.parse::<toml::Table>()
+                        .unwrap_or_else(|e| panic!("Kimi's payload must be TOML: {e}"));
+                }
+                AgentControl::OpenCode | AgentControl::Pi | AgentControl::Omp => {
+                    assert!(
+                        !back.is_empty(),
+                        "{agent:?}'s script payload must not be empty"
+                    );
+                }
+                AgentControl::Unknown => {
+                    assert!(back.is_empty(), "Unknown carries no payload");
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
