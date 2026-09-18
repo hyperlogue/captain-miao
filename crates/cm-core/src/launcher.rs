@@ -182,17 +182,7 @@ pub async fn run(
     } else {
         None
     };
-    // App-server mode installs no native Codex hooks or profile. The generic
-    // launcher cleanup owns this private settings path in both modes.
-    let hooks_settings_json = if launcher_state.codex_mode.is_native() {
-        agent.hooks_settings_json(&sock_path.to_string_lossy())
-    } else {
-        "{}".into()
-    };
-    // The settings file carries backend-specific formats (JSON, TOML,
-    // JavaScript, TypeScript), so write it through verbatim: parsing it as
-    // JSON here breaks every non-JSON backend's launch.
-    state::write_private(&settings_path, &hooks_settings_json)?;
+    write_hook_settings(agent, launcher_state.codex_mode, &sock_path, &settings_path)?;
     launcher_state.write()?;
 
     // The clipboard shims, for a pooled session only. Minted here rather than by
@@ -591,6 +581,25 @@ fn sweep_dead_launcher_runtime_files(sock_dir: &Path) {
             }
         }
     }
+}
+
+/// Generate and transport the hook payload before the agent reads it. The
+/// launcher's settings path is opaque transport for JSON, TOML and script
+/// sources; parsing it as JSON would prevent non-JSON backends from starting.
+fn write_hook_settings(
+    agent: AgentControl,
+    codex_mode: crate::agents::codex::CodexMode,
+    sock_path: &Path,
+    settings_path: &Path,
+) -> Result<()> {
+    // App-server mode installs no native Codex hooks or profile. The generic
+    // launcher cleanup owns this private settings path in both modes.
+    let payload = if codex_mode.is_native() {
+        agent.hooks_settings_json(&sock_path.to_string_lossy())
+    } else {
+        "{}".into()
+    };
+    state::write_private(settings_path, &payload)
 }
 
 /// Remove the per-launcher state file, socket, and hook-settings file. Called
@@ -3037,15 +3046,22 @@ mod tests {
     fn settings_transport_carries_every_backend_payload_verbatim() {
         let dir =
             std::env::temp_dir().join(format!("cm-settings-transport-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        for agent in AgentControl::ALL {
-            let payload = agent.hooks_settings_json("/run/user/1000/launcher.sock");
+        state::create_dir_all_private(&dir).unwrap();
+        let sock = dir.join("launcher.sock");
+        for &agent in AgentControl::ALL {
+            let payload = agent.hooks_settings_json(&sock.to_string_lossy());
             let path = dir.join("settings.json");
-            state::write_private(&path, &payload).unwrap();
+            write_hook_settings(agent, crate::agents::codex::CodexMode::Native, &sock, &path)
+                .unwrap_or_else(|e| panic!("{agent:?}'s settings must be written: {e}"));
             let back = std::fs::read_to_string(&path).unwrap();
             assert_eq!(
                 back, payload,
                 "{agent:?}'s payload must survive the transport"
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{agent:?}'s settings must stay private"
             );
             // The payload must stay readable by the consumer the launcher's
             // `build_launch_command` hands it to.
@@ -3073,6 +3089,22 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn app_server_settings_do_not_install_native_hooks() {
+        let dir =
+            std::env::temp_dir().join(format!("cm-app-server-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        write_hook_settings(
+            AgentControl::Codex,
+            crate::agents::codex::CodexMode::AppServer,
+            &dir.join("launcher.sock"),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
