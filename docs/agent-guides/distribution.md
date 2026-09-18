@@ -48,3 +48,11 @@ There is no `bundle-*` Cargo feature.
   lacks populated changelog notes. Tags use `v` followed by plain SemVer.
 - Pass GitHub Actions expression values into shell scripts through `env:`.
   No `run:` body may interpolate a `${{ }}` expression.
+- GitHub assets, npm platform packages and the launcher publish in separate
+  jobs. Use **Re-run failed jobs** to resume a failed release; successful jobs
+  stay complete and existing npm versions are skipped. npm jobs stage the
+  published GitHub assets so retries use the same binary bytes.
+- The launcher waits up to ten minutes for all exact platform pins to become
+  visible, revalidating npm metadata on each poll. The deadline includes registry
+  requests. Run `node --test scripts/wait-for-npm-packages.test.mjs` in
+  `nix develop` when changing this wait.

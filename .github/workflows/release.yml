@@ -1,10 +1,12 @@
 name: release
 
-# Tag-driven release: push a `v*` tag (e.g. `git tag v0.2.0 && git push --tags`)
+# Tag-driven release: push a specific `v*` tag (e.g. `git push origin v0.2.0`)
 # to build every target, publish a GitHub Release with the binaries attached,
 # then publish the npm packages — the four per-platform binary packages FIRST,
 # then the launcher that pins them. That order matters: a user must never resolve
 # a launcher whose platform dependency isn't on the registry yet.
+# Each publication phase has its own job: use "Re-run failed jobs" to resume
+# after a failure without rebuilding or repeating successful publication jobs.
 #
 # A pre-release tag (a SemVer `-` suffix, e.g. `v0.2.0-rc.1`) is marked prerelease
 # so it never becomes the repo's "Latest", and goes to npm's `next` dist-tag so
@@ -130,24 +132,16 @@ jobs:
       version: v${{ needs.verify.outputs.version }}
 
   publish:
-    name: publish release
+    name: publish GitHub release
     needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # This job holds the npm token, and a tag push bypasses branch protection —
-    # so anyone with write access (or any workflow holding contents:write) could
-    # otherwise tag an arbitrary commit into a signed publish. Configure this
-    # environment in repo settings with required reviewers, and add a tag ruleset
-    # on `v*`. GitHub creates the environment implicitly if it doesn't exist yet,
-    # so the workflow still runs — it just isn't gated until you configure it.
+    # All publication jobs use the same environment protection. Configure its
+    # required reviewers and a tag ruleset on `v*` to gate publication.
     environment: release
     permissions:
       contents: write # create the GitHub Release + upload assets
-      id-token: write # npm provenance attestation
     env:
-      # Read by stage-npm-packages.sh; already validated against the tag above.
-      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
-      # Same value, named for the release-notes extraction that also reads it.
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -179,9 +173,10 @@ jobs:
           echo "--- release notes ---"
           cat "$RUNNER_TEMP/relnotes.md"
 
-      # GitHub Release FIRST (reversible, and the curl/manual channel) — npm is
-      # effectively irreversible, so it goes last. Globbed by extension rather
-      # than `artifacts/*` so only the intended asset kinds are ever attached.
+      # GitHub Release FIRST: npm jobs consume these published assets, including
+      # on retries. Published immutable assets cannot be replaced; keep existing
+      # files even on a full rerun that rebuilds the binaries.
+      # Globbed by extension so only the intended asset kinds are attached.
       # generate_release_notes stays on: GitHub appends its auto-generated
       # commit/contributor list *below* body_path, so the changelog leads and the
       # mechanical detail follows.
@@ -190,9 +185,33 @@ jobs:
         with:
           body_path: ${{ runner.temp }}/relnotes.md
           files: artifacts/*.tar.gz
+          overwrite_files: false
           generate_release_notes: true
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  publish-platforms:
+    name: publish npm platforms
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
+    env:
+      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Use the release's canonical bytes, even if a full rerun rebuilt artifacts.
+      - name: Download published dashboard assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "v$EXPECT_VERSION" --pattern "miao-v$EXPECT_VERSION-*.tar.gz" --dir artifacts
 
       # Unpacks each tarball into dist/npm/<pkg>/ and stamps the launcher's
       # version + optionalDependencies from the Cargo version.
@@ -240,12 +259,43 @@ jobs:
           for d in dist/npm/*/; do
             NAME=$(jq -r .name "$d/package.json")
             V=$(jq -r .version "$d/package.json")
-            if [ -n "$(npm view "$NAME@$V" version 2>/dev/null || true)" ]; then
+            if [ -n "$(npm view "$NAME@$V" version --prefer-online 2>/dev/null || true)" ]; then
               echo "$NAME@$V already published — skipping (idempotent re-run)."
               continue
             fi
             ( cd "$d" && npm publish --provenance --access public --ignore-scripts )
           done
+
+  publish-launcher:
+    name: publish npm launcher
+    needs: [verify, publish-platforms]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
+    env:
+      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download published dashboard assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "v$EXPECT_VERSION" --pattern "miao-v$EXPECT_VERSION-*.tar.gz" --dir artifacts
+
+      # Reuse the version/pin authority; this job only publishes the launcher.
+      - name: Stage npm packages and launcher pins
+        run: scripts/stage-npm-packages.sh artifacts
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
 
       # npm's read path can lag a successful publish by seconds; wait until all
       # four platform packages are visible before publishing the launcher, so the
@@ -254,21 +304,7 @@ jobs:
       # anyway would ship exactly the broken resolve this step exists to prevent
       # (a re-run converges once the registry catches up).
       - name: Wait for platform packages to be visible
-        run: |
-          set -euo pipefail
-          for d in dist/npm/*/; do
-            NAME=$(jq -r .name "$d/package.json")
-            V=$(jq -r .version "$d/package.json")
-            SEEN=""
-            for i in $(seq 1 30); do
-              [ -n "$(npm view "$NAME@$V" version 2>/dev/null || true)" ] && { echo "$NAME@$V visible."; SEEN=1; break; }
-              echo "waiting for $NAME@$V to appear ($i/30)…"; sleep 5
-            done
-            if [ -z "$SEEN" ]; then
-              echo "::error::$NAME@$V not visible after 150s — not publishing the launcher against a missing platform package."
-              exit 1
-            fi
-          done
+        run: scripts/wait-for-npm-packages.sh
 
       # The launcher LAST, after its platform packages. Skip if this exact version
       # is already on npm so a re-run after a transient failure converges.
@@ -280,7 +316,7 @@ jobs:
         run: |
           set -euo pipefail
           V=$(jq -r .version package.json)
-          if [ -n "$(npm view "@hyperlogue/captain-miao@$V" version 2>/dev/null || true)" ]; then
+          if [ -n "$(npm view "@hyperlogue/captain-miao@$V" version --prefer-online 2>/dev/null || true)" ]; then
             echo "@hyperlogue/captain-miao@$V already published — skipping (idempotent re-run)."
             exit 0
           fi

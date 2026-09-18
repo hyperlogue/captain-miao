@@ -73,6 +73,9 @@ jobs:
       - name: rustfmt
         run: nix develop --command cargo fmt --all --check
 
+      - name: npm publication wait tests
+        run: nix develop --command node --test scripts/wait-for-npm-packages.test.mjs
+
       # Two explicit runs rather than `--all-features`. `remote` is the feature
       # that gates real code, so it gets an explicit pass rather than being swept
       # up in a flag whose meaning changes as features are added. Nothing here
