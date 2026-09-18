@@ -355,6 +355,30 @@ mod tests {
     /// previous run left its socket file behind.
     #[tokio::test]
     async fn a_stale_socket_file_does_not_block_a_bind() {
+        // A parallel test can fork while our listener is open. Its child holds
+        // an inherited descriptor until exec, so dropping our copy does not
+        // necessarily make the socket stale. Run this case in its own process
+        // so no other test can keep the listener alive.
+        const CHILD_ENV: &str = "CM_TEST_CLIPBOARD_STALE_SOCKET";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "clipboard::serve::tests::a_stale_socket_file_does_not_block_a_bind",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated stale-socket test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let dir = scratch("stale");
         let path = dir.join("clipboard.sock");
         // A leftover file, as an orphaned run would leave.
@@ -366,6 +390,7 @@ mod tests {
             "bind did not replace the file"
         );
         task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
 
         // And a stale *socket* — the real case — refuses a connect rather than
         // answering, which is what `already_serving` distinguishes.
@@ -377,5 +402,9 @@ mod tests {
             !already_serving(&orphan).await,
             "a dead socket must not answer"
         );
+        let rebound = bind(&orphan).expect("a stale socket must not block a new listener");
+        assert!(already_serving(&orphan).await);
+        drop(rebound);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
