@@ -36,8 +36,7 @@
 //! [`build_hooks_settings`] returns **TypeScript source** rather than JSON —
 //! the seam calls it "the per-session hook-settings file", and nothing requires
 //! its contents to be JSON (Kimi already puts TOML through the same channel).
-//! captain-miao therefore ships generated JavaScript in a tree with no JS
-//! toolchain, which is a real, nameable cost. It is contained three ways:
+//! Its scope stays small, and Rust owns status decisions:
 //!
 //! - **The extension carries no logic.** It holds one table ([`FORWARDED`],
 //!   rendered into the source) and one function that serializes a fixed payload
@@ -50,9 +49,9 @@
 //!   one per launch (see it for why that matters more here than elsewhere), and
 //!   it means nothing in the TypeScript needs shell quoting: `spawn(MIAO,
 //!   [args])` runs no shell at all.
-//! - **Tests cover generation, not execution.** This tree cannot run the file,
-//!   so [`extension_source`] is pure and pinned by a full-text snapshot; a
-//!   changed template fails loudly rather than silently shipping.
+//! - **Tests cover generation and delivery.** A full-text snapshot pins
+//!   [`extension_source`], and a controlled Node host executes it to verify
+//!   compaction outcomes through the real Rust parser and dispatcher.
 //!
 //! # `agent_settled` is the turn-end signal, and it removes two mechanisms
 //!
@@ -61,8 +60,11 @@
 //! continue with queued follow-up messages. Use `agent_settled` for status
 //! integrations that need to know Pi will not continue running automatically."*
 //!
-//! So `agent_settled` maps to [`HookEvent::Stop`] and **nothing else does**.
-//! Two absences fall out of that, and both are absences rather than gaps:
+//! So `agent_settled` maps to [`HookEvent::Stop`] for turn completion. Manual
+//! compaction runs outside that lifecycle: `session_compact_failed` must also
+//! settle a failed or cancelled compaction. Its `willRetry` flag keeps an
+//! automatic retry active instead of reporting an idle session.
+//! Two absences follow for ordinary turns:
 //!
 //! - **No interrupt detection.** A settled interrupt is still "Pi will not
 //!   continue", so it settles too — which is the case that costs Codex a
@@ -117,7 +119,7 @@
 //!   registration loop swallows a throwing `pi.on` so one renamed event costs
 //!   one transition instead of the whole extension — which is the right trade
 //!   and also the reason a rename is *invisible*. Run a full session (prompt →
-//!   tool → compact → settle) with the launcher log open and check all eight
+//!   tool → compact → settle) with the launcher log open and check all nine
 //!   arrive.
 //! - **That `agent_settled` fires on an interrupted run.** Press Esc mid-turn.
 //!   The whole no-interrupt-detection claim rests on it; if it doesn't fire, a
@@ -187,10 +189,10 @@ pub(crate) const BIN: &str = "pi";
 ///   of `Starting` — and a rename cannot happen while `Starting`, since
 ///   `session_start` has already fired by then. So it adopts the title and
 ///   moves nothing, which is precisely what is wanted.
-/// - **No [`HookEvent::StopFailure`].** Pi's surface has no run-failed event; a
-///   run that ends in an error still ends, so `agent_settled` covers it and the
-///   row goes `Idle` with no error text. Inventing an event to carry one is
-///   exactly what the "never invent" rule forbids.
+/// - **`session_compact_failed` uses [`HookEvent::StopFailure`].** Manual
+///   compaction has no later `agent_settled` to clear `Compacting`. Rust uses
+///   its `aborted` and `willRetry` fields to distinguish cancellation, failure
+///   and an automatic retry; only a terminal failure surfaces error text.
 ///
 /// Deliberately not registered: `agent_start` / `agent_end` / `turn_*` /
 /// `message_*` / `context` / `before_provider_*` / `after_provider_response`
@@ -210,6 +212,7 @@ const FORWARDED: &[(&str, HookEvent)] = &[
     ("agent_settled", HookEvent::Stop),
     ("session_before_compact", HookEvent::PreCompact),
     ("session_compact", HookEvent::PostCompact),
+    ("session_compact_failed", HookEvent::StopFailure),
 ];
 
 // =============================================================================
@@ -331,6 +334,9 @@ function send(forwarded, pi, event, ctx) {{
       tool_name: event?.toolName,
       prompt: event?.prompt,
       is_error: event?.isError,
+      aborted: event?.aborted,
+      will_retry: event?.willRetry,
+      error_message: event?.errorMessage,
       context_tokens: Math.round(ctx?.getContextUsage?.()?.tokens),
       model: ctx?.model?.id,
     }});
@@ -438,7 +444,9 @@ fn launch_args(extension: &Path, extra: &[String]) -> Vec<String> {
 /// The pi-side sources, one per field: `ctx.sessionManager.getSessionId()`,
 /// `pi.getSessionName()`, `ctx.cwd`, `event.toolName` (the tool-execution
 /// events), `event.prompt` (`before_agent_start`), `event.isError`
-/// (`tool_execution_end`), `ctx.getContextUsage().tokens` and `ctx.model.id`.
+/// (`tool_execution_end`), `event.aborted` / `event.willRetry` /
+/// `event.errorMessage` (`session_compact_failed`), `ctx.getContextUsage().tokens`
+/// and `ctx.model.id`.
 #[derive(Deserialize)]
 struct HookPayload {
     session_id: Option<String>,
@@ -451,6 +459,12 @@ struct HookPayload {
     /// Set on a `tool_execution_end` whose tool failed.
     #[serde(default)]
     is_error: bool,
+    /// Compaction may stop, be cancelled, or leave an automatic retry running.
+    #[serde(default)]
+    aborted: bool,
+    #[serde(default)]
+    will_retry: bool,
+    error_message: Option<String>,
 }
 
 /// Normalize one Pi hook payload, as sent by the generated extension.
@@ -461,10 +475,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         event: normalize_event(event, &payload),
         session_id: payload.session_id,
         tool_name: payload.tool_name,
-        // No error text is read. `tool_execution_end` carries a `result`, but
-        // its shape is per-tool and the failure arm doesn't surface a message
-        // anyway; `raw` holds the whole payload for anyone who needs it.
-        message: None,
+        message: payload.error_message,
         cwd: payload.cwd,
         prompt: payload.prompt,
         // All three ride every payload — see the module doc for why they come
@@ -492,9 +503,15 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 /// identically, so nothing on the row moves differently. It is here because the
 /// fact is on the payload and dropping it would read as an oversight later, and
 /// because this is where the correction belongs the day the two arms diverge.
+///
+/// Compaction failures settle unless Pi will retry automatically. Cancellation
+/// is a clean stop; only a terminal failure reports an error. `PostToolUse` is
+/// the shared active transition, and does not turn a retry into a new prompt.
 fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
     match event {
         HookEvent::PostToolUse if payload.is_error => HookEvent::PostToolUseFailure,
+        HookEvent::StopFailure if payload.will_retry => HookEvent::PostToolUse,
+        HookEvent::StopFailure if payload.aborted => HookEvent::Stop,
         other => other,
     }
 }
@@ -505,7 +522,7 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 
 /// Pi departs from [`common::dispatch_default`] nowhere. The native → normalized
 /// renaming is done in the generated table ([`FORWARDED`]) rather than here, the
-/// one payload-driven correction is done in [`parse_hook_payload`], and
+/// payload-driven corrections are done in [`parse_hook_payload`], and
 /// `agent_settled` means the shared `Stop` arm needs no help from a session file
 /// or a rollout scan.
 ///
@@ -586,6 +603,7 @@ const FORWARD = [
   ["agent_settled", "stop"],
   ["session_before_compact", "pre-compact"],
   ["session_compact", "post-compact"],
+  ["session_compact_failed", "stop-failure"],
 ];
 
 export default function (pi) {
@@ -613,6 +631,9 @@ function send(forwarded, pi, event, ctx) {
       tool_name: event?.toolName,
       prompt: event?.prompt,
       is_error: event?.isError,
+      aborted: event?.aborted,
+      will_retry: event?.willRetry,
+      error_message: event?.errorMessage,
       context_tokens: Math.round(ctx?.getContextUsage?.()?.tokens),
       model: ctx?.model?.id,
     });
@@ -657,10 +678,11 @@ function send(forwarded, pi, event, ctx) {
                 "agent_settled",
                 "session_before_compact",
                 "session_compact",
+                "session_compact_failed",
             ]
         );
-        // **Only `agent_settled` becomes `Stop`.** That is the whole turn-end
-        // design: nothing else may claim the turn is over.
+        // Only agent_settled unconditionally means Stop. Compaction failure
+        // needs its payload checked before deciding whether Pi will continue.
         assert_eq!(
             FORWARDED
                 .iter()
@@ -801,6 +823,60 @@ function send(forwarded, pi, event, ctx) {
         let unusable = parse_hook_payload(HookEvent::Stop, r#"{"context_tokens":null}"#)
             .expect("a null token count parses");
         assert_eq!(unusable.context_tokens, None);
+    }
+
+    #[test]
+    fn failed_compaction_settles_but_a_retry_stays_active() {
+        let failure = FORWARDED
+            .iter()
+            .find(|(native, _)| *native == "session_compact_failed")
+            .expect("compaction failures must reach the launcher")
+            .1;
+        for (extra, expected, error) in [
+            (
+                r#", "aborted": true, "will_retry": false"#,
+                SessionStatus::Idle,
+                None,
+            ),
+            (
+                r#", "error_message": "summary failed", "will_retry": false"#,
+                SessionStatus::Idle,
+                Some("summary failed"),
+            ),
+            (
+                r#", "error_message": "summary failed", "will_retry": true"#,
+                SessionStatus::Active,
+                None,
+            ),
+            (
+                r#", "aborted": true, "will_retry": true"#,
+                SessionStatus::Active,
+                None,
+            ),
+        ] {
+            let mut state = state_at(SessionStatus::Idle);
+            feed(&mut state, HookEvent::PreCompact, &payload(""));
+            feed(&mut state, failure, &payload(extra));
+            assert_eq!(state.status, expected);
+            assert_eq!(state.last_error.as_deref(), error);
+        }
+    }
+
+    #[test]
+    fn generated_forwarder_carries_compaction_outcomes() {
+        let messages =
+            super::super::forwarder_test::run(&extension_source("/path/to/miao"), "pi_compaction");
+        assert_eq!(messages.len(), 4);
+        let mut state = state_at(SessionStatus::Idle);
+        for ((event, body), status) in messages.into_iter().zip([
+            SessionStatus::Compacting,
+            SessionStatus::Idle,
+            SessionStatus::Idle,
+            SessionStatus::Active,
+        ]) {
+            feed(&mut state, event, &body);
+            assert_eq!(state.status, status);
+        }
     }
 
     /// No transcript path, ever — the field the launcher gates its whole

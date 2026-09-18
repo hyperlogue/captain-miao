@@ -2185,6 +2185,7 @@ mod tests {
                     PreToolUse,
                     PostToolUse,
                     Stop,
+                    StopFailure,
                     PreCompact,
                     PostCompact,
                 ],
