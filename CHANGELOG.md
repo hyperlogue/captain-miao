@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-17
+
+Thanks to @g1ibby for fixing agent launches with non-JSON hook settings
+([#4](https://github.com/hyperlogue/captain-miao/pull/4)).
+
+### Added
+
+- **Recovery keys appear in the Detail panel when a session has problems**:
+  `x` to remove, `Space e` to restart, `Space h` to inspect the host, and `y`
+  to copy the session ID.
+
+### Changed
+
+- **Kitty work tabs stay together beside the dashboard and session tabs**,
+  and opening the same working directory again focuses its existing work tab.
+- **Use `x` to force-remove stale Codex app-server sessions** when the server
+  is unreachable or the conversation is missing, with a clear removal result
+  and a warning if server-side work may still be running.
+
+### Fixed
+
+- **Kimi, OpenCode, Pi and omp sessions launch correctly** with hook settings
+  in their native formats.
+- **OpenCode preserves project settings and explicit custom-config overrides**,
+  without loading global plugins twice.
+- **OpenCode child-session completion no longer falsely marks the parent idle**
+  because of reordered hook events.
+- **Failed or cancelled Pi compaction clears `Compacting`**, reports terminal
+  failures and keeps automatic retries active.
+- **Codex app-server tracking survives `/btw` side questions**, keeping the
+  main conversation's status and identity accurate.
+- **The resume picker immediately rejects a Codex conversation already managed
+  on the selected host**, preventing a duplicate session. App-server mode would
+  reject it anyway, but only after a long timeout.
+
+### Removed
+
+- **The host-utilization legend no longer takes up panel space**, with the
+  utilization values and warning colors retained.
+
 ## [0.9.1] - 2026-09-12
 
 ### Added
@@ -585,7 +625,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hyperlogue/captain-miao/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/hyperlogue/captain-miao/compare/v0.8.0...v0.8.1
