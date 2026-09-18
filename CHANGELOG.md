@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-18
+
+This release only contains release pipeline change. The 0.9.2 version isn't fully
+published on npm, so this version is also used to get a fully-published latest
+version.
+
+### Fixed
+
+- **npm releases tolerate registry delays and resume failed publication jobs**,
+  with a ten-minute visibility wait and existing GitHub release assets preserved.
+
 ## [0.9.2] - 2026-09-17
 
 Thanks to @g1ibby for fixing agent launches with non-JSON hook settings
@@ -625,7 +636,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/hyperlogue/captain-miao/compare/v0.8.1...v0.9.0
