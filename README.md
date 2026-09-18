@@ -214,7 +214,7 @@ Status, launch, resume, fork, worktrees, and the **title, token and model column
 Status, launch, resume, fork and the **title, tool, token and model columns** all work. opencode has no shell-command hooks, so captain-miao generates a JavaScript plugin for it.
 
 - **No worktrees, no background-task tiers** — a settled turn reads as `Idle` whatever else is still running.
-- Your own plugins keep loading: `plugins/` is rebuilt to symlink each of them beside our generated `captain-miao.js`.
+- Your global and project settings and plugins keep loading normally. An explicit `OPENCODE_CONFIG_DIR` keeps its override priority.
 - The plugin stays out of `permission.ask`, so nothing it does can delay a decision you're being asked to make.
 
 #### Pi support

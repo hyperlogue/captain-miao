@@ -100,6 +100,7 @@
         commonArgs = {
           inherit src;
           strictDeps = true;
+          nativeCheckInputs = [pkgs.nodejs];
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;

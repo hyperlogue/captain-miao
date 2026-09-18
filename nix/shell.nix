@@ -23,6 +23,9 @@ in
       cargo-edit
       cargo-watch
 
+      # Execute the generated agent forwarders against a controlled hook host.
+      nodejs
+
       # `cargo xtask prepare-servers` (and `dist`'s default `--from build`)
       # cross-compiles miao-server for the dashboards that carry one. zig
       # is what makes that work at all: the server pulls in bundled SQLite's C

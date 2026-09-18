@@ -33,51 +33,30 @@
 //! [`crate::agent::AgentControl::hooks_settings_json`] returns its **JS
 //! source** — the seam calls it "the per-session hook-settings file" and
 //! nothing requires it to be JSON; Kimi already puts TOML through it — and
-//! [`build_launch_command`] relocates it into `<state>/opencode-config/plugins/`
-//! behind `OPENCODE_CONFIG_DIR`. Structurally this is Codex's and Grok's
-//! per-session-isolated injection; only the payload language differs.
+//! [`build_launch_command`] installs it into a synthetic config overlay behind
+//! `OPENCODE_CONFIG_DIR`.
 //!
-//! The cost is real and worth naming: captain-miao now ships generated
-//! JavaScript in a tree with no JS toolchain and no way to execute it in a
-//! test. §9.1's containment is therefore followed to the letter and is not
-//! negotiable —
+//! The plugin only forwards events. Rust owns session selection, child-session
+//! filtering and status decisions. A per-instance delivery queue preserves
+//! callback order because OpenCode does not await bus hooks. Each child has a
+//! five-second deadline so a failed hook cannot stall delivery indefinitely.
+//! Payloads are captured before queueing, and children use an argv array rather
+//! than a shell. The socket arrives via `$CAPTAIN_MIAO_SOCK`, never in the file.
+//! Tests pin the generated source and execute it against a controlled Node host
+//! to exercise ordering, failure recovery and payload delivery.
 //!
-//! - the plugin holds **no state, no retries and no reads of the agent's own
-//!   data**. It serializes what it was handed and spawns
-//!   `miao hook --agent opencode <event>`. What it does decide is the *event
-//!   name*, which is our argv and therefore cannot be deferred to Rust — see
-//!   [`BUS_EVENTS`] for the two places that decision needs a payload field, and
-//!   why forwarding those two unfiltered would be a denial of service against
-//!   the user's own session. Every other field is dug out in
-//!   [`parse_hook_payload`], where it is testable, rather than in JavaScript
-//!   this tree cannot execute;
-//! - the socket arrives via `$CAPTAIN_MIAO_SOCK`, never spliced into the file,
-//!   so one plugin serves every session byte-for-byte (and nothing in the JS
-//!   needs shell quoting: the child is spawned with an argv array, never
-//!   through a shell);
-//! - the tests cover **generation, not execution**: the source is byte-stable
-//!   across sockets, every handler key maps to a real [`HookEvent`], and
-//!   [`tests::the_generated_plugin_is_byte_for_byte_what_we_think_it_is`] is a
-//!   full snapshot, so any edit to the template fails loudly instead of
-//!   shipping unreviewed JS.
+//! **`OPENCODE_CONFIG_DIR` is an additional override, not a global config
+//! replacement.** OpenCode loads it after global and project settings. By
+//! default our overlay therefore contains only our plugin: copying globals
+//! there would override project settings and load global plugins twice. An
+//! explicit user `OPENCODE_CONFIG_DIR` is mirrored into a separate overlay for
+//! that path, preserving its priority without mixing concurrent profiles.
 //!
-//! **`plugins/` is owned *and* mirrored, which is the trap this backend shares
-//! with Grok's `hooks/`.** `OPENCODE_CONFIG_DIR` relocates agents, commands,
-//! modes **and** plugins together, so the synthetic dir is a symlink farm over
-//! the real one ([`super::synth_home`]) — and `plugins/` is the one entry that
-//! can be neither linked nor simply owned. Link it and
-//! [`super::synth_home::SynthHome::write_owned`] writes our module **through the
-//! symlink into the user's real `~/.config/opencode/plugins/`**, which is the
-//! one thing a synthetic home exists to prevent. Own it without mirroring and
-//! every plugin the user has stops loading inside a captain-miao session,
-//! silently. [`ensure_synth_config`] therefore builds a **second [`SynthHome`]
-//! inside the first**, exactly as `agents::grok` does for `hooks/`.
-//!
-//! Nothing is **copied**: opencode's config is `opencode.json`/`opencode.jsonc`
-//! and we neither edit it nor need the agent to write back through us (Codex
-//! and Kimi copy only because they persist hook trust / carry our hook block
-//! *in* the config). A symlink is enough, and it keeps a `/model` change inside
-//! a captain-miao session landing in the user's real file.
+//! In an explicit custom overlay, `plugins/` is both owned and mirrored. The
+//! outer [`SynthHome`] owns that directory to prevent writing through a symlink
+//! into the user's real config. A nested mirror links the user's plugins and
+//! adds `captain-miao.js`. Other entries remain symlinks; user config files are
+//! never edited by the launcher.
 //!
 //! ## Two mechanisms, because `Hooks` is two mechanisms
 //!
@@ -137,11 +116,6 @@
 //!   subprocess per turn rather than one per streamed chunk; if the completed
 //!   message is re-emitted, the token column simply updates twice with the same
 //!   number, but if it is *never* emitted the column stays empty;
-//! - **whether `$XDG_CONFIG_HOME` moves the real config dir.** §9 spells it
-//!   `~/.config/opencode/`, the XDG default; [`config_dir`] honours the
-//!   variable when it is set, which is a guess in the direction that fails
-//!   *loudly* (a missing real dir yields a synthetic one holding only our
-//!   plugin — the user's agents and commands visibly gone) rather than quietly.
 //! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
 //!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
 //!   this works if the agent reads the clipboard by shelling out to
@@ -153,6 +127,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -163,6 +138,9 @@ use crate::state::{HookEvent, HookMessage, LauncherState};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "opencode";
+
+#[cfg(test)]
+mod config_tests;
 
 /// The directory inside the synthetic config dir that holds plugin modules
 /// (§9's facts table: `~/.config/opencode/plugins/`). Owned by us *and*
@@ -252,54 +230,40 @@ const DIRECT_HOOKS: &[(&str, HookEvent)] = &[
 // Filesystem locations
 // =============================================================================
 
-/// The real opencode config dir — what the synthetic one mirrors. It is *not*
-/// what the launched agent is handed (see [`ensure_synth_config`]).
-///
-/// `$OPENCODE_CONFIG_DIR` first, because a user who already relocated it means
-/// that dir and mirroring `~/.config/opencode` would silently ignore every
-/// agent, command and mode they have. Then `$XDG_CONFIG_HOME/opencode`, then
-/// `~/.config/opencode` (§9's spelling). The middle branch is the guess — see
-/// the module doc's probe list — and it is the branch that fails visibly.
-///
-/// Note the two *sibling* overrides §9 lists are deliberately not touched:
-/// `OPENCODE_CONFIG` names a config **file** and `OPENCODE_CONFIG_CONTENT` an
-/// inline document, neither of which relocates `plugins/`, so neither affects
-/// where our module has to land.
-fn config_dir() -> Option<PathBuf> {
-    for var in ["OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
-        if let Some(v) = std::env::var_os(var) {
-            let p = PathBuf::from(v);
-            if !p.as_os_str().is_empty() {
-                // `OPENCODE_CONFIG_DIR` *is* the config dir; `XDG_CONFIG_HOME`
-                // is its parent.
-                return Some(if var == "OPENCODE_CONFIG_DIR" {
-                    p
-                } else {
-                    p.join(BIN)
-                });
-            }
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".config").join(BIN))
+/// Only an explicit custom directory belongs in our overlay. OpenCode loads
+/// globals independently, before project config; mirroring globals here would
+/// load them again *after* the project and reverse that precedence.
+fn custom_config_dir(cwd: &Path) -> Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let path =
+        std::path::absolute(cwd.join(value)).context("resolving opencode config directory")?;
+    Ok(Some(path.canonicalize().unwrap_or(path)))
 }
 
-/// A single shared synthetic `$OPENCODE_CONFIG_DIR` for every opencode session:
-/// the real config dir mirrored through symlinks, plus the `plugins/` subtree we
-/// own. Shared rather than per-session because it is a symlink farm over the
-/// user's config — one stable copy is cheaper to build and to reason about than
-/// one per launch — and that sharing is exactly why the plugin may carry no
-/// per-session data (see [`plugin_source`]).
-fn synth_config_dir() -> PathBuf {
-    crate::state::state_dir().join("opencode-config")
+/// Keep custom profiles separate so concurrent launches cannot retarget each
+/// other's symlinks. The new layout also leaves old `opencode-config` mirrors
+/// unused: they may contain global config links that must no longer load.
+fn synth_config_dir(custom: Option<&Path>) -> PathBuf {
+    let profile = match custom {
+        Some(path) => Sha256::digest(path.as_os_str().as_encoded_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        None => "default".to_string(),
+    };
+    crate::state::state_dir()
+        .join("opencode-overlays")
+        .join(profile)
 }
 
 // =============================================================================
 // Launcher: process spawn + synthetic OPENCODE_CONFIG_DIR
 // =============================================================================
 
-/// Build the argv for an opencode session. opencode discovers global plugins
-/// from its config dir alone, so the generated JavaScript plugin is installed
-/// into a synthetic one — the whole reason this backend needs a config dir.
+/// Build the argv for an opencode session, injecting our plugin through an
+/// additional config directory without changing global/project precedence.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -308,15 +272,13 @@ pub fn build_launch_command(
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
     // The launcher already wrote our plugin source to `settings_path`;
-    // relocate it into the synthetic config dir, which is the only place
-    // opencode discovers global plugins (there is no per-invocation
-    // `--settings` equivalent and no shell-command hook — that is the whole
-    // reason this backend needs a config dir at all). Note the file the
+    // relocate it into the additional config dir (there is no per-invocation
+    // `--settings` equivalent and no shell-command hook). Note the file the
     // launcher wrote is named `…-settings.json` and holds **JavaScript**: that
     // path is generic transport, opaque to the launcher, and every backend puts
     // its own format through it (Kimi's is TOML).
     let plugin_js = std::fs::read_to_string(settings_path).context("reading opencode plugin")?;
-    let config = ensure_synth_config(&plugin_js)?;
+    let config = ensure_synth_config(&plugin_js, Path::new(cwd))?;
 
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("OPENCODE_CONFIG_DIR", &config);
@@ -368,26 +330,24 @@ fn launch_args(extra: &[String]) -> Vec<String> {
 ///   real `plugins/` entries, so the user's own plugins keep loading inside a
 ///   captain-miao session, and adds `captain-miao.js` beside them.
 ///
-/// Everything else — `opencode.json`, `agent/`, `command/`, `mode/`, whatever
-/// else the real dir holds — is symlinked by construction rather than by
+/// Everything else in an explicit custom directory — `opencode.json`, `agent/`,
+/// `command/`, `mode/` — is symlinked by construction rather than by
 /// enumeration, which is what makes this survive opencode growing a new config
 /// entry without a change here.
 ///
-/// A real config dir that does not exist yet yields a synthetic one holding
-/// only our plugin. That is a working session with no agents, commands or modes
-/// of the user's — visible immediately, and fixed by running `opencode` once
-/// outside captain-miao.
-fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
-    let real = config_dir();
+/// Without a custom directory, the overlay contains only our plugin. Global
+/// config and plugins continue loading from their normal locations.
+fn ensure_synth_config(plugin_js: &str, cwd: &Path) -> Result<PathBuf> {
+    let real = custom_config_dir(cwd)?;
     let config = SynthHome {
-        dir: synth_config_dir(),
+        dir: synth_config_dir(real.as_deref()),
         real: real.clone(),
         owned: &[PLUGINS_DIR],
         copied: &[],
         // opencode keeps its credentials outside the config dir entirely, so
         // nothing the agent owns is reachable through this mirror.
         adopted: &[],
-        prune: false,
+        prune: true,
     };
     config.ensure()?;
 
@@ -412,7 +372,7 @@ fn ensure_synth_config(plugin_js: &str) -> Result<PathBuf> {
 // The generated plugin
 // =============================================================================
 
-/// Build the contents of `<state>/opencode-config/plugins/captain-miao.js`.
+/// Build the contents of our overlay's `plugins/captain-miao.js`.
 ///
 /// Named `build_hooks_settings` like every other backend's, because the seam
 /// calls this "the per-session hook-settings file" and the contents are opaque
@@ -434,32 +394,16 @@ const BIN_FALLBACK: &str = "miao";
 /// The plugin module, as source. Pure and parameterized on the `miao` path so
 /// the snapshot test can pin every other byte of it.
 ///
-/// Four properties this file has to hold, none of which a JS test could check
-/// here (this tree has no JS toolchain, and executing generated JavaScript is
-/// not something a `cargo test` should start doing):
+/// The source is byte-identical across sessions: only the executable path is
+/// embedded. Children inherit the launcher socket, ignore stdout/stderr and
+/// never run through a shell. Spawn failures, pipe errors and timeouts must not
+/// escape into the agent or stop the delivery queue.
 ///
-/// - **byte-identical across sessions.** `miao`'s path is per *machine*, not
-///   per session; nothing session-shaped appears at all. That is what lets one
-///   shared config dir serve every session, and it is asserted directly.
-/// - **it cannot affect the agent.** stdout and stderr go to `ignore`, the exit
-///   status is never read, `spawn` and `JSON.stringify` are each wrapped so a
-///   throw cannot escape into opencode's handler, and both the child and its
-///   stdin carry an `error` listener — an unhandled `EPIPE` on a pipe whose
-///   reader died is otherwise a *process-level* crash in Node, which would take
-///   the user's session down with it.
-/// - **it needs no shell quoting.** The argv is an array, so no metacharacter
-///   in the `miao` path can word-split or inject. The path is embedded as a
-///   JSON string literal, which is also a valid JS one.
-/// - **ordering is offered, not assumed.** Every handler returns `send`'s
-///   promise, which settles when the child exits. At 1.18.18 opencode awaits
-///   the **direct hooks** in registration order (`plugin/index.ts`), so those
-///   arrive serialized; the bus `event` hook's return is discarded (`void`),
-///   so bus events race each other and the direct hooks freely. Returning the
-///   promise costs nothing where it is dropped, keeps the direct hooks in
-///   order today, and means any future opencode that does await the bus gets
-///   ordering for free — but nothing downstream may *depend* on cross-event
-///   order, which is why the child-session gate in [`dispatch_hook`] is
-///   denylist-shaped rather than sequence-shaped.
+/// Both direct hooks and bus events use one queue per plugin instance. OpenCode
+/// awaits direct hooks but discards bus promises, so returning a promise alone
+/// cannot preserve ordering. In particular, child lineage must arrive before a
+/// later child status event reaches [`dispatch_hook`]. The queue preserves
+/// callback order; it cannot recover an event lost to a failed hook process.
 ///
 /// The export is emitted **twice**, named and default, because §9 states that a
 /// plugin "export[s] a function" without saying under which convention. Both
@@ -491,8 +435,8 @@ fn plugin_source(miao: &str) -> String {
 // captain-miao's `agents/opencode.rs` on every launch, so edits here are lost.
 //
 // It forwards opencode's lifecycle events to the captain-miao launcher that
-// started this session and does nothing else: no state, no retries, no reads of
-// your data. Payloads are forwarded whole and picked apart on the other side;
+// started this session. A delivery queue preserves their order; it makes no
+// session decisions and reads none of your data. Payloads are forwarded whole;
 // the only fields read here are the two that decide whether to forward at all.
 // The launcher socket arrives in $CAPTAIN_MIAO_SOCK — it is never written into
 // this file, so the file is identical for every session. Delete it and sessions
@@ -509,9 +453,9 @@ const BUS = {{
 
 const CaptainMiao = async (ctx) => {{
   const directory = ctx?.directory ?? null;
-  // The returned promise settles when the child exits, so an opencode that
-  // awaits its hooks delivers these events in the order it fired them; one
-  // that does not await loses nothing. It never rejects.
+  // The bus does not await us. Serialize all deliveries, including direct
+  // hooks, so later status events cannot overtake session lineage.
+  let pending = Promise.resolve();
   const send = (event, args) => {{
     let body;
     try {{
@@ -519,21 +463,34 @@ const CaptainMiao = async (ctx) => {{
     }} catch {{
       body = JSON.stringify({{ event, directory }});
     }}
-    return new Promise((resolve) => {{
+    // Capture the payload now: direct-hook outputs can be mutated later.
+    const deliver = () => new Promise((resolve) => {{
       let child;
+      let timeout;
+      const finish = () => {{
+        clearTimeout(timeout);
+        resolve();
+      }};
+      const abort = () => {{
+        try {{ child?.kill("SIGKILL"); }} catch {{}}
+        finish();
+      }};
       try {{
         child = spawn(MIAO, ["hook", "--agent", "opencode", event], {{
           stdio: ["pipe", "ignore", "ignore"],
         }});
+        // A stuck hook must not block the queue or an awaited direct hook.
+        timeout = setTimeout(abort, 5000);
+        child.on("error", finish);
+        child.on("close", finish);
+        child.stdin.on("error", () => {{}});
+        child.stdin.end(body);
       }} catch {{
-        resolve();
-        return;
+        abort();
       }}
-      child.on("error", () => resolve());
-      child.on("close", () => resolve());
-      child.stdin.on("error", () => {{}});
-      child.stdin.end(body);
     }});
+    pending = pending.then(deliver, deliver);
+    return pending;
   }};
   const report =
     (event) =>
@@ -1231,6 +1188,48 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("ses_root2"));
     }
 
+    #[test]
+    fn generated_forwarder_preserves_child_lineage_before_status() {
+        let messages =
+            super::super::forwarder_test::run(&plugin_source("/path/to/miao"), "opencode_order");
+        assert_eq!(messages[0].0, HookEvent::SessionStart);
+        assert_eq!(messages[1].0, HookEvent::Stop);
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("root".into());
+        for (event, body) in messages {
+            feed(&mut state, event, &body);
+        }
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.session_id.as_deref(), Some("root"));
+        assert_eq!(state.child_session_ids, ["child"]);
+    }
+
+    #[test]
+    fn generated_forwarder_recovers_from_child_failures() {
+        for scenario in [
+            "opencode_spawn_error",
+            "opencode_spawn_throw",
+            "opencode_stdin_error",
+            "opencode_timeout",
+        ] {
+            let messages =
+                super::super::forwarder_test::run(&plugin_source("/path/to/miao"), scenario);
+            assert_eq!(messages.last().unwrap().0, HookEvent::Stop);
+        }
+    }
+
+    #[test]
+    fn generated_forwarder_orders_direct_hooks_and_captures_payloads() {
+        let messages =
+            super::super::forwarder_test::run(&plugin_source("/path/to/miao"), "opencode_direct");
+        assert_eq!(
+            messages.iter().map(|(event, _)| *event).collect::<Vec<_>>(),
+            [HookEvent::SessionStart, HookEvent::PreToolUse]
+        );
+        let msg = parse_hook_payload(messages[1].0, &messages[1].1).unwrap();
+        assert_eq!(msg.tool_name.as_deref(), Some("original"));
+    }
+
     /// A deliberate Esc publishes `session.error` with `MessageAbortedError`
     /// beside the idle events. It is the turn ending, not failing: the row
     /// settles with no error parked on it.
@@ -1490,18 +1489,15 @@ mod tests {
         }
     }
 
-    /// **The snapshot.** captain-miao cannot execute this JavaScript — there is
-    /// no JS toolchain in the tree — so the only defence against a careless
-    /// edit is that every byte of it is pinned and any change has to be
-    /// re-reviewed here deliberately.
+    /// Pin the complete generated module alongside its runtime delivery tests.
     #[test]
     fn the_generated_plugin_is_byte_for_byte_what_we_think_it_is() {
         let expected = r#"// captain-miao session tracking for opencode. GENERATED — rewritten from
 // captain-miao's `agents/opencode.rs` on every launch, so edits here are lost.
 //
 // It forwards opencode's lifecycle events to the captain-miao launcher that
-// started this session and does nothing else: no state, no retries, no reads of
-// your data. Payloads are forwarded whole and picked apart on the other side;
+// started this session. A delivery queue preserves their order; it makes no
+// session decisions and reads none of your data. Payloads are forwarded whole;
 // the only fields read here are the two that decide whether to forward at all.
 // The launcher socket arrives in $CAPTAIN_MIAO_SOCK — it is never written into
 // this file, so the file is identical for every session. Delete it and sessions
@@ -1525,9 +1521,9 @@ const BUS = {
 
 const CaptainMiao = async (ctx) => {
   const directory = ctx?.directory ?? null;
-  // The returned promise settles when the child exits, so an opencode that
-  // awaits its hooks delivers these events in the order it fired them; one
-  // that does not await loses nothing. It never rejects.
+  // The bus does not await us. Serialize all deliveries, including direct
+  // hooks, so later status events cannot overtake session lineage.
+  let pending = Promise.resolve();
   const send = (event, args) => {
     let body;
     try {
@@ -1535,21 +1531,34 @@ const CaptainMiao = async (ctx) => {
     } catch {
       body = JSON.stringify({ event, directory });
     }
-    return new Promise((resolve) => {
+    // Capture the payload now: direct-hook outputs can be mutated later.
+    const deliver = () => new Promise((resolve) => {
       let child;
+      let timeout;
+      const finish = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+      const abort = () => {
+        try { child?.kill("SIGKILL"); } catch {}
+        finish();
+      };
       try {
         child = spawn(MIAO, ["hook", "--agent", "opencode", event], {
           stdio: ["pipe", "ignore", "ignore"],
         });
+        // A stuck hook must not block the queue or an awaited direct hook.
+        timeout = setTimeout(abort, 5000);
+        child.on("error", finish);
+        child.on("close", finish);
+        child.stdin.on("error", () => {});
+        child.stdin.end(body);
       } catch {
-        resolve();
-        return;
+        abort();
       }
-      child.on("error", () => resolve());
-      child.on("close", () => resolve());
-      child.stdin.on("error", () => {});
-      child.stdin.end(body);
     });
+    pending = pending.then(deliver, deliver);
+    return pending;
   };
   const report =
     (event) =>

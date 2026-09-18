@@ -19,6 +19,9 @@ pub mod reasonix;
 mod common;
 mod synth_home;
 
+#[cfg(test)]
+mod forwarder_test;
+
 // Small helpers shared by the backend modules. They live here (rather than
 // duplicated in each backend) because both `claude` and `codex` need byte-for-
 // byte the same behaviour and had drifted as copies.
