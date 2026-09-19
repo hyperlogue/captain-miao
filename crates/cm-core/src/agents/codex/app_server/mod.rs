@@ -202,7 +202,26 @@ async fn stop_loaded(client: &mut transport::Client, id: &str, turn: Option<&str
             "thread/turns/list",
             json!({"threadId":id,"limit":1,"sortDirection":"desc"}),
         )
-        .await;
+        .await
+        .or_else(|error| {
+            // A new thread is loaded before it has any persisted turn history.
+            // This explicit absence is an empty list, including for the cached
+            // turn fallback below. Goal and terminal cleanup still must succeed.
+            if error
+                .downcast_ref::<transport::RpcError>()
+                .is_some_and(|rpc| {
+                    rpc.code == Some(-32600)
+                        && rpc.message
+                            == format!(
+                                "thread {id} is not materialized yet; thread/turns/list is unavailable before first user message"
+                            )
+                })
+            {
+                Ok(json!({"data":[]}))
+            } else {
+                Err(error)
+            }
+        });
     let current = latest
         .as_ref()
         .ok()

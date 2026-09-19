@@ -132,6 +132,12 @@ interrupted turn. Teardown addresses only the
 selected thread, preserves history, and never stops the shared daemon. Codex
 may retain an idle thread in memory after clients disconnect.
 
+An updated launcher can also clean up a thread before its first user message.
+Codex reports that such a thread is not yet materialized when miao reads its
+turn history; miao treats that specific response as an empty history and still
+requires goal and background-terminal cleanup to succeed. Already-running
+launchers keep their existing cleanup behavior until replaced.
+
 Before cleanup, the relay stops forwarding new mutations and waits for already
 forwarded lifecycle, turn and goal requests to settle. Responses continue to
 flow while it waits. A lost response leaves cleanup uncertain: reconnecting a

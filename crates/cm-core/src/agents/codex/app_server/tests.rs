@@ -845,6 +845,100 @@ async fn disabled_goals_allow_cleanup_but_real_goal_errors_are_reported() {
     }
 }
 
+#[tokio::test]
+async fn cleanup_succeeds_before_the_first_user_message() {
+    for (failure, cached_turn) in [
+        (None, None),
+        (None, Some("stale-turn")),
+        (Some("goal"), None),
+        (Some("terminals"), None),
+        (Some("other-thread"), None),
+        (Some("other-code"), None),
+        (Some("other-message"), None),
+        (Some("other-message"), Some("stale-turn")),
+    ] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("stop.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let config = CodexConfig {
+            endpoint: format!("unix://{}", path.display()),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let init = receive(&mut socket).await;
+            send(&mut socket, &json!({"id":init["id"],"result":{}})).await;
+            assert_eq!(receive(&mut socket).await["method"], "initialized");
+            let mut calls = Vec::new();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let id = &request["id"];
+                let method = request["method"].as_str().unwrap();
+                calls.push(method.to_owned());
+                if method != "thread/loaded/list" {
+                    assert_eq!(request["params"]["threadId"], "test-thread");
+                }
+                let reply = match method {
+                    "thread/goal/get" => json!({"id":id,"result":{"goal":{"status":"active"}}}),
+                    "thread/goal/set" => {
+                        assert_eq!(request["params"]["status"], "paused");
+                        if failure == Some("goal") {
+                            json!({"id":id,"error":{"code":-32603,"message":"goal pause failed"}})
+                        } else {
+                            json!({"id":id,"result":{}})
+                        }
+                    }
+                    "thread/turns/list" => {
+                        let thread = if failure == Some("other-thread") {
+                            "other-thread"
+                        } else {
+                            "test-thread"
+                        };
+                        let message = if failure == Some("other-message") {
+                            "turn history unavailable".to_owned()
+                        } else {
+                            format!(
+                                "thread {thread} is not materialized yet; thread/turns/list is unavailable before first user message"
+                            )
+                        };
+                        json!({"id":id,"error":{
+                            "code":if failure == Some("other-code") { -32603 } else { -32600 },
+                            "message":message
+                        }})
+                    }
+                    "turn/interrupt" => {
+                        assert_eq!(request["params"]["turnId"], "stale-turn");
+                        json!({"id":id,"result":{}})
+                    }
+                    "thread/backgroundTerminals/clean" if failure == Some("terminals") => {
+                        json!({"id":id,"error":{"code":-32603,"message":"terminal cleanup failed"}})
+                    }
+                    "thread/backgroundTerminals/clean" => json!({"id":id,"result":{}}),
+                    "thread/loaded/list" => json!({"id":id,"result":{"data":["test-thread"]}}),
+                    method => panic!("unexpected cleanup method {method}"),
+                };
+                send(&mut socket, &reply).await;
+            }
+            calls
+        });
+        let mut row = state();
+        row.session_id = Some("test-thread".into());
+        let result = stop(&config, &row, cached_turn).await;
+        let calls = server.await.unwrap();
+        let mut expected = vec!["thread/goal/get", "thread/goal/set", "thread/turns/list"];
+        if failure == Some("other-message") && cached_turn.is_some() {
+            expected.push("turn/interrupt");
+        }
+        expected.push("thread/backgroundTerminals/clean");
+        if failure.is_some() {
+            expected.push("thread/loaded/list");
+        }
+        assert_eq!(result.is_ok(), failure.is_none(), "{failure:?}: {result:?}");
+        assert_eq!(calls, expected, "{failure:?}, cached turn: {cached_turn:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inventory_uses_paginated_rpc_without_loading_threads() {
     let scratch = Scratch::new();
