@@ -17,6 +17,7 @@ pub mod reasonix;
 // start from, and the synthetic-home builder an agent needs when its hooks can
 // only be discovered from its home directory.
 mod common;
+mod pi_extension;
 mod synth_home;
 
 #[cfg(test)]

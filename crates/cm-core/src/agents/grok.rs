@@ -73,7 +73,7 @@ use tokio::process::Command;
 
 use super::common;
 use super::shell_quote;
-use super::synth_home::atomic_write;
+use super::synth_home::write_if_changed;
 use crate::agent::{BgSeedKind, BgShell, ResumeCandidate, TranscriptStats};
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
@@ -407,14 +407,7 @@ fn install_hooks_file(contents: &str) -> Result<()> {
     crate::state::create_dir_all_private(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(HOOKS_FILE);
-    let unchanged = std::fs::read_to_string(&path)
-        .map(|cur| cur == contents)
-        .unwrap_or(false);
-    if !unchanged {
-        atomic_write(&path, contents.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(())
+    write_if_changed(&path, contents)
 }
 
 /// Build the contents of `$GROK_HOME/hooks/captain-miao.json`.

@@ -219,15 +219,7 @@ impl SynthHome<'_> {
     /// [`SynthHome::owned`], or [`SynthHome::ensure`] will have symlinked the
     /// real home's entry over the top of it.
     pub(super) fn write_owned(&self, name: &str, contents: &str) -> Result<()> {
-        let path = self.dir.join(name);
-        let unchanged = std::fs::read_to_string(&path)
-            .map(|cur| cur == contents)
-            .unwrap_or(false);
-        if !unchanged {
-            atomic_write(&path, contents.as_bytes())
-                .with_context(|| format!("writing {}", path.display()))?;
-        }
-        Ok(())
+        write_if_changed(&self.dir.join(name), contents)
     }
 
     /// Move entries the agent minted **here** into the real home, so its own
@@ -408,6 +400,15 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Refresh a generated file atomically, preserving it when the bytes agree.
+/// The caller owns the path and creates its parent directory.
+pub(super) fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|current| current == contents) {
+        return Ok(());
+    }
+    atomic_write(path, contents.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

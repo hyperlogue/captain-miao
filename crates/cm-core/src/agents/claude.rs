@@ -327,7 +327,8 @@ impl StatsCursor {
         // until then.
         if self.first_prompt.is_none()
             && line.contains("\"user\"")
-            && let Some(p) = parse_first_user_prompt_line(line)
+            && let Ok(value) = serde_json::from_str(line)
+            && let Some(p) = first_user_prompt(&value)
         {
             self.first_prompt = Some(p);
             // A user line is never an assistant-usage/compact line, so it falls
@@ -552,7 +553,7 @@ fn classify_bg_shells(cmdlines: &[String]) -> Vec<BgShell> {
 /// Falls back to the whole (trimmed) command line when no `eval '…'` is present
 /// (or it parses to nothing), so an unusual wrapper still yields *some* stable
 /// key rather than nothing.
-pub fn normalize_bg_command(cmd: &str) -> String {
+fn normalize_bg_command(cmd: &str) -> String {
     const MARK: &str = "eval '";
     if let Some(start) = cmd.find(MARK) {
         // Resume *at* the opening quote (MARK includes it, and it's ASCII):
@@ -808,7 +809,7 @@ fn child_cmdlines(pid: u32) -> Option<Vec<String>> {
 /// The ppid is field 4 of `/proc/<pid>/stat`, two fields past the parenthesized
 /// comm — which can itself contain spaces and parens, so split at the *last*
 /// `)`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 fn parse_stat_ppid(stat: &str) -> Option<u32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     // After the comm: state, ppid, pgrp, …
@@ -818,7 +819,7 @@ fn parse_stat_ppid(stat: &str) -> Option<u32> {
 /// Filter `ps -Aww -o ppid=,command=` output down to the command lines of
 /// `pid`'s direct children. Each line is a right-aligned ppid, whitespace, then
 /// the full command.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn parse_ps_child_cmdlines(ps_output: &str, pid: u32) -> Vec<String> {
     ps_output
         .lines()
@@ -879,11 +880,10 @@ fn parse_custom_title_line(line: &str) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-/// Parse one transcript line into the user prompt it carries, or None if it isn't
+/// Read the user prompt from a transcript entry, or None if it isn't
 /// a real (non-sidechain, non-meta) user message. Shared by the incremental
-/// [`StatsCursor`] fold and the standalone [`read_first_user_prompt`].
-fn parse_first_user_prompt_line(line: &str) -> Option<String> {
-    let val: serde_json::Value = serde_json::from_str(line).ok()?;
+/// [`StatsCursor`] fold and the resume picker's [`read_transcript_header`].
+fn first_user_prompt(val: &serde_json::Value) -> Option<String> {
     if val.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -899,7 +899,7 @@ fn parse_first_user_prompt_line(line: &str) -> Option<String> {
 /// Latest `/rename` entry's title. Claude writes
 /// `{"type":"custom-title","customTitle":"..."}` to the transcript the moment
 /// `/rename` runs — the only place the new name lands until the session exits.
-pub fn read_custom_title(path: &Path) -> Option<String> {
+fn read_custom_title(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
 
     // Scan the WHOLE file, not just the tail: an early `/rename` in a long
@@ -1016,11 +1016,7 @@ fn read_transcript_header(path: &Path) -> TranscriptHeader {
             header.git_branch = Some(b.to_string());
         }
         if header.first_prompt.is_none()
-            && val.get("type").and_then(|t| t.as_str()) == Some("user")
-            && val.get("isSidechain").and_then(|b| b.as_bool()) != Some(true)
-            && val.get("isMeta").and_then(|b| b.as_bool()) != Some(true)
-            && let Some(content) = val.pointer("/message/content")
-            && let Some(p) = extract_user_prompt(content)
+            && let Some(p) = first_user_prompt(&val)
         {
             header.first_prompt = Some(p);
         }
@@ -1408,8 +1404,8 @@ pub fn session_activity(agent_pid: u32) -> Option<AgentActivity> {
 ///
 /// Only `Active`+`Working` holds; every other combination still settles to a
 /// rest shape, so this can never strand a non-`Active` state or invent activity
-/// from a missing file. Claude-only: Codex has no session file (its
-/// `session_activity` is always `None`), so its `Stop` still settles to `Idle`.
+/// from a missing file. Codex handles its turn lifecycle separately through
+/// hooks, rollout events or its app-server connection.
 fn status_after_stop(current: &SessionStatus, activity: Option<AgentActivity>) -> SessionStatus {
     match (current, activity) {
         (SessionStatus::Active, Some(AgentActivity::Working)) => SessionStatus::Active,

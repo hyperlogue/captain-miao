@@ -74,6 +74,38 @@ fn resume_restores_identity_before_input_and_replays_context() {
 }
 
 #[test]
+fn inline_and_paginated_history_restore_the_latest_prompt_and_active_turn() {
+    for paginated in [false, true] {
+        let (mut monitor, mut row) = (Monitor::default(), state());
+        let mut turns = vec![
+            json!({"id":"old-turn","status":"completed","items":[{
+                "type":"userMessage","content":[{"type":"text","text":"Old prompt"}]
+            }]}),
+            json!({"id":"live-turn","status":"inProgress","items":[{
+                "type":"userMessage","content":[{"type":"text","text":"Current prompt"}]
+            }]}),
+        ];
+        let mut result = json!({"thread":{
+            "id":"thread-root","status":{"type":"active","activeFlags":[]}
+        }});
+        if paginated {
+            turns.reverse();
+            result["initialTurnsPage"] = json!({"data":turns});
+        } else {
+            result["thread"]["turns"] = json!(turns);
+        }
+        request(&mut monitor, &mut row, 1, "thread/resume");
+        monitor.apply(
+            &mut row,
+            Observation::Server(json!({"id":1,"result":result})),
+        );
+        assert_eq!(row.last_prompt.as_deref(), Some("Current prompt"));
+        assert_eq!(monitor.turn.as_deref(), Some("live-turn"));
+        assert_eq!(row.status, S::Active);
+    }
+}
+
+#[test]
 fn status_approvals_tools_compaction_and_queued_turns_follow_server_events() {
     let (mut m, mut s) = (Monitor::default(), state());
     resume(&mut m, &mut s);

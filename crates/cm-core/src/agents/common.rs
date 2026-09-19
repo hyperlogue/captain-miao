@@ -92,12 +92,9 @@ fn check_direnv_allowed(direnv: &Path, cwd: &str) -> Result<()> {
 
 /// The immediate subdirectories of `dir`, or nothing if it can't be read.
 ///
-/// Three backends key their session store on a directory name derived from the
-/// working directory — Grok's `<cwd-key>`, Kimi's bucket, opencode's
-/// `projectID` — and **none of them is decoded here**. Each agent's own resolver
-/// walks every key when it has only a session id, so a scan does the same: one
-/// `read_dir` per level, and the authoritative cwd comes out of the session's
-/// own metadata rather than out of its path.
+/// Grok and Kimi bucket sessions by working directory; Codex nests rollouts by
+/// date. Walk each store one level at a time and read the authoritative cwd
+/// from session metadata rather than attempting to decode the directory name.
 pub(super) fn read_subdirs(dir: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();

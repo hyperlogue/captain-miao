@@ -12,9 +12,8 @@ mod tui;
 pub(crate) use native::read_resume_metadata_at;
 pub use native::{
     build_hooks_settings, build_launch_command, dispatch_hook, parse_hook_payload,
-    read_resume_metadata, read_session_index, read_thread_titles, read_transcript_stats,
-    scan_transcript_signals, session_activity, thread_self_continues, title_store_mtimes,
-    title_watch_path,
+    read_resume_metadata, read_thread_titles, read_transcript_stats, scan_transcript_signals,
+    thread_self_continues, title_store_mtimes, title_watch_path,
 };
 pub use settings::{CodexConfig, CodexMode};
 pub(crate) use tui::{BIN, clipboard_paste_input, reattach_prime, uses_kitty_keyboard};

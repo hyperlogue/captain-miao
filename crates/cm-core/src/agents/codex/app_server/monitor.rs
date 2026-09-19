@@ -126,14 +126,7 @@ impl Monitor {
                 }
                 if let Some(turns) = result["initialTurnsPage"]["data"].as_array() {
                     for turn in turns.iter().rev() {
-                        if let Some(items) = turn["items"].as_array() {
-                            for item in items {
-                                self.item(state, item, false);
-                            }
-                        }
-                        if turn["status"] == "inProgress" {
-                            self.turn = turn["id"].as_str().map(str::to_owned);
-                        }
+                        self.replay_turn(state, turn);
                     }
                     status(state, &thread["status"]);
                 }
@@ -283,17 +276,21 @@ impl Monitor {
         }
         if let Some(turns) = thread["turns"].as_array() {
             for turn in turns {
-                if let Some(items) = turn["items"].as_array() {
-                    for item in items {
-                        self.item(state, item, false);
-                    }
-                }
-                if turn["status"] == "inProgress" {
-                    self.turn = turn["id"].as_str().map(str::to_owned);
-                }
+                self.replay_turn(state, turn);
             }
         }
         status(state, &thread["status"]);
+    }
+
+    fn replay_turn(&mut self, state: &mut LauncherState, turn: &Value) {
+        if let Some(items) = turn["items"].as_array() {
+            for item in items {
+                self.item(state, item, false);
+            }
+        }
+        if turn["status"] == "inProgress" {
+            self.turn = turn["id"].as_str().map(str::to_owned);
+        }
     }
 
     fn item(&self, state: &mut LauncherState, item: &Value, started: bool) {

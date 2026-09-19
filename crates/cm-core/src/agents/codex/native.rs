@@ -46,10 +46,7 @@ use std::time::SystemTime;
 use tokio::process::Command;
 
 use super::tui::{BIN, codex_home};
-use crate::agent::{
-    AgentActivity, ResumeCandidate, ResumeMetadata, SessionIndex, SessionIndexCache,
-    TranscriptScan, TranscriptStats,
-};
+use crate::agent::{ResumeCandidate, ResumeMetadata, TranscriptScan, TranscriptStats};
 use crate::agents::common;
 use crate::agents::synth_home::atomic_write;
 use crate::agents::{collapse_whitespace, shell_quote};
@@ -75,35 +72,6 @@ const PROFILE_HEADER: &str = concat!(
 
 fn codex_path(name: &str) -> Option<PathBuf> {
     Some(codex_home()?.join(name))
-}
-
-fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect()
-}
-
-// =============================================================================
-// Session-name index
-// =============================================================================
-
-/// Codex has no per-pid session-name manifest like Claude's
-/// `~/.claude/sessions/<pid>.json`; a session's identity is the rollout UUID,
-/// which the launcher learns from every hook payload and stores on
-/// `state.session_id`. Names — both user renames and Codex's own auto-titles —
-/// live in `state_5.sqlite`, read by the **per-host title overlay** in
-/// [`crate::backend::LocalBackend`] (one cached reader per host, keyed by
-/// session id — see [`read_thread_titles`]) and stamped onto
-/// `LauncherState.name`, so the title reaches the dashboard exactly like
-/// Claude's, local *and* remote. This index therefore stays empty: the name
-/// reaches `session_display_name` via `name`, not here.
-pub fn read_session_index(_cache: &mut SessionIndexCache) -> SessionIndex {
-    SessionIndex::default()
 }
 
 // =============================================================================
@@ -392,7 +360,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
 
 /// First real user prompt — the `event_msg/user_message` payload's `message`.
 /// Used as the fallback display title before any rename.
-pub fn read_first_user_prompt(path: &Path) -> Option<String> {
+fn read_first_user_prompt(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -446,9 +414,9 @@ fn list_resumable_at(home: &Path, limit: usize) -> Result<Vec<ResumeCandidate>> 
     let root = home.join("sessions");
 
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    for year in read_subdirs(&root) {
-        for month in read_subdirs(&year) {
-            for day in read_subdirs(&month) {
+    for year in common::read_subdirs(&root) {
+        for month in common::read_subdirs(&year) {
+            for day in common::read_subdirs(&month) {
                 let Ok(entries) = std::fs::read_dir(&day) else {
                     continue;
                 };
@@ -964,20 +932,6 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         raw: Some(stdin.to_string()),
         session_is_child: None,
     })
-}
-
-// =============================================================================
-// Agent activity (session-status file)
-// =============================================================================
-
-/// Codex has no session-status file we read, so it never reports a coarse
-/// working/idle/background-shell activity — its `Active`↔`Idle` transitions ride
-/// hooks (plus the rollout's own turn lifecycle, which settles both the
-/// interrupt the Stop hook never reports and the goal continuation no prompt
-/// hook announces — see [`scan_transcript_signals`]), and its sessions are
-/// never refined into `BackgroundActive`.
-pub fn session_activity(_agent_pid: u32) -> Option<AgentActivity> {
-    None
 }
 
 // =============================================================================

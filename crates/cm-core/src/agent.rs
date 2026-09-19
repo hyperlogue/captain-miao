@@ -614,42 +614,12 @@ impl AgentControl {
     pub fn forwarded_events(self) -> Vec<HookEvent> {
         // Only Claude splices the socket in at all, and no event name can be
         // confused with this: it is a path, not a bare token.
-        let mut config = self.hooks_settings_json("/dev/null");
-        for extra in self.extra_hook_registrations() {
-            config.push(' ');
-            config.push_str(&extra);
-        }
+        let config = self.hooks_settings_json("/dev/null");
         HookEvent::ALL
             .iter()
             .copied()
             .filter(|e| mentions_event(&config, e.as_kebab()))
             .collect()
-    }
-
-    // =============================================================================
-    // Hooks: what each backend registers
-    // =============================================================================
-
-    /// Hook commands a backend installs **somewhere other than** the file
-    /// [`Self::hooks_settings_json`] returns, so [`Self::forwarded_events`] can
-    /// see the whole subscription rather than the largest part of it.
-    ///
-    /// Currently empty: every backend's hooks live in the file
-    /// [`Self::hooks_settings_json`] returns. The seam stays so a second site
-    /// does not have to re-derive [`Self::forwarded_events`].
-    fn extra_hook_registrations(self) -> Vec<String> {
-        match self {
-            AgentControl::Grok
-            | AgentControl::Claude
-            | AgentControl::Codex
-            | AgentControl::Reasonix
-            | AgentControl::Kimi
-            | AgentControl::OpenCode
-            | AgentControl::Pi
-            | AgentControl::Antigravity
-            | AgentControl::Omp
-            | AgentControl::Unknown => vec![],
-        }
     }
 
     // -- Dashboard-side: filesystem watching, transcript reading, naming --
@@ -769,7 +739,8 @@ impl AgentControl {
     pub fn read_session_index(self, cache: &mut SessionIndexCache) -> SessionIndex {
         match self {
             AgentControl::Claude => claude::read_session_index(cache),
-            AgentControl::Codex => codex::read_session_index(cache),
+            // Codex titles come from the host's SQLite overlay, not a per-pid index.
+            AgentControl::Codex => SessionIndex::default(),
             // No per-pid manifest to scan: a Reasonix session's id arrives on
             // every hook payload, which is what this index is a fallback for.
             AgentControl::Reasonix => SessionIndex::default(),
@@ -1195,7 +1166,8 @@ impl AgentControl {
     pub fn agent_activity(self, agent_pid: u32) -> Option<AgentActivity> {
         match self {
             AgentControl::Claude => claude::session_activity(agent_pid),
-            AgentControl::Codex => codex::session_activity(agent_pid),
+            // Codex uses hook and turn events rather than a session-status file.
+            AgentControl::Codex => None,
             // No status file, so no second opinion on the working/idle axis —
             // Reasonix's transitions ride hooks alone, interrupts included.
             AgentControl::Reasonix => None,
@@ -1524,9 +1496,8 @@ pub struct AgentCapabilities {
 /// Every generated hook config renders an event as the last word of a `miao hook
 /// …` command or as a bare JSON/JS string, so the name always *opens* on a space
 /// or a quote. What may follow it is open-ended: a closing quote, the end of the
-/// input (where an [`AgentControl::extra_hook_registrations`] command stops), or
-/// more shell — Antigravity's commands continue `>/dev/null; echo …` because that
-/// agent requires JSON on a hook's stdout. So the trailing side admits anything
+/// input, or more shell — Antigravity's commands continue `>/dev/null; echo …`
+/// because that agent requires JSON on a hook's stdout. The trailing side admits anything
 /// that could not be part of the name itself.
 ///
 /// The boundary check is load-bearing, not decoration: `stop` is a prefix of

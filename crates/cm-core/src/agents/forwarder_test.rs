@@ -66,6 +66,7 @@ const context = vm.createContext({
   clearTimeout(id) { timers.delete(id); },
 });
 const spawn = (_exe, args) => {
+  assert.deepEqual(Array.from(args.slice(0, 3)), ['hook', '--agent', scenario.split('_')[0]]);
   if (++spawnAttempts === 1 && scenario === 'opencode_spawn_throw') {
     throw new Error('spawn threw');
   }
@@ -134,6 +135,40 @@ if (scenario.startsWith('opencode_')) {
   assert.equal(timers.size, 0, 'completed sends must clear their deadlines');
   if (scenario === 'opencode_direct') {
     assert.equal(delivered[1].body.payload[0].tool, 'original');
+  }
+} else if (scenario.endsWith('_extension')) {
+  const handlers = new Map();
+  const pi = {
+    on(name, fn) { handlers.set(name, fn); },
+    getSessionName: () => 'Current title',
+  };
+  module.namespace.default(pi);
+  const ctx = {
+    sessionManager: { getSessionId: () => 'root' },
+    cwd: '/project',
+    getContextUsage: () => ({ tokens: 1234.6 }),
+    model: { id: 'test-model' },
+  };
+  const events = [
+    { type: 'before_agent_start', prompt: 'Do the work' },
+    { type: 'tool_execution_end', toolName: 'bash', isError: true },
+    ...(scenario.startsWith('omp_') ? [
+      { type: 'agent_end', willContinue: true },
+      { type: 'agent_end', willContinue: false },
+    ] : [
+      { type: 'session_compact_failed', willRetry: true },
+      { type: 'session_compact_failed', aborted: true, willRetry: false },
+    ]),
+  ];
+  for (const event of events) {
+    assert.ok(handlers.has(event.type), `missing handler: ${event.type}`);
+    const sent = handlers.get(event.type)(event, ctx);
+    let settled = false;
+    sent.then(value => { assert.equal(value, undefined); settled = true; });
+    await tick();
+    assert.equal(settled, false, 'delivery must await its hook child');
+    complete(pending.at(-1));
+    await sent;
   }
 } else if (scenario === 'pi_compaction') {
   const handlers = new Map();
