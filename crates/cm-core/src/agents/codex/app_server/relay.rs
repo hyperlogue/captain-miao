@@ -5,8 +5,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 
 pub(crate) struct Relay {
@@ -32,6 +33,9 @@ impl Relay {
         let (ack_tx, pause_ack) = watch::channel(InputState::Running);
         let task = tokio::spawn(async move {
             let mut gate = InputGate::default();
+            // Extra clients (the in-session resume picker) outlive one session
+            // connection. Aborting this task drops the set and stops them too.
+            let mut extras = JoinSet::new();
             loop {
                 gate.acknowledge(*pause_rx.borrow(), &ack_tx);
                 let accepted = tokio::select! {
@@ -46,11 +50,13 @@ impl Relay {
                 let Ok(stream) = accepted else {
                     break;
                 };
+                while extras.try_join_next().is_some() {}
                 let result = async {
                     let mut client = tokio::time::timeout(transport::DEADLINE,
                         tokio_tungstenite::accept_async_with_config(stream, Some(transport::limits())))
                         .await??;
                     let mut server = transport::connect(&upstream).await?;
+                    let mut accept_extras = true;
                     loop {
                         tokio::select! {
                             biased;
@@ -58,6 +64,9 @@ impl Relay {
                                 if changed.is_err() { break; }
                                 gate.acknowledge(*pause_rx.borrow_and_update(), &ack_tx);
                             }
+                            // EOF before a new accept, so a reconnect stays the
+                            // observed session. Accept before server frames, so a
+                            // busy turn cannot starve the picker handshake.
                             frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
                                 let frame = frame?;
@@ -72,6 +81,26 @@ impl Relay {
                                 let closed = frame.is_close();
                                 server.send(frame).await?;
                                 if closed { break; }
+                            }
+                            accepted = listener.accept(), if accept_extras => {
+                                match accepted {
+                                    Ok(stream) => {
+                                        let upstream = upstream.clone();
+                                        let mut pause_rx = pause_rx.clone();
+                                        extras.spawn(async move {
+                                            if forward_unobserved(stream, &upstream, &mut pause_rx).await.is_err() {
+                                                tracing::debug!("Codex relay connection ended");
+                                            }
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // The message can name the socket path.
+                                        accept_extras = false;
+                                        tracing::debug!(
+                                            "Codex relay stopped accepting extra connections"
+                                        );
+                                    }
+                                }
                             }
                             frame = server.next() => {
                                 let Some(frame) = frame else { break };
@@ -189,6 +218,47 @@ impl std::fmt::Display for UnsettledThreads {
     }
 }
 impl std::error::Error for UnsettledThreads {}
+
+/// Codex's `/resume` picker opens a second websocket to the same `--remote`
+/// socket while the session TUI stays connected. Give it its own upstream
+/// connection and fence it during cleanup, but do not observe it: it repeats
+/// the session connection's request ids, and its close is not a disconnect.
+async fn forward_unobserved(
+    stream: UnixStream,
+    upstream: &std::path::Path,
+    pause_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut client = tokio::time::timeout(
+        transport::DEADLINE,
+        tokio_tungstenite::accept_async_with_config(stream, Some(transport::limits())),
+    )
+    .await??;
+    let mut server = transport::connect(upstream).await?;
+    loop {
+        tokio::select! {
+            biased;
+            changed = pause_rx.changed() => {
+                if changed.is_err() { break; }
+                pause_rx.borrow_and_update();
+            }
+            frame = client.next(), if !*pause_rx.borrow() => {
+                let Some(frame) = frame else { break };
+                let frame = frame?;
+                let closed = frame.is_close();
+                server.send(frame).await?;
+                if closed { break; }
+            }
+            frame = server.next() => {
+                let Some(frame) = frame else { break };
+                let frame = frame?;
+                let closed = frame.is_close();
+                client.send(frame).await?;
+                if closed { break; }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Only request identities cross this gate; prompts/configuration stay on the
 /// original stream. A successful lifecycle reply reestablishes which thread

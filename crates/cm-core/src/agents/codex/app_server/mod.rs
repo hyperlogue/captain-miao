@@ -1,7 +1,9 @@
 //! App-server adapter. A per-launcher relay observes the real Codex TUI's RPC
 //! stream, preserving its full input, approval, configuration and reconnect
-//! behavior. Only the launcher reduces observations into its own state file.
-//! No hook profile, rollout reader or SQLite connection belongs to this mode.
+//! behavior. Additional clients on that socket — Codex's in-session resume
+//! picker — are proxied and fenced, but not observed. Only the launcher reduces
+//! observations into its own state file. No hook profile, rollout reader or
+//! SQLite connection belongs to this mode.
 mod control;
 mod kill;
 mod lifecycle;

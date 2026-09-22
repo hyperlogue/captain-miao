@@ -787,6 +787,171 @@ async fn relay_preserves_bidirectional_protocol_and_accepts_reconnection() {
 }
 
 #[tokio::test]
+async fn relay_proxies_resume_picker_without_retargeting_or_disconnecting() {
+    let scratch = Scratch::new();
+    let upstream = scratch.0.join("server.sock");
+    let proxy = scratch.0.join("relay.sock");
+    let listener = UnixListener::bind(&upstream).unwrap();
+    let config = CodexConfig {
+        mode: super::super::CodexMode::AppServer,
+        endpoint: format!("unix://{}", upstream.display()),
+    };
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let seen_tx = seen_tx.clone();
+            tokio::spawn(async move {
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(frame)) = socket.next().await {
+                    let Message::Text(text) = &frame else {
+                        if frame.is_close() {
+                            break;
+                        }
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(text) else {
+                        continue;
+                    };
+                    if value.get("id").is_none() {
+                        continue;
+                    }
+                    let _ = seen_tx.send(value.clone());
+                    let method = value["method"].as_str().unwrap_or("");
+                    let result = if matches!(
+                        method,
+                        "thread/resume" | "thread/read" | "thread/fork" | "thread/start"
+                    ) {
+                        let id = value["params"]["threadId"].as_str().unwrap_or("created");
+                        json!({"thread":{"id":id,"status":{"type":"idle"},"cwd":"/work"}})
+                    } else {
+                        json!({})
+                    };
+                    if socket
+                        .send(Message::Text(
+                            json!({"id":value["id"],"result":result}).to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut relay = Relay::start(&config, &proxy).await.unwrap();
+    let initialize = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initialize["method"], "initialize");
+
+    let mut session = transport::connect(&proxy).await.unwrap();
+    send(
+        &mut session,
+        &json!({"id":1,"method":"thread/resume","params":{"threadId":"thread-root"}}),
+    )
+    .await;
+    assert_eq!(
+        receive(&mut session).await["result"]["thread"]["id"],
+        "thread-root"
+    );
+    let (mut monitor, mut state) = (Monitor::default(), state());
+    while let Ok(observation) = relay.events.try_recv() {
+        assert!(
+            !matches!(observation, Observation::Disconnected),
+            "attaching the session must not disconnect it"
+        );
+        monitor.apply(&mut state, observation);
+    }
+    assert_eq!(state.session_id.as_deref(), Some("thread-root"));
+    assert_eq!(state.codex_connected, Some(true));
+
+    // Codex's `/resume` picker dials `--remote` again while this TUI stays up.
+    let mut picker = tokio::time::timeout(Duration::from_secs(2), transport::connect(&proxy))
+        .await
+        .expect("resume picker connects while the session is attached")
+        .expect("resume picker handshake");
+    send(
+        &mut picker,
+        &json!({"id":1,"method":"thread/resume","params":{"threadId":"thread-other"}}),
+    )
+    .await;
+    assert_eq!(
+        receive(&mut picker).await["result"]["thread"]["id"],
+        "thread-other"
+    );
+    while let Ok(observation) = relay.events.try_recv() {
+        assert!(
+            !matches!(observation, Observation::Disconnected),
+            "picker traffic must not disconnect the session"
+        );
+        monitor.apply(&mut state, observation);
+    }
+    assert_eq!(
+        state.session_id.as_deref(),
+        Some("thread-root"),
+        "picker traffic must not retarget the row"
+    );
+    assert_eq!(state.codex_connected, Some(true));
+    for thread in ["thread-root", "thread-other"] {
+        let seen = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen["method"], "thread/resume");
+        assert_eq!(seen["params"]["threadId"], thread);
+    }
+
+    relay.pause_input(true).await.unwrap();
+    send(
+        &mut picker,
+        &json!({"id":2,"method":"thread/list","params":{}}),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+            .await
+            .is_err(),
+        "cleanup must fence the picker connection too"
+    );
+    relay.pause_input(false).await.unwrap();
+    let listed = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(listed["method"], "thread/list");
+    assert_eq!(receive(&mut picker).await["id"], 2);
+
+    drop(picker);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), relay.events.recv())
+            .await
+            .is_err(),
+        "closing the picker must not disconnect the session"
+    );
+    assert_eq!(state.codex_connected, Some(true));
+
+    drop(session);
+    let disconnected = tokio::time::timeout(Duration::from_secs(2), relay.events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(disconnected, Observation::Disconnected));
+    monitor.apply(&mut state, disconnected);
+    assert_eq!(state.codex_connected, Some(false));
+    assert_eq!(state.session_id.as_deref(), Some("thread-root"));
+
+    drop(relay);
+    server.abort();
+}
+
+#[tokio::test]
 async fn stopping_pauses_the_goal_and_cleans_shells_even_if_the_turn_just_finished() {
     let scratch = Scratch::new();
     let path = scratch.0.join("stop.sock");

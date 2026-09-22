@@ -58,6 +58,13 @@ The relay observes metadata and lifecycle events; it never answers an approval
 or retries a user submission. Separate inventory/control connections do not
 subscribe to threads.
 
+Codex's in-session resume picker (`/resume`) opens a second connection to that
+same `--remote` endpoint while the session TUI stays attached. The relay
+proxies the extra connection on its own upstream socket. Only the session
+connection is observed, so picker traffic cannot retarget the row and closing
+the picker does not disconnect the session. Cleanup still fences new requests
+on every connection.
+
 The launcher remains the sole writer of its session state. The dashboard and
 remote session subscription consume that state as before. App-server sessions
 never enter the native title overlay. Thread identity uses `thread.id`, not the
