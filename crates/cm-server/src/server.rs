@@ -969,6 +969,24 @@ async fn handle_conn(
                             .and_then(|()| cm_core::config::read_codex());
                         write_frame(&mut wr, &codex_config_reply(req_id, result)).await?;
                     }
+                    ClientFrame::GetVcsStatus { req_id, cwd } => {
+                        let tx = replies_tx.clone();
+                        tokio::spawn(async move {
+                            let snapshot = tokio::task::spawn_blocking(move || cm_core::vcs::status(&cwd))
+                                .await
+                                .unwrap_or_else(|_| cm_core::vcs::VcsSnapshot {
+                                    outcome: cm_core::vcs::VcsOutcome::Error,
+                                    ..Default::default()
+                                });
+                            let _ = tx.send(ServerFrame::VcsStatus { req_id, snapshot });
+                        });
+                    }
+                    ClientFrame::VcsPush { req_id, cwd } => {
+                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, cm_core::vcs::push);
+                    }
+                    ClientFrame::VcsPull { req_id, cwd } => {
+                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, cm_core::vcs::pull);
+                    }
                     // A newer client's frame we don't know. Ignoring it keeps
                     // the connection alive (protocol §3 forward tolerance); a
                     // request-shaped one simply never gets its reply, which the
@@ -1092,6 +1110,27 @@ fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::R
 /// Best-effort human label for this host, surfaced in the handshake. The
 /// dashboard sets its own display label per the hosts list, so this is only a
 /// diagnostic hint.
+fn spawn_vcs_command(
+    tx: tokio::sync::mpsc::UnboundedSender<ServerFrame>,
+    req_id: u64,
+    cwd: String,
+    run: fn(&str) -> Result<String, String>,
+) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || run(&cwd)).await;
+        let (ok, message) = match result {
+            Ok(Ok(message)) => (true, message),
+            Ok(Err(message)) => (false, message),
+            Err(_) => (false, "git failed".to_string()),
+        };
+        let _ = tx.send(ServerFrame::VcsCommandDone {
+            req_id,
+            ok,
+            message,
+        });
+    });
+}
+
 fn host_label() -> String {
     std::env::var("HOSTNAME")
         .ok()

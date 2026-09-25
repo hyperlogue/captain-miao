@@ -7275,6 +7275,38 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 #[test]
+fn space_v_s_opens_the_version_control_panel() {
+    let mut d = TestDashboard::new(120, 24);
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('v'));
+    d.press(KeyCode::Char('s'));
+    assert!(d.app.vcs_panel);
+    let snap = cm_core::vcs::VcsSnapshot {
+        outcome: cm_core::vcs::VcsOutcome::Ready,
+        system: Some("git".into()),
+        head: Some("main".into()),
+        upstream: Some("origin/main".into()),
+        ahead: 2,
+        ..Default::default()
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(snap),
+            ..Default::default()
+        },
+    );
+    d.press(KeyCode::Char('p'));
+    let confirm = d.app.pending_confirm.expect("push asks first");
+    assert!(confirm.prompt.contains("origin/main"), "{}", confirm.prompt);
+    assert!(matches!(confirm.action, Action::VcsRun { push: true, .. }));
+}
+
+#[test]
 fn space_t_v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);

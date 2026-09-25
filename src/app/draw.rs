@@ -111,6 +111,9 @@ impl App {
         if self.input_mode == InputMode::HostEdit {
             self.draw_host_edit(frame, frame.area());
         }
+        if self.vcs_panel && self.input_mode == InputMode::Normal {
+            self.draw_vcs_panel(frame, frame.area());
+        }
         if self.input_mode == InputMode::Messages {
             self.draw_message_log(frame, frame.area());
         }
@@ -311,6 +314,93 @@ impl App {
     // =============================================================================
     // Overlays: directory marks, hosts, confirm
     // =============================================================================
+
+    fn vcs_detail_line(&self, host: &crate::state::HostId, cwd: &str) -> Line<'static> {
+        let ui = &config::get().colors.ui;
+        let view = self
+            .vcs
+            .get(&(host.clone(), cwd.to_string()))
+            .map(|slot| &slot.view);
+        let (text, style) = match view {
+            Some(super::VcsView::Snapshot(snap))
+                if snap.outcome == cm_core::vcs::VcsOutcome::Ready =>
+            {
+                (vcs_ready_text(snap), vcs_ready_style(snap, ui))
+            }
+            Some(super::VcsView::Snapshot(snap)) => {
+                (vcs_outcome_label(snap), Style::default().fg(ui.error_fg))
+            }
+            Some(super::VcsView::Unavailable) => (
+                "n/a".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            _ => (
+                "…".to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        };
+        Line::from(vec![
+            Span::styled(
+                format!("{:<9}", "Head"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(text, style),
+        ])
+    }
+
+    fn draw_vcs_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(session) = self.selected_session_ref() else {
+            return;
+        };
+        let popup = centered_rect(56, 40, area);
+        clear_overlay(frame, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Version control ", Style::default().bold()));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let view = self
+            .vcs
+            .get(&(session.host.clone(), session.cwd.clone()))
+            .map(|slot| &slot.view);
+        let lines = match view {
+            Some(super::VcsView::Snapshot(snap))
+                if snap.outcome == cm_core::vcs::VcsOutcome::Ready =>
+            {
+                let mut lines = vec![
+                    vcs_row("Branch", snap.head.as_deref().unwrap_or("detached")),
+                    vcs_row("Upstream", snap.upstream.as_deref().unwrap_or("none")),
+                    vcs_row("Ahead", &snap.ahead.to_string()),
+                    vcs_row("Behind", &snap.behind.to_string()),
+                ];
+                if let Some(operation) = &snap.operation {
+                    lines.push(vcs_row("Operation", operation));
+                }
+                if let Some(workspace) = &snap.workspace {
+                    lines.push(vcs_row("Worktree", workspace));
+                }
+                lines.push(vcs_row(
+                    "Tree",
+                    if snap.conflicts {
+                        "conflicts"
+                    } else if snap.dirty {
+                        "dirty"
+                    } else {
+                        "clean"
+                    },
+                ));
+                lines
+            }
+            Some(super::VcsView::Snapshot(snap)) => vec![Line::from(vcs_outcome_label(snap))],
+            Some(super::VcsView::Unavailable) => {
+                vec![Line::from(
+                    "n/a — this host's server does not report version control",
+                )]
+            }
+            _ => vec![Line::from("…")],
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 
     fn draw_confirm(&self, frame: &mut ratatui::Frame, area: Rect) {
         let Some(pending) = self.pending_confirm.as_ref() else {
@@ -759,6 +849,7 @@ impl App {
             Line::from(vec![label("Dir"), Span::raw(cwd)]),
         ]);
         lines.extend(worktree);
+        lines.push(self.vcs_detail_line(&s.host, &s.cwd));
 
         if let Some(err) = &s.last_error
             && !matches!(&s.cleanup, Some(crate::state::CleanupStatus::Failed { message }) if message == err)
@@ -1360,6 +1451,11 @@ impl App {
             cmd(Command::ShellTab),
             cmd(Command::JumpAttention),
             Line::from(""),
+            section("Version control (Space v)"),
+            cmd(Command::VcsPanel),
+            cmd(Command::VcsPush),
+            cmd(Command::VcsPull),
+            Line::from(""),
             section("Toggles (Space t)"),
             cmd(Command::TogglePreview),
             cmd(Command::ToggleDetail),
@@ -1491,6 +1587,14 @@ impl App {
         // and every label the other (dim, so it recedes). A pending prefix
         // (Space / g) or the search `/` marker gets a distinct yellow badge pill.
         let spans = match &self.input_mode {
+            InputMode::Normal if self.vcs_panel => {
+                let mut spans = Vec::new();
+                spans.extend(hint_pair("p", "push"));
+                spans.extend(hint_pair("l", "pull"));
+                spans.extend(hint_pair("r", "refresh"));
+                spans.extend(hint_pair("Esc", "close"));
+                spans
+            }
             InputMode::Normal if !self.pending_prefix.is_empty() => {
                 // which-key: a prefix (e.g. Space, or Space v) is pending — show
                 // what the next key can do, straight from the live keymap. The
@@ -1949,4 +2053,72 @@ pub(super) fn host_tally_spans(
         }
     }
     spans
+}
+
+fn vcs_row(name: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{name:<10}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::raw(value.to_string()),
+    ])
+}
+
+fn vcs_ready_text(snap: &cm_core::vcs::VcsSnapshot) -> String {
+    let mut text = if snap.detached {
+        "detached".to_string()
+    } else {
+        snap.head.clone().unwrap_or_else(|| "—".to_string())
+    };
+    if let Some(upstream) = &snap.upstream {
+        text.push('…');
+        text.push_str(upstream);
+    }
+    if snap.ahead > 0 && snap.behind > 0 {
+        text.push_str(&format!("  ahead {}, behind {}", snap.ahead, snap.behind));
+    } else if snap.ahead > 0 {
+        text.push_str(&format!("  ahead {}", snap.ahead));
+    } else if snap.behind > 0 {
+        text.push_str(&format!("  behind {}", snap.behind));
+    }
+    if snap.conflicts {
+        text.push_str("  conflicts");
+    } else if snap.dirty {
+        text.push_str("  dirty");
+    }
+    if let Some(operation) = &snap.operation {
+        text.push_str("  ");
+        text.push_str(operation);
+    }
+    text
+}
+
+fn vcs_ready_style(snap: &cm_core::vcs::VcsSnapshot, ui: &crate::config::UiColors) -> Style {
+    if snap.conflicts || snap.operation.is_some() {
+        Style::default().fg(ui.error_fg)
+    } else if snap.dirty || snap.detached {
+        Style::default().fg(ui.attention_fg)
+    } else if snap.ahead > 0 || snap.behind > 0 {
+        Style::default().fg(ui.header_fg)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+fn vcs_outcome_label(snap: &cm_core::vcs::VcsSnapshot) -> String {
+    use cm_core::vcs::VcsOutcome;
+    match snap.outcome {
+        VcsOutcome::Unsupported => format!(
+            "{} is not supported",
+            snap.system.as_deref().unwrap_or("this system")
+        ),
+        VcsOutcome::NotACheckout => "not a version-control checkout".to_string(),
+        VcsOutcome::Missing => "directory is gone".to_string(),
+        VcsOutcome::Denied => "permission denied".to_string(),
+        VcsOutcome::TimedOut => "timed out".to_string(),
+        VcsOutcome::NoTool => "git is not on PATH".to_string(),
+        VcsOutcome::Error => "git failed".to_string(),
+        VcsOutcome::Ready => "ready".to_string(),
+    }
 }

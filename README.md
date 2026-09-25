@@ -314,7 +314,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
-Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, pin, needs-input, and keep-awake.
+Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, pin, needs-input, and keep-awake. `Space v` opens version control: `s` the panel, `p` push, `l` pull (fast-forward only).
 
 The **Detail** panel shows the full session ID and its copy shortcut. Troubled
 sessions show connection or cleanup information with available recovery keys;

@@ -105,6 +105,13 @@ pub enum ClientFrame {
         req_id: u64,
         config: crate::agents::codex::CodexConfig,
     },
+    /// Version-control status of `cwd`. Reply: `VcsStatus`. Pulled, not pushed:
+    /// the dashboard asks while it is showing the answer.
+    GetVcsStatus { req_id: u64, cwd: String },
+    /// Publish the current branch or bookmark. No force. Reply: `VcsCommandDone`.
+    VcsPush { req_id: u64, cwd: String },
+    /// Take remote changes without creating a local commit. Reply: `VcsCommandDone`.
+    VcsPull { req_id: u64, cwd: String },
     /// A frame this build doesn't know — a *newer* peer's addition. Decoded
     /// rather than erroring, so the connection survives; the handler ignores it.
     #[serde(other)]
@@ -188,6 +195,17 @@ pub enum ServerFrame {
     PathCompletions { req_id: u64, matches: Vec<String> },
     /// Reply to `CheckDir`.
     DirChecked { req_id: u64, exists: bool },
+    /// Reply to `GetVcsStatus`.
+    VcsStatus {
+        req_id: u64,
+        snapshot: crate::vcs::VcsSnapshot,
+    },
+    /// Reply to `VcsPush` and `VcsPull`. `req_id` says which command finished.
+    VcsCommandDone {
+        req_id: u64,
+        ok: bool,
+        message: String,
+    },
     /// A frame this build doesn't know — see [`ClientFrame::Unknown`].
     #[serde(other)]
     Unknown,
@@ -208,7 +226,9 @@ impl ServerFrame {
             | ServerFrame::RecentDirForgotten { req_id, .. }
             | ServerFrame::PathCompletions { req_id, .. }
             | ServerFrame::DirChecked { req_id, .. }
-            | ServerFrame::Vitals { req_id, .. } => Some(*req_id),
+            | ServerFrame::Vitals { req_id, .. }
+            | ServerFrame::VcsStatus { req_id, .. }
+            | ServerFrame::VcsCommandDone { req_id, .. } => Some(*req_id),
             ServerFrame::CodexConfig { req_id, .. } => Some(*req_id),
             ServerFrame::Welcome { .. }
             | ServerFrame::Snapshot { .. }

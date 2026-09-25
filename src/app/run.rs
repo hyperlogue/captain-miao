@@ -119,7 +119,23 @@ struct LoopInboxes {
     /// belongs to, so two kills in flight can't be confused for one another.
     kill_rx: tokio::sync::mpsc::UnboundedReceiver<KillResult>,
     kill_tx: tokio::sync::mpsc::UnboundedSender<KillResult>,
+    vcs_rx: tokio::sync::mpsc::UnboundedReceiver<VcsMsg>,
+    vcs_tx: tokio::sync::mpsc::UnboundedSender<VcsMsg>,
     restarts: super::restart::Restarts,
+}
+
+enum VcsMsg {
+    Status {
+        host: HostId,
+        cwd: String,
+        snapshot: Option<cm_core::vcs::VcsSnapshot>,
+    },
+    Command {
+        host: HostId,
+        cwd: String,
+        ok: bool,
+        message: String,
+    },
 }
 
 impl LoopInboxes {
@@ -127,6 +143,7 @@ impl LoopInboxes {
         let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
         let (upgrade_tx, upgrade_rx) = tokio::sync::mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (vcs_tx, vcs_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             resume_rx,
             resume_tx,
@@ -135,6 +152,8 @@ impl LoopInboxes {
             upgrade_tx,
             kill_rx,
             kill_tx,
+            vcs_rx,
+            vcs_tx,
             restarts: Default::default(),
         }
     }
@@ -145,6 +164,192 @@ impl LoopInboxes {
 /// throttle is unit-tested without a wall clock.
 fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
+}
+
+const VCS_PANEL_POLL: Duration = Duration::from_secs(2);
+const VCS_DETAIL_POLL: Duration = Duration::from_secs(15);
+const VCS_RPC_TIMEOUT: Duration = Duration::from_secs(40);
+const VCS_COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
+
+enum RemoteReach {
+    Local,
+    Down,
+    Up(std::sync::Arc<crate::backend::RemoteBackend>),
+}
+
+fn remote_reach(app: &App, host: &HostId) -> RemoteReach {
+    match app.backend_for(host) {
+        Some(Backend::Local(_)) | None => RemoteReach::Local,
+        Some(backend) if !backend.conn_state().is_connected() => RemoteReach::Down,
+        Some(Backend::Remote(backend)) => RemoteReach::Up(std::sync::Arc::clone(backend)),
+    }
+}
+
+/// Ask for the selected checkout's status while the detail line or the panel
+/// can show it. Returns immediately; the answer arrives on `tx`.
+fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
+    if !app.detail_visible && !app.vcs_panel {
+        return;
+    }
+    let Some(session) = app.selected_session() else {
+        return;
+    };
+    let host = session.host.clone();
+    let cwd = session.cwd.clone();
+    let interval = if app.vcs_panel {
+        VCS_PANEL_POLL
+    } else {
+        VCS_DETAIL_POLL
+    };
+    {
+        let slot = app.vcs.entry((host.clone(), cwd.clone())).or_default();
+        if slot.inflight {
+            return;
+        }
+        if slot.asked.is_some_and(|asked| asked.elapsed() < interval) {
+            return;
+        }
+        slot.asked = Some(Instant::now());
+        slot.inflight = true;
+    }
+    let remote = match remote_reach(app, &host) {
+        RemoteReach::Up(backend) => Some(backend),
+        RemoteReach::Down => {
+            if let Some(slot) = app.vcs.get_mut(&(host, cwd)) {
+                slot.view = super::VcsView::Unavailable;
+                slot.inflight = false;
+            }
+            return;
+        }
+        RemoteReach::Local => None,
+    };
+    let report_cwd = cwd.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let snapshot = if let Some(remote) = remote {
+            match remote
+                .request_within(VCS_RPC_TIMEOUT, |req_id| {
+                    cm_core::protocol::ClientFrame::GetVcsStatus { req_id, cwd }
+                })
+                .await
+            {
+                Some(cm_core::protocol::ServerFrame::VcsStatus { snapshot, .. }) => Some(snapshot),
+                _ => None,
+            }
+        } else {
+            Some(
+                tokio::task::spawn_blocking(move || cm_core::vcs::status(&cwd))
+                    .await
+                    .unwrap_or_default(),
+            )
+        };
+        let _ = tx.send(VcsMsg::Status {
+            host,
+            cwd: report_cwd,
+            snapshot,
+        });
+    });
+}
+
+fn apply_vcs(app: &mut App, msg: VcsMsg) {
+    match msg {
+        VcsMsg::Status {
+            host,
+            cwd,
+            snapshot,
+        } => {
+            let slot = app.vcs.entry((host, cwd)).or_default();
+            slot.inflight = false;
+            slot.view = match snapshot {
+                Some(snapshot) => super::VcsView::Snapshot(snapshot),
+                None => super::VcsView::Unavailable,
+            };
+        }
+        VcsMsg::Command {
+            host,
+            cwd,
+            ok,
+            message,
+        } => {
+            if let Some(slot) = app.vcs.get_mut(&(host, cwd)) {
+                slot.asked = None;
+                slot.inflight = false;
+            }
+            app.set_status(message, !ok);
+        }
+    }
+}
+
+fn start_vcs_command(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
+    host: HostId,
+    cwd: String,
+    push: bool,
+) {
+    let remote = match remote_reach(app, &host) {
+        RemoteReach::Up(backend) => Some(backend),
+        RemoteReach::Down => {
+            app.set_status("disconnected".to_string(), true);
+            return;
+        }
+        RemoteReach::Local => None,
+    };
+    app.set_status(
+        if push {
+            "pushing…".to_string()
+        } else {
+            "pulling…".to_string()
+        },
+        false,
+    );
+    let report_cwd = cwd.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let (ok, message) = if let Some(remote) = remote {
+            let reply = remote
+                .request_within(VCS_COMMAND_TIMEOUT, |req_id| {
+                    if push {
+                        cm_core::protocol::ClientFrame::VcsPush {
+                            req_id,
+                            cwd: cwd.clone(),
+                        }
+                    } else {
+                        cm_core::protocol::ClientFrame::VcsPull {
+                            req_id,
+                            cwd: cwd.clone(),
+                        }
+                    }
+                })
+                .await;
+            match reply {
+                Some(cm_core::protocol::ServerFrame::VcsCommandDone { ok, message, .. }) => {
+                    (ok, message)
+                }
+                _ => (false, "no answer from the host".to_string()),
+            }
+        } else {
+            match tokio::task::spawn_blocking(move || {
+                if push {
+                    cm_core::vcs::push(&cwd)
+                } else {
+                    cm_core::vcs::pull(&cwd)
+                }
+            })
+            .await
+            {
+                Ok(Ok(message)) => (true, message),
+                Ok(Err(message)) => (false, message),
+                Err(_) => (false, "git failed".to_string()),
+            }
+        };
+        let _ = tx.send(VcsMsg::Command {
+            host,
+            cwd: report_cwd,
+            ok,
+            message,
+        });
+    });
 }
 
 /// Arm the detach prune for the *next* loop iteration, given evidence that a
@@ -1854,6 +2059,11 @@ async fn drain_background_results(
     // reload path. Taken unconditionally (hence not folded into the `if`
     // above) so a reply that lands as the panel closes drains here instead
     // of banking a stale repaint for whenever it next opens.
+    poll_vcs(app, &inboxes.vcs_tx);
+    while let Ok(msg) = inboxes.vcs_rx.try_recv() {
+        apply_vcs(app, msg);
+        redraw = true;
+    }
     let vitals_moved = app
         .backend_events
         .iter()
@@ -2636,6 +2846,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     // the dropped sender is what the waiting task reads as no.
                     Action::GrantConsent(reply) => {
                         let _ = reply.send(true);
+                    }
+                    Action::VcsRun { host, cwd, push } => {
+                        start_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
                     }
                     Action::CopySessionId(sid) => {
                         match copy_to_clipboard(&sid) {

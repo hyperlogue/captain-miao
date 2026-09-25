@@ -31,4 +31,5 @@ pub mod protocol;
 pub mod state;
 pub mod terminal;
 pub mod terminal_modes;
+pub mod vcs;
 pub mod vitals;

@@ -220,6 +220,12 @@ pub(super) enum Action {
     },
     /// Copy the selected session's id to the system clipboard (via OSC 52).
     CopySessionId(String),
+    /// Push or pull the selected session's checkout. Runs off the UI thread.
+    VcsRun {
+        host: HostId,
+        cwd: String,
+        push: bool,
+    },
     /// Attach a local window to an already-running remote pool session (§5):
     /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
     AttachRemoteRunning {
@@ -315,6 +321,7 @@ impl Action {
             Action::AttachAll { .. } => "AttachAll",
             Action::UpgradeHost { .. } => "UpgradeHost",
             Action::GrantConsent(_) => "GrantConsent",
+            Action::VcsRun { .. } => "VcsRun",
         }
     }
 }
@@ -800,6 +807,24 @@ impl HostTally {
     }
 }
 
+/// One checkout's version-control answer, plus whether a probe is out.
+#[derive(Debug, Default)]
+pub(super) struct VcsSlot {
+    pub(super) view: VcsView,
+    pub(super) asked: Option<Instant>,
+    pub(super) inflight: bool,
+}
+
+/// What the detail line and the version-control panel draw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) enum VcsView {
+    #[default]
+    Loading,
+    Snapshot(cm_core::vcs::VcsSnapshot),
+    /// The host did not answer. An old server, or a remote that is down.
+    Unavailable,
+}
+
 /// A pending y/N confirmation. Set when the user invokes a destructive
 /// action (e.g. restart) — the action is fired only after Enter / y / Y.
 #[derive(Debug)]
@@ -1104,6 +1129,11 @@ pub(super) struct App {
     /// User toggle for the preview panel. Manual toggle always wins — the
     /// panel renders iff this flag is true.
     pub(super) preview_visible: bool,
+    /// Version-control panel for the selected session. `Space v s`.
+    pub(super) vcs_panel: bool,
+    /// Last status per `(host, cwd)`. The UI thread only reads this; probes
+    /// land through the event loop.
+    pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,
     /// First-draw defaults have been picked based on the initial viewport
@@ -1657,6 +1687,8 @@ impl App {
             preview_height: 0,
             narrow_layout: false,
             preview_visible: true,
+            vcs_panel: false,
+            vcs: HashMap::new(),
             detail_visible: true,
             panels_initialized: false,
             drag: None,

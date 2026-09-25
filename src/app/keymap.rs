@@ -323,6 +323,12 @@ pub(super) enum Command {
     MessageLog,
     /// Open the preferences overlay.
     Preferences,
+    /// Open the version-control panel for the selected session.
+    VcsPanel,
+    /// Publish the selected session's branch.
+    VcsPush,
+    /// Fast-forward the selected session from its upstream.
+    VcsPull,
 }
 
 impl Command {
@@ -368,6 +374,9 @@ impl Command {
             Command::ManageHosts => "manage_hosts",
             Command::MessageLog => "messages",
             Command::Preferences => "preferences",
+            Command::VcsPanel => "vcs_panel",
+            Command::VcsPush => "vcs_push",
+            Command::VcsPull => "vcs_pull",
         }
     }
 
@@ -424,6 +433,9 @@ impl Command {
             Command::ManageHosts => "manage remote hosts",
             Command::MessageLog => "message log (status messages the footer showed)",
             Command::Preferences => "open preferences",
+            Command::VcsPanel => "open version control",
+            Command::VcsPush => "push the branch",
+            Command::VcsPull => "pull from the remote (fast-forward only)",
         }
     }
 
@@ -469,7 +481,17 @@ impl Command {
             Command::ManageHosts => "hosts",
             Command::MessageLog => "messages",
             Command::Preferences => "prefs",
+            Command::VcsPanel => "status",
+            Command::VcsPush => "push",
+            Command::VcsPull => "pull",
         }
+    }
+
+    fn is_vcs(self) -> bool {
+        matches!(
+            self,
+            Command::VcsPanel | Command::VcsPush | Command::VcsPull
+        )
     }
 
     fn is_toggle(self) -> bool {
@@ -521,6 +543,9 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::TogglePin,          &["space t p"]),
     (Command::ToggleFollowUp,     &["space t i"]),
     (Command::ToggleKeepAwake,    &["space t z"]),
+    (Command::VcsPanel,           &["space v s"]),
+    (Command::VcsPush,            &["space v p"]),
+    (Command::VcsPull,            &["space v l"]),
     (Command::RestartSelected,    &["space e"]),
     (Command::RestartAll,         &["space E"]),
     (Command::EditDir,            &["space i"]),
@@ -754,12 +779,19 @@ impl Keymap {
     fn menu_label(&self, so_far: &[Chord], next: Chord) -> &'static str {
         let mut prefix = so_far.to_vec();
         prefix.push(next);
-        let toggles = self
+        let commands: Vec<Command> = self
             .ordered
             .iter()
             .filter(|(seq, _)| seq.starts_with(&prefix))
-            .all(|(_, cmd)| cmd.is_toggle());
-        if toggles { "toggles" } else { "more" }
+            .map(|(_, cmd)| *cmd)
+            .collect();
+        if commands.iter().all(|cmd| cmd.is_toggle()) {
+            "toggles"
+        } else if commands.iter().all(|cmd| cmd.is_vcs()) {
+            "vcs"
+        } else {
+            "more"
+        }
     }
 
     /// The leader prefix to advertise in the steady-state footer: the chord
@@ -1060,6 +1092,9 @@ mod tests {
             ("edit_dir", "ctrl+x i"),
             ("keep_awake", "ctrl+x z"),
             ("default_agent", "ctrl+x a"),
+            ("vcs_panel", "ctrl+x s"),
+            ("vcs_push", "ctrl+x p"),
+            ("vcs_pull", "ctrl+x l"),
         ];
         let mut cfg = HashMap::new();
         for (id, key) in moved {
@@ -1141,10 +1176,7 @@ mod tests {
             Some(Command::RestartSelected)
         );
         let nested = km.continuations(&[chord("space"), chord("v")]);
-        assert_eq!(
-            nested.first(),
-            Some(&("e".to_string(), Continuation::Run(Command::RestartSelected)))
-        );
+        assert!(nested.contains(&("e".to_string(), Continuation::Run(Command::RestartSelected))));
     }
 
     #[test]
