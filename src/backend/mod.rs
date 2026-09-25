@@ -1795,7 +1795,7 @@ impl RemoteBackend {
     /// silence would park the caller until the connection ended.
     ///
     /// [`request`]: Self::request
-    async fn request_within(
+    pub(crate) async fn request_within(
         &self,
         within: Duration,
         make: impl FnOnce(u64) -> ClientFrame,
