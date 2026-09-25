@@ -295,16 +295,16 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gg` / `G`            | Jump to top / bottom                                                                                                                                                       |
 | `1..9` / `Ctrl-1..9`  | Select Nth session / select and focus its window                                                                                                                           |
-| `p` / `i`             | Pin / toggle needs-input on the selected session                                                                                                                           |
+| `Space t p` / `Space t i` | Pin / toggle needs-input on the selected session                                                                                                                           |
 | `y`                   | Copy the selected session id to the clipboard                                                                                                                              |
 | `t` / `w`             | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab                                                                                                 |
 | `h`/`l`, `←`/`→`      | Scroll the preview horizontally                                                                                                                                            |
 | `Ctrl-u` / `Ctrl-d`   | Scroll the preview up / down                                                                                                                                               |
 | `R`                   | Refresh the preview now                                                                                                                                                    |
-| `v` / `Space d`       | Toggle the preview / detail panel                                                                                                                                          |
+| `Space t v` / `Space t d` | Toggle the preview / detail panel                                                                                                                                          |
 | `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
-| `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
+| `Space t z`           | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
 | `,` (Agents) / `Space h` | Reorder agents / hosts to choose the default for new sessions                                                                                                                    |
 | `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                          |
 | `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
@@ -314,7 +314,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
-Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer.
+Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, pin, needs-input, and keep-awake.
 
 The **Detail** panel shows the full session ID and its copy shortcut. Troubled
 sessions show connection or cleanup information with available recovery keys;

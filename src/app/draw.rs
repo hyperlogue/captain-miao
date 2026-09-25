@@ -1315,9 +1315,6 @@ impl App {
                 cmd(Command::RefreshPreview),
             ]);
         }
-        // Preview toggle stays listed when capture is unavailable: the panel
-        // still opens, it just explains that this terminal cannot be read.
-        lines.push(cmd(Command::TogglePreview));
         lines.extend([
             Line::from(""),
             section("Actions"),
@@ -1363,12 +1360,14 @@ impl App {
             cmd(Command::ShellTab),
             cmd(Command::JumpAttention),
             Line::from(""),
-            section("Flags"),
+            section("Toggles (Space t)"),
+            cmd(Command::TogglePreview),
+            cmd(Command::ToggleDetail),
             cmd(Command::TogglePin),
             cmd(Command::ToggleFollowUp),
+            cmd(Command::ToggleKeepAwake),
             Line::from(""),
             section("Layout (leader: Space)"),
-            cmd(Command::ToggleDetail),
             cmd(Command::EditDir),
         ]);
         let push_if_bound = |lines: &mut Vec<Line>, c: Command| {
@@ -1376,7 +1375,6 @@ impl App {
                 lines.push(cmd(c));
             }
         };
-        push_if_bound(&mut lines, Command::ToggleKeepAwake);
         push_if_bound(&mut lines, Command::DefaultAgent);
         if self.capabilities.layout_is_a_choice() {
             push_if_bound(&mut lines, Command::SessionsLayout);
@@ -1504,14 +1502,19 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let mut spans = hint_badge(prefix);
-                for (key, command) in self.keymap.continuations(&self.pending_prefix) {
-                    // Same gate as the `?` overlay: don't advertise a layout
-                    // toggle on a backend where both layouts are the same thing.
-                    if command == Command::SessionsLayout && !self.capabilities.layout_is_a_choice()
-                    {
-                        continue;
-                    }
-                    spans.extend(hint_pair(&key, command.short_label()));
+                for (key, next) in self.keymap.continuations(&self.pending_prefix) {
+                    let label = match next {
+                        // Same gate as the `?` overlay: don't advertise a layout
+                        // toggle on a backend where both layouts are the same thing.
+                        super::keymap::Continuation::Run(Command::SessionsLayout)
+                            if !self.capabilities.layout_is_a_choice() =>
+                        {
+                            continue;
+                        }
+                        super::keymap::Continuation::Run(command) => command.short_label(),
+                        super::keymap::Continuation::Menu(label) => label,
+                    };
+                    spans.extend(hint_pair(&key, label));
                 }
                 spans
             }

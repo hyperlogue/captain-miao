@@ -471,6 +471,17 @@ impl Command {
             Command::Preferences => "prefs",
         }
     }
+
+    fn is_toggle(self) -> bool {
+        matches!(
+            self,
+            Command::TogglePin
+                | Command::ToggleFollowUp
+                | Command::TogglePreview
+                | Command::ToggleDetail
+                | Command::ToggleKeepAwake
+        )
+    }
 }
 
 // =============================================================================
@@ -501,18 +512,18 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ScrollPreviewDown,  &["ctrl+d"]),
     (Command::ScrollPreviewLeft,  &["h", "left", "<"]),
     (Command::ScrollPreviewRight, &["l", "right", ">"]),
-    (Command::TogglePin,          &["p"]),
-    (Command::ToggleFollowUp,     &["i"]),
     (Command::Search,             &["/"]),
     (Command::ClearSearch,        &["esc"]),
     (Command::Help,               &["?"]),
     (Command::Quit,               &["q"]),
-    (Command::TogglePreview,      &["v"]),
-    (Command::ToggleDetail,       &["space d"]),
+    (Command::TogglePreview,      &["space t v"]),
+    (Command::ToggleDetail,       &["space t d"]),
+    (Command::TogglePin,          &["space t p"]),
+    (Command::ToggleFollowUp,     &["space t i"]),
+    (Command::ToggleKeepAwake,    &["space t z"]),
     (Command::RestartSelected,    &["space e"]),
     (Command::RestartAll,         &["space E"]),
     (Command::EditDir,            &["space i"]),
-    (Command::ToggleKeepAwake,    &[]),
     (Command::DefaultAgent,       &[]),
     (Command::DefaultHost,        &[]),
     (Command::StealAttach,        &["space s"]),
@@ -526,6 +537,15 @@ const DEFAULTS: &[(Command, &[&str])] = &[
 // =============================================================================
 // The keymap: build it, then ask it
 // =============================================================================
+
+/// What the next key of a pending prefix will do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Continuation {
+    /// The next key runs this command.
+    Run(Command),
+    /// The next key opens another which-key page. The label is the page name.
+    Menu(&'static str),
+}
 
 /// Resolved binding table: sequence → command, plus the proper prefixes of
 /// multi-chord sequences and an ordered list for display.
@@ -699,15 +719,47 @@ impl Keymap {
         KeySeq::from_slice(chords).is_some_and(|seq| self.prefixes.contains(&seq))
     }
 
-    /// Bindings one chord longer than `so_far`, as `(next-key display, command)`
-    /// in display order. Drives the which-key footer strip shown while a prefix
-    /// (e.g. `Space`, or `Space v`) is pending.
-    pub(super) fn continuations(&self, so_far: &[Chord]) -> Vec<(String, Command)> {
-        self.ordered
+    /// Bindings one chord longer than `so_far`, in display order. A next chord
+    /// that finishes a command is [`Continuation::Run`]. A next chord that only
+    /// continues toward longer bindings is [`Continuation::Menu`], so `Space`
+    /// can offer `t` even though every toggle completes on the third chord.
+    pub(super) fn continuations(&self, so_far: &[Chord]) -> Vec<(String, Continuation)> {
+        let mut seen: Vec<(String, Continuation)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for (seq, cmd) in &self.ordered {
+            if !seq.starts_with(so_far) || seq.len() <= so_far.len() {
+                continue;
+            }
+            let Some(next) = seq.chord_at(so_far.len()) else {
+                continue;
+            };
+            let key = next.display();
+            if seq.len() == so_far.len() + 1 {
+                if let Some(slot) = index.get(&key) {
+                    seen[*slot].1 = Continuation::Run(*cmd);
+                } else {
+                    index.insert(key.clone(), seen.len());
+                    seen.push((key, Continuation::Run(*cmd)));
+                }
+            } else if !index.contains_key(&key) {
+                index.insert(key.clone(), seen.len());
+                seen.push((key, Continuation::Menu(self.menu_label(so_far, next))));
+            }
+        }
+        seen
+    }
+
+    /// Label for a which-key entry that does not finish a command. The toggle
+    /// prefix is the one menu whose commands are all toggles.
+    fn menu_label(&self, so_far: &[Chord], next: Chord) -> &'static str {
+        let mut prefix = so_far.to_vec();
+        prefix.push(next);
+        let toggles = self
+            .ordered
             .iter()
-            .filter(|(seq, _)| seq.len() == so_far.len() + 1 && seq.starts_with(so_far))
-            .filter_map(|(seq, cmd)| seq.chord_at(so_far.len()).map(|c| (c.display(), *cmd)))
-            .collect()
+            .filter(|(seq, _)| seq.starts_with(&prefix))
+            .all(|(_, cmd)| cmd.is_toggle());
+        if toggles { "toggles" } else { "more" }
     }
 
     /// The leader prefix to advertise in the steady-state footer: the chord
@@ -836,18 +888,28 @@ mod tests {
     fn continuations_lists_leader_options_in_order() {
         let km = Keymap::defaults();
         let conts = km.continuations(&[chord("space")]);
-        // Preview moved off `Space v` onto bare `v`, so the first leader
-        // option is `d` → toggle detail.
+        // Every toggle lives under `Space t`, so the leader offers one menu
+        // rather than a command on `t`.
         assert_eq!(
             conts.first(),
-            Some(&("d".to_string(), Command::ToggleDetail))
+            Some(&("t".to_string(), Continuation::Menu("toggles")))
         );
-        assert_eq!(km.lookup_single(chord("v")), Some(Command::TogglePreview));
-        // Detail moved to `Space d`; the icon editor now owns `Space i`.
-        assert!(conts.contains(&("d".to_string(), Command::ToggleDetail)));
-        assert!(conts.contains(&("i".to_string(), Command::EditDir)));
-        // Every option is a real leader command; a non-prefix yields nothing.
-        assert!(conts.iter().any(|(_, c)| *c == Command::Preferences));
+        assert!(conts.contains(&("i".to_string(), Continuation::Run(Command::EditDir))));
+        assert!(
+            conts
+                .iter()
+                .any(|(_, c)| *c == Continuation::Run(Command::Preferences))
+        );
+        let toggles = km.continuations(&[chord("space"), chord("t")]);
+        assert_eq!(
+            toggles.first(),
+            Some(&("v".to_string(), Continuation::Run(Command::TogglePreview)))
+        );
+        assert!(toggles.contains(&("d".to_string(), Continuation::Run(Command::ToggleDetail))));
+        assert!(toggles.contains(&("p".to_string(), Continuation::Run(Command::TogglePin))));
+        assert!(toggles.contains(&("i".to_string(), Continuation::Run(Command::ToggleFollowUp))));
+        assert!(toggles.contains(&("z".to_string(), Continuation::Run(Command::ToggleKeepAwake))));
+        assert_eq!(km.lookup_single(chord("v")), None);
         assert!(km.continuations(&[chord("x")]).is_empty());
     }
 
@@ -1081,7 +1143,7 @@ mod tests {
         let nested = km.continuations(&[chord("space"), chord("v")]);
         assert_eq!(
             nested.first(),
-            Some(&("e".to_string(), Command::RestartSelected))
+            Some(&("e".to_string(), Continuation::Run(Command::RestartSelected)))
         );
     }
 

@@ -114,6 +114,13 @@ impl TestDashboard {
         self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    /// `Space t <key>`: every toggle lives under that prefix.
+    fn press_toggle(&mut self, key: char) -> Option<Action> {
+        self.press(KeyCode::Char(' '));
+        self.press(KeyCode::Char('t'));
+        self.press(KeyCode::Char(key))
+    }
+
     fn press_ctrl(&mut self, code: KeyCode) -> Option<Action> {
         self.app
             .handle_key(KeyEvent::new(code, KeyModifiers::CONTROL))
@@ -3706,7 +3713,7 @@ fn marking_needs_input_keeps_cursor_on_the_session() {
     // Select the 2nd session and mark it needs-input.
     d.press(KeyCode::Char('j'));
     assert_eq!(d.app.selected_pid(), Some(2));
-    d.press(KeyCode::Char('i'));
+    d.press_toggle('i');
 
     // End state is needs-attention: pid 2 floats up to the attention tier and the
     // cursor rides up with it, so the user stays on the session they just flagged.
@@ -3731,13 +3738,13 @@ fn clearing_needs_input_advances_cursor_to_next_session() {
 
     // Flag pid 2; it floats to the top attention tier and the cursor follows.
     d.press(KeyCode::Char('j'));
-    d.press(KeyCode::Char('i'));
+    d.press_toggle('i');
     assert_eq!(d.app.selected_pid(), Some(2));
     // Order is now [2, 1, 3, 4]; pid 1 sits just below the flagged row.
 
     // Clearing needs-input (end state not attention) drops pid 2 back to idle.
     // The cursor doesn't follow it down — it lands on what was the *next* row.
-    d.press(KeyCode::Char('i'));
+    d.press_toggle('i');
     assert!(!d.app.is_follow_up(&(crate::state::HostId::local(), 2)));
     assert_eq!(d.app.selected_pid(), Some(1));
 }
@@ -3762,7 +3769,7 @@ fn clearing_needs_input_on_last_row_moves_to_previous() {
     assert_eq!(d.app.selected_pid(), Some(2));
 
     // Clear it: no session below, so the cursor falls back to the previous one.
-    d.press(KeyCode::Char('i'));
+    d.press_toggle('i');
     assert!(!d.app.is_follow_up(&(crate::state::HostId::local(), 2)));
     assert_eq!(d.app.selected_pid(), Some(1));
 }
@@ -5269,8 +5276,8 @@ fn leader_which_key_footer_shown() {
     assert!(!d.app.pending_prefix.is_empty());
     let out = d.render();
     assert!(
-        out.contains("detail"),
-        "which-key should list leader options"
+        out.contains("toggles"),
+        "which-key should list the toggle prefix"
     );
     assert!(
         out.contains("restart"),
@@ -7268,23 +7275,20 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 #[test]
-fn v_toggles_preview_visibility() {
+fn space_t_v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
-    // First render initializes panel defaults based on viewport.
     let out = d.render();
     assert!(out.contains("Terminal Preview"));
     assert!(d.app.preview_visible);
 
-    // Bare `v` toggles off. `Space v` is no longer the binding, so the leader
-    // can grow a third chord under `v`.
-    d.press(KeyCode::Char('v'));
+    d.press_toggle('v');
     assert!(d.app.pending_prefix.is_empty());
     assert!(!d.app.preview_visible);
     let out = d.render();
     assert!(!out.contains("Terminal Preview"));
 
-    d.press(KeyCode::Char('v'));
+    d.press_toggle('v');
     assert!(d.app.preview_visible);
     let out = d.render();
     assert!(out.contains("Terminal Preview"));
@@ -7298,9 +7302,7 @@ fn leader_d_toggles_detail_visibility() {
     assert!(out.contains("Detail"));
     assert!(d.app.detail_visible);
 
-    // Detail toggle lives on `Space d` (the icon editor took `Space i`).
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('d'));
+    d.press_toggle('d');
     assert!(!d.app.detail_visible);
     let out = d.render();
     assert!(!out.contains("Detail"));
@@ -7316,7 +7318,7 @@ fn manual_toggle_overrides_small_viewport() {
     assert!(!out.contains("Terminal Preview"), "auto-hidden at startup");
     assert!(!d.app.preview_visible);
 
-    d.press(KeyCode::Char('v'));
+    d.press_toggle('v');
     assert!(d.app.preview_visible);
     let out = d.render();
     assert!(
@@ -7533,8 +7535,7 @@ fn prevent_sleep_toggle_errors_when_unsupported() {
     assert!(!d.app.prevent_sleep_enabled, "default off when unsupported");
 
     // Trying to enable should surface an error and leave the flag off.
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('z'));
+    d.press_toggle('z');
     assert!(
         !d.app.prevent_sleep_enabled,
         "toggle blocked when no backend"
