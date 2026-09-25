@@ -852,7 +852,8 @@ pub(super) struct App {
     /// is pressed in Normal mode, cleared by the next keypress. The following
     /// key either completes a two-chord binding or is swallowed. See
     /// `handle_normal_key`.
-    pub(super) pending_prefix: Option<keymap::Chord>,
+    /// Chords of a multi-key binding typed so far. Empty when no prefix is pending.
+    pub(super) pending_prefix: Vec<keymap::Chord>,
     /// Configurable Normal-mode keymap, built once from `[keybinds]` config.
     pub(super) keymap: keymap::Keymap,
     /// The backend's `Capabilities`, read once at startup (it's a process-wide
@@ -1594,7 +1595,7 @@ impl App {
             search_input: self::picker::TextInput::new(),
             search_filter: None,
             pending_g: false,
-            pending_prefix: None,
+            pending_prefix: Vec::new(),
             keymap,
             capabilities: crate::terminal::get().capabilities(),
             new_session_agent: AgentControl::from_cli(&cfg.launcher.default_agent)

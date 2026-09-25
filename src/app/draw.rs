@@ -1315,6 +1315,9 @@ impl App {
                 cmd(Command::RefreshPreview),
             ]);
         }
+        // Preview toggle stays listed when capture is unavailable: the panel
+        // still opens, it just explains that this terminal cannot be read.
+        lines.push(cmd(Command::TogglePreview));
         lines.extend([
             Line::from(""),
             section("Actions"),
@@ -1365,7 +1368,6 @@ impl App {
             cmd(Command::ToggleFollowUp),
             Line::from(""),
             section("Layout (leader: Space)"),
-            cmd(Command::TogglePreview),
             cmd(Command::ToggleDetail),
             cmd(Command::EditDir),
         ]);
@@ -1491,13 +1493,18 @@ impl App {
         // and every label the other (dim, so it recedes). A pending prefix
         // (Space / g) or the search `/` marker gets a distinct yellow badge pill.
         let spans = match &self.input_mode {
-            InputMode::Normal if self.pending_prefix.is_some() => {
-                // which-key: a prefix (e.g. Space) is pending — show what the
-                // next key can do, straight from the live keymap. The prefix
-                // itself leads as a badge pill.
-                let prefix = self.pending_prefix.expect("is_some checked");
-                let mut spans = hint_badge(prefix.display());
-                for (key, command) in self.keymap.continuations(prefix) {
+            InputMode::Normal if !self.pending_prefix.is_empty() => {
+                // which-key: a prefix (e.g. Space, or Space v) is pending — show
+                // what the next key can do, straight from the live keymap. The
+                // chords typed so far lead as a badge pill.
+                let prefix = self
+                    .pending_prefix
+                    .iter()
+                    .map(|chord| chord.display())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut spans = hint_badge(prefix);
+                for (key, command) in self.keymap.continuations(&self.pending_prefix) {
                     // Same gate as the `?` overlay: don't advertise a layout
                     // toggle on a backend where both layouts are the same thing.
                     if command == Command::SessionsLayout && !self.capabilities.layout_is_a_choice()

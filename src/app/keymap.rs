@@ -11,11 +11,11 @@
 //! (always quit), the `g g` prefix (jump-to-top), and the digit selectors
 //! `1..9` / `Ctrl-1..9`.
 //!
-//! A [`KeySeq`] is one or two [`Chord`]s. Two-chord sequences (e.g. `Space e`)
-//! work via a generic prefix mechanism in `keys.rs`: the first chord of any
-//! two-chord binding is a *prefix*; once pressed, the next key either completes
-//! a binding or is swallowed (so `Space` + an unbound key never falls through
-//! to a dangerous single-key command like `x`).
+//! A [`KeySeq`] is one, two, or three [`Chord`]s. Longer sequences (e.g. `Space e`,
+//! `Space v p`) work via a generic prefix mechanism in `keys.rs`: every proper
+//! prefix of a binding waits for the next key, which either completes a binding,
+//! extends the prefix, or is swallowed (so `Space` + an unbound key never falls
+//! through to a dangerous single-key command like `x`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -166,49 +166,95 @@ fn parse_key_code(key: &str) -> Option<KeyCode> {
     })
 }
 
-/// One or two chords. Two-chord sequences are leader/prefix bindings such as
-/// `Space e`. Stored small-and-flat (no heap): a sequence is at most two chords,
-/// so lookups construct one on the stack rather than allocating a `Vec`.
+/// One, two, or three chords. Longer sequences are leader/prefix bindings such
+/// as `Space e` or `Space v p`. Stored small-and-flat (no heap): a sequence is
+/// at most three chords, so lookups construct one on the stack.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) struct KeySeq {
     first: Chord,
     second: Option<Chord>,
+    third: Option<Chord>,
 }
 
 impl KeySeq {
-    /// Parse a whitespace-separated sequence like `"g g"` or `"Space e"` or a
-    /// single `"ctrl+u"`. Rejects empty and over-long (>2 chord) sequences.
+    /// Parse a whitespace-separated sequence like `"g g"`, `"Space e"`,
+    /// `"Space v p"`, or a single `"ctrl+u"`. Rejects empty and over-long
+    /// (>3 chord) sequences.
     fn parse(s: &str) -> Option<Self> {
-        let mut tokens = s.split_whitespace();
-        let first = Chord::parse(tokens.next()?)?;
-        let second = match tokens.next() {
-            Some(tok) => Some(Chord::parse(tok)?),
-            None => None,
-        };
-        // At most two chords: a third token rejects the whole sequence.
-        if tokens.next().is_some() {
-            return None;
+        let mut chords = Vec::new();
+        for tok in s.split_whitespace() {
+            if chords.len() == 3 {
+                return None;
+            }
+            chords.push(Chord::parse(tok)?);
         }
-        Some(Self { first, second })
+        Self::from_slice(&chords)
+    }
+
+    fn from_slice(chords: &[Chord]) -> Option<Self> {
+        match *chords {
+            [first] => Some(Self {
+                first,
+                second: None,
+                third: None,
+            }),
+            [first, second] => Some(Self {
+                first,
+                second: Some(second),
+                third: None,
+            }),
+            [first, second, third] => Some(Self {
+                first,
+                second: Some(second),
+                third: Some(third),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The first `n` chords, when this sequence is at least that long.
+    fn leading(&self, n: usize) -> Option<Self> {
+        let chords: Vec<Chord> = self.iter().take(n).collect();
+        (chords.len() == n)
+            .then(|| Self::from_slice(&chords))
+            .flatten()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Chord> {
+        std::iter::once(self.first)
+            .chain(self.second)
+            .chain(self.third)
     }
 
     fn first(&self) -> Chord {
         self.first
     }
 
-    fn second(&self) -> Option<Chord> {
-        self.second
+    fn chord_at(&self, index: usize) -> Option<Chord> {
+        match index {
+            0 => Some(self.first),
+            1 => self.second,
+            2 => self.third,
+            _ => None,
+        }
+    }
+
+    fn starts_with(&self, prefix: &[Chord]) -> bool {
+        prefix
+            .iter()
+            .enumerate()
+            .all(|(i, chord)| self.chord_at(i) == Some(*chord))
     }
 
     fn len(&self) -> usize {
-        if self.second.is_some() { 2 } else { 1 }
+        self.iter().count()
     }
 
     pub(super) fn display(&self) -> String {
-        match self.second {
-            Some(second) => format!("{} {}", self.first.display(), second.display()),
-            None => self.first.display(),
-        }
+        self.iter()
+            .map(|chord| chord.display())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -461,7 +507,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ClearSearch,        &["esc"]),
     (Command::Help,               &["?"]),
     (Command::Quit,               &["q"]),
-    (Command::TogglePreview,      &["space v"]),
+    (Command::TogglePreview,      &["v"]),
     (Command::ToggleDetail,       &["space d"]),
     (Command::RestartSelected,    &["space e"]),
     (Command::RestartAll,         &["space E"]),
@@ -481,11 +527,12 @@ const DEFAULTS: &[(Command, &[&str])] = &[
 // The keymap: build it, then ask it
 // =============================================================================
 
-/// Resolved binding table: sequence → command, plus the set of prefix chords
-/// (first chords of two-chord sequences) and an ordered list for display.
+/// Resolved binding table: sequence → command, plus the proper prefixes of
+/// multi-chord sequences and an ordered list for display.
 pub(crate) struct Keymap {
     by_seq: HashMap<KeySeq, Command>,
-    prefixes: HashSet<Chord>,
+    /// Leading one- and two-chord sequences that a longer binding continues.
+    prefixes: HashSet<KeySeq>,
     /// `(seq, command)` in default display order, filtered to the entries that
     /// actually won in `by_seq` (so the help overlay never shows a stale key).
     ordered: Vec<(KeySeq, Command)>,
@@ -575,17 +622,16 @@ impl Keymap {
 
         let km = Self::build(entries);
 
-        // A surviving single-chord binding whose chord *also* begins a two-chord
-        // sequence is unreachable: `handle_normal_key` checks `is_prefix` first,
-        // so the chord always starts a pending sequence and the single-key
-        // command never fires. Warn (the prefix wins at dispatch). Walk the
-        // ordered winners so the message set is deterministic.
+        // A binding that is also a proper prefix of a longer one is unreachable:
+        // `handle_normal_key` extends the prefix instead of firing the command.
+        // Warn (the longer sequence wins at dispatch). Walk the ordered winners
+        // so the message set is deterministic.
         for (seq, cmd) in &km.ordered {
-            if seq.second().is_none() && km.prefixes.contains(&seq.first()) {
+            if seq.len() < 3 && km.prefixes.contains(seq) {
                 warnings.push(format!(
-                    "keybinds: '{}' is bound to '{}' but also begins a leader sequence; \
-                     the leader prefix wins, so '{}' is unreachable",
-                    seq.first().display(),
+                    "keybinds: '{}' is bound to '{}' but also begins a longer sequence; \
+                     the prefix wins, so '{}' is unreachable",
+                    seq.display(),
                     cmd.id(),
                     cmd.id(),
                 ));
@@ -597,14 +643,21 @@ impl Keymap {
 
     fn build(entries: Vec<(Command, Vec<KeySeq>)>) -> Self {
         let mut by_seq: HashMap<KeySeq, Command> = HashMap::new();
-        let mut prefixes: HashSet<Chord> = HashSet::new();
+        let mut prefixes: HashSet<KeySeq> = HashSet::new();
         // Insert into the lookup map first so later duplicates win (matches the
         // collision warning's "last wins").
         for (cmd, seqs) in &entries {
             for s in seqs {
                 by_seq.insert(s.clone(), *cmd);
-                if s.len() == 2 {
-                    prefixes.insert(s.first());
+                if s.len() >= 2
+                    && let Some(head) = s.leading(1)
+                {
+                    prefixes.insert(head);
+                }
+                if s.len() == 3
+                    && let Some(head) = s.leading(2)
+                {
+                    prefixes.insert(head);
                 }
             }
         }
@@ -624,56 +677,52 @@ impl Keymap {
         }
     }
 
+    /// Look up the command bound to this exact sequence.
+    pub(super) fn lookup(&self, chords: &[Chord]) -> Option<Command> {
+        let seq = KeySeq::from_slice(chords)?;
+        self.by_seq.get(&seq).copied()
+    }
+
     /// Look up a single-chord binding.
     pub(super) fn lookup_single(&self, chord: Chord) -> Option<Command> {
-        self.by_seq
-            .get(&KeySeq {
-                first: chord,
-                second: None,
-            })
-            .copied()
+        self.lookup(&[chord])
     }
 
-    /// Look up a two-chord (prefix) binding.
-    pub(super) fn lookup_pair(&self, first: Chord, second: Chord) -> Option<Command> {
-        self.by_seq
-            .get(&KeySeq {
-                first,
-                second: Some(second),
-            })
-            .copied()
-    }
-
-    /// Whether `chord` begins some two-chord binding (so the dispatcher should
-    /// wait for a second key).
+    /// Whether `chord` begins some longer binding (so the dispatcher should
+    /// wait for another key).
     pub(super) fn is_prefix(&self, chord: Chord) -> bool {
-        self.prefixes.contains(&chord)
+        self.is_prefix_seq(&[chord])
     }
 
-    /// The two-chord bindings that begin with `prefix`, as
-    /// `(second-key display, command)` in display order. Drives the which-key
-    /// footer strip shown while a prefix (e.g. `Space`) is pending.
-    pub(super) fn continuations(&self, prefix: Chord) -> Vec<(String, Command)> {
+    /// Whether `chords` is a proper prefix of some longer binding.
+    pub(super) fn is_prefix_seq(&self, chords: &[Chord]) -> bool {
+        KeySeq::from_slice(chords).is_some_and(|seq| self.prefixes.contains(&seq))
+    }
+
+    /// Bindings one chord longer than `so_far`, as `(next-key display, command)`
+    /// in display order. Drives the which-key footer strip shown while a prefix
+    /// (e.g. `Space`, or `Space v`) is pending.
+    pub(super) fn continuations(&self, so_far: &[Chord]) -> Vec<(String, Command)> {
         self.ordered
             .iter()
-            .filter(|(seq, _)| seq.len() == 2 && seq.first() == prefix)
-            .filter_map(|(seq, cmd)| seq.second().map(|c| (c.display(), *cmd)))
+            .filter(|(seq, _)| seq.len() == so_far.len() + 1 && seq.starts_with(so_far))
+            .filter_map(|(seq, cmd)| seq.chord_at(so_far.len()).map(|c| (c.display(), *cmd)))
             .collect()
     }
 
     /// The leader prefix to advertise in the steady-state footer: the chord
-    /// that begins the *most* two-chord bindings — `Space` by default, or
+    /// that begins the *most* multi-chord bindings — `Space` by default, or
     /// whatever chord a remap moved the bulk of the leader sequences onto. When
     /// leader sequences are split across several prefixes, `more…` points at the
     /// one that opens the largest menu. Ties break by display order (the
     /// earliest-listed prefix wins), so the result is deterministic. `None` when
-    /// no two-chord bindings exist. Derived from the live table, so it tracks a
+    /// no multi-chord bindings exist. Derived from the live table, so it tracks a
     /// customized leader without any special-casing.
     pub(super) fn primary_prefix(&self) -> Option<String> {
         let mut counts: HashMap<Chord, usize> = HashMap::new();
         let mut order: Vec<Chord> = Vec::new();
         for (seq, _) in &self.ordered {
-            if seq.len() == 2 {
+            if seq.len() >= 2 {
                 let first = seq.first();
                 if !counts.contains_key(&first) {
                     order.push(first);
@@ -772,11 +821,11 @@ mod tests {
         assert!(km.is_prefix(chord("space")));
         assert!(!km.is_prefix(chord("x")));
         assert_eq!(
-            km.lookup_pair(chord("space"), chord("e")),
+            km.lookup(&[chord("space"), chord("e")]),
             Some(Command::RestartSelected)
         );
         assert_eq!(
-            km.lookup_pair(chord("space"), chord("E")),
+            km.lookup(&[chord("space"), chord("E")]),
             Some(Command::RestartAll)
         );
         // The leader chord alone isn't a single binding.
@@ -786,18 +835,20 @@ mod tests {
     #[test]
     fn continuations_lists_leader_options_in_order() {
         let km = Keymap::defaults();
-        let conts = km.continuations(chord("space"));
-        // First leader option is `v` → toggle preview.
+        let conts = km.continuations(&[chord("space")]);
+        // Preview moved off `Space v` onto bare `v`, so the first leader
+        // option is `d` → toggle detail.
         assert_eq!(
             conts.first(),
-            Some(&("v".to_string(), Command::TogglePreview))
+            Some(&("d".to_string(), Command::ToggleDetail))
         );
+        assert_eq!(km.lookup_single(chord("v")), Some(Command::TogglePreview));
         // Detail moved to `Space d`; the icon editor now owns `Space i`.
         assert!(conts.contains(&("d".to_string(), Command::ToggleDetail)));
         assert!(conts.contains(&("i".to_string(), Command::EditDir)));
         // Every option is a real leader command; a non-prefix yields nothing.
         assert!(conts.iter().any(|(_, c)| *c == Command::Preferences));
-        assert!(km.continuations(chord("x")).is_empty());
+        assert!(km.continuations(&[chord("x")]).is_empty());
     }
 
     #[test]
@@ -983,7 +1034,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(km.is_prefix(chord("ctrl+x")));
         assert_eq!(
-            km.lookup_pair(chord("ctrl+x"), chord("e")),
+            km.lookup(&[chord("ctrl+x"), chord("e")]),
             Some(Command::RestartSelected)
         );
     }
@@ -1004,7 +1055,58 @@ mod tests {
         );
         assert_eq!(chord("f5"), Chord::new(KeyCode::F(5), KeyModifiers::NONE));
         assert_eq!(chord("up"), Chord::new(KeyCode::Up, KeyModifiers::NONE));
-        assert!(KeySeq::parse("a b c").is_none(), "3-chord seq rejected");
+        let three = KeySeq::parse("a b c").expect("3-chord seq");
+        assert_eq!(three.len(), 3);
+        assert_eq!(three.display(), "a b c");
+        assert!(KeySeq::parse("a b c d").is_none(), "4-chord seq rejected");
         assert!(KeySeq::parse("").is_none());
+    }
+
+    #[test]
+    fn three_chord_sequence_is_a_prefix_then_a_binding() {
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "restart".to_string(),
+            crate::config::KeyBinding::One("space v e".to_string()),
+        );
+        let (km, warnings) = Keymap::from_config(&cfg);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(km.is_prefix(chord("space")));
+        assert!(km.is_prefix_seq(&[chord("space"), chord("v")]));
+        assert!(!km.is_prefix_seq(&[chord("space"), chord("v"), chord("e")]));
+        assert_eq!(
+            km.lookup(&[chord("space"), chord("v"), chord("e")]),
+            Some(Command::RestartSelected)
+        );
+        let nested = km.continuations(&[chord("space"), chord("v")]);
+        assert_eq!(
+            nested.first(),
+            Some(&("e".to_string(), Command::RestartSelected))
+        );
+    }
+
+    #[test]
+    fn shorter_binding_hidden_by_three_chord_prefix_warns() {
+        let mut cfg = HashMap::new();
+        cfg.insert(
+            "restart".to_string(),
+            crate::config::KeyBinding::One("space v".to_string()),
+        );
+        cfg.insert(
+            "restart_all".to_string(),
+            crate::config::KeyBinding::One("space v e".to_string()),
+        );
+        let (km, warnings) = Keymap::from_config(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Space v") && w.contains("unreachable")),
+            "{warnings:?}"
+        );
+        assert!(km.is_prefix_seq(&[chord("space"), chord("v")]));
+        assert_eq!(
+            km.lookup(&[chord("space"), chord("v"), chord("e")]),
+            Some(Command::RestartAll)
+        );
     }
 }

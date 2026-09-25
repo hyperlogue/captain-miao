@@ -5266,10 +5266,10 @@ fn leader_which_key_footer_shown() {
     let mut d = TestDashboard::new(120, 10);
     // Pressing the leader surfaces the available continuations in the footer.
     d.press(KeyCode::Char(' '));
-    assert!(d.app.pending_prefix.is_some());
+    assert!(!d.app.pending_prefix.is_empty());
     let out = d.render();
     assert!(
-        out.contains("preview"),
+        out.contains("detail"),
         "which-key should list leader options"
     );
     assert!(
@@ -7268,7 +7268,7 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 #[test]
-fn leader_v_toggles_preview_visibility() {
+fn v_toggles_preview_visibility() {
     let mut d = TestDashboard::new(120, 24);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
     // First render initializes panel defaults based on viewport.
@@ -7276,17 +7276,14 @@ fn leader_v_toggles_preview_visibility() {
     assert!(out.contains("Terminal Preview"));
     assert!(d.app.preview_visible);
 
-    // Space then v toggles off.
-    d.press(KeyCode::Char(' '));
-    assert!(d.app.pending_prefix.is_some());
+    // Bare `v` toggles off. `Space v` is no longer the binding, so the leader
+    // can grow a third chord under `v`.
     d.press(KeyCode::Char('v'));
-    assert!(d.app.pending_prefix.is_none());
+    assert!(d.app.pending_prefix.is_empty());
     assert!(!d.app.preview_visible);
     let out = d.render();
     assert!(!out.contains("Terminal Preview"));
 
-    // And back on.
-    d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('v'));
     assert!(d.app.preview_visible);
     let out = d.render();
@@ -7319,7 +7316,6 @@ fn manual_toggle_overrides_small_viewport() {
     assert!(!out.contains("Terminal Preview"), "auto-hidden at startup");
     assert!(!d.app.preview_visible);
 
-    d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('v'));
     assert!(d.app.preview_visible);
     let out = d.render();
@@ -7333,12 +7329,12 @@ fn manual_toggle_overrides_small_viewport() {
 fn leader_cancels_on_unknown_key() {
     let mut d = TestDashboard::new(120, 24);
     d.press(KeyCode::Char(' '));
-    assert!(d.app.pending_prefix.is_some());
+    assert!(!d.app.pending_prefix.is_empty());
     // Unknown leader sequence: consume the key, clear pending, no action.
     // 'q' isn't a registered leader binding (top-level 'q' quits, but the
     // leader namespace ignores it).
     d.press(KeyCode::Char('q'));
-    assert!(d.app.pending_prefix.is_none());
+    assert!(d.app.pending_prefix.is_empty());
     assert_eq!(d.app.input_mode, InputMode::Normal);
     // Falling through to top-level 'q' would quit; the leader handler
     // swallows the key, so the dashboard stays open.
@@ -7352,10 +7348,10 @@ fn leader_then_unbound_key_does_not_fall_through_to_destructive_command() {
     let mut d = TestDashboard::new(120, 15);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
     d.press(KeyCode::Char(' '));
-    assert!(d.app.pending_prefix.is_some());
+    assert!(!d.app.pending_prefix.is_empty());
     let action = d.press(KeyCode::Char('x'));
     assert!(action.is_none(), "Space x must not kill the session");
-    assert!(d.app.pending_prefix.is_none());
+    assert!(d.app.pending_prefix.is_empty());
 }
 
 #[test]
@@ -7380,6 +7376,34 @@ fn remapped_key_dispatches_and_frees_old_default() {
 }
 
 #[test]
+fn three_chord_sequence_waits_then_dispatches() {
+    use crate::config::KeyBinding;
+    let mut cfg = std::collections::HashMap::new();
+    cfg.insert(
+        "restart".to_string(),
+        KeyBinding::One("space v e".to_string()),
+    );
+    let (keymap, warnings) = super::keymap::Keymap::from_config(&cfg);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let mut d = TestDashboard::new(120, 15);
+    d.app.keymap = keymap;
+    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+
+    d.press(KeyCode::Char(' '));
+    assert_eq!(d.app.pending_prefix.len(), 1);
+    d.press(KeyCode::Char('v'));
+    assert_eq!(d.app.pending_prefix.len(), 2);
+    let out = d.render();
+    assert!(
+        out.contains("restart"),
+        "which-key should list the third chord: {out}"
+    );
+    d.press(KeyCode::Char('e'));
+    assert!(d.app.pending_prefix.is_empty());
+}
+
+#[test]
 fn remapped_leader_completes_sequence() {
     use crate::config::KeyBinding;
     let mut cfg = std::collections::HashMap::new();
@@ -7395,9 +7419,9 @@ fn remapped_leader_completes_sequence() {
     // `;` is now a prefix; `r` completes it. (No assertion on the restart side
     // effect — just that the sequence is recognized and consumed cleanly.)
     d.press(KeyCode::Char(';'));
-    assert!(d.app.pending_prefix.is_some());
+    assert!(!d.app.pending_prefix.is_empty());
     d.press(KeyCode::Char('r'));
-    assert!(d.app.pending_prefix.is_none());
+    assert!(d.app.pending_prefix.is_empty());
 }
 
 // =============================================================================

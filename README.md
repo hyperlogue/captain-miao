@@ -301,7 +301,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `h`/`l`, `←`/`→`      | Scroll the preview horizontally                                                                                                                                            |
 | `Ctrl-u` / `Ctrl-d`   | Scroll the preview up / down                                                                                                                                               |
 | `R`                   | Refresh the preview now                                                                                                                                                    |
-| `Space v` / `Space d` | Toggle the preview / detail panel                                                                                                                                          |
+| `v` / `Space d`       | Toggle the preview / detail panel                                                                                                                                          |
 | `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space z`             | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
@@ -340,7 +340,7 @@ restart = "space r"             # remap a leader sequence
 toggle_detail = []              # unbind a command
 ```
 
-Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
+Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
 
 Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
 

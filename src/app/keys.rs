@@ -230,15 +230,24 @@ impl App {
         // Capture any half-typed chord and clear both flags up front, so an
         // unrelated key seen mid-sequence cancels it rather than being invisible
         // to it.
-        let pending_prefix = self.pending_prefix.take();
+        let pending_prefix = std::mem::take(&mut self.pending_prefix);
         let was_g = std::mem::take(&mut self.pending_g);
         let chord = Chord::from_event(key);
 
-        // Completing a leader/prefix sequence (e.g. `Space e`). On a miss the
-        // second key is swallowed — this is what keeps `Space` + an unbound key
+        // Completing or extending a leader/prefix sequence (e.g. `Space e`,
+        // `Space v p`). A key that continues a longer binding waits. On a miss
+        // the key is swallowed — this is what keeps `Space` + an unbound key
         // from falling through to a destructive single-key command like `x`.
-        if let Some(prefix) = pending_prefix {
-            return match self.keymap.lookup_pair(prefix, chord) {
+        // A sequence that is both a complete binding and a prefix of a longer
+        // one extends; the shorter command is unreachable.
+        if !pending_prefix.is_empty() {
+            let mut seq = pending_prefix;
+            seq.push(chord);
+            if self.keymap.is_prefix_seq(&seq) {
+                self.pending_prefix = seq;
+                return None;
+            }
+            return match self.keymap.lookup(&seq) {
                 Some(cmd) => self.run_command(cmd),
                 None => None,
             };
@@ -258,9 +267,10 @@ impl App {
         }
 
         // A configured prefix (the leader, by default `Space`): wait for the
-        // second chord.
+        // next chord. A two-chord prefix such as `Space v` is the same path
+        // once the first chord has been stored above.
         if self.keymap.is_prefix(chord) {
-            self.pending_prefix = Some(chord);
+            self.pending_prefix = vec![chord];
             return None;
         }
 
