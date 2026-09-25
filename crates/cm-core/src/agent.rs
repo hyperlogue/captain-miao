@@ -1280,6 +1280,15 @@ impl AgentControl {
         }
     }
 
+    /// Whether a watched transcript write can clear a pending approval after
+    /// the launcher's grace period. Preserve that fast path for conversation
+    /// logs; Grok watches summary/token metadata that can change during a
+    /// permission wait (for example, a background memory flush). Its hooks
+    /// must release the wait. Other backends do not watch a transcript.
+    pub(crate) fn transcript_write_clears_approval(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Kimi)
+    }
+
     /// `Some(interval)` when the launcher's transcript watch must be a
     /// stat-polling one (`launcher::start_stat_poll`) rather than the
     /// platform's event-driven watcher, because the agent's writer defeats the

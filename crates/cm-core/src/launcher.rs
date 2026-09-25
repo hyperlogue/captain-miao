@@ -766,10 +766,11 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
     // approved tool's PostToolUse hook, which can be many seconds away).
     let (fs_tx, mut fs_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     // Session-status-file changes get their OWN channel, kept separate from the
-    // transcript's `fs_rx`. `on_transcript_changed` treats any `fs_rx` wake past
-    // the approval-grace window as "the permission dialog was dismissed → Active";
-    // a session-file write (e.g. a background job finishing during a later turn's
-    // approval prompt) is not that signal and must not reach it.
+    // transcript's `fs_rx`. For agents whose transcript writes clear approvals,
+    // `on_transcript_changed` treats a wake past the grace window as "the
+    // permission dialog was dismissed → Active". A session-file write (e.g. a
+    // background job finishing during a later turn's approval prompt) is not
+    // that signal and must not reach it.
     let (sess_tx, mut sess_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut transcript_watcher: Option<TranscriptWatch> = None;
     let mut transcript_path: Option<PathBuf> = None;
@@ -1462,16 +1463,19 @@ fn on_transcript_changed(
     grace: std::time::Duration,
 ) {
     // The only state transition driven by transcript changes today is leaving
-    // WaitingForApproval — Claude has no "approval granted" hook, and any
-    // transcript write while the permission dialog is up means the user just
-    // dismissed it and the agent is back to executing the tool.
+    // WaitingForApproval — Claude has no "approval granted" hook, so a later
+    // transcript write serves as evidence that execution resumed. This depends
+    // on the agent: Grok's watched metadata can change while permission still
+    // waits, so its hooks alone own this transition.
     //
     // However, the assistant message that *contains* the tool_use is also
     // written to the transcript around the same time the PermissionRequest
     // hook fires. FSEvents/notify can deliver that write event after we've
     // already set WaitingForApproval, so we ignore transcript changes within
     // a short grace window after entering the state.
-    if state.status == SessionStatus::WaitingForApproval {
+    if state.status == SessionStatus::WaitingForApproval
+        && state.agent.transcript_write_clears_approval()
+    {
         let past_grace = approval_entered_at
             .map(|t| t.elapsed() >= grace)
             .unwrap_or(true);
@@ -2277,6 +2281,66 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A memory flush rewrites Grok's summary while a command still waits for
+    /// permission. The notification reached Approval, then that metadata wake
+    /// incorrectly restored Active after the grace period.
+    #[test]
+    fn grok_metadata_writes_preserve_a_pending_approval() {
+        let agent = AgentControl::Grok;
+        let mut state = LauncherState::for_test(agent, SessionStatus::Active);
+        state.last_tool = Some("run_terminal_command".into());
+        agent.dispatch_hook(
+            &mut state,
+            agent
+                .parse_hook_payload(
+                    HookEvent::PermissionRequest,
+                    r#"{"notificationType":"permission_prompt"}"#,
+                )
+                .unwrap(),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+
+        let entered_at = Some(Instant::now() - Duration::from_secs(21));
+        on_transcript_changed(&mut state, entered_at, Duration::from_secs(2));
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+        assert_eq!(state.last_tool.as_deref(), Some("run_terminal_command"));
+
+        // An actual tool completion still releases the wait through the hook.
+        agent.dispatch_hook(
+            &mut state,
+            agent
+                .parse_hook_payload(
+                    HookEvent::PostToolUse,
+                    r#"{"toolName":"run_terminal_command"}"#,
+                )
+                .unwrap(),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool, None);
+    }
+
+    #[test]
+    fn conversation_writes_clear_approval_only_after_the_grace_period() {
+        for agent in [
+            AgentControl::Claude,
+            AgentControl::Codex,
+            AgentControl::Kimi,
+        ] {
+            let mut state = LauncherState::for_test(agent, SessionStatus::WaitingForApproval);
+            let grace = Duration::from_secs(2);
+            on_transcript_changed(&mut state, Some(Instant::now()), grace);
+            assert_eq!(state.status, SessionStatus::WaitingForApproval, "{agent:?}");
+
+            let entered_at = Some(Instant::now() - Duration::from_secs(21));
+            on_transcript_changed(&mut state, entered_at, grace);
+            assert_eq!(state.status, SessionStatus::Active, "{agent:?}");
+
+            state.status = SessionStatus::WaitingForDecision;
+            on_transcript_changed(&mut state, entered_at, grace);
+            assert_eq!(state.status, SessionStatus::WaitingForDecision, "{agent:?}");
+        }
     }
 
     /// The hookless turn start, end to end through the launcher: a turn opened
