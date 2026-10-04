@@ -310,7 +310,8 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                          |
 | `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
-| `Space m`             | Message log — the footer's status messages, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
+| `Space m`             | Message log — notification history, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
+| `Space n`             | Dismiss the newest notification (or click its `×`)                                                                                                                     |
 | `?`                   | Show the full key list (help overlay)                                                                                                                                      |
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
@@ -320,17 +321,26 @@ host whose server is older than the dashboard; press `Enter` for version details
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
-Push and pull read fresh checkout status before asking for confirmation, even
-when the Detail panel is hidden. Further keyboard or mouse input cancels a
-pending confirmation read. A deleted tracking branch appears as `upstream gone`;
-push offers to recreate it instead of reporting that the checkout is in sync.
+Push and pull start immediately without a confirmation prompt, reading fresh
+checkout status even when the Detail panel is hidden. They keep running when you
+navigate elsewhere. Only one Git operation runs per checkout at a time. A deleted
+tracking branch appears as `upstream gone`; push can recreate it.
 
-Confirmation names the branch, commit, and destination. Push uses Git's configured
-push remote and publishes exactly that commit to one branch, without force or
-extra tags. Mirror, wildcard, and multiple-ref pushes must be run outside the
-dashboard. Pull fetches its candidate before confirmation and fast-forwards only
-to that commit. A changed checkout, commit, or destination requires a new
-confirmation. These checks do not lock out other programs using the checkout.
+Push uses Git's configured push remote and publishes the prepared commit to one
+branch, without force or extra tags. Mirror, wildcard, and multiple-ref pushes
+must be run outside the dashboard. Pull fetches its candidate and fast-forwards
+only to that commit. If the checkout, commit, or destination changes during
+preparation, the operation stops; invoke it again to retry. These checks do not
+lock out other programs using the checkout.
+
+Dashboard notifications float in the bottom-right corner and stack vertically.
+Git progress updates one popup until the operation finishes. Information and
+successful results disappear after five seconds; warnings and errors stay until
+you dismiss them. Click a popup's `×` to close it, or press `Space n` to dismiss
+the newest notification (`dismiss_notification` in `[keybinds]`). Dismissing
+progress does not cancel the operation; its result still appears. Notifications
+briefly fade from dim to normal on arrival. `Space m` opens their history,
+including the full text of long messages and notifications hidden above the stack.
 
 Commands have a 60-second host-side budget, including queueing and cleanup. On
 timeout, the dashboard stops its Git process group and reports an unknown outcome

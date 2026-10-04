@@ -1,4 +1,4 @@
-//! A confirmation describes one immutable Git target. Old wire commands cannot
+//! A prepared command describes one immutable Git target. Old wire commands cannot
 //! express this contract and are rejected by the server.
 
 use std::os::unix::ffi::OsStrExt;
@@ -61,7 +61,7 @@ struct Checkout {
     tracking: Vec<String>,
 }
 
-const CHANGED: &str = "checkout or destination changed; request a fresh confirmation";
+const CHANGED: &str = "checkout or destination changed; run the command again";
 
 pub fn prepare(cwd: &str, push: bool, deadline: Instant) -> Result<VcsPlan, String> {
     prepare_with_agent(cwd, push, None, deadline)
@@ -91,7 +91,7 @@ pub fn prepare_with_agent(
             deadline,
         )?;
         // Fetch only the announced object. Another agent's FETCH_HEAD cannot
-        // replace the candidate, and no branch/worktree moves before consent.
+        // replace the candidate, and no branch/worktree moves during preparation.
         finish_command(
             run_git_with_agent(
                 &cwd,
@@ -157,7 +157,7 @@ pub fn execute_with_agent(
     if expected.push {
         let refspec = format!("{}:{}", expected.commit, expected.target_ref);
         // Explicit URL and OID prevent config changes and moving local refs
-        // from redirecting this invocation or publishing unconfirmed commits.
+        // from redirecting this invocation or publishing unprepared commits.
         finish_command(
             run_git_with_agent(
                 &cwd,
@@ -405,7 +405,7 @@ fn inspect(cwd: &Path, push: bool, deadline: Instant) -> Result<Checkout, String
     let url = urls;
     let git_dir = line(cwd, &["rev-parse", "--absolute-git-dir"], deadline)?;
     let mut identity = Sha256::new();
-    // A daemon restart or a different host must require a new confirmation.
+    // A daemon restart or a different host must require a new preparation.
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     digest_part(
         &mut identity,
@@ -747,7 +747,7 @@ exec sh -c "$last"
         let pull =
             prepare_with_agent(cwd, false, Some("/tmp/agent-first.sock"), deadline()).unwrap();
         // Preparation authenticates both ls-remote and fetch. Execution uses a
-        // replacement connection's agent and keeps the same confirmed commit.
+        // replacement connection's agent and keeps the same prepared commit.
         std::fs::write(&expected, "/tmp/agent-second.sock").unwrap();
         assert!(
             execute_with_agent(cwd, &pull, Some("/tmp/agent-first.sock"), deadline())
@@ -876,7 +876,7 @@ exec sh -c "$last"
     }
 
     #[test]
-    fn changed_branch_commit_destination_or_checkout_requires_confirmation() {
+    fn changed_branch_commit_destination_or_checkout_requires_preparation() {
         for change in ["branch", "commit", "destination", "checkout"] {
             let repo = Repo::new();
             let plan = repo.plan(true);
@@ -923,7 +923,7 @@ exec sh -c "$last"
     }
 
     #[test]
-    fn pull_uses_confirmed_candidate_and_rejects_remote_movement() {
+    fn pull_uses_prepared_candidate_and_rejects_remote_movement() {
         let repo = Repo::new();
         repo.publish();
         let old = git(&repo.work, &["rev-parse", "HEAD"]);
@@ -932,11 +932,7 @@ exec sh -c "$last"
         assert_eq!(plan.target_commit.as_deref(), Some(target.as_str()));
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), old);
         // An unrelated FETCH_HEAD cannot redirect the merge.
-        std::fs::write(
-            repo.work.join(".git/FETCH_HEAD"),
-            "not the confirmed commit",
-        )
-        .unwrap();
+        std::fs::write(repo.work.join(".git/FETCH_HEAD"), "not the prepared commit").unwrap();
         assert_eq!(repo.run(&plan).unwrap(), "pulled");
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
         assert_eq!(git(&repo.work, &["rev-parse", "@{upstream}"]), target);

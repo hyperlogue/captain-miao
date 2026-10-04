@@ -39,6 +39,7 @@ mod keymap;
 mod keys;
 mod logo;
 mod messages;
+mod notifications;
 mod picker;
 mod port_forwards;
 mod prefs;
@@ -220,18 +221,11 @@ pub(super) enum Action {
     },
     /// Copy the selected session's id to the system clipboard (via OSC 52).
     CopySessionId(String),
-    /// Read current checkout status before offering a push/pull confirmation.
+    /// Prepare and run push/pull against fresh checkout status in the background.
     VcsPrepare {
         host: HostId,
         cwd: String,
         push: bool,
-        seq: u64,
-    },
-    /// Push or pull the selected session's checkout. Runs off the UI thread.
-    VcsRun {
-        host: HostId,
-        cwd: String,
-        plan: Box<cm_core::vcs::VcsPlan>,
     },
     /// Attach a local window to an already-running remote pool session (§5):
     /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
@@ -328,7 +322,6 @@ impl Action {
             Action::AttachAll { .. } => "AttachAll",
             Action::UpgradeHost { .. } => "UpgradeHost",
             Action::GrantConsent(_) => "GrantConsent",
-            Action::VcsRun { .. } => "VcsRun",
             Action::VcsPrepare { .. } => "VcsPrepare",
         }
     }
@@ -867,10 +860,11 @@ pub(super) struct App {
     pub(super) table_state: TableState,
     pub(super) should_quit: bool,
     pub(super) home_dir: String,
+    /// Latest outcome, also used by restart recovery. Presentation lives in notifications.
     pub(super) status_msg: Option<String>,
     pub(super) status_is_error: bool,
-    /// Everything `set_status` has ever shown, capped and memory-only. The
-    /// footer keeps one line; this is where the ones it replaced went.
+    pub(in crate::app) notifications: notifications::Notifications,
+    /// Notification history, capped and memory-only.
     pub(super) messages: messages::MessageLog,
     /// Active message-log popup. `Some` iff `input_mode == InputMode::Messages`.
     pub(super) message_view: Option<messages::MessageLogView>,
@@ -1146,9 +1140,8 @@ pub(super) struct App {
     /// Last status per `(host, cwd)`. The UI thread only reads this; probes
     /// land through the event loop.
     pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
-    /// Input invalidates an outstanding command preparation, so a delayed
-    /// reply cannot open a confirmation after the user has moved on.
-    pub(super) vcs_prepare_seq: u64,
+    /// One command per checkout; unrelated checkouts can run concurrently.
+    pub(super) vcs_commands: HashMap<(HostId, String), notifications::NotificationId>,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,
     /// First-draw defaults have been picked based on the initial viewport
@@ -1605,7 +1598,7 @@ impl App {
         let cfg = crate::config::get();
         let (keymap, keybind_warnings) = keymap::Keymap::from_config(&cfg.keybinds);
         // Surface config problems the TUI would otherwise hide (it swallows
-        // stderr, so a status line is the only place the user would see them): a
+        // stderr, so notifications must surface them): a
         // whole-file parse failure that reverted everything to defaults, then any
         // malformed `[keybinds]` entries.
         let mut warnings: Vec<String> = cfg.load_warning.iter().cloned().collect();
@@ -1616,8 +1609,10 @@ impl App {
         // likely to be overwritten before they're read — they land before the
         // user has looked at the screen at all.
         let mut messages = messages::MessageLog::default();
+        let mut notifications = notifications::Notifications::default();
         if let Some(msg) = &status_msg {
             messages.push(msg, status_is_error);
+            notifications.push(notifications::Level::Warning, msg.clone(), Instant::now());
         }
 
         // Only this machine is built here; every configured host is dialled by
@@ -1634,6 +1629,7 @@ impl App {
             home_dir,
             status_msg,
             status_is_error,
+            notifications,
             messages,
             message_view: None,
             input_mode: InputMode::Normal,
@@ -1706,7 +1702,7 @@ impl App {
             session_detail: false,
             session_detail_scroll: 0,
             vcs: HashMap::new(),
-            vcs_prepare_seq: 0,
+            vcs_commands: HashMap::new(),
             detail_visible: true,
             panels_initialized: false,
             drag: None,
@@ -4198,13 +4194,14 @@ impl App {
             .select(if len == 0 { None } else { Some(0) });
     }
 
-    /// Show `msg` in the footer, and keep it. Every status the dashboard shows
-    /// goes through here, which is what makes this the one place the message log
-    /// has to be fed from — see [`messages`].
+    /// Show a shared notification and retain it in the message log.
     pub(super) fn set_status(&mut self, msg: String, is_error: bool) {
-        self.messages.push(&msg, is_error);
-        self.status_msg = Some(msg);
-        self.status_is_error = is_error;
+        let level = if is_error {
+            notifications::Level::Error
+        } else {
+            notifications::Level::Info
+        };
+        self.notify(level, msg);
     }
 
     /// Open the message-log popup, parked on the newest entry.

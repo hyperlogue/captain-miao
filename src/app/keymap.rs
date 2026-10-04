@@ -319,7 +319,9 @@ pub(super) enum Command {
     /// skipped rather than stolen: a steal is a per-session decision (§10.2),
     /// and one keypress must not kick a roomful of terminals.
     AttachAll,
-    /// Open the scrollback of footer status messages.
+    /// Dismiss the newest notification.
+    DismissNotification,
+    /// Open the notification history.
     MessageLog,
     /// Open the preferences overlay.
     Preferences,
@@ -372,6 +374,7 @@ impl Command {
             Command::AttachAll => "attach_all",
             Command::SessionsLayout => "sessions_layout",
             Command::ManageHosts => "manage_hosts",
+            Command::DismissNotification => "dismiss_notification",
             Command::MessageLog => "messages",
             Command::Preferences => "preferences",
             Command::SessionDetail => "session_detail",
@@ -431,7 +434,8 @@ impl Command {
             Command::AttachAll => "attach every free detached session",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
-            Command::MessageLog => "message log (status messages the footer showed)",
+            Command::DismissNotification => "dismiss the newest notification",
+            Command::MessageLog => "message log (notification history)",
             Command::Preferences => "open preferences",
             Command::SessionDetail => "session record (pid, terminfo, context, first prompt)",
             Command::VcsPush => "push the branch",
@@ -479,6 +483,7 @@ impl Command {
             Command::AttachAll => "attach all",
             Command::SessionsLayout => "layout",
             Command::ManageHosts => "hosts",
+            Command::DismissNotification => "dismiss notification",
             Command::MessageLog => "messages",
             Command::Preferences => "prefs",
             Command::SessionDetail => "session",
@@ -552,6 +557,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::SessionsLayout,     &[]),
     (Command::ManageHosts,        &["space h"]),
     (Command::MessageLog,         &["space m"]),
+    (Command::DismissNotification, &["space n"]),
     (Command::Preferences,        &[",", "space p"]),
 ];
 

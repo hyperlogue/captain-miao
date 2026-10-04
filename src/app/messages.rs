@@ -1,10 +1,8 @@
-//! In-memory history of the footer's status messages.
+//! In-memory notification history.
 //!
-//! The footer holds exactly one status line and the next [`App::set_status`]
-//! overwrites it, so anything said while the user was reading a preview — a
-//! launch failure, a host's refusal, the `[keybinds]` warnings from startup — is
-//! simply gone by the time they look down. This keeps the last [`MAX_ENTRIES`]
-//! of them so the message-log popup can show what went past.
+//! Notifications expire or are dismissed, while the last [`MAX_ENTRIES`]
+//! messages remain available in the message-log popup. Every notification
+//! update is recorded here, including an operation's progress and outcome.
 //!
 //! **Memory only, on purpose.** These lines quote cwds, host targets and prompt
 //! text — the reason the state files are `0600` in the first place — and a log
@@ -26,7 +24,7 @@ use super::format;
 /// small enough that the log is a few tens of KiB in the pathological case.
 const MAX_ENTRIES: usize = 200;
 
-/// One status message, as it was shown in the footer.
+/// One notification message, as it was shown in a popup.
 #[derive(Debug, Clone)]
 pub(super) struct MessageEntry {
     /// When it was last set — refreshed by a repeat, so the age reads as "how

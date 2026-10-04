@@ -120,12 +120,13 @@ impl App {
         if self.input_mode == InputMode::Prefs {
             self.draw_prefs(frame, frame.area());
         }
-        // Last, and independent of `input_mode`: an attach freezes the loop for
+        // Independent of `input_mode`: an attach freezes the loop for
         // its whole round trip, so this is the only feedback the keypress gets
         // until the window comes up.
         if self.attaching.is_some() {
             self.draw_attaching(frame, frame.area());
         }
+        self.draw_notifications(frame, body);
     }
 
     /// The "Attaching…" overlay shown while an attach is in flight.
@@ -1542,6 +1543,7 @@ impl App {
             cmd(Command::Search),
             cmd(Command::ClearSearch),
             cmd(Command::MessageLog),
+            cmd(Command::DismissNotification),
             cmd(Command::Preferences),
             cmd(Command::Help),
             row(
@@ -1562,8 +1564,7 @@ impl App {
         frame.render_widget(para, inner);
     }
 
-    /// The footer's status messages, oldest first — the ones it showed and then
-    /// replaced, which is every one the user didn't happen to be looking at.
+    /// Notification history, oldest first, including expired and dismissed notices.
     ///
     /// Takes `&mut self` only to record the viewport height and re-clamp the
     /// scroll, both of which only a render knows — the same bookkeeping
@@ -1700,16 +1701,6 @@ impl App {
                 // whole which-key menu is discoverable. Tracks a remapped leader.
                 if let Some(prefix) = self.keymap.primary_prefix() {
                     spans.extend(hint_pair(&prefix, "more…"));
-                }
-                // The status message trails the ribbon as plain (un-pilled) text.
-                if let Some(msg) = &self.status_msg {
-                    let style = if self.status_is_error {
-                        Style::default().fg(config::get().colors.ui.error_fg)
-                    } else {
-                        Style::default().add_modifier(Modifier::DIM)
-                    };
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(msg.clone(), style));
                 }
                 spans
             }

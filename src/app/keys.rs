@@ -59,7 +59,6 @@ pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> 
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
-        self.vcs_prepare_seq = self.vcs_prepare_seq.wrapping_add(1);
         // Ctrl+c always quits, regardless of current mode.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
@@ -83,7 +82,12 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
-        self.vcs_prepare_seq = self.vcs_prepare_seq.wrapping_add(1);
+        if self.notifications.handle_mouse(mouse) {
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.drag = None;
+            }
+            return None;
+        }
         // Only process mouse events in Normal mode; inputs/pickers consume keys only.
         // The session record is modal too: a click must not change the row
         // underneath it.
@@ -267,41 +271,7 @@ impl App {
             host: session.host,
             cwd: session.cwd,
             push,
-            seq: self.vcs_prepare_seq,
         })
-    }
-
-    /// Confirm the host's resolved target, independent of the display cache.
-    pub(super) fn confirm_vcs(&mut self, plan: Box<cm_core::vcs::VcsPlan>) {
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let short = |oid: &str| oid.chars().take(12).collect::<String>();
-        let prompt = if plan.push {
-            format!(
-                "Push {} at {} to {}? [y/N]",
-                plan.branch,
-                short(&plan.commit),
-                plan.destination()
-            )
-        } else {
-            format!(
-                "Fast-forward {} at {} to {} at {}? [y/N]",
-                plan.branch,
-                short(&plan.commit),
-                plan.destination(),
-                short(plan.target_commit.as_deref().unwrap_or(""))
-            )
-        };
-        self.pending_confirm = Some(super::PendingConfirm {
-            prompt,
-            action: Action::VcsRun {
-                host: session.host,
-                cwd: session.cwd,
-                plan,
-            },
-        });
-        self.input_mode = InputMode::Confirm;
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -625,6 +595,10 @@ impl App {
             }
             Command::Help => {
                 self.input_mode = InputMode::Help;
+                None
+            }
+            Command::DismissNotification => {
+                self.notifications.dismiss_latest();
                 None
             }
             Command::MessageLog => {

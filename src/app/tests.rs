@@ -464,19 +464,56 @@ fn q_sets_should_quit() {
 }
 
 #[test]
-fn status_msg_shown_in_footer() {
-    // Wide enough that the full hint ribbon plus the trailing status message
-    // fit without clipping (the padded two-tone hints eat more width than the
-    // old plain strip).
-    let mut d = TestDashboard::new(160, 10);
-    d.app.status_msg = Some("Launched window 42".to_string());
+fn status_messages_float_above_the_footer_and_stack() {
+    let mut d = TestDashboard::new(100, 24);
+    d.app.set_status("Launched window 42".to_string(), false);
+    d.app.set_status("Push failed".to_string(), true);
     let out = d.render();
-    assert!(out.contains("Launched window 42"));
+    assert!(out.contains("Launched window 42"), "{out}");
+    assert!(out.contains("Push failed"), "{out}");
+    let footer = out.lines().last().unwrap();
+    assert!(!footer.contains("Push failed"));
+    assert!(!footer.contains("Launched window"));
+    let buf = d.terminal.backend().buffer();
+    let (info_x, info_y) = find_cell(buf, "Launched window").unwrap();
+    let (error_x, error_y) = find_cell(buf, "Push failed").unwrap();
+    assert!(info_x > 40 && error_x > 40);
+    assert!(info_y < error_y && error_y < 23);
+
+    // Success expires independently; errors require the dismissal command.
+    d.app
+        .notifications
+        .tick(std::time::Instant::now() + std::time::Duration::from_secs(6));
+    let out = d.render();
+    assert!(!out.contains("Launched window 42"), "{out}");
+    assert!(out.contains("Push failed"), "{out}");
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('n'));
+    assert!(!d.render().contains("Push failed"));
+    assert_eq!(d.app.messages.len(), 2);
 }
 
-/// The footer shows one status at a time; `Space m` is where the ones it
-/// replaced are still readable. What makes that work is that every status goes
-/// through `set_status` — so the log is fed there, not at each call site.
+#[test]
+fn notification_close_button_does_not_select_the_obscured_session() {
+    let mut d = TestDashboard::new(100, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app.set_status("Click to dismiss".into(), true);
+    d.render();
+    let before = d.app.table_state.selected();
+    let (x, y) = find_cell(d.terminal.backend().buffer(), "Error").unwrap();
+    // The right-hand × is the close button, after the severity label.
+    let row = d.terminal.backend().buffer();
+    let close_x = (x + 1..100)
+        .rev()
+        .find(|col| row[(*col, y)].symbol() == "×")
+        .unwrap();
+    d.click(close_x, y);
+    assert!(!d.render().contains("Click to dismiss"));
+    assert_eq!(d.app.table_state.selected(), before);
+}
+
+/// Every status goes through the shared notification path, so history remains
+/// available after a popup is dismissed or expires.
 #[test]
 fn space_m_opens_the_message_log_and_esc_closes_it() {
     let mut d = TestDashboard::new(120, 20);
@@ -484,10 +521,10 @@ fn space_m_opens_the_message_log_and_esc_closes_it() {
     d.app
         .set_status("Kill failed: host is unreachable".to_string(), true);
 
-    // The footer only carries the newest of the two.
+    // Both notifications are visible until dismissed or expired.
     let footer = d.render();
     assert!(footer.contains("Kill failed"), "{footer}");
-    assert!(!footer.contains("Launched window 42"), "{footer}");
+    assert!(footer.contains("Launched window 42"), "{footer}");
 
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('m'));
@@ -7975,19 +8012,6 @@ fn vcs_commands_request_status_when_details_are_hidden() {
 }
 
 #[test]
-fn checked_pull_confirmation_fits_a_small_terminal() {
-    let mut d = TestDashboard::new(40, 18);
-    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
-    d.app
-        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(false)));
-    let out = d.render();
-    assert!(out.contains("origin/main"), "{out}");
-    assert!(out.contains("aaaaaaaaaaaa"), "{out}");
-    assert!(out.contains("bbbbbbbbbbbb"), "{out}");
-    assert!(out.contains("cancel"), "{out}");
-}
-
-#[test]
 fn gone_upstream_warns_and_offers_republication() {
     let mut d = TestDashboard::new(160, 30);
     d.app.panels_initialized = true;
@@ -8014,20 +8038,17 @@ fn gone_upstream_warns_and_offers_republication() {
     let out = d.render();
     assert!(out.contains("upstream gone"), "{out}");
     assert!(!out.contains('✓'), "{out}");
-    d.app
-        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(true)));
-    assert!(
-        d.app
-            .pending_confirm
-            .as_ref()
-            .unwrap()
-            .prompt
-            .contains("to origin/main")
-    );
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('v'));
+    assert!(matches!(
+        d.press(KeyCode::Char('p')),
+        Some(Action::VcsPrepare { push: true, .. })
+    ));
+    assert!(d.app.pending_confirm.is_none());
 }
 
 #[test]
-fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
+fn space_v_p_starts_without_prompt_and_the_detail_panel_shows_the_checkout() {
     let mut d = TestDashboard::new(160, 40);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;
@@ -8154,15 +8175,7 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
         Some(Action::VcsPrepare { push: true, .. })
     ));
     assert!(d.app.pending_confirm.is_none());
-    // The event loop supplies a fresh read before opening this confirmation.
-    d.app
-        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(true)));
-    let confirm = d.app.pending_confirm.expect("push asks first");
-    assert!(confirm.prompt.contains("origin/main"), "{}", confirm.prompt);
-    assert!(matches!(confirm.action, Action::VcsRun { plan, .. } if plan.push));
-    // Drop the confirm so the next render is the detail panel again.
-    d.app.pending_confirm = None;
-    d.app.input_mode = InputMode::Normal;
+    assert_eq!(d.app.input_mode, InputMode::Normal);
 
     let rebasing = cm_core::vcs::VcsSnapshot {
         outcome: cm_core::vcs::VcsOutcome::Ready,

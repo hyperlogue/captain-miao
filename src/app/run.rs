@@ -29,6 +29,7 @@ use crossterm::event::{
 use crossterm::execute;
 use std::time::{Duration, Instant};
 
+use super::notifications::Level;
 use super::render_backend::DashboardTerminal;
 use crate::agent::AgentControl;
 use crate::backend::{Backend, CleanupPolicy, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
@@ -128,7 +129,6 @@ enum VcsMsg {
     Prepared {
         host: HostId,
         cwd: String,
-        seq: u64,
         result: Result<Box<cm_core::vcs::VcsPlan>, String>,
     },
     Status {
@@ -218,10 +218,23 @@ fn prepare_vcs_command(
     host: HostId,
     cwd: String,
     push: bool,
-    seq: u64,
 ) {
+    let key = (host.clone(), cwd.clone());
+    if app.vcs_commands.contains_key(&key) {
+        app.notify(
+            Level::Warning,
+            vcs_notice(&host, &cwd, "A Git operation is already running"),
+        );
+        return;
+    }
+    let verb = if push {
+        "Preparing push…"
+    } else {
+        "Preparing pull…"
+    };
+    let id = app.notify(Level::Progress, vcs_notice(&host, &cwd, verb));
+    app.vcs_commands.insert(key, id);
     let remote = remote_reach(app, &host);
-    app.set_status("reading checkout…".to_string(), false);
     let tx = tx.clone();
     let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
@@ -258,12 +271,7 @@ fn prepare_vcs_command(
                 }
             }
         };
-        let _ = tx.send(VcsMsg::Prepared {
-            host,
-            cwd,
-            seq,
-            result,
-        });
+        let _ = tx.send(VcsMsg::Prepared { host, cwd, result });
     });
 }
 
@@ -313,30 +321,34 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
     });
 }
 
-fn apply_vcs(app: &mut App, msg: VcsMsg) {
+fn vcs_notice(host: &HostId, cwd: &str, message: &str) -> String {
+    format!("{message}\n{}: {cwd}", host.0)
+}
+
+fn finish_vcs_command(app: &mut App, host: HostId, cwd: String, ok: bool, message: String) {
+    let key = (host.clone(), cwd.clone());
+    if let Some(slot) = app.vcs.get_mut(&key) {
+        slot.asked = None;
+        slot.inflight = false;
+    }
+    let level = if ok { Level::Success } else { Level::Error };
+    let message = vcs_notice(&host, &cwd, &message);
+    if let Some(id) = app.vcs_commands.remove(&key) {
+        app.update_notification(id, level, message);
+    }
+}
+
+fn apply_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>, msg: VcsMsg) {
     match msg {
-        VcsMsg::Prepared {
-            host,
-            cwd,
-            seq,
-            result,
-        } => {
-            if seq != app.vcs_prepare_seq
-                || app.input_mode != InputMode::Normal
-                || app.session_detail
-                || !app
-                    .selected_session_ref()
-                    .is_some_and(|s| s.host == host && s.cwd == cwd)
-            {
-                return;
-            }
-            if matches!(remote_reach(app, &host), RemoteReach::Down) {
-                app.set_status("disconnected".to_string(), true);
+        VcsMsg::Prepared { host, cwd, result } => {
+            // The command belongs to the checkout captured at the keystroke.
+            // Navigation and open dialogs must neither cancel it nor retarget it.
+            if !app.vcs_commands.contains_key(&(host.clone(), cwd.clone())) {
                 return;
             }
             match result {
-                Ok(plan) => app.confirm_vcs(plan),
-                Err(error) => app.set_status(error, true),
+                Ok(plan) => start_vcs_command(app, tx, host, cwd, plan),
+                Err(error) => finish_vcs_command(app, host, cwd, false, error),
             }
         }
         VcsMsg::Status {
@@ -357,11 +369,7 @@ fn apply_vcs(app: &mut App, msg: VcsMsg) {
             ok,
             message,
         } => {
-            if let Some(slot) = app.vcs.get_mut(&(host, cwd)) {
-                slot.asked = None;
-                slot.inflight = false;
-            }
-            app.set_status(message, !ok);
+            finish_vcs_command(app, host, cwd, ok, message);
         }
     }
 }
@@ -376,18 +384,21 @@ fn start_vcs_command(
     let remote = match remote_reach(app, &host) {
         RemoteReach::Up(backend) => Some(backend),
         RemoteReach::Down => {
-            app.set_status("disconnected".to_string(), true);
+            finish_vcs_command(app, host, cwd, false, "disconnected".to_string());
             return;
         }
         RemoteReach::Local => None,
     };
-    app.set_status(
-        if plan.push {
-            "pushing…".to_string()
-        } else {
-            "pulling…".to_string()
-        },
-        false,
+    let id = app.vcs_commands[&(host.clone(), cwd.clone())];
+    let verb = if plan.push { "Pushing" } else { "Pulling" };
+    app.update_notification(
+        id,
+        Level::Progress,
+        vcs_notice(
+            &host,
+            &cwd,
+            &format!("{verb} {} ↔ {}…", plan.branch, plan.destination()),
+        ),
     );
     let report_cwd = cwd.clone();
     let tx = tx.clone();
@@ -2134,7 +2145,7 @@ async fn drain_background_results(
     // of banking a stale repaint for whenever it next opens.
     poll_vcs(app, &inboxes.vcs_tx);
     while let Ok(msg) = inboxes.vcs_rx.try_recv() {
-        apply_vcs(app, msg);
+        apply_vcs(app, &inboxes.vcs_tx, msg);
         redraw = true;
     }
     let vitals_moved = app
@@ -2363,6 +2374,9 @@ fn next_wakeup(
     if app.vcs_spinner_phase().is_some() {
         poll_timeout = poll_timeout.min(super::draw::VITALS_SPINNER_STEP);
     }
+    if let Some(wakeup) = app.notifications.next_wakeup(Instant::now()) {
+        poll_timeout = poll_timeout.min(wakeup);
+    }
     poll_timeout
 }
 
@@ -2521,6 +2535,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
 
         needs_redraw |= refresh_preview(&mut app, &mut last_detach_prune, preview_debounce).await;
 
+        needs_redraw |= app.notifications.tick(Instant::now());
         needs_redraw |= redraw_reasons(
             &app,
             &mut last_age_label,
@@ -2955,16 +2970,8 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::GrantConsent(reply) => {
                         let _ = reply.send(true);
                     }
-                    Action::VcsPrepare {
-                        host,
-                        cwd,
-                        push,
-                        seq,
-                    } => {
-                        prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push, seq);
-                    }
-                    Action::VcsRun { host, cwd, plan } => {
-                        start_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, plan);
+                    Action::VcsPrepare { host, cwd, push } => {
+                        prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
                     }
                     Action::CopySessionId(sid) => {
                         match copy_to_clipboard(&sid) {
@@ -3079,13 +3086,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_preparation_reads_with_hidden_details() {
-        let root = std::env::temp_dir().join(format!("cm-vcs-hidden-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+    async fn push_and_pull_run_without_prompt_after_navigation_with_hidden_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
         assert!(
             std::process::Command::new("git")
                 .args(["init", "-q", "-b", "main"])
-                .current_dir(&root)
+                .current_dir(root)
                 .status()
                 .unwrap()
                 .success()
@@ -3107,7 +3114,7 @@ mod tests {
             assert!(
                 std::process::Command::new("git")
                     .args(args)
-                    .current_dir(&root)
+                    .current_dir(root)
                     .status()
                     .unwrap()
                     .success()
@@ -3117,37 +3124,75 @@ mod tests {
         let cwd = root.to_string_lossy().into_owned();
         app.sessions[0].cwd = cwd.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        prepare_vcs_command(&mut app, &tx, HostId::local(), cwd, true, 0);
-        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        for push in [true, false] {
+            app.input_mode = InputMode::Normal;
+            prepare_vcs_command(&mut app, &tx, HostId::local(), cwd.clone(), push);
+            assert_eq!(app.vcs_commands.len(), 1);
+            // A second keystroke warns without starting another command.
+            prepare_vcs_command(&mut app, &tx, HostId::local(), cwd.clone(), push);
+            assert_eq!(app.vcs_commands.len(), 1);
+            let id = app.vcs_commands[&(HostId::local(), cwd.clone())];
+            let prepared = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&prepared, VcsMsg::Prepared { result: Ok(_), .. }));
+            app.sessions[0].cwd = "/tmp/elsewhere".into();
+            app.input_mode = InputMode::Search;
+            apply_vcs(&mut app, &tx, prepared);
+            assert!(app.pending_confirm.is_none());
+            assert_eq!(app.input_mode, InputMode::Search);
+            assert_eq!(app.vcs_commands[&(HostId::local(), cwd.clone())], id);
+            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match &done {
+                VcsMsg::Command {
+                    ok,
+                    message,
+                    cwd: target,
+                    ..
+                } => {
+                    assert!(ok, "{message}");
+                    assert_eq!(target, &cwd);
+                }
+                _ => panic!("expected a command result"),
+            }
+            apply_vcs(&mut app, &tx, done);
+            assert!(app.vcs_commands.is_empty());
+            assert!(!app.status_is_error);
+            assert!(
+                rx.try_recv().is_err(),
+                "duplicate keystroke must not start another task"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_vcs_preparation_finishes_with_a_persistent_error() {
+        let mut app = vcs_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        prepare_vcs_command(
+            &mut app,
+            &tx,
+            HostId("removed-host".into()),
+            "/tmp/checkout".into(),
+            false,
+        );
+        let prepared = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        apply_vcs(&mut app, message);
-        std::fs::remove_dir_all(root).unwrap();
-        assert!(app.pending_confirm.is_some());
-        assert_eq!(app.input_mode, InputMode::Confirm);
-    }
-
-    #[test]
-    fn late_preparation_cannot_interrupt_new_input_or_selection() {
-        for changed_selection in [false, true] {
-            let mut app = vcs_app();
-            if changed_selection {
-                app.sessions[0].cwd = "/tmp/elsewhere".into();
-            } else {
-                app.vcs_prepare_seq += 1;
-            }
-            apply_vcs(
-                &mut app,
-                VcsMsg::Prepared {
-                    host: HostId::local(),
-                    cwd: "/tmp/checkout".into(),
-                    seq: 0,
-                    result: Ok(Box::new(cm_core::vcs::VcsPlan::for_test(true))),
-                },
-            );
-            assert!(app.pending_confirm.is_none());
-        }
+        apply_vcs(&mut app, &tx, prepared);
+        assert!(app.vcs_commands.is_empty());
+        assert!(app.status_is_error);
+        assert!(app.status_msg.as_deref().unwrap().contains("disconnected"));
+        assert!(app.pending_confirm.is_none());
+        // Even a long poll interval wakes for the fade, then the error is idle.
+        assert!(
+            next_wakeup(&app, Duration::from_secs(60), None, None) <= Duration::from_millis(180)
+        );
     }
 
     #[test]
