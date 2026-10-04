@@ -86,7 +86,9 @@ done
     }
 
     fn socket(&self) -> PathBuf {
-        self.root.path().join("run/captain-miao/pty-pool.sock")
+        self.root
+            .path()
+            .join("state/captain-miao/run/pty-pool.sock")
     }
 
     fn connect(&self) -> UnixStream {
@@ -201,7 +203,9 @@ done
     }
 
     fn clipboard(&self) -> UnixListener {
-        UnixListener::bind(self.root.path().join("run/captain-miao/clipboard.sock")).unwrap()
+        let path = self.root.path().join("run/captain-miao/clipboard.sock");
+        cm_core::state::create_dir_all_private(path.parent().unwrap()).unwrap();
+        UnixListener::bind(path).unwrap()
     }
 
     fn images(&self) -> PathBuf {

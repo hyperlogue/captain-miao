@@ -125,7 +125,7 @@ exec {} --exact codex_fixture --nocapture
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.root.path().join("run/captain-miao/server.sock")
+        self.root.path().join("state/captain-miao/run/server.sock")
     }
     pub fn codex_socket(&self) -> PathBuf {
         self.root.path().join("codex.sock")

@@ -368,19 +368,27 @@ about what exists.
   continues** rather than propagating: the daemon *is* the pool, so returning
   on one transient EMFILE would kill every session on the host. A failed accept
   backs off 200ms so a persistent fd exhaustion can't spin the loop hot.
-  (2) The **socket-gone wedge** self-heals. Without `loginctl enable-linger`,
-  systemd-logind removes `/run/user/<uid>` at last logout, unlinking the
-  control socket out from under a daemon that survives holding deleted inodes
-  and the flock — so `daemon ensure` no-ops forever, printing a socket path
-  nothing binds. Two layers fix it, in order of preference:
-  * **Daemon-side rebind** (`rebind_if_socket_vanished`, a 5s stat tick):
-    the daemon notices its socket path is gone and re-binds once the runtime
-    dir is back — which is the next login, since a non-root user can't
-    recreate `/run/user/<uid>` itself. **Every pooled session survives**, which
-    is why this is the primary heal.
-  * **`ensure`-side restart** (`heal_wedged_daemon`), the backstop: a lock
-    held with an unreachable socket gets a 3s grace (in case a rebind is
-    imminent), then SIGTERM → SIGKILL, and `ensure` starts a fresh daemon.
+  (2) **Recovery preserves sessions.** A 5s daemon-side check restores an
+  accidentally unlinked control socket. `daemon ensure` waits up to 7s for
+  the lock holder's sockets, then returns an error without signalling it.
+  It can start a replacement only after acquiring the singleton lock; an
+  unreachable live daemon requires an explicit stop to restart.
+
+  Both daemon sockets now live in `state::daemon_dir()` (`state_dir()/run`),
+  beside the state root's singleton lock. Previously, callers sharing the
+  lock could compute different sockets from their `XDG_RUNTIME_DIR` values;
+  the old recovery code treated each mismatch as a wedge and killed a healthy
+  session-owning daemon. Fixed paths remove that ambiguity.
+
+  **Migration** (`daemon_compat.rs`): while a legacy daemon holds the lock,
+  `ensure` verifies that both old sockets' kernel peer PIDs match the recorded
+  daemon, then publishes symlinks at the fixed paths (pool first, control last).
+  Linux discovery reads the daemon's original runtime environment from procfs;
+  if unavailable, it checks known legacy locations with the same owner checks.
+  An occupied fixed path produces an error, preserving the old daemon. A later
+  normal start replaces stale aliases with real sockets. No endpoint registry
+  or forced migration restart is needed. All invoked server binaries must be
+  updated: an old `ensure` still has the destructive recovery behavior.
 
   **`loginctl enable-linger` is a documented host requirement** — see
   `README.md`. On `KillUserProcesses=yes` distros the daemon is killed outright
@@ -388,7 +396,9 @@ about what exists.
 - **Two sockets, easily confused:** the **control socket** (the protocol; what
   `daemon ensure` prints; what the dashboard forwards/dials) and the **pool
   socket** (libshpool's own; what `attach` and `cm-client list` dial). They
-  live in the same runtime dir but are distinct endpoints.
+  live in the same fixed daemon directory but are distinct endpoints. A state
+  root whose path exceeds the Unix socket limit is rejected before daemonizing;
+  the filesystem hosting new sockets must support Unix sockets.
 - **Watchers.** The daemon `notify`-watches `sessions/` plus Codex's title
   WAL, feeding a broadcast channel that drives the per-connection push stream.
   A `SetSessionFlags` also pokes that channel, so a flag another dashboard set
@@ -616,7 +626,8 @@ the full sequence and re-runs it on every reconnect:
    path; idempotent. Its stderr becomes the `Failed` reason when the probe had
    nothing to say. A daemon with a vanished socket gets a full five-second
    socket-check interval plus two seconds of scheduling margin to rebind before
-   recovery considers restarting it; a successful rebind preserves its pool.
+   `ensure` reports it unavailable. It never kills the lock holder; a successful
+   rebind preserves its pool.
 3. **Forward** — cancel any stale forward, then a **forward-only**
    `ssh -N -L <local>:<remote> <target>` child (`kill_on_drop`), under
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth

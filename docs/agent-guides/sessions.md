@@ -14,9 +14,13 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
   `~/.local/state/captain-miao/`. Use `create_dir_all_private` (directories
   `0700`) and `write_json_atomic` (JSON `0600`): state contains prompts and cwds.
   State files regenerate or reset when deleted.
-- Runtime sockets belong under `$XDG_RUNTIME_DIR/captain-miao/`, falling back
-  to `~/.local/state/captain-miao/run/`. macOS reaps `$TMPDIR`, so it cannot host
-  long-lived runtime sockets. ssh's `ssh_sock_dir` is the documented exception.
+- Daemon control and pool sockets use `state::daemon_dir()` under the same
+  state root as `server.pid`, independent of `XDG_RUNTIME_DIR`. `daemon ensure`
+  preserves a live lock holder even when unreachable; only explicit stop can
+  terminate it. Legacy socket aliases are owned by `daemon_compat`.
+- Launcher and clipboard sockets use `$XDG_RUNTIME_DIR/captain-miao/`, falling
+  back to `~/.local/state/captain-miao/run/`. macOS reaps `$TMPDIR`, so it cannot
+  host long-lived sockets. ssh's `ssh_sock_dir` is the documented exception.
 - Pooled per-session flags are host-owned in `session-flags.json`, separate
   from the launcher's state file; preserve the single-writer rule.
 

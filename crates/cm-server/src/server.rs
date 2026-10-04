@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,9 +71,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const IDLE_GRACE: Duration = Duration::from_secs(300);
 /// How often the idle watchdog samples liveness.
 const IDLE_CHECK: Duration = Duration::from_secs(30);
-/// How often the daemon checks that its control socket still exists on disk
-/// (the logind socket-gone wedge — see [`rebind_if_socket_vanished`]). One
-/// stat, so it can be frequent enough that a reconnect isn't left waiting.
+/// How often the daemon checks that its control socket still exists on disk.
+/// One stat, so a reconnect need not wait long for an accidental unlink to heal.
 const SOCKET_CHECK: Duration = Duration::from_secs(5);
 /// Pause after a failed `accept` so a persistent fd exhaustion can't spin the
 /// serve loop hot while it drains.
@@ -152,111 +151,51 @@ fn daemon_log_path() -> PathBuf {
     state::state_dir().join("logs").join("daemon.log")
 }
 
-/// `daemon ensure`: start the daemon if it isn't running, then serve forever.
-/// Idempotent — a live daemon just gets the socket path printed. Self-daemonizes
-/// so it outlives the ssh session that fired it.
+/// Start an absent daemon, or wait for the lock holder to become reachable.
+/// A failed connection never authorizes killing the process hosting the PTYs.
 fn ensure() -> Result<()> {
-    // Print the socket path *first*, while stdout still reaches the ssh channel
-    // (before `daemonize` redirects it). The dashboard reads this to set up its
-    // `-L` forward. Flush explicitly since we're about to fork.
-    println!("{}", state::server_sock_path().display());
-    let _ = std::io::stdout().flush();
+    let socket = state::server_sock_path();
+    for path in [&socket, &state::pool_socket_path()] {
+        std::os::unix::net::SocketAddr::from_pathname(path)
+            .with_context(|| format!("daemon socket path is too long: {}", path.display()))?;
+    }
+    state::create_dir_all_private(&state::daemon_dir())
+        .context("create private daemon socket directory")?;
 
-    // Acquire the singleton lock BEFORE forking. An `flock` on the pid file is the
-    // atomic gate that closes the check-then-bind race between two concurrent
-    // `ensure`s (a mere `running_pid()` read would let both pass and both bind,
-    // the second stealing the socket). If held, a daemon is up/starting → this is
-    // the idempotent no-op (path already printed). The lock lives on the open file
-    // description, so it rides the daemonize forks into the grandchild and is held
-    // for the daemon's life (released only when `lock` drops on a clean exit).
-    let Some(lock) = acquire_singleton_lock() else {
-        // A live daemon holds the lock — the idempotent no-op. Unless it's
-        // *wedged*: systemd-logind removes `/run/user/<uid>` on last logout
-        // (without `loginctl enable-linger`), which unlinks the control socket
-        // out from under a daemon that survives holding the deleted inode and
-        // the flock. It then answers nothing forever while `ensure` keeps
-        // printing a socket path nothing binds. Detect that (lock held, socket
-        // unreachable) and clear it, so the next `ensure` — the reconnect loop
-        // fires one per attempt — starts a working daemon.
-        if !heal_wedged_daemon() {
-            eprintln!("captain-miao daemon already running");
+    let deadline = Instant::now() + DAEMON_READY_GRACE;
+    loop {
+        // Recheck the lock while waiting: a daemon may exit naturally, in
+        // which case starting a replacement is safe. Permission/I/O errors
+        // are errors, not evidence that another process holds the lock.
+        if let Some(lock) = acquire_singleton_lock()? {
+            println!("{}", socket.display());
+            std::io::stdout().flush()?;
+            return run_daemon(lock);
+        }
+        if let Some(pid) = running_pid()
+            && (crate::daemon_compat::sockets_belong_to(&state::daemon_dir(), pid)
+                || crate::daemon_compat::link_sockets(pid)?)
+        {
+            println!("{}", socket.display());
             return Ok(());
         }
-        // The wedged daemon is gone; fall through and take the lock ourselves.
-        let Some(lock) = acquire_singleton_lock() else {
-            eprintln!("captain-miao daemon already running");
-            return Ok(());
-        };
-        return run_daemon(lock);
-    };
-    run_daemon(lock)
-}
-
-/// Whether the daemon's control socket currently accepts a connection. A bare
-/// connect is enough — it's our own 0600 socket in a 0700 dir, so anything that
-/// answers there is the daemon.
-fn control_socket_is_live() -> bool {
-    std::os::unix::net::UnixStream::connect(state::server_sock_path()).is_ok()
-}
-
-/// Recover from the **socket-gone wedge**: a daemon that still holds the
-/// singleton lock but whose control socket no longer exists. systemd-logind
-/// removes `/run/user/<uid>` on last logout unless the user has
-/// `loginctl enable-linger`, taking the socket (and the pool socket) with it
-/// while the daemon itself survives — holding deleted inodes and the flock —
-/// so every later `daemon ensure` no-ops and prints a path nothing binds.
-///
-/// The daemon rebinds itself when the runtime dir comes back (see
-/// [`rebind_if_socket_vanished`]), so first give it a grace window to do that:
-/// a rebind keeps every pooled session alive, which killing would not. Only if
-/// it is *still* unreachable do we SIGTERM it and report that the lock is free
-/// for a fresh daemon. Returns whether the caller should now try to start one.
-fn heal_wedged_daemon() -> bool {
-    if control_socket_is_live() {
-        return false;
-    }
-    let Some(pid) = running_pid() else {
-        // Lock held but no live pid on file: whoever holds it is mid-startup.
-        return false;
-    };
-    // Grace: the holder may be a daemon still binding, or one about to rebind.
-    let deadline = Instant::now() + WEDGE_GRACE;
-    while Instant::now() < deadline {
+        if Instant::now() >= deadline {
+            bail!(
+                "daemon holds the singleton lock but its sockets are unavailable at {}; \
+                 leaving the daemon and its sessions running. Retry after it recovers, or \
+                 explicitly run `miao-server daemon stop` (add --force only to end live sessions)",
+                state::daemon_dir().display()
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
-        if control_socket_is_live() {
-            return false;
-        }
     }
-    tracing::warn!(
-        "daemon pid {pid} holds the lock but its control socket is unreachable \
-         (runtime dir removed? see `loginctl enable-linger`); restarting it"
-    );
-    eprintln!(
-        "captain-miao: daemon pid {pid} is wedged (control socket gone); restarting it. \
-         Run `loginctl enable-linger` to stop the runtime dir being removed at logout."
-    );
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    // Wait for it to release the flock so our own acquire can succeed.
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        if !state::is_process_alive(pid) {
-            return true;
-        }
-    }
-    // Still alive after 5s — SIGKILL, then give the kernel a moment to reap it.
-    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    std::thread::sleep(Duration::from_millis(300));
-    true
 }
 
-/// How long a lock-holding daemon with an unreachable socket is given to come
-/// back (bind, or rebind after the runtime dir returns) before it's restarted.
-/// Cover a complete socket-check interval plus scheduling margin: killing it
-/// sooner can destroy healthy pooled sessions just before their next rebind.
-const WEDGE_GRACE: Duration = Duration::from_secs(SOCKET_CHECK.as_secs() + 2);
+/// Cover a complete socket-check interval plus scheduling margin. Expiry
+/// reports an unavailable daemon; it never escalates to a signal.
+const DAEMON_READY_GRACE: Duration = Duration::from_secs(SOCKET_CHECK.as_secs() + 2);
 
-/// Daemonize, set the process up, and serve forever. Split from [`ensure`] so
-/// the wedge-recovery path can re-enter it with a freshly acquired lock.
+/// Daemonize with the singleton lock held through the entire process lifetime.
 fn run_daemon(lock: std::fs::File) -> Result<()> {
     // Detach from the ssh session so the daemon survives its disconnect. Returns
     // only in the final grandchild; the parent (which the ssh command awaits) and
@@ -305,22 +244,27 @@ fn run_daemon(lock: std::fs::File) -> Result<()> {
 /// it. The lock is associated with the open file description, so it survives the
 /// daemonize forks (the grandchild inherits the fd) and releases when the returned
 /// handle finally drops (a clean daemon exit) or the process dies.
-fn acquire_singleton_lock() -> Option<std::fs::File> {
+fn acquire_singleton_lock() -> Result<Option<std::fs::File>> {
     let path = state::server_pid_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    state::create_dir_all_private(&state::state_dir())?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        // Don't truncate: the pid content is written separately, and truncating
-        // would race a concurrent holder's content.
+        .mode(0o600)
+        // Never truncate or replace this inode: the flock is held on it.
         .truncate(false)
         .open(&path)
-        .ok()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    (rc == 0).then_some(file)
+        .with_context(|| format!("open daemon lock {}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error).context("acquire daemon singleton lock")
+    }
 }
 
 /// Sessions hosted in *this daemon's pty pool* (those carrying a `pool_session`),
@@ -772,14 +716,8 @@ fn build_server_core() -> LocalBackend {
 /// the host can't connect (mirrors the launcher socket). Any stale socket file
 /// is cleared first — a SIGKILLed daemon never unlinks its own.
 fn bind_control_socket(sock_path: &Path) -> Result<UnixListener> {
-    if let Some(parent) = sock_path.parent()
-        && std::fs::DirBuilder::new()
-            .recursive(false)
-            .mode(0o700)
-            .create(parent)
-            .is_err()
-    {
-        std::fs::create_dir_all(parent).ok();
+    if let Some(parent) = sock_path.parent() {
+        state::create_dir_all_private(parent).context("create daemon socket directory")?;
     }
     let _ = std::fs::remove_file(sock_path);
     let listener =
@@ -788,19 +726,9 @@ fn bind_control_socket(sock_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Re-bind the control socket if its path no longer exists — the **socket-gone
-/// wedge** seen from the daemon's side. systemd-logind removes
-/// `/run/user/<uid>` at last logout unless the user has `loginctl
-/// enable-linger`; the daemon survives, but its listener now refers to a
-/// deleted inode that nothing can dial, so it would answer nothing forever
-/// while `daemon ensure` kept printing a path nothing binds.
-///
-/// Rebinding here is strictly better than the `ensure`-side restart
-/// ([`heal_wedged_daemon`], the backstop): the pty pool lives in *this*
-/// process, so every pooled session survives. It only succeeds once the
-/// runtime dir is back (a non-root user can't recreate `/run/user/<uid>`
-/// itself), which is exactly the next login — until then the tick is a cheap
-/// stat that fails and retries.
+/// Restore an accidentally removed control socket without disturbing the pool.
+/// The daemon directory no longer lives under the login session's runtime
+/// directory. If a rebind fails, `ensure` reports the failure without killing us.
 fn rebind_if_socket_vanished(sock_path: &Path) -> Option<UnixListener> {
     if sock_path.exists() {
         return None;
@@ -808,8 +736,7 @@ fn rebind_if_socket_vanished(sock_path: &Path) -> Option<UnixListener> {
     match bind_control_socket(sock_path) {
         Ok(l) => {
             tracing::warn!(
-                "control socket {} had vanished (runtime dir removed?); rebound it. \
-                 `loginctl enable-linger` prevents this",
+                "control socket {} had vanished; rebound it without restarting the daemon",
                 sock_path.display()
             );
             Some(l)
@@ -1462,6 +1389,22 @@ mod tests {
     async fn pending_cleanup_allows_updates_requests_and_fragmented_frames() {
         use cm_core::agents::codex::CodexMode;
         use tokio::io::AsyncWriteExt;
+        const TEST: &str =
+            "server::tests::pending_cleanup_allows_updates_requests_and_fragmented_frames";
+        if std::env::var_os("CM_TEST_PENDING_CLEANUP").is_none() {
+            let root = tempfile::tempdir_in("/tmp").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("CM_TEST_PENDING_CLEANUP", "1")
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated cleanup test failed");
+            return;
+        }
         state::ensure_sessions_dir().unwrap();
         let mut row = LauncherState::for_test(AgentControl::Codex, state::SessionStatus::Idle);
         row.launcher_pid = std::process::id();

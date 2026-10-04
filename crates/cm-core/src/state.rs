@@ -10,10 +10,10 @@
 //! is `0700` and every JSON file `0600`. That is why writes go through
 //! [`create_dir_all_private`] and [`write_json_atomic`] and never `fs::write`:
 //! the mode is applied by the helper, so a new call site cannot forget it.
-//! Runtime sockets live under `$XDG_RUNTIME_DIR`, falling back to a state
-//! subdirectory where that is unset (macOS) — never `$TMPDIR`, which macOS
-//! reaps out from under a long-lived session. [`ssh_sock_dir`] documents the
-//! one exception.
+//! Daemon sockets always live in [`daemon_dir`], alongside their lock's state
+//! root. Launcher and clipboard sockets use `$XDG_RUNTIME_DIR`, falling back
+//! to that state subdirectory where unset (macOS) — never `$TMPDIR`, which
+//! macOS reaps during long-lived sessions. [`ssh_sock_dir`] is the exception.
 //!
 //! All of it is safe to delete; each file regenerates or resets.
 //!
@@ -178,7 +178,15 @@ pub fn server_pid_path() -> PathBuf {
 /// The per-host server's control socket. A remote dashboard reaches it by
 /// forwarding this path over ssh; a local one connects to it directly.
 pub fn server_sock_path() -> PathBuf {
-    runtime_dir().join("server.sock")
+    daemon_dir().join("server.sock")
+}
+
+/// Shared daemon sockets and pool configuration, beside the singleton lock in
+/// the state tree. All callers using that lock must choose the same sockets,
+/// even when SSH and local login sessions disagree about `XDG_RUNTIME_DIR`.
+/// Launcher and clipboard sockets still use [`runtime_dir`].
+pub fn daemon_dir() -> PathBuf {
+    state_dir().join("run")
 }
 
 /// captain-miao's private pty-pool socket. A dedicated path (not shpool's
@@ -187,7 +195,7 @@ pub fn server_sock_path() -> PathBuf {
 /// binds it) and the client (which lists/attaches over it) can't drift on the
 /// path.
 pub fn pool_socket_path() -> PathBuf {
-    runtime_dir().join("pty-pool.sock")
+    daemon_dir().join("pty-pool.sock")
 }
 
 /// The base dir for ssh control/forward sockets, kept as short as possible.

@@ -27,7 +27,7 @@ impl Daemon {
     }
 
     fn socket(&self) -> PathBuf {
-        self.0.path().join("run/captain-miao/server.sock")
+        self.0.path().join("state/captain-miao/run/server.sock")
     }
 
     fn pid(&self) -> String {

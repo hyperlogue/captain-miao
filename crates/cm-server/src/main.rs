@@ -4,6 +4,7 @@
 //! ssh; it never drives a terminal, so there is no Kitty gate. All the shared
 //! logic (state, protocol, agents, launcher, hooks) lives in `cm-core`.
 
+mod daemon_compat;
 #[cfg(feature = "pty-pool")]
 mod pty_pool;
 mod server;

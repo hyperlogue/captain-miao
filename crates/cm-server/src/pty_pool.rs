@@ -64,7 +64,7 @@ const POOL_CONFIG: &str = "session_restore_mode = \"simple\"\nkeybinding = []\n"
 /// next to the pool socket in the per-user runtime dir; regenerated on every
 /// daemon start, so it's safe to lose across reboots.
 fn pool_config_path() -> PathBuf {
-    crate::state::runtime_dir().join("pool-config.toml")
+    crate::state::daemon_dir().join("pool-config.toml")
 }
 
 /// Write [`POOL_CONFIG`] to [`pool_config_path`] and return the path (to pass
@@ -118,7 +118,7 @@ fn attach_config_body(names: &[String]) -> String {
 /// (`attach-config-<name>.toml`) so two concurrent attaches to different
 /// sessions never race on one file, and regenerated on every attach.
 fn attach_config_path(name: &str) -> PathBuf {
-    crate::state::runtime_dir().join(format!("attach-config-{name}.toml"))
+    crate::state::daemon_dir().join(format!("attach-config-{name}.toml"))
 }
 
 /// Write [`attach_config_body`] to [`attach_config_path`] and return the path
@@ -127,8 +127,7 @@ fn attach_config_path(name: &str) -> PathBuf {
 /// no env is forwarded.
 ///
 /// `0600` via [`cm_core::state::write_private`], like the rest of the state
-/// tree — `runtime_dir()` falls back *into* that tree where `XDG_RUNTIME_DIR`
-/// is unset, and this file lists the environment variables a session forwards,
+/// tree. This file lists the environment variables a session forwards,
 /// which on a shared host tells every other local user which secrets are in
 /// play.
 fn write_attach_config(name: &str, names: &[String]) -> Result<String> {
@@ -218,7 +217,7 @@ fn run_shpool_with(
 ///
 /// Deduplicated at the entrypoint itself (not only via
 /// `server_pool::ensure_daemon`): **at most one pty-daemon per user**. The pool
-/// socket lives in the per-user `runtime_dir()` (`$XDG_RUNTIME_DIR`, 0700), so a
+/// socket lives in the private [`crate::state::daemon_dir`] (0700), so a
 /// single live socket there *is* the per-user singleton. If one already answers
 /// we no-op; libshpool's own bind is the final backstop against a cold-start
 /// race.

@@ -569,8 +569,20 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
   `cargo xtask dist` bundles servers into the binary (`--list` shows the
   variants); carrying none for a host, it offers to download the published one.
   `miao --version` reports what a binary carries.
+  Its control and pool sockets live under `~/.local/state/captain-miao/run/`
+  (or `$XDG_STATE_HOME/captain-miao/run/`), so local and SSH connections agree
+  even when their `XDG_RUNTIME_DIR` differs. `daemon ensure` waits briefly for
+  an unavailable daemon and then reports an error, preserving its sessions.
+  Retry after recovery, or explicitly stop it with `miao-server daemon stop`;
+  `--force` is required when that would end live pooled sessions.
+  On upgrade, `daemon ensure` can link the fixed paths to an older daemon's
+  verified live sockets, keeping its sessions running until a planned restart.
+  Update both the server on `PATH` and any deployed copy used by your clients:
+  older `daemon ensure` binaries still contain the destructive recovery logic.
 - **Run `loginctl enable-linger "$USER"`** on any Linux host running the daemon,
-  or systemd-logind takes its sockets away at your last logout.
+  to protect session runtime directories at logout. Daemon sockets now live in
+  the state tree, but launcher and clipboard sockets still use the runtime
+  directory, and host logout policies can terminate processes.
 
 #### Pasting a screenshot into a remote session
 
@@ -631,7 +643,7 @@ captain-miao is built around a strict unidirectional data flow:
 - **Hooks** are thin forwarders: they parse the agent's hook payload from stdin and send it to the launcher socket.
 - The **dashboard** is a pure viewer. It watches the session state directory and per-backend transcript dirs with `notify` (FSEvents on macOS, inotify on Linux) and re-reads files when they change. It performs no IPC of its own.
 
-State lives under `~/.local/state/captain-miao/` and runtime sockets under `$XDG_RUNTIME_DIR/captain-miao/`, both owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For implementation rules and architecture references, see [AGENTS.md](AGENTS.md).
+State lives under `~/.local/state/captain-miao/`, with daemon control and pool sockets in its `run/` directory. Launcher and clipboard sockets use `$XDG_RUNTIME_DIR/captain-miao/`, falling back to that state `run/` directory. These directories are owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For implementation rules and architecture references, see [AGENTS.md](AGENTS.md).
 
 ## License
 
