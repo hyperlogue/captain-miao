@@ -5,8 +5,10 @@ name: release
 # then publish the npm packages — the four per-platform binary packages FIRST,
 # then the launcher that pins them. That order matters: a user must never resolve
 # a launcher whose platform dependency isn't on the registry yet.
-# Each publication phase has its own job: use "Re-run failed jobs" to resume
-# after a failure without rebuilding or repeating successful publication jobs.
+# One publish job shares a single `release` environment approval. "Re-run failed
+# jobs" leaves an existing GitHub Release untouched and skips published npm
+# versions. It checks for the release before downloading build artifacts, so
+# npm retries still work after those artifacts expire.
 #
 # A pre-release tag (a SemVer `-` suffix, e.g. `v0.2.0-rc.1`) is marked prerelease
 # so it never becomes the repo's "Latest", and goes to npm's `next` dist-tag so
@@ -132,26 +134,52 @@ jobs:
       version: v${{ needs.verify.outputs.version }}
 
   publish:
-    name: publish GitHub release
+    name: publish GitHub release and npm packages
     needs: [verify, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # All publication jobs use the same environment protection. Configure its
+    timeout-minutes: 60
+    # One approval gates GitHub and npm publication. Configure this environment's
     # required reviewers and a tag ruleset on `v*` to gate publication.
     environment: release
     permissions:
       contents: write # create the GitHub Release + upload assets
+      id-token: write # npm trusted publishing and provenance
     env:
       VERSION: ${{ needs.verify.outputs.version }}
+      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # nothing here pushes
 
+      # Only a 404 permits creation. API errors and unfinished drafts must stop
+      # publication rather than treating an unknown state as a missing release.
+      - name: Check for an existing GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" \
+              --include > "$RUNNER_TEMP/release-response"; then
+            if ! sed '1,/^\r*$/d' "$RUNNER_TEMP/release-response" | jq -e '.draft == false' >/dev/null; then
+              echo "::error::v$VERSION is not a published release. Complete or remove its draft before retrying."
+              exit 1
+            fi
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already published — keeping its release and assets unchanged."
+          elif grep -q '^HTTP/[^ ]* 404' "$RUNNER_TEMP/release-response"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not check the GitHub Release; refusing to publish."
+            exit 1
+          fi
+
       # `pattern` scopes the download to the build matrix's own artifacts, so a
       # stray artifact uploaded by some future job in this run can't ride along
       # into the release assets or the npm packages.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.release.outputs.exists == 'false'
         with:
           pattern: captain-miao-*
           path: artifacts
@@ -162,6 +190,7 @@ jobs:
       # already proved this section exists and is non-empty, so this can't
       # silently produce a blank release page.
       - name: Extract the release notes from CHANGELOG.md
+        if: steps.release.outputs.exists == 'false'
         run: |
           set -euo pipefail
           awk -v v="$VERSION" '
@@ -173,49 +202,37 @@ jobs:
           echo "--- release notes ---"
           cat "$RUNNER_TEMP/relnotes.md"
 
-      # GitHub Release FIRST: npm jobs consume these published assets, including
-      # on retries. Published immutable assets cannot be replaced; keep existing
-      # files even on a full rerun that rebuilds the binaries.
+      # GitHub Release FIRST: npm consumes these published assets, including on
+      # the first attempt. Existing release notes and assets stay untouched.
       # Globbed by extension so only the intended asset kinds are attached.
-      # generate_release_notes stays on: GitHub appends its auto-generated
-      # commit/contributor list *below* body_path, so the changelog leads and the
-      # mechanical detail follows.
+      # Append GitHub's generated commit/contributor list after the changelog.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          body_path: ${{ runner.temp }}/relnotes.md
-          files: artifacts/*.tar.gz
-          overwrite_files: false
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
-  publish-platforms:
-    name: publish npm platforms
-    needs: [verify, publish]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment: release
-    permissions:
-      contents: read
-      id-token: write # npm trusted publishing and provenance
-    env:
-      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+        if: steps.release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRERELEASE=()
+          [[ "$VERSION" == *-* ]] && PRERELEASE=(--prerelease)
+          gh release create "v$VERSION" artifacts/*.tar.gz --verify-tag \
+            --title "v$VERSION" --notes-file "$RUNNER_TEMP/relnotes.md" \
+            --generate-notes "${PRERELEASE[@]}"
 
       # Use the release's canonical bytes, even if a full rerun rebuilt artifacts.
       - name: Download published dashboard assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release download "v$EXPECT_VERSION" --pattern "miao-v$EXPECT_VERSION-*.tar.gz" --dir artifacts
+        run: |
+          set -euo pipefail
+          # Remove build tarballs first: a missing published asset must not be
+          # silently supplied by a different build left over from this attempt.
+          rm -f artifacts/*.tar.gz
+          gh release download "v$VERSION" --pattern "miao-v$VERSION-*.tar.gz" --dir artifacts
 
       # Unpacks each tarball into dist/npm/<pkg>/ and stamps the launcher's
       # version + optionalDependencies from the Cargo version.
-      - name: Stage npm platform packages
+      - name: Stage npm packages and launcher pins
         run: scripts/stage-npm-packages.sh artifacts
 
       # npm preserves tarball file modes, so a 0644 binary would EACCES on every
@@ -232,16 +249,17 @@ jobs:
             echo "  ok $d"
           done
 
-      # setup-node points npm at the registry. Node 24 for npm >= 11: that's the
-      # floor for Trusted Publishing (OIDC), which this job's `id-token: write`
-      # feeds. Deliberately no NODE_AUTH_TOKEN — npm mints its own short-lived
-      # credential from the id-token, so an empty `_authToken` line in .npmrc is
-      # not a fallback but a failure. An auth error from `npm publish` below means
-      # the registry-side link is missing, not that a secret went stale.
+      # Trusted publishing needs npm >= 11.5.1. Upgrade explicitly rather than
+      # depending on Node's bundled npm. Omit registry-url so setup-node doesn't
+      # write an .npmrc token placeholder that interferes with OIDC.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          registry-url: "https://registry.npmjs.org"
+
+      - name: Use an npm that speaks OIDC
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # Publish the four per-platform binary packages BEFORE the launcher: the
       # launcher's optionalDependencies pin them at this exact version, so a user
@@ -266,38 +284,7 @@ jobs:
             ( cd "$d" && npm publish --provenance --access public --ignore-scripts )
           done
 
-  publish-launcher:
-    name: publish npm launcher
-    needs: [verify, publish-platforms]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: release
-    permissions:
-      contents: read
-      id-token: write # npm trusted publishing and provenance
-    env:
-      EXPECT_VERSION: ${{ needs.verify.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Download published dashboard assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh release download "v$EXPECT_VERSION" --pattern "miao-v$EXPECT_VERSION-*.tar.gz" --dir artifacts
-
-      # Reuse the version/pin authority; this job only publishes the launcher.
-      - name: Stage npm packages and launcher pins
-        run: scripts/stage-npm-packages.sh artifacts
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          registry-url: "https://registry.npmjs.org"
-
-      # npm's read path can lag a successful publish by seconds; wait until all
+      # npm's read path can lag a successful publish by minutes; wait until all
       # four platform packages are visible before publishing the launcher, so the
       # first post-release `npx` can't 404 on a platform dependency. A package
       # still missing after the timeout FAILS the run — publishing the launcher

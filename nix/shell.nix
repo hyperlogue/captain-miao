@@ -26,6 +26,10 @@ in
       # Execute the generated agent forwarders against a controlled hook host.
       nodejs
 
+      # Run release staging and parse the workflow in isolated publication tests.
+      jq
+      yq-go
+
       # `cargo xtask prepare-servers` (and `dist`'s default `--from build`)
       # cross-compiles miao-server for the dashboards that carry one. zig
       # is what makes that work at all: the server pulls in bundled SQLite's C

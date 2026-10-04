@@ -48,11 +48,18 @@ There is no `bundle-*` Cargo feature.
   lacks populated changelog notes. Tags use `v` followed by plain SemVer.
 - Pass GitHub Actions expression values into shell scripts through `env:`.
   No `run:` body may interpolate a `${{ }}` expression.
-- GitHub assets, npm platform packages and the launcher publish in separate
-  jobs. Use **Re-run failed jobs** to resume a failed release; successful jobs
-  stay complete and existing npm versions are skipped. npm jobs stage the
-  published GitHub assets so retries use the same binary bytes.
+- GitHub assets, npm platform packages and the launcher share one `publish`
+  job and one `release` environment approval. Keep the workflow filename and
+  environment name for npm Trusted Publishing. **Re-run failed jobs** checks
+  for the release before downloading build artifacts, leaves published assets
+  and notes untouched, and skips existing npm versions. Only a GitHub 404 permits
+  creation; other lookup failures and unfinished drafts stop publication.
+- npm always stages the published GitHub assets, including on the first attempt.
+  Clear build tarballs before downloading them so a missing asset cannot fall
+  back to rebuilt bytes. Stage once, publish platforms, wait for visibility,
+  then publish the launcher. The publish job never executes release binaries.
 - The launcher waits up to ten minutes for all exact platform pins to become
   visible, revalidating npm metadata on each poll. The deadline includes registry
-  requests. Run `node --test scripts/wait-for-npm-packages.test.mjs` in
-  `nix develop` when changing this wait.
+  requests. Run `node --test scripts/release-workflow.test.mjs
+  scripts/wait-for-npm-packages.test.mjs` in `nix develop` when changing
+  publication; CI runs both suites with fake GitHub/npm commands.

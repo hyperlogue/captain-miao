@@ -100,12 +100,10 @@ while IFS='|' read -r slug target os cpu libc; do
 
     [ -f "$tarball" ] || { echo "error: missing $tarball" >&2; exit 1; }
 
-    # No checksum step here. In CI the tarball arrives via download-artifact,
-    # which verifies the SHA-256 digest upload-artifact recorded — re-checking a
-    # sidecar that travelled with the tarball would prove integrity a second time
-    # and provenance neither time (an attacker who rewrote one would rewrite
-    # both). tar itself is the remaining integrity check: gzip carries a CRC and
-    # a truncated archive fails extraction below.
+    # CI stages published GitHub assets, including on retries. No sidecar
+    # checksum: a file fetched alongside the tarball would not establish its
+    # provenance. tar checks archive integrity: gzip carries a CRC and a
+    # truncated archive fails extraction below.
     mkdir -p "$pkgdir/bin"
     # The tarball holds <tarball-v-target>/miao; --strip-components lands the
     # binary directly in bin/. Extract only the binary — never the README/LICENSE
