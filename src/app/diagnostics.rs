@@ -86,7 +86,7 @@ pub(super) fn session_diagnostics(
             if let Some(key) = keys.primary_key(Command::KillSelected) {
                 add(
                     "Next",
-                    format!("Fix the launch error below; {key}: remove failed session"),
+                    format!("Fix the launch error; {key}: remove failed session"),
                     true,
                 );
             }

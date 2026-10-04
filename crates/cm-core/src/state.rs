@@ -1103,6 +1103,10 @@ pub struct LauncherState {
     pub child_pid: Option<u32>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// When the last error occurred, independent of later session activity.
+    /// Older launchers omit this; readers can fall back to `updated_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<CleanupStatus>,
     /// Session ids this launcher has seen proven to be **subagent children** of
@@ -1271,6 +1275,7 @@ impl LauncherState {
             last_prompt: None,
             child_pid: None,
             last_error: None,
+            last_error_at: None,
             cleanup: None,
             context_tokens: None,
             context_window: None,
@@ -1394,6 +1399,12 @@ impl LauncherState {
     /// session is pooled too, and `pool_session` is then the right token.
     pub fn binding_token(&self) -> Option<&str> {
         self.pool_session.as_deref().or(self.launch_id.as_deref())
+    }
+
+    /// Record or clear an error together with its occurrence time.
+    pub fn set_last_error(&mut self, error: Option<String>) {
+        self.last_error_at = error.as_ref().map(|_| Self::now());
+        self.last_error = error;
     }
 
     pub fn write(&self) -> Result<()> {
@@ -1919,6 +1930,19 @@ mod tests {
             mk(3, Some("cm-claude-1-2")),
         ]);
         assert_eq!(pids, vec![2, 3]);
+    }
+
+    #[test]
+    fn error_timestamps_round_trip_and_old_records_still_decode() {
+        let old = r#"{"launcher_pid":7,"cwd":"/work",
+            "status":"idle","updated_at":42,"last_error":"Failed"}"#;
+        let mut row: LauncherState = serde_json::from_str(old).unwrap();
+        assert_eq!(row.last_error_at, None);
+        row.last_error_at = Some(40);
+        let restored: LauncherState =
+            serde_json::from_value(serde_json::to_value(row.capped()).unwrap()).unwrap();
+        assert_eq!(restored.last_error_at, Some(40));
+        assert_eq!(restored.last_error.as_deref(), Some("Failed"));
     }
 
     /// `term` was added late, so it has to be additive in both directions: a

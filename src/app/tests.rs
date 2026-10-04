@@ -5612,6 +5612,39 @@ fn the_detail_panel_names_the_worktree_a_session_sits_in() {
 }
 
 #[test]
+fn the_detail_panel_hides_old_errors_without_erasing_them() {
+    let mut d = TestDashboard::new(160, 40);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.preview_visible = false;
+    let mut s = session(1, "/work", SessionStatus::Idle);
+    s.set_last_error(Some("Provider unavailable".into()));
+    d.set_sessions(vec![s]);
+
+    let at = d.app.sessions[0].last_error_at.unwrap();
+    assert!(d.app.detail_error(at + 299).is_some());
+    assert!(d.app.detail_error(at + 300).is_none());
+    assert!(d.app.detail_error(at - 1).is_some(), "tolerate clock skew");
+    let out = d.render();
+    assert!(out.contains("Last error"), "{out}");
+    assert!(out.contains("Provider unavailable"), "{out}");
+
+    // Recent unrelated activity must not prolong the old error's visibility.
+    d.app.sessions[0].last_error_at = Some(at - 600);
+    d.app.sessions[0].updated_at = at;
+    let out = d.render();
+    assert!(!out.contains("Last error"), "{out}");
+    assert!(!out.contains("Provider unavailable"), "{out}");
+    assert!(out.contains("Last prompt"), "{out}");
+    assert!(d.app.sessions[0].last_error.is_some());
+
+    // Older launchers supply only the time of the last session update.
+    d.app.sessions[0].last_error_at = None;
+    assert!(d.app.detail_error(at + 299).is_some());
+    assert!(d.app.detail_error(at + 300).is_none());
+}
+
+#[test]
 fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     use crate::state::HostId;
     use ratatui::style::Modifier;

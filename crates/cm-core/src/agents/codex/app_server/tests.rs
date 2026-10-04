@@ -80,7 +80,8 @@ fn inline_and_paginated_history_restore_the_latest_prompt_and_active_turn() {
         let mut turns = vec![
             json!({"id":"old-turn","status":"completed","items":[{
                 "type":"userMessage","content":[{"type":"text","text":"Old prompt"}]
-            }]}),
+            }, {"type":"commandExecution","exitCode":2},
+            {"type":"mcpToolCall","error":{"message":"Old tool error"}}]}),
             json!({"id":"live-turn","status":"inProgress","items":[{
                 "type":"userMessage","content":[{"type":"text","text":"Current prompt"}]
             }]}),
@@ -102,6 +103,11 @@ fn inline_and_paginated_history_restore_the_latest_prompt_and_active_turn() {
         assert_eq!(row.last_prompt.as_deref(), Some("Current prompt"));
         assert_eq!(monitor.turn.as_deref(), Some("live-turn"));
         assert_eq!(row.status, S::Active);
+        assert_eq!(
+            row.last_error, None,
+            "history must not resurrect old errors"
+        );
+        assert_eq!(row.last_error_at, None);
     }
 }
 
@@ -571,6 +577,8 @@ fn live_metadata_updates_and_unloading_are_reflected_without_input() {
         s.last_error.as_deref(),
         Some("Command exited with status 2")
     );
+    assert!(s.last_error_at.is_some());
+    s.last_error_at = Some(1);
     notify(
         &mut m,
         &mut s,
@@ -578,9 +586,11 @@ fn live_metadata_updates_and_unloading_are_reflected_without_input() {
         json!({"threadId":"thread-root","status":{"type":"notLoaded"}}),
     );
     assert_eq!(s.status_label(), "Disconnected");
+    assert_eq!(s.last_error_at, Some(1));
     resume(&mut m, &mut s);
     assert_eq!(s.status_label(), "Idle");
     assert!(s.last_error.is_none());
+    assert!(s.last_error_at.is_none());
     notify(
         &mut m,
         &mut s,

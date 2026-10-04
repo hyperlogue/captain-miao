@@ -223,7 +223,7 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
         HookEvent::PromptSubmit => {
             state.status = SessionStatus::Active;
             state.last_tool = None;
-            state.last_error = None;
+            state.set_last_error(None);
             if let Some(prompt) = msg.prompt {
                 state.last_prompt = Some(prompt);
             }
@@ -255,10 +255,11 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
         HookEvent::StopFailure => {
             state.status = SessionStatus::Idle;
             state.last_tool = None;
-            state.last_error = msg
-                .message
-                .or(msg.raw)
-                .or_else(|| Some("Stop hook failed".to_string()));
+            state.set_last_error(Some(
+                msg.message
+                    .or(msg.raw)
+                    .unwrap_or_else(|| "Stop hook failed".to_string()),
+            ));
         }
         HookEvent::PreCompact => {
             state.status = SessionStatus::Compacting;
@@ -362,6 +363,49 @@ mod tests {
             session_title: session_title.map(str::to_string),
             ..blank()
         }
+    }
+
+    #[test]
+    fn errors_keep_their_occurrence_time_until_replaced_or_cleared() {
+        let mut s = state();
+        let fail = || HookMessage {
+            event: HookEvent::StopFailure,
+            message: Some("Provider unavailable".into()),
+            ..blank()
+        };
+        let before = LauncherState::now();
+        dispatch_default(&mut s, fail());
+        assert_eq!(s.last_error.as_deref(), Some("Provider unavailable"));
+        assert!((before..=LauncherState::now()).contains(&s.last_error_at.unwrap()));
+
+        s.last_error_at = Some(1);
+        dispatch_default(
+            &mut s,
+            HookMessage {
+                event: HookEvent::PreToolUse,
+                ..blank()
+            },
+        );
+        assert_eq!(
+            s.last_error_at,
+            Some(1),
+            "activity must not refresh an error"
+        );
+        dispatch_default(&mut s, fail());
+        assert!(
+            s.last_error_at.unwrap() >= before,
+            "a repeated error is fresh"
+        );
+
+        dispatch_default(
+            &mut s,
+            HookMessage {
+                event: HookEvent::PromptSubmit,
+                ..blank()
+            },
+        );
+        assert_eq!(s.last_error, None);
+        assert_eq!(s.last_error_at, None);
     }
 
     /// A backend that reports its own title needs no title store at all: the

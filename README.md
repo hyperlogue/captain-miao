@@ -340,7 +340,9 @@ server; older dashboards must also update before issuing commands to a new serve
 
 The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead (`↑`) or behind (`↓`), and the working tree (clean, dirty, or mid-operation). That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
 sessions show connection or cleanup information with available recovery keys;
-narrow layouts prioritize those hints. For Codex app-server sessions, a forced
+narrow layouts prioritize those hints. The **Last error** section disappears after
+five minutes; older launchers without an error timestamp use the session's last
+update time. For Codex app-server sessions, a forced
 removal reports whether the thread was missing or the server was unreachable,
 and warns when server-side work could still be running. Results stay in the
 message log (`Space m`). See [Codex lifecycle details](docs/codex-app-server.md).

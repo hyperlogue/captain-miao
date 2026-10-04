@@ -589,6 +589,21 @@ impl App {
     // The detail panel
     // =============================================================================
 
+    pub(super) fn detail_error(&self, now: u64) -> Option<&str> {
+        const MAX_ERROR_AGE_SECS: u64 = 5 * 60;
+        if !self.detail_visible || self.narrow_layout {
+            return None;
+        }
+        let s = self.selected_session_ref()?;
+        let error = s.last_error.as_deref()?;
+        if now.saturating_sub(s.last_error_at.unwrap_or(s.updated_at)) >= MAX_ERROR_AGE_SECS
+            || matches!(&s.cleanup, Some(crate::state::CleanupStatus::Failed { message }) if message == error)
+        {
+            return None;
+        }
+        Some(error)
+    }
+
     fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let narrow = self.narrow_layout;
         self.last_detail_rect = Some(area);
@@ -713,16 +728,14 @@ impl App {
         lines.extend(worktree);
         lines.extend(self.vcs_detail_lines(&s.host, &s.cwd));
 
-        if let Some(err) = &s.last_error
-            && !matches!(&s.cleanup, Some(crate::state::CleanupStatus::Failed { message }) if message == err)
-        {
+        if let Some(err) = self.detail_error(LauncherState::now()) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Last error",
                 Style::default().fg(ui.error_fg).add_modifier(Modifier::DIM),
             )));
             lines.push(Line::from(Span::styled(
-                err.clone(),
+                err.to_string(),
                 Style::default().fg(ui.error_fg),
             )));
         }

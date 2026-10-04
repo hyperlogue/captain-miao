@@ -63,8 +63,9 @@ impl Monitor {
                 self.waiting.clear();
                 state.codex_connected = Some(false);
                 self.idle_between_goal_turns = false;
-                state.last_error =
-                    Some("Codex app-server disconnected; reconnect in the Codex terminal".into());
+                state.set_last_error(Some(
+                    "Codex app-server disconnected; reconnect in the Codex terminal".into(),
+                ));
                 transition(state, SessionStatus::Starting);
             }
             Observation::Client {
@@ -119,7 +120,7 @@ impl Monitor {
                 && !side_fork
                 && (method != "thread/read" || thread["id"].as_str() == state.session_id.as_deref())
             {
-                state.last_error = None;
+                state.set_last_error(None);
                 self.thread(state, thread);
                 if let Some(model) = result["model"].as_str() {
                     state.model = Some(model.into());
@@ -131,7 +132,7 @@ impl Monitor {
                     status(state, &thread["status"]);
                 }
             } else if let Some(error) = value["error"]["message"].as_str() {
-                state.last_error = Some(error.into());
+                state.set_last_error(Some(error.into()));
             }
             return;
         }
@@ -176,18 +177,21 @@ impl Monitor {
             "turn/started" => {
                 self.idle_between_goal_turns = false;
                 self.turn = params["turn"]["id"].as_str().map(str::to_owned);
-                state.last_error = None;
+                state.set_last_error(None);
                 transition(state, SessionStatus::Active);
             }
             "turn/completed" => {
                 self.waiting.clear();
                 self.turn = None;
                 if let Some(error) = params["turn"]["error"]["message"].as_str() {
-                    state.last_error = Some(error.into());
+                    state.set_last_error(Some(error.into()));
                 }
                 transition(state, SessionStatus::Idle);
             }
             "item/started" | "item/completed" => {
+                if method == "item/completed" {
+                    record_item_error(state, &params["item"]);
+                }
                 self.item(state, &params["item"], method == "item/started")
             }
             "item/tool/requestUserInput" | "mcpServer/elicitation/request" => {
@@ -216,7 +220,7 @@ impl Monitor {
             }
             "error" => {
                 if let Some(error) = params["error"]["message"].as_str() {
-                    state.last_error = Some(error.into());
+                    state.set_last_error(Some(error.into()));
                 }
             }
             _ => {}
@@ -294,16 +298,6 @@ impl Monitor {
     }
 
     fn item(&self, state: &mut LauncherState, item: &Value, started: bool) {
-        if !started {
-            if let Some(error) = item["error"]["message"]
-                .as_str()
-                .or_else(|| item["error"].as_str())
-            {
-                state.last_error = Some(error.into());
-            } else if let Some(code) = item["exitCode"].as_i64().filter(|code| *code != 0) {
-                state.last_error = Some(format!("Command exited with status {code}"));
-            }
-        }
         let kind = item["type"].as_str().unwrap_or_default();
         match kind {
             "userMessage" => {
@@ -363,6 +357,19 @@ impl Monitor {
     }
 }
 
+/// Only live completions have a known occurrence time. Replaying a thread's
+/// history must not make its old command failures appear fresh again.
+fn record_item_error(state: &mut LauncherState, item: &Value) {
+    if let Some(error) = item["error"]["message"]
+        .as_str()
+        .or_else(|| item["error"].as_str())
+    {
+        state.set_last_error(Some(error.into()));
+    } else if let Some(code) = item["exitCode"].as_i64().filter(|code| *code != 0) {
+        state.set_last_error(Some(format!("Command exited with status {code}")));
+    }
+}
+
 fn status(state: &mut LauncherState, value: &Value) {
     let next = match value["type"].as_str() {
         Some("idle") => SessionStatus::Idle,
@@ -381,7 +388,7 @@ fn status(state: &mut LauncherState, value: &Value) {
             SessionStatus::Starting
         }
         Some("systemError") => {
-            state.last_error = Some("Codex app-server reported a thread error".into());
+            state.set_last_error(Some("Codex app-server reported a thread error".into()));
             SessionStatus::Starting
         }
         _ => return,

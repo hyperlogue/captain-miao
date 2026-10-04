@@ -164,7 +164,7 @@ pub(crate) async fn supervise(
                     Err(error) => {
                         let message = format!("Codex cleanup failed: {error:#}");
                         tracing::warn!("{message}");
-                        state.last_error = Some(message.clone());
+                        state.set_last_error(Some(message.clone()));
                         state.cleanup = Some(crate::state::CleanupStatus::Failed { message: message.clone() });
                         if !child_live {
                             state.codex_connected = Some(false);

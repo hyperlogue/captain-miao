@@ -2257,6 +2257,7 @@ async fn refresh_preview(
 fn redraw_reasons(
     app: &App,
     last_age_label: &mut Option<String>,
+    last_error_visible: &mut bool,
     last_blink_phase: &mut Option<bool>,
     last_vitals_phase: &mut Option<usize>,
     last_vcs_phase: &mut Option<usize>,
@@ -2268,6 +2269,15 @@ fn redraw_reasons(
     let age_label = app.preview_age_label();
     if age_label != *last_age_label {
         *last_age_label = age_label;
+        redraw = true;
+    }
+
+    // Expire the detail's error even when the session emits no more events.
+    let error_visible = app
+        .detail_error(crate::state::LauncherState::now())
+        .is_some();
+    if error_visible != *last_error_visible {
+        *last_error_visible = error_visible;
         redraw = true;
     }
 
@@ -2380,6 +2390,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let detach_reports_watched = detach_report_watcher.is_some();
     let mut needs_redraw = true;
     let mut last_age_label: Option<String> = None;
+    let mut last_error_visible = false;
     // The connecting cloud's blink phase as last drawn: `None` while nothing is
     // dialing, so the steady state costs no frames at all.
     let mut last_blink_phase: Option<bool> = None;
@@ -2513,6 +2524,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         needs_redraw |= redraw_reasons(
             &app,
             &mut last_age_label,
+            &mut last_error_visible,
             &mut last_blink_phase,
             &mut last_vitals_phase,
             &mut last_vcs_phase,
@@ -3034,6 +3046,36 @@ mod tests {
         app.mark_dirty(super::super::Cursor::HoldIndex);
         app.table_state.select(Some(0));
         app
+    }
+
+    #[test]
+    fn expiring_an_error_redraws_an_otherwise_idle_dashboard() {
+        let mut app = vcs_app();
+        app.detail_visible = true;
+        app.sessions[0].set_last_error(Some("Provider unavailable".into()));
+        let mut age = None;
+        let mut error_visible = false;
+        let mut blink = None;
+        let mut vitals = None;
+        let mut vcs = None;
+        let mut redraw = |app: &App| {
+            redraw_reasons(
+                app,
+                &mut age,
+                &mut error_visible,
+                &mut blink,
+                &mut vitals,
+                &mut vcs,
+            )
+        };
+        assert!(redraw(&app));
+        assert!(!redraw(&app));
+        app.sessions[0].last_error_at = Some(crate::state::LauncherState::now() - 600);
+        assert!(redraw(&app), "expiry needs a frame without another event");
+        assert!(
+            !redraw(&app),
+            "an expired error should cost no further frames"
+        );
     }
 
     #[tokio::test]

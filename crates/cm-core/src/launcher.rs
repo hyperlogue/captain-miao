@@ -126,6 +126,7 @@ pub async fn run(
         last_prompt: None,
         child_pid: None,
         last_error: None,
+        last_error_at: None,
         cleanup: None,
         context_tokens: None,
         context_window: None,
@@ -653,7 +654,7 @@ async fn hold_failed_launch(
     tracing::warn!("launch failed; holding window as FailedToStart: {msg}");
     state.status = SessionStatus::FailedToStart;
     state.codex_control = false;
-    state.last_error = Some(msg);
+    state.set_last_error(Some(msg));
     state.child_pid = None;
     state.active_since = None;
     state.updated_at = LauncherState::now();
