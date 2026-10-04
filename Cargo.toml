@@ -59,6 +59,7 @@ libc = "0.2"
 notify = "8"
 toml = "1.1"
 unicode-width = "0.2"
+unicode-segmentation = "1"
 emojis = "0.9"
 # Encodes raw-RGBA image payloads into kitty graphics-protocol escapes for the
 # header paw + cat.

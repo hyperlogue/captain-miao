@@ -1101,10 +1101,12 @@ fn try_cli_copy(bin: &str, args: &[&str], text: &str) -> Option<std::io::Result<
 /// visible output, so writing it between the key event and the next ratatui
 /// frame doesn't disturb the rendered screen.
 fn emit_osc52(text: &str) -> std::io::Result<()> {
+    write_osc52(&mut std::io::stdout().lock(), text)
+}
+
+fn write_osc52(stdout: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
     use base64::Engine as _;
-    use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let mut stdout = std::io::stdout();
     // OSC 52: ESC ] 52 ; c ; <base64> BEL  — `c` targets the clipboard selection.
     write!(stdout, "\x1b]52;c;{encoded}\x07")?;
     stdout.flush()
@@ -2273,7 +2275,10 @@ fn redraw_reasons(
     last_vitals_phase: &mut Option<usize>,
     last_vcs_phase: &mut Option<usize>,
 ) -> bool {
-    let mut redraw = false;
+    let mut redraw = app
+        .message_view
+        .as_ref()
+        .is_some_and(|v| v.next_tick().is_zero());
     // Redraw when the preview staleness label changes (at most once a
     // minute at its resolution). Nothing else triggers a draw on an
     // otherwise idle dashboard, so the age would freeze on screen.
@@ -2373,6 +2378,9 @@ fn next_wakeup(
     // interval would freeze it between frames.
     if app.vcs_spinner_phase().is_some() {
         poll_timeout = poll_timeout.min(super::draw::VITALS_SPINNER_STEP);
+    }
+    if let Some(view) = &app.message_view {
+        poll_timeout = poll_timeout.min(view.next_tick());
     }
     if let Some(wakeup) = app.notifications.next_wakeup(Instant::now()) {
         poll_timeout = poll_timeout.min(wakeup);
@@ -2967,6 +2975,15 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::VcsPrepare { host, cwd, push } => {
                         prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
                     }
+                    Action::CopyMessageSelection(text) => {
+                        let feedback = match emit_osc52(&text) {
+                            Ok(()) => "Selection sent to clipboard".to_string(),
+                            Err(e) => format!("Copy failed: {e}"),
+                        };
+                        if let Some(view) = app.message_view.as_mut() {
+                            view.copy_feedback = Some(feedback);
+                        }
+                    }
                     Action::CopySessionId(sid) => {
                         match copy_to_clipboard(&sid) {
                             Ok(CopyOutcome::Cli) => {
@@ -3034,6 +3051,20 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_escape_preserves_multiline_unicode_text() {
+        use base64::Engine as _;
+        let text = "first line\nsecond 界e\u{301} line";
+        let mut output = Vec::new();
+        write_osc52(&mut output, text).unwrap();
+        assert!(output.starts_with(b"\x1b]52;c;"));
+        assert!(output.ends_with(b"\x07"));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&output[7..output.len() - 1])
+            .unwrap();
+        assert_eq!(decoded, text.as_bytes());
+    }
 
     fn vcs_app() -> App {
         let mut app = App::new();

@@ -603,6 +603,169 @@ fn the_message_log_opens_at_the_newest_entry() {
     );
 }
 
+fn message_mouse(d: &mut TestDashboard, kind: MouseEventKind, at: (u16, u16)) -> Option<Action> {
+    d.app.handle_mouse(MouseEvent {
+        kind,
+        column: at.0,
+        row: at.1,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn message_panel_distinguishes_severity_and_local_time() {
+    use super::notifications::Level;
+    let mut d = TestDashboard::new(120, 22);
+    for (level, text) in [
+        (Level::Info, "Server connected"),
+        (Level::Warning, "Server version needs attention"),
+        (Level::Error, "Push failed: remote rejected the update"),
+    ] {
+        d.app.notify(level, text.into());
+    }
+    d.app.open_message_log();
+    let out = d.render();
+    assert!(out.contains("TIME (LOCAL)"), "{out}");
+    assert!(out.contains("(-0s)"), "{out}");
+    assert!(out.contains("release to copy"), "{out}");
+    let ui = &crate::config::get().colors.ui;
+    for (label, message, color) in [
+        ("INFO", "Server connected", ui.header_fg),
+        ("WARNING", "Server version", ui.attention_fg),
+        ("ERROR", "Push failed", ui.error_fg),
+    ] {
+        let buffer = d.terminal.backend().buffer();
+        let label_at = find_cell(buffer, label).unwrap();
+        let text_at = find_cell(buffer, message).unwrap();
+        assert_eq!(buffer[label_at].fg, color);
+        assert_eq!(buffer[text_at].fg, color);
+        assert_eq!(label_at.1, text_at.1);
+    }
+}
+
+#[test]
+fn message_panel_handles_empty_and_tiny_viewports() {
+    for (width, height) in [(1, 1), (12, 5), (40, 10), (120, 24)] {
+        let mut d = TestDashboard::new(width, height);
+        d.app.open_message_log();
+        let out = d.render();
+        if width >= 40 {
+            assert!(out.contains("No messages yet"), "{out}");
+        }
+        d.app
+            .set_status("A long failure message with multiple words".into(), true);
+        d.render();
+    }
+}
+
+#[test]
+fn message_mouse_selection_copies_original_text_in_both_directions() {
+    for width in [44, 90, 120] {
+        let mut d = TestDashboard::new(width, 30);
+        let text = "START  a long message with spaces and wide 界 characters that wraps across several rows.\nA second source line END";
+        d.app.set_status(text.into(), false);
+        d.app.open_message_log();
+        let out = d.render();
+        let start = find_cell(d.terminal.backend().buffer(), "START").expect(&out);
+        let end = find_cell(d.terminal.backend().buffer(), "END").expect(&out);
+        let end = (end.0 + 2, end.1);
+        assert!(end.1 > start.1);
+        for (anchor, focus) in [(start, end), (end, start)] {
+            assert!(
+                message_mouse(&mut d, MouseEventKind::Down(MouseButton::Left), anchor).is_none()
+            );
+            assert!(
+                message_mouse(&mut d, MouseEventKind::Drag(MouseButton::Left), focus).is_none()
+            );
+            d.render();
+            assert!(
+                d.terminal.backend().buffer()[start]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            );
+            match message_mouse(&mut d, MouseEventKind::Up(MouseButton::Left), focus) {
+                Some(Action::CopyMessageSelection(copied)) => assert_eq!(copied, text),
+                other => panic!("expected a clipboard action, got {other:?}"),
+            }
+            // A second release must not copy twice.
+            assert!(message_mouse(&mut d, MouseEventKind::Up(MouseButton::Left), focus).is_none());
+        }
+        // A click alone and dragging from metadata must never copy anything.
+        d.click(start.0, start.1);
+        assert!(message_mouse(&mut d, MouseEventKind::Up(MouseButton::Left), start).is_none());
+        d.click(start.0 - 2, start.1);
+        assert!(message_mouse(&mut d, MouseEventKind::Up(MouseButton::Left), end).is_none());
+    }
+}
+
+#[test]
+fn message_selection_handles_graphemes_reflow_and_arrivals() {
+    let mut d = TestDashboard::new(110, 22);
+    d.app.set_status("MARK 界e\u{301}👩‍💻 last".into(), false);
+    d.app.open_message_log();
+    d.render();
+    let (x, y) = find_cell(d.terminal.backend().buffer(), "MARK").unwrap();
+    // Start on the second cell of the wide glyph, finish on the emoji's tail.
+    d.click(x + 6, y);
+    message_mouse(&mut d, MouseEventKind::Drag(MouseButton::Left), (x + 9, y));
+    let action = message_mouse(&mut d, MouseEventKind::Up(MouseButton::Left), (x + 9, y));
+    assert!(matches!(action, Some(Action::CopyMessageSelection(text)) if text == "界e\u{301}👩‍💻"));
+    d.app.set_status("a later message".into(), false);
+    d.terminal.backend_mut().resize(44, 22);
+    d.terminal
+        .resize(ratatui::layout::Rect::new(0, 0, 44, 22))
+        .unwrap();
+    d.render();
+    let (x, y) = find_cell(d.terminal.backend().buffer(), "MARK").unwrap();
+    let buffer = d.terminal.backend().buffer();
+    assert!(
+        !buffer[(x, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    assert!(
+        buffer[(x + 5, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    assert!(
+        buffer[(x + 8, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+}
+
+#[test]
+fn message_wheel_scroll_can_extend_selection_across_entries() {
+    let mut d = TestDashboard::new(100, 16);
+    for i in 0..30 {
+        d.app.set_status(format!("entry {i:02}"), false);
+    }
+    d.app.open_message_log();
+    d.render();
+    d.press(KeyCode::Char('g'));
+    d.render();
+    let start = find_cell(d.terminal.backend().buffer(), "entry 00").unwrap();
+    d.click(start.0, start.1);
+    message_mouse(&mut d, MouseEventKind::ScrollDown, start);
+    let out = d.render();
+    assert!(d.app.message_view.as_ref().unwrap().scroll > 0);
+    let end = find_cell(d.terminal.backend().buffer(), "entry 05").expect(&out);
+    let action = message_mouse(
+        &mut d,
+        MouseEventKind::Up(MouseButton::Left),
+        (end.0 + 7, end.1),
+    );
+    let expected = (0..=5)
+        .map(|i| format!("entry {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(matches!(action, Some(Action::CopyMessageSelection(text)) if text == expected));
+    message_mouse(&mut d, MouseEventKind::ScrollUp, start);
+    d.render();
+    assert_eq!(d.app.message_view.as_ref().unwrap().scroll, 0);
+}
+
 // =============================================================================
 // The preferences overlay
 // =============================================================================

@@ -82,6 +82,9 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        if self.input_mode == InputMode::Messages {
+            return self.handle_message_log_mouse(mouse);
+        }
         if self.notifications.handle_mouse(mouse) {
             if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
                 self.drag = None;
@@ -1196,9 +1199,11 @@ impl App {
         let page = view.rows.saturating_sub(1).max(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.close_message_log(),
-            KeyCode::Down | KeyCode::Char('j') => view.scroll += 1,
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = view.scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
-            KeyCode::PageDown | KeyCode::Char('f') => view.scroll += page,
+            KeyCode::PageDown | KeyCode::Char('f') => {
+                view.scroll = view.scroll.saturating_add(page)
+            }
             KeyCode::PageUp | KeyCode::Char('b') => view.scroll = view.scroll.saturating_sub(page),
             KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
             // Clamped down to the real last page by the draw, which knows the

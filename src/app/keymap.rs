@@ -869,6 +869,7 @@ mod tests {
     fn defaults_build_without_panicking() {
         let km = Keymap::defaults();
         assert_eq!(km.lookup_single(chord("X")), Some(Command::KillSelected));
+        assert_eq!(km.lookup(&[chord("space"), chord("n")]), None);
         assert_eq!(
             km.lookup_single(chord("x")),
             Some(Command::DismissNotification)

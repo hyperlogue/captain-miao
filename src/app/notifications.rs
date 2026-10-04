@@ -266,7 +266,7 @@ impl App {
     }
 
     fn record_notification(&mut self, level: Level, msg: &str) {
-        self.messages.push(msg, level.needs_attention());
+        self.messages.push(msg, level);
         self.status_msg = Some(msg.to_string());
         self.status_is_error = level.needs_attention();
     }

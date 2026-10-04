@@ -341,6 +341,12 @@ the newest notification (`dismiss_notification` in `[keybinds]`). Dismissing
 progress does not cancel the operation; its result still appears. Notifications
 briefly fade from dim to normal on arrival. `Space m` opens their history,
 including the full text of long messages and notifications hidden above the stack.
+The panel distinguishes info, warnings and errors by color and label. Each entry
+shows local ISO 8601 time to the second, its UTC offset, and a single-unit age
+(for example, `(-2h)`). Scroll with the mouse wheel or the pager keys. Drag across
+message text and release to copy through OSC 52; the terminal must permit
+clipboard writes. Copied text retains its original line breaks and excludes
+timestamps, severity labels and display wrapping.
 
 Commands have a 60-second host-side budget, including queueing and cleanup. On
 timeout, the dashboard stops its Git process group and reports an unknown outcome

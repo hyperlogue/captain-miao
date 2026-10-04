@@ -221,6 +221,8 @@ pub(super) enum Action {
     },
     /// Copy the selected session's id to the system clipboard (via OSC 52).
     CopySessionId(String),
+    /// Copy selected message text through the terminal clipboard protocol.
+    CopyMessageSelection(String),
     /// Prepare and run push/pull against fresh checkout status in the background.
     VcsPrepare {
         host: HostId,
@@ -318,6 +320,7 @@ impl Action {
             Action::ConfigureCodex { .. } => "ConfigureCodex",
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
+            Action::CopyMessageSelection(_) => "CopyMessageSelection",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
             Action::AttachAll { .. } => "AttachAll",
             Action::UpgradeHost { .. } => "UpgradeHost",
@@ -1611,7 +1614,7 @@ impl App {
         let mut messages = messages::MessageLog::default();
         let mut notifications = notifications::Notifications::default();
         if let Some(msg) = &status_msg {
-            messages.push(msg, status_is_error);
+            messages.push(msg, notifications::Level::Warning);
             notifications.push(notifications::Level::Warning, msg.clone(), Instant::now());
         }
 
