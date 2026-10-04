@@ -2801,7 +2801,6 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // still alive, else spawn a fresh shell tab and record it.
                         // It never scans for an unrelated shell that happens to
                         // sit in the cwd — only tabs captain-miao created count.
-                        let label = cwd.clone();
                         let key = (host.clone(), cwd.clone());
                         // Ask the host how to open a shell there: in process on
                         // this machine, an `ssh -t <target>` that cds into the
@@ -2849,74 +2848,69 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         } else {
                             None
                         };
-                        let outcome: Result<&'static str, anyhow::Error> =
-                            if let Some(tab_id) = existing {
-                                terminal::get()
-                                    .focus_tab(&tab_id)
-                                    .await
-                                    .map(|_| "Switched to work tab")
-                            } else {
-                                let title = app.work_tab_title(&host, &cwd);
-                                let work_tabs: Vec<_> = app
-                                    .work_tabs
-                                    .values()
-                                    .map(|work| work.tab_id.clone())
-                                    .collect();
-                                match terminal::get()
-                                    .spawn_work_tab(
-                                        SpawnSpec {
-                                            cwd: spawn_cwd.clone(),
-                                            target: SpawnTarget::NewTab,
-                                            command,
-                                            title: Some(title),
-                                            hold: false,
-                                            take_focus: true,
-                                            stack: false,
+                        let outcome: Result<(), anyhow::Error> = if let Some(tab_id) = existing {
+                            terminal::get().focus_tab(&tab_id).await
+                        } else {
+                            let title = app.work_tab_title(&host, &cwd);
+                            let work_tabs: Vec<_> = app
+                                .work_tabs
+                                .values()
+                                .map(|work| work.tab_id.clone())
+                                .collect();
+                            match terminal::get()
+                                .spawn_work_tab(
+                                    SpawnSpec {
+                                        cwd: spawn_cwd.clone(),
+                                        target: SpawnTarget::NewTab,
+                                        command,
+                                        title: Some(title),
+                                        hold: false,
+                                        take_focus: true,
+                                        stack: false,
+                                    },
+                                    &work_tabs,
+                                )
+                                .await
+                            {
+                                Ok(result) => {
+                                    // Record the tab so the next `w` on this cwd
+                                    // switches back. Prefer the tab id the backend
+                                    // returned (zellij prints it — no second
+                                    // snapshot); else resolve the new window's tab
+                                    // from one snapshot (kitty). Best-effort: an
+                                    // unresolved tab just means the next `w`
+                                    // spawns again.
+                                    let tab_id = match result.tab.clone() {
+                                        Some(tab_id) => Some(tab_id),
+                                        None => match &result.window {
+                                            Some(wid) => {
+                                                let tabs = terminal::get()
+                                                    .snapshot()
+                                                    .await
+                                                    .unwrap_or_default();
+                                                crate::terminal::window_tab_map(&tabs)
+                                                    .get(wid)
+                                                    .cloned()
+                                            }
+                                            None => None,
                                         },
-                                        &work_tabs,
-                                    )
-                                    .await
-                                {
-                                    Ok(result) => {
-                                        // Record the tab so the next `w` on this cwd
-                                        // switches back. Prefer the tab id the backend
-                                        // returned (zellij prints it — no second
-                                        // snapshot); else resolve the new window's tab
-                                        // from one snapshot (kitty). Best-effort: an
-                                        // unresolved tab just means the next `w`
-                                        // spawns again.
-                                        let tab_id = match result.tab.clone() {
-                                            Some(tab_id) => Some(tab_id),
-                                            None => match &result.window {
-                                                Some(wid) => {
-                                                    let tabs = terminal::get()
-                                                        .snapshot()
-                                                        .await
-                                                        .unwrap_or_default();
-                                                    crate::terminal::window_tab_map(&tabs)
-                                                        .get(wid)
-                                                        .cloned()
-                                                }
-                                                None => None,
+                                    };
+                                    if let Some(tab_id) = tab_id {
+                                        app.work_tabs.insert(
+                                            key,
+                                            super::WorkTab {
+                                                tab_id,
+                                                window_id: result.window,
                                             },
-                                        };
-                                        if let Some(tab_id) = tab_id {
-                                            app.work_tabs.insert(
-                                                key,
-                                                super::WorkTab {
-                                                    tab_id,
-                                                    window_id: result.window,
-                                                },
-                                            );
-                                        }
-                                        Ok("Opened work tab")
+                                        );
                                     }
-                                    Err(e) => Err(e),
+                                    Ok(())
                                 }
-                            };
-                        match outcome {
-                            Ok(verb) => app.set_status(format!("{verb} in {label}"), false),
-                            Err(e) => app.set_status(format!("Work tab failed: {e}"), true),
+                                Err(e) => Err(e),
+                            }
+                        };
+                        if let Err(e) = outcome {
+                            app.set_status(format!("Work tab failed: {e}"), true);
                         }
                         // Persist the map (a fresh insert above, and/or a stale
                         // entry `live_work_tab` pruned) so a dashboard restart

@@ -360,6 +360,7 @@ message log (`Space m`). See [Codex lifecycle details](docs/codex-app-server.md)
 In Kitty, new work tabs opened with `w` follow the dashboard, `miao:sessions`
 (when present), and earlier work tabs, keeping them together before other tabs.
 Pressing `w` again for the same cwd switches to its existing work tab.
+Opening or switching work tabs only shows a notification if an error occurs.
 
 In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, and `Ctrl-d` drops the highlighted recent directory.
 It opens pointed at the focused session's own workdir when that host's recent list holds it, so a single `Enter` starts a second session alongside the one you were looking at. That choice then follows `Ctrl-h` from host to host: a host that doesn't have the directory falls back to the top of its own list without losing it, so cycling on to one that does lands back on it. Moving the cursor picks a new one.
