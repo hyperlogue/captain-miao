@@ -384,6 +384,7 @@ It opens pointed at the focused session's own workdir when that host's recent li
 ```toml
 [keybinds]
 kill = "delete"                 # move kill from X to Delete
+dismiss_notification = "f8"      # move notification dismissal from x to F8
 jump_attention = ["s", "n"]     # bind two keys to one command
 restart = "space r"             # remap a leader sequence
 toggle_detail = []              # unbind a command
@@ -392,6 +393,11 @@ toggle_detail = []              # unbind a command
 Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
 
 Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
+
+A one-time startup popup explains the change to `X` for killing sessions and
+`x` for dismissing notifications, and shows your active bindings. Press Enter or
+Esc, or click **Got it**, to acknowledge it. The acknowledgement survives restarts;
+your configured `kill` and `dismiss_notification` bindings remain in effect.
 
 Codex can also run through a shared app-server, selected **per execution host**.
 Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix

@@ -64,6 +64,10 @@ impl App {
             self.should_quit = true;
             return None;
         }
+        if self.keybinding_notice.is_some() {
+            self.handle_keybinding_notice_key(key);
+            return None;
+        }
         match self.input_mode {
             InputMode::Normal if self.session_detail => self.handle_session_detail_key(key),
             InputMode::Normal => self.handle_normal_key(key),
@@ -82,6 +86,10 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        if self.keybinding_notice.is_some() {
+            self.handle_keybinding_notice_mouse(mouse);
+            return None;
+        }
         if self.input_mode == InputMode::Messages {
             return self.handle_message_log_mouse(mouse);
         }

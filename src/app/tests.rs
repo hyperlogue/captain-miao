@@ -603,6 +603,166 @@ fn the_message_log_opens_at_the_newest_entry() {
     );
 }
 
+#[test]
+fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() {
+    use super::keybinding_notice::KeybindingNotice;
+    let temp = tempfile::tempdir().unwrap();
+    let receipt = temp.path().join("notice.json");
+    let mut d = TestDashboard::new(100, 24);
+    d.app.input_mode = InputMode::Confirm;
+    d.app.pending_confirm = Some(super::PendingConfirm {
+        prompt: "Restart missing sessions?".into(),
+        action: Action::RestartAll {
+            sessions: Vec::new(),
+        },
+    });
+    d.app.keybinding_notice = KeybindingNotice::load(receipt.clone());
+    let out = d.render();
+    assert!(out.contains("Session shortcuts changed"), "{out}");
+    assert!(out.contains("kill = \"X\""), "{out}");
+    assert!(out.contains("dismiss_notification = \"x\""), "{out}");
+    assert!(!receipt.exists(), "drawing must not acknowledge the notice");
+    for key in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('y')] {
+        assert!(d.press(key).is_none());
+        assert!(d.app.keybinding_notice.is_some());
+        assert!(d.app.pending_confirm.is_some());
+    }
+    assert!(d.press(KeyCode::Enter).is_none());
+    assert!(d.app.keybinding_notice.is_none());
+    assert!(KeybindingNotice::load(receipt).is_none());
+    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    assert!(d.app.pending_confirm.is_some());
+    assert!(matches!(
+        d.press(KeyCode::Enter),
+        Some(Action::RestartAll { .. })
+    ));
+}
+
+#[test]
+fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
+    use super::keybinding_notice::KeybindingNotice;
+    let temp = tempfile::tempdir().unwrap();
+    let receipt = temp.path().join("notice.json");
+    let mut d = TestDashboard::new(100, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app.keybinding_notice = KeybindingNotice::load(receipt.clone());
+    let out = d.render();
+    let selected = d.selected();
+    assert!(d.click(0, 0).is_none());
+    assert_eq!(d.selected(), selected);
+    assert!(d.app.keybinding_notice.is_some());
+    d.press_ctrl(KeyCode::Char('c'));
+    assert!(d.app.should_quit);
+    assert!(
+        !receipt.exists(),
+        "quitting without acknowledgement shows it next time"
+    );
+    d.app.should_quit = false;
+    let at = find_cell(d.terminal.backend().buffer(), "Got it").expect(&out);
+    assert!(d.click(at.0, at.1).is_none());
+    assert!(d.app.keybinding_notice.is_none());
+    assert_eq!(d.selected(), selected);
+    assert!(KeybindingNotice::load(receipt).is_none());
+}
+
+#[test]
+fn shortcut_notice_reports_a_failed_receipt_without_blocking_the_dashboard() {
+    use super::keybinding_notice::KeybindingNotice;
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("file");
+    std::fs::write(&file, "cannot hold a child").unwrap();
+    let mut d = TestDashboard::new(100, 24);
+    d.app.keybinding_notice = KeybindingNotice::load(file.join("notice.json"));
+    d.press(KeyCode::Esc);
+    assert!(d.app.keybinding_notice.is_none());
+    assert!(d.app.status_is_error);
+    assert!(
+        d.app
+            .status_msg
+            .as_deref()
+            .unwrap()
+            .contains("may appear again")
+    );
+}
+
+#[test]
+fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
+    use super::keybinding_notice::KeybindingNotice;
+    use super::keymap::Keymap;
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [keybinds]
+        kill = "delete"
+        dismiss_notification = ["f8", "space d"]
+    "#,
+    )
+    .unwrap();
+    let (keymap, warnings) = Keymap::from_config(&cfg.keybinds);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = TestDashboard::new(100, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app.keymap = keymap;
+    d.app.keybinding_notice = KeybindingNotice::load(temp.path().join("notice.json"));
+    let out = d.render();
+    assert!(out.contains("Del  Kill selected session"), "{out}");
+    assert!(out.contains("F8"), "{out}");
+    assert!(out.contains("Space d"), "{out}");
+    d.press(KeyCode::Esc);
+    d.app.set_status("Visible error".into(), true);
+    assert!(d.press(KeyCode::Char('x')).is_none());
+    assert!(d.press(KeyCode::Char('X')).is_none());
+    let out = d.render();
+    assert!(out.contains("Visible error"), "{out}");
+    assert!(out.contains("F8 dismiss newest"), "{out}");
+    assert!(d.press(KeyCode::F(8)).is_none());
+    assert!(!d.render().contains("Visible error"));
+    d.app.set_status("Second error".into(), true);
+    d.press(KeyCode::Char(' '));
+    assert!(d.press(KeyCode::Char('d')).is_none());
+    assert!(!d.render().contains("Second error"));
+    assert!(matches!(
+        d.press(KeyCode::Delete),
+        Some(Action::KillSession { .. })
+    ));
+}
+
+#[test]
+fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
+    use super::keybinding_notice::KeybindingNotice;
+    use super::keymap::Keymap;
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [keybinds]
+        kill = []
+        dismiss_notification = []
+    "#,
+    )
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    for (width, height) in [(1, 1), (20, 6), (40, 12), (100, 24)] {
+        let mut d = TestDashboard::new(width, height);
+        d.app.keymap = Keymap::from_config(&cfg.keybinds).0;
+        d.app.keybinding_notice = KeybindingNotice::load(temp.path().join("notice.json"));
+        let out = d.render();
+        if width == 100 {
+            assert!(out.contains("Unbound  Kill selected session"), "{out}");
+            assert!(
+                out.contains("Unbound  Dismiss newest notification"),
+                "{out}"
+            );
+        }
+        for _ in 0..20 {
+            d.press(KeyCode::Down);
+            d.render();
+        }
+        for _ in 0..20 {
+            d.press(KeyCode::Up);
+            d.render();
+        }
+    }
+}
+
 fn message_mouse(d: &mut TestDashboard, kind: MouseEventKind, at: (u16, u16)) -> Option<Action> {
     d.app.handle_mouse(MouseEvent {
         kind,

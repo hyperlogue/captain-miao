@@ -35,6 +35,7 @@ mod format;
 mod host_edit;
 mod hosts;
 mod keybind_log;
+mod keybinding_notice;
 mod keymap;
 mod keys;
 mod logo;
@@ -871,6 +872,7 @@ pub(super) struct App {
     pub(super) messages: messages::MessageLog,
     /// Active message-log popup. `Some` iff `input_mode == InputMode::Messages`.
     pub(super) message_view: Option<messages::MessageLogView>,
+    pub(in crate::app) keybinding_notice: Option<keybinding_notice::KeybindingNotice>,
     pub(super) input_mode: InputMode,
     /// The Search-mode (`/`) text buffer: a cursor-aware input with readline
     /// editing, shared with the pickers. Only meaningful while `input_mode ==
@@ -1635,6 +1637,7 @@ impl App {
             notifications,
             messages,
             message_view: None,
+            keybinding_notice: None,
             input_mode: InputMode::Normal,
             search_input: self::picker::TextInput::new(),
             search_filter: None,

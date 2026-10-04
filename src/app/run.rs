@@ -2390,6 +2390,8 @@ fn next_wakeup(
 
 async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let mut app = start_dashboard().await;
+    app.keybinding_notice =
+        super::keybinding_notice::KeybindingNotice::load(state::keybinding_notice_path());
     app.save_session_snapshot();
     let mut inboxes = LoopInboxes::new();
 
