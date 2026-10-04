@@ -2389,9 +2389,23 @@ fn next_wakeup(
 }
 
 async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
+    // reload_sessions writes window bindings, even for an empty dashboard;
+    // inspect prior use before start_dashboard can create that evidence.
+    let keybinding_notice = super::keybinding_notice::KeybindingNotice::for_startup(
+        state::keybinding_notice_path(),
+        &[
+            state::dashboard_overrides_path(),
+            state::window_bindings_path(),
+        ],
+    );
     let mut app = start_dashboard().await;
-    app.keybinding_notice =
-        super::keybinding_notice::KeybindingNotice::load(state::keybinding_notice_path());
+    match keybinding_notice {
+        Ok(notice) => app.keybinding_notice = notice,
+        Err(error) => app.set_status(
+            format!("Could not save shortcut notice state: {error}"),
+            true,
+        ),
+    }
     app.save_session_snapshot();
     let mut inboxes = LoopInboxes::new();
 
