@@ -106,9 +106,12 @@ impl App {
             active(Command::KillSelected, "Kill selected session"),
             active(Command::DismissNotification, "Dismiss newest notification"),
             Line::from(""),
-            Line::styled("Customize [keybinds] in config.toml. Defaults:", muted),
+            Line::styled("Edit these keys in config.toml (defaults shown):", muted),
+            Line::from("[keybinds]"),
             Line::from("kill = \"X\""),
             Line::from("dismiss_notification = \"x\""),
+            Line::from(""),
+            Line::styled("Restart miao to apply your changes.", muted),
         ])
         .wrap(Wrap { trim: false });
         let width = area.width.saturating_sub(2).min(66);
