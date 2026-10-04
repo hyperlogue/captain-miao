@@ -110,7 +110,7 @@ struct LoopInboxes {
     upgrade_tx: tokio::sync::mpsc::UnboundedSender<super::UpgradeReport>,
     /// Kills coming back from the round trip that carried them, for the same
     /// reason the resume list does: a remote `KillSession` is an ssh round trip,
-    /// and running it on the UI thread meant `x` froze the dashboard until the
+    /// and running it on the UI thread meant `X` froze the dashboard until the
     /// host answered — the whole span in which the row it killed sat there
     /// looking alive. The row now goes at the keystroke
     /// (`Backend::presume_killed`) and the answer lands here, where it is either
@@ -865,7 +865,7 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
     }
     match outcome {
         KillOutcome::Signalled => app.set_status("Session terminated".to_string(), false),
-        // Not an error: the row leaving is what `x` was for, and it has.
+        // Not an error: the row leaving is what `X` was for, and it has.
         KillOutcome::AlreadyGone => app.set_status("Session had already ended".to_string(), false),
         KillOutcome::Forced(reason) => {
             use crate::backend::ForcedRemoval;
@@ -1445,7 +1445,7 @@ async fn attach_pool_session(
 /// minus the focus yank: a reconnect restoring five windows must not fight the
 /// user for the cursor.
 /// End the sessions whose windows the user closed, per `[remote]
-/// on_window_close` (`App::pending_session_close`). The same host RPC `x` makes,
+/// on_window_close` (`App::pending_session_close`). The same host RPC `X` makes,
 /// so the host re-resolves the key to a live pid at signal time.
 ///
 /// Only the ones whose `CLOSE_ON_WINDOW_CLOSE_DELAY` is up go out; the rest stay
@@ -1454,7 +1454,7 @@ async fn attach_pool_session(
 ///
 /// Failure is silent by design. The queue is filled from a *report*, which
 /// arrives after the fact and can only ever race the session's own end — a
-/// window closed on a host that has since dropped, or a session `x` already
+/// window closed on a host that has since dropped, or a session `X` already
 /// killed. There is no keypress to answer here and nothing the user could do
 /// about it, so a failed close belongs in the log, not the status line. The
 /// count is worth saying: with the default policy a closed tab full of sessions

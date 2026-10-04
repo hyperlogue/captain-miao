@@ -180,7 +180,8 @@ impl Notifications {
         let ui = &crate::config::get().colors.ui;
         let width = 58.min(area.width.saturating_sub(2));
         let x = area.right() - width - 1;
-        let mut bottom = area.bottom();
+        // Leave one blank row between the stack and the footer.
+        let mut bottom = area.bottom().saturating_sub(1);
         for entry in self.entries.iter().rev() {
             // Reserve a row above the stack for its overflow count.
             let available = bottom.saturating_sub(area.y + 1);
@@ -376,9 +377,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let area = Rect::new(0, 0, width, height);
             terminal
-                .draw(|frame| {
-                    notices.draw(frame, area, Some("Space n".into()), Some("Space m".into()))
-                })
+                .draw(|frame| notices.draw(frame, area, Some("x".into()), Some("Space m".into())))
                 .unwrap();
             for (_, rect) in &notices.hitboxes {
                 assert_eq!(rect.intersection(area), *rect);
@@ -389,6 +388,7 @@ mod tests {
             if width >= 18 {
                 assert!(!notices.hitboxes.is_empty());
                 assert_eq!(notices.hitboxes[0].0, 7);
+                assert_eq!(notices.hitboxes[0].1.bottom(), area.bottom() - 1);
                 assert!(notices.hitboxes.len() < notices.entries.len());
             }
         }

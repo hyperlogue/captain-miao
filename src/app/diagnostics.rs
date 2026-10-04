@@ -129,7 +129,7 @@ mod tests {
         row.codex_connected = Some(false);
         row.codex_control = true;
         let (keys, warnings) = Keymap::from_config(&HashMap::from([
-            ("kill".into(), KeyBinding::One("X".into())),
+            ("kill".into(), KeyBinding::One("delete".into())),
             ("restart".into(), KeyBinding::Many(vec![])),
         ]));
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -139,7 +139,7 @@ mod tests {
             .find(|line| line.label == "Next")
             .unwrap()
             .message;
-        assert!(next.contains("X: remove session"));
+        assert!(next.contains("Del: remove session"));
         assert!(!next.contains("restart saved conversation"));
         row.cleanup = Some(CleanupStatus::Failed {
             message: "cleanup refused".into(),
@@ -148,7 +148,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.message.contains("X: retry Kill"))
+                .any(|line| line.message.contains("Del: retry Kill"))
         );
         assert!(lines.iter().any(|line| line.message == "cleanup refused"));
     }

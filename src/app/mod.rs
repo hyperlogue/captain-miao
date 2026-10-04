@@ -446,7 +446,7 @@ pub(super) struct ResumeLoad {
 /// saying out loud once it lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KillOrigin {
-    /// The user pressed `x`. They are owed an answer, including the one that
+    /// The user pressed `X`. They are owed an answer, including the one that
     /// arrives a round trip after the row already left.
     Asked,
     /// The window-close policy (`[remote] on_window_close`). Silent by design —
@@ -1412,7 +1412,7 @@ pub(crate) const ATTACH_STARTUP_GRACE: Duration = Duration::from_secs(10);
 ///
 /// A queued close is therefore **dropped if the dashboard exits first**, quit
 /// included. That is the right way round: the cost of dropping one is a session
-/// left running, which `x` fixes in a keystroke; the cost of the reverse is a
+/// left running, which `X` fixes in a keystroke; the cost of the reverse is a
 /// terminal quit that ends every session on the host — the exact thing pooling
 /// exists to prevent.
 ///
@@ -3720,7 +3720,7 @@ impl App {
     /// closing the window** (`D` does). A close-without-kill path that skipped
     /// the retire would read as the user's.
     ///
-    /// `x` and restart don't retire, and don't need to: they close the window
+    /// `X` and restart don't retire, and don't need to: they close the window
     /// *because* they are ending that session, so the queued close asks for
     /// exactly what is already happening. It is not merely harmless but the
     /// better of the two orderings — since the kill now goes out optimistically
@@ -3751,7 +3751,7 @@ impl App {
                     config::OnWindowClose::Close => {
                         // The row goes **now**, on the strength of a close that
                         // is decided but not yet due — the same optimism
-                        // `run::start_kill` applies to `x`, moved from when the
+                        // `run::start_kill` applies to `X`, moved from when the
                         // request goes out to when it is settled. What the wait
                         // below guards against is a *quitting terminal*, not a
                         // user who might change their mind, so nothing about it
@@ -3889,7 +3889,7 @@ impl App {
             }
             Some(state::ATTACH_EXIT_STALE) => {
                 // Not a live session any more, so the row is the stale thing —
-                // the same presumption `x` makes, reached by evidence rather
+                // the same presumption `X` makes, reached by evidence rather
                 // than by intent.
                 correct(Backend::presume_killed);
                 format!("{} is no longer a live session", report.token)
@@ -3901,7 +3901,7 @@ impl App {
     /// The `SessionKey` of the pooled session `token` names on `host`, for the
     /// host to re-resolve to a pid at signal time (§the key is opaque here).
     /// `None` once the row is gone — a session that already ended needs no
-    /// ending, which is what makes a report arriving after `x` or a restart a
+    /// ending, which is what makes a report arriving after `X` or a restart a
     /// no-op rather than a signal at a recycled pid.
     fn pooled_session_key(&self, host: &HostId, token: &str) -> Option<state::SessionKey> {
         self.sessions

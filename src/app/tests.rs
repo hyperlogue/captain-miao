@@ -487,8 +487,7 @@ fn status_messages_float_above_the_footer_and_stack() {
     let out = d.render();
     assert!(!out.contains("Launched window 42"), "{out}");
     assert!(out.contains("Push failed"), "{out}");
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('n'));
+    d.press(KeyCode::Char('x'));
     assert!(!d.render().contains("Push failed"));
     assert_eq!(d.app.messages.len(), 2);
 }
@@ -510,6 +509,34 @@ fn notification_close_button_does_not_select_the_obscured_session() {
     d.click(close_x, y);
     assert!(!d.render().contains("Click to dismiss"));
     assert_eq!(d.app.table_state.selected(), before);
+}
+
+#[test]
+fn x_dismisses_the_newest_notification_and_shift_x_closes_the_session() {
+    let mut d = TestDashboard::new(100, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app.set_status("Older failure".into(), true);
+    d.app.set_status("Newest failure".into(), true);
+    let out = d.render();
+    assert!(out.contains("x dismiss newest"), "{out}");
+    assert!(d.press(KeyCode::Char('x')).is_none());
+    let out = d.render();
+    assert!(!out.contains("Newest failure"), "{out}");
+    assert!(out.contains("Older failure"), "{out}");
+
+    // Uppercase X still closes the selected session while a popup is visible.
+    assert!(matches!(
+        d.app
+            .handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+        Some(Action::KillSession { .. })
+    ));
+    assert!(d.render().contains("Older failure"));
+    assert!(d.press(KeyCode::Char('x')).is_none());
+    assert!(!d.render().contains("Older failure"));
+    assert!(
+        d.press(KeyCode::Char('x')).is_none(),
+        "no popup must mean no action"
+    );
 }
 
 /// Every status goes through the shared notification path, so history remains
@@ -535,8 +562,8 @@ fn space_m_opens_the_message_log_and_esc_closes_it() {
     assert!(out.contains("Kill failed"), "{out}");
 
     // A stray key is swallowed by the pager rather than reaching the list
-    // underneath — `x` here must not kill the selected session.
-    d.press(KeyCode::Char('x'));
+    // underneath — `X` here must not kill the selected session.
+    d.press(KeyCode::Char('X'));
     assert_eq!(d.app.input_mode, InputMode::Messages);
 
     d.press(KeyCode::Esc);
@@ -1793,7 +1820,7 @@ fn reap_skips_foreign_terminal_row() {
 #[test]
 fn enter_on_foreign_terminal_row_reports_it() {
     // Enter (focus) on a foreign row sets an explanatory status instead of a
-    // generic no-op; `x` (kill) stays available since it signals by pid.
+    // generic no-op; `X` (kill) stays available since it signals by pid.
     let mut d = TestDashboard::new(120, 10);
     d.app.terminal_identity = Some("kitty:me".into());
     let mut s = session(1, "/home/test/a", SessionStatus::Idle);
@@ -2432,7 +2459,7 @@ fn only_a_user_closed_window_ends_its_session() {
 /// `continue` above the policy.
 ///
 /// That ordering was merely tidy when the report only retired a binding; it is
-/// load-bearing now, and this is what pins it. The same shape protects `x` and
+/// load-bearing now, and this is what pins it. The same shape protects `X` and
 /// restart, which don't retire first but have already ended the session, so
 /// their late 129 finds no row and resolves no key.
 #[test]
@@ -8344,13 +8371,13 @@ fn leader_cancels_on_unknown_key() {
 #[test]
 fn leader_then_unbound_key_does_not_fall_through_to_destructive_command() {
     // Safety: `Space` (a prefix) followed by an unbound key must be swallowed,
-    // never reinterpreted as the single-key command (here `x` = kill).
+    // never reinterpreted as the single-key command (here `X` = kill).
     let mut d = TestDashboard::new(120, 15);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
     d.press(KeyCode::Char(' '));
     assert!(!d.app.pending_prefix.is_empty());
-    let action = d.press(KeyCode::Char('x'));
-    assert!(action.is_none(), "Space x must not kill the session");
+    let action = d.press(KeyCode::Char('X'));
+    assert!(action.is_none(), "Space X must not kill the session");
     assert!(d.app.pending_prefix.is_empty());
 }
 
@@ -8358,7 +8385,11 @@ fn leader_then_unbound_key_does_not_fall_through_to_destructive_command() {
 fn remapped_key_dispatches_and_frees_old_default() {
     use crate::config::KeyBinding;
     let mut cfg = std::collections::HashMap::new();
-    cfg.insert("kill".to_string(), KeyBinding::One("X".to_string()));
+    cfg.insert("kill".to_string(), KeyBinding::One("delete".to_string()));
+    cfg.insert(
+        "dismiss_notification".to_string(),
+        KeyBinding::One("n".to_string()),
+    );
     let (keymap, warnings) = super::keymap::Keymap::from_config(&cfg);
     assert!(warnings.is_empty(), "{warnings:?}");
 
@@ -8366,10 +8397,17 @@ fn remapped_key_dispatches_and_frees_old_default() {
     d.app.keymap = keymap;
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
 
-    // The old default `x` no longer kills.
+    d.app.set_status("Test notification".into(), true);
+    assert!(d.render().contains("n dismiss newest"));
     assert!(d.press(KeyCode::Char('x')).is_none());
-    // The remapped `X` does.
-    match d.press(KeyCode::Char('X')) {
+    assert!(d.render().contains("Test notification"));
+    assert!(d.press(KeyCode::Char('n')).is_none());
+    assert!(!d.render().contains("Test notification"));
+
+    // The old default `X` no longer kills.
+    assert!(d.press(KeyCode::Char('X')).is_none());
+    // The remapped Delete does.
+    match d.press(KeyCode::Delete) {
         Some(Action::KillSession { .. }) => {}
         other => panic!("expected KillSession from remapped key, got {other:?}"),
     }

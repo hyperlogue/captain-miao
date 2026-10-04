@@ -910,14 +910,14 @@ actually *takes* the pty's lock, so its refusal is a transaction's answer —
 authoritative for the instant it happened — where any query about the same
 session is a sample (§10.2). So each one corrects the row it came from: `43`
 presumes the session attached, `44` presumes it killed, both reusing the
-presumption machinery `x` already has. The host says the same thing a round trip
+presumption machinery `X` already has. The host says the same thing a round trip
 later — a refusal fires the pool's `on_busy` hook there, a dead session its
 `Removed` — and that is what ends the presumption. Every other status keeps the
 old text, because for those the window really is the only place the reason
 exists.
 
 **A window the user closed ends its session** — `[remote] on_window_close`,
-default `close`, the same host RPC `x` makes. Closing a window by hand reads as
+default `close`, the same host RPC `X` makes. Closing a window by hand reads as
 "I'm done with this", and the alternative leaves a pooled session running with
 nothing on screen to show for it. `detach` opts out; either way the binding is
 retired, since the policy decides the session's fate, never the window's.
@@ -954,7 +954,7 @@ same distinction the rest of this section turns on — *the attach ended* versus
   own pty dies. It cannot outlive a second of that — no SIGHUP handler, and an
   `event::poll` that fails on a dead pty — so anything still waiting is dropped
   with it. The trade is deliberate: a dropped close leaves a session running,
-  which `x` fixes in a keystroke, where the reverse ends every session on the
+  which `X` fixes in a keystroke, where the reverse ends every session on the
   host. Note this is the *only* guard that is a duration; it is here because the
   question ("is this terminal going away?") has no authoritative answer that
   survives the terminal going away.
@@ -965,7 +965,7 @@ working, not a bug, and the run loop says how many it closed.
 
 **None of that second is on screen.** The row is presumed dead where the close is
 *decided* — `apply_detach_reports`, as the kill is queued — not where the request
-finally goes out, so `presume_killed` moves one step earlier than `x` makes it.
+finally goes out, so `presume_killed` moves one step earlier than `X` makes it.
 The guard is against a quitting terminal, not against a user who might change
 their mind, and a dashboard that dies inside the delay drops the presumption and
 the queued close together. Left visible instead, that second was the whole of
@@ -1082,14 +1082,14 @@ through the identical path.
   tier; Enter re-attaches. The reload's `prune_detached_sessions` treats
   externally-closed windows the same way, minus the intent (gated on
   `has_remote()` + an interval floor).
-- **KILL** (`x`): `KillSession{key}` → the host resolves the key to a live pid
+- **KILL** (`X`): `KillSession{key}` → the host resolves the key to a live pid
   and SIGTERMs the agent → launcher tears down, removes its state file →
   `Removed` push → row gone. Later the session shows in that host's resumable
   list; resuming is OPEN with `resume: Some(…)`.
 
   **The row leaves at the keystroke, not at the `Removed`.** That whole chain is
   an ssh round trip plus a process teardown, and it used to run on the UI thread
-  — so `x` froze the dashboard for its duration with the row it was killing
+  — so `X` froze the dashboard for its duration with the row it was killing
   still sitting there. `start_kill` now marks the key *presumed dead* before the
   request goes out (hidden from `Remote::list_sessions`) and makes the call from
   a pool thread. The same applies to the window-close policy below, which is the
@@ -1553,7 +1553,7 @@ decides what they mean**.
   cross-host browser) is gone**: the table covers running and `r` covers
   resumable. A cross-host search can come back if it's actually missed.
 - **`D` detach** — a *pooled* concept (close the attach window, keep the
-  session; contrast `x` kill), keyed on the capability rather than on locality
+  session; contrast `X` kill), keyed on the capability rather than on locality
   so it works under pooled-localhost too.
 - **`Space s` steal** — attach, kicking whatever client holds the session,
   behind a y/N confirm. Skipped when the host's attached-bit overlay says the

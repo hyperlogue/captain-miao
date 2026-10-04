@@ -285,7 +285,7 @@ impl App {
         // Completing or extending a leader/prefix sequence (e.g. `Space e`,
         // `Space v p`). A key that continues a longer binding waits. On a miss
         // the key is swallowed — this is what keeps `Space` + an unbound key
-        // from falling through to a destructive single-key command like `x`.
+        // from falling through to a destructive single-key command like `X`.
         // A sequence that is both a complete binding and a prefix of a longer
         // one extends; the shorter command is unreachable.
         if !pending_prefix.is_empty() {
@@ -477,7 +477,7 @@ impl App {
                 let s = self.selected_session()?;
                 // Detach only makes sense for a **pooled** session we're
                 // attached to: an unpooled session *is* its window, so closing
-                // it would lose the session — that's `x`. Keyed on the *row*
+                // it would lose the session — that's `X`. Keyed on the *row*
                 // rather than on its host's `pooled` capability, because those
                 // two answers come apart on this machine: a direct-local
                 // dashboard pools nothing itself, yet still lists the sessions
@@ -486,10 +486,12 @@ impl App {
                 // the pooled session running; the row stays and Enter
                 // re-attaches.
                 let Some(token) = s.pool_session.clone() else {
-                    self.set_status(
-                        "Detach is for pooled sessions; use x to kill a local one".to_string(),
-                        true,
-                    );
+                    let hint = self
+                        .keymap
+                        .primary_key(Command::KillSelected)
+                        .map(|key| format!("; use {key} to kill a local one"))
+                        .unwrap_or_default();
+                    self.set_status(format!("Detach is for pooled sessions{hint}"), true);
                     return None;
                 };
                 match self.window_id_for_session(&s) {

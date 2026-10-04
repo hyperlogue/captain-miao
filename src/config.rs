@@ -198,7 +198,7 @@ pub struct Config {
     pub load_warning: Option<String>,
 }
 
-/// One `[keybinds]` value: either a single key string (`kill = "x"`) or a list
+/// One `[keybinds]` value: either a single key string (`kill = "X"`) or a list
 /// of alternates (`next = ["j", "down", "ctrl+n"]`). An empty list unbinds the
 /// command.
 #[derive(Debug, Clone, Deserialize)]

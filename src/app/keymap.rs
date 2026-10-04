@@ -15,7 +15,7 @@
 //! `Space v p`) work via a generic prefix mechanism in `keys.rs`: every proper
 //! prefix of a binding waits for the next key, which either completes a binding,
 //! extends the prefix, or is swallowed (so `Space` + an unbound key never falls
-//! through to a dangerous single-key command like `x`).
+//! through to a dangerous single-key command like `X`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -525,7 +525,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ResumePicker,       &["r"]),
     (Command::ForkSession,        &["f"]),
     (Command::CopySessionId,      &["y"]),
-    (Command::KillSelected,       &["x"]),
+    (Command::KillSelected,       &["X"]),
     (Command::DetachRemote,       &["D"]),
     (Command::MoveToTab,          &["t"]),
     (Command::ShellTab,           &["w"]),
@@ -557,7 +557,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::SessionsLayout,     &[]),
     (Command::ManageHosts,        &["space h"]),
     (Command::MessageLog,         &["space m"]),
-    (Command::DismissNotification, &["space n"]),
+    (Command::DismissNotification, &["x"]),
     (Command::Preferences,        &[",", "space p"]),
 ];
 
@@ -868,7 +868,11 @@ mod tests {
     #[test]
     fn defaults_build_without_panicking() {
         let km = Keymap::defaults();
-        assert_eq!(km.lookup_single(chord("x")), Some(Command::KillSelected));
+        assert_eq!(km.lookup_single(chord("X")), Some(Command::KillSelected));
+        assert_eq!(
+            km.lookup_single(chord("x")),
+            Some(Command::DismissNotification)
+        );
         assert_eq!(
             km.lookup_single(chord("enter")),
             Some(Command::FocusSelected)
@@ -998,13 +1002,20 @@ mod tests {
         let mut cfg = HashMap::new();
         cfg.insert(
             "kill".to_string(),
-            crate::config::KeyBinding::One("X".to_string()),
+            crate::config::KeyBinding::One("delete".to_string()),
         );
         let (km, warnings) = Keymap::from_config(&cfg);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(km.lookup_single(chord("X")), Some(Command::KillSelected));
-        // Old default `x` is freed.
-        assert_eq!(km.lookup_single(chord("x")), None);
+        assert_eq!(
+            km.lookup_single(chord("delete")),
+            Some(Command::KillSelected)
+        );
+        // The kill binding is freed without affecting notification dismissal.
+        assert_eq!(km.lookup_single(chord("X")), None);
+        assert_eq!(
+            km.lookup_single(chord("x")),
+            Some(Command::DismissNotification)
+        );
     }
 
     #[test]

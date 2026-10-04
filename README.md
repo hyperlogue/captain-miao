@@ -286,7 +286,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Enter`                        | Focus the selected session's window, or attach one to a detached session (asking first if another client holds it) |
 | `o` / `O`                      | New session (same cwd / prompt for cwd)                                                                            |
 | `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session                                            |
-| `x` / `D`                      | Kill the selected session / detach from it, leaving it running                                                     |
+| `X` / `D`                      | Kill the selected session / detach from it, leaving it running                                                     |
 | `s`                            | Jump to the next session needing attention                                                                         |
 
 #### Remaining key bindings
@@ -311,7 +311,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — notification history, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
-| `Space n`             | Dismiss the newest notification (or click its `×`)                                                                                                                     |
+| `x`                   | Dismiss the newest notification (or click its `×`)                                                                                                                     |
 | `?`                   | Show the full key list (help overlay)                                                                                                                                      |
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
@@ -336,7 +336,7 @@ lock out other programs using the checkout.
 Dashboard notifications float in the bottom-right corner and stack vertically.
 Git progress updates one popup until the operation finishes. Information and
 successful results disappear after five seconds; warnings and errors stay until
-you dismiss them. Click a popup's `×` to close it, or press `Space n` to dismiss
+you dismiss them. Click a popup's `×` to close it, or press `x` to dismiss
 the newest notification (`dismiss_notification` in `[keybinds]`). Dismissing
 progress does not cancel the operation; its result still appears. Notifications
 briefly fade from dim to normal on arrival. `Space m` opens their history,
@@ -369,7 +369,7 @@ It opens pointed at the focused session's own workdir when that host's recent li
 
 ```toml
 [keybinds]
-kill = "X"                      # move kill from x to X
+kill = "delete"                 # move kill from X to Delete
 jump_attention = ["s", "n"]     # bind two keys to one command
 restart = "space r"             # remap a leader sequence
 toggle_detail = []              # unbind a command
@@ -485,7 +485,7 @@ keybind_log_file = "keybinds.log"
 [keybinds]
 # Remap any Normal-mode command: command-id = "key" or ["key", "alt"]; [] unbinds.
 # command-ids are the Command::id() strings in src/app/keymap.rs (DEFAULTS table).
-# e.g. kill = "X"  /  jump_attention = ["s", "n"]  /  restart = "space r"
+# e.g. kill = "delete"  /  jump_attention = ["s", "n"]  /  restart = "space r"
 ```
 
 Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`kill`, `jump_attention`, `restart`, `toggle_preview`, …).
@@ -515,7 +515,7 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
 - **Detached rows** — running there, no window here — are dimmed and marked 🙈
   when free or 👀 when another client is holding one. `Enter` attaches, `Space A`
   attaches every free one, `Space s` steals a held one.
-- **Closing a session's window ends it**, the same as `x`; set `on_window_close =
+- **Closing a session's window ends it**, the same as `X`; set `on_window_close =
 "detach"` under `[remote]` for the opposite. A window lost to a dropped link
   detaches instead, so a flaky network never costs you a session.
 - **Port forwards** — press `f` on an SSH host to add, edit, duplicate (`y`),
