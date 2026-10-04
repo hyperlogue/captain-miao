@@ -633,7 +633,7 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     assert_eq!(d.app.input_mode, InputMode::Confirm);
     assert!(d.app.pending_confirm.is_some());
     assert!(matches!(
-        d.press(KeyCode::Enter),
+        d.press(KeyCode::Char('y')),
         Some(Action::RestartAll { .. })
     ));
 }
@@ -5673,7 +5673,7 @@ fn leader_which_key_footer_shown() {
 }
 
 #[test]
-fn g_then_other_key_does_not_jump() {
+fn g_then_other_key_cancels_without_running_the_key() {
     let mut d = TestDashboard::new(120, 15);
     d.set_sessions(vec![
         session(1, "/home/test/a", SessionStatus::Active),
@@ -5684,8 +5684,11 @@ fn g_then_other_key_does_not_jump() {
     d.press(KeyCode::Char('j'));
     assert_eq!(d.selected(), Some(1));
 
-    // Press g then j (not gg) — should just navigate down
+    // An unknown g sequence consumes its second key, like a Space sequence.
     d.press(KeyCode::Char('g'));
+    d.press(KeyCode::Char('j'));
+    assert_eq!(d.selected(), Some(1));
+    // The prefix is cleared, so the next standalone j navigates normally.
     d.press(KeyCode::Char('j'));
     assert_eq!(d.selected(), Some(2));
 }
@@ -8968,6 +8971,102 @@ fn ctrl_c_quits_from_any_mode() {
 }
 
 #[test]
+fn unknown_builtin_prefix_sequences_never_fall_through_to_session_actions() {
+    let mut d = TestDashboard::new(80, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    for prefix in ['g', ' '] {
+        assert!(d.press(KeyCode::Char(prefix)).is_none());
+        assert!(d.press(KeyCode::Char('X')).is_none());
+        assert!(!d.app.pending_g);
+        assert!(d.app.pending_prefix.is_empty());
+    }
+    // Subsequent standalone X still works after either sequence cancels.
+    assert!(matches!(
+        d.press(KeyCode::Char('X')),
+        Some(Action::KillSession { .. })
+    ));
+}
+
+#[test]
+fn help_can_reach_every_shortcut_on_an_ordinary_terminal() {
+    let mut d = TestDashboard::new(80, 24);
+    d.press(KeyCode::Char('?'));
+    let out = d.render();
+    assert!(out.contains("Navigation"), "{out}");
+    d.press(KeyCode::Char('G'));
+    let out = d.render();
+    assert!(out.contains("Rebind via [keybinds]"), "{out}");
+    assert!(out.contains("dismiss the newest notification"), "{out}");
+    assert_eq!(d.app.input_mode, InputMode::Help);
+    assert!(d.app.help_scroll > 0);
+    d.press(KeyCode::Home);
+    d.render();
+    assert_eq!(d.app.help_scroll, 0);
+    message_mouse(&mut d, MouseEventKind::ScrollDown, (20, 10));
+    d.render();
+    assert!(d.app.help_scroll > 0);
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char('?'));
+    d.render();
+    assert_eq!(d.app.help_scroll, 0, "reopening starts at the beginning");
+}
+
+#[test]
+fn negative_default_confirmations_need_an_explicit_unmodified_yes() {
+    for key in [
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+    ] {
+        let mut d = TestDashboard::new(80, 24);
+        d.app.input_mode = InputMode::Confirm;
+        d.app.pending_confirm = Some(super::PendingConfirm {
+            prompt: "Restart sessions? [y/N]".into(),
+            action: Action::RestartAll { sessions: vec![] },
+        });
+        let out = d.render();
+        assert!(!out.contains("y/Y/Enter"), "{out}");
+        assert!(out.contains("Enter/Esc"), "{out}");
+        assert!(d.app.handle_key(key).is_none());
+        assert!(d.app.pending_confirm.is_none());
+        assert_eq!(d.app.input_mode, InputMode::Normal);
+    }
+}
+
+#[test]
+fn releasing_or_adding_unbound_modifiers_cannot_execute_session_actions() {
+    use crossterm::event::KeyEventKind;
+    let mut d = TestDashboard::new(80, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    let release = KeyEvent::new_with_kind(
+        KeyCode::Char('X'),
+        KeyModifiers::SHIFT,
+        KeyEventKind::Release,
+    );
+    assert!(d.app.handle_key(release).is_none());
+    assert!(
+        d.app
+            .handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SUPER))
+            .is_none()
+    );
+    assert!(
+        d.app
+            .handle_key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ))
+            .is_none()
+    );
+    assert!(!d.app.should_quit);
+    // An enhanced base-codepoint + Shift event still reaches the capital-X action.
+    assert!(matches!(
+        d.app
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SHIFT)),
+        Some(Action::KillSession { .. })
+    ));
+}
+
+#[test]
 fn help_overlay_opens_and_dismisses() {
     let mut d = TestDashboard::new(120, 30);
     d.press(KeyCode::Char('?'));
@@ -9334,7 +9433,7 @@ fn disconnected_codex_sessions_can_restart_selected_and_all() {
             InputMode::Confirm,
             "Space {key} must allow recovering a disconnected Codex session"
         );
-        let specs = match d.press(KeyCode::Enter) {
+        let specs = match d.press(KeyCode::Char('y')) {
             Some(Action::RestartSession(spec)) => vec![spec],
             Some(Action::RestartAll { sessions }) => sessions,
             other => panic!("expected restart action, got {other:?}"),
@@ -9484,7 +9583,12 @@ fn confirm_dialog_renders_prompt() {
         out.contains("Restart session"),
         "should show restart prompt"
     );
-    assert!(out.contains("y/Y/Enter"), "should show confirm hint");
+    assert!(out.contains("y/Y"), "should show confirm hint");
+    assert!(out.contains("Enter/Esc"), "should show cancellation hint");
+    assert!(
+        !out.contains("y/Y/Enter"),
+        "Enter must not be offered as yes"
+    );
 }
 
 /// `Space E` with all idle sessions queues a RestartAll action whose specs
@@ -9502,7 +9606,7 @@ fn space_shift_e_restarts_all_when_all_idle() {
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Confirm);
 
-    let action = d.press(KeyCode::Enter);
+    let action = d.press(KeyCode::Char('y'));
     match action {
         Some(Action::RestartAll { sessions }) => {
             assert_eq!(sessions.len(), 3);
@@ -9579,7 +9683,7 @@ fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('E'));
     assert_eq!(d.app.input_mode, InputMode::Confirm);
-    match d.press(KeyCode::Enter) {
+    match d.press(KeyCode::Char('y')) {
         Some(Action::RestartAll { sessions }) => assert_eq!(sessions.len(), 3),
         other => panic!("expected RestartAll over all three, got {other:?}"),
     }

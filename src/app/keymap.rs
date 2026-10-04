@@ -7,9 +7,9 @@
 //!
 //! Scope: only Normal-mode commands are remappable. The text-input modes
 //! (Search / Picker / DirEdit / Confirm / Help) keep fixed keys,
-//! as do a handful of structural keys that aren't table-dispatched: `Ctrl-c`
-//! (always quit), the `g g` prefix (jump-to-top), and the digit selectors
-//! `1..9` / `Ctrl-1..9`.
+//! as does `Ctrl-c` (always quit). The structural `g g` prefix (jump-to-top)
+//! and digit selectors `1..9` / `Ctrl-1..9` are built-in fallbacks; explicit
+//! configured bindings take precedence over them.
 //!
 //! A [`KeySeq`] is one, two, or three [`Chord`]s. Longer sequences (e.g. `Space e`,
 //! `Space v p`) work via a generic prefix mechanism in `keys.rs`: every proper
@@ -36,19 +36,22 @@ pub(crate) struct Chord {
 }
 
 impl Chord {
-    fn new(code: KeyCode, mods: KeyModifiers) -> Self {
-        // Keep only the modifiers we dispatch on. Shift is meaningless for a
-        // `Char` (the case already encodes it) and we never bind Super/Hyper/
-        // Meta, so masking here makes a pressed key compare equal to its
-        // parsed binding regardless of how the terminal reports extras.
-        let mut mods = mods & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
-        // Shift is redundant on a `Char` (the case already encodes it) and on
-        // `BackTab` (which *is* Shift+Tab — crossterm delivers it as
-        // `BackTab` + SHIFT, while a parsed `"backtab"` carries no SHIFT).
-        // Strip it in both so a live event compares equal to its binding.
+    fn new(mut code: KeyCode, mut mods: KeyModifiers) -> Self {
+        // Some enhanced events carry the base letter plus Shift instead of an
+        // uppercase codepoint. Normalize those exactly like config strings.
+        if mods.contains(KeyModifiers::SHIFT) {
+            code = match code {
+                KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                    KeyCode::Char(c.to_ascii_uppercase())
+                }
+                KeyCode::Tab => KeyCode::BackTab,
+                other => other,
+            };
+        }
         if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
             mods.remove(KeyModifiers::SHIFT);
         }
+        // Preserve unsupported modifiers: Super+X must never match plain X.
         Self { code, mods }
     }
 
@@ -66,34 +69,28 @@ impl Chord {
             return None;
         }
         // Split modifiers off the front. The final segment is the key; if the
-        // token ends in `+` the key itself is `+` (no split).
+        // token ends in `+` the key itself is `+`, as in `ctrl++`.
         let mut mods = KeyModifiers::NONE;
-        let key_part = if token.ends_with('+') || !token.contains('+') {
-            token
-        } else {
-            let parts: Vec<&str> = token.split('+').collect();
-            let (mod_parts, last) = parts.split_at(parts.len() - 1);
-            for m in mod_parts {
+        let key_part = if let Some((prefix, key)) = token.rsplit_once('+') {
+            let (prefix, key) = if key.is_empty() {
+                (prefix.trim_end_matches('+'), "+")
+            } else {
+                (prefix, key)
+            };
+            for m in prefix.split('+').filter(|m| !m.is_empty()) {
                 match m.trim().to_ascii_lowercase().as_str() {
                     "ctrl" | "control" | "c" => mods |= KeyModifiers::CONTROL,
                     "alt" | "option" | "a" | "meta" | "m" => mods |= KeyModifiers::ALT,
                     "shift" | "s" => mods |= KeyModifiers::SHIFT,
-                    "" => {}
                     _ => return None,
                 }
             }
-            last[0]
+            key
+        } else {
+            token
         };
 
         let code = parse_key_code(key_part)?;
-        // `shift+<letter>` → uppercase letter, so it lands in the same chord as
-        // a bare `O`. `Chord::new` then strips the (now redundant) Shift.
-        if mods.contains(KeyModifiers::SHIFT)
-            && let KeyCode::Char(c) = code
-            && c.is_ascii_alphabetic()
-        {
-            return Some(Self::new(KeyCode::Char(c.to_ascii_uppercase()), mods));
-        }
         Some(Self::new(code, mods))
     }
 
@@ -106,6 +103,9 @@ impl Chord {
         }
         if self.mods.contains(KeyModifiers::ALT) {
             s.push_str("A-");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            s.push_str("S-");
         }
         let body = match self.code {
             KeyCode::Char(' ') => "Space".to_string(),
@@ -513,7 +513,11 @@ impl Command {
 
 /// Default bindings, in display order. The first string per command is its
 /// canonical key; extra strings are alternates (all dispatch to the same
-/// command). These reproduce the dashboard's historical hard-coded keys.
+/// command). Existing assignments and command ids are compatibility contracts:
+/// do not repurpose them for new actions. Add related actions beneath an
+/// existing leader group, keep useful aliases, and leave removed keys vacant.
+/// Navigation uses lowercase letters/arrows; explicit session termination is X;
+/// panel toggles live under Space t and version-control actions under Space v.
 #[rustfmt::skip]
 const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::SelectNext,         &["j", "down", "ctrl+n"]),
@@ -622,7 +626,18 @@ impl Keymap {
             let mut seqs = Vec::new();
             for key in binding.keys() {
                 match KeySeq::parse(key) {
-                    Some(seq) => seqs.push(seq),
+                    Some(seq) => {
+                        if seq.iter().any(|chord| {
+                            chord == Chord::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+                        }) && !(cmd == Command::Quit && seq.len() == 1)
+                        {
+                            warnings.push(format!(
+                                "keybinds.{id}: '{key}' uses Ctrl-c, which is reserved for quit"
+                            ));
+                        } else {
+                            seqs.push(seq);
+                        }
+                    }
                     None => warnings.push(format!("keybinds.{id}: cannot parse key '{key}'")),
                 }
             }
@@ -863,6 +878,73 @@ mod tests {
 
     fn chord(s: &str) -> Chord {
         Chord::parse(s).unwrap()
+    }
+
+    #[test]
+    fn defaults_have_unique_reachable_bindings_and_valid_command_ids() {
+        let (keymap, warnings) = Keymap::from_config(&HashMap::new());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut commands = HashSet::new();
+        let mut sequences = HashSet::new();
+        for (command, keys) in DEFAULTS {
+            assert!(
+                commands.insert(command.id()),
+                "duplicate command {}",
+                command.id()
+            );
+            assert_eq!(Command::from_id(command.id()), Some(*command));
+            for key in *keys {
+                let sequence = KeySeq::parse(key).unwrap();
+                assert!(
+                    sequences.insert(sequence.clone()),
+                    "duplicate default {key}"
+                );
+                assert!(
+                    !keymap.prefixes.contains(&sequence),
+                    "unreachable default {key}"
+                );
+                assert_eq!(keymap.by_seq.get(&sequence), Some(command));
+            }
+        }
+    }
+
+    #[test]
+    fn enhanced_shift_events_and_config_chords_match() {
+        assert_eq!(
+            Chord::from_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SHIFT)),
+            chord("X")
+        );
+        assert_eq!(
+            Chord::from_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            chord("shift+tab")
+        );
+        assert_eq!(chord("shift+tab"), chord("backtab"));
+        assert_eq!(chord("shift+enter").display(), "S-Enter");
+        assert_eq!(chord("ctrl+shift+up").display(), "C-S-↑");
+        assert_eq!(
+            chord("ctrl++"),
+            Chord::from_event(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::CONTROL))
+        );
+        let super_x = Chord::from_event(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SUPER));
+        assert_eq!(Keymap::defaults().lookup_single(super_x), None);
+    }
+
+    #[test]
+    fn config_warns_about_chords_intercepted_by_global_quit() {
+        for key in ["ctrl+c", "space ctrl+c", "ctrl+c x"] {
+            let cfg = HashMap::from([("kill".into(), crate::config::KeyBinding::One(key.into()))]);
+            let (map, warnings) = Keymap::from_config(&cfg);
+            assert!(
+                warnings.iter().any(|w| w.contains("reserved for quit")),
+                "{warnings:?}"
+            );
+            assert_eq!(map.keys_for(Command::KillSelected), None);
+        }
+        let cfg = HashMap::from([(
+            "quit".into(),
+            crate::config::KeyBinding::One("ctrl+c".into()),
+        )]);
+        assert!(Keymap::from_config(&cfg).1.is_empty());
     }
 
     #[test]

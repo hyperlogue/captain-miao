@@ -382,9 +382,9 @@ impl App {
             Line::from(Span::raw(pending.prompt.clone())),
             Line::from(""),
             Line::from(vec![
-                Span::styled("y/Y/Enter ", Style::default().bold()),
+                Span::styled("y/Y ", Style::default().bold()),
                 Span::raw("confirm   "),
-                Span::styled("any other key ", Style::default().bold()),
+                Span::styled("Enter/Esc/other key ", Style::default().bold()),
                 Span::raw("cancel"),
             ]),
         ];
@@ -1403,7 +1403,7 @@ impl App {
     // Help, and the message log
     // =============================================================================
 
-    fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_help(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let popup = centered_rect(70, 90, area);
         clear_overlay(frame, popup);
         let block = Block::default()
@@ -1507,17 +1507,17 @@ impl App {
             cmd(Command::TogglePin),
             cmd(Command::ToggleFollowUp),
             Line::from(""),
-            section("Version control (Space v)"),
+            section("Version control"),
             cmd(Command::VcsPush),
             cmd(Command::VcsPull),
             Line::from(""),
-            section("Toggles (Space t)"),
+            section("Panels"),
             cmd(Command::TogglePreview),
             cmd(Command::ToggleDetail),
             cmd(Command::SessionDetail),
             cmd(Command::ToggleKeepAwake),
             Line::from(""),
-            section("Layout (leader: Space)"),
+            section("Workspace"),
             cmd(Command::EditDir),
         ]);
         let push_if_bound = |lines: &mut Vec<Line>, c: Command| {
@@ -1562,7 +1562,14 @@ impl App {
         ]);
 
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        frame.render_widget(para, inner);
+        self.help_rows = usize::from(inner.height);
+        self.help_scroll = self
+            .help_scroll
+            .min(para.line_count(inner.width).saturating_sub(self.help_rows));
+        frame.render_widget(
+            para.scroll((self.help_scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
     }
 
     // =============================================================================
@@ -1645,7 +1652,12 @@ impl App {
                 }
                 spans
             }
-            InputMode::Help => hint_pair("any key", "dismiss help"),
+            InputMode::Help => {
+                let mut spans = hint_pair("j/k", "scroll");
+                spans.extend(hint_pair("g/G", "top/bottom"));
+                spans.extend(hint_pair("Esc", "close"));
+                spans
+            }
             InputMode::Search => {
                 // Render the buffer with a block cursor at the edit position,
                 // reusing the picker's REVERSED-cursor approach so it tracks
@@ -1733,8 +1745,8 @@ impl App {
                 spans
             }
             InputMode::Confirm => {
-                let mut spans = hint_pair("y/Y/Enter", "confirm");
-                spans.extend(hint_pair("any other key", "cancel"));
+                let mut spans = hint_pair("y/Y", "confirm");
+                spans.extend(hint_pair("Enter/Esc/other", "cancel"));
                 spans
             }
             InputMode::DirEdit => {

@@ -888,6 +888,8 @@ pub(super) struct App {
     pub(super) pending_prefix: Vec<keymap::Chord>,
     /// Configurable Normal-mode keymap, built once from `[keybinds]` config.
     pub(super) keymap: keymap::Keymap,
+    pub(super) help_scroll: usize,
+    pub(super) help_rows: usize,
     /// The backend's `Capabilities`, read once at startup (it's a process-wide
     /// constant) — every consumer reads this cache, never
     /// `terminal::get().capabilities()` again. `move_to_tab` gates the `t`
@@ -1644,6 +1646,8 @@ impl App {
             pending_g: false,
             pending_prefix: Vec::new(),
             keymap,
+            help_scroll: 0,
+            help_rows: 0,
             capabilities: crate::terminal::get().capabilities(),
             new_session_agent: AgentControl::from_cli(&cfg.launcher.default_agent)
                 .unwrap_or_default(),

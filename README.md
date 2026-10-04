@@ -286,7 +286,7 @@ heavily-evolved fork of pi, and is hooked with a generated extension passed as
 
 ### Key bindings
 
-Press `?` in the dashboard for the complete list. The six you'll reach for most:
+Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/Down, `g`/`G`, or the mouse wheel. The six you'll reach for most:
 
 | Key                            | Action                                                                                                             |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
@@ -312,10 +312,11 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `Space t v` / `Space t d` | Toggle the preview / detail panel                                                                                                                                          |
 | `Space t s`           | Session record — pid, terminfo, context, updated, and the first prompt (`Esc` closes)                                                                                      |
 | `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
+| `Space v p` / `Space v l` | Push / pull (fast-forward only)                                                                                                                                       |
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space t z`           | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
 | `,` (Agents) / `Space h` | Reorder agents / hosts to choose the default for new sessions                                                                                                                    |
-| `Space l`             | Switch session layout (stacked in one tab / one tab per session; not offered on tmux, Ghostty or iTerm2, which have only the one)                                          |
+| `,` / `Space p`       | Preferences; **General → Session layout** changes stacked/per-tab layout where supported                                                                                  |
 | `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — notification history, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
@@ -324,8 +325,16 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
+Confirmation prompts marked `[y/N]` require `y` or `Y`; Enter cancels.
+`Ctrl-1..9` needs terminal support for distinct modified digits; `1..9` followed
+by Enter works through the ordinary select/focus bindings.
+
 The Hosts panel shows each host's emoji before its name. A `↑` marks a connected
 host whose server is older than the dashboard; press `Enter` for version details.
+
+An unknown sequence after `Space` or `g` cancels the prefix and consumes the
+key without running a session action. Existing defaults and command ids are
+kept stable; new actions should use free keys within the related leader menu.
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
@@ -390,7 +399,7 @@ restart = "space r"             # remap a leader sequence
 toggle_detail = []              # unbind a command
 ```
 
-Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c`, `g g`, and the `1..9` / `Ctrl-1..9` selectors are fixed.
+Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c` is reserved for quitting. The `g g` and `1..9` / `Ctrl-1..9` shortcuts are built-in fallbacks; an explicit configured binding takes precedence.
 
 Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
 

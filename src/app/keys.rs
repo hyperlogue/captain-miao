@@ -18,7 +18,9 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::{HostId, SessionStatus};
@@ -59,8 +61,13 @@ pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> 
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
-        // Ctrl+c always quits, regardless of current mode.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // Releases are not another invocation of the key's action.
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        // Ctrl+c always quits, regardless of current mode. Extra modifiers
+        // describe a different chord and must not silently turn it into quit.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return None;
         }
@@ -92,6 +99,14 @@ impl App {
         }
         if self.input_mode == InputMode::Messages {
             return self.handle_message_log_mouse(mouse);
+        }
+        if self.input_mode == InputMode::Help {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => self.help_scroll = self.help_scroll.saturating_add(3),
+                _ => {}
+            }
+            return None;
         }
         if self.notifications.handle_mouse(mouse) {
             if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
@@ -312,14 +327,12 @@ impl App {
             };
         }
 
-        // `g g` (jump to top) is a fixed prefix kept outside the keymap: unlike
-        // the leader, a non-`g` key after `g` falls *through* to normal handling
-        // (`g` then `j` still navigates down), which the generic prefix can't
-        // express. The keymap takes precedence, so binding a two-chord sequence
-        // starting with `g` would shadow this.
-        if was_g && key.code == KeyCode::Char('g') && !key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            if self.visible_len() != 0 {
+        // The fixed g g fallback consumes its second chord, just like a
+        // configured prefix. An unknown g X sequence must never kill a row.
+        // A configured binding/prefix on g takes precedence when it begins.
+        if was_g {
+            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() && self.visible_len() != 0
+            {
                 self.table_state.select(Some(0));
             }
             return None;
@@ -335,7 +348,7 @@ impl App {
 
         // Start a `g g` sequence (only when `g` isn't itself a configured key).
         if key.code == KeyCode::Char('g')
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.is_empty()
             && self.keymap.lookup_single(chord).is_none()
         {
             self.pending_g = true;
@@ -350,13 +363,10 @@ impl App {
         // cursor to the N-th visible row; `Ctrl+1..9` also focus its window.
         if let KeyCode::Char(c @ '1'..='9') = key.code {
             let idx = (c as u8 - b'1') as usize;
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.modifiers == KeyModifiers::CONTROL {
                 return self.focus_visible_by_index(idx);
             }
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
-            {
+            if key.modifiers.is_empty() {
                 return self.select_visible_by_index(idx);
             }
         }
@@ -607,6 +617,7 @@ impl App {
                 None
             }
             Command::Help => {
+                self.help_scroll = 0;
                 self.input_mode = InputMode::Help;
                 None
             }
@@ -1221,15 +1232,35 @@ impl App {
         }
     }
 
-    fn handle_help_key(&mut self, _key: KeyEvent) -> Option<Action> {
-        // Any key dismisses the help overlay.
-        self.input_mode = InputMode::Normal;
+    fn handle_help_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let page = self.help_rows.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown | KeyCode::Char('f') => {
+                self.help_scroll = self.help_scroll.saturating_add(page)
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                self.help_scroll = self.help_scroll.saturating_sub(page)
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.help_scroll = usize::MAX,
+            // Preserve dismissal by other keys without dispatching them to the
+            // underlying session list.
+            _ => self.input_mode = InputMode::Normal,
+        }
         None
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            KeyCode::Char('y') | KeyCode::Char('Y')
+                if (key.modifiers - KeyModifiers::SHIFT).is_empty() =>
+            {
                 self.input_mode = InputMode::Normal;
                 self.pending_confirm.take().map(|p| p.action)
             }
