@@ -1113,29 +1113,21 @@ fn write_osc52(stdout: &mut impl std::io::Write, text: &str) -> std::io::Result<
 }
 
 struct LaunchCopy {
-    progress: &'static str,  // "Launching"  / "Resuming"
-    succeeded: &'static str, // "Launched"   / "Resumed"
-    failed: &'static str,    // "Launch"     / "Resume"
-    is_resume: bool,         // selects new_tab_title vs resume_tab_title from config
+    failed: &'static str, // "Launch" / "Resume" / "Restart"
+    is_resume: bool,      // selects new_tab_title vs resume_tab_title from config
 }
 
 const LAUNCH_COPY_NEW: LaunchCopy = LaunchCopy {
-    progress: "Launching",
-    succeeded: "Launched",
     failed: "Launch",
     is_resume: false,
 };
 
 const LAUNCH_COPY_RESUME: LaunchCopy = LaunchCopy {
-    progress: "Resuming",
-    succeeded: "Resumed",
     failed: "Resume",
     is_resume: true,
 };
 
 const LAUNCH_COPY_RESTART: LaunchCopy = LaunchCopy {
-    progress: "Restarting",
-    succeeded: "Restarted",
     failed: "Restart",
     is_resume: true,
 };
@@ -1194,7 +1186,6 @@ async fn launch_agent(
     // The cwd goes into the recent list of the host it lands on — never another
     // one's, so a mac path can't pollute a Linux box's picker.
     app.record_launch_cwd(host, cwd);
-    app.set_status(format!("{} in {}", copy.progress, cwd), false);
 
     // Ask the host how to open the session. A pooled host RPCs its daemon to
     // start the launcher in the pty pool and returns an `AttachRemote` plan (an
@@ -1315,7 +1306,6 @@ async fn launch_agent(
                 app.set_status(format!("{} failed: no window id", copy.failed), true);
                 return None;
             };
-            app.set_status(format!("{} (window {id})", copy.succeeded), false);
             // Bind the window to the session's token so the dashboard resolves it
             // (preview / focus / move-to-tab) and prunes it when the window dies —
             // local and remote uniformly (§6, §8).

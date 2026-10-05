@@ -476,16 +476,16 @@ fn q_sets_should_quit() {
 #[test]
 fn status_messages_float_above_the_footer_and_stack() {
     let mut d = TestDashboard::new(100, 24);
-    d.app.set_status("Launched window 42".to_string(), false);
+    d.app.set_status("Copied session ID".to_string(), false);
     d.app.set_status("Push failed".to_string(), true);
     let out = d.render();
-    assert!(out.contains("Launched window 42"), "{out}");
+    assert!(out.contains("Copied session ID"), "{out}");
     assert!(out.contains("Push failed"), "{out}");
     let footer = out.lines().last().unwrap();
     assert!(!footer.contains("Push failed"));
-    assert!(!footer.contains("Launched window"));
+    assert!(!footer.contains("Copied session ID"));
     let buf = d.terminal.backend().buffer();
-    let (info_x, info_y) = find_cell(buf, "Launched window").unwrap();
+    let (info_x, info_y) = find_cell(buf, "Copied session ID").unwrap();
     let (error_x, error_y) = find_cell(buf, "Push failed").unwrap();
     assert!(info_x > 40 && error_x > 40);
     assert!(info_y < error_y && error_y < 23);
@@ -495,7 +495,7 @@ fn status_messages_float_above_the_footer_and_stack() {
         .notifications
         .tick(std::time::Instant::now() + std::time::Duration::from_secs(6));
     let out = d.render();
-    assert!(!out.contains("Launched window 42"), "{out}");
+    assert!(!out.contains("Copied session ID"), "{out}");
     assert!(out.contains("Push failed"), "{out}");
     d.press(KeyCode::Char('x'));
     assert!(!d.render().contains("Push failed"));
@@ -554,21 +554,21 @@ fn x_dismisses_the_newest_notification_and_shift_x_closes_the_session() {
 #[test]
 fn space_m_opens_the_message_log_and_esc_closes_it() {
     let mut d = TestDashboard::new(120, 20);
-    d.app.set_status("Launched window 42".to_string(), false);
+    d.app.set_status("Copied session ID".to_string(), false);
     d.app
         .set_status("Kill failed: host is unreachable".to_string(), true);
 
     // Both notifications are visible until dismissed or expired.
     let footer = d.render();
     assert!(footer.contains("Kill failed"), "{footer}");
-    assert!(footer.contains("Launched window 42"), "{footer}");
+    assert!(footer.contains("Copied session ID"), "{footer}");
 
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('m'));
     assert_eq!(d.app.input_mode, InputMode::Messages);
     let out = d.render();
     assert!(out.contains("Messages"), "{out}");
-    assert!(out.contains("Launched window 42"), "{out}");
+    assert!(out.contains("Copied session ID"), "{out}");
     assert!(out.contains("Kill failed"), "{out}");
 
     // A stray key is swallowed by the pager rather than reaching the list
