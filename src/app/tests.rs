@@ -528,7 +528,7 @@ fn x_dismisses_the_newest_notification_and_shift_x_closes_the_session() {
     d.app.set_status("Older failure".into(), true);
     d.app.set_status("Newest failure".into(), true);
     let out = d.render();
-    assert!(out.contains("x dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss newest"), "{out}");
     assert!(d.press(KeyCode::Char('x')).is_none());
     let out = d.render();
     assert!(!out.contains("Newest failure"), "{out}");
@@ -949,7 +949,7 @@ fn close_session_and_notification_dismissal_config_drive_the_notice_and_actions(
     assert!(d.press(KeyCode::Char('X')).is_none());
     let out = d.render();
     assert!(out.contains("Visible error"), "{out}");
-    assert!(out.contains("F8 dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss newest"), "{out}");
     assert!(d.press(KeyCode::F(8)).is_none());
     assert!(!d.render().contains("Visible error"));
     d.app.set_status("Second error".into(), true);
@@ -8909,7 +8909,7 @@ fn remapped_key_dispatches_and_frees_old_default() {
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
 
     d.app.set_status("Test notification".into(), true);
-    assert!(d.render().contains("n dismiss newest"));
+    assert!(!d.render().contains("dismiss newest"));
     assert!(d.press(KeyCode::Char('x')).is_none());
     assert!(d.render().contains("Test notification"));
     assert!(d.press(KeyCode::Char('n')).is_none());
@@ -11045,11 +11045,10 @@ fn escape_cancels_prefixes_and_clears_search_before_dismissing_notifications() {
     d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
     d.app.set_status("Older notification".into(), true);
     d.app.set_status("Newest notification".into(), true);
-    assert!(d.render().contains("Esc/x dismiss newest"));
+    assert!(!d.render().contains("dismiss newest"));
     d.app.set_search_filter(Some("project".into()));
     let out = d.render();
-    assert!(out.contains("x dismiss newest"), "{out}");
-    assert!(!out.contains("Esc/x dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss newest"), "{out}");
 
     for prefix in [' ', 'g'] {
         d.press(KeyCode::Char(prefix));
@@ -11065,7 +11064,7 @@ fn escape_cancels_prefixes_and_clears_search_before_dismissing_notifications() {
     let out = d.render();
     assert!(out.contains("Newest notification"), "{out}");
     assert!(out.contains("Older notification"), "{out}");
-    assert!(out.contains("Esc/x dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss newest"), "{out}");
 
     assert!(d.press(KeyCode::Esc).is_none());
     let out = d.render();
@@ -11117,15 +11116,14 @@ fn contextual_and_direct_notification_dismissal_follow_configured_bindings() {
     assert!(warnings.is_empty(), "{warnings:?}");
     d.app.keymap = keymap;
     d.app.set_status("First notification".into(), true);
-    assert!(d.render().contains("F9/F8 dismiss newest"));
+    assert!(!d.render().contains("dismiss newest"));
     d.app.set_search_filter(Some("project".into()));
     d.press(KeyCode::Esc);
     d.press(KeyCode::Char('x'));
     assert_eq!(d.app.search_filter.as_deref(), Some("project"));
     let out = d.render();
     assert!(out.contains("First notification"), "{out}");
-    assert!(out.contains("F8 dismiss newest"), "{out}");
-    assert!(!out.contains("F9/F8"), "{out}");
+    assert!(!out.contains("dismiss newest"), "{out}");
     d.press(KeyCode::F(8));
     assert!(!d.render().contains("First notification"));
     assert_eq!(d.app.search_filter.as_deref(), Some("project"));

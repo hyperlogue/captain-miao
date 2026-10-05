@@ -173,13 +173,7 @@ impl Notifications {
             .min()
     }
 
-    fn draw(
-        &mut self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-        dismiss: Option<String>,
-        history: Option<String>,
-    ) {
+    fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect, history: Option<String>) {
         self.hitboxes.clear();
         if area.width < 12 || area.height < 4 {
             return;
@@ -225,17 +219,10 @@ impl Notifications {
                 .padding(Padding::horizontal(1))
                 .title(Span::styled(format!(" {title} "), Style::default().bold()))
                 .title(Line::from(" × ").alignment(Alignment::Right));
-            let mut hints = Vec::new();
-            if let Some(key) = &dismiss {
-                hints.push(format!("{key} dismiss newest"));
-            }
             if lines > height.saturating_sub(2) as usize
                 && let Some(key) = &history
             {
-                hints.push(format!("{key} more"));
-            }
-            if !hints.is_empty() {
-                block = block.title_bottom(Line::from(format!(" {} ", hints.join(" · "))));
+                block = block.title_bottom(Line::from(format!(" {key} more ")));
             }
             clear_overlay(frame, rect);
             let inner = block.inner(rect);
@@ -295,22 +282,10 @@ impl App {
             && !self.session_detail
             && !self.pending_g
             && self.pending_prefix.is_empty();
-        let dismiss = normal
-            .then(|| {
-                let clear = self
-                    .search_filter
-                    .is_none()
-                    .then(|| self.keymap.primary_key(Command::ClearSearch))
-                    .flatten();
-                let direct = self.keymap.primary_key(Command::DismissNotification);
-                let keys: Vec<_> = [clear, direct].into_iter().flatten().collect();
-                (!keys.is_empty()).then(|| keys.join("/"))
-            })
-            .flatten();
         let history = normal
             .then(|| self.keymap.primary_key(Command::MessageLog))
             .flatten();
-        self.notifications.draw(frame, area, dismiss, history);
+        self.notifications.draw(frame, area, history);
     }
 }
 
@@ -403,7 +378,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let area = Rect::new(0, 0, width, height);
             terminal
-                .draw(|frame| notices.draw(frame, area, Some("x".into()), Some("Space m".into())))
+                .draw(|frame| notices.draw(frame, area, Some("Space m".into())))
                 .unwrap();
             for (_, rect) in &notices.hitboxes {
                 assert_eq!(rect.intersection(area), *rect);
