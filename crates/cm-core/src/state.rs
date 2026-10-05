@@ -252,8 +252,8 @@ pub fn dashboard_overrides_path() -> PathBuf {
     state_dir().join("dashboard-overrides.json")
 }
 
-/// Acknowledgement of the x/X shortcut change. Kept separate so older
-/// dashboards and concurrent preference saves cannot reset the receipt.
+/// Legacy acknowledgement of the x/X shortcut change. New dashboards migrate
+/// it into `last_dashboard_version` in dashboard overrides, then remove it.
 pub fn keybinding_notice_path() -> PathBuf {
     state_dir().join("keybinding-notice-x-v1.json")
 }

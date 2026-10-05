@@ -1,11 +1,9 @@
-//! Acknowledged once per state directory, independently of dashboard prefs.
+//! The shortcut-change announcement shown when crossing its dashboard version.
 //!
 //! This overlay sits above the current input mode so startup crash recovery
 //! remains available after the shortcut notice closes. Merely displaying it
 //! does not count as acknowledgement: quitting before reading it shows it again.
-//! Fresh dashboard installs record the notice as handled without showing it.
-
-use std::path::PathBuf;
+//! Dashboard state owns version tracking and fresh-install detection.
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -16,56 +14,23 @@ use ratatui::{
 };
 
 use super::{App, format::clear_overlay, keymap::Command};
-use crate::{config, state};
+use crate::config;
 
+#[derive(Default)]
 pub(super) struct KeybindingNotice {
-    receipt: PathBuf,
     button: Rect,
     scroll: u16,
 }
 
-impl KeybindingNotice {
-    /// Inspect dashboard-owned files before startup can create them. A state
-    /// directory or launcher sessions alone do not establish dashboard use.
-    pub(super) fn for_startup(
-        receipt: PathBuf,
-        prior_dashboard_state: &[PathBuf],
-    ) -> anyhow::Result<Option<Self>> {
-        let Some(notice) = Self::load(receipt) else {
-            return Ok(None);
-        };
-        if prior_dashboard_state.iter().any(|path| path.is_file()) {
-            return Ok(Some(notice));
-        }
-        // Save the exemption now, before this launch writes its own dashboard
-        // state and would otherwise look like an upgrade on the next launch.
-        notice.acknowledge()?;
-        Ok(None)
-    }
-
-    pub(super) fn load(receipt: PathBuf) -> Option<Self> {
-        (state::read_json::<bool>(&receipt) != Some(true)).then_some(Self {
-            receipt,
-            button: Rect::default(),
-            scroll: 0,
-        })
-    }
-
-    fn acknowledge(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.receipt.parent() {
-            state::create_dir_all_private(parent)?;
-        }
-        state::write_json_atomic(&self.receipt, &true)
-    }
-}
-
 impl App {
     fn acknowledge_keybinding_notice(&mut self) {
-        if let Some(notice) = self.keybinding_notice.take()
-            && let Err(error) = notice.acknowledge()
+        if self.keybinding_notice.take().is_some()
+            && let Err(error) = self.dashboard_state.finish_startup()
         {
             self.set_status(
-                format!("Could not remember the shortcut notice; it may appear again: {error}"),
+                format!(
+                    "Could not save the dashboard version; the notice may appear again: {error}"
+                ),
                 true,
             );
         }
@@ -176,65 +141,5 @@ impl App {
                 .style(accent.reversed()),
             notice.button,
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fresh_dashboard_skips_the_notice_on_first_and_later_launches() {
-        let temp = tempfile::tempdir().unwrap();
-        let receipt = temp.path().join("notice.json");
-        let dashboard_state = [
-            temp.path().join("overrides.json"),
-            temp.path().join("bindings.json"),
-        ];
-        // Other components can have already created state for a new dashboard user.
-        std::fs::create_dir(temp.path().join("sessions")).unwrap();
-        std::fs::write(temp.path().join("server.pid"), "1").unwrap();
-        assert!(
-            KeybindingNotice::for_startup(receipt.clone(), &dashboard_state)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(state::read_json::<bool>(&receipt), Some(true));
-        // Model the files written by the first dashboard's normal startup.
-        for path in &dashboard_state {
-            std::fs::write(path, "[]").unwrap();
-        }
-        assert!(
-            KeybindingNotice::for_startup(receipt, &dashboard_state)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn existing_dashboard_users_see_the_notice_until_acknowledged() {
-        for evidence in [0, 1] {
-            let temp = tempfile::tempdir().unwrap();
-            let receipt = temp.path().join("notice.json");
-            let dashboard_state = [
-                temp.path().join("overrides.json"),
-                temp.path().join("bindings.json"),
-            ];
-            std::fs::write(&dashboard_state[evidence], "[]").unwrap();
-            let first = KeybindingNotice::for_startup(receipt.clone(), &dashboard_state).unwrap();
-            assert!(first.is_some());
-            assert!(!receipt.exists());
-            // Closing the process before acknowledging must not hide the notice.
-            drop(first);
-            let next = KeybindingNotice::for_startup(receipt.clone(), &dashboard_state)
-                .unwrap()
-                .unwrap();
-            next.acknowledge().unwrap();
-            assert!(
-                KeybindingNotice::for_startup(receipt, &dashboard_state)
-                    .unwrap()
-                    .is_none()
-            );
-        }
     }
 }

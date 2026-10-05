@@ -259,6 +259,7 @@ dependencies = [
  "lzma-rs",
  "notify 8.2.0",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

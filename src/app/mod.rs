@@ -28,6 +28,7 @@
 //! marking dirty.
 
 mod bindings;
+mod dashboard_state;
 mod diagnostics;
 mod dir_edit;
 mod draw;
@@ -486,6 +487,10 @@ pub(super) struct KillWindow {
 /// drops it as an unknown field, which is exactly the wanted migration.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DashboardOverrides {
+    /// Dashboard version last used past any startup notices. Keeping this in
+    /// the existing state avoids a separate receipt for each announcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_dashboard_version: Option<String>,
     #[serde(default)]
     pinned: Vec<u32>,
     #[serde(default)]
@@ -873,6 +878,7 @@ pub(super) struct App {
     /// Active message-log popup. `Some` iff `input_mode == InputMode::Messages`.
     pub(super) message_view: Option<messages::MessageLogView>,
     pub(in crate::app) keybinding_notice: Option<keybinding_notice::KeybindingNotice>,
+    pub(in crate::app) dashboard_state: dashboard_state::DashboardState,
     pub(super) input_mode: InputMode,
     /// The Search-mode (`/`) text buffer: a cursor-aware input with readline
     /// editing, shared with the pickers. Only meaningful while `input_mode ==
@@ -1640,6 +1646,7 @@ impl App {
             messages,
             message_view: None,
             keybinding_notice: None,
+            dashboard_state: dashboard_state::DashboardState::default(),
             input_mode: InputMode::Normal,
             search_input: self::picker::TextInput::new(),
             search_filter: None,
@@ -2107,13 +2114,11 @@ impl App {
         overrides.sessions_layout = self.extra_prefs.sessions_layout.clone();
         overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
         overrides.prefs = self.extra_prefs.clone();
-        let _ = state::write_json_atomic(&state::dashboard_overrides_path(), &overrides);
+        let _ = self.dashboard_state.save(overrides);
     }
 
     pub(super) fn load_overrides(&mut self) {
-        let Some(overrides): Option<DashboardOverrides> =
-            state::read_json(&state::dashboard_overrides_path())
-        else {
+        let Some(overrides) = self.dashboard_state.load() else {
             return;
         };
         self.flags.clear();

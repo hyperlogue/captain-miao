@@ -74,6 +74,15 @@ impl TestDashboard {
         Self { app, terminal }
     }
 
+    fn show_shortcut_notice(&mut self, dir: &std::path::Path) {
+        self.app.dashboard_state = super::dashboard_state::DashboardState::new(
+            dir.join("dashboard-overrides.json"),
+            dir.join("keybinding-notice-x-v1.json"),
+            env!("CARGO_PKG_VERSION"),
+        );
+        self.app.keybinding_notice = Some(super::keybinding_notice::KeybindingNotice::default());
+    }
+
     fn set_sessions(&mut self, sessions: Vec<LauncherState>) {
         // Mirror the live spawn path: a dashboard-spawned session has a recorded
         // (host, token) → window binding. Seed one for each local session that
@@ -605,9 +614,8 @@ fn the_message_log_opens_at_the_newest_entry() {
 
 #[test]
 fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() {
-    use super::keybinding_notice::KeybindingNotice;
     let temp = tempfile::tempdir().unwrap();
-    let receipt = temp.path().join("notice.json");
+    let overrides = temp.path().join("dashboard-overrides.json");
     let mut d = TestDashboard::new(100, 24);
     d.app.input_mode = InputMode::Confirm;
     d.app.pending_confirm = Some(super::PendingConfirm {
@@ -616,12 +624,15 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
             sessions: Vec::new(),
         },
     });
-    d.app.keybinding_notice = KeybindingNotice::load(receipt.clone());
+    d.show_shortcut_notice(temp.path());
     let out = d.render();
     assert!(out.contains("Session shortcuts changed"), "{out}");
     assert!(out.contains("kill = \"X\""), "{out}");
     assert!(out.contains("dismiss_notification = \"x\""), "{out}");
-    assert!(!receipt.exists(), "drawing must not acknowledge the notice");
+    assert!(
+        !overrides.exists(),
+        "drawing must not acknowledge the notice"
+    );
     for key in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('y')] {
         assert!(d.press(key).is_none());
         assert!(d.app.keybinding_notice.is_some());
@@ -629,7 +640,15 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     }
     assert!(d.press(KeyCode::Enter).is_none());
     assert!(d.app.keybinding_notice.is_none());
-    assert!(KeybindingNotice::load(receipt).is_none());
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(d.app.input_mode, InputMode::Confirm);
     assert!(d.app.pending_confirm.is_some());
     assert!(matches!(
@@ -640,12 +659,11 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
 
 #[test]
 fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
-    use super::keybinding_notice::KeybindingNotice;
     let temp = tempfile::tempdir().unwrap();
-    let receipt = temp.path().join("notice.json");
+    let overrides = temp.path().join("dashboard-overrides.json");
     let mut d = TestDashboard::new(100, 24);
     d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
-    d.app.keybinding_notice = KeybindingNotice::load(receipt.clone());
+    d.show_shortcut_notice(temp.path());
     let out = d.render();
     let selected = d.selected();
     assert!(d.click(0, 0).is_none());
@@ -654,7 +672,7 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
     d.press_ctrl(KeyCode::Char('c'));
     assert!(d.app.should_quit);
     assert!(
-        !receipt.exists(),
+        !overrides.exists(),
         "quitting without acknowledgement shows it next time"
     );
     d.app.should_quit = false;
@@ -662,17 +680,24 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
     assert!(d.click(at.0, at.1).is_none());
     assert!(d.app.keybinding_notice.is_none());
     assert_eq!(d.selected(), selected);
-    assert!(KeybindingNotice::load(receipt).is_none());
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
-fn shortcut_notice_reports_a_failed_receipt_without_blocking_the_dashboard() {
-    use super::keybinding_notice::KeybindingNotice;
+fn shortcut_notice_reports_a_failed_version_save_without_blocking_the_dashboard() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("file");
     std::fs::write(&file, "cannot hold a child").unwrap();
     let mut d = TestDashboard::new(100, 24);
-    d.app.keybinding_notice = KeybindingNotice::load(file.join("notice.json"));
+    d.show_shortcut_notice(&file);
     d.press(KeyCode::Esc);
     assert!(d.app.keybinding_notice.is_none());
     assert!(d.app.status_is_error);
@@ -686,8 +711,49 @@ fn shortcut_notice_reports_a_failed_receipt_without_blocking_the_dashboard() {
 }
 
 #[test]
+fn preference_migrations_and_saves_preserve_the_dashboard_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = temp.path().join("dashboard-overrides.json");
+    crate::state::write_json_atomic(
+        &overrides,
+        &serde_json::json!({"last_dashboard_version": "0.10.0"}),
+    )
+    .unwrap();
+    let mut d = TestDashboard::new(100, 24);
+    d.show_shortcut_notice(temp.path());
+    // load_overrides may migrate preferences and save them during startup,
+    // before the popup is rendered or acknowledged.
+    d.app.load_overrides();
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some("0.10.0")
+    );
+    d.press(KeyCode::Enter);
+    d.app.save_overrides();
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(
+        !d.app
+            .dashboard_state
+            .begin_startup(&temp.path().join("window-bindings.json"))
+            .unwrap()
+    );
+}
+
+#[test]
 fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
-    use super::keybinding_notice::KeybindingNotice;
     use super::keymap::Keymap;
     let cfg: crate::config::Config = toml::from_str(
         r#"
@@ -703,7 +769,7 @@ fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
     let mut d = TestDashboard::new(100, 24);
     d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
     d.app.keymap = keymap;
-    d.app.keybinding_notice = KeybindingNotice::load(temp.path().join("notice.json"));
+    d.show_shortcut_notice(temp.path());
     let out = d.render();
     assert!(out.contains("Del  Kill selected session"), "{out}");
     assert!(out.contains("F8"), "{out}");
@@ -729,7 +795,6 @@ fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
 
 #[test]
 fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
-    use super::keybinding_notice::KeybindingNotice;
     use super::keymap::Keymap;
     let cfg: crate::config::Config = toml::from_str(
         r#"
@@ -743,7 +808,7 @@ fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
     for (width, height) in [(1, 1), (20, 6), (40, 12), (100, 24)] {
         let mut d = TestDashboard::new(width, height);
         d.app.keymap = Keymap::from_config(&cfg.keybinds).0;
-        d.app.keybinding_notice = KeybindingNotice::load(temp.path().join("notice.json"));
+        d.show_shortcut_notice(temp.path());
         let out = d.render();
         if width == 100 {
             assert!(out.contains("Unbound  Kill selected session"), "{out}");

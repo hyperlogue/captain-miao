@@ -410,6 +410,12 @@ acknowledgement survives restarts;
 your configured `kill` and `dismiss_notification` bindings remain in effect.
 Fresh installs skip the notice permanently. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
+The dashboard stores `last_dashboard_version` in `dashboard-overrides.json`;
+upgrade notices appear only when crossing the version that introduced a change.
+The version is saved immediately for fresh installs and launches without a
+notice, or after acknowledgement when a notice is shown. Ordinary preference
+saves preserve it. The older separate shortcut-notice file is migrated and
+removed automatically after the version is saved.
 
 Codex can also run through a shared app-server, selected **per execution host**.
 Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix
