@@ -337,6 +337,11 @@ Pooled sessions automatically mark needs-input on their host when work finishes,
 even while the dashboard is disconnected. Reconnecting restores that flag;
 focusing the session or pressing `i` clears it, and new work clears it
 automatically. Direct-local sessions track these transitions in the dashboard.
+Upgrade `miao-server` on each pooled host (including pooled localhost) to the
+build matching your dashboard: completion tracking moved to the server, so an
+older server will not arm the yellow dot when a turn finishes. Use the Hosts
+panel's `u` action when offered, or update your own server installation and
+restart its daemon.
 
 An unknown sequence after `Space` or `g` cancels the prefix and consumes the
 key without running a session action. Existing defaults and command ids are
@@ -420,9 +425,17 @@ Command ids are the string in each `Command::id()`; the authoritative list lives
 The old `kill` name remains an alias for `close_session`. If both are configured,
 `close_session` takes precedence.
 
-A one-time startup popup for existing dashboard users explains the change to `X`
-for closing sessions and `x` for dismissing notifications, and shows your active
-bindings. It includes a snippet to restore the previous default:
+**What's new.** Existing dashboard users see a one-time startup inbox for new
+features, changes, and upgrade warnings. A list of updates sits above the
+selected item's details. Warnings have an explicit label and the first warning
+is selected initially. Use arrows or `j`/`k` to select an item, or click its row.
+Tab switches focus between the list and details; arrows or `j`/`k` then scroll
+the focused panel. Page Up/Down always scroll details, and the mouse wheel
+operates on the panel under the pointer.
+
+The shortcut update explains `X` for closing sessions and `x` for dismissing
+notifications, shows your active bindings, and includes a snippet to restore
+the previous default:
 
 ```toml
 [keybinds]
@@ -432,24 +445,26 @@ dismiss_notification = []
 
 Click **Copy snippet** or press `c` in the popup to copy it, then edit
 `config.toml` and restart miao. Press Enter or Esc, or click **Got it**, to
-acknowledge the notice. The acknowledgement survives restarts; your configured
+acknowledge the entire displayed batch. Browsing items does not acknowledge
+them. The acknowledgement survives restarts; your configured
 `close_session` (or `kill`) and `dismiss_notification` bindings remain in effect.
-Fresh installs skip the notice permanently. Existing use is detected from saved
+Fresh installs skip existing announcements. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
-The dashboard stores `last_dashboard_version` in `dashboard-overrides.json`;
-upgrade notices appear only when crossing the version that introduced a change.
-Skipping releases queues all applicable breaking-change notices, oldest first.
-Each popup shows its introduction version and position in the queue; Enter,
-Esc, or **Next** acknowledges it and advances to the next notice. **Got it**
-finishes the queue. The version is saved immediately for fresh installs and
-launches without notices, or after the whole queue is acknowledged. Quitting
-partway through leaves the queue pending for the next launch. Ordinary
-preference saves preserve the version.
+The dashboard stores announcement IDs and `last_dashboard_version` in
+`dashboard-overrides.json`. Unseen items appear once their introduction version
+is reached, including new items added to a version you already acknowledged.
+The server-upgrade warning therefore still appears if you dismissed the earlier
+shortcut notice. Skipping releases includes all unseen announcements, oldest
+first, with each item's version shown in the list and details. Quitting with
+Ctrl+C before acknowledgement leaves the batch pending for the next launch.
+Ordinary preference saves preserve acknowledgements.
 
 New announcements are declared in the
-[`BREAKING_CHANGES` catalog](src/app/breaking_changes.rs) with a stable ID,
-introduction version, title, and content. Text, headings, code snippets, and
-active shortcut bindings use the same popup and persistence logic.
+[`ANNOUNCEMENTS` catalog](src/app/announcements.rs) with a stable ID,
+introduction version, title, kind (`Update` or `Warning`), and content.
+Feature promotions and migrations use the same inbox. Text, headings, code
+snippets, and active shortcut bindings share its rendering and persistence;
+keep existing IDs stable and give each new announcement a new ID.
 
 Codex can also run through a shared app-server, selected **per execution host**.
 Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix

@@ -80,7 +80,10 @@ impl TestDashboard {
             env!("CARGO_PKG_VERSION"),
         );
         self.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
-            super::breaking_changes::BREAKING_CHANGES.iter().collect(),
+            super::announcements::ANNOUNCEMENTS
+                .iter()
+                .filter(|item| item.id == "session-shortcuts-x")
+                .collect(),
         );
     }
 
@@ -614,10 +617,54 @@ fn the_message_log_opens_at_the_newest_entry() {
 }
 
 #[test]
+fn update_inbox_delivers_new_items_after_the_shortcut_notice_was_acknowledged() {
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = temp.path().join("dashboard-overrides.json");
+    let bindings = temp.path().join("window-bindings.json");
+    crate::state::write_json_atomic(
+        &overrides,
+        &serde_json::json!({"last_dashboard_version": "0.11.0"}),
+    )
+    .unwrap();
+    let mut d = TestDashboard::new(100, 30);
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(overrides, "0.11.0");
+    d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, super::announcements::ANNOUNCEMENTS)
+            .unwrap(),
+    );
+    let out = d.render();
+    assert!(out.contains("What's new"), "{out}");
+    assert!(out.contains("Upgrade servers for the yellow dot"), "{out}");
+    assert!(!out.contains("Session shortcuts changed"), "{out}");
+    assert!(out.contains("Warning"), "{out}");
+    assert!(out.contains("miao-server"), "{out}");
+    d.app.save_overrides();
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, super::announcements::ANNOUNCEMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
+    d.press(KeyCode::Enter);
+    d.app.save_overrides();
+    assert!(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, super::announcements::ANNOUNCEMENTS)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() {
     let temp = tempfile::tempdir().unwrap();
     let overrides = temp.path().join("dashboard-overrides.json");
-    let mut d = TestDashboard::new(100, 24);
+    let mut d = TestDashboard::new(100, 36);
     d.app.input_mode = InputMode::Confirm;
     d.app.pending_confirm = Some(super::PendingConfirm {
         prompt: "Restart missing sessions?".into(),
@@ -743,8 +790,8 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
 }
 
 #[test]
-fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page() {
-    use super::breaking_changes::tests::EXAMPLE_CHANGES;
+fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_prompt() {
+    use super::announcements::tests::EXAMPLE_ANNOUNCEMENTS;
     use super::upgrade_notices::UpgradeNotices;
     use crossterm::event::KeyEventKind;
 
@@ -756,12 +803,12 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
         &serde_json::json!({"last_dashboard_version": "0.10.0"}),
     )
     .unwrap();
-    let mut d = TestDashboard::new(100, 24);
+    let mut d = TestDashboard::new(100, 30);
     d.app.dashboard_state = super::dashboard_state::DashboardState::new(overrides, "0.12.0");
     d.app.upgrade_notices = UpgradeNotices::new(
         d.app
             .dashboard_state
-            .begin_startup(&bindings, EXAMPLE_CHANGES)
+            .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
             .unwrap(),
     );
     d.app.input_mode = InputMode::Confirm;
@@ -770,72 +817,78 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
         action: Action::RestartAll { sessions: vec![] },
     });
     let out = d.render();
-    assert!(out.contains("Session shortcuts changed"), "{out}");
-    assert!(out.contains("v0.11.0 · 1/3"), "{out}");
-    assert!(!out.contains("Copy snippet"), "{out}");
-    assert!(d.press(KeyCode::Char('c')).is_none());
-    // Holding Enter must not acknowledge several pages through key repeats.
+    for text in [
+        "What's new",
+        "Session shortcuts changed",
+        "Configuration format changed",
+        "Connection policy changed",
+        "Details · Warning · v0.12.0",
+        "setting = \"new\"",
+        "2/3",
+    ] {
+        assert!(out.contains(text), "missing {text}: {out}");
+    }
+    assert!(!out.contains("A later change"), "{out}");
+    let copy_at = find_cell(d.terminal.backend().buffer(), "Copy snippet").expect(&out);
+    assert!(
+        matches!(d.click(copy_at.0, copy_at.1), Some(Action::CopyUpgradeSnippet(text)) if text == "[example]\nsetting = \"new\"")
+    );
+    d.app.upgrade_notices.as_mut().unwrap().copy_feedback = Some("Snippet copied".into());
+    // Key repeats cannot dismiss the entire batch.
     d.app.handle_key(KeyEvent::new_with_kind(
         KeyCode::Enter,
         KeyModifiers::NONE,
         KeyEventKind::Repeat,
     ));
-    assert!(d.render().contains("1/3"));
-    assert!(d.press(KeyCode::Enter).is_none());
+    assert!(d.app.upgrade_notices.is_some());
+    d.press(KeyCode::Down);
+    // An old copy hitbox must not act on a newly selected item.
+    assert!(d.click(copy_at.0, copy_at.1).is_none());
     let out = d.render();
-    assert!(out.contains("Configuration format changed"), "{out}");
-    assert!(out.contains("setting = \"new\""), "{out}");
-    assert!(out.contains("v0.12.0 · 2/3"), "{out}");
-    let copy_at = find_cell(d.terminal.backend().buffer(), "Copy snippet").expect(&out);
-    match d.click(copy_at.0, copy_at.1) {
-        Some(Action::CopyUpgradeSnippet(text)) => {
-            assert_eq!(text, "[example]\nsetting = \"new\"");
-        }
-        other => panic!("expected a snippet clipboard action, got {other:?}"),
-    }
-    d.app.upgrade_notices.as_mut().unwrap().copy_feedback = Some("Copy failed: unavailable".into());
-    assert!(d.render().contains("Copy failed: unavailable"));
+    assert!(out.contains("Review connection settings."), "{out}");
+    assert!(out.contains("3/3"), "{out}");
+    assert!(!out.contains("Copy snippet"), "{out}");
+    assert!(!out.contains("Snippet copied"), "{out}");
+    assert!(d.press(KeyCode::Char('c')).is_none());
+    let at = find_cell(d.terminal.backend().buffer(), "Session shortcuts changed").expect(&out);
+    d.click(at.0, at.1);
+    assert!(d.render().contains("Shortcut migration"));
+    d.press(KeyCode::Tab);
+    let out = d.render();
+    assert!(out.contains("v0.11.0 · focused"), "{out}");
+    d.press(KeyCode::Down);
     assert!(
-        !out.contains("close_session ="),
-        "generic pages have no shortcut content"
+        d.render().contains("Shortcut migration"),
+        "details scroll must not select another item"
     );
-    assert_eq!(
-        d.app
-            .dashboard_state
-            .load()
-            .unwrap()
-            .last_dashboard_version
-            .as_deref(),
-        Some("0.10.0")
-    );
-
+    d.press(KeyCode::Tab);
+    d.press(KeyCode::Down);
+    assert!(d.render().contains("setting = \"new\""));
+    d.app.save_overrides();
     d.press_ctrl(KeyCode::Char('c'));
     assert!(d.app.should_quit);
     assert_eq!(
         d.app
             .dashboard_state
-            .begin_startup(&bindings, EXAMPLE_CHANGES)
+            .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
             .unwrap()
             .len(),
         3
     );
     d.app.should_quit = false;
-    let at = find_cell(d.terminal.backend().buffer(), "Next").expect(&out);
-    assert!(d.click(at.0, at.1).is_none());
-    // A second click before drawing cannot acknowledge an unseen page.
-    assert!(d.click(at.0, at.1).is_none());
-    assert!(d.click(copy_at.0, copy_at.1).is_none());
     let out = d.render();
-    assert!(out.contains("Connection policy changed"), "{out}");
-    assert!(out.contains("Action required"), "{out}");
-    assert!(out.contains("3/3"), "{out}");
-    assert!(out.contains("Got it"), "{out}");
-    assert!(!out.contains("Copy snippet"), "{out}");
-    assert!(!out.contains("Copy failed"), "{out}");
-    assert!(d.press(KeyCode::Esc).is_none());
+    let at = find_cell(d.terminal.backend().buffer(), "Got it").expect(&out);
+    d.click(at.0, at.1);
     assert!(d.app.upgrade_notices.is_none());
     assert_eq!(d.app.input_mode, InputMode::Confirm);
     assert!(d.app.pending_confirm.is_some());
+    assert!(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         d.app
             .dashboard_state
@@ -845,15 +898,92 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
             .as_deref(),
         Some("0.12.0")
     );
-    assert!(
-        UpgradeNotices::new(
-            d.app
-                .dashboard_state
-                .begin_startup(&bindings, EXAMPLE_CHANGES)
-                .unwrap()
-        )
-        .is_none()
+}
+
+#[test]
+fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let cfg: crate::config::Config = toml::from_str("[keybinds]\nmanage_hosts = \"f6\"").unwrap();
+    let mut d = TestDashboard::new(70, 20);
+    d.app.keymap = super::keymap::Keymap::from_config(&cfg.keybinds).0;
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
+        temp.path().join("dashboard-overrides.json"),
+        "0.11.0",
     );
+    d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+        super::announcements::ANNOUNCEMENTS.iter().collect(),
+    );
+    let out = d.render();
+    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("Upgrade servers for the yellow dot"), "{out}");
+    assert!(!out.contains("Completion flags are shared"), "{out}");
+    assert!(out.contains("more ↓"), "{out}");
+    let at = find_cell(d.terminal.backend().buffer(), "Action required").expect(&out);
+    message_mouse(&mut d, MouseEventKind::ScrollDown, at);
+    let scrolled = d.render();
+    assert_ne!(scrolled, out);
+    assert!(scrolled.contains("2/2"), "{scrolled}");
+    message_mouse(&mut d, MouseEventKind::ScrollUp, at);
+    assert_eq!(d.render(), out);
+    d.press(KeyCode::Tab);
+    d.press(KeyCode::End);
+    let out = d.render();
+    assert!(out.contains("F6  Open Hosts"), "{out}");
+    assert!(out.contains("↑ more"), "{out}");
+    assert!(out.contains("Completion flags are shared"), "{out}");
+    assert!(out.contains("2/2"), "{out}");
+    // Scrolling outside the overlay never moves either panel.
+    message_mouse(&mut d, MouseEventKind::ScrollUp, (0, 0));
+    assert_eq!(d.render(), out);
+    d.press(KeyCode::Tab);
+    d.press(KeyCode::Up);
+    let out = d.render();
+    assert!(out.contains("1/2"), "{out}");
+    assert!(
+        out.contains("The default key"),
+        "selection resets detail scroll: {out}"
+    );
+    assert!(out.contains("Copy snippet"), "{out}");
+}
+
+#[test]
+fn update_inbox_list_scrolling_keeps_mouse_targets_on_visible_items() {
+    use super::announcements::tests::EXAMPLE_ANNOUNCEMENTS;
+    let mut d = TestDashboard::new(60, 16);
+    d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+        super::announcements::pending(EXAMPLE_ANNOUNCEMENTS, &[], &semver::Version::new(0, 13, 0))
+            .unwrap(),
+    );
+    d.press(KeyCode::End);
+    let out = d.render();
+    assert!(out.contains("4/4"), "{out}");
+    assert!(!out.contains("Session shortcuts changed"), "{out}");
+    let at = find_cell(d.terminal.backend().buffer(), "A later change").expect(&out);
+    d.click(at.0, at.1);
+    assert!(d.render().contains("Not yet applicable"));
+    // The wheel changes list selection even while details have keyboard focus.
+    d.press(KeyCode::Tab);
+    message_mouse(&mut d, MouseEventKind::ScrollUp, at);
+    let out = d.render();
+    assert!(out.contains("3/4"), "{out}");
+    assert!(out.contains("Action required"), "{out}");
+    message_mouse(&mut d, MouseEventKind::ScrollUp, at);
+    let out = d.render();
+    assert!(out.contains("2/4"), "{out}");
+    assert!(matches!(
+        d.press(KeyCode::Char('c')),
+        Some(Action::CopyUpgradeSnippet(_))
+    ));
+    for (width, height) in [(1, 1), (20, 6), (40, 12), (100, 30)] {
+        d.terminal.backend_mut().resize(width, height);
+        d.terminal
+            .resize(ratatui::layout::Rect::new(0, 0, width, height))
+            .unwrap();
+        for key in [KeyCode::Tab, KeyCode::End, KeyCode::PageDown, KeyCode::Home] {
+            d.press(key);
+            d.render();
+        }
+    }
 }
 
 #[test]
@@ -914,10 +1044,11 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
             .dashboard_state
             .begin_startup(
                 &temp.path().join("window-bindings.json"),
-                super::breaking_changes::BREAKING_CHANGES
+                super::announcements::ANNOUNCEMENTS
             )
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|item| item.id == "server-owned-attention")
     );
 }
 

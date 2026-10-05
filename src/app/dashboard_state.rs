@@ -1,8 +1,9 @@
-//! Dashboard preferences and the last completed startup version share one file.
+//! Dashboard preferences and announcement acknowledgements share one file.
 //!
-//! Version checks happen before startup creates dashboard state. A fresh install
-//! records the current version immediately; an upgrade with a notice records it
-//! only after acknowledgement. Ordinary preference saves preserve that version.
+//! Check prior use before startup creates dashboard state. Fresh installs skip
+//! existing announcements. Other users acknowledge the entire displayed batch;
+//! browsing or saving preferences never dismisses it. Stable ids allow new items
+//! within an already seen version, including feature promotions and warnings.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use serde_json::{Map, Value};
 
 use super::{
     DashboardOverrides,
-    breaking_changes::{self, BreakingChange},
+    announcements::{self, Announcement},
 };
 use crate::state;
 
@@ -47,43 +48,52 @@ impl DashboardState {
                 .context("dashboard state has no parent")?;
             cm_core::session_flags::SessionFlagsStore::new(root.to_path_buf()).migrate_legacy()?;
         }
-        // Read the latest version rather than carrying a stale copy in App:
-        // startup acknowledgement can advance it after preferences were loaded.
-        overrides.last_dashboard_version = state::read_json::<Value>(&self.path)
-            .and_then(|v| v.get("last_dashboard_version")?.as_str().map(str::to_owned));
+        // Startup acknowledgement can advance metadata after preferences load.
+        overrides.last_dashboard_version = document
+            .get("last_dashboard_version")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        overrides.acknowledged_announcements = document
+            .get("acknowledged_announcements")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("reading announcement acknowledgements")?;
         self.ensure_parent()?;
         state::write_json_atomic(&self.path, &overrides)
     }
 
-    /// Queue every applicable breaking change. The caller must do
+    /// Collect every unseen, released announcement. The caller must do
     /// this before the first session reload writes window bindings.
     pub(super) fn begin_startup(
         &self,
         window_bindings: &Path,
-        catalog: &'static [BreakingChange],
-    ) -> anyhow::Result<Vec<&'static BreakingChange>> {
+        catalog: &'static [Announcement],
+    ) -> anyhow::Result<Vec<&'static Announcement>> {
         let document = self.read_document()?;
         let prior_use = self.path.is_file() || window_bindings.is_file();
-        let previous = document
-            .get("last_dashboard_version")
-            .and_then(Value::as_str)
-            .and_then(|v| Version::parse(v).ok());
         let current = Version::parse(self.version)?;
-        let notices = if prior_use {
-            breaking_changes::pending(catalog, previous.as_ref(), &current)?
-        } else {
-            Vec::new()
-        };
-        if notices.is_empty() {
-            self.finish_startup()?;
+        let notices = announcements::pending(catalog, &acknowledged(&document)?, &current)?;
+        if !prior_use || notices.is_empty() {
+            self.finish_startup(&notices)?;
+            return Ok(Vec::new());
         }
         Ok(notices)
     }
 
-    pub(super) fn finish_startup(&self) -> anyhow::Result<()> {
+    pub(super) fn finish_startup(&self, notices: &[&Announcement]) -> anyhow::Result<()> {
         // Patch only metadata. Startup can precede preference loading, and
         // acknowledgement must not reset pins, preferences or unknown fields.
         let mut document = self.read_document()?;
+        let mut ids = acknowledged(&document)?;
+        for notice in notices {
+            if !ids.iter().any(|id| id == notice.id) {
+                ids.push(notice.id.to_owned());
+            }
+        }
+        document.insert(
+            "acknowledged_announcements".into(),
+            serde_json::to_value(ids)?,
+        );
         document.insert(
             "last_dashboard_version".into(),
             Value::String(self.version.into()),
@@ -108,9 +118,30 @@ impl DashboardState {
     }
 }
 
+fn acknowledged(document: &Map<String, Value>) -> anyhow::Result<Vec<String>> {
+    if let Some(ids) = document.get("acknowledged_announcements") {
+        return serde_json::from_value(ids.clone())
+            .context("reading announcement acknowledgements");
+    }
+    // The only announcement shipped with version-only tracking was the x/X
+    // change. Preserve that acknowledgement without hiding later additions to
+    // the same release. This migration list must not grow with the catalog.
+    let previous = document
+        .get("last_dashboard_version")
+        .and_then(Value::as_str)
+        .and_then(|v| Version::parse(v).ok());
+    Ok(
+        if previous.is_some_and(|v| !v.cmp_precedence(&Version::new(0, 11, 0)).is_lt()) {
+            vec!["session-shortcuts-x".into()]
+        } else {
+            Vec::new()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::breaking_changes::{BREAKING_CHANGES, tests::EXAMPLE_CHANGES};
+    use super::super::announcements::{ANNOUNCEMENTS, tests::EXAMPLE_ANNOUNCEMENTS};
     use super::*;
     use serde_json::json;
 
@@ -128,7 +159,7 @@ mod tests {
         std::fs::write(temp.path().join("server.pid"), "1").unwrap();
         assert!(
             dashboard
-                .begin_startup(&bindings, BREAKING_CHANGES)
+                .begin_startup(&bindings, ANNOUNCEMENTS)
                 .unwrap()
                 .is_empty()
         );
@@ -139,7 +170,7 @@ mod tests {
         std::fs::write(&bindings, "[]").unwrap();
         assert!(
             dashboard
-                .begin_startup(&bindings, BREAKING_CHANGES)
+                .begin_startup(&bindings, ANNOUNCEMENTS)
                 .unwrap()
                 .is_empty()
         );
@@ -158,7 +189,7 @@ mod tests {
             }
             assert!(
                 !dashboard
-                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .begin_startup(&bindings, ANNOUNCEMENTS)
                     .unwrap()
                     .is_empty()
             );
@@ -168,11 +199,13 @@ mod tests {
             assert!(dashboard.load().unwrap().last_dashboard_version.is_none());
             assert!(
                 !dashboard
-                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .begin_startup(&bindings, ANNOUNCEMENTS)
                     .unwrap()
                     .is_empty()
             );
-            dashboard.finish_startup().unwrap();
+            dashboard
+                .finish_startup(&ANNOUNCEMENTS.iter().collect::<Vec<_>>())
+                .unwrap();
             dashboard.save(DashboardOverrides::default()).unwrap();
             assert_eq!(
                 dashboard.load().unwrap().last_dashboard_version.as_deref(),
@@ -180,7 +213,7 @@ mod tests {
             );
             assert!(
                 dashboard
-                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .begin_startup(&bindings, ANNOUNCEMENTS)
                     .unwrap()
                     .is_empty()
             );
@@ -188,39 +221,86 @@ mod tests {
     }
 
     #[test]
-    fn only_crossing_the_change_version_triggers_the_notice() {
-        for (previous, current, expected) in [
-            ("0.9.0", "0.11.0", true),
-            ("0.10.10", "0.11.0", true),
-            ("0.11.0-rc.1", "0.11.0", true),
-            ("0.11.0", "0.11.0", false),
-            ("0.11.0+local", "0.11.0", false),
-            ("0.11.0", "0.12.0", false),
-            ("0.12.0", "0.11.0", false),
-            ("1.0.0", "0.11.0", false),
-            ("0.9.0", "0.10.0", false),
-            ("unrecognized", "0.11.0", true),
+    fn legacy_version_only_acknowledges_the_original_shortcut_item() {
+        for (previous, expected) in [
+            ("0.10.10", 2),
+            ("0.11.0-rc.1", 2),
+            ("unrecognized", 2),
+            ("0.11.0", 1),
+            ("0.11.0+local", 1),
+            ("0.12.0", 1),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let dashboard = dashboard(temp.path(), current);
+            let dashboard = dashboard(temp.path(), "0.11.0");
             state::write_json_atomic(
                 &dashboard.path,
                 &json!({"last_dashboard_version": previous}),
             )
             .unwrap();
-            assert_eq!(
-                dashboard
-                    .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
-                    .unwrap()
-                    .is_empty(),
-                !expected,
-                "{previous} -> {current}"
-            );
+            let pending = dashboard
+                .begin_startup(&temp.path().join("window-bindings.json"), ANNOUNCEMENTS)
+                .unwrap();
+            assert_eq!(pending.len(), expected, "{previous}");
             assert_eq!(
                 dashboard.load().unwrap().last_dashboard_version.as_deref(),
-                Some(if expected { previous } else { current })
+                Some(previous)
             );
         }
+    }
+
+    #[test]
+    fn fresh_install_can_receive_a_later_addition_to_the_same_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let dashboard = dashboard(temp.path(), "0.11.0");
+        let bindings = temp.path().join("window-bindings.json");
+        assert!(
+            dashboard
+                .begin_startup(&bindings, &ANNOUNCEMENTS[..1])
+                .unwrap()
+                .is_empty()
+        );
+        let notices = dashboard.begin_startup(&bindings, ANNOUNCEMENTS).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, "server-owned-attention");
+        dashboard.save(DashboardOverrides::default()).unwrap();
+        assert_eq!(
+            dashboard
+                .begin_startup(&bindings, ANNOUNCEMENTS)
+                .unwrap()
+                .len(),
+            1
+        );
+        dashboard.finish_startup(&notices).unwrap();
+        assert!(
+            dashboard
+                .begin_startup(&bindings, ANNOUNCEMENTS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn acknowledgements_survive_a_downgrade_and_preference_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let bindings = temp.path().join("window-bindings.json");
+        let latest = dashboard(temp.path(), "0.12.0");
+        latest
+            .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
+            .unwrap();
+        let older = dashboard(temp.path(), "0.11.0");
+        assert!(
+            older
+                .begin_startup(&bindings, &EXAMPLE_ANNOUNCEMENTS[1..2])
+                .unwrap()
+                .is_empty()
+        );
+        older.save(DashboardOverrides::default()).unwrap();
+        assert!(
+            latest
+                .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -234,8 +314,12 @@ mod tests {
             "future_preference": "preserve"
         });
         state::write_json_atomic(&dashboard.path, &saved).unwrap();
-        dashboard.finish_startup().unwrap();
+        dashboard
+            .finish_startup(&ANNOUNCEMENTS.iter().collect::<Vec<_>>())
+            .unwrap();
         saved["last_dashboard_version"] = json!("0.11.0");
+        saved["acknowledged_announcements"] =
+            json!(["session-shortcuts-x", "server-owned-attention"]);
         assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
         dashboard.save(dashboard.load().unwrap()).unwrap();
         let overrides = dashboard.load().unwrap();
@@ -294,25 +378,27 @@ mod tests {
         let bindings = temp.path().join("window-bindings.json");
         assert!(
             first
-                .begin_startup(&bindings, EXAMPLE_CHANGES)
+                .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
                 .unwrap()
                 .is_empty()
         );
         let next = dashboard(temp.path(), "0.12.0");
-        let notices = next.begin_startup(&bindings, EXAMPLE_CHANGES).unwrap();
+        let notices = next
+            .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
+            .unwrap();
         assert_eq!(notices.len(), 2);
         assert!(notices.iter().all(|change| change.introduced == "0.12.0"));
         assert_eq!(
             next.load().unwrap().last_dashboard_version.as_deref(),
             Some("0.11.0")
         );
-        next.finish_startup().unwrap();
+        next.finish_startup(&notices).unwrap();
         assert_eq!(
             next.load().unwrap().last_dashboard_version.as_deref(),
             Some("0.12.0")
         );
         assert!(
-            next.begin_startup(&bindings, EXAMPLE_CHANGES)
+            next.begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
                 .unwrap()
                 .is_empty()
         );
@@ -326,7 +412,7 @@ mod tests {
         state::write_json_atomic(&dashboard.path, &saved).unwrap();
         // Prevent the atomic write without relying on Unix user permissions.
         std::fs::create_dir(dashboard.path.with_extension("tmp")).unwrap();
-        assert!(dashboard.finish_startup().is_err());
+        assert!(dashboard.finish_startup(&[]).is_err());
         assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
     }
 
@@ -335,7 +421,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dashboard = dashboard(temp.path(), "0.11.0");
         std::fs::write(&dashboard.path, "{broken").unwrap();
-        assert!(dashboard.finish_startup().is_err());
+        assert!(dashboard.finish_startup(&[]).is_err());
         assert_eq!(std::fs::read_to_string(&dashboard.path).unwrap(), "{broken");
     }
 }

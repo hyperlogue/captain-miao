@@ -271,7 +271,7 @@ impl App {
     }
 
     pub(super) fn draw_notifications(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        // Keep history and the startup shortcut announcement unobscured.
+        // Keep history and the startup announcement inbox unobscured.
         if matches!(self.input_mode, InputMode::Messages | InputMode::Help)
             || self.upgrade_notices.is_some()
         {

@@ -2390,7 +2390,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // inspect prior use before start_dashboard can create that evidence.
     let upgrade_notices = super::dashboard_state::DashboardState::default().begin_startup(
         &state::window_bindings_path(),
-        super::breaking_changes::BREAKING_CHANGES,
+        super::announcements::ANNOUNCEMENTS,
     );
     let mut app = start_dashboard().await;
     match upgrade_notices {

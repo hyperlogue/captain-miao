@@ -1590,7 +1590,9 @@ impl App {
         let spans = match &self.input_mode {
             _ if self.upgrade_notices.is_some() => {
                 let mut spans = hint_pair("Enter/Esc", "acknowledge");
-                spans.extend(hint_pair("j/k", "scroll"));
+                spans.extend(hint_pair("j/k", "navigate"));
+                spans.extend(hint_pair("Tab", "switch panel"));
+                spans.extend(hint_pair("PgUp/PgDn", "scroll details"));
                 spans
             }
             InputMode::Normal if self.session_detail => {

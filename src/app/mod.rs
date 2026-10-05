@@ -27,8 +27,8 @@
 //! `window_bindings` directly, since those re-anchor the cursor as well as
 //! marking dirty.
 
+mod announcements;
 mod bindings;
-mod breaking_changes;
 mod dashboard_state;
 mod diagnostics;
 mod dir_edit;
@@ -491,10 +491,13 @@ pub(super) struct KillWindow {
 /// drops it as an unknown field, which is exactly the wanted migration.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DashboardOverrides {
-    /// Dashboard version last used past any startup notices. Keeping this in
-    /// the existing state avoids a separate receipt for each announcement.
+    /// Dashboard version last used past any startup announcements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_dashboard_version: Option<String>,
+    /// Stable announcement ids, shared with preferences so new items can be
+    /// delivered even when their release version was already acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acknowledged_announcements: Option<Vec<String>>,
     /// Presentation order only. Legacy pin flags are imported by cm-core;
     /// their former array still supplies the initial local ordering.
     #[serde(default, alias = "pinned")]

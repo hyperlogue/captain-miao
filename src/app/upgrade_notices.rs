@@ -1,28 +1,36 @@
-//! Shared, scrollable presentation of versioned breaking-change notices.
+//! Split announcement inbox: a selectable list above scrollable details.
 //!
-//! This overlay sits above the current input mode so startup crash recovery
-//! remains available after all notices close. The full queue must be acknowledged
-//! before advancing the saved dashboard version; quitting partway replays it.
-//! Dashboard state owns version tracking and fresh-install detection.
+//! The overlay preserves the underlying input mode, including crash recovery.
+//! Browsing never acknowledges items. Got it acknowledges the displayed batch;
+//! quitting first leaves it pending. Dashboard state owns durable receipts.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
 use super::{
     Action, App,
-    breaking_changes::{BreakingChange, Content},
+    announcements::{Announcement, Content, Kind},
     format::clear_overlay,
 };
 use crate::config;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Focus {
+    List,
+    Details,
+}
+
 pub(super) struct UpgradeNotices {
-    changes: Vec<&'static BreakingChange>,
-    position: usize,
+    items: Vec<&'static Announcement>,
+    list: ListState,
+    focus: Focus,
+    list_area: Rect,
+    detail_area: Rect,
     button: Rect,
     copy_button: Rect,
     pub(super) copy_feedback: Option<String>,
@@ -30,10 +38,22 @@ pub(super) struct UpgradeNotices {
 }
 
 impl UpgradeNotices {
-    pub(super) fn new(changes: Vec<&'static BreakingChange>) -> Option<Self> {
-        (!changes.is_empty()).then_some(Self {
-            changes,
-            position: 0,
+    pub(super) fn new(items: Vec<&'static Announcement>) -> Option<Self> {
+        if items.is_empty() {
+            return None;
+        }
+        // Put required action in view immediately; all other updates remain
+        // visible and freely browsable in their release order.
+        let selected = items
+            .iter()
+            .position(|item| matches!(item.kind, Kind::Warning))
+            .unwrap_or(0);
+        Some(Self {
+            items,
+            list: ListState::default().with_selected(Some(selected)),
+            focus: Focus::List,
+            list_area: Rect::default(),
+            detail_area: Rect::default(),
             button: Rect::default(),
             copy_button: Rect::default(),
             copy_feedback: None,
@@ -41,8 +61,33 @@ impl UpgradeNotices {
         })
     }
 
+    fn selected(&self) -> &'static Announcement {
+        self.items[self.list.selected().unwrap_or(0)]
+    }
+
+    fn select(&mut self, index: usize) {
+        let index = index.min(self.items.len() - 1);
+        if self.list.selected() != Some(index) {
+            self.list.select(Some(index));
+            self.scroll = 0;
+            self.copy_feedback = None;
+            // Invalidate the old snippet target until the new details render.
+            self.copy_button = Rect::default();
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        self.select(
+            self.list
+                .selected()
+                .unwrap_or(0)
+                .saturating_add_signed(delta),
+        );
+    }
+
     fn copy_snippet(&self) -> Option<Action> {
-        let snippets: Vec<_> = self.changes[self.position]
+        let snippets: Vec<_> = self
+            .selected()
             .content
             .iter()
             .filter_map(|content| match content {
@@ -56,23 +101,12 @@ impl UpgradeNotices {
 
 impl App {
     fn acknowledge_upgrade_notices(&mut self) {
-        let Some(notices) = self.upgrade_notices.as_mut() else {
+        let Some(notices) = self.upgrade_notices.take() else {
             return;
         };
-        notices.position += 1;
-        if notices.position < notices.changes.len() {
-            notices.scroll = 0;
-            // Do not let a second click on the old page acknowledge the next
-            // one before it has been rendered.
-            notices.button = Rect::default();
-            notices.copy_button = Rect::default();
-            notices.copy_feedback = None;
-            return;
-        }
-        self.upgrade_notices = None;
-        if let Err(error) = self.dashboard_state.finish_startup() {
+        if let Err(error) = self.dashboard_state.finish_startup(&notices.items) {
             self.set_status(
-                format!("Could not save the dashboard version; upgrade notices may appear again: {error}"),
+                format!("Could not save announcement acknowledgements; updates may appear again: {error}"),
                 true,
             );
         }
@@ -80,13 +114,59 @@ impl App {
 
     pub(super) fn handle_upgrade_notices_key(&mut self, key: KeyEvent) -> Option<Action> {
         let notice = self.upgrade_notices.as_mut()?;
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
         match key.code {
             KeyCode::Enter | KeyCode::Esc if key.kind == KeyEventKind::Press => {
                 self.acknowledge_upgrade_notices();
             }
+            KeyCode::Tab | KeyCode::BackTab if key.kind == KeyEventKind::Press => {
+                notice.focus = if notice.focus == Focus::List {
+                    Focus::Details
+                } else {
+                    Focus::List
+                };
+            }
             KeyCode::Char('c') if key.kind == KeyEventKind::Press => return notice.copy_snippet(),
-            KeyCode::Down | KeyCode::Char('j') => notice.scroll = notice.scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => notice.scroll = notice.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if notice.focus == Focus::List {
+                    notice.move_selection(1);
+                } else {
+                    notice.scroll = notice.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if notice.focus == Focus::List {
+                    notice.move_selection(-1);
+                } else {
+                    notice.scroll = notice.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageDown => {
+                notice.scroll = notice
+                    .scroll
+                    .saturating_add(notice.detail_area.height.max(1))
+            }
+            KeyCode::PageUp => {
+                notice.scroll = notice
+                    .scroll
+                    .saturating_sub(notice.detail_area.height.max(1))
+            }
+            KeyCode::Home => {
+                if notice.focus == Focus::List {
+                    notice.select(0);
+                } else {
+                    notice.scroll = 0;
+                }
+            }
+            KeyCode::End => {
+                if notice.focus == Focus::List {
+                    notice.select(notice.items.len() - 1);
+                } else {
+                    notice.scroll = u16::MAX;
+                }
+            }
             _ => {}
         }
         None
@@ -94,21 +174,32 @@ impl App {
 
     pub(super) fn handle_upgrade_notices_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
         let notice = self.upgrade_notices.as_mut()?;
+        let at = (mouse.column, mouse.row).into();
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left)
-                if notice
-                    .copy_button
-                    .contains((mouse.column, mouse.row).into()) =>
-            {
+            MouseEventKind::Down(MouseButton::Left) if notice.copy_button.contains(at) => {
                 return notice.copy_snippet();
             }
-            MouseEventKind::Down(MouseButton::Left)
-                if notice.button.contains((mouse.column, mouse.row).into()) =>
-            {
-                self.acknowledge_upgrade_notices();
+            MouseEventKind::Down(MouseButton::Left) if notice.button.contains(at) => {
+                self.acknowledge_upgrade_notices()
             }
-            MouseEventKind::ScrollDown => notice.scroll = notice.scroll.saturating_add(3),
-            MouseEventKind::ScrollUp => notice.scroll = notice.scroll.saturating_sub(3),
+            MouseEventKind::Down(MouseButton::Left) if notice.list_area.contains(at) => {
+                notice.focus = Focus::List;
+                let index = notice.list.offset() + usize::from(mouse.row - notice.list_area.y);
+                if index < notice.items.len() {
+                    notice.select(index);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if notice.detail_area.contains(at) => {
+                notice.focus = Focus::Details
+            }
+            MouseEventKind::ScrollDown if notice.list_area.contains(at) => notice.move_selection(1),
+            MouseEventKind::ScrollUp if notice.list_area.contains(at) => notice.move_selection(-1),
+            MouseEventKind::ScrollDown if notice.detail_area.contains(at) => {
+                notice.scroll = notice.scroll.saturating_add(3)
+            }
+            MouseEventKind::ScrollUp if notice.detail_area.contains(at) => {
+                notice.scroll = notice.scroll.saturating_sub(3)
+            }
             _ => {}
         }
         None
@@ -120,14 +211,18 @@ impl App {
         };
         let ui = &config::get().colors.ui;
         let accent = Style::default().fg(ui.title_fg).bold();
-        let change = notice.changes[notice.position];
-        let mut lines = Vec::new();
-        for content in change.content {
+        let muted = Style::default().dim();
+        let item = notice.selected();
+        let mut lines = vec![
+            Line::styled(item.title, Style::default().bold()),
+            Line::default(),
+        ];
+        for content in item.content {
             match content {
                 Content::Text(text) | Content::Code(text) => {
-                    lines.extend(text.split('\n').map(Line::from));
+                    lines.extend(text.split('\n').map(Line::from))
                 }
-                Content::Heading(text) => lines.push(Line::styled(*text, Style::default().dim())),
+                Content::Heading(text) => lines.push(Line::styled(*text, Style::default().bold())),
                 Content::Binding(command, description) => lines.push(Line::from(vec![
                     Span::styled(
                         self.keymap
@@ -139,66 +234,144 @@ impl App {
                 ])),
             }
         }
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let width = area.width.saturating_sub(2).min(66);
-        let content_width = width.saturating_sub(4);
-        let content_lines = paragraph.line_count(content_width);
-        let label = if notice.position + 1 < notice.changes.len() {
-            " Enter: Next "
-        } else {
-            " Enter: Got it "
-        };
-        let copy_label = " c: Copy snippet ";
-        let has_snippet = change.content.iter().any(|c| matches!(c, Content::Code(_)));
-        let buttons_width = (label.len() + copy_label.len() + 2) as u16;
-        let stack_buttons = has_snippet && buttons_width > content_width;
-        let button_rows = 1 + u16::from(stack_buttons);
-        let feedback = Paragraph::new(notice.copy_feedback.as_deref().unwrap_or(""))
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false });
-        let feedback_height = feedback.line_count(content_width).clamp(1, 3) as u16;
-        let footer_height = button_rows + feedback_height;
-        let height = (content_lines
-            .saturating_add(footer_height as usize + 3)
-            .min(u16::MAX as usize) as u16)
-            .min(area.height.saturating_sub(2));
+        let width = area.width.saturating_sub(2).min(80);
+        let height = area.height.saturating_sub(2).min(36);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
             width,
             height,
         );
+        let hint = if notice.focus == Focus::List {
+            " j/k: select · Tab: details "
+        } else {
+            " j/k: scroll · Tab: updates "
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::horizontal(1))
-            .border_style(Style::default().fg(ui.title_fg))
-            .title(Span::styled(format!(" {} ", change.title), accent))
-            .title_bottom(Line::from(format!(
-                " v{} · {}/{} ",
-                change.introduced,
-                notice.position + 1,
-                notice.changes.len(),
-            )));
+            .border_style(accent)
+            .title(Span::styled(
+                format!(" What's new in miao v{} ", env!("CARGO_PKG_VERSION")),
+                accent,
+            ))
+            .title_bottom(Line::from(hint));
         clear_overlay(frame, popup);
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        let button_rows = button_rows.min(inner.height);
-        let feedback_height = feedback_height.min(inner.height.saturating_sub(button_rows));
-        let body = Rect::new(
-            inner.x,
-            inner.y,
-            inner.width,
-            inner.height.saturating_sub(button_rows + feedback_height),
+
+        let label = " Enter: Got it ";
+        let copy_label = " c: Copy snippet ";
+        let has_snippet = item.content.iter().any(|c| matches!(c, Content::Code(_)));
+        let buttons_width = (label.len() + copy_label.len() + 2) as u16;
+        let stack_buttons = has_snippet && buttons_width > inner.width;
+        let button_rows = (1 + u16::from(stack_buttons)).min(inner.height);
+        let feedback = Paragraph::new(notice.copy_feedback.as_deref().unwrap_or(""))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false });
+        let feedback_height = if notice.copy_feedback.is_some() {
+            (feedback.line_count(inner.width).clamp(1, 3) as u16)
+                .min(inner.height.saturating_sub(button_rows))
+        } else {
+            0
+        };
+        let content_height = inner.height.saturating_sub(button_rows + feedback_height);
+        // Reserve most of the height for details; the list scrolls when releases
+        // have many items. Saturation keeps even a 1x1 terminal safe to render.
+        let list_height = (notice.items.len().min(5) as u16 + 1).min(content_height / 3);
+        let list_rect = Rect::new(inner.x, inner.y, inner.width, list_height);
+        let list_block = Block::default().title(Line::styled(
+            format!(
+                "Updates · {}/{}{}",
+                notice.list.selected().unwrap_or(0) + 1,
+                notice.items.len(),
+                if notice.focus == Focus::List {
+                    " · focused"
+                } else {
+                    ""
+                }
+            ),
+            if notice.focus == Focus::List {
+                accent
+            } else {
+                muted
+            },
+        ));
+        notice.list_area = list_block.inner(list_rect);
+        let rows: Vec<_> = notice
+            .items
+            .iter()
+            .map(|item| {
+                let kind_style = match item.kind {
+                    Kind::Warning => Style::default().fg(ui.attention_fg),
+                    Kind::Update => Style::default().fg(ui.title_fg),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<7} ", item.kind.label()), kind_style),
+                    Span::raw(item.title),
+                    Span::styled(format!("  v{}", item.introduced), muted),
+                ]))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(rows)
+                .block(list_block)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().bg(ui.highlight_bg).bold()),
+            list_rect,
+            &mut notice.list,
         );
-        notice.scroll = notice
-            .scroll
-            .min(content_lines.saturating_sub(body.height as usize) as u16);
-        frame.render_widget(paragraph.scroll((notice.scroll, 0)), body);
+        let details = Rect::new(
+            inner.x,
+            list_rect.bottom(),
+            inner.width,
+            content_height.saturating_sub(list_height),
+        );
+        let mut detail_block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(if notice.focus == Focus::Details {
+                accent
+            } else {
+                muted
+            })
+            .title(format!(
+                " Details · {} · v{}{} ",
+                item.kind.label(),
+                item.introduced,
+                if notice.focus == Focus::Details {
+                    " · focused"
+                } else {
+                    ""
+                }
+            ));
+        notice.detail_area = detail_block.inner(details);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let content_lines = paragraph.line_count(notice.detail_area.width);
+        notice.scroll = notice.scroll.min(
+            content_lines
+                .saturating_sub(notice.detail_area.height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+        if content_lines > usize::from(notice.detail_area.height) {
+            let above = notice.scroll > 0;
+            let below =
+                usize::from(notice.scroll) + usize::from(notice.detail_area.height) < content_lines;
+            let more = match (above, below) {
+                (true, true) => " ↑ more ↓ ",
+                (true, false) => " ↑ more ",
+                _ => " more ↓ ",
+            };
+            detail_block =
+                detail_block.title(Line::styled(more, muted).alignment(Alignment::Right));
+        }
+        frame.render_widget(detail_block, details);
+        frame.render_widget(paragraph.scroll((notice.scroll, 0)), notice.detail_area);
         frame.render_widget(
             feedback,
-            Rect::new(inner.x, body.bottom(), inner.width, feedback_height),
+            Rect::new(inner.x, details.bottom(), inner.width, feedback_height),
         );
+
         let button_width = (label.len() as u16).min(inner.width);
         notice.button = Rect::new(
             inner.x + (inner.width - button_width) / 2,
