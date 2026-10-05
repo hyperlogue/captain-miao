@@ -10974,3 +10974,102 @@ fn rejected_cleanup_restores_the_optimistic_row_and_keeps_its_window_binding() {
             .contains("Codex cleanup refused")
     );
 }
+
+#[test]
+fn escape_cancels_prefixes_and_clears_search_before_dismissing_notifications() {
+    let mut d = TestDashboard::new(100, 24);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app.set_status("Older notification".into(), true);
+    d.app.set_status("Newest notification".into(), true);
+    assert!(d.render().contains("Esc/x dismiss newest"));
+    d.app.set_search_filter(Some("project".into()));
+    let out = d.render();
+    assert!(out.contains("x dismiss newest"), "{out}");
+    assert!(!out.contains("Esc/x dismiss newest"), "{out}");
+
+    for prefix in [' ', 'g'] {
+        d.press(KeyCode::Char(prefix));
+        assert!(!d.render().contains("dismiss newest"));
+        assert!(d.press(KeyCode::Esc).is_none());
+        assert!(!d.app.pending_g);
+        assert!(d.app.pending_prefix.is_empty());
+        assert_eq!(d.app.search_filter.as_deref(), Some("project"));
+        assert!(d.render().contains("Newest notification"));
+    }
+    assert!(d.press(KeyCode::Esc).is_none());
+    assert!(d.app.search_filter.is_none());
+    let out = d.render();
+    assert!(out.contains("Newest notification"), "{out}");
+    assert!(out.contains("Older notification"), "{out}");
+    assert!(out.contains("Esc/x dismiss newest"), "{out}");
+
+    assert!(d.press(KeyCode::Esc).is_none());
+    let out = d.render();
+    assert!(!out.contains("Newest notification"), "{out}");
+    assert!(out.contains("Older notification"), "{out}");
+    assert!(d.press(KeyCode::Esc).is_none());
+    assert!(!d.render().contains("Older notification"));
+    assert!(d.press(KeyCode::Esc).is_none());
+    assert!(matches!(
+        d.press(KeyCode::Char('X')),
+        Some(Action::KillSession { .. })
+    ));
+}
+
+#[test]
+fn escape_closes_panels_or_search_input_before_dismissing_notifications() {
+    for sequence in ["?", " m", " ts", ",", "/"] {
+        let mut d = TestDashboard::new(100, 24);
+        d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+        d.app.set_status("Persistent notification".into(), true);
+        for key in sequence.chars() {
+            d.press(KeyCode::Char(key));
+        }
+        assert!(
+            d.app.input_mode != InputMode::Normal || d.app.session_detail,
+            "{sequence}"
+        );
+        assert!(d.press(KeyCode::Esc).is_none());
+        assert_eq!(d.app.input_mode, InputMode::Normal, "{sequence}");
+        assert!(!d.app.session_detail, "{sequence}");
+        assert!(d.render().contains("Persistent notification"), "{sequence}");
+        assert!(d.press(KeyCode::Esc).is_none());
+        assert!(
+            !d.render().contains("Persistent notification"),
+            "{sequence}"
+        );
+    }
+}
+
+#[test]
+fn contextual_and_direct_notification_dismissal_follow_configured_bindings() {
+    use crate::config::KeyBinding;
+    let config = std::collections::HashMap::from([
+        ("clear".into(), KeyBinding::One("f9".into())),
+        ("dismiss_notification".into(), KeyBinding::One("f8".into())),
+    ]);
+    let mut d = TestDashboard::new(100, 24);
+    let (keymap, warnings) = super::keymap::Keymap::from_config(&config);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    d.app.keymap = keymap;
+    d.app.set_status("First notification".into(), true);
+    assert!(d.render().contains("F9/F8 dismiss newest"));
+    d.app.set_search_filter(Some("project".into()));
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char('x'));
+    assert_eq!(d.app.search_filter.as_deref(), Some("project"));
+    let out = d.render();
+    assert!(out.contains("First notification"), "{out}");
+    assert!(out.contains("F8 dismiss newest"), "{out}");
+    assert!(!out.contains("F9/F8"), "{out}");
+    d.press(KeyCode::F(8));
+    assert!(!d.render().contains("First notification"));
+    assert_eq!(d.app.search_filter.as_deref(), Some("project"));
+
+    d.app.set_status("Second notification".into(), true);
+    d.press(KeyCode::F(9));
+    assert!(d.app.search_filter.is_none());
+    assert!(d.render().contains("Second notification"));
+    d.press(KeyCode::F(9));
+    assert!(!d.render().contains("Second notification"));
+}

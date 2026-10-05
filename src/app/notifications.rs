@@ -279,9 +279,21 @@ impl App {
             self.notifications.hitboxes.clear();
             return;
         }
-        let normal = self.input_mode == InputMode::Normal && !self.session_detail;
+        let normal = self.input_mode == InputMode::Normal
+            && !self.session_detail
+            && !self.pending_g
+            && self.pending_prefix.is_empty();
         let dismiss = normal
-            .then(|| self.keymap.primary_key(Command::DismissNotification))
+            .then(|| {
+                let clear = self
+                    .search_filter
+                    .is_none()
+                    .then(|| self.keymap.primary_key(Command::ClearSearch))
+                    .flatten();
+                let direct = self.keymap.primary_key(Command::DismissNotification);
+                let keys: Vec<_> = [clear, direct].into_iter().flatten().collect();
+                (!keys.is_empty()).then(|| keys.join("/"))
+            })
             .flatten();
         let history = normal
             .then(|| self.keymap.primary_key(Command::MessageLog))

@@ -612,7 +612,11 @@ impl App {
                 None
             }
             Command::ClearSearch => {
-                self.set_search_filter(None);
+                if self.search_filter.is_some() {
+                    self.set_search_filter(None);
+                } else {
+                    self.notifications.dismiss_latest();
+                }
                 self.status_msg = None;
                 None
             }

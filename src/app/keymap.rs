@@ -415,7 +415,7 @@ impl Command {
             Command::TogglePin => "pin",
             Command::ToggleFollowUp => "toggle needs-input (idle only)",
             Command::Search => "search",
-            Command::ClearSearch => "clear search / status",
+            Command::ClearSearch => "clear search, otherwise dismiss newest notification",
             Command::Help => "help",
             Command::Quit => "quit",
             Command::TogglePreview => "toggle preview panel",

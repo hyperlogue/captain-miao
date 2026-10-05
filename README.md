@@ -321,6 +321,7 @@ Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/D
 | `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
 | `Space m`             | Message log — notification history, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
 | `x`                   | Dismiss the newest notification (or click its `×`)                                                                                                                     |
+| `Esc`                 | Close a popup or cancel input/a key sequence; clear the search filter; otherwise dismiss the newest notification                                                         |
 | `?`                   | Show the full key list (help overlay)                                                                                                                                      |
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
@@ -365,9 +366,12 @@ Session launches only show a notification if an error occurs.
 Git progress updates one popup until the operation finishes. Information and
 successful results disappear after five seconds; warnings and errors stay until
 you dismiss them. Click a popup's `×` to close it, or press `x` to dismiss
-the newest notification (`dismiss_notification` in `[keybinds]`). Dismissing
-progress does not cancel the operation; its result still appears. Notifications
-briefly fade from dim to normal on arrival. `Space m` opens their history,
+the newest notification (`dismiss_notification` in `[keybinds]`). `Esc` handles
+open dialogs, text input, and pending key sequences first, then clears any search
+filter; otherwise it dismisses the newest notification. Its Normal-mode action
+is configurable as `clear` in `[keybinds]`. Dismissing progress does not cancel
+the operation; its result still appears. Notifications briefly fade from dim to
+normal on arrival. `Space m` opens their history,
 including the full text of long messages and notifications hidden above the stack.
 The panel distinguishes info, warnings and errors by color and label. Each entry
 shows local ISO 8601 time to the second, its UTC offset, and a single-unit age
