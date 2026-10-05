@@ -417,10 +417,20 @@ Fresh installs skip the notice permanently. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
 The dashboard stores `last_dashboard_version` in `dashboard-overrides.json`;
 upgrade notices appear only when crossing the version that introduced a change.
-The version is saved immediately for fresh installs and launches without a
-notice, or after acknowledgement when a notice is shown. Ordinary preference
-saves preserve it. The older separate shortcut-notice file is migrated and
-removed automatically after the version is saved.
+Skipping releases queues all applicable breaking-change notices, oldest first.
+Each popup shows its introduction version and position in the queue; Enter,
+Esc, or **Next** acknowledges it and advances to the next notice. **Got it**
+finishes the queue. The version is saved immediately for fresh installs and
+launches without notices, or after the whole queue is acknowledged. Quitting
+partway through leaves the queue pending for the next launch. Ordinary
+preference saves preserve the version. The older separate shortcut-notice file
+is migrated and removed after the version is saved; it acknowledges only the
+x/X change.
+
+New announcements are declared in the
+[`BREAKING_CHANGES` catalog](src/app/breaking_changes.rs) with a stable ID,
+introduction version, title, and content. Text, headings, code snippets, and
+active shortcut bindings use the same popup and persistence logic.
 
 Codex can also run through a shared app-server, selected **per execution host**.
 Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix

@@ -274,7 +274,7 @@ impl App {
     pub(super) fn draw_notifications(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         // Keep history and the startup shortcut announcement unobscured.
         if matches!(self.input_mode, InputMode::Messages | InputMode::Help)
-            || self.keybinding_notice.is_some()
+            || self.upgrade_notices.is_some()
         {
             self.notifications.hitboxes.clear();
             return;

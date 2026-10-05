@@ -28,6 +28,7 @@
 //! marking dirty.
 
 mod bindings;
+mod breaking_changes;
 mod dashboard_state;
 mod diagnostics;
 mod dir_edit;
@@ -36,7 +37,6 @@ mod format;
 mod host_edit;
 mod hosts;
 mod keybind_log;
-mod keybinding_notice;
 mod keymap;
 mod keys;
 mod logo;
@@ -48,6 +48,7 @@ mod prefs;
 mod render_backend;
 mod restart;
 mod run;
+mod upgrade_notices;
 
 /// The hosts panel's types stay reachable as `super::X` from every module
 /// that already named them; the panel owns them, `mod.rs` no longer declares
@@ -877,7 +878,7 @@ pub(super) struct App {
     pub(super) messages: messages::MessageLog,
     /// Active message-log popup. `Some` iff `input_mode == InputMode::Messages`.
     pub(super) message_view: Option<messages::MessageLogView>,
-    pub(in crate::app) keybinding_notice: Option<keybinding_notice::KeybindingNotice>,
+    pub(in crate::app) upgrade_notices: Option<upgrade_notices::UpgradeNotices>,
     pub(in crate::app) dashboard_state: dashboard_state::DashboardState,
     pub(super) input_mode: InputMode,
     /// The Search-mode (`/`) text buffer: a cursor-aware input with readline
@@ -1645,7 +1646,7 @@ impl App {
             notifications,
             messages,
             message_view: None,
-            keybinding_notice: None,
+            upgrade_notices: None,
             dashboard_state: dashboard_state::DashboardState::default(),
             input_mode: InputMode::Normal,
             search_input: self::picker::TextInput::new(),

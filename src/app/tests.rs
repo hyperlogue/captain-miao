@@ -80,7 +80,9 @@ impl TestDashboard {
             dir.join("keybinding-notice-x-v1.json"),
             env!("CARGO_PKG_VERSION"),
         );
-        self.app.keybinding_notice = Some(super::keybinding_notice::KeybindingNotice::default());
+        self.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+            super::breaking_changes::BREAKING_CHANGES.iter().collect(),
+        );
     }
 
     fn set_sessions(&mut self, sessions: Vec<LauncherState>) {
@@ -635,11 +637,11 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     );
     for key in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('y')] {
         assert!(d.press(key).is_none());
-        assert!(d.app.keybinding_notice.is_some());
+        assert!(d.app.upgrade_notices.is_some());
         assert!(d.app.pending_confirm.is_some());
     }
     assert!(d.press(KeyCode::Enter).is_none());
-    assert!(d.app.keybinding_notice.is_none());
+    assert!(d.app.upgrade_notices.is_none());
     assert_eq!(
         d.app
             .dashboard_state
@@ -668,7 +670,7 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
     let selected = d.selected();
     assert!(d.click(0, 0).is_none());
     assert_eq!(d.selected(), selected);
-    assert!(d.app.keybinding_notice.is_some());
+    assert!(d.app.upgrade_notices.is_some());
     d.press_ctrl(KeyCode::Char('c'));
     assert!(d.app.should_quit);
     assert!(
@@ -678,7 +680,7 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
     d.app.should_quit = false;
     let at = find_cell(d.terminal.backend().buffer(), "Got it").expect(&out);
     assert!(d.click(at.0, at.1).is_none());
-    assert!(d.app.keybinding_notice.is_none());
+    assert!(d.app.upgrade_notices.is_none());
     assert_eq!(d.selected(), selected);
     assert_eq!(
         d.app
@@ -692,6 +694,110 @@ fn shortcut_notice_mouse_acknowledgement_and_quit_have_distinct_persistence() {
 }
 
 #[test]
+fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page() {
+    use super::breaking_changes::tests::EXAMPLE_CHANGES;
+    use super::upgrade_notices::UpgradeNotices;
+    use crossterm::event::KeyEventKind;
+
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = temp.path().join("dashboard-overrides.json");
+    let bindings = temp.path().join("window-bindings.json");
+    crate::state::write_json_atomic(
+        &overrides,
+        &serde_json::json!({"last_dashboard_version": "0.10.0"}),
+    )
+    .unwrap();
+    let mut d = TestDashboard::new(100, 24);
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
+        overrides,
+        temp.path().join("keybinding-notice-x-v1.json"),
+        "0.12.0",
+    );
+    d.app.upgrade_notices = UpgradeNotices::new(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, EXAMPLE_CHANGES)
+            .unwrap(),
+    );
+    d.app.input_mode = InputMode::Confirm;
+    d.app.pending_confirm = Some(super::PendingConfirm {
+        prompt: "Recover sessions?".into(),
+        action: Action::RestartAll { sessions: vec![] },
+    });
+    let out = d.render();
+    assert!(out.contains("Session shortcuts changed"), "{out}");
+    assert!(out.contains("v0.11.0 · 1/3"), "{out}");
+    // Holding Enter must not acknowledge several pages through key repeats.
+    d.app.handle_key(KeyEvent::new_with_kind(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+        KeyEventKind::Repeat,
+    ));
+    assert!(d.render().contains("1/3"));
+    assert!(d.press(KeyCode::Enter).is_none());
+    let out = d.render();
+    assert!(out.contains("Configuration format changed"), "{out}");
+    assert!(out.contains("setting = \"new\""), "{out}");
+    assert!(out.contains("v0.12.0 · 2/3"), "{out}");
+    assert!(
+        !out.contains("kill ="),
+        "generic pages have no shortcut content"
+    );
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some("0.10.0")
+    );
+
+    d.press_ctrl(KeyCode::Char('c'));
+    assert!(d.app.should_quit);
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .begin_startup(&bindings, EXAMPLE_CHANGES)
+            .unwrap()
+            .len(),
+        3
+    );
+    d.app.should_quit = false;
+    let at = find_cell(d.terminal.backend().buffer(), "Next").expect(&out);
+    assert!(d.click(at.0, at.1).is_none());
+    // A second click before drawing cannot acknowledge an unseen page.
+    assert!(d.click(at.0, at.1).is_none());
+    let out = d.render();
+    assert!(out.contains("Connection policy changed"), "{out}");
+    assert!(out.contains("Action required"), "{out}");
+    assert!(out.contains("3/3"), "{out}");
+    assert!(out.contains("Got it"), "{out}");
+    assert!(d.press(KeyCode::Esc).is_none());
+    assert!(d.app.upgrade_notices.is_none());
+    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    assert!(d.app.pending_confirm.is_some());
+    assert_eq!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .last_dashboard_version
+            .as_deref(),
+        Some("0.12.0")
+    );
+    assert!(
+        UpgradeNotices::new(
+            d.app
+                .dashboard_state
+                .begin_startup(&bindings, EXAMPLE_CHANGES)
+                .unwrap()
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn shortcut_notice_reports_a_failed_version_save_without_blocking_the_dashboard() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("file");
@@ -699,7 +805,7 @@ fn shortcut_notice_reports_a_failed_version_save_without_blocking_the_dashboard(
     let mut d = TestDashboard::new(100, 24);
     d.show_shortcut_notice(&file);
     d.press(KeyCode::Esc);
-    assert!(d.app.keybinding_notice.is_none());
+    assert!(d.app.upgrade_notices.is_none());
     assert!(d.app.status_is_error);
     assert!(
         d.app
@@ -745,10 +851,14 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
         Some(env!("CARGO_PKG_VERSION"))
     );
     assert!(
-        !d.app
+        d.app
             .dashboard_state
-            .begin_startup(&temp.path().join("window-bindings.json"))
+            .begin_startup(
+                &temp.path().join("window-bindings.json"),
+                super::breaking_changes::BREAKING_CHANGES
+            )
             .unwrap()
+            .is_empty()
     );
 }
 

@@ -10,7 +10,10 @@ use anyhow::Context;
 use semver::Version;
 use serde_json::{Map, Value};
 
-use super::DashboardOverrides;
+use super::{
+    DashboardOverrides,
+    breaking_changes::{self, BreakingChange, SESSION_SHORTCUTS_ID},
+};
 use crate::state;
 
 pub(super) struct DashboardState {
@@ -51,9 +54,13 @@ impl DashboardState {
         state::write_json_atomic(&self.path, &overrides)
     }
 
-    /// Return whether the shortcut-change notice is due. The caller must do
+    /// Queue every applicable breaking change. The caller must do
     /// this before the first session reload writes window bindings.
-    pub(super) fn begin_startup(&self, window_bindings: &Path) -> anyhow::Result<bool> {
+    pub(super) fn begin_startup(
+        &self,
+        window_bindings: &Path,
+        catalog: &'static [BreakingChange],
+    ) -> anyhow::Result<Vec<&'static BreakingChange>> {
         let document = self.read_document()?;
         let prior_use = self.path.is_file() || window_bindings.is_file();
         let acknowledged_legacy = state::read_json::<bool>(&self.legacy_notice) == Some(true);
@@ -62,16 +69,20 @@ impl DashboardState {
             .and_then(Value::as_str)
             .and_then(|v| Version::parse(v).ok());
         let current = Version::parse(self.version)?;
-        // The first dashboard version tracking this shortcut change. This is
-        // deliberately fixed: a later release must not replay the same notice.
-        let shortcut_change = Version::new(0, 11, 0);
-        let crossed_change = !current.cmp_precedence(&shortcut_change).is_lt()
-            && previous.is_none_or(|v| v.cmp_precedence(&shortcut_change).is_lt());
-        let show_notice = prior_use && !acknowledged_legacy && crossed_change;
-        if !show_notice {
+        let mut notices = if prior_use {
+            breaking_changes::pending(catalog, previous.as_ref(), &current)?
+        } else {
+            Vec::new()
+        };
+        // The legacy receipt acknowledged only the x/X announcement, not all
+        // changes through the version being launched today.
+        if acknowledged_legacy {
+            notices.retain(|change| change.id != SESSION_SHORTCUTS_ID);
+        }
+        if notices.is_empty() {
             self.finish_startup()?;
         }
-        Ok(show_notice)
+        Ok(notices)
     }
 
     pub(super) fn finish_startup(&self) -> anyhow::Result<()> {
@@ -110,6 +121,7 @@ impl DashboardState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::breaking_changes::{BREAKING_CHANGES, tests::EXAMPLE_CHANGES};
     use super::*;
     use serde_json::json;
 
@@ -129,14 +141,24 @@ mod tests {
         // Launcher and server use alone do not establish previous dashboard use.
         std::fs::create_dir(temp.path().join("sessions")).unwrap();
         std::fs::write(temp.path().join("server.pid"), "1").unwrap();
-        assert!(!dashboard.begin_startup(&bindings).unwrap());
+        assert!(
+            dashboard
+                .begin_startup(&bindings, BREAKING_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             dashboard.load().unwrap().last_dashboard_version.as_deref(),
             Some("0.11.0")
         );
         assert!(!dashboard.legacy_notice.exists());
         std::fs::write(&bindings, "[]").unwrap();
-        assert!(!dashboard.begin_startup(&bindings).unwrap());
+        assert!(
+            dashboard
+                .begin_startup(&bindings, BREAKING_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -150,19 +172,34 @@ mod tests {
             } else {
                 std::fs::write(&bindings, "[]").unwrap();
             }
-            assert!(dashboard.begin_startup(&bindings).unwrap());
+            assert!(
+                !dashboard
+                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .unwrap()
+                    .is_empty()
+            );
             // Startup migrations and later preference saves cannot silently
             // acknowledge an open notice, even if the dashboard then quits.
             dashboard.save(DashboardOverrides::default()).unwrap();
             assert!(dashboard.load().unwrap().last_dashboard_version.is_none());
-            assert!(dashboard.begin_startup(&bindings).unwrap());
+            assert!(
+                !dashboard
+                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .unwrap()
+                    .is_empty()
+            );
             dashboard.finish_startup().unwrap();
             dashboard.save(DashboardOverrides::default()).unwrap();
             assert_eq!(
                 dashboard.load().unwrap().last_dashboard_version.as_deref(),
                 Some("0.11.0")
             );
-            assert!(!dashboard.begin_startup(&bindings).unwrap());
+            assert!(
+                dashboard
+                    .begin_startup(&bindings, BREAKING_CHANGES)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -189,9 +226,10 @@ mod tests {
             .unwrap();
             assert_eq!(
                 dashboard
-                    .begin_startup(&temp.path().join("window-bindings.json"))
-                    .unwrap(),
-                expected,
+                    .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
+                    .unwrap()
+                    .is_empty(),
+                !expected,
                 "{previous} -> {current}"
             );
             assert_eq!(
@@ -214,9 +252,10 @@ mod tests {
         state::write_json_atomic(&dashboard.path, &saved).unwrap();
         state::write_json_atomic(&dashboard.legacy_notice, &true).unwrap();
         assert!(
-            !dashboard
-                .begin_startup(&temp.path().join("window-bindings.json"))
+            dashboard
+                .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
                 .unwrap()
+                .is_empty()
         );
         assert!(!dashboard.legacy_notice.exists());
         saved["last_dashboard_version"] = json!("0.11.0");
@@ -232,17 +271,84 @@ mod tests {
     }
 
     #[test]
+    fn legacy_receipt_never_acknowledges_other_changes_in_skipped_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let dashboard = dashboard(temp.path(), "0.12.0");
+        let bindings = temp.path().join("window-bindings.json");
+        std::fs::write(&bindings, "[]").unwrap();
+        state::write_json_atomic(&dashboard.legacy_notice, &true).unwrap();
+        for _ in 0..2 {
+            let notices = dashboard.begin_startup(&bindings, EXAMPLE_CHANGES).unwrap();
+            assert_eq!(
+                notices.iter().map(|change| change.id).collect::<Vec<_>>(),
+                ["config-format", "connection-policy"]
+            );
+            assert!(dashboard.legacy_notice.exists());
+            assert!(!dashboard.path.exists(), "no acknowledgement yet");
+        }
+        dashboard.finish_startup().unwrap();
+        assert!(!dashboard.legacy_notice.exists());
+        assert!(
+            dashboard
+                .begin_startup(&bindings, EXAMPLE_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn new_install_skips_the_entire_catalog_but_later_upgrades_do_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = dashboard(temp.path(), "0.11.0");
+        let bindings = temp.path().join("window-bindings.json");
+        assert!(
+            first
+                .begin_startup(&bindings, EXAMPLE_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
+        let next = dashboard(temp.path(), "0.12.0");
+        let notices = next.begin_startup(&bindings, EXAMPLE_CHANGES).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|change| change.introduced == "0.12.0"));
+        assert_eq!(
+            next.load().unwrap().last_dashboard_version.as_deref(),
+            Some("0.11.0")
+        );
+        next.finish_startup().unwrap();
+        assert_eq!(
+            next.load().unwrap().last_dashboard_version.as_deref(),
+            Some("0.12.0")
+        );
+        assert!(
+            next.begin_startup(&bindings, EXAMPLE_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn an_unacknowledged_legacy_receipt_is_removed_after_acknowledgement() {
         let temp = tempfile::tempdir().unwrap();
         let dashboard = dashboard(temp.path(), "0.11.0");
         let bindings = temp.path().join("window-bindings.json");
         std::fs::write(&bindings, "[]").unwrap();
         state::write_json_atomic(&dashboard.legacy_notice, &false).unwrap();
-        assert!(dashboard.begin_startup(&bindings).unwrap());
+        assert!(
+            !dashboard
+                .begin_startup(&bindings, BREAKING_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
         assert!(dashboard.legacy_notice.exists());
         dashboard.finish_startup().unwrap();
         assert!(!dashboard.legacy_notice.exists());
-        assert!(!dashboard.begin_startup(&bindings).unwrap());
+        assert!(
+            dashboard
+                .begin_startup(&bindings, BREAKING_CHANGES)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -256,7 +362,7 @@ mod tests {
         std::fs::create_dir(dashboard.path.with_extension("tmp")).unwrap();
         assert!(
             dashboard
-                .begin_startup(&temp.path().join("window-bindings.json"))
+                .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
                 .is_err()
         );
         assert_eq!(

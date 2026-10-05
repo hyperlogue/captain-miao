@@ -71,8 +71,8 @@ impl App {
             self.should_quit = true;
             return None;
         }
-        if self.keybinding_notice.is_some() {
-            self.handle_keybinding_notice_key(key);
+        if self.upgrade_notices.is_some() {
+            self.handle_upgrade_notices_key(key);
             return None;
         }
         match self.input_mode {
@@ -93,8 +93,8 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
-        if self.keybinding_notice.is_some() {
-            self.handle_keybinding_notice_mouse(mouse);
+        if self.upgrade_notices.is_some() {
+            self.handle_upgrade_notices_mouse(mouse);
             return None;
         }
         if self.input_mode == InputMode::Messages {

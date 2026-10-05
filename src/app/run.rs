@@ -2391,13 +2391,14 @@ fn next_wakeup(
 async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // reload_sessions writes window bindings, even for an empty dashboard;
     // inspect prior use before start_dashboard can create that evidence.
-    let keybinding_notice = super::dashboard_state::DashboardState::default()
-        .begin_startup(&state::window_bindings_path());
+    let upgrade_notices = super::dashboard_state::DashboardState::default().begin_startup(
+        &state::window_bindings_path(),
+        super::breaking_changes::BREAKING_CHANGES,
+    );
     let mut app = start_dashboard().await;
-    match keybinding_notice {
-        Ok(show_notice) => {
-            app.keybinding_notice =
-                show_notice.then(super::keybinding_notice::KeybindingNotice::default);
+    match upgrade_notices {
+        Ok(notices) => {
+            app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(notices);
         }
         Err(error) => app.set_status(
             format!("Could not track the dashboard version: {error}"),

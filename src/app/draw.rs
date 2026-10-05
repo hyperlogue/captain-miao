@@ -127,7 +127,7 @@ impl App {
             self.draw_attaching(frame, frame.area());
         }
         self.draw_notifications(frame, body);
-        self.draw_keybinding_notice(frame, frame.area());
+        self.draw_upgrade_notices(frame, frame.area());
     }
 
     /// The "Attaching…" overlay shown while an attach is in flight.
@@ -1583,8 +1583,8 @@ impl App {
         // and every label the other (dim, so it recedes). A pending prefix
         // (Space / g) or the search `/` marker gets a distinct yellow badge pill.
         let spans = match &self.input_mode {
-            _ if self.keybinding_notice.is_some() => {
-                let mut spans = hint_pair("Enter/Esc", "got it");
+            _ if self.upgrade_notices.is_some() => {
+                let mut spans = hint_pair("Enter/Esc", "acknowledge");
                 spans.extend(hint_pair("j/k", "scroll"));
                 spans
             }
