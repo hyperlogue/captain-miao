@@ -1480,7 +1480,7 @@ impl App {
         }
         lines.extend([
             cmd(Command::CopySessionId),
-            cmd(Command::KillSelected),
+            cmd(Command::CloseSession),
             cmd(Command::RestartSelected),
             cmd(Command::RestartAll),
         ]);

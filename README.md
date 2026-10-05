@@ -294,7 +294,7 @@ Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/D
 | `Enter`                        | Focus the selected session's window, or attach one to a detached session (asking first if another client holds it) |
 | `o` / `O`                      | New session (same cwd / prompt for cwd)                                                                            |
 | `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session                                            |
-| `X` / `D`                      | Kill the selected session / detach from it, leaving it running                                                     |
+| `X` / `D`                      | Close the selected session / detach from it, leaving it running                                                    |
 | `s`                            | Jump to the next session needing attention                                                                         |
 
 #### Remaining key bindings
@@ -407,7 +407,7 @@ It opens pointed at the focused session's own workdir when that host's recent li
 
 ```toml
 [keybinds]
-kill = "delete"                 # move kill from X to Delete
+close_session = "delete"        # move session closing from X to Delete
 dismiss_notification = "f8"      # move notification dismissal from x to F8
 jump_attention = ["s", "n"]     # bind two keys to one command
 restart = "space r"             # remap a leader sequence
@@ -417,12 +417,23 @@ toggle_detail = []              # unbind a command
 Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c` is reserved for quitting. The `g g` and `1..9` / `Ctrl-1..9` shortcuts are built-in fallbacks; an explicit configured binding takes precedence.
 
 Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
+The old `kill` name remains an alias for `close_session`. If both are configured,
+`close_session` takes precedence.
 
 A one-time startup popup for existing dashboard users explains the change to `X`
-for killing sessions and `x` for dismissing notifications, and shows your active
-bindings. Press Enter or Esc, or click **Got it**, to acknowledge it. The
-acknowledgement survives restarts;
-your configured `kill` and `dismiss_notification` bindings remain in effect.
+for closing sessions and `x` for dismissing notifications, and shows your active
+bindings. It includes a snippet to restore the previous default:
+
+```toml
+[keybinds]
+close_session = "x"
+dismiss_notification = []
+```
+
+Click **Copy snippet** or press `c` in the popup to copy it, then edit
+`config.toml` and restart miao. Press Enter or Esc, or click **Got it**, to
+acknowledge the notice. The acknowledgement survives restarts; your configured
+`close_session` (or `kill`) and `dismiss_notification` bindings remain in effect.
 Fresh installs skip the notice permanently. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
 The dashboard stores `last_dashboard_version` in `dashboard-overrides.json`;
@@ -546,10 +557,10 @@ keybind_log_file = "keybinds.log"
 [keybinds]
 # Remap any Normal-mode command: command-id = "key" or ["key", "alt"]; [] unbinds.
 # command-ids are the Command::id() strings in src/app/keymap.rs (DEFAULTS table).
-# e.g. kill = "delete"  /  jump_attention = ["s", "n"]  /  restart = "space r"
+# e.g. close_session = "delete"  /  jump_attention = ["s", "n"]  /  restart = "space r"
 ```
 
-Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`kill`, `jump_attention`, `restart`, `toggle_preview`, …).
+Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`close_session`, `jump_attention`, `restart`, `toggle_preview`, …).
 
 ### Running sessions on remote servers
 

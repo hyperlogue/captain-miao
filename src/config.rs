@@ -198,7 +198,7 @@ pub struct Config {
     pub load_warning: Option<String>,
 }
 
-/// One `[keybinds]` value: either a single key string (`kill = "X"`) or a list
+/// One `[keybinds]` value: either a single key string (`close_session = "X"`) or a list
 /// of alternates (`next = ["j", "down", "ctrl+n"]`). An empty list unbinds the
 /// command.
 #[derive(Debug, Clone, Deserialize)]
@@ -656,12 +656,12 @@ mod tests {
     fn keybinds_table_parses_string_and_list_forms() {
         let toml = r#"
             [keybinds]
-            kill = "X"
+            close_session = "X"
             next = ["j", "down", "ctrl+n"]
             help = []
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.keybinds["kill"].keys(), vec!["X"]);
+        assert_eq!(cfg.keybinds["close_session"].keys(), vec!["X"]);
         assert_eq!(cfg.keybinds["next"].keys(), vec!["j", "down", "ctrl+n"]);
         assert!(cfg.keybinds["help"].keys().is_empty());
     }

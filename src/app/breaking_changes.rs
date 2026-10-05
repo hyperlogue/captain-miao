@@ -32,15 +32,17 @@ pub(super) const BREAKING_CHANGES: &[BreakingChange] = &[BreakingChange {
     title: "Session shortcuts changed",
     content: &[
         Content::Text(
-            "The default kill key moved from x to X (Shift+x).\nBy default, x now dismisses the newest notification.",
+            "The default key for closing session is moved from x to X (Shift+x).\nBy default, x now dismisses the notification.",
         ),
         Content::Text(""),
         Content::Heading("Your active shortcuts"),
-        Content::Binding(Command::KillSelected, "Kill selected session"),
+        Content::Binding(Command::CloseSession, "Close selected session"),
         Content::Binding(Command::DismissNotification, "Dismiss newest notification"),
         Content::Text(""),
-        Content::Heading("Edit these keys in config.toml (defaults shown):"),
-        Content::Code("[keybinds]\nkill = \"X\"\ndismiss_notification = \"x\""),
+        Content::Text(
+            "If you want to override and restore the previous default, edit these keys in config.toml.",
+        ),
+        Content::Code("[keybinds]\nclose_session = \"x\"\ndismiss_notification = []"),
         Content::Text(""),
         Content::Text("Restart miao to apply your changes."),
     ],

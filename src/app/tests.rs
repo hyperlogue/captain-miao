@@ -628,8 +628,8 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     d.show_shortcut_notice(temp.path());
     let out = d.render();
     assert!(out.contains("Session shortcuts changed"), "{out}");
-    assert!(out.contains("kill = \"X\""), "{out}");
-    assert!(out.contains("dismiss_notification = \"x\""), "{out}");
+    assert!(out.contains("close_session = \"x\""), "{out}");
+    assert!(out.contains("dismiss_notification = []"), "{out}");
     assert!(
         !overrides.exists(),
         "drawing must not acknowledge the notice"
@@ -656,6 +656,56 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
         d.press(KeyCode::Char('y')),
         Some(Action::RestartAll { .. })
     ));
+}
+
+#[test]
+fn shortcut_notice_copies_a_working_restore_snippet_without_acknowledging() {
+    use super::keymap::{Command, Keymap};
+
+    let temp = tempfile::tempdir().unwrap();
+    for (width, height) in [(100, 24), (40, 12), (24, 12)] {
+        let mut d = TestDashboard::new(width, height);
+        d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+        d.show_shortcut_notice(temp.path());
+        // The copy control stays reachable even when the content needs scrolling.
+        for _ in 0..30 {
+            d.press(KeyCode::Down);
+        }
+        let out = d.render();
+        let at = find_cell(d.terminal.backend().buffer(), "Copy snippet").expect(&out);
+        let selected = d.selected();
+        for action in [d.click(at.0, at.1), d.press(KeyCode::Char('c'))] {
+            let Some(Action::CopyUpgradeSnippet(text)) = action else {
+                panic!("expected a snippet clipboard action, got {action:?}");
+            };
+            assert_eq!(
+                text,
+                "[keybinds]\nclose_session = \"x\"\ndismiss_notification = []"
+            );
+            let config: crate::config::Config = toml::from_str(&text).unwrap();
+            let (keymap, warnings) = Keymap::from_config(&config.keybinds);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                keymap.primary_key(Command::CloseSession).as_deref(),
+                Some("x")
+            );
+            assert_eq!(keymap.keys_for(Command::DismissNotification), None);
+            d.app.keymap = keymap;
+        }
+        assert!(d.app.upgrade_notices.is_some());
+        assert_eq!(d.selected(), selected);
+        assert!(!temp.path().join("dashboard-overrides.json").exists());
+        d.app.upgrade_notices.as_mut().unwrap().copy_feedback = Some("Snippet copied".into());
+        let out = d.render();
+        assert!(out.contains("Snippet copied"), "{out}");
+        d.press(KeyCode::Enter);
+        assert!(matches!(
+            d.press(KeyCode::Char('x')),
+            Some(Action::KillSession { .. })
+        ));
+        // Use a fresh state file for the next viewport.
+        std::fs::remove_file(temp.path().join("dashboard-overrides.json")).unwrap();
+    }
 }
 
 #[test]
@@ -722,6 +772,8 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
     let out = d.render();
     assert!(out.contains("Session shortcuts changed"), "{out}");
     assert!(out.contains("v0.11.0 · 1/3"), "{out}");
+    assert!(!out.contains("Copy snippet"), "{out}");
+    assert!(d.press(KeyCode::Char('c')).is_none());
     // Holding Enter must not acknowledge several pages through key repeats.
     d.app.handle_key(KeyEvent::new_with_kind(
         KeyCode::Enter,
@@ -734,8 +786,17 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
     assert!(out.contains("Configuration format changed"), "{out}");
     assert!(out.contains("setting = \"new\""), "{out}");
     assert!(out.contains("v0.12.0 · 2/3"), "{out}");
+    let copy_at = find_cell(d.terminal.backend().buffer(), "Copy snippet").expect(&out);
+    match d.click(copy_at.0, copy_at.1) {
+        Some(Action::CopyUpgradeSnippet(text)) => {
+            assert_eq!(text, "[example]\nsetting = \"new\"");
+        }
+        other => panic!("expected a snippet clipboard action, got {other:?}"),
+    }
+    d.app.upgrade_notices.as_mut().unwrap().copy_feedback = Some("Copy failed: unavailable".into());
+    assert!(d.render().contains("Copy failed: unavailable"));
     assert!(
-        !out.contains("kill ="),
+        !out.contains("close_session ="),
         "generic pages have no shortcut content"
     );
     assert_eq!(
@@ -763,11 +824,14 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
     assert!(d.click(at.0, at.1).is_none());
     // A second click before drawing cannot acknowledge an unseen page.
     assert!(d.click(at.0, at.1).is_none());
+    assert!(d.click(copy_at.0, copy_at.1).is_none());
     let out = d.render();
     assert!(out.contains("Connection policy changed"), "{out}");
     assert!(out.contains("Action required"), "{out}");
     assert!(out.contains("3/3"), "{out}");
     assert!(out.contains("Got it"), "{out}");
+    assert!(!out.contains("Copy snippet"), "{out}");
+    assert!(!out.contains("Copy failed"), "{out}");
     assert!(d.press(KeyCode::Esc).is_none());
     assert!(d.app.upgrade_notices.is_none());
     assert_eq!(d.app.input_mode, InputMode::Confirm);
@@ -858,12 +922,12 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
 }
 
 #[test]
-fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
+fn close_session_and_notification_dismissal_config_drive_the_notice_and_actions() {
     use super::keymap::Keymap;
     let cfg: crate::config::Config = toml::from_str(
         r#"
         [keybinds]
-        kill = "delete"
+        close_session = "delete"
         dismiss_notification = ["f8", "space d"]
     "#,
     )
@@ -876,7 +940,7 @@ fn kill_and_notification_dismissal_config_drive_the_notice_and_actions() {
     d.app.keymap = keymap;
     d.show_shortcut_notice(temp.path());
     let out = d.render();
-    assert!(out.contains("Del  Kill selected session"), "{out}");
+    assert!(out.contains("Del  Close selected session"), "{out}");
     assert!(out.contains("F8"), "{out}");
     assert!(out.contains("Space d"), "{out}");
     d.press(KeyCode::Esc);
@@ -904,7 +968,7 @@ fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
     let cfg: crate::config::Config = toml::from_str(
         r#"
         [keybinds]
-        kill = []
+        close_session = []
         dismiss_notification = []
     "#,
     )
@@ -916,7 +980,7 @@ fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
         d.show_shortcut_notice(temp.path());
         let out = d.render();
         if width == 100 {
-            assert!(out.contains("Unbound  Kill selected session"), "{out}");
+            assert!(out.contains("Unbound  Close selected session"), "{out}");
             assert!(
                 out.contains("Unbound  Dismiss newest notification"),
                 "{out}"
@@ -10863,7 +10927,7 @@ fn narrow_detail_prioritizes_cleanup_failure_and_retry() {
     });
     d.set_sessions(vec![row]);
     let rendered = d.render();
-    assert!(rendered.contains("retry Kill"), "{rendered}");
+    assert!(rendered.contains("retry Close session"), "{rendered}");
     assert!(
         rendered.contains("Background cleanup refused"),
         "{rendered}"

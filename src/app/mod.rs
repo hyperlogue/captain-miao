@@ -226,6 +226,8 @@ pub(super) enum Action {
     CopySessionId(String),
     /// Copy selected message text through the terminal clipboard protocol.
     CopyMessageSelection(String),
+    /// Copy a configuration snippet from an upgrade notice.
+    CopyUpgradeSnippet(String),
     /// Prepare and run push/pull against fresh checkout status in the background.
     VcsPrepare {
         host: HostId,
@@ -324,6 +326,7 @@ impl Action {
             Action::RestartAll { .. } => "RestartAll",
             Action::CopySessionId(_) => "CopySessionId",
             Action::CopyMessageSelection(_) => "CopyMessageSelection",
+            Action::CopyUpgradeSnippet(_) => "CopyUpgradeSnippet",
             Action::AttachRemoteRunning { .. } => "AttachRemoteRunning",
             Action::AttachAll { .. } => "AttachAll",
             Action::UpgradeHost { .. } => "UpgradeHost",

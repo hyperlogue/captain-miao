@@ -72,8 +72,7 @@ impl App {
             return None;
         }
         if self.upgrade_notices.is_some() {
-            self.handle_upgrade_notices_key(key);
-            return None;
+            return self.handle_upgrade_notices_key(key);
         }
         match self.input_mode {
             InputMode::Normal if self.session_detail => self.handle_session_detail_key(key),
@@ -94,8 +93,7 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
         if self.upgrade_notices.is_some() {
-            self.handle_upgrade_notices_mouse(mouse);
-            return None;
+            return self.handle_upgrade_notices_mouse(mouse);
         }
         if self.input_mode == InputMode::Messages {
             return self.handle_message_log_mouse(mouse);
@@ -479,7 +477,7 @@ impl App {
                     }
                 }
             }
-            Command::KillSelected => {
+            Command::CloseSession => {
                 let s = self.selected_session()?;
                 // The local window to close alongside the signal, resolved through
                 // the binding: a local session's own window, an attached remote's
@@ -509,8 +507,8 @@ impl App {
                 let Some(token) = s.pool_session.clone() else {
                     let hint = self
                         .keymap
-                        .primary_key(Command::KillSelected)
-                        .map(|key| format!("; use {key} to kill a local one"))
+                        .primary_key(Command::CloseSession)
+                        .map(|key| format!("; use {key} to close a local one"))
                         .unwrap_or_default();
                     self.set_status(format!("Detach is for pooled sessions{hint}"), true);
                     return None;

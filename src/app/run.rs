@@ -822,9 +822,9 @@ fn start_kill(
     let task = backend.kill_session(key.clone(), CleanupPolicy::ForceIfUnavailable);
     let tx = inboxes.kill_tx.clone();
     tokio::spawn(async move {
-        let outcome = task
-            .await
-            .unwrap_or_else(|error| KillOutcome::Failed(format!("Kill worker failed: {error}")));
+        let outcome = task.await.unwrap_or_else(|error| {
+            KillOutcome::Failed(format!("Close session worker failed: {error}"))
+        });
         let _ = tx.send(KillResult {
             host,
             key,
@@ -884,10 +884,13 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
             };
             app.set_status(message.to_string(), reason != ForcedRemoval::ThreadMissing);
         }
-        KillOutcome::Failed(error) => app.set_status(format!("Kill failed: {error}"), true),
-        KillOutcome::Unreachable => {
-            app.set_status(format!("Kill failed: {} did not answer", host.0), true)
+        KillOutcome::Failed(error) => {
+            app.set_status(format!("Close session failed: {error}"), true)
         }
+        KillOutcome::Unreachable => app.set_status(
+            format!("Close session failed: {} did not answer", host.0),
+            true,
+        ),
     }
 }
 
@@ -3005,6 +3008,18 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                 false,
                             ),
                             Err(e) => app.set_status(format!("Copy failed: {e}"), true),
+                        }
+                    }
+                    Action::CopyUpgradeSnippet(text) => {
+                        let feedback = match copy_to_clipboard(&text) {
+                            Ok(CopyOutcome::Cli) => "Snippet copied".to_string(),
+                            Ok(CopyOutcome::Osc52Fallback) => {
+                                "Snippet sent to terminal clipboard".to_string()
+                            }
+                            Err(e) => format!("Copy failed: {e}"),
+                        };
+                        if let Some(notice) = app.upgrade_notices.as_mut() {
+                            notice.copy_feedback = Some(feedback);
                         }
                     }
                     Action::AttachRemoteRunning {

@@ -55,10 +55,10 @@ pub(super) fn session_diagnostics(
             );
         }
         Some(CleanupStatus::Failed { message }) => {
-            if let Some(key) = keys.primary_key(Command::KillSelected) {
+            if let Some(key) = keys.primary_key(Command::CloseSession) {
                 add(
                     "Next",
-                    format!("{key}: retry Kill; session retained after failed cleanup"),
+                    format!("{key}: retry Close session; session retained after failed cleanup"),
                     true,
                 );
             }
@@ -77,13 +77,13 @@ pub(super) fn session_diagnostics(
             {
                 next.push_str(&format!("; {key}: restart saved conversation"));
             }
-            if let Some(key) = keys.primary_key(Command::KillSelected) {
+            if let Some(key) = keys.primary_key(Command::CloseSession) {
                 next.push_str(&format!("; {key}: remove session"));
             }
             add("Next", next, true);
         }
         _ if state.status == SessionStatus::FailedToStart => {
-            if let Some(key) = keys.primary_key(Command::KillSelected) {
+            if let Some(key) = keys.primary_key(Command::CloseSession) {
                 add(
                     "Next",
                     format!("Fix the launch error; {key}: remove failed session"),
@@ -148,7 +148,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.message.contains("Del: retry Kill"))
+                .any(|line| line.message.contains("Del: retry Close session"))
         );
         assert!(lines.iter().any(|line| line.message == "cleanup refused"));
     }

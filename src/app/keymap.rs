@@ -278,7 +278,7 @@ pub(super) enum Command {
     ResumePicker,
     ForkSession,
     CopySessionId,
-    KillSelected,
+    CloseSession,
     DetachRemote,
     MoveToTab,
     ShellTab,
@@ -346,7 +346,7 @@ impl Command {
             Command::ResumePicker => "resume",
             Command::ForkSession => "fork",
             Command::CopySessionId => "copy_id",
-            Command::KillSelected => "kill",
+            Command::CloseSession => "close_session",
             Command::DetachRemote => "detach",
             Command::MoveToTab => "move_tab",
             Command::ShellTab => "shell_tab",
@@ -384,6 +384,9 @@ impl Command {
     }
 
     fn from_id(id: &str) -> Option<Command> {
+        if id == "kill" {
+            return Some(Command::CloseSession);
+        }
         DEFAULTS.iter().map(|(c, _)| *c).find(|c| c.id() == id)
     }
 
@@ -402,7 +405,7 @@ impl Command {
             // than quietly deliver the one outcome a fork exists to avoid.
             Command::ForkSession => "fork the selected session",
             Command::CopySessionId => "copy selected session id to clipboard",
-            Command::KillSelected => "kill selected session",
+            Command::CloseSession => "close selected session",
             Command::DetachRemote => "detach remote session (keep it running)",
             Command::MoveToTab => "move window to another tab",
             Command::ShellTab => "switch to / open the cwd's work tab",
@@ -455,7 +458,7 @@ impl Command {
             Command::ResumePicker => "resume",
             Command::ForkSession => "fork",
             Command::CopySessionId => "copy id",
-            Command::KillSelected => "kill",
+            Command::CloseSession => "close",
             Command::DetachRemote => "detach",
             Command::MoveToTab => "move tab",
             Command::ShellTab => "shell",
@@ -529,7 +532,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ResumePicker,       &["r"]),
     (Command::ForkSession,        &["f"]),
     (Command::CopySessionId,      &["y"]),
-    (Command::KillSelected,       &["X"]),
+    (Command::CloseSession,       &["X"]),
     (Command::DetachRemote,       &["D"]),
     (Command::MoveToTab,          &["t"]),
     (Command::ShellTab,           &["w"]),
@@ -619,6 +622,11 @@ impl Keymap {
         let mut overrides: HashMap<Command, Vec<KeySeq>> = HashMap::new();
 
         for (id, binding) in cfg {
+            // Prefer the canonical name when both it and the legacy alias
+            // are present, independent of HashMap iteration order.
+            if id == "kill" && cfg.contains_key("close_session") {
+                continue;
+            }
             let Some(cmd) = Command::from_id(id) else {
                 warnings.push(format!("keybinds: unknown command '{id}'"));
                 continue;
@@ -938,7 +946,7 @@ mod tests {
                 warnings.iter().any(|w| w.contains("reserved for quit")),
                 "{warnings:?}"
             );
-            assert_eq!(map.keys_for(Command::KillSelected), None);
+            assert_eq!(map.keys_for(Command::CloseSession), None);
         }
         let cfg = HashMap::from([(
             "quit".into(),
@@ -950,7 +958,7 @@ mod tests {
     #[test]
     fn defaults_build_without_panicking() {
         let km = Keymap::defaults();
-        assert_eq!(km.lookup_single(chord("X")), Some(Command::KillSelected));
+        assert_eq!(km.lookup_single(chord("X")), Some(Command::CloseSession));
         assert_eq!(km.lookup(&[chord("space"), chord("n")]), None);
         assert_eq!(
             km.lookup_single(chord("x")),
@@ -1082,23 +1090,45 @@ mod tests {
 
     #[test]
     fn override_replaces_default_key() {
-        let mut cfg = HashMap::new();
-        cfg.insert(
-            "kill".to_string(),
-            crate::config::KeyBinding::One("delete".to_string()),
-        );
+        for id in ["close_session", "kill"] {
+            let cfg = HashMap::from([(
+                id.to_string(),
+                crate::config::KeyBinding::One("delete".to_string()),
+            )]);
+            let (km, warnings) = Keymap::from_config(&cfg);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                km.lookup_single(chord("delete")),
+                Some(Command::CloseSession)
+            );
+            // The closing binding is freed without affecting notification dismissal.
+            assert_eq!(km.lookup_single(chord("X")), None);
+            assert_eq!(
+                km.lookup_single(chord("x")),
+                Some(Command::DismissNotification)
+            );
+        }
+    }
+
+    #[test]
+    fn close_session_takes_precedence_over_legacy_kill_including_unbinding() {
+        use crate::config::KeyBinding;
+
+        let mut cfg = HashMap::from([
+            ("close_session".into(), KeyBinding::One("f8".into())),
+            ("kill".into(), KeyBinding::One("delete".into())),
+        ]);
         let (km, warnings) = Keymap::from_config(&cfg);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            km.lookup_single(chord("delete")),
-            Some(Command::KillSelected)
-        );
-        // The kill binding is freed without affecting notification dismissal.
-        assert_eq!(km.lookup_single(chord("X")), None);
-        assert_eq!(
-            km.lookup_single(chord("x")),
-            Some(Command::DismissNotification)
-        );
+        assert_eq!(km.lookup_single(chord("f8")), Some(Command::CloseSession));
+        assert_eq!(km.lookup_single(chord("delete")), None);
+        assert_eq!(km.keys_for(Command::CloseSession).as_deref(), Some("F8"));
+
+        cfg.insert("close_session".into(), KeyBinding::Many(vec![]));
+        let (km, warnings) = Keymap::from_config(&cfg);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(km.keys_for(Command::CloseSession), None);
+        assert_eq!(km.lookup_single(chord("delete")), None);
     }
 
     #[test]
@@ -1122,9 +1152,9 @@ mod tests {
             crate::config::KeyBinding::One("s".to_string()),
         );
         let (km, _) = Keymap::from_config(&cfg);
-        assert_eq!(km.lookup_single(chord("s")), Some(Command::KillSelected));
+        assert_eq!(km.lookup_single(chord("s")), Some(Command::CloseSession));
         assert_eq!(km.keys_for(Command::JumpAttention), None);
-        assert_eq!(km.keys_for(Command::KillSelected).as_deref(), Some("s"));
+        assert_eq!(km.keys_for(Command::CloseSession).as_deref(), Some("s"));
     }
 
     #[test]
