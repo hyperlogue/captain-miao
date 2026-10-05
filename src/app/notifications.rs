@@ -47,6 +47,7 @@ impl Level {
 struct Notification {
     id: NotificationId,
     level: Level,
+    progress_title: &'static str,
     text: String,
     created: Instant,
     updated: Instant,
@@ -89,10 +90,17 @@ impl Notifications {
             self.entries.push(Notification {
                 id,
                 level,
+                progress_title: "Working",
                 text,
                 created: now,
                 updated: now,
             });
+        }
+    }
+
+    pub(super) fn set_progress_title(&mut self, id: NotificationId, title: &'static str) {
+        if let Some(entry) = self.entries.iter_mut().find(|n| n.id == id) {
+            entry.progress_title = title;
         }
     }
 
@@ -194,7 +202,11 @@ impl Notifications {
                     let phase =
                         now.duration_since(entry.created).as_millis() / SPINNER_STEP.as_millis();
                     (
-                        format!("{} Working", SPINNER[phase as usize % SPINNER.len()]),
+                        format!(
+                            "{} {}",
+                            SPINNER[phase as usize % SPINNER.len()],
+                            entry.progress_title
+                        ),
                         ui.title_fg,
                     )
                 }

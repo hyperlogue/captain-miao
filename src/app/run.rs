@@ -233,6 +233,8 @@ fn prepare_vcs_command(
         "Preparing pull…"
     };
     let id = app.notify(Level::Progress, vcs_notice(&host, &cwd, verb));
+    app.notifications
+        .set_progress_title(id, if push { "pushing" } else { "pulling" });
     app.vcs_commands.insert(key, id);
     let remote = remote_reach(app, &host);
     let tx = tx.clone();
@@ -400,6 +402,8 @@ fn start_vcs_command(
             &format!("{verb} {} ↔ {}…", plan.branch, plan.destination()),
         ),
     );
+    app.notifications
+        .set_progress_title(id, if plan.push { "pushing" } else { "pulling" });
     let report_cwd = cwd.clone();
     let tx = tx.clone();
     let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
