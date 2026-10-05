@@ -75,7 +75,7 @@ Every one of them runs the whole dashboard; the notes above are the deltas. One 
 | **[opencode](https://github.com/anomalyco/opencode)**            | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                          |
 | **[Pi](https://github.com/earendil-works/pi)**                   | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                                |
 | **[Antigravity](https://antigravity.google/docs/cli/reference)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
-| **[omp](https://github.com/can1357/oh-my-pi)**                   | Hooked with a generated extension passed as `omp -e`; nothing of yours is touched. No resume-picker entries and no worktrees ([known limits](#omp-support)).                                                                                                           |
+| **[omp](https://github.com/can1357/oh-my-pi)**                   | Hooked with a generated extension passed as `omp -e`; nothing of yours is touched. No worktrees ([known limits](#omp-support)).                                                                                                                                        |
 
 > [!NOTE]
 > The Kitty/zellij + Claude Code/Codex have the best level of support and
@@ -261,20 +261,28 @@ missing below is missing from the agent rather than from captain-miao.
 Status, launch, resume, fork and the **approval, title, token and model
 columns** all work. omp is [Oh My Pi](https://github.com/can1357/oh-my-pi), a
 heavily-evolved fork of pi, and is hooked with a generated extension passed as
-`omp -e`; nothing of yours is touched. Verified against omp v17.3.7.
+`omp -e`; nothing of yours is touched. Verified against omp v18.4.8.
 
 - **A `Waiting for approval` state works** — omp has a per-tool approval gate
   (`tool_approval_requested` / `tool_approval_resolved`), the one capability
   pi lacks. `s` jumps to a session blocked on one.
+- **A question reads as a Decision** — when omp's `ask` tool puts a question
+  to you, the row shows `Decision` and rings for attention, separately from
+  the per-tool approval gate above.
 - **Esc mid-turn settles the row immediately** — omp's `agent_end` fires on an
   aborted run too, so the case that costs Antigravity a stranded `Active` row
   cannot arise.
-- **No resume-picker entries** — omp's sessions are trees rather than logs
-  (the same `parentId` shape pi's docs describe). `omp -r` opens omp's own
-  picker meanwhile.
-- **No worktrees, no background-task tiers** — omp does run background work
-  (async bash jobs, `task` spawns), but nothing enumerates them on any payload
-  we receive, so a settled turn reads as `Idle` whatever else is still running.
+- **Resume-picker entries come from `~/.omp/agent/sessions`** (or
+  `$PI_CODING_AGENT_DIR/sessions`). Sessions in other `--profile` directories
+  are not listed; `omp -r` opens omp's own picker for those.
+- **Background-task tiers work** — a turn that settles while async bash jobs or
+  `task` spawns are still running lands on `Task`, on `Server` for a recognised
+  long-running service (`npm run dev`), or on `Review` for an `r3 watch`, rather
+  than reading `Idle`. The generated extension reads omp's
+  `ctx.getAsyncJobSnapshot()` at turn end and forwards the live jobs; `omp ps`
+  and its daemon broker are a different tier (daemon-supervised named services)
+  and are not what these columns read.
+- **No worktrees** — omp has no launch-time worktree flag.
 
 ### Key bindings
 

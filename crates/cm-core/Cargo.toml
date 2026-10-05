@@ -49,6 +49,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 [dev-dependencies]
 # Exercise deferred title refreshes with a paused clock, without wall sleeps.
 tokio = { version = "1", features = ["test-util"] }
+# `TempDir` for the resume-candidate fixture trees, so a test cannot leave a
+# sessions directory behind and two runs never collide on a path.
+tempfile = "3"
 
 # macOS only, and only for the clipboard bridge: `NSPasteboard` is the sole way
 # to get a screenshot's image bytes off the pasteboard (`pbpaste` serves text

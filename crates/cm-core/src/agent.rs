@@ -662,8 +662,10 @@ impl AgentControl {
             AgentControl::Antigravity => vec![],
             // Nothing, and for the strongest reason of any backend, the same as
             // pi's: every fact an omp row carries — status, title, tokens,
-            // model — rides a hook payload, and nothing of ours reads an omp
-            // file at all. There is no file whose change could make a row stale.
+            // model — rides a hook payload. `list_resumable` does read omp's
+            // session heads, but only when the resume picker opens, and that is
+            // no row's fact and not a watch, so no file here can make a row
+            // stale.
             AgentControl::Omp => vec![],
             AgentControl::Unknown => vec![],
         }
@@ -872,15 +874,16 @@ impl AgentControl {
             // that fold land together.
             AgentControl::Pi => Ok(vec![]),
             AgentControl::Antigravity => antigravity::list_resumable(limit),
-            // Empty, and unlike pi's it is not blocked on an active-branch walk:
-            // `omp -r` opens omp's own picker with a current-folder / all-projects
-            // scope toggle, and sessions live at
+            // Read off disk the way the other file-backed backends are: every
+            // field a candidate needs sits in the head of
             // `~/.omp/agent/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`
             // (overridable by `PI_CODING_AGENT_DIR`, and per-profile under
-            // `~/.omp/profiles/<name>/agent`). Reading them means committing to
-            // the same `parentId` walk `read_transcript_stats` declines, so both
-            // stay unimplemented together.
-            AgentControl::Omp => Ok(vec![]),
+            // `~/.omp/profiles/<name>/agent`) — the `session` header's id and
+            // cwd, the pad-rewritten `title` record, and the first `user`
+            // message — so no `parentId` walk is needed. That walk stays where
+            // it belongs: `read_transcript_stats`, whose fold really does need
+            // the active leaf.
+            AgentControl::Omp => omp::list_resumable(limit),
             AgentControl::Unknown => Ok(vec![]),
         }
     }
@@ -1449,11 +1452,12 @@ impl AgentControl {
             // and no tier to put the row in. Unlike Pi's, this one has something
             // to wire up if that list ever appears.
             AgentControl::Antigravity => None,
-            // `None` for a sharper reason than pi's: omp *does* run background
-            // work (async bash jobs, `task` spawns) and `session_stop` is even
-            // deferred until they are idle — but nothing enumerates them on any
-            // payload we receive, so there is no shell to name and no tier to
-            // put the row in.
+            // The live list is applied at Stop in `omp::dispatch_hook` rather
+            // than here: the extension reads omp's in-process async jobs
+            // (`ctx.getAsyncJobSnapshot()`) and rides them on the `agent_end`
+            // payload, so the answer already arrives with the turn end. A
+            // pid-only tree walk is not the source and would disagree with the
+            // agent that just decided the turn is over — Grok's reason.
             AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }

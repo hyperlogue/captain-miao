@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Background-task tiers for omp** — a turn that settles while async bash jobs
+  or `task` spawns are still running lands on `Task`, on `Server` for a
+  recognised long-running service (`npm run dev`), or on `Review` for an
+  `r3 watch`, rather than reading `Idle`. The generated extension reads omp's
+  `ctx.getAsyncJobSnapshot()` at turn end and forwards the live jobs.
+
+### Fixed
+
+- **An omp question reads as a Decision** and rings for attention, rather
+  than looking like a session doing work.
+- **omp sessions appear in the resume picker**, with their title and first
+  prompt.
+
 ## [0.11.0] - 2026-10-03
 
 ### Added
