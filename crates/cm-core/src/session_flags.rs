@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
@@ -30,6 +29,28 @@ struct Entry {
     // bookkeeping stays on disk and never enters SessionFlags or the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observed_status: Option<SessionStatus>,
+}
+
+impl Entry {
+    fn observe(&mut self, status: &SessionStatus) {
+        use SessionStatus::*;
+        let previous = self.observed_status.as_ref();
+        let entered_rest = matches!(
+            (previous, status),
+            (
+                Some(Active | BackgroundActive | BackgroundServer | ReviewPending),
+                Idle
+            ) | (Some(Compacting), Compacted)
+        );
+        let parked_server =
+            *status == BackgroundServer && previous.is_some_and(|p| *p != BackgroundServer);
+        if entered_rest || parked_server {
+            self.flags.follow_up = true;
+        } else if *status == Active {
+            self.flags.follow_up = false;
+        }
+        self.observed_status = Some(status.clone());
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -103,15 +124,10 @@ impl SessionFlagsStore {
             });
         }
         for session in &sessions {
-            let entry = entries.entry(session.key()).or_default();
-            if let Some(want) = follow_up_change(
-                &session.status,
-                entry.observed_status.as_ref(),
-                entry.flags.follow_up,
-            ) {
-                entry.flags.follow_up = want;
-            }
-            entry.observed_status = Some(session.status.clone());
+            entries
+                .entry(session.key())
+                .or_default()
+                .observe(&session.status);
         }
         if let Some((key, flags)) = requested {
             // Apply after observation so the next reader cannot re-arm a
@@ -165,15 +181,12 @@ impl SessionFlagsStore {
             .mode(0o600)
             .open(self.root.join("session-flags.lock"))?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(file);
-            }
-            let error = std::io::Error::last_os_error();
+        while let Err(error) = file.lock() {
             if error.kind() != std::io::ErrorKind::Interrupted {
                 return Err(error).context("locking session flags");
             }
         }
+        Ok(file)
     }
 }
 
@@ -185,30 +198,6 @@ fn overlay(sessions: &mut [LauncherState], entries: &HashMap<SessionKey, Entry>)
                 .map(|e| e.flags)
                 .unwrap_or_default(),
         );
-    }
-}
-
-fn follow_up_change(
-    status: &SessionStatus,
-    previous: Option<&SessionStatus>,
-    follow_up: bool,
-) -> Option<bool> {
-    use SessionStatus::*;
-    let entered_rest = matches!(
-        (previous, status),
-        (
-            Some(Active | BackgroundActive | BackgroundServer | ReviewPending),
-            Idle
-        ) | (Some(Compacting), Compacted)
-    );
-    let parked_server =
-        *status == BackgroundServer && previous.is_some_and(|p| *p != BackgroundServer);
-    if (entered_rest || parked_server) && !follow_up {
-        Some(true)
-    } else if *status == Active && follow_up {
-        Some(false)
-    } else {
-        None
     }
 }
 

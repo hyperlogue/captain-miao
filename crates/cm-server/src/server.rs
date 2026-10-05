@@ -29,7 +29,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use notify::Watcher;
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
@@ -588,7 +587,6 @@ async fn serve() -> Result<()> {
                 let backend = backend.clone();
                 let vitals = vitals.clone();
                 let changes = changes_tx.subscribe();
-                let flag_changes = changes_tx.clone();
                 let host = host.clone();
                 // Panic-safe connection count: the guard decrements on drop, so a
                 // panic inside handle_conn can't leak the count (which would pin
@@ -597,7 +595,7 @@ async fn serve() -> Result<()> {
                 tokio::spawn(async move {
                     let _guard = guard;
                     if let Err(e) =
-                        handle_conn(stream, backend, vitals, changes, flag_changes, host).await
+                        handle_conn(stream, backend, vitals, changes, host).await
                     {
                         tracing::debug!("connection ended: {e}");
                     }
@@ -614,17 +612,13 @@ async fn serve() -> Result<()> {
             _ = socket_tick.tick() => {
                 // Retry a failed flags write even if the finished session never
                 // changes again. Normal transitions use the watcher below.
-                if backend.refresh_session_flags() {
-                    let _ = changes_tx.send(());
-                }
+                backend.refresh_session_flags();
                 if let Some(fresh) = rebind_if_socket_vanished(&sock_path) {
                     listener = fresh;
                 }
             }
             _ = host_changes.recv() => {
-                if backend.refresh_session_flags() {
-                    let _ = changes_tx.send(());
-                }
+                backend.refresh_session_flags();
             }
             _ = idle_tick.tick() => {
                 // Idle = no connected clients and no *pool* sessions (unrelated
@@ -794,7 +788,6 @@ async fn handle_conn(
     backend: Arc<LocalBackend>,
     vitals: Arc<tokio::sync::Mutex<VitalsProbe>>,
     mut changes: broadcast::Receiver<()>,
-    flag_changes: broadcast::Sender<()>,
     host: String,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = stream.into_split();
@@ -882,12 +875,6 @@ async fn handle_conn(
                     }
                     ClientFrame::SetSessionFlags { req_id, key, flags } => {
                         let ok = backend.set_session_flags(&key, flags);
-                        // Wake every subscriber (this one included) so the new
-                        // flags reach each dashboard watching the host as an
-                        // ordinary Delta, not just the one that set them.
-                        if ok {
-                            let _ = flag_changes.send(());
-                        }
                         write_frame(&mut wr, &ServerFrame::FlagsSet { req_id, ok }).await?;
                     }
                     ClientFrame::ListRecentDirs { req_id } => {
@@ -1062,33 +1049,12 @@ async fn push_changes(
 /// A deferred read schedules another broadcast at the deadline; an
 /// unchanged diff pushes nothing. Best-effort: a missing store isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
-    let dir = state::sessions_dir();
-    let root = state::state_dir();
-    let flags = state::session_flags_path();
-    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(event) = res else { return };
-        // Skip Access (open/close/read) — our own reads would otherwise spin us.
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        if !event.paths.is_empty()
-            && event
-                .paths
-                .iter()
-                .all(|p| p == &root || (p.parent() == Some(root.as_path()) && p != &flags))
-        {
-            return;
-        }
+    let paths = AgentControl::ALL
+        .iter()
+        .flat_map(|agent| agent.out_of_band_watch_paths());
+    cm_core::backend::watch_session_changes(paths, move || {
         let _ = tx.send(());
-    })?;
-    w.watch(&dir, notify::RecursiveMode::NonRecursive)?;
-    w.watch(&state::state_dir(), notify::RecursiveMode::NonRecursive)?;
-    for &agent in AgentControl::ALL {
-        for path in agent.out_of_band_watch_paths() {
-            let _ = w.watch(&path, notify::RecursiveMode::NonRecursive);
-        }
-    }
-    Ok(w)
+    })
 }
 
 fn spawn_vcs_command(
@@ -1136,13 +1102,12 @@ mod tests {
     #[tokio::test]
     async fn legacy_vcs_commands_are_refused_and_connection_survives() {
         let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
-        let (changes, rx) = broadcast::channel(16);
+        let (_changes, rx) = broadcast::channel(16);
         let server = tokio::spawn(handle_conn(
             stream,
             Arc::new(LocalBackend::new()),
             Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
             rx,
-            changes,
             "test-host".into(),
         ));
         write_frame(
@@ -1210,13 +1175,12 @@ mod tests {
         // remain serviceable while GetVitals waits for this shared probe.
         let held = probe.lock().await;
         let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
-        let (changes, rx) = broadcast::channel(16);
+        let (_changes, rx) = broadcast::channel(16);
         let server = tokio::spawn(handle_conn(
             stream,
             Arc::new(LocalBackend::new()),
             probe.clone(),
             rx,
-            changes,
             "test-host".into(),
         ));
         write_frame(
@@ -1318,7 +1282,6 @@ mod tests {
             Arc::new(LocalBackend::new()),
             Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
             rx,
-            changes.clone(),
             "test-host".into(),
         ));
         write_frame(
@@ -1473,7 +1436,6 @@ mod tests {
             Arc::new(LocalBackend::new()),
             Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
             rx,
-            changes.clone(),
             "test-host".into(),
         ));
         write_frame(

@@ -1378,41 +1378,18 @@ impl Backend {
 /// that can't be created at all leaves the dashboard on its reload cadence
 /// rather than failing to start.
 fn start_local_watcher(changed: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
-    use notify::Watcher as _;
-    let sink = changed.clone();
-    let root = state::state_dir();
-    let flags = state::session_flags_path();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(event) = res else { return };
-        // Skip Access (open/close/read): our own reads would otherwise wake us.
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        // Also watch the sidecar's directory so atomic replacement by another
-        // dashboard or daemon wakes us. Ignore unrelated preference writes.
-        if !event.paths.is_empty()
-            && event
-                .paths
-                .iter()
-                .all(|p| p == &root || (p.parent() == Some(root.as_path()) && p != &flags))
-        {
-            return;
-        }
-        sink.store(true, Ordering::Relaxed);
-    })
-    .ok()?;
-    let dir = state::sessions_dir();
-    if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
-        tracing::warn!("could not watch {}: {e}", dir.display());
-        return None;
-    }
-    let _ = watcher.watch(&state::state_dir(), notify::RecursiveMode::NonRecursive);
-    for &agent in crate::agent::AgentControl::ALL {
-        for path in agent.watch_paths() {
-            let _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);
+    let paths = crate::agent::AgentControl::ALL
+        .iter()
+        .flat_map(|agent| agent.watch_paths());
+    match cm_core::backend::watch_session_changes(paths, move || {
+        changed.store(true, Ordering::Relaxed);
+    }) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!("could not watch session state: {error}");
+            None
         }
     }
-    Some(watcher)
 }
 
 // =============================================================================

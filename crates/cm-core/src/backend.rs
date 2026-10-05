@@ -39,6 +39,9 @@ use crate::paths;
 use crate::session_flags::SessionFlagsStore;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus};
 
+mod watch;
+pub use watch::watch_session_changes;
+
 /// Restart must confirm server-owned work ended before resuming it. Explicit
 /// Kill may abandon control when Codex is unreachable or the thread is absent.
 /// It also permits main-thread cleanup despite a lost internal-helper creation
@@ -261,10 +264,7 @@ impl LocalBackend {
     }
 
     pub fn list_sessions(&self) -> Vec<LauncherState> {
-        let (mut sessions, changed) = self.flags.snapshot();
-        if changed && let Some(notify) = &self.change_notifier {
-            notify();
-        }
+        let mut sessions = self.read_flagged_sessions();
         self.overlay_codex_titles(&mut sessions);
         // Every path leaving the backend is host-canonical, so the client can
         // display it verbatim and hand it straight back (§3).
@@ -290,9 +290,17 @@ impl LocalBackend {
 
     /// Observe status changes even with no subscribers. The daemon calls this
     /// on filesystem wakes and periodically to retry unsuccessful writes.
-    /// Returns whether persisted flags changed and subscribers need a wake.
-    pub fn refresh_session_flags(&self) -> bool {
-        self.flags.snapshot().1
+    /// Successful flag changes notify readers through the backend's notifier.
+    pub fn refresh_session_flags(&self) {
+        self.read_flagged_sessions();
+    }
+
+    fn read_flagged_sessions(&self) -> Vec<LauncherState> {
+        let (sessions, changed) = self.flags.snapshot();
+        if changed && let Some(notify) = &self.change_notifier {
+            notify();
+        }
+        sessions
     }
 
     /// Record an explicit flag change through the shared host store.
@@ -1523,7 +1531,10 @@ mod tests {
         let mut row = LauncherState::for_test(AgentControl::Claude, SessionStatus::Active);
         row.launcher_pid = std::process::id();
         row.write().unwrap();
-        let backend = LocalBackend::new();
+        let (notifier, changes) = std::sync::mpsc::channel();
+        let backend = LocalBackend::new().with_change_notifier(move || {
+            notifier.send(()).unwrap();
+        });
         let cleared = SessionFlags {
             pinned: true,
             follow_up: false,
@@ -1533,6 +1544,7 @@ mod tests {
             follow_up: true,
         };
         assert!(backend.set_session_flags(&row.key(), cleared));
+        assert!(changes.try_recv().is_ok());
 
         row.status = SessionStatus::Idle;
         row.write().unwrap();
@@ -1540,22 +1552,34 @@ mod tests {
         // flags readable. A failed write must not consume the transition.
         let blocked = state::session_flags_path().with_extension("tmp");
         std::fs::create_dir(&blocked).unwrap();
-        assert!(!backend.refresh_session_flags());
+        backend.refresh_session_flags();
         assert_eq!(backend.list_sessions()[0].flags, Some(cleared));
+        assert!(changes.try_recv().is_err(), "failed writes must not notify");
         std::fs::remove_dir(blocked).unwrap();
-        assert!(backend.refresh_session_flags());
+        backend.refresh_session_flags();
+        assert!(changes.try_recv().is_ok(), "successful retries must notify");
         assert_eq!(backend.list_sessions()[0].flags, Some(armed));
         assert_eq!(LocalBackend::new().list_sessions()[0].flags, Some(armed));
+        assert!(
+            changes.try_recv().is_err(),
+            "unchanged reads must not notify"
+        );
 
         row.status = SessionStatus::Active;
         row.write().unwrap();
-        assert!(backend.refresh_session_flags());
+        assert_eq!(backend.list_sessions()[0].flags, Some(cleared));
+        assert!(
+            changes.try_recv().is_ok(),
+            "snapshot changes must notify too"
+        );
         row.status = SessionStatus::Idle;
         row.write().unwrap();
         // Clear before the filesystem observer processes completion. A later
         // wake must not undo this explicit acknowledgement.
         assert!(backend.set_session_flags(&row.key(), cleared));
-        assert!(!backend.refresh_session_flags());
+        assert!(changes.try_recv().is_ok());
+        backend.refresh_session_flags();
+        assert!(changes.try_recv().is_err());
         assert_eq!(backend.list_sessions()[0].flags, Some(cleared));
         assert_eq!(LocalBackend::new().list_sessions()[0].flags, Some(cleared));
     }
