@@ -3241,18 +3241,15 @@ impl App {
             .collect();
         self.window_bindings.retain_expected(&live_bindings);
         self.sweep_reconnected_hosts();
-        // Auto-mark follow_up on Active→Idle and Compacting→Compacted
-        // transitions, and clear it when a session goes back to Active — the
-        // user has re-engaged, so any stale attention flag is obsolete.
+        // Direct-local sessions need us to mark/clear follow-up on status
+        // transitions. Pooled hosts do this themselves, including offline.
         let transitions = self.follow_up_transitions(&prev_status, &self.sessions);
         let mut flag_changes: Vec<FlagKey> = Vec::with_capacity(transitions.len());
         for (key, want) in transitions {
             self.update_flags(key.clone(), Cursor::HoldIndex, |f| f.follow_up = want);
             flag_changes.push(key);
         }
-        // The auto-arm reaches the owning host like every other flag change:
-        // leaving it local would let the host's older value win the next
-        // `adopt_host_flags` and the bell would never settle.
+        // Persist direct-local transitions through the normal flag path.
         let mut overrides_changed = self.publish_flag_changes(flag_changes);
         // Bring a just-failed launch's held window to the foreground exactly
         // once — on the transition into `FailedToStart`. The run loop drains and
@@ -3930,8 +3927,8 @@ impl App {
     // =============================================================================
 
     /// The follow-up flag auto-mark / auto-clear transitions to apply after a
-    /// reload — a pure function of the previous status map and the freshly
-    /// collected sessions, returning `(key, want)` pairs the caller feeds to
+    /// reload for direct-local rows. Pooled rows adopt their host's flags.
+    /// Returns `(key, want)` pairs the caller feeds to
     /// `update_flags`. Sibling of `newly_failed_windows`; extracted so the
     /// transition is unit-testable (`reload_sessions` itself is driven only
     /// through fs events). A session that just entered a rest state and isn't
@@ -3945,39 +3942,16 @@ impl App {
         sessions
             .iter()
             .filter_map(|s| {
-                let prev = prev_status.get(&flag_key(s));
-                let flags = self.flags_of(&flag_key(s));
-                let entered_rest = matches!(
-                    (prev, &s.status),
-                    (Some(SessionStatus::Active), SessionStatus::Idle)
-                    | (Some(SessionStatus::Compacting), SessionStatus::Compacted)
-                    // A turn that ended with a short-term background task lands in
-                    // Idle only once the task finishes — surface that for attention
-                    // too, so Active→Task→Idle gets the same follow-up as Active→Idle.
-                    | (Some(SessionStatus::BackgroundActive), SessionStatus::Idle)
-                    // Same for a parked server / review-watch that ends without the
-                    // agent resuming (killed / timed out): Server/Review→Idle earns
-                    // a follow-up.
-                    | (Some(SessionStatus::BackgroundServer), SessionStatus::Idle)
-                    | (Some(SessionStatus::ReviewPending), SessionStatus::Idle),
-                );
-                // Parking a long-running service (entering `BackgroundServer`) is
-                // itself an at-rest "needs a look" event: the agent stopped working
-                // and left a dev server/watcher running. Arm the bell the moment it
-                // appears — but only on a real transition into it from a known other
-                // state, so pre-existing Server rows don't all light up at dashboard
-                // startup (prev is None then). (`BackgroundActive` — a busy
-                // short-term task — is not armed on entry; it arms on its exit to
-                // Idle above, like Active.)
-                let parked_server = s.status == SessionStatus::BackgroundServer
-                    && prev.is_some_and(|p| *p != SessionStatus::BackgroundServer);
-                if (entered_rest || parked_server) && !flags.follow_up {
-                    Some((flag_key(s), true))
-                } else if s.status == SessionStatus::Active && flags.follow_up {
-                    Some((flag_key(s), false))
-                } else {
-                    None
+                // Pooled hosts own automatic transitions, including while this
+                // dashboard is disconnected. Only direct-local rows need a
+                // dashboard to observe and persist their changes.
+                if self.host_owns_flags(&s.host) {
+                    return None;
                 }
+                let key = flag_key(s);
+                s.status
+                    .follow_up_change(prev_status.get(&key), self.flags_of(&key).follow_up)
+                    .map(|want| (key, want))
             })
             .collect()
     }

@@ -332,6 +332,11 @@ by Enter works through the ordinary select/focus bindings.
 The Hosts panel shows each host's emoji before its name. A `↑` marks a connected
 host whose server is older than the dashboard; press `Enter` for version details.
 
+Pooled sessions automatically mark needs-input on their host when work finishes,
+even while the dashboard is disconnected. Reconnecting restores that flag;
+focusing the session or pressing `i` clears it, and new work clears it
+automatically. Direct-local sessions track these transitions in the dashboard.
+
 An unknown sequence after `Space` or `g` cancels the prefix and consumes the
 key without running a session action. Existing defaults and command ids are
 kept stable; new actions should use free keys within the related leader menu.

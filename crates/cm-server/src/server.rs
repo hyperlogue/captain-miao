@@ -508,7 +508,7 @@ static CHANGES: LazyLock<broadcast::Sender<()>> = LazyLock::new(|| broadcast::ch
 /// Wake every subscribed connection to re-read and diff. Cheap to over-call:
 /// `push_changes` sends only what actually differs from what that connection
 /// last saw, so a wake with nothing behind it costs one read and pushes
-/// nothing. A wake before anyone has subscribed is discarded.
+/// nothing. The daemon itself also listens, so flags advance without clients.
 ///
 /// The pool hooks are the only caller, so without them the notify watch is once
 /// again the only writer and this has nothing to do.
@@ -532,6 +532,7 @@ async fn serve() -> Result<()> {
     // wake channel — each connection diffs the change against what it last sent
     // (so late joiners stay correct after their own snapshot).
     let changes_tx = CHANGES.clone();
+    let mut host_changes = changes_tx.subscribe();
     let _watcher = start_sessions_watcher(changes_tx.clone()).context("watch sessions dir")?;
 
     // The daemon is the host's server-core: on top of the reads it owns the
@@ -541,6 +542,9 @@ async fn serve() -> Result<()> {
     let backend = Arc::new(build_server_core().with_change_notifier(move || {
         let _ = retry_tx.send(());
     }));
+    // Seed once for the host, never once per client: reconnecting an Idle row
+    // must retain the completion the daemon observed while clients were away.
+    backend.refresh_session_flags();
     // One probe for the whole daemon; see [`VitalsProbe`]. A tokio mutex because
     // a cold probe holds it across a short sleep.
     let vitals = Arc::new(tokio::sync::Mutex::new(VitalsProbe::new()));
@@ -608,8 +612,18 @@ async fn serve() -> Result<()> {
                 return Ok(());
             }
             _ = socket_tick.tick() => {
+                // Retry a failed flags write even if the finished session never
+                // changes again. Normal transitions use the watcher below.
+                if backend.refresh_session_flags() {
+                    let _ = changes_tx.send(());
+                }
                 if let Some(fresh) = rebind_if_socket_vanished(&sock_path) {
                     listener = fresh;
+                }
+            }
+            _ = host_changes.recv() => {
+                if backend.refresh_session_flags() {
+                    let _ = changes_tx.send(());
                 }
             }
             _ = idle_tick.tick() => {

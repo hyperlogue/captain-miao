@@ -198,8 +198,8 @@ fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<
 pub struct LocalBackend {
     session_index_caches: HashMap<AgentControl, SessionIndexCache>,
     codex_titles: Mutex<CodexTitles>,
-    /// The owning host's existing change channel. A deferred title read wakes
-    /// it once; the ordinary reload path performs the read and publishes it.
+    /// The owning host's existing change channel. Deferred title reads and
+    /// automatic flag writes wake it so every subscriber can refresh.
     change_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     /// This host's `$HOME`, resolved once. Every path the backend returns is
     /// collapsed against it and every path it receives is expanded against it,
@@ -212,6 +212,10 @@ pub struct LocalBackend {
     /// serves. A plain local dashboard leaves both off: its flags live in
     /// `dashboard-overrides.json`, and it has no pool.
     serve_host_state: bool,
+    /// Daemon-wide status history for automatic follow-up changes. Also guards
+    /// every sidecar read/modify/write, including explicit flag requests, so
+    /// concurrent subscribers cannot replay a completion or lose another pin.
+    flag_statuses: Mutex<HashMap<SessionKey, SessionStatus>>,
     /// Reads libshpool's live session list for the attached-bit overlay.
     /// Injected so cm-core stays free of libshpool (only the server links it).
     #[allow(clippy::type_complexity)]
@@ -240,7 +244,7 @@ impl LocalBackend {
         }
     }
 
-    /// Connect deferred refreshes to the host's existing change signal: the
+    /// Connect refreshes to the host's existing change signal: the
     /// dashboard's dirty bit or the daemon's subscriber broadcast. Install
     /// before the first session read. With a notifier, reads must run inside a
     /// Tokio runtime so a throttled change can arm its one-shot timer.
@@ -277,7 +281,17 @@ impl LocalBackend {
     }
 
     pub fn list_sessions(&self) -> Vec<LauncherState> {
-        let mut sessions = state::read_all_launcher_states();
+        let mut sessions = if self.serve_host_state {
+            let (sessions, changed) = self.read_host_sessions();
+            // A snapshot may observe completion before the daemon's watcher
+            // does. Publish its flag write to existing subscribers as well.
+            if changed && let Some(notify) = &self.change_notifier {
+                notify();
+            }
+            sessions
+        } else {
+            state::read_all_launcher_states()
+        };
         self.overlay_codex_titles(&mut sessions);
         // Every path leaving the backend is host-canonical, so the client can
         // display it verbatim and hand it straight back (§3).
@@ -293,25 +307,59 @@ impl LocalBackend {
             }
         }
         if self.serve_host_state {
-            self.overlay_host_state(&mut sessions);
+            let attached = self.attached_probe.as_ref().map(|p| p());
+            for s in &mut sessions {
+                if let (Some(map), Some(pool)) = (&attached, s.pool_session.as_deref()) {
+                    s.attached = map.get(pool).copied();
+                }
+            }
         }
         sessions
     }
 
-    /// Stamp the host-owned per-session state onto the rows being served: the
-    /// flags sidecar (so every dashboard sees the same pins/bells) and the
-    /// pool's live attached bit (so the UI knows whether a steal even applies).
-    fn overlay_host_state(&self, sessions: &mut [LauncherState]) {
-        let flags = read_session_flags();
-        let attached = self.attached_probe.as_ref().map(|p| p());
-        for s in sessions.iter_mut() {
+    /// Observe status changes even with no subscribers. The daemon calls this
+    /// on filesystem wakes and periodically to retry unsuccessful writes.
+    /// Returns whether persisted flags changed and subscribers need a wake.
+    pub fn refresh_session_flags(&self) -> bool {
+        self.serve_host_state && self.read_host_sessions().1
+    }
+
+    /// Read status and update its flags under the same lock as explicit writes.
+    /// Lock before reading the sessions, otherwise a delayed subscriber could
+    /// replay an older status after another reader already observed completion.
+    fn read_host_sessions(&self) -> (Vec<LauncherState>, bool) {
+        let mut previous = self.flag_statuses.lock().unwrap();
+        let mut sessions = state::read_all_launcher_states();
+        let before = read_session_flags();
+        let mut flags = before.clone();
+        let current = advance_follow_up_flags(&previous, &sessions, &mut flags);
+        let changed = flags != before;
+        let persisted = if changed {
+            // As with explicit writes, collect departed entries only when a
+            // real flag mutation already needs to rewrite the sidecar.
+            flags.retain(|key, _| current.contains_key(key));
+            match state::write_json_atomic(&state::session_flags_path(), &flags) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("could not persist session follow-up flags: {error}");
+                    // Keep both the old history and served flags: a later wake
+                    // retries this transition instead of claiming it was saved.
+                    flags = before;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !changed || persisted {
+            *previous = current;
+        }
+        for s in &mut sessions {
             if let Some(f) = flags.get(&s.key()) {
                 s.flags = Some(*f);
             }
-            if let (Some(map), Some(pool)) = (&attached, s.pool_session.as_deref()) {
-                s.attached = map.get(pool).copied();
-            }
         }
+        (sessions, persisted)
     }
 
     /// Record this host's flags for a session. Server-core only — a plain local
@@ -320,12 +368,19 @@ impl LocalBackend {
         if !self.serve_host_state {
             return false;
         }
-        let live: std::collections::HashSet<SessionKey> = state::read_all_launcher_states()
-            .iter()
-            .map(|s| s.key())
-            .collect();
-        let all = sidecar_with(read_session_flags(), key, flags, &live);
-        state::write_json_atomic(&state::session_flags_path(), &all).is_ok()
+        let mut previous = self.flag_statuses.lock().unwrap();
+        let sessions = state::read_all_launcher_states();
+        let mut all = read_session_flags();
+        // Acknowledge against current status so a delayed filesystem wake
+        // cannot re-arm a completion the user just cleared.
+        let current = advance_follow_up_flags(&previous, &sessions, &mut all);
+        let live = current.keys().cloned().collect();
+        let all = sidecar_with(all, key, flags, &live);
+        if state::write_json_atomic(&state::session_flags_path(), &all).is_err() {
+            return false;
+        }
+        *previous = current;
+        true
     }
 
     /// Overlay Codex display names from the host's single title cache onto the
@@ -665,6 +720,25 @@ fn forget_recent_dir(cwd: &str, home: &str) -> bool {
 /// deleted file just resets flags rather than failing anything.
 fn read_session_flags() -> HashMap<SessionKey, SessionFlags> {
     state::read_json(&state::session_flags_path()).unwrap_or_default()
+}
+
+/// Reconcile the shared rule once per host status observation. Keep pins and
+/// explicit clears intact; a repeated Idle observation must not ring again.
+fn advance_follow_up_flags(
+    previous: &HashMap<SessionKey, SessionStatus>,
+    sessions: &[LauncherState],
+    flags: &mut HashMap<SessionKey, SessionFlags>,
+) -> HashMap<SessionKey, SessionStatus> {
+    let mut current = HashMap::new();
+    for s in sessions {
+        let key = s.key();
+        let follow_up = flags.get(&key).is_some_and(|f| f.follow_up);
+        if let Some(want) = s.status.follow_up_change(previous.get(&key), follow_up) {
+            flags.entry(key.clone()).or_default().follow_up = want;
+        }
+        current.insert(key, s.status.clone());
+    }
+    current
 }
 
 /// The flags sidecar after recording `flags` for `key`, minus the entries whose
@@ -1582,5 +1656,82 @@ mod tests {
         assert!(after[&key("2")].pinned);
         // ...and a departed session's are collected.
         assert!(!after.contains_key(&key("3")));
+    }
+
+    #[test]
+    fn host_follow_up_retries_failed_writes_and_respects_acknowledgements() {
+        const TEST: &str =
+            "backend::tests::host_follow_up_retries_failed_writes_and_respects_acknowledgements";
+        // Filesystem state and environment belong to this child alone; other
+        // core tests can continue in parallel against their own fixtures.
+        if std::env::var_os("CM_TEST_HOST_FOLLOW_UP").is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "cm-host-follow-up-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("CM_TEST_HOST_FOLLOW_UP", "1")
+                .env("XDG_STATE_HOME", &root)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        state::ensure_sessions_dir().unwrap();
+        let mut row = LauncherState::for_test(AgentControl::Claude, SessionStatus::Active);
+        row.launcher_pid = std::process::id();
+        row.write().unwrap();
+        let backend = LocalBackend::server_core();
+        let cleared = SessionFlags {
+            pinned: true,
+            follow_up: false,
+        };
+        let armed = SessionFlags {
+            pinned: true,
+            follow_up: true,
+        };
+        assert!(backend.set_session_flags(&row.key(), cleared));
+
+        row.status = SessionStatus::Idle;
+        row.write().unwrap();
+        // Block the atomic-write temporary file, leaving the last persisted
+        // flags readable. A failed write must not consume the transition.
+        let blocked = state::session_flags_path().with_extension("tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(!backend.refresh_session_flags());
+        assert_eq!(backend.list_sessions()[0].flags, Some(cleared));
+        std::fs::remove_dir(blocked).unwrap();
+        assert!(backend.refresh_session_flags());
+        assert_eq!(backend.list_sessions()[0].flags, Some(armed));
+        assert_eq!(
+            LocalBackend::server_core().list_sessions()[0].flags,
+            Some(armed)
+        );
+
+        row.status = SessionStatus::Active;
+        row.write().unwrap();
+        assert!(backend.refresh_session_flags());
+        row.status = SessionStatus::Idle;
+        row.write().unwrap();
+        // Clear before the filesystem observer processes completion. A later
+        // wake must not undo this explicit acknowledgement.
+        assert!(backend.set_session_flags(&row.key(), cleared));
+        assert!(!backend.refresh_session_flags());
+        assert_eq!(backend.list_sessions()[0].flags, Some(cleared));
+        assert_eq!(
+            LocalBackend::server_core().list_sessions()[0].flags,
+            Some(cleared)
+        );
     }
 }

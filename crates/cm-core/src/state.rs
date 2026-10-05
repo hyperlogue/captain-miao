@@ -835,6 +835,35 @@ impl SessionStatus {
         )
     }
 
+    /// Automatic follow-up change after observing this status. The owning
+    /// host applies this for pooled sessions; a direct-local dashboard applies
+    /// it for its own rows. First-seen rest states do not manufacture a bell.
+    pub fn follow_up_change(&self, previous: Option<&Self>, follow_up: bool) -> Option<bool> {
+        let entered_rest = matches!(
+            (previous, self),
+            (
+                Some(
+                    Self::Active
+                        | Self::BackgroundActive
+                        | Self::BackgroundServer
+                        | Self::ReviewPending
+                ),
+                Self::Idle
+            ) | (Some(Self::Compacting), Self::Compacted)
+        );
+        // Parking a long-running service earns attention immediately; a busy
+        // background task earns it when that task finishes instead.
+        let parked_server = *self == Self::BackgroundServer
+            && previous.is_some_and(|p| *p != Self::BackgroundServer);
+        if (entered_rest || parked_server) && !follow_up {
+            Some(true)
+        } else if *self == Self::Active && follow_up {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Whether the session is doing work: the agent is mid-turn
     /// (`Active`/`Compacting`) or its turn ended but a **short-term** background
     /// task it's waiting on is still running (`BackgroundActive`). Drives the
@@ -1304,8 +1333,9 @@ impl LauncherState {
 /// Per-session flags a host owns on behalf of every dashboard watching it
 /// (`docs/remote-sessions.md` §9). Persisted in the daemon's sidecar
 /// ([`session_flags_path`]), overlaid onto served rows, and updated by
-/// `ClientFrame::SetSessionFlags` — so pins and bells are the same for every
-/// dashboard attached to the host, and survive a dashboard restart.
+/// `ClientFrame::SetSessionFlags` and host-observed status transitions — so
+/// pins and bells are the same for every dashboard attached to the host, and
+/// work finishing without a connected dashboard still earns a follow-up.
 ///
 /// This carried a third flag, `muted`, until it was dropped as unused. Both
 /// directions of a version-mixed pair keep working: `#[serde(default)]` fills

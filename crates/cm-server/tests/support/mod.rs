@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cm_core::protocol::{ClientFrame, PROTOCOL_VERSION, ServerFrame, read_frame, write_frame};
-use cm_core::state::{LauncherState, SessionKey};
+use cm_core::state::{LauncherState, SessionFlags, SessionKey};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::{UnixListener, UnixStream};
@@ -176,6 +176,16 @@ exec {} --exact codex_fixture --nocapture
             .path()
             .join(format!("state/captain-miao/sessions/{pid}.json"));
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    pub fn session_flags(&self, key: &SessionKey) -> Option<SessionFlags> {
+        let path = self
+            .root
+            .path()
+            .join("state/captain-miao/session-flags.json");
+        let flags: HashMap<SessionKey, SessionFlags> =
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        flags.get(key).copied()
     }
 
     pub async fn wait_exited(&mut self, pid: u32) {
@@ -427,6 +437,10 @@ impl CodexServer {
     pub fn activate(&self, id: &str) {
         self.script.active.lock().unwrap().insert(id.into());
         self.events.send(json!({"method":"turn/started","params":{"threadId":id,"turn":{"id":format!("turn-{id}")}}})).unwrap();
+    }
+    pub fn complete(&self, id: &str) {
+        self.script.active.lock().unwrap().remove(id);
+        self.events.send(json!({"method":"turn/completed","params":{"threadId":id,"turn":{"id":format!("turn-{id}"),"status":"completed"}}})).unwrap();
     }
     pub fn hold_cleanup(&self, id: &str) -> Arc<Notify> {
         let gate = Arc::new(Notify::new());

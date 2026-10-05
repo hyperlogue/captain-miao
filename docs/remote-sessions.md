@@ -1123,9 +1123,14 @@ Three layers, strictly ordered by authority:
    `SessionKey → SessionFlags` sidecar the server-core owns. Deliberately a
    sidecar and not a field on the state file: that file has exactly one writer
    (its launcher), and flags are set by someone else entirely. Overlaid onto
-   served rows like the Codex titles, updated by `SetSessionFlags`, and
-   garbage-collected against live sessions. A cleared flag is stored as an
-   all-false **entry**, never by dropping the key: `flags: None` on a served row
+   served rows like the Codex titles, updated by `SetSessionFlags` and automatic
+   status transitions, and garbage-collected against live sessions. The daemon
+   observes these transitions even without connected dashboards. Its shared
+   status history and sidecar writes are serialized, so subscribers cannot
+   replay a completion or race an acknowledgement. Failed automatic writes
+   retain the previous status for retry on the next wake or periodic check.
+   A cleared flag is stored as an all-false **entry**, never by dropping the
+   key: `flags: None` on a served row
    means *no host owns this row's flags*, so a removal would say nothing at all
    and every dashboard showing the bell would keep showing it.
 3. **Server — in-memory only, all rebuildable**: per-connection `last_sent`
@@ -1571,11 +1576,11 @@ decides what they mean**.
   dashboard attached to that host — and a phone-ssh user on the box — sees the
   same ones, and they survive a dashboard restart. `pin_seq` stays client-side:
   pin *ordering* is presentation. Direct-local rows keep using
-  `dashboard-overrides.json`. Because adoption re-reads the host on *every*
-  reload, every writer has to push there — the automatic follow-up arm and the
-  focus-clear as much as the `i` toggle. A mutation that only reached
-  `dashboard-overrides.json` is reverted within a reload, and the second copy it
-  leaves behind is restored at the next startup.
+  `dashboard-overrides.json`. Automatic follow-up arm/clear runs on the owning
+  daemon for pooled rows, so work completed while disconnected is flagged
+  before a dashboard reconnects. The dashboard only runs those transitions
+  for direct-local rows. Explicit focus-clears and `i` toggles still push to
+  the host; adoption re-reads its flags on every reload.
 
 ### How mixed is remote support with the rest of the code?
 

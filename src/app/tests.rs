@@ -4152,6 +4152,38 @@ fn follow_up_transitions_mark_and_clear() {
 }
 
 #[test]
+fn pooled_follow_up_transitions_belong_to_the_host() {
+    use super::flag_key;
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::HostId;
+
+    let mut d = TestDashboard::new(120, 15);
+    let host = HostId("test-host".into());
+    d.app
+        .backends
+        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
+            host.clone(),
+            vec![],
+        )));
+    let mut idle = session(1, "/srv/project", SessionStatus::Idle);
+    idle.host = host.clone();
+    let mut active = session(2, "/srv/project", SessionStatus::Active);
+    active.host = host;
+    d.app
+        .update_flags(flag_key(&active), Cursor::HoldIndex, |f| f.follow_up = true);
+    let previous = [
+        (flag_key(&idle), SessionStatus::Active),
+        (flag_key(&active), SessionStatus::Idle),
+    ]
+    .into();
+    assert!(
+        d.app
+            .follow_up_transitions(&previous, &[idle, active])
+            .is_empty()
+    );
+}
+
+#[test]
 fn marking_needs_input_keeps_cursor_on_the_session() {
     let mut d = TestDashboard::new(120, 15);
     // Four idle sessions keep insertion order (equal updated_at, stable sort).

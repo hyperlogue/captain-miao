@@ -7,9 +7,96 @@ mod support;
 
 use cm_core::backend::{CleanupPolicy, ForcedRemoval};
 use cm_core::protocol::{ClientFrame, ServerFrame};
-use cm_core::state::{CleanupStatus, SessionStatus};
+use cm_core::state::{CleanupStatus, SessionFlags, SessionStatus};
 use serde_json::json;
 use support::{CodexServer, Host, Peer, WAIT, until};
+
+#[tokio::test]
+async fn follow_up_is_persisted_while_every_dashboard_is_disconnected() {
+    let mut host = Host::new();
+    let codex = CodexServer::start(host.codex_socket()).await;
+    host.start();
+    let launcher = host.launch("alpha", true);
+    let mut peer = Peer::connect(host.socket()).await;
+    peer.rows_until(|rows| rows.values().any(|s| s.status == SessionStatus::Idle))
+        .await;
+    let key = peer.row("alpha").key();
+    let cleared = SessionFlags {
+        pinned: true,
+        follow_up: false,
+    };
+    peer.send(ClientFrame::SetSessionFlags {
+        req_id: 1,
+        key: key.clone(),
+        flags: cleared,
+    })
+    .await;
+    assert!(matches!(
+        peer.reply(1).await,
+        ServerFrame::FlagsSet { ok: true, .. }
+    ));
+    codex.activate("alpha");
+    peer.rows_until(|rows| rows[&key].status == SessionStatus::Active)
+        .await;
+    drop(peer);
+
+    // The real launcher writes Idle while the daemon has no subscribers.
+    codex.complete("alpha");
+    until("launcher finishes offline", || {
+        host.launcher_state(launcher)
+            .is_some_and(|s| s.status == SessionStatus::Idle)
+    })
+    .await;
+    let armed = SessionFlags {
+        pinned: true,
+        follow_up: true,
+    };
+    until("follow-up persisted without a dashboard", || {
+        host.session_flags(&key) == Some(armed)
+    })
+    .await;
+
+    // A whole subsequent turn also clears and re-arms without a dashboard.
+    codex.activate("alpha");
+    until("follow-up cleared on offline work", || {
+        host.session_flags(&key) == Some(cleared)
+    })
+    .await;
+    codex.complete("alpha");
+    until("follow-up re-armed on offline completion", || {
+        host.session_flags(&key) == Some(armed)
+    })
+    .await;
+
+    let mut peer = Peer::connect(host.socket()).await;
+    assert_eq!(peer.row("alpha").flags, Some(armed));
+    let mut other = Peer::connect(host.socket()).await;
+    peer.send(ClientFrame::SetSessionFlags {
+        req_id: 2,
+        key: key.clone(),
+        flags: cleared,
+    })
+    .await;
+    assert!(matches!(
+        peer.reply(2).await,
+        ServerFrame::FlagsSet { ok: true, .. }
+    ));
+    other
+        .rows_until(|rows| rows[&key].flags == Some(cleared))
+        .await;
+    // An unrelated update and a fresh subscription must not replay the old
+    // completion after the human acknowledged it.
+    codex.rename("alpha", "Acknowledged");
+    other
+        .rows_until(|rows| rows[&key].name.as_deref() == Some("Acknowledged"))
+        .await;
+    assert_eq!(other.row("alpha").flags, Some(cleared));
+    drop(peer);
+    drop(other);
+    let peer = Peer::connect(host.socket()).await;
+    assert_eq!(peer.row("alpha").flags, Some(cleared));
+    host.assert_alive(&[launcher]);
+}
 
 #[tokio::test]
 async fn native_launcher_survives_ctrl_c_until_its_agent_exits() {
