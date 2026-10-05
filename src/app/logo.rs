@@ -16,12 +16,11 @@
 //!
 //! A click also sends a **cat** trotting across the header's blank padding row
 //! (the second row). Unlike the pulse, the cat *moves*, which kitty's in-place
-//! frame animation can't do, so this one is **client-driven**: the sprite sheet is
-//! tinted to a random colour (four common dashboard colours, plus a rare special
-//! one) and uploaded at walk start, then each render re-places it at native size
-//! with an advancing column + sub-cell offset, cropping the current walk-cycle
-//! frame — the run loop ticks fast (`App::cat_walking`) until the cat leaves the
-//! row.
+//! frame animation can't do, so this one is **client-driven**: a full-color anime
+//! walk sheet is selected on each click, sized to the terminal's row height, and
+//! uploaded once. Each render crops the next pose and advances the placement by
+//! a column + sub-cell offset. The run loop ticks fast (`App::cat_walking`) until
+//! all kittens leave the lane. See `assets/logo/cats/README.md` for the artwork.
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -33,6 +32,8 @@ use crate::config;
 use crate::terminal::graphics::{self, PAW_IMAGE_ID, Placement};
 
 use super::App;
+
+mod cat;
 
 // =============================================================================
 // The paw: masks, colours, pulse
@@ -84,58 +85,19 @@ const PAW_MASK_DIM: u32 = 64;
 // The walking cat
 // =============================================================================
 
-/// The cat walk sprite **sheet**: `CAT_FRAMES` walk poses laid out horizontally,
-/// each `CAT_FRAME_W`×`CAT_FRAME_H` px. One alpha mask (like the paw), tinted to a
-/// per-walk random colour; the walk plays by cropping one frame per placement while
-/// the placement slides across the row. Kept in sync with `gen_logo_assets.rs`.
-const CAT_MASK: &[u8] = include_bytes!("../../assets/logo/cat-mask.gray");
-const CAT_FRAME_W: u32 = 80;
-const CAT_FRAME_H: u32 = 40;
-const CAT_FRAMES: u32 = 4;
-/// Walking speed in **cells per second** — a leisurely saunter. Speed (not a fixed
-/// total duration) is the knob so the *visual* pace is constant on any width; a
-/// fixed duration makes the cat sprint across a wide terminal. Lower = slower.
-const CAT_SPEED_CELLS_PER_S: f32 = 9.0;
-/// How long each walk-cycle frame (leg pose) is shown — the leg cadence. Kept
-/// inversely proportional to the speed (a fixed distance per step) so the legs stay
-/// in time with the travel rather than scrabbling or gliding.
-const CAT_FRAME_MS: u128 = 167;
 /// Base of the cat image-id **pool** (`CAT_IMAGE_ID .. CAT_IMAGE_ID + CAT_MAX`),
 /// clear of the three paw ids (7101–7103). Each concurrent cat gets its own id from
-/// this pool (they carry different random tints, so they can't share one image);
+/// this pool (each walk owns its uploaded sheet);
 /// the placement id is shared, since the `(image, placement)` pair is already unique
 /// per cat via the image id. `CAT_MAX` caps how many cats can walk at once — extra
 /// clicks past that still pulse the paw, they just don't spawn another cat.
 const CAT_IMAGE_ID: u32 = PAW_IMAGE_ID + 10;
 const CAT_MAX: u32 = 12;
-const CAT_PLACEMENT_ID: u32 = 2;
-
-/// The four ANSI palette colours (error/active/attention/selection — the ones the
-/// dashboard leans on) the cat is tinted from at random each walk, resolved to the
-/// terminal's real RGB at startup so they match the theme (see `probe_logo_colors`).
-const CAT_COMMON_ANSI: [Color; 4] = [Color::Red, Color::Green, Color::Yellow, Color::Blue];
-/// Fallbacks for the four common tints when the palette can't be queried
-/// (Catppuccin red/green/yellow/blue).
-const CAT_COMMON_FALLBACK: [(u8, u8, u8); 4] = [
-    (0xf3, 0x8b, 0xa8), // red
-    (0xa6, 0xe3, 0xa1), // green
-    (0xf9, 0xe2, 0xaf), // yellow
-    (0x89, 0xb4, 0xfa), // blue
-];
-/// The rare "special" tint (Catppuccin pink), a fixed colour outside the common
-/// four, chosen ~1 in `CAT_RARE_ONE_IN` walks — a little easter egg to spot.
-const CAT_RARE_COLOR: (u8, u8, u8) = (0xf5, 0xc2, 0xe7);
-const CAT_RARE_ONE_IN: u64 = 20;
-
-/// One cat walk in progress (several can run at once — a click always spawns a new
-/// one). Holds its start instant (the render derives position + walk-cycle frame
-/// from monotonic elapsed, so playback is frame-rate independent), the
-/// randomly-picked tint, the kitty image id it owns from the pool, and whether that
-/// tinted sheet has been uploaded yet (done on the walk's first render, since the
-/// colour isn't known until the click).
+/// One summoned kitten: its start time drives both position and pose, independent
+/// of redraw frequency. The coat persists across resize and graphics re-uploads.
 pub(crate) struct CatWalk {
     started: Instant,
-    color: (u8, u8, u8),
+    coat: usize,
     image_id: u32,
     transmitted: bool,
 }
@@ -166,14 +128,12 @@ impl App {
     pub(super) fn start_logo_anim(&mut self) {
         if self.logo.caps.is_some() {
             self.logo.pulse_pending = true;
-            // Same click also sends a cat trotting across the padding row, tinted to
-            // a fresh random colour (its sheet is uploaded on the first render). A
-            // click while earlier cats are still walking spawns *another* one — until
-            // the pool is full, in which case the click just pulses the paw.
+            // Each click summons another kitten, until the pool is full. The
+            // paw still pulses when every slot is occupied.
             if let Some(image_id) = self.alloc_cat_image_id() {
                 self.logo.cats.push(CatWalk {
                     started: Instant::now(),
-                    color: self.pick_cat_color(),
+                    coat: self.pick_cat_coat(),
                     image_id,
                     transmitted: false,
                 });
@@ -187,14 +147,12 @@ impl App {
             .find(|id| self.logo.cats.iter().all(|c| c.image_id != *id))
     }
 
-    /// Pick this walk's cat tint: usually one of the four common dashboard colours
-    /// (equal odds), and ~1 in `CAT_RARE_ONE_IN` the rare special pink. Entropy is
-    /// the click's wall-clock nanos, whitened through `splitmix64`.
-    fn pick_cat_color(&self) -> (u8, u8, u8) {
+    /// Click-time entropy is sufficient for a cosmetic coat choice.
+    fn pick_cat_coat(&self) -> usize {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| (d.as_secs() << 32) ^ d.subsec_nanos() as u64);
-        select_cat_color(splitmix64(seed), self.logo.cat_colors)
+        cat::select_coat(splitmix64(seed))
     }
 
     /// Whether a cat is mid-walk, so the run loop ticks fast enough to animate it
@@ -211,6 +169,7 @@ impl App {
     /// unknown.
     pub(super) fn render_logo_graphics(&mut self) {
         let Some(rect) = self.logo.rect else {
+            self.clear_cat_walks();
             return;
         };
         if self.logo.caps.is_none() {
@@ -223,8 +182,8 @@ impl App {
         }
 
         // Compose the three animated paws once (a base frame plus the pulse frames,
-        // per status colour, parked stopped on frame 1). The cat sheet isn't composed
-        // here — its colour is random per walk, so it's uploaded in `render_cat_walk`.
+        // per status colour, parked stopped on frame 1). Cat sheets are uploaded
+        // on demand by `render_cat_walk`.
         if !self.logo.composed {
             if PAW_STATES
                 .into_iter()
@@ -260,82 +219,48 @@ impl App {
         self.render_cat_walk();
     }
 
-    /// Advance every walking cat for this frame, retiring any that have left the
-    /// row. Client-driven: each cat derives its pixel position and walk-cycle frame
-    /// from monotonic elapsed, re-placing its own image (a unique pool id) at an
-    /// advancing column + sub-cell X offset with the current frame's source crop. A
-    /// cat uploads its tinted sheet on its first render (the colour isn't known
-    /// until the click). Called from `render_logo_graphics` (so `logo_caps`/
-    /// `logo_composed` already hold). A no-op when no cats are walking.
+    /// Advance all kittens and release their image IDs when they leave the lane.
+    /// Position is checked before upload so a failed write cannot keep the fast
+    /// animation tick alive indefinitely.
     fn render_cat_walk(&mut self) {
         if self.logo.cats.is_empty() {
             return;
         }
-        // The padding row spans the full header width; without it (pre-first-draw)
-        // there's nowhere to walk, so drop the walk rather than guess.
-        let Some(track) = self.logo.cat_track else {
-            self.logo.cats.clear();
+        let (Some(track), Some(cell)) = (self.logo.cat_track, self.logo.caps) else {
+            self.clear_cat_walks();
             return;
         };
-        let cell_w = self.logo.caps.map_or(1, |c| c.w).max(1) as u32;
-        let track_px = track.width as u32 * cell_w;
-
-        // Image ids of cats that finished this frame (to free after the loop).
-        let mut finished: Vec<u32> = Vec::new();
-        for cat in &mut self.logo.cats {
-            // Position first, from monotonic elapsed (cells/s → px/ms), split into a
-            // whole cell column and a sub-cell offset for smooth motion between
-            // cells. Deciding this *before* the upload means a cat always retires
-            // after its walk duration even if its transmit never succeeds — so a
-            // permanently-failing upload can't pin the fast render tick.
-            let elapsed = cat.started.elapsed().as_millis();
-            let x_px = (elapsed as f32 * CAT_SPEED_CELLS_PER_S * cell_w as f32 / 1000.0) as u32;
-            if x_px >= track_px {
-                finished.push(cat.image_id);
-                continue;
-            }
-            // Upload this cat's tinted sheet on its first render; skip (retry next
-            // frame) on a write error rather than placing a stale/empty image.
+        let size = cat::FrameSize::for_cell(cell);
+        self.logo.cats.retain_mut(|cat| {
+            let Some(placement) =
+                size.placement(cat.image_id, cat.started.elapsed().as_millis(), track, cell)
+            else {
+                let _ = graphics::free_image(cat.image_id);
+                return false;
+            };
             if !cat.transmitted {
-                let rgba = tint_sheet(CAT_MASK, cat.color);
                 if graphics::transmit_rgba(
                     cat.image_id,
-                    CAT_FRAME_W * CAT_FRAMES,
-                    CAT_FRAME_H,
-                    &rgba,
+                    size.sheet_width(),
+                    size.height,
+                    &size.sheet(cat.coat),
                 )
                 .is_err()
                 {
-                    continue;
+                    return true;
                 }
                 cat.transmitted = true;
             }
-            let col = track.x + (x_px / cell_w) as u16;
-            let offset_x = (x_px % cell_w) as u16;
-            // Which walk-cycle pose to show (cycles through the sheet's frames).
-            let frame = (elapsed / CAT_FRAME_MS % CAT_FRAMES as u128) as u32;
-            let _ = graphics::place(&Placement {
-                image: cat.image_id,
-                placement: CAT_PLACEMENT_ID,
-                col,
-                row: track.y,
-                // Native pixel size (no c/r): scaling to a cell box makes kitty snap
-                // the placement to the grid, so the sub-cell `offset` below is
-                // ignored and the cat jumps cell-to-cell. Native size keeps the walk
-                // smooth (the sheet is sized so native ≈ the header row height).
-                cells: None,
-                z: 1,
-                crop: Some((frame * CAT_FRAME_W, 0, CAT_FRAME_W, CAT_FRAME_H)),
-                offset: (offset_x, 0),
-            });
-        }
-        // Retire finished cats: drop their placement + image (freeing the pool id)
-        // and remove them from the list.
-        if !finished.is_empty() {
-            for id in &finished {
-                let _ = graphics::free_image(*id);
+            let _ = graphics::place(&placement);
+            true
+        });
+    }
+
+    fn clear_cat_walks(&mut self) {
+        for cat in self.logo.cats.drain(..) {
+            if self.logo.caps.is_some() {
+                let _ = graphics::free_image(cat.image_id);
             }
-            self.logo.cats.retain(|c| !finished.contains(&c.image_id));
         }
     }
 
@@ -408,37 +333,13 @@ impl App {
 // Tinting and easing
 // =============================================================================
 
-/// Choose a cat tint from a whitened random `rand`: usually one of the four common
-/// dashboard colours (equal odds), and 1 in `CAT_RARE_ONE_IN` the rare special
-/// pink. Pure (given `rand`) so the split is unit-testable; the low and high bits
-/// of a `splitmix64` output are independent enough to reuse the one draw for both
-/// the rare roll (`% CAT_RARE_ONE_IN`) and the common index (`>> 8 % 4`).
-fn select_cat_color(rand: u64, common: [(u8, u8, u8); 4]) -> (u8, u8, u8) {
-    if rand.is_multiple_of(CAT_RARE_ONE_IN) {
-        CAT_RARE_COLOR
-    } else {
-        common[((rand >> 8) % 4) as usize]
-    }
-}
-
 /// A `splitmix64` step — mixes a seed into a well-distributed 64-bit value. Enough
-/// randomness for picking a cat colour without pulling in the `rand` crate.
+/// randomness for picking a cat coat without pulling in the `rand` crate.
 fn splitmix64(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
-}
-
-/// Straight-alpha RGBA from a coverage mask: every pixel gets `color`, the mask's
-/// coverage byte as its alpha. (The paw's `tint` also brightens/fades per pulse
-/// frame; the cat is a flat silhouette, so this plain version is enough.)
-fn tint_sheet(mask: &[u8], (r, g, b): (u8, u8, u8)) -> Vec<u8> {
-    let mut out = Vec::with_capacity(mask.len() * 4);
-    for &cov in mask {
-        out.extend_from_slice(&[r, g, b, cov]);
-    }
-    out
 }
 
 /// A whole-image placement of `id` at the header logo cell (no crop). The paw is
@@ -536,12 +437,11 @@ fn brighten((r, g, b): (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
 // Probing the terminal's palette
 // =============================================================================
 
-/// Caches of the startup-probed paw + cat tints, so `App::new` (which runs after
+/// Caches of the startup-probed paw tints, so `App::new` (which runs after
 /// the terminal modes are armed) can read what `probe_logo_colors` resolved earlier.
 static PROBED_PAW_COLORS: OnceLock<[(u8, u8, u8); 3]> = OnceLock::new();
-static PROBED_CAT_COLORS: OnceLock<[(u8, u8, u8); 4]> = OnceLock::new();
 
-/// Probe the paw's status tints and the cat's four common tints once at startup and
+/// Probe the paw's status tints once at startup and
 /// cache them, resolved from the terminal's own palette (OSC 4) so they match the
 /// theme; any miss keeps the baked default. **Must** be called during setup — see
 /// [`graphics::query_palette`] — after raw mode is on but before the event loop /
@@ -549,7 +449,6 @@ static PROBED_CAT_COLORS: OnceLock<[(u8, u8, u8); 4]> = OnceLock::new();
 /// kitty graphics.
 pub(crate) fn probe_logo_colors() {
     let mut paw = DEFAULT_PAW_COLORS;
-    let mut cat = CAT_COMMON_FALLBACK;
     if graphics::capability().is_some() {
         // Paw: active = the "Active" symbol colour (green); attention = the
         // configured attention foreground (yellow by default).
@@ -560,15 +459,8 @@ pub(crate) fn probe_logo_colors() {
         if let Some(rgb) = resolve_terminal_color(attention) {
             paw[PawState::Attention as usize] = rgb;
         }
-        // Cat: the four common ANSI dashboard colours, to the terminal's real RGB.
-        for (slot, &ansi) in cat.iter_mut().zip(CAT_COMMON_ANSI.iter()) {
-            if let Some(rgb) = resolve_terminal_color(ansi) {
-                *slot = rgb;
-            }
-        }
     }
     let _ = PROBED_PAW_COLORS.set(paw);
-    let _ = PROBED_CAT_COLORS.set(cat);
 }
 
 /// The probed paw tints, or `DEFAULT_PAW_COLORS` if `probe_logo_colors` hasn't run
@@ -578,15 +470,6 @@ pub(super) fn probed_paw_colors() -> [(u8, u8, u8); 3] {
         .get()
         .copied()
         .unwrap_or(DEFAULT_PAW_COLORS)
-}
-
-/// The probed cat common tints, or `CAT_COMMON_FALLBACK` if `probe_logo_colors`
-/// hasn't run (tests, non-kitty).
-pub(super) fn probed_cat_colors() -> [(u8, u8, u8); 4] {
-    PROBED_CAT_COLORS
-        .get()
-        .copied()
-        .unwrap_or(CAT_COMMON_FALLBACK)
 }
 
 /// Resolve a ratatui `Color` to concrete RGB: an explicit `Rgb` as-is; a named
@@ -629,12 +512,6 @@ fn ansi_palette_index(color: Color) -> Option<u8> {
 // =============================================================================
 
 /// Everything the header paw and its cats need, held as one `App` field.
-///
-/// Nine fields on `App` said "logo" in their names because there was nothing
-/// else to say it; here the type says it and the names shed the prefix. Three
-/// of them (`pulse_pending`, `paw_colors`, `cat_colors`) are read nowhere but
-/// this module, which is only visible now that they are not sitting in a
-/// 98-field struct every file in `app` can see.
 pub(crate) struct LogoState {
     /// Cell pixel size when the terminal can render kitty graphics, else `None`
     /// (the header draws the emoji-paw fallback). Recomputed on resize.
@@ -662,18 +539,13 @@ pub(crate) struct LogoState {
     /// advances them from wall-clock elapsed, and the run loop ticks fast while any
     /// are live (see `App::cat_walking`).
     pub(in crate::app) cats: Vec<CatWalk>,
-    /// The cat's four common tints (error/active/attention/selection), resolved from
-    /// the terminal palette at startup; a walk picks one at random (or, rarely, a
-    /// fixed special colour). See `logo::probe_logo_colors`.
-    pub(in crate::app) cat_colors: [(u8, u8, u8); 4],
     /// The header's blank padding row (full width, one cell tall) the cat walks
     /// across. Set by `draw_header` each frame; `None` before the first draw.
     pub(in crate::app) cat_track: Option<Rect>,
 }
 
 impl LogoState {
-    /// Probes the terminal: graphics capability and the palette the paw and cat
-    /// tints are baked from. Not `Default` for that reason — it is a startup
+    /// Probes the terminal: graphics capability and the paw's status palette. Not `Default` for that reason — it is a startup
     /// action, not a zero value.
     pub(crate) fn new() -> Self {
         Self {
@@ -685,7 +557,6 @@ impl LogoState {
             paw_colors: probed_paw_colors(),
             cats: Vec::new(),
             cat_track: None,
-            cat_colors: probed_cat_colors(),
         }
     }
 }
@@ -751,67 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn cat_mask_matches_declared_dimensions() {
-        // The raw `f=32` transmit trusts these dims; a regenerated sheet that
-        // changed size (without updating the consts) would corrupt the image and
-        // desync the per-frame crops.
-        assert_eq!(
-            CAT_MASK.len(),
-            (CAT_FRAME_W * CAT_FRAMES * CAT_FRAME_H) as usize
-        );
-    }
-
-    #[test]
-    fn cat_color_selection_common_and_rare() {
-        let common = [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)];
-        // A multiple of CAT_RARE_ONE_IN rolls the rare special colour.
-        assert_eq!(select_cat_color(0, common), CAT_RARE_COLOR);
-        assert_eq!(
-            select_cat_color(CAT_RARE_ONE_IN * 7, common),
-            CAT_RARE_COLOR
-        );
-        // Otherwise the high bits index the four common colours. Each index is
-        // reachable: `(rand >> 8) % 4`, with rand not a multiple of the rare floor.
-        for idx in 0u64..4 {
-            let rand = (idx << 8) | 1; // low byte 1 → not rare; high bits pick idx
-            assert!(!rand.is_multiple_of(CAT_RARE_ONE_IN));
-            assert_eq!(select_cat_color(rand, common), common[idx as usize]);
+    fn coat_selection_keeps_the_pink_kitten_rare() {
+        let mut counts = [0; 3];
+        for seed in 0..4000 {
+            counts[cat::select_coat(splitmix64(seed))] += 1;
         }
-    }
-
-    #[test]
-    fn splitmix64_spreads_sequential_seeds() {
-        // Sequential seeds must not map to sequential/correlated outputs — a weak
-        // mixer would bias the colour pick toward one bucket across nearby click
-        // times. Check the low-bit rare roll and the 4-bucket index both vary.
-        let mut buckets = [0u32; 4];
-        let mut rare = 0;
-        for seed in 0..4000u64 {
-            let r = splitmix64(seed);
-            if r.is_multiple_of(CAT_RARE_ONE_IN) {
-                rare += 1;
-            } else {
-                buckets[((r >> 8) % 4) as usize] += 1;
-            }
-        }
-        // Every common bucket got a healthy share, and the rare bucket is roughly
-        // 4000/CAT_RARE_ONE_IN ≈ 200 (loose bounds — this pins "well-spread", not
-        // exact).
-        assert!(buckets.iter().all(|&b| b > 700), "buckets: {buckets:?}");
-        assert!((140..=280).contains(&rare), "rare: {rare}");
-    }
-
-    #[test]
-    fn tint_sheet_is_flat_rgba() {
-        // Every pixel carries the tint colour; alpha is the coverage byte verbatim.
-        let out = tint_sheet(&[0x00, 0x80, 0xff], (0x11, 0x22, 0x33));
-        assert_eq!(
-            out,
-            vec![
-                0x11, 0x22, 0x33, 0x00, //
-                0x11, 0x22, 0x33, 0x80, //
-                0x11, 0x22, 0x33, 0xff,
-            ]
-        );
+        assert!(counts[0] > 1500 && counts[1] > 1500, "{counts:?}");
+        assert!((140..=280).contains(&counts[2]), "{counts:?}");
+        assert_eq!(cat::select_coat(cat::RARE_ONE_IN), 2);
     }
 }

@@ -1764,7 +1764,7 @@ pub async fn run() -> Result<()> {
     // No tab label here: the run loop owns it now (it carries the live attention
     // count), and there is nothing to say about a dashboard that hasn't read the
     // sessions yet.
-    // Probe the terminal palette for the paw's status tints and the cat's colours
+    // Probe the terminal palette for the paw's status tints
     // now: raw mode is on (render_backend::init) so the OSC-4 reply isn't line-buffered,
     // but mouse/focus reporting and the event loop haven't started reading stdin
     // yet, so the reply can't be mistaken for input. Cached for `App::new`.

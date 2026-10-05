@@ -10810,6 +10810,33 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
 // Logo graphics
 // =============================================================================
 
+#[test]
+fn paw_clicks_summon_kittens_only_with_graphics_and_cap_the_pool() {
+    use ratatui::layout::Rect;
+
+    let mut d = TestDashboard::new(80, 24);
+    d.app.logo.caps = None;
+    d.render();
+    let paw = d.app.logo.rect.unwrap();
+    d.click(paw.x, paw.y);
+    assert!(!d.app.cat_walking());
+
+    d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    d.render();
+    d.click(paw.x, paw.y);
+    d.click(paw.x + 1, paw.y);
+    assert_eq!(d.app.logo.cats.len(), 2);
+    assert!(d.app.logo.pulse_pending);
+    assert_eq!(
+        d.app.logo.cat_track.unwrap(),
+        Rect::new(0, paw.y + 1, 80, 1)
+    );
+    for _ in 0..20 {
+        d.click(paw.x, paw.y);
+    }
+    assert_eq!(d.app.logo.cats.len(), 12);
+}
+
 /// A resize costs the logo its kitty *images*, not just its placement: ratatui
 /// clears the screen on every resize, and kitty's clear frees every image the
 /// deleted placements leave unreferenced — all three paws, since only the shown

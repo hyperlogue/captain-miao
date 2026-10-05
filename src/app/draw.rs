@@ -410,6 +410,11 @@ impl App {
     // =============================================================================
 
     fn draw_header(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.logo.rect = None;
+        self.logo.cat_track = None;
+        if area.is_empty() {
+            return;
+        }
         let total = self.sessions.len();
         let noun = if total == 1 { "session" } else { "sessions" };
         let cfg = config::get();
@@ -450,7 +455,7 @@ impl App {
         });
         // The blank padding row beneath the bar is the cat's walking track (full
         // width, one cell tall) — empty, so the cat never collides with text.
-        self.logo.cat_track = Some(Rect {
+        self.logo.cat_track = (area.height >= 2).then_some(Rect {
             x: area.x,
             y: bar.y + 1,
             width: area.width,

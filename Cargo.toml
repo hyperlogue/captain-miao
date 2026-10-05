@@ -99,10 +99,10 @@ default = ["remote"]
 # essentially nothing a second pass could find that the first doesn't.
 remote = []
 
-# Dev-only: the logo/cat alpha-mask assets are generated once by
+# Dev-only: the paw alpha-mask asset is generated once by
 # `examples/gen_logo_assets` (pure-Rust 2D rasteriser) and committed under
 # `assets/logo/`. tiny-skia never ships in the dashboard binary — the runtime only
-# embeds the finished `.gray` masks (the `.png` outputs are eyeball previews).
+# embeds the finished `.gray` mask (the `.png` output is an eyeball preview).
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tiny-skia = "0.12"
