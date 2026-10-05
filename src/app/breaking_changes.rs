@@ -7,6 +7,7 @@
 //! Keep old entries and their versions unchanged so skipped releases work.
 //! No new input handling, state fields or receipt files are needed per notice.
 
+use anyhow::Context;
 use semver::Version;
 
 use super::keymap::Command;
@@ -25,10 +26,8 @@ pub(super) enum Content {
     Binding(Command, &'static str),
 }
 
-pub(super) const SESSION_SHORTCUTS_ID: &str = "session-shortcuts-x";
-
 pub(super) const BREAKING_CHANGES: &[BreakingChange] = &[BreakingChange {
-    id: SESSION_SHORTCUTS_ID,
+    id: "session-shortcuts-x",
     introduced: "0.11.0",
     title: "Session shortcuts changed",
     content: &[
@@ -56,7 +55,8 @@ pub(super) fn pending(
 ) -> anyhow::Result<Vec<&'static BreakingChange>> {
     let mut changes = Vec::new();
     for change in catalog {
-        let introduced = Version::parse(change.introduced)?;
+        let introduced = Version::parse(change.introduced)
+            .with_context(|| format!("invalid version for breaking change '{}'", change.id))?;
         if !introduced.cmp_precedence(current).is_gt()
             && previous.is_none_or(|v| introduced.cmp_precedence(v).is_gt())
         {
@@ -83,7 +83,7 @@ pub(super) mod tests {
             ],
         },
         BreakingChange {
-            id: SESSION_SHORTCUTS_ID,
+            id: "session-shortcuts-x",
             introduced: "0.11.0",
             title: "Session shortcuts changed",
             content: &[Content::Text("Shortcut migration")],
@@ -127,7 +127,7 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(
             pending.iter().map(|change| change.id).collect::<Vec<_>>(),
-            [SESSION_SHORTCUTS_ID, "config-format", "connection-policy"]
+            ["session-shortcuts-x", "config-format", "connection-policy"]
         );
     }
 

@@ -252,12 +252,6 @@ pub fn dashboard_overrides_path() -> PathBuf {
     state_dir().join("dashboard-overrides.json")
 }
 
-/// Legacy acknowledgement of the x/X shortcut change. New dashboards migrate
-/// it into `last_dashboard_version` in dashboard overrides, then remove it.
-pub fn keybinding_notice_path() -> PathBuf {
-    state_dir().join("keybinding-notice-x-v1.json")
-}
-
 /// Snapshot of every restartable session the dashboard knew about. Written on
 /// every reload while running and removed on clean exit, so its presence at
 /// startup means the previous dashboard exited unexpectedly — and any entries

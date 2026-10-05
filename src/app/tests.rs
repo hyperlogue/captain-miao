@@ -77,7 +77,6 @@ impl TestDashboard {
     fn show_shortcut_notice(&mut self, dir: &std::path::Path) {
         self.app.dashboard_state = super::dashboard_state::DashboardState::new(
             dir.join("dashboard-overrides.json"),
-            dir.join("keybinding-notice-x-v1.json"),
             env!("CARGO_PKG_VERSION"),
         );
         self.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
@@ -708,11 +707,7 @@ fn upgrade_notice_queue_handles_general_changes_and_commits_after_the_last_page(
     )
     .unwrap();
     let mut d = TestDashboard::new(100, 24);
-    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
-        overrides,
-        temp.path().join("keybinding-notice-x-v1.json"),
-        "0.12.0",
-    );
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(overrides, "0.12.0");
     d.app.upgrade_notices = UpgradeNotices::new(
         d.app
             .dashboard_state
@@ -3789,11 +3784,7 @@ fn loading_preferences_preserves_local_host_flags_and_restores_pin_order() {
     let temp = tempfile::tempdir().unwrap();
     let mut d = TestDashboard::new(120, 10);
     let path = temp.path().join("dashboard-overrides.json");
-    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
-        path.clone(),
-        temp.path().join("legacy.json"),
-        "0.11.0",
-    );
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(path.clone(), "0.11.0");
     let mut first = session(1, "/workspace/first", SessionStatus::Idle);
     let mut second = session(2, "/workspace/second", SessionStatus::Idle);
     first.flags = Some(HostFlags {

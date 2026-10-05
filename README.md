@@ -428,9 +428,7 @@ Esc, or **Next** acknowledges it and advances to the next notice. **Got it**
 finishes the queue. The version is saved immediately for fresh installs and
 launches without notices, or after the whole queue is acknowledged. Quitting
 partway through leaves the queue pending for the next launch. Ordinary
-preference saves preserve the version. The older separate shortcut-notice file
-is migrated and removed after the version is saved; it acknowledges only the
-x/X change.
+preference saves preserve the version.
 
 New announcements are declared in the
 [`BREAKING_CHANGES` catalog](src/app/breaking_changes.rs) with a stable ID,

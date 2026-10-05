@@ -12,33 +12,24 @@ use serde_json::{Map, Value};
 
 use super::{
     DashboardOverrides,
-    breaking_changes::{self, BreakingChange, SESSION_SHORTCUTS_ID},
+    breaking_changes::{self, BreakingChange},
 };
 use crate::state;
 
 pub(super) struct DashboardState {
     path: PathBuf,
-    legacy_notice: PathBuf,
     version: &'static str,
 }
 
 impl Default for DashboardState {
     fn default() -> Self {
-        Self::new(
-            state::dashboard_overrides_path(),
-            state::keybinding_notice_path(),
-            env!("CARGO_PKG_VERSION"),
-        )
+        Self::new(state::dashboard_overrides_path(), env!("CARGO_PKG_VERSION"))
     }
 }
 
 impl DashboardState {
-    pub(super) fn new(path: PathBuf, legacy_notice: PathBuf, version: &'static str) -> Self {
-        Self {
-            path,
-            legacy_notice,
-            version,
-        }
+    pub(super) fn new(path: PathBuf, version: &'static str) -> Self {
+        Self { path, version }
     }
 
     pub(super) fn load(&self) -> Option<DashboardOverrides> {
@@ -73,22 +64,16 @@ impl DashboardState {
     ) -> anyhow::Result<Vec<&'static BreakingChange>> {
         let document = self.read_document()?;
         let prior_use = self.path.is_file() || window_bindings.is_file();
-        let acknowledged_legacy = state::read_json::<bool>(&self.legacy_notice) == Some(true);
         let previous = document
             .get("last_dashboard_version")
             .and_then(Value::as_str)
             .and_then(|v| Version::parse(v).ok());
         let current = Version::parse(self.version)?;
-        let mut notices = if prior_use {
+        let notices = if prior_use {
             breaking_changes::pending(catalog, previous.as_ref(), &current)?
         } else {
             Vec::new()
         };
-        // The legacy receipt acknowledged only the x/X announcement, not all
-        // changes through the version being launched today.
-        if acknowledged_legacy {
-            notices.retain(|change| change.id != SESSION_SHORTCUTS_ID);
-        }
         if notices.is_empty() {
             self.finish_startup()?;
         }
@@ -104,13 +89,7 @@ impl DashboardState {
             Value::String(self.version.into()),
         );
         self.ensure_parent()?;
-        state::write_json_atomic(&self.path, &document)?;
-        // Never delete the old receipt until its replacement is safely saved.
-        match std::fs::remove_file(&self.legacy_notice) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("removing the legacy shortcut notice receipt"),
-        }
+        state::write_json_atomic(&self.path, &document)
     }
 
     fn read_document(&self) -> anyhow::Result<Map<String, Value>> {
@@ -136,15 +115,11 @@ mod tests {
     use serde_json::json;
 
     fn dashboard(dir: &Path, version: &'static str) -> DashboardState {
-        DashboardState::new(
-            dir.join("dashboard-overrides.json"),
-            dir.join("keybinding-notice-x-v1.json"),
-            version,
-        )
+        DashboardState::new(dir.join("dashboard-overrides.json"), version)
     }
 
     #[test]
-    fn fresh_dashboard_records_its_version_without_a_notice_or_extra_file() {
+    fn fresh_dashboard_records_its_version_without_a_notice() {
         let temp = tempfile::tempdir().unwrap();
         let dashboard = dashboard(temp.path(), "0.11.0");
         let bindings = temp.path().join("window-bindings.json");
@@ -161,7 +136,6 @@ mod tests {
             dashboard.load().unwrap().last_dashboard_version.as_deref(),
             Some("0.11.0")
         );
-        assert!(!dashboard.legacy_notice.exists());
         std::fs::write(&bindings, "[]").unwrap();
         assert!(
             dashboard
@@ -250,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_acknowledgement_migrates_without_resetting_preferences() {
+    fn recording_the_dashboard_version_preserves_preferences() {
         let temp = tempfile::tempdir().unwrap();
         let dashboard = dashboard(temp.path(), "0.11.0");
         let mut saved = json!({
@@ -260,14 +234,7 @@ mod tests {
             "future_preference": "preserve"
         });
         state::write_json_atomic(&dashboard.path, &saved).unwrap();
-        state::write_json_atomic(&dashboard.legacy_notice, &true).unwrap();
-        assert!(
-            dashboard
-                .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(!dashboard.legacy_notice.exists());
+        dashboard.finish_startup().unwrap();
         saved["last_dashboard_version"] = json!("0.11.0");
         assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
         dashboard.save(dashboard.load().unwrap()).unwrap();
@@ -321,32 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_receipt_never_acknowledges_other_changes_in_skipped_releases() {
-        let temp = tempfile::tempdir().unwrap();
-        let dashboard = dashboard(temp.path(), "0.12.0");
-        let bindings = temp.path().join("window-bindings.json");
-        std::fs::write(&bindings, "[]").unwrap();
-        state::write_json_atomic(&dashboard.legacy_notice, &true).unwrap();
-        for _ in 0..2 {
-            let notices = dashboard.begin_startup(&bindings, EXAMPLE_CHANGES).unwrap();
-            assert_eq!(
-                notices.iter().map(|change| change.id).collect::<Vec<_>>(),
-                ["config-format", "connection-policy"]
-            );
-            assert!(dashboard.legacy_notice.exists());
-            assert!(!dashboard.path.exists(), "no acknowledgement yet");
-        }
-        dashboard.finish_startup().unwrap();
-        assert!(!dashboard.legacy_notice.exists());
-        assert!(
-            dashboard
-                .begin_startup(&bindings, EXAMPLE_CHANGES)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn new_install_skips_the_entire_catalog_but_later_upgrades_do_not() {
         let temp = tempfile::tempdir().unwrap();
         let first = dashboard(temp.path(), "0.11.0");
@@ -378,47 +319,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unacknowledged_legacy_receipt_is_removed_after_acknowledgement() {
+    fn failed_version_save_preserves_existing_state() {
         let temp = tempfile::tempdir().unwrap();
         let dashboard = dashboard(temp.path(), "0.11.0");
-        let bindings = temp.path().join("window-bindings.json");
-        std::fs::write(&bindings, "[]").unwrap();
-        state::write_json_atomic(&dashboard.legacy_notice, &false).unwrap();
-        assert!(
-            !dashboard
-                .begin_startup(&bindings, BREAKING_CHANGES)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(dashboard.legacy_notice.exists());
-        dashboard.finish_startup().unwrap();
-        assert!(!dashboard.legacy_notice.exists());
-        assert!(
-            dashboard
-                .begin_startup(&bindings, BREAKING_CHANGES)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn failed_migration_preserves_the_old_receipt_and_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let dashboard = dashboard(temp.path(), "0.11.0");
-        let saved = json!({"pinned": [42]});
+        let saved = json!({"last_dashboard_version": "0.10.0", "pin_order": [42]});
         state::write_json_atomic(&dashboard.path, &saved).unwrap();
-        state::write_json_atomic(&dashboard.legacy_notice, &true).unwrap();
         // Prevent the atomic write without relying on Unix user permissions.
         std::fs::create_dir(dashboard.path.with_extension("tmp")).unwrap();
-        assert!(
-            dashboard
-                .begin_startup(&temp.path().join("window-bindings.json"), BREAKING_CHANGES)
-                .is_err()
-        );
-        assert_eq!(
-            state::read_json::<bool>(&dashboard.legacy_notice),
-            Some(true)
-        );
+        assert!(dashboard.finish_startup().is_err());
         assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
     }
 
