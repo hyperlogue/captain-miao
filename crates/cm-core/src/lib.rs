@@ -28,6 +28,7 @@ pub mod learned;
 pub mod logging;
 pub mod paths;
 pub mod protocol;
+pub mod session_flags;
 pub mod state;
 pub mod terminal;
 pub mod terminal_modes;

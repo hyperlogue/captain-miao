@@ -1216,15 +1216,12 @@ impl Backend {
         }
     }
 
-    /// Record the host-owned flags for a session, so every dashboard watching
-    /// that host agrees (§9). `false` when the host doesn't serve flags — a
-    /// plain local backend, whose flags are the dashboard's own
-    /// `dashboard-overrides.json` — which is the caller's signal to persist
-    /// them locally instead. Blocks on a round-trip for a remote host.
+    /// Persist flags through the owning host's shared store. Remote hosts use
+    /// the same operation over RPC; false means the write was unsuccessful.
     pub(crate) fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
         match self {
-            Backend::Local(_) => false,
-            Backend::Remote(b) => b.set_session_flags(key, flags),
+            Backend::Local(h) => h.inner.set_session_flags(key, flags),
+            Backend::Remote(b) => tokio::task::block_in_place(|| b.set_session_flags(key, flags)),
         }
     }
 
@@ -1373,8 +1370,9 @@ impl Backend {
 
 /// Watch this host's session state for changes, feeding `changed`. Owned by the
 /// local backend (§5), not the app: the `sessions/` dir where launchers write,
-/// plus each agent backend's own nominated paths (Claude's session-name store,
-/// Codex's title-store WAL — the wake for the cached title overlay).
+/// the shared flags sidecar, and each agent backend's own nominated paths
+/// (Claude's session-name store, Codex's title-store WAL — the wake for the
+/// cached title overlay).
 ///
 /// Best-effort throughout: a missing path simply isn't watched, and a watcher
 /// that can't be created at all leaves the dashboard on its reload cadence
@@ -1382,10 +1380,22 @@ impl Backend {
 fn start_local_watcher(changed: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
     use notify::Watcher as _;
     let sink = changed.clone();
+    let root = state::state_dir();
+    let flags = state::session_flags_path();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Skip Access (open/close/read): our own reads would otherwise wake us.
         if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        // Also watch the sidecar's directory so atomic replacement by another
+        // dashboard or daemon wakes us. Ignore unrelated preference writes.
+        if !event.paths.is_empty()
+            && event
+                .paths
+                .iter()
+                .all(|p| p == &root || (p.parent() == Some(root.as_path()) && p != &flags))
+        {
             return;
         }
         sink.store(true, Ordering::Relaxed);
@@ -1396,6 +1406,7 @@ fn start_local_watcher(changed: Arc<AtomicBool>) -> Option<notify::RecommendedWa
         tracing::warn!("could not watch {}: {e}", dir.display());
         return None;
     }
+    let _ = watcher.watch(&state::state_dir(), notify::RecursiveMode::NonRecursive);
     for &agent in crate::agent::AgentControl::ALL {
         for path in agent.watch_paths() {
             let _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);

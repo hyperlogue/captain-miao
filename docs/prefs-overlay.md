@@ -291,7 +291,7 @@ Stored as `prefs.agents: [{ "id": "claude", "enabled": true }, …]`.
 
 **Always on, not in the panel:**
 
-- **Mark idle as needing input** (`follow_up_transitions`). Core
+- **Mark idle as needing input** (`SessionFlagsStore`). Core
   behaviour; `i` still toggles one row. No pref, no TOML key.
 - **Reattach on reconnect** (`sweep_reconnected_hosts`). When a
   remote (or local-pool) `reconnect_epoch` advances and it is not
@@ -772,8 +772,8 @@ signal for Restart-tagged drift.
 ## References
 
 `src/config.rs`, `crates/cm-core/src/config.rs`, `src/app/mod.rs`
-(`DashboardOverrides`, `sweep_reconnected_hosts`,
-`follow_up_transitions`, `save_overrides`), `src/app/keymap.rs`
+(`DashboardOverrides`, `sweep_reconnected_hosts`, `save_overrides`),
+`crates/cm-core/src/session_flags.rs`, `src/app/keymap.rs`
 `DEFAULTS`, `src/app/hosts.rs`, `src/app/format.rs`
 `context_pressure_style`, `src/terminal/kitty.rs`,
 `crates/cm-core/src/state.rs` `session_flags_path`,

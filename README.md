@@ -343,6 +343,11 @@ kept stable; new actions should use free keys within the related leader menu.
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
+Pins and follow-up flags are saved on the session's host and shared across
+dashboards, including direct-local sessions. The daemon tracks completion while
+remote dashboards are disconnected, so the follow-up flag is ready on reconnect.
+Existing local flags migrate automatically from dashboard preferences.
+
 Push and pull start immediately without a confirmation prompt, reading fresh
 checkout status even when the Detail panel is hidden. They keep running when you
 navigate elsewhere. Only one Git operation runs per checkout at a time. A deleted

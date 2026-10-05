@@ -188,6 +188,10 @@ exec {} --exact codex_fixture --nocapture
         flags.get(key).copied()
     }
 
+    pub fn flag_store(&self) -> cm_core::session_flags::SessionFlagsStore {
+        cm_core::session_flags::SessionFlagsStore::new(self.root.path().join("state/captain-miao"))
+    }
+
     pub async fn wait_exited(&mut self, pid: u32) {
         let child = self
             .launchers

@@ -46,6 +46,16 @@ impl DashboardState {
     }
 
     pub(super) fn save(&self, mut overrides: DashboardOverrides) -> anyhow::Result<()> {
+        let document = self.read_document()?;
+        if document.contains_key("pinned") || document.contains_key("follow_up") {
+            // Only discard the legacy flag arrays after the shared store has
+            // imported them durably. A failed import leaves preferences intact.
+            let root = self
+                .path
+                .parent()
+                .context("dashboard state has no parent")?;
+            cm_core::session_flags::SessionFlagsStore::new(root.to_path_buf()).migrate_legacy()?;
+        }
         // Read the latest version rather than carrying a stale copy in App:
         // startup acknowledgement can advance it after preferences were loaded.
         overrides.last_dashboard_version = state::read_json::<Value>(&self.path)
@@ -260,14 +270,54 @@ mod tests {
         assert!(!dashboard.legacy_notice.exists());
         saved["last_dashboard_version"] = json!("0.11.0");
         assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
-        let mut overrides = dashboard.load().unwrap();
-        overrides.follow_up.push(44);
-        dashboard.save(overrides).unwrap();
+        dashboard.save(dashboard.load().unwrap()).unwrap();
         let overrides = dashboard.load().unwrap();
-        assert_eq!(overrides.pinned, vec![42]);
-        assert_eq!(overrides.follow_up, vec![43, 44]);
+        assert_eq!(overrides.pin_order, vec![42]);
+        let document: Value = state::read_json(&dashboard.path).unwrap();
+        assert!(document.get("pinned").is_none());
+        assert!(document.get("follow_up").is_none());
         assert_eq!(overrides.prefs.prevent_sleep, Some(false));
         assert_eq!(overrides.last_dashboard_version.as_deref(), Some("0.11.0"));
+    }
+
+    #[test]
+    fn preference_save_removes_legacy_flags_only_after_a_durable_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let dashboard = dashboard(temp.path(), "0.11.0");
+        let pid = std::process::id();
+        let saved = json!({"pinned": [pid], "follow_up": [pid]});
+        state::write_json_atomic(&dashboard.path, &saved).unwrap();
+        let row = state::LauncherState {
+            launcher_pid: pid,
+            ..state::LauncherState::for_test(
+                crate::agent::AgentControl::Claude,
+                state::SessionStatus::Idle,
+            )
+        };
+        let sessions = temp.path().join("sessions");
+        state::create_dir_all_private(&sessions).unwrap();
+        state::write_json_atomic(&sessions.join(format!("{pid}.json")), &row).unwrap();
+
+        let blocked = temp.path().join("session-flags.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(dashboard.save(dashboard.load().unwrap()).is_err());
+        assert_eq!(state::read_json::<Value>(&dashboard.path), Some(saved));
+
+        std::fs::remove_dir(blocked).unwrap();
+        dashboard.save(dashboard.load().unwrap()).unwrap();
+        let document: Value = state::read_json(&dashboard.path).unwrap();
+        assert!(document.get("pinned").is_none());
+        assert!(document.get("follow_up").is_none());
+        assert_eq!(document["pin_order"], json!([pid]));
+        let flags: std::collections::HashMap<state::SessionKey, state::SessionFlags> =
+            state::read_json(&temp.path().join("session-flags.json")).unwrap();
+        assert_eq!(
+            flags[&row.key()],
+            state::SessionFlags {
+                pinned: true,
+                follow_up: true
+            }
+        );
     }
 
     #[test]

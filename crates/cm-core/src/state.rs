@@ -245,7 +245,7 @@ pub fn ssh_control_path(target: &str) -> PathBuf {
     ssh_sock_dir().join(format!("c{}", short_hash(target)))
 }
 
-/// Everything the dashboard persists about itself — pins, marks, prefs, the
+/// Everything the dashboard persists about itself — pin order, prefs, the
 /// default host and agent. Safe to delete; the dashboard resets rather than
 /// failing.
 pub fn dashboard_overrides_path() -> PathBuf {
@@ -317,14 +317,13 @@ pub fn window_bindings_path() -> PathBuf {
 }
 
 /// The host-side per-session flags sidecar (`docs/remote-sessions.md` §9): a
-/// `SessionKey → SessionFlags` map the **server-core** owns, so every dashboard
-/// attached to a host sees the same pins/bells and they survive a dashboard
-/// restart. Deliberately a sidecar rather than a field on the launcher's state
-/// file: that file has exactly one writer (its launcher), and flags are set by
-/// someone else entirely.
+/// map owned by [`crate::session_flags::SessionFlagsStore`], used by both the
+/// daemon and direct-local backends. Each entry contains flags and the last
+/// observed status, so dashboards agree on pins/bells across restarts.
+/// Separate from launcher state to preserve its single-writer rule.
 ///
-/// Last-writer-wins across concurrent dashboards, by decision (§8) — nothing
-/// coordinates beyond the atomic replace. Safe to delete (flags reset).
+/// Store transactions use a stable lock file and atomic replacement.
+/// Safe to delete (flags and observation history reset).
 pub fn session_flags_path() -> PathBuf {
     state_dir().join("session-flags.json")
 }
@@ -835,35 +834,6 @@ impl SessionStatus {
         )
     }
 
-    /// Automatic follow-up change after observing this status. The owning
-    /// host applies this for pooled sessions; a direct-local dashboard applies
-    /// it for its own rows. First-seen rest states do not manufacture a bell.
-    pub fn follow_up_change(&self, previous: Option<&Self>, follow_up: bool) -> Option<bool> {
-        let entered_rest = matches!(
-            (previous, self),
-            (
-                Some(
-                    Self::Active
-                        | Self::BackgroundActive
-                        | Self::BackgroundServer
-                        | Self::ReviewPending
-                ),
-                Self::Idle
-            ) | (Some(Self::Compacting), Self::Compacted)
-        );
-        // Parking a long-running service earns attention immediately; a busy
-        // background task earns it when that task finishes instead.
-        let parked_server = *self == Self::BackgroundServer
-            && previous.is_some_and(|p| *p != Self::BackgroundServer);
-        if (entered_rest || parked_server) && !follow_up {
-            Some(true)
-        } else if *self == Self::Active && follow_up {
-            Some(false)
-        } else {
-            None
-        }
-    }
-
     /// Whether the session is doing work: the agent is mid-turn
     /// (`Active`/`Compacting`) or its turn ended but a **short-term** background
     /// task it's waiting on is still running (`BackgroundActive`). Drives the
@@ -1253,12 +1223,11 @@ pub struct LauncherState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kitty_keyboard: bool,
     /// Per-session flags (pinned / follow-up) as the **owning host**
-    /// knows them, overlaid by the server-core from its sidecar as sessions are
-    /// served — never written by the launcher (single-writer rule). `None`
-    /// means *no host owns this row's flags* (a plain local dashboard, which
-    /// keeps its own `dashboard-overrides.json`) — never "cleared", which a
-    /// serving host says with an all-false value, since a reader has to be able
-    /// to tell a clear from silence. Serialized so it rides the wire;
+    /// knows them, overlaid by the shared backend from its sidecar as sessions
+    /// are served — never written by the launcher (single-writer rule). `None`
+    /// means unavailable (raw launcher state, an older peer or a failed read).
+    /// A backend says "cleared" with an all-false value so a reader can
+    /// distinguish it from silence. Serialized so it rides the wire;
     /// part of `PartialEq`, so a flag change from another dashboard pushes a
     /// `Delta` like any other state change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1331,9 +1300,9 @@ impl LauncherState {
 }
 
 /// Per-session flags a host owns on behalf of every dashboard watching it
-/// (`docs/remote-sessions.md` §9). Persisted in the daemon's sidecar
+/// (`docs/remote-sessions.md` §9). Persisted by the shared flag store in a sidecar
 /// ([`session_flags_path`]), overlaid onto served rows, and updated by
-/// `ClientFrame::SetSessionFlags` and host-observed status transitions — so
+/// backend flag writes and host-observed status transitions — so
 /// pins and bells are the same for every dashboard attached to the host, and
 /// work finishing without a connected dashboard still earns a follow-up.
 ///
@@ -1707,7 +1676,7 @@ pub fn read_all_launcher_states() -> Vec<LauncherState> {
     read_launcher_states_in(&sessions_dir())
 }
 
-fn read_launcher_states_in(dir: &Path) -> Vec<LauncherState> {
+pub(crate) fn read_launcher_states_in(dir: &Path) -> Vec<LauncherState> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),

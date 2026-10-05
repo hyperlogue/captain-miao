@@ -720,7 +720,7 @@ fn sample_primed_vitals(
 /// this build hosts a pool. Without the pool the bit stays `None` ("unknown"),
 /// which the dashboard reads as "don't offer a steal".
 fn build_server_core() -> LocalBackend {
-    let backend = LocalBackend::server_core();
+    let backend = LocalBackend::new();
     #[cfg(feature = "pty-pool")]
     let backend = backend.with_attached_probe(crate::pty_pool::attached_by_session);
     backend
@@ -1063,15 +1063,26 @@ async fn push_changes(
 /// unchanged diff pushes nothing. Best-effort: a missing store isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
     let dir = state::sessions_dir();
+    let root = state::state_dir();
+    let flags = state::session_flags_path();
     let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
         // Skip Access (open/close/read) — our own reads would otherwise spin us.
         if matches!(event.kind, notify::EventKind::Access(_)) {
             return;
         }
+        if !event.paths.is_empty()
+            && event
+                .paths
+                .iter()
+                .all(|p| p == &root || (p.parent() == Some(root.as_path()) && p != &flags))
+        {
+            return;
+        }
         let _ = tx.send(());
     })?;
     w.watch(&dir, notify::RecursiveMode::NonRecursive)?;
+    w.watch(&state::state_dir(), notify::RecursiveMode::NonRecursive)?;
     for &agent in AgentControl::ALL {
         for path in agent.out_of_band_watch_paths() {
             let _ = w.watch(&path, notify::RecursiveMode::NonRecursive);

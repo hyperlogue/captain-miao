@@ -344,12 +344,11 @@ about what exists.
 
 - **Server-core = `LocalBackend`.** The daemon wraps the *same*
   `cm_core::backend::LocalBackend` struct the dashboard uses for this machine
-  (`LocalBackend::server_core()`): reading state files, overlaying Codex sqlite
+  (`LocalBackend::new()`): reading state files, overlaying Codex sqlite
   titles, listing resumables, planning launches, host-fs queries — written
-  once, so the in-process path and the wire path cannot drift. `server_core()`
-  additionally owns the two things only a *serving* backend has: the
-  per-session flags sidecar and the pool's live attached bit, both overlaid
-  onto the rows it serves (§8, §10.2).
+  once, so the in-process path and the wire path cannot drift. Both use
+  `SessionFlagsStore` for flags and automatic follow-up transitions (§8).
+  The daemon additionally injects the pool's live attached-bit probe (§10.2).
 - **Lifecycle** (`server.rs`): self-daemonizing (`daemon ensure` double-forks +
   `setsid`, detaching from the ssh channel that started it — this is what
   survives disconnects); singleton via `flock(server.pid)` (the *lock* is the
@@ -1120,27 +1119,31 @@ Three layers, strictly ordered by authority:
    session's host). One writer, atomic rename. Killing the daemon, dashboard,
    or tunnel loses nothing; state lives with the session.
 2. **Host-owned, alongside truth** — `session-flags.json`, a
-   `SessionKey → SessionFlags` sidecar the server-core owns. Deliberately a
-   sidecar and not a field on the state file: that file has exactly one writer
+   sidecar owned by `cm-core::session_flags::SessionFlagsStore`, shared by
+   direct-local and daemon backends. Deliberately separate from the state
+   file: that file has exactly one writer
    (its launcher), and flags are set by someone else entirely. Overlaid onto
    served rows like the Codex titles, updated by `SetSessionFlags` and automatic
-   status transitions, and garbage-collected against live sessions. The daemon
-   observes these transitions even without connected dashboards. Its shared
-   status history and sidecar writes are serialized, so subscribers cannot
-   replay a completion or race an acknowledgement. Failed automatic writes
-   retain the previous status for retry on the next wake or periodic check.
+   status transitions, and garbage-collected when launcher files disappear.
+   The daemon observes transitions even without connected dashboards. Its shared
+   store persists the last observed status beside each session's flags.
+   Transactions use `session-flags.lock` and atomic replacement, so independent
+   dashboards and the daemon cannot replay a completion or race an
+   acknowledgement. Failed automatic writes retain the previous status for
+   retry on the next wake or periodic check.
    A cleared flag is stored as an all-false **entry**, never by dropping the
-   key: `flags: None` on a served row
-   means *no host owns this row's flags*, so a removal would say nothing at all
-   and every dashboard showing the bell would keep showing it.
+   key. Served rows always carry flags, including all-false values; `None`
+   means unavailable, such as an older peer or a failed read. Legacy flags
+   migrate from `dashboard-overrides.json` only when no sidecar entry exists,
+   so an acknowledged completion cannot be re-armed by an old preference file.
 3. **Server — in-memory only, all rebuildable**: per-connection `last_sent`
    diff maps, `LocalBackend` caches, the pool's ptys (which live as long as
    the daemon), plus the host's persisted `recent-cwds.json`.
 4. **Dashboard — projections + preferences**: mirrors and the host-stamped row
    list in memory; on disk `hosts.json` (targets, labels, colors, icons),
-   `window-bindings.json`, `dashboard-overrides.json` (pins/bells for
-   *direct-local* rows, plus keep-awake / default agent / default host /
-   layout), `dashboard-sessions.json` (crash-recovery snapshot — direct-local
+   `window-bindings.json`, `dashboard-overrides.json` (local pin ordering,
+   keep-awake / default agent / default host / layout),
+   `dashboard-sessions.json` (crash-recovery snapshot — direct-local
    by design, since a pooled session survives a dashboard crash on its own and
    "recovering" it would mean resuming a session that never stopped).
 
@@ -1151,9 +1154,11 @@ calls it) so a remote pid can't collide with a local one.
 **Multi-dashboard semantics**: several dashboards on one host are supported by
 construction — each is just another subscriber, and now they agree on
 pins/bells too (the flags sidecar, pushed as a `Delta` to every subscriber).
-All shared mutable state lives in host-fs files with **last-writer-wins**
-semantics, accepted as-is. Steal-attach is an action, not state. Nothing
-coordinates concurrent writers beyond atomic file replacement, by decision.
+Shared mutable state lives in host-fs files. Flag transactions are locked,
+preserving unrelated sessions' updates and observing status before applying an
+explicit acknowledgement. Conflicting explicit edits to the same session still
+use **last-writer-wins** semantics. Other preference files use atomic replacement
+without writer coordination. Steal-attach is an action, not state.
 
 ### `config.toml` is per-machine, and the halves are not interchangeable
 
@@ -1571,16 +1576,17 @@ decides what they mean**.
 - **`w` work tab** — `shell_plan` decides: an in-process shell for this
   machine, an `ssh -t <host>` tab that cds into the session's cwd for a remote.
 - **Fork and restart** work on any host.
-- **Preferences**: pins/follow-ups on a pooled host's rows are stored
-  **server-side** (§8) and adopted onto `App.flags` at reload, so every
+- **Preferences**: pins/follow-ups for all rows are stored on their owning
+  **host** (§8) and adopted onto `App.flags` at reload, so every
   dashboard attached to that host — and a phone-ssh user on the box — sees the
   same ones, and they survive a dashboard restart. `pin_seq` stays client-side:
-  pin *ordering* is presentation. Direct-local rows keep using
-  `dashboard-overrides.json`. Automatic follow-up arm/clear runs on the owning
-  daemon for pooled rows, so work completed while disconnected is flagged
-  before a dashboard reconnects. The dashboard only runs those transitions
-  for direct-local rows. Explicit focus-clears and `i` toggles still push to
-  the host; adoption re-reads its flags on every reload.
+  pin *ordering* is presentation, persisted for local rows in
+  `dashboard-overrides.json`. The shared `SessionFlagsStore` performs automatic
+  follow-up arm/clear for both direct-local and daemon backends. The daemon
+  observes it without subscribers, so work completed while disconnected is
+  flagged before a dashboard reconnects. Explicit focus-clears and `i` toggles
+  also go through the backend; the dashboard has no automatic transition or
+  flag persistence policy.
 
 ### How mixed is remote support with the rest of the code?
 
@@ -1682,9 +1688,9 @@ the session. Nothing in the message pointed at the binary; reading the daemon's
 own `/proc` entry leaves nothing to point at.
 
 `BackendCaps::pooled` keeps its host-level meaning and its host-level callers:
-whether a kill is a round trip worth being optimistic about, whether the host
-serves the flags sidecar, whether `launcher_pid` names a process in *this*
-table. What it stopped being is the answer to "can I attach to this row".
+whether a kill is a round trip worth being optimistic about, whether
+`launcher_pid` names a process in *this* table. What it stopped being is the
+answer to "can I attach to this row".
 
 **The attached bit, for a backend that talks to no daemon.** Every other field
 on a row is written to a file by the launcher and read straight back; `attached`

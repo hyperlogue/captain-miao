@@ -93,8 +93,19 @@ async fn follow_up_is_persisted_while_every_dashboard_is_disconnected() {
     assert_eq!(other.row("alpha").flags, Some(cleared));
     drop(peer);
     drop(other);
-    let peer = Peer::connect(host.socket()).await;
+    let mut peer = Peer::connect(host.socket()).await;
     assert_eq!(peer.row("alpha").flags, Some(cleared));
+
+    // A direct-local dashboard uses this same store without RPC. Its writes
+    // must wake remote subscribers, and both readers must preserve a clear.
+    let local = host.flag_store();
+    local.set(&key, armed).unwrap();
+    peer.rows_until(|rows| rows[&key].flags == Some(armed))
+        .await;
+    local.set(&key, cleared).unwrap();
+    peer.rows_until(|rows| rows[&key].flags == Some(cleared))
+        .await;
+    assert_eq!(local.snapshot().0[0].flags, Some(cleared));
     host.assert_alive(&[launcher]);
 }
 

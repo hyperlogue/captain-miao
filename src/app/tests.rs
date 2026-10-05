@@ -3764,28 +3764,66 @@ fn reconnect_sweep_only_reattaches_expected_sessions() {
 #[test]
 fn host_served_flags_are_adopted_onto_rows() {
     use crate::state::{HostId, SessionFlags as HostFlags};
+    for host in [HostId::local(), HostId("box".into())] {
+        let mut d = TestDashboard::new(120, 10);
+        let mut s = session(1, "/srv/p", SessionStatus::Idle);
+        s.host = host;
+        s.flags = Some(HostFlags {
+            pinned: true,
+            follow_up: true,
+        });
+        d.app.sessions = vec![s];
+        d.app.adopt_host_flags();
+
+        let key = super::flag_key(&d.app.sessions[0]);
+        assert!(d.app.flags_of(&key).pinned);
+        assert!(d.app.flags_of(&key).follow_up);
+        // A locally-issued pin sequence sorts among this dashboard's pins.
+        assert!(d.app.flags_of(&key).pin_seq > 0);
+    }
+}
+
+#[test]
+fn loading_preferences_preserves_local_host_flags_and_restores_pin_order() {
+    use crate::state::SessionFlags as HostFlags;
+    let temp = tempfile::tempdir().unwrap();
     let mut d = TestDashboard::new(120, 10);
-    let mut s = session(1, "/srv/p", SessionStatus::Idle);
-    s.host = HostId("box".into());
-    s.pool_session = Some("cm-1".into());
-    s.flags = Some(HostFlags {
+    let path = temp.path().join("dashboard-overrides.json");
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
+        path.clone(),
+        temp.path().join("legacy.json"),
+        "0.11.0",
+    );
+    let mut first = session(1, "/workspace/first", SessionStatus::Idle);
+    let mut second = session(2, "/workspace/second", SessionStatus::Idle);
+    first.flags = Some(HostFlags {
+        pinned: true,
+        follow_up: true,
+    });
+    second.flags = Some(HostFlags {
         pinned: true,
         follow_up: false,
     });
-    d.app.sessions = vec![s];
+    d.app.sessions = vec![first, second];
     d.app.adopt_host_flags();
-
-    let key = super::flag_key(&d.app.sessions[0]);
-    assert!(d.app.flags_of(&key).pinned);
-    // A locally-issued pin sequence is assigned so it sorts among our own pins.
-    assert!(d.app.flags_of(&key).pin_seq > 0);
+    crate::state::write_json_atomic(&path, &serde_json::json!({"pin_order": [2, 1]})).unwrap();
+    d.app.load_overrides();
+    let first = d.app.flags_of(&super::flag_key(&d.app.sessions[0]));
+    let second = d.app.flags_of(&super::flag_key(&d.app.sessions[1]));
+    assert!(first.pinned && first.follow_up);
+    assert!(second.pinned && !second.follow_up);
+    assert!(first.pin_seq > second.pin_seq);
+    d.app.save_overrides();
+    let saved: serde_json::Value = crate::state::read_json(&path).unwrap();
+    assert_eq!(saved["pin_order"], serde_json::json!([2, 1]));
+    assert!(saved.get("pinned").is_none());
+    assert!(saved.get("follow_up").is_none());
 }
 
 /// The other direction, and the one the bell hangs on: a host that serves
 /// *cleared* flags clears this dashboard's copy too.
 ///
-/// `None` is not that signal — it means the host doesn't own the row's flags at
-/// all — so the host has to be able to say "all false" and be believed. Without
+/// `None` means unavailable, so the host must say "all false" to clear. Without
 /// it, adoption could only ever add flags: a follow-up the host was told to drop
 /// would come back on the very next reload, which is what once made a pooled
 /// row's auto-armed bell impossible to put out.
@@ -4177,121 +4215,6 @@ fn seed_queues_dead_local_binding_pane_for_reap() {
 // =============================================================================
 // The follow-up and needs-input flags
 // =============================================================================
-
-#[test]
-fn follow_up_transitions_mark_and_clear() {
-    use super::{FlagKey, flag_key};
-    use std::collections::HashMap;
-
-    let mut d = TestDashboard::new(120, 15);
-
-    // Each rest-entering transition marks follow_up; a row already carrying the
-    // bell is skipped even though it entered rest too. Entering `BackgroundServer` (parking a
-    // long-running dev server) also arms the bell — but only on a real transition
-    // into it, not for a Server row seen for the first time (prev is None at
-    // startup). Entering the *busy* `BackgroundActive` (a short-term task) does
-    // NOT arm — it's work in progress, and arms on its exit to Idle like Active.
-    let active_to_idle = session(1, "/home/test/a", SessionStatus::Idle);
-    let bg_to_idle = session(2, "/home/test/b", SessionStatus::Idle);
-    let review_to_idle = session(3, "/home/test/c", SessionStatus::Idle);
-    let compacting_to_compacted = session(4, "/home/test/d", SessionStatus::Compacted);
-    let flagged_to_idle = session(5, "/home/test/e", SessionStatus::Idle);
-    let active_to_server = session(6, "/home/test/f", SessionStatus::BackgroundServer);
-    let fresh_server = session(7, "/home/test/g", SessionStatus::BackgroundServer);
-    let active_to_bg = session(8, "/home/test/h", SessionStatus::BackgroundActive);
-    let server_to_idle = session(9, "/home/test/i", SessionStatus::Idle);
-    let sessions = vec![
-        active_to_idle.clone(),
-        bg_to_idle.clone(),
-        review_to_idle.clone(),
-        compacting_to_compacted.clone(),
-        flagged_to_idle.clone(),
-        active_to_server.clone(),
-        fresh_server.clone(),
-        active_to_bg.clone(),
-        server_to_idle.clone(),
-    ];
-    d.app
-        .update_flags(flag_key(&flagged_to_idle), Cursor::HoldIndex, |f| {
-            f.follow_up = true
-        });
-
-    let prev: HashMap<FlagKey, SessionStatus> = [
-        (flag_key(&active_to_idle), SessionStatus::Active),
-        (flag_key(&bg_to_idle), SessionStatus::BackgroundActive),
-        (flag_key(&review_to_idle), SessionStatus::ReviewPending),
-        (
-            flag_key(&compacting_to_compacted),
-            SessionStatus::Compacting,
-        ),
-        (flag_key(&flagged_to_idle), SessionStatus::Active),
-        (flag_key(&active_to_server), SessionStatus::Active),
-        // fresh_server has no prev entry → prev is None (dashboard just started).
-        (flag_key(&active_to_bg), SessionStatus::Active),
-        (flag_key(&server_to_idle), SessionStatus::BackgroundServer),
-    ]
-    .into();
-
-    let got = d.app.follow_up_transitions(&prev, &sessions);
-    assert_eq!(
-        got,
-        vec![
-            (flag_key(&active_to_idle), true),
-            (flag_key(&bg_to_idle), true),
-            (flag_key(&review_to_idle), true),
-            (flag_key(&compacting_to_compacted), true),
-            // Active → BackgroundServer arms; a first-seen Server row and the
-            // busy Active → BackgroundActive transition do not.
-            (flag_key(&active_to_server), true),
-            (flag_key(&server_to_idle), true),
-        ]
-    );
-
-    // A flagged session that goes back to Active clears the flag.
-    let resumed = session(6, "/home/test/f", SessionStatus::Active);
-    d.app
-        .update_flags(flag_key(&resumed), Cursor::HoldIndex, |f| {
-            f.follow_up = true
-        });
-    let prev: HashMap<FlagKey, SessionStatus> =
-        [(flag_key(&resumed), SessionStatus::ReviewPending)].into();
-    let got = d
-        .app
-        .follow_up_transitions(&prev, std::slice::from_ref(&resumed));
-    assert_eq!(got, vec![(flag_key(&resumed), false)]);
-}
-
-#[test]
-fn pooled_follow_up_transitions_belong_to_the_host() {
-    use super::flag_key;
-    use crate::backend::{Backend, RemoteBackend};
-    use crate::state::HostId;
-
-    let mut d = TestDashboard::new(120, 15);
-    let host = HostId("test-host".into());
-    d.app
-        .backends
-        .push(Backend::Remote(RemoteBackend::unconnected_for_tests(
-            host.clone(),
-            vec![],
-        )));
-    let mut idle = session(1, "/srv/project", SessionStatus::Idle);
-    idle.host = host.clone();
-    let mut active = session(2, "/srv/project", SessionStatus::Active);
-    active.host = host;
-    d.app
-        .update_flags(flag_key(&active), Cursor::HoldIndex, |f| f.follow_up = true);
-    let previous = [
-        (flag_key(&idle), SessionStatus::Active),
-        (flag_key(&active), SessionStatus::Idle),
-    ]
-    .into();
-    assert!(
-        d.app
-            .follow_up_transitions(&previous, &[idle, active])
-            .is_empty()
-    );
-}
 
 #[test]
 fn marking_needs_input_keeps_cursor_on_the_session() {

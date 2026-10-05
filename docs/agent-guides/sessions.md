@@ -21,8 +21,11 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
 - Launcher and clipboard sockets use `$XDG_RUNTIME_DIR/captain-miao/`, falling
   back to `~/.local/state/captain-miao/run/`. macOS reaps `$TMPDIR`, so it cannot
   host long-lived sockets. ssh's `ssh_sock_dir` is the documented exception.
-- Pooled per-session flags are host-owned in `session-flags.json`, separate
-  from the launcher's state file; preserve the single-writer rule.
+- All per-session flags are host-owned in `session-flags.json`, separate
+  from the launcher's state file; preserve the launcher's single-writer rule.
+  `cm-core::session_flags::SessionFlagsStore` owns automatic transitions,
+  explicit writes and legacy migration for both direct-local and daemon use.
+  Its file lock coordinates writers; the dashboard only adopts served flags.
 
 ## Agent integration
 
