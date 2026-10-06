@@ -1,8 +1,9 @@
-//! Split announcement inbox: a selectable list above scrollable details.
+//! Split announcement inbox: scrollable details above a selectable list.
 //!
 //! The overlay preserves the underlying input mode, including crash recovery.
-//! Browsing never acknowledges items. Got it acknowledges the displayed batch;
-//! quitting first leaves it pending. Dashboard state tracks the saved version.
+//! Viewing details marks an item read for this popup only. Enter visits unread
+//! items before acknowledging the batch; Escape postpones it. Only the saved
+//! dashboard version persists, so leaving early keeps the whole batch pending.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -27,6 +28,7 @@ enum Focus {
 
 pub(super) struct UpgradeNotices {
     items: Vec<&'static Announcement>,
+    read: Vec<bool>,
     list: ListState,
     focus: Focus,
     list_area: Rect,
@@ -38,19 +40,16 @@ pub(super) struct UpgradeNotices {
 }
 
 impl UpgradeNotices {
-    pub(super) fn new(items: Vec<&'static Announcement>) -> Option<Self> {
+    pub(super) fn new(mut items: Vec<&'static Announcement>) -> Option<Self> {
         if items.is_empty() {
             return None;
         }
-        // Put required action in view immediately; all other updates remain
-        // visible and freely browsable in their release order.
-        let selected = items
-            .iter()
-            .position(|item| matches!(item.kind, Kind::Warning))
-            .unwrap_or(0);
+        // Keep release order within each kind, with required actions first.
+        items.sort_by_key(|item| !matches!(item.kind, Kind::Warning));
         Some(Self {
+            read: vec![false; items.len()],
             items,
-            list: ListState::default().with_selected(Some(selected)),
+            list: ListState::default().with_selected(Some(0)),
             focus: Focus::List,
             list_area: Rect::default(),
             detail_area: Rect::default(),
@@ -71,8 +70,9 @@ impl UpgradeNotices {
             self.list.select(Some(index));
             self.scroll = 0;
             self.copy_feedback = None;
-            // Invalidate the old snippet target until the new details render.
+            // Invalidate old action targets until the new details render.
             self.copy_button = Rect::default();
+            self.button = Rect::default();
         }
     }
 
@@ -83,6 +83,25 @@ impl UpgradeNotices {
                 .unwrap_or(0)
                 .saturating_add_signed(delta),
         );
+    }
+
+    /// Return true once every item has been displayed. Otherwise select the
+    /// next unread item, wrapping around any items the user already browsed.
+    fn advance(&mut self) -> bool {
+        let selected = self.list.selected().unwrap_or(0);
+        // Repeated input before a frame must not skip unseen details.
+        if !self.read[selected] {
+            return false;
+        }
+        if let Some(next) = (1..self.items.len())
+            .map(|offset| (selected + offset) % self.items.len())
+            .find(|&index| !self.read[index])
+        {
+            self.select(next);
+            false
+        } else {
+            true
+        }
     }
 
     fn copy_snippet(&self) -> Option<Action> {
@@ -97,6 +116,37 @@ impl UpgradeNotices {
             .collect();
         (!snippets.is_empty()).then(|| Action::CopyUpgradeSnippet(snippets.join("\n\n")))
     }
+}
+
+/// Style the table, key and value of small TOML examples; other snippets stay
+/// plain. Presentation spacing is separate from the exact source copied out.
+fn code_lines(text: &'static str, accent: Style, value: Style, muted: Style) -> Vec<Line<'static>> {
+    let toml = toml::from_str::<toml::Value>(text).is_ok();
+    let mut lines = vec![
+        Line::default(),
+        Line::styled(if toml { "  TOML" } else { "  Code" }, muted),
+        Line::default(),
+    ];
+    for line in text.split('\n') {
+        let mut spans = vec![Span::raw("  ")];
+        if toml && line.trim().starts_with('[') && line.trim().ends_with(']') {
+            spans.push(Span::styled(line, accent));
+            lines.push(Line::from(spans));
+            lines.push(Line::default());
+            continue;
+        } else if toml && let Some((key, rest)) = line.split_once('=') {
+            spans.extend([
+                Span::styled(key, accent),
+                Span::styled("=", muted),
+                Span::styled(rest, value),
+            ]);
+        } else {
+            spans.push(Span::raw(line));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::default());
+    lines
 }
 
 impl App {
@@ -118,8 +168,13 @@ impl App {
             return None;
         }
         match key.code {
-            KeyCode::Enter | KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                self.acknowledge_upgrade_notices();
+            KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                if notice.advance() {
+                    self.acknowledge_upgrade_notices();
+                }
+            }
+            KeyCode::Esc if key.kind == KeyEventKind::Press => {
+                self.upgrade_notices = None;
             }
             KeyCode::Tab | KeyCode::BackTab if key.kind == KeyEventKind::Press => {
                 notice.focus = if notice.focus == Focus::List {
@@ -180,7 +235,9 @@ impl App {
                 return notice.copy_snippet();
             }
             MouseEventKind::Down(MouseButton::Left) if notice.button.contains(at) => {
-                self.acknowledge_upgrade_notices()
+                if notice.advance() {
+                    self.acknowledge_upgrade_notices();
+                }
             }
             MouseEventKind::Down(MouseButton::Left) if notice.list_area.contains(at) => {
                 notice.focus = Focus::List;
@@ -219,9 +276,13 @@ impl App {
         ];
         for content in item.content {
             match content {
-                Content::Text(text) | Content::Code(text) => {
-                    lines.extend(text.split('\n').map(Line::from))
-                }
+                Content::Text(text) => lines.extend(text.split('\n').map(Line::from)),
+                Content::Code(text) => lines.extend(code_lines(
+                    text,
+                    accent,
+                    Style::default().fg(ui.attention_fg),
+                    muted,
+                )),
                 Content::Heading(text) => lines.push(Line::styled(*text, Style::default().bold())),
                 Content::Binding(command, description) => lines.push(Line::from(vec![
                     Span::styled(
@@ -243,11 +304,13 @@ impl App {
             height,
         );
         let hint = if notice.focus == Focus::List {
-            " j/k: select · Tab: details "
+            " j/k: select · Tab: details · Esc: later "
         } else {
-            " j/k: scroll · Tab: updates "
+            " j/k: scroll · Tab: updates · Esc: later "
         };
-        let block = Block::default()
+        let copy_label = " c: Copy snippet ";
+        let has_snippet = item.content.iter().any(|c| matches!(c, Content::Code(_)));
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .padding(Padding::horizontal(1))
@@ -255,18 +318,29 @@ impl App {
             .title(Span::styled(
                 format!(" What's new in miao v{} ", env!("CARGO_PKG_VERSION")),
                 accent,
-            ))
-            .title_bottom(Line::from(hint));
+            ));
+        if has_snippet {
+            block = block.title_bottom(Line::styled(copy_label, accent));
+        }
+        let hints_width = hint.chars().count() + if has_snippet { copy_label.len() + 2 } else { 0 };
+        if hints_width <= usize::from(width.saturating_sub(2)) {
+            block = block.title_bottom(Line::styled(hint, muted).alignment(Alignment::Right));
+        }
         clear_overlay(frame, popup);
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
+        notice.copy_button = if has_snippet && popup.height > 1 {
+            Rect::new(
+                popup.x + 1,
+                popup.bottom() - 1,
+                (copy_label.len() as u16).min(popup.width.saturating_sub(2)),
+                1,
+            )
+        } else {
+            Rect::default()
+        };
 
-        let label = " Enter: Got it ";
-        let copy_label = " c: Copy snippet ";
-        let has_snippet = item.content.iter().any(|c| matches!(c, Content::Code(_)));
-        let buttons_width = (label.len() + copy_label.len() + 2) as u16;
-        let stack_buttons = has_snippet && buttons_width > inner.width;
-        let button_rows = (1 + u16::from(stack_buttons)).min(inner.height);
+        let button_rows = inner.height.min(1);
         let feedback = Paragraph::new(notice.copy_feedback.as_deref().unwrap_or(""))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false });
@@ -277,59 +351,21 @@ impl App {
             0
         };
         let content_height = inner.height.saturating_sub(button_rows + feedback_height);
-        // Reserve most of the height for details; the list scrolls when releases
-        // have many items. Saturation keeps even a 1x1 terminal safe to render.
-        let list_height = (notice.items.len().min(5) as u16 + 1).min(content_height / 3);
-        let list_rect = Rect::new(inner.x, inner.y, inner.width, list_height);
-        let list_block = Block::default().title(Line::styled(
-            format!(
-                "Updates · {}/{}{}",
-                notice.list.selected().unwrap_or(0) + 1,
-                notice.items.len(),
-                if notice.focus == Focus::List {
-                    " · focused"
-                } else {
-                    ""
-                }
-            ),
-            if notice.focus == Focus::List {
-                accent
-            } else {
-                muted
-            },
-        ));
-        notice.list_area = list_block.inner(list_rect);
-        let rows: Vec<_> = notice
-            .items
-            .iter()
-            .map(|item| {
-                let kind_style = match item.kind {
-                    Kind::Warning => Style::default().fg(ui.attention_fg),
-                    Kind::Update => Style::default().fg(ui.title_fg),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<7} ", item.kind.label()), kind_style),
-                    Span::raw(item.title),
-                    Span::styled(format!("  v{}", item.introduced), muted),
-                ]))
-            })
-            .collect();
-        frame.render_stateful_widget(
-            List::new(rows)
-                .block(list_block)
-                .highlight_symbol("› ")
-                .highlight_style(Style::default().bg(ui.highlight_bg).bold()),
-            list_rect,
-            &mut notice.list,
-        );
+        // Details get most of the space. Keep at least one list row on compact
+        // terminals; both panes can scroll independently.
+        let list_height = (notice.items.len().min(5) as u16 + 2)
+            .min((content_height / 3).max(3))
+            .min(content_height);
+        let gap = u16::from(content_height >= 12);
         let details = Rect::new(
             inner.x,
-            list_rect.bottom(),
+            inner.y,
             inner.width,
-            content_height.saturating_sub(list_height),
+            content_height.saturating_sub(list_height + gap),
         );
         let mut detail_block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
             .border_style(if notice.focus == Focus::Details {
                 accent
             } else {
@@ -367,11 +403,66 @@ impl App {
         }
         frame.render_widget(detail_block, details);
         frame.render_widget(paragraph.scroll((notice.scroll, 0)), notice.detail_area);
+        if notice.detail_area.width > 0 && notice.detail_area.height > 0 {
+            notice.read[notice.list.selected().unwrap_or(0)] = true;
+        }
+
+        let read_count = notice.read.iter().filter(|&&read| read).count();
+        let list_rect = Rect::new(inner.x, details.bottom() + gap, inner.width, list_height);
+        let list_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if notice.focus == Focus::List {
+                accent
+            } else {
+                muted
+            })
+            .title(format!(
+                " Updates · {}/{} · {read_count} read{} ",
+                notice.list.selected().unwrap_or(0) + 1,
+                notice.items.len(),
+                if notice.focus == Focus::List {
+                    " · focused"
+                } else {
+                    ""
+                }
+            ))
+            .title_bottom(Line::styled(" ✓ read · • unread ", muted));
+        notice.list_area = list_block.inner(list_rect);
+        let rows: Vec<_> = notice
+            .items
+            .iter()
+            .zip(&notice.read)
+            .map(|(item, read)| {
+                let kind_style = match item.kind {
+                    Kind::Warning => Style::default().fg(ui.attention_fg),
+                    Kind::Update => Style::default().fg(ui.title_fg),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(if *read { "✓ " } else { "• " }, muted),
+                    Span::styled(format!("{:<7} ", item.kind.label()), kind_style),
+                    Span::raw(item.title),
+                    Span::styled(format!("  v{}", item.introduced), muted),
+                ]))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(rows)
+                .block(list_block)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().bg(ui.highlight_bg).bold()),
+            list_rect,
+            &mut notice.list,
+        );
         frame.render_widget(
             feedback,
-            Rect::new(inner.x, details.bottom(), inner.width, feedback_height),
+            Rect::new(inner.x, list_rect.bottom(), inner.width, feedback_height),
         );
 
+        let label = if read_count == notice.items.len() {
+            " Enter: Got it "
+        } else {
+            " Enter: Next unread "
+        };
         let button_width = (label.len() as u16).min(inner.width);
         notice.button = Rect::new(
             inner.x + (inner.width - button_width) / 2,
@@ -379,28 +470,6 @@ impl App {
             button_width,
             u16::from(inner.height > 0),
         );
-        notice.copy_button = Rect::default();
-        if has_snippet && (!stack_buttons || button_rows == 2) {
-            let copy_width = (copy_label.len() as u16).min(inner.width);
-            notice.copy_button = if stack_buttons {
-                Rect::new(
-                    inner.x + (inner.width - copy_width) / 2,
-                    notice.button.y.saturating_sub(1),
-                    copy_width,
-                    1,
-                )
-            } else {
-                let left = inner.x + (inner.width - buttons_width) / 2;
-                notice.button.x = left + copy_width + 2;
-                Rect::new(left, notice.button.y, copy_width, notice.button.height)
-            };
-            frame.render_widget(
-                Paragraph::new(copy_label)
-                    .alignment(Alignment::Center)
-                    .style(accent),
-                notice.copy_button,
-            );
-        }
         frame.render_widget(
             Paragraph::new(label)
                 .alignment(Alignment::Center)

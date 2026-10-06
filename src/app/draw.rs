@@ -1589,7 +1589,8 @@ impl App {
         // (Space / g) or the search `/` marker gets a distinct yellow badge pill.
         let spans = match &self.input_mode {
             _ if self.upgrade_notices.is_some() => {
-                let mut spans = hint_pair("Enter/Esc", "acknowledge");
+                let mut spans = hint_pair("Enter", "next unread / done");
+                spans.extend(hint_pair("Esc", "later"));
                 spans.extend(hint_pair("j/k", "navigate"));
                 spans.extend(hint_pair("Tab", "switch panel"));
                 spans.extend(hint_pair("PgUp/PgDn", "scroll details"));

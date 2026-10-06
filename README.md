@@ -426,9 +426,9 @@ The old `kill` name remains an alias for `close_session`. If both are configured
 `close_session` takes precedence.
 
 **What's new.** Existing dashboard users see a one-time startup inbox for new
-features, changes, and upgrade warnings. A list of updates sits above the
-selected item's details. Warnings have an explicit label and the first warning
-is selected initially. Use arrows or `j`/`k` to select an item, or click its row.
+features, changes, and upgrade warnings. The selected item's details sit above
+a bordered list of updates. Warnings appear first, and the first item is
+selected initially. Use arrows or `j`/`k` to select an item, or click its row.
 Tab switches focus between the list and details; arrows or `j`/`k` then scroll
 the focused panel. Page Up/Down always scroll details, and the mouse wheel
 operates on the panel under the pointer.
@@ -443,20 +443,28 @@ close_session = "x"
 dismiss_notification = []
 ```
 
-Click **Copy snippet** or press `c` in the popup to copy it, then edit
-`config.toml` and restart miao. Press Enter or Esc, or click **Got it**, to
-acknowledge the entire displayed batch. Browsing items does not acknowledge
-them. The acknowledgement survives restarts; your configured
-`close_session` (or `kill`) and `dismiss_notification` bindings remain in effect.
+Click **Copy snippet** on the bottom border or press `c` in the popup to copy
+it, then edit `config.toml` and restart miao. TOML snippets have syntax
+highlighting and extra vertical spacing.
+
+Viewing an item's details marks it read with a checkmark in the list. Press
+Enter or click **Next unread** to visit the next unread item. Once every item
+has been viewed, Enter or **Got it** closes the inbox and acknowledges the
+batch. Read status lasts only while the popup is open; browsing does not save
+acknowledgements. The completed batch stays acknowledged across restarts; your
+configured `close_session` (or `kill`) and `dismiss_notification` bindings remain
+in effect.
 Fresh installs skip existing announcements. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
 The dashboard stores only `last_dashboard_version` in
 `dashboard-overrides.json` to track announcements. Upgrading from version `x`
-to `y` shows every announcement introduced in `(x, y]`, oldest first, with each
-item's version shown in the list and details. This includes all announcements
+to `y` shows every announcement introduced in `(x, y]`, warnings first and
+oldest first within each kind, with each item's version shown in the list and
+details. This includes all announcements
 from skipped releases. The same version and downgrades show no announcements;
 adding an item to an already-seen version does not reopen the inbox.
-Acknowledging the batch records `y`. Quitting with Ctrl+C first leaves `x`
+Acknowledging the batch records `y`. Escape postpones the inbox without
+acknowledging it. Postponing or quitting with Ctrl+C first leaves `x`
 unchanged, so the batch appears on the next launch. Ordinary preference saves
 preserve the version. Fresh installs and launches without announcements record
 the current version immediately. Existing dashboards without a recorded version

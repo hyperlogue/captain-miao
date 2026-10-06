@@ -641,7 +641,7 @@ fn update_inbox_shows_the_whole_new_release_until_the_version_is_acknowledged() 
         "{out}"
     );
     assert!(out.contains("Session shortcuts changed"), "{out}");
-    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("1/2"), "{out}");
     assert!(out.contains("Warning"), "{out}");
     assert!(out.contains("miao-server"), "{out}");
     d.app.save_overrides();
@@ -654,6 +654,11 @@ fn update_inbox_shows_the_whole_new_release_until_the_version_is_acknowledged() 
         2
     );
     d.press(KeyCode::Enter);
+    assert!(d.app.upgrade_notices.is_some());
+    let out = d.render();
+    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("2 read"), "{out}");
+    d.press(KeyCode::Enter);
     d.app.save_overrides();
     assert!(
         d.app
@@ -662,6 +667,130 @@ fn update_inbox_shows_the_whole_new_release_until_the_version_is_acknowledged() 
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn update_inbox_enter_skips_read_items_and_waits_for_unseen_details() {
+    use super::announcements::tests::EXAMPLE_ANNOUNCEMENTS;
+
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = temp.path().join("dashboard-overrides.json");
+    let mut d = TestDashboard::new(100, 30);
+    d.app.dashboard_state =
+        super::dashboard_state::DashboardState::new(overrides.clone(), "0.13.0");
+    d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+        super::announcements::pending(EXAMPLE_ANNOUNCEMENTS, None, &semver::Version::new(0, 13, 0))
+            .unwrap(),
+    );
+    // Input before the first frame cannot acknowledge unseen announcements.
+    d.press(KeyCode::Enter);
+    let out = d.render();
+    assert!(out.contains("1/4 · 1 read"), "{out}");
+    assert!(out.contains("setting = \"new\""), "{out}");
+    let buffer = d.terminal.backend().buffer();
+    let detail = find_cell(buffer, "setting =").unwrap();
+    let warning = find_cell(buffer, "Warning Configuration format changed").unwrap();
+    let update = find_cell(buffer, "Update  Session shortcuts changed").unwrap();
+    assert!(detail.1 < warning.1 && warning.1 < update.1);
+
+    let next = find_cell(buffer, "Next unread").expect(&out);
+    d.click(next.0, next.1);
+    // Neither another click nor Enter can skip the new item before it renders.
+    d.click(next.0, next.1);
+    d.press(KeyCode::Enter);
+    let out = d.render();
+    assert!(out.contains("2/4 · 2 read"), "{out}");
+    assert!(out.contains("Review connection settings."), "{out}");
+    d.press(KeyCode::End);
+    let out = d.render();
+    assert!(out.contains("4/4 · 3 read"), "{out}");
+    // Wrap past both read warnings to the one remaining unread update.
+    d.press(KeyCode::Enter);
+    d.press(KeyCode::Enter);
+    assert!(d.app.upgrade_notices.is_some());
+    assert!(!overrides.exists());
+    let out = d.render();
+    assert!(out.contains("3/4 · 4 read"), "{out}");
+    assert!(out.contains("Shortcut migration"), "{out}");
+    assert!(out.contains("Enter: Got it"), "{out}");
+    d.press(KeyCode::Enter);
+    assert!(d.app.upgrade_notices.is_none());
+    let saved: serde_json::Value = crate::state::read_json(&overrides).unwrap();
+    assert_eq!(
+        saved,
+        serde_json::json!({"last_dashboard_version": "0.13.0"})
+    );
+}
+
+#[test]
+fn update_inbox_postponing_preserves_the_version_and_resets_read_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let overrides = temp.path().join("dashboard-overrides.json");
+    let bindings = temp.path().join("window-bindings.json");
+    crate::state::write_json_atomic(
+        &overrides,
+        &serde_json::json!({"last_dashboard_version": "0.10.0"}),
+    )
+    .unwrap();
+    let mut d = TestDashboard::new(100, 30);
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(overrides, "0.11.0");
+    for _ in 0..2 {
+        d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
+            d.app
+                .dashboard_state
+                .begin_startup(&bindings, super::announcements::ANNOUNCEMENTS)
+                .unwrap(),
+        );
+        let out = d.render();
+        assert!(out.contains("1/2 · 1 read"), "{out}");
+        d.press(KeyCode::Enter);
+        let out = d.render();
+        assert!(out.contains("2/2 · 2 read"), "{out}");
+        d.press(KeyCode::Esc);
+        assert!(d.app.upgrade_notices.is_none());
+        d.app.save_overrides();
+        assert_eq!(
+            d.app
+                .dashboard_state
+                .load()
+                .unwrap()
+                .last_dashboard_version
+                .as_deref(),
+            Some("0.10.0")
+        );
+    }
+}
+
+#[test]
+fn shortcut_notice_spaces_and_highlights_toml_with_copy_on_the_bottom_border() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut d = TestDashboard::new(100, 40);
+    d.show_shortcut_notice(temp.path());
+    let out = d.render();
+    let buffer = d.terminal.backend().buffer();
+    let intro = find_cell(buffer, "config.toml.").expect(&out);
+    let language = find_cell(buffer, "TOML").expect(&out);
+    let table = find_cell(buffer, "[keybinds]").expect(&out);
+    let key = find_cell(buffer, "close_session").expect(&out);
+    let value = find_cell(buffer, "\"x\"").expect(&out);
+    let restart = find_cell(buffer, "Restart miao").expect(&out);
+    assert!(language.1 >= intro.1 + 2);
+    assert_eq!(table.1, language.1 + 2);
+    assert_eq!(key.1, table.1 + 2);
+    assert!(restart.1 >= key.1 + 3);
+    let ui = &crate::config::get().colors.ui;
+    assert_eq!(buffer[table].fg, ui.title_fg);
+    assert_eq!(buffer[key].fg, ui.title_fg);
+    assert_eq!(buffer[value].fg, ui.attention_fg);
+    assert_ne!(buffer[key].fg, buffer[intro].fg);
+    let copy = find_cell(buffer, "Copy snippet").expect(&out);
+    let done = find_cell(buffer, "Enter: Got it").expect(&out);
+    assert_eq!(copy.1, done.1 + 1);
+    assert_eq!(buffer[(copy.0 - 5, copy.1)].symbol(), "╰");
+    assert!(matches!(
+        d.click(copy.0, copy.1),
+        Some(Action::CopyUpgradeSnippet(_))
+    ));
 }
 
 #[test]
@@ -828,7 +957,7 @@ fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_promp
         "Connection policy changed",
         "Details · Warning · v0.12.0",
         "setting = \"new\"",
-        "2/3",
+        "1/3",
     ] {
         assert!(out.contains(text), "missing {text}: {out}");
     }
@@ -850,7 +979,7 @@ fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_promp
     assert!(d.click(copy_at.0, copy_at.1).is_none());
     let out = d.render();
     assert!(out.contains("Review connection settings."), "{out}");
-    assert!(out.contains("3/3"), "{out}");
+    assert!(out.contains("2/3"), "{out}");
     assert!(!out.contains("Copy snippet"), "{out}");
     assert!(!out.contains("Snippet copied"), "{out}");
     assert!(d.press(KeyCode::Char('c')).is_none());
@@ -866,7 +995,7 @@ fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_promp
         "details scroll must not select another item"
     );
     d.press(KeyCode::Tab);
-    d.press(KeyCode::Down);
+    d.press(KeyCode::Home);
     assert!(d.render().contains("setting = \"new\""));
     d.app.save_overrides();
     d.press_ctrl(KeyCode::Char('c'));
@@ -918,7 +1047,7 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
         super::announcements::ANNOUNCEMENTS.iter().collect(),
     );
     let out = d.render();
-    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("1/2"), "{out}");
     assert!(
         out.contains("Upgrade servers for the notification yellow dot"),
         "{out}"
@@ -929,7 +1058,7 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
     message_mouse(&mut d, MouseEventKind::ScrollDown, at);
     let scrolled = d.render();
     assert_ne!(scrolled, out);
-    assert!(scrolled.contains("2/2"), "{scrolled}");
+    assert!(scrolled.contains("1/2"), "{scrolled}");
     message_mouse(&mut d, MouseEventKind::ScrollUp, at);
     assert_eq!(d.render(), out);
     d.press(KeyCode::Tab);
@@ -938,14 +1067,14 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
     assert!(out.contains("F6  Open Hosts"), "{out}");
     assert!(out.contains("↑ more"), "{out}");
     assert!(out.contains("Direct-local sessions"), "{out}");
-    assert!(out.contains("2/2"), "{out}");
+    assert!(out.contains("1/2"), "{out}");
     // Scrolling outside the overlay never moves either panel.
     message_mouse(&mut d, MouseEventKind::ScrollUp, (0, 0));
     assert_eq!(d.render(), out);
     d.press(KeyCode::Tab);
-    d.press(KeyCode::Up);
+    d.press(KeyCode::Down);
     let out = d.render();
-    assert!(out.contains("1/2"), "{out}");
+    assert!(out.contains("2/2"), "{out}");
     assert!(
         out.contains("To avoid closing a session by mistake"),
         "selection resets detail scroll: {out}"
@@ -965,7 +1094,7 @@ fn update_inbox_list_scrolling_keeps_mouse_targets_on_visible_items() {
     let out = d.render();
     assert!(out.contains("4/4"), "{out}");
     assert!(!out.contains("Session shortcuts changed"), "{out}");
-    let at = find_cell(d.terminal.backend().buffer(), "A later change").expect(&out);
+    let at = find_cell(d.terminal.backend().buffer(), "Update  A later change").expect(&out);
     d.click(at.0, at.1);
     assert!(d.render().contains("Not yet applicable"));
     // The wheel changes list selection even while details have keyboard focus.
@@ -973,10 +1102,14 @@ fn update_inbox_list_scrolling_keeps_mouse_targets_on_visible_items() {
     message_mouse(&mut d, MouseEventKind::ScrollUp, at);
     let out = d.render();
     assert!(out.contains("3/4"), "{out}");
-    assert!(out.contains("Action required"), "{out}");
+    assert!(out.contains("Shortcut migration"), "{out}");
     message_mouse(&mut d, MouseEventKind::ScrollUp, at);
     let out = d.render();
     assert!(out.contains("2/4"), "{out}");
+    assert!(out.contains("Action required"), "{out}");
+    message_mouse(&mut d, MouseEventKind::ScrollUp, at);
+    let out = d.render();
+    assert!(out.contains("1/4"), "{out}");
     assert!(matches!(
         d.press(KeyCode::Char('c')),
         Some(Action::CopyUpgradeSnippet(_))
@@ -1000,7 +1133,8 @@ fn shortcut_notice_reports_a_failed_version_save_without_blocking_the_dashboard(
     std::fs::write(&file, "cannot hold a child").unwrap();
     let mut d = TestDashboard::new(100, 24);
     d.show_shortcut_notice(&file);
-    d.press(KeyCode::Esc);
+    d.render();
+    d.press(KeyCode::Enter);
     assert!(d.app.upgrade_notices.is_none());
     assert!(d.app.status_is_error);
     assert!(
@@ -1035,6 +1169,7 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
             .as_deref(),
         Some("0.10.0")
     );
+    d.render();
     d.press(KeyCode::Enter);
     d.app.save_overrides();
     assert_eq!(
