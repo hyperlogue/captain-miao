@@ -7,20 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-06
+
+Thanks to @TomGrozev for improving omp status tracking and the resume picker
+([#5](https://github.com/hyperlogue/captain-miao/pull/5)).
+
 ### Added
 
-- **Background-task tiers for omp** — a turn that settles while async bash jobs
-  or `task` spawns are still running lands on `Task`, on `Server` for a
-  recognised long-running service (`npm run dev`), or on `Review` for an
-  `r3 watch`, rather than reading `Idle`. The generated extension reads omp's
-  `ctx.getAsyncJobSnapshot()` at turn end and forwards the live jobs.
+- **A What's new popup** announces changes and upgrade warnings in new releases.
+- **Message history** (`Space m`) shows severity, precise local timestamps
+  and message ages, and supports dragging across text to copy it when the
+  terminal permits clipboard writes.
+- **Background-task tiers for omp** show `Task` for running async jobs,
+  `Server` for recognised long-running services, and `Review` for an
+  `r3 watch` after a turn ends.
+
+### Changed
+
+- **The notification window** has been redesigned.
+- **Title-bar kittens in Kitty** have improved graphics.
+- **Session shortcuts** now use `X` to close a session and `x` to dismiss the
+  newest notification.
+- **The `kill` command** has been renamed to `close_session`, with `kill`
+  kept as a configuration alias for backward compatibility.
+- **Pins and follow-up flags** are shared across dashboards and saved on the
+  session's host, with existing local flags migrated automatically.
+- **Pooled-session completion tracking** continues while dashboards are
+  disconnected; upgrade `miao-server` on every pooled host, including
+  localhost, to the matching version so finished turns mark the yellow
+  needs-input dot.
+- **Git push and pull** start immediately without confirmation, continue as
+  you navigate, and retain the existing single-branch push and fast-forward
+  pull safeguards.
+- **Session launches and work tabs** show notifications only when an error
+  occurs.
 
 ### Fixed
 
-- **An omp question reads as a Decision** and rings for attention, rather
-  than looking like a session doing work.
-- **omp sessions appear in the resume picker**, with their title and first
-  prompt.
+- **omp questions** display `Decision` and ring for attention.
+- **omp sessions** appear in the resume picker with their title and first
+  prompt, using the default session directory or `$PI_CODING_AGENT_DIR`.
+- **Keyboard handling** consumes unknown leader sequences without triggering
+  session actions, requires an explicit `y` for `[y/N]` prompts, and makes
+  the complete shortcut list scrollable in help.
+- **Escape** dismisses the newest notification after open dialogs, pending
+  input and search filters have been cleared.
+- **The Detail panel** hides session errors after five minutes.
+- **Daemon recovery** preserves live sessions when sockets are unavailable
+  and uses consistent socket paths across local and SSH connections, with
+  compatibility links for a verified older daemon until its planned restart.
+- **Force-attaching pooled sessions** succeeds even when the previous
+  client's input is blocked by a full terminal buffer, while large pastes
+  retain their complete contents.
+- **Release retries** reuse published GitHub assets and resume missing npm
+  packages even after build artifacts have expired.
 
 ## [0.11.0] - 2026-10-03
 
@@ -747,7 +787,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...v0.9.3
