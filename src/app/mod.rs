@@ -871,8 +871,11 @@ pub(super) struct WorkdirCompletion {
 pub(super) struct App {
     pub(super) sessions: Vec<LauncherState>,
     pub(in crate::app) launches: launch::Launches,
-    /// Fixed, non-selectable launch rows beneath the table's column headings.
-    pub(super) launch_header_rows: u16,
+    /// Last rendered order: a real row's visible-session index, or `None` for
+    /// a pending launch. Mouse hit-testing uses the same order as rendering.
+    pub(super) table_rows: Vec<Option<usize>>,
+    /// Selection indexes visible sessions (only real rows are actionable).
+    /// The scroll offset indexes `table_rows`, including pending launches.
     pub(super) table_state: TableState,
     pub(super) should_quit: bool,
     pub(super) home_dir: String,
@@ -1599,6 +1602,81 @@ impl SessionFlags {
     }
 }
 
+/// Shared ordering for real sessions and pending launches. A pending launch
+/// is attached-in-progress, unflagged, and has a creation time but no pid.
+fn session_sort_key(
+    status: &SessionStatus,
+    flags: SessionFlags,
+    detached: bool,
+    updated_at: u64,
+    active_since: Option<u64>,
+) -> (u8, i64) {
+    let active = status.is_busy();
+    // Approvals, decisions, and failed-to-start launches float to the
+    // top attention rank. `ReviewPending` is needs-attention too, but
+    // it's a *follow-up*: the human should get to the review, it isn't
+    // the agent blocking on a live prompt. It ranks like a follow-up
+    // idle session but sits in its own tier *below* the actual
+    // follow-up-flagged rows (rank 3) — above plain idle, below
+    // follow-up — sorted by updated_at like the other attention tiers.
+    let review_pending = matches!(status, SessionStatus::ReviewPending);
+    let attention = status.needs_attention() && !review_pending;
+    // A pooled session with no window on this screen sinks to the very
+    // bottom — it's running somewhere else, so it shouldn't compete for
+    // the eye with what's in front of you (§9).
+    //
+    // Detachment is the **first** key after an explicit pin: no status
+    // lifts a row out of the tier, not even a live approval or decision
+    // prompt. Those are urgent, but they are urgent *elsewhere* — the
+    // prompt can't be answered until you attach, so seating it above
+    // the sessions actually on this screen buries the work you can do
+    // now. `follow_up` is the same argument twice over, since it is
+    // auto-armed on every Active→Idle, so a detached session that
+    // merely finished a turn would otherwise homestead the attention
+    // block. The one thing that still wins is `pinned`: that's a
+    // deliberate per-row "keep this in front of me", and honouring it
+    // is the whole point of the key.
+    // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
+    // or at-rest follow-up row); kept split here because ordering needs
+    // the finer tiers, and with the detached tier taking precedence over
+    // all three an attention row that is also detached lands in 6.
+    // `jump_to_next_attention` skips that same row for the same reason
+    // it sinks here — the prompt can't be answered until you attach —
+    // so the sort and the jump target stay in agreement. Changing the
+    // predicate on either side means revisiting the other.
+    let rank: u8 = if flags.pinned {
+        0
+    } else if detached {
+        6
+    } else if attention {
+        1
+    } else if flags.follow_up && !active {
+        2
+    } else if review_pending {
+        3
+    } else if !active {
+        4
+    } else {
+        5
+    };
+    // Pinned: most-recently-pinned first (negate seq so larger sorts before smaller).
+    // Attention groups (approval + follow_up + review-pending): oldest
+    // first so the longest-waiting session surfaces at the top of its
+    // tier. Active group: sort by when the session entered the active
+    // state so the order stays stable during a turn (updated_at churns
+    // on every tool event). Everything else: newest updated_at first.
+    let time_key: i64 = if rank == 0 {
+        -(flags.pin_seq as i64)
+    } else if rank == 1 || rank == 2 || rank == 3 {
+        updated_at as i64
+    } else if active {
+        -(active_since.unwrap_or(updated_at) as i64)
+    } else {
+        -(updated_at as i64)
+    };
+    (rank, time_key)
+}
+
 impl App {
     // =============================================================================
     // Construction
@@ -1643,7 +1721,7 @@ impl App {
         let mut app = Self {
             sessions: Vec::new(),
             launches: Default::default(),
-            launch_header_rows: 0,
+            table_rows: Vec::new(),
             table_state: TableState::default(),
             should_quit: false,
             home_dir,
@@ -3287,22 +3365,19 @@ impl App {
     }
 
     /// Map a screen row (a mouse event's `row`) to the visible-session index it
-    /// lands on, or `None` when the row is on the table's border/header chrome
-    /// or past the last data row. `draw_table` renders the table with
-    /// `Borders::ALL` + a header, so the first data row sits two rows below the
-    /// rect's top; this is the single place that chrome offset is encoded for
-    /// click hit-testing. Adds the `TableState` scroll offset so clicks resolve
-    /// to the right row once the table has scrolled to keep the selection in
-    /// view.
+    /// lands on, or `None` for chrome, pending launches, or empty space.
+    /// `draw_table` uses a top border and a header, so data starts two rows
+    /// below the rect's top. Both the scroll offset and the hit map use the
+    /// rendered order, which includes pending launches between real sessions.
     pub(super) fn visible_index_at(&self, screen_row: u16, table_rect: Rect) -> Option<usize> {
         // Top border (1) + header (1) rows above the first data row.
         const CHROME_ROWS: u16 = 2;
-        let first_row_y = table_rect.y + CHROME_ROWS + self.launch_header_rows;
-        if screen_row < first_row_y {
+        let first_row_y = table_rect.y + CHROME_ROWS;
+        if screen_row < first_row_y || screen_row >= table_rect.bottom() {
             return None;
         }
         let idx = self.table_state.offset() + (screen_row - first_row_y) as usize;
-        (idx < self.visible_len()).then_some(idx)
+        self.table_rows.get(idx).copied().flatten()
     }
 
     fn compute_visible_indices(&self) -> Vec<usize> {
@@ -3328,77 +3403,15 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
-        // Pinned sessions always float to the top, even while actively working.
-        // Among pinned, the most-recently pinned (highest pin_seq) comes first.
-        // Within other ranks, most-recently-updated sessions come first.
         indices.sort_by_cached_key(|&i| {
             let s = &self.sessions[i];
-            let active = s.status.is_busy();
-            let flags = self.flags_of(&flag_key(s));
-            // Approvals, decisions, and failed-to-start launches float to the
-            // top attention rank. `ReviewPending` is needs-attention too, but
-            // it's a *follow-up*: the human should get to the review, it isn't
-            // the agent blocking on a live prompt. It ranks like a follow-up
-            // idle session but sits in its own tier *below* the actual
-            // follow-up-flagged rows (rank 3) — above plain idle, below
-            // follow-up — sorted by updated_at like the other attention tiers.
-            let review_pending = matches!(s.status, SessionStatus::ReviewPending);
-            let attention = s.status.needs_attention() && !review_pending;
-            // A pooled session with no window on this screen sinks to the very
-            // bottom — it's running somewhere else, so it shouldn't compete for
-            // the eye with what's in front of you (§9).
-            //
-            // Detachment is the **first** key after an explicit pin: no status
-            // lifts a row out of the tier, not even a live approval or decision
-            // prompt. Those are urgent, but they are urgent *elsewhere* — the
-            // prompt can't be answered until you attach, so seating it above
-            // the sessions actually on this screen buries the work you can do
-            // now. `follow_up` is the same argument twice over, since it is
-            // auto-armed on every Active→Idle, so a detached session that
-            // merely finished a turn would otherwise homestead the attention
-            // block. The one thing that still wins is `pinned`: that's a
-            // deliberate per-row "keep this in front of me", and honouring it
-            // is the whole point of the key.
-            let detached = self.is_detached_row(s);
-            // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
-            // or at-rest follow-up row); kept split here because ordering needs
-            // the finer tiers, and with the detached tier taking precedence over
-            // all three an attention row that is also detached lands in 6.
-            // `jump_to_next_attention` skips that same row for the same reason
-            // it sinks here — the prompt can't be answered until you attach —
-            // so the sort and the jump target stay in agreement. Changing the
-            // predicate on either side means revisiting the other.
-            let rank: u8 = if flags.pinned {
-                0
-            } else if detached {
-                6
-            } else if attention {
-                1
-            } else if flags.follow_up && !active {
-                2
-            } else if review_pending {
-                3
-            } else if !active {
-                4
-            } else {
-                5
-            };
-            // Pinned: most-recently-pinned first (negate seq so larger sorts before smaller).
-            // Attention groups (approval + follow_up + review-pending): oldest
-            // first so the longest-waiting session surfaces at the top of its
-            // tier. Active group: sort by when the session entered the active
-            // state so the order stays stable during a turn (updated_at churns
-            // on every tool event). Everything else: newest updated_at first.
-            let time_key: i64 = if rank == 0 {
-                -(flags.pin_seq as i64)
-            } else if rank == 1 || rank == 2 || rank == 3 {
-                s.updated_at as i64
-            } else if active {
-                -(s.active_since.unwrap_or(s.updated_at) as i64)
-            } else {
-                -(s.updated_at as i64)
-            };
-            (rank, time_key)
+            session_sort_key(
+                &s.status,
+                self.flags_of(&flag_key(s)),
+                self.is_detached_row(s),
+                s.updated_at,
+                s.active_since,
+            )
         });
         indices
     }

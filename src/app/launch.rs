@@ -112,6 +112,8 @@ enum Phase {
 
 pub(super) struct Pending {
     pub request: Request,
+    /// Creation time for the same newest-first ordering as a fresh idle row.
+    pub created_at: u64,
     token: Option<String>,
     phase: Phase,
     focus: bool,
@@ -161,6 +163,7 @@ impl Launches {
         self.cancel_focus();
         self.pending.push(Pending {
             request,
+            created_at: LauncherState::now(),
             token: None,
             phase: Phase::Opening(work(open)),
             focus: true,

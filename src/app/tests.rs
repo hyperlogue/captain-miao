@@ -258,51 +258,139 @@ fn pending_launch(app: &mut App, token: &str) {
 }
 
 #[tokio::test]
-async fn pending_launch_is_visible_during_reservation_without_changing_session_actions() {
+async fn pending_launch_ranks_after_follow_up_before_and_after_confirmation() {
+    let mut d = TestDashboard::new(120, 24);
+    d.app.panels_initialized = true;
+    d.app.preview_visible = false;
+    d.app.detail_visible = false;
+    let mut follow_up = session(1, "/work/follow-up", SessionStatus::Idle);
+    follow_up.name = Some("needs-follow-up".into());
+    let mut older = session(2, "/work/older", SessionStatus::Idle);
+    older.name = Some("older-session".into());
+    older.updated_at = LauncherState::now().saturating_sub(60);
+    d.app
+        .flags
+        .entry(super::flag_key(&follow_up))
+        .or_default()
+        .follow_up = true;
+    d.set_sessions(vec![follow_up.clone(), older.clone()]);
+    pending_launch(&mut d.app, "pending");
+
+    d.render();
+    let buffer = d.terminal.backend().buffer();
+    let follow_y = find_cell(buffer, "needs-follow-up").unwrap().1;
+    let new_y = find_cell(buffer, "new-session").unwrap().1;
+    let older_y = find_cell(buffer, "older-session").unwrap().1;
+    assert_eq!(
+        new_y,
+        follow_y + 1,
+        "a pending launch must follow the attention row"
+    );
+    assert_eq!(older_y, new_y + 1);
+
+    d.app.launches = Default::default();
+    for status in [SessionStatus::Starting, SessionStatus::Idle] {
+        let mut confirmed = session(3, "/work/new-project", status);
+        confirmed.name = Some("new-session".into());
+        d.set_sessions(vec![follow_up.clone(), confirmed, older.clone()]);
+        d.render();
+        assert_eq!(
+            find_cell(d.terminal.backend().buffer(), "new-session")
+                .unwrap()
+                .1,
+            new_y
+        );
+    }
+}
+
+#[tokio::test]
+async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets() {
     for width in [78, 120] {
         let mut d = TestDashboard::new(width, 24);
+        d.app.panels_initialized = true;
         d.app.preview_visible = false;
-        d.set_sessions(
-            (1..=30)
-                .map(|pid| session(pid, &format!("/work/project-{pid}"), SessionStatus::Idle))
-                .collect(),
-        );
+        d.app.detail_visible = false;
+        let sessions = (1..=30)
+            .map(|pid| {
+                let mut row = session(pid, &format!("/work/project-{pid}"), SessionStatus::Idle);
+                row.updated_at = LauncherState::now().saturating_sub(60);
+                if pid <= 10 {
+                    d.app
+                        .flags
+                        .entry(super::flag_key(&row))
+                        .or_default()
+                        .follow_up = true;
+                }
+                row
+            })
+            .collect();
+        d.set_sessions(sessions);
         d.app.table_state.select(Some(20));
         let selected = d.app.selected_session().unwrap().launcher_pid;
         for i in 0..4 {
             pending_launch(&mut d.app, &format!("pending-{i}"));
         }
 
-        // The reservation never resolves: rendering and navigation must still
-        // work, including when the real session list is scrolled.
+        // The reservation never resolves. All four launches rank between the
+        // attention rows and the older idle rows, within a scrolled viewport.
         let rendered = d.render();
         assert!(rendered.contains("4 starting"), "{rendered}");
-        assert!(rendered.contains("new-session"), "{rendered}");
-        assert!(!rendered.contains("Codex: new-project"), "{rendered}");
-        assert!(rendered.contains("2 more sessions…"), "{rendered}");
+        assert_eq!(rendered.matches("new-session").count(), 4, "{rendered}");
         assert_eq!(d.app.sessions.len(), 30);
         assert_eq!(d.app.visible_sessions().len(), 30);
         assert_eq!(d.app.selected_session().unwrap().launcher_pid, selected);
-        assert!(d.app.table_state.offset() > 0);
+        assert_eq!(&d.app.table_rows[10..14], &[None; 4]);
+        let offset = d.app.table_state.offset();
+        assert!(offset > 0);
+        d.render();
+        assert_eq!(
+            d.app.table_state.offset(),
+            offset,
+            "redrawing must not scroll"
+        );
 
         let rect = d.app.last_table_rect.unwrap();
-        for y in rect.y + 2..rect.y + 2 + d.app.launch_header_rows {
-            assert_eq!(d.app.visible_index_at(y, rect), None);
-            assert!(d.click(rect.x + 2, y).is_none());
-            assert_eq!(d.app.selected_session().unwrap().launcher_pid, selected);
+        let targets: Vec<_> = (rect.y + 2..rect.bottom())
+            .map(|y| {
+                let index = offset + usize::from(y - rect.y - 2);
+                (y, d.app.table_rows.get(index).copied().flatten())
+            })
+            .collect();
+        for (y, target) in targets {
+            assert_eq!(d.app.visible_index_at(y, rect), target);
+            let before = d.selected();
+            d.click(rect.x + 2, y);
+            assert_eq!(d.selected(), target.or(before));
         }
-        let first_data = rect.y + 2 + d.app.launch_header_rows;
-        let offset = d.app.table_state.offset();
-        d.click(rect.x + 2, first_data);
-        assert_eq!(d.selected(), Some(offset));
-        d.press(KeyCode::Down);
-        assert_eq!(d.selected(), Some(offset + 1));
 
-        // Confirmation/removal returns the space to the real rows and mouse
-        // indexing follows the new header height on the same frame.
+        // Keyboard navigation crosses the pending rows without selecting one.
+        d.app.table_state.select(Some(9));
+        d.press(KeyCode::Down);
+        assert_eq!(d.selected(), Some(10));
+        d.render();
+        let visual_index = d
+            .app
+            .table_rows
+            .iter()
+            .position(|row| *row == Some(10))
+            .unwrap();
+        let y = rect.y + 2 + (visual_index - d.app.table_state.offset()) as u16;
+        let symbol = crate::config::get()
+            .colors
+            .ui
+            .selection_symbol
+            .chars()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(d.terminal.backend().buffer()[(rect.x, y)].symbol(), symbol);
+        d.press(KeyCode::Up);
+        assert_eq!(d.selected(), Some(9));
+
+        // Removal returns to the ordinary scroll/click mapping immediately.
         d.app.launches = Default::default();
         assert!(!d.render().contains("4 starting"));
-        assert_eq!(d.app.launch_header_rows, 0);
+        assert_eq!(d.app.table_rows, (0..30).map(Some).collect::<Vec<_>>());
         assert_eq!(
             d.app.visible_index_at(rect.y + 2, rect),
             Some(d.app.table_state.offset())
@@ -321,7 +409,7 @@ async fn pending_launch_on_empty_and_resized_dashboards_never_becomes_a_session(
         assert!(d.app.sessions.is_empty());
         assert!(d.app.selected_session().is_none());
         assert!(d.press(KeyCode::Enter).is_none());
-        if d.app.launch_header_rows > 0 {
+        if d.app.last_table_rect.unwrap().height > 2 {
             assert!(rendered.contains("Starting"), "{rendered}");
         }
     }

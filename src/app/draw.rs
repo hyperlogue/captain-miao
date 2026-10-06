@@ -971,11 +971,8 @@ impl App {
         // Chrome above the data rows is the top rule + the table header (2
         // rows); there's no bottom border to subtract now.
         let pending_count = self.launches.visible(&self.sessions).len();
-        // Keep at least one real row available. Extra launches are summarized
-        // in the last fixed row instead of consuming the whole session table.
-        self.launch_header_rows = (pending_count.min(3) as u16).min(area.height.saturating_sub(3));
-        let visible_rows = area.height.saturating_sub(2 + self.launch_header_rows) as usize;
-        let total_visible = self.visible_len();
+        let visible_rows = area.height.saturating_sub(2) as usize;
+        let total_visible = self.visible_len() + pending_count;
         let has_overflow = total_visible > visible_rows;
 
         // Re-clamp the scroll offset to the last full page. ratatui's Table only
@@ -1070,83 +1067,24 @@ impl App {
                 "Updated".into(),
             ]
         };
-        let heading = Style::default().bold().fg(ui.header_fg);
-        let mut columns: Vec<Vec<Line<'static>>> = labels
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| {
-                vec![Line::styled(label, heading).alignment(if i == 3 || i == 5 {
-                    Alignment::Right
-                } else {
-                    Alignment::Left
-                })]
-            })
-            .collect();
-        let pending = self.launches.visible(&self.sessions);
-        for (i, pending) in pending
-            .iter()
-            .take(self.launch_header_rows as usize)
-            .enumerate()
-        {
-            let summarized = i + 1 == self.launch_header_rows as usize
-                && pending_count > self.launch_header_rows as usize;
-            let request = &pending.request;
-            let label = if summarized {
-                format!("{} more sessions…", pending_count - i)
+        let header = Row::new(labels.into_iter().enumerate().map(|(i, label)| {
+            Cell::from(Line::from(label).alignment(if i == 3 || i == 5 {
+                Alignment::Right
             } else {
-                "new-session".into()
-            };
-            let style = if search_active {
-                Style::default().add_modifier(Modifier::DIM)
-            } else {
-                Style::default()
-            };
-            let mut status = override_indicator_spans(false, false, None);
-            status.push(Span::styled(
-                SessionStatus::Starting.label(),
-                Style::default().fg(super::format::status_fg(&SessionStatus::Starting, false)),
-            ));
-            columns[0].push(Line::from(status).style(style));
-            columns[1].push(if summarized {
-                Line::raw("")
-            } else {
-                self.session_icon_line(&request.window.host, &request.window.cwd, show_host)
-                    .style(style)
-            });
-            columns[2].push(Line::from(truncate_str(&label, name_col_max as usize)));
-            if !narrow {
-                let ctx = if summarized || request.agent.capabilities().context_tokens {
-                    ""
-                } else {
-                    "n/a"
-                };
-                columns[3].push(
-                    Line::styled(ctx, Style::default().add_modifier(Modifier::DIM))
-                        .alignment(Alignment::Right),
-                );
-                columns[4].push(Line::raw(""));
-                columns[5].push(if summarized {
-                    Line::raw("")
-                } else {
-                    elapsed_line(0).style(style)
-                });
-            }
-        }
-        let header = Row::new(
-            columns
-                .into_iter()
-                .map(|lines| Cell::from(Text::from(lines))),
-        )
-        .height(1 + self.launch_header_rows);
+                Alignment::Left
+            }))
+        }))
+        .style(Style::default().bold().fg(ui.header_fg));
 
         let now = LauncherState::now();
 
         // In search mode, dim every column except the Name column so the eye
         // lands on the titles being filtered. The row-level DIM below covers
         // all cells; the Name cell removes it to stay bright.
-        let mut rows: Vec<Row> = visible
+        let mut ranked_rows: Vec<_> = visible
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(index, s)| {
                 let flags = self.flags_of(&super::flag_key(s));
                 let important = flags.pinned;
                 let follow_up = flags.follow_up;
@@ -1218,20 +1156,95 @@ impl App {
                     row_cells.push(elapsed);
                 }
                 let row = Row::new(row_cells);
-                if search_active || foreign || detached {
+                let row = if search_active || foreign || detached {
                     row.style(Style::default().add_modifier(Modifier::DIM))
                 } else {
                     row
-                }
+                };
+                let order = super::session_sort_key(
+                    &s.status,
+                    flags,
+                    detached,
+                    s.updated_at,
+                    s.active_since,
+                );
+                (order, Some(index), row)
             })
             .collect();
+
+        for pending in self.launches.visible(&self.sessions) {
+            let request = &pending.request;
+            let mut status = override_indicator_spans(false, false, None);
+            status.push(Span::styled(
+                SessionStatus::Starting.label(),
+                Style::default().fg(super::format::status_fg(&SessionStatus::Starting, false)),
+            ));
+            let name = Cell::from(truncate_str("new-session", name_col_max as usize))
+                .style(Style::default().remove_modifier(Modifier::DIM));
+            let mut cells = vec![
+                Cell::from(Line::from(status)),
+                Cell::from(self.session_icon_line(
+                    &request.window.host,
+                    &request.window.cwd,
+                    show_host,
+                )),
+                name,
+            ];
+            if !narrow {
+                let ctx = if request.agent.capabilities().context_tokens {
+                    ""
+                } else {
+                    "n/a"
+                };
+                cells.push(
+                    Cell::from(Line::from(ctx).alignment(Alignment::Right))
+                        .style(Style::default().add_modifier(Modifier::DIM)),
+                );
+                cells.push(Cell::from("").style(Style::default().add_modifier(Modifier::DIM)));
+                cells.push(Cell::from(elapsed_line(
+                    now.saturating_sub(pending.created_at),
+                )));
+            }
+            let row = Row::new(cells);
+            let row = if search_active {
+                row.style(Style::default().add_modifier(Modifier::DIM))
+            } else {
+                row
+            };
+            let order = super::session_sort_key(
+                &SessionStatus::Starting,
+                super::SessionFlags::default(),
+                false,
+                pending.created_at,
+                None,
+            );
+            ranked_rows.push((order, None, row));
+        }
+        // Use the same sort key for both kinds of row. A pending launch has
+        // the ordinary Starting/Idle rank, below pins and attention sessions.
+        if pending_count > 0 {
+            ranked_rows.sort_by_key(|(order, _, _)| *order);
+        }
+        let (table_rows, mut rows): (Vec<_>, Vec<_>) = ranked_rows
+            .into_iter()
+            .map(|(_, index, row)| (index, row))
+            .unzip();
+        // Commands and keyboard movement index only real sessions. Translate
+        // that selection for ratatui, whose rows also include pending launches.
+        // Its scroll offset is already in this combined display order.
+        let mut render_state = self.table_state;
+        render_state.select(
+            self.table_state
+                .selected()
+                .and_then(|selected| table_rows.iter().position(|index| *index == Some(selected))),
+        );
 
         // A host still dialing mirrors no sessions yet, so the table would
         // otherwise read as complete while rows are still on their way — worst
         // at startup, where an empty list looks like an answer. The line goes
         // *in the table*, where the missing rows will appear, rather than in the
         // panel title. It is chrome, not a session: dim, unselectable
-        // (`visible_index_at` bounds clicks by `visible_len`), and uncounted by
+        // (absent from the real-row hit map), and uncounted by
         // the title's total, so a full list simply clips it like any other
         // trailing row.
         if let Some(label) = connecting_row_label(&self.connecting_hosts()) {
@@ -1304,7 +1317,9 @@ impl App {
             ))
             .highlight_spacing(HighlightSpacing::Always);
 
-        frame.render_stateful_widget(table, area, &mut self.table_state);
+        frame.render_stateful_widget(table, area, &mut render_state);
+        *self.table_state.offset_mut() = render_state.offset();
+        self.table_rows = table_rows;
     }
 
     // =============================================================================
