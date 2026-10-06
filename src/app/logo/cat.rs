@@ -1,31 +1,49 @@
 //! Full-color walk sheets and their lane geometry. Artwork is prepared offline;
-//! the dashboard embeds straight-alpha RGBA without an image-decoder dependency.
+//! the dashboard expands lossless XZ sheets once per coat using its existing decoder.
+
+use std::sync::OnceLock;
 
 use ratatui::layout::Rect;
 
 use crate::terminal::graphics::{CellSize, Placement};
 
-const FRAME_W: u32 = 96;
-const FRAME_H: u32 = 64;
+const FRAME_W: u32 = 48;
+const FRAME_H: u32 = 32;
+const MAX_DISPLAY_H: u32 = 64;
 const FRAMES: u32 = 8;
 const FRAME_MS: u128 = 125;
-// Planted paws move back about five source pixels per frame. Match that stride
+// Planted paws move back about 2.5 stored pixels per frame. Match that stride
 // at the displayed scale so the kitten walks instead of skating across cells.
-const STRIDE_PX: u32 = 40;
-pub(super) const RARE_ONE_IN: u64 = 20;
+const STRIDE_PX: u32 = 20;
 
-const SHEETS: [&[u8]; 3] = [
-    include_bytes!("../../../assets/logo/cats/tabby.rgba"),
-    include_bytes!("../../../assets/logo/cats/tuxedo.rgba"),
-    include_bytes!("../../../assets/logo/cats/pink.rgba"),
+const PACKED: [&[u8]; 4] = [
+    include_bytes!("../../../assets/logo/cats/tabby.rgba.xz"),
+    include_bytes!("../../../assets/logo/cats/tuxedo.rgba.xz"),
+    include_bytes!("../../../assets/logo/cats/calico.rgba.xz"),
+    include_bytes!("../../../assets/logo/cats/pink.rgba.xz"),
 ];
+static SHEETS: [OnceLock<Vec<u8>>; 4] = [const { OnceLock::new() }; 4];
+
+fn source_sheet(coat: usize) -> &'static [u8] {
+    SHEETS[coat].get_or_init(|| {
+        // Use the same reader/writer types as server-payload inflation so the
+        // release binary can share the decoder's monomorphized implementation.
+        let mut rgba = Vec::with_capacity((FRAME_W * FRAME_H * FRAMES * 4) as usize);
+        let mut packed = PACKED[coat];
+        lzma_rs::xz_decompress(&mut packed, &mut rgba)
+            .expect("embedded kitten sheet must be valid XZ");
+        assert_eq!(rgba.len(), (FRAME_W * FRAME_H * FRAMES * 4) as usize);
+        rgba
+    })
+}
 
 /// Select a coat once per summon; the pink kitten remains a rare surprise.
 pub(super) fn select_coat(random: u64) -> usize {
-    if random.is_multiple_of(RARE_ONE_IN) {
-        2
-    } else {
-        ((random >> 8) % 2) as usize
+    match random % 100 {
+        0..=31 => 0,
+        32..=63 => 1,
+        64..=95 => 2,
+        _ => 3,
     }
 }
 
@@ -37,18 +55,19 @@ pub(super) struct FrameSize {
 
 impl FrameSize {
     pub fn for_cell(cell: CellSize) -> Self {
-        let height = u32::from(cell.h).clamp(1, FRAME_H);
+        let height = u32::from(cell.h).clamp(1, MAX_DISPLAY_H);
         Self {
             width: (FRAME_W * height / FRAME_H).max(1),
             height,
         }
     }
 
-    /// Downsample each frame independently so filtering never bleeds between
+    /// Resample each frame independently so filtering never bleeds between
     /// poses. Average premultiplied channels, then unpremultiply for kitty's
     /// straight-alpha protocol; transparent edges cannot produce dark halos.
+    /// For larger terminal rows, repeat source pixels to retain the display size.
     pub fn sheet(self, coat: usize) -> Vec<u8> {
-        let source = SHEETS[coat];
+        let source = source_sheet(coat);
         let sheet_width = self.width * FRAMES;
         let mut rgba = vec![0; (sheet_width * self.height * 4) as usize];
         for frame in 0..FRAMES {
@@ -57,8 +76,12 @@ impl FrameSize {
                     let mut channels = [0u32; 3];
                     let mut alpha = 0;
                     let mut samples = 0;
-                    for sy in y * FRAME_H / self.height..(y + 1) * FRAME_H / self.height {
-                        for sx in x * FRAME_W / self.width..(x + 1) * FRAME_W / self.width {
+                    let top = y * FRAME_H / self.height;
+                    let bottom = ((y + 1) * FRAME_H / self.height).max(top + 1);
+                    let left = x * FRAME_W / self.width;
+                    let right = ((x + 1) * FRAME_W / self.width).max(left + 1);
+                    for sy in top..bottom {
+                        for sx in left..right {
                             let at = ((sy * FRAME_W * FRAMES + frame * FRAME_W + sx) * 4) as usize;
                             let a = u32::from(source[at + 3]);
                             for c in 0..3 {
@@ -132,7 +155,8 @@ mod tests {
 
     #[test]
     fn sheets_have_distinct_poses_color_and_transparency() {
-        for sheet in SHEETS {
+        for coat in 0..PACKED.len() {
+            let sheet = source_sheet(coat);
             assert_eq!(sheet.len(), (FRAME_W * FRAME_H * FRAMES * 4) as usize);
             let frame_bytes = |frame: u32| -> Vec<u8> {
                 (0..FRAME_H)
@@ -168,8 +192,22 @@ mod tests {
                 assert!(sheet.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
             }
         }
-        let native = FrameSize::for_cell(CellSize { w: 32, h: 64 });
-        assert_eq!(native.sheet(0), SHEETS[0]);
+        let native = FrameSize::for_cell(CellSize { w: 16, h: 32 });
+        assert_eq!(native.sheet(0), source_sheet(0));
+    }
+
+    #[test]
+    fn enlarged_rows_repeat_pixels_without_changing_frame_boundaries() {
+        let size = FrameSize::for_cell(CellSize { w: 32, h: 64 });
+        let enlarged = size.sheet(2);
+        let source = source_sheet(2);
+        for y in 0..64 {
+            for x in 0..96 * FRAMES {
+                let from = (((y / 2) * FRAME_W * FRAMES + x / 2) * 4) as usize;
+                let to = ((y * 96 * FRAMES + x) * 4) as usize;
+                assert_eq!(&enlarged[to..to + 4], &source[from..from + 4]);
+            }
+        }
     }
 
     #[test]

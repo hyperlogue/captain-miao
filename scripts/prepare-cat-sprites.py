@@ -2,13 +2,33 @@
 """Pack eight sampled Grok animation frames into an RGBA walk strip (Pillow 12.1+)."""
 
 import argparse
+import lzma
 from pathlib import Path
 
 from PIL import Image
 
 
 FRAME_SIZE = (96, 64)
+STORED_SIZE = (48, 32)
 FRAMES = 8
+
+
+def half_size(sheet):
+    """Match the dashboard's premultiplied box filter at a 32px row height."""
+    pixels = sheet.load()
+    result = Image.new("RGBA", (STORED_SIZE[0] * FRAMES, STORED_SIZE[1]))
+    reduced = []
+    for y in range(result.height):
+        for x in range(result.width):
+            samples = [pixels[x * 2 + dx, y * 2 + dy] for dy in range(2) for dx in range(2)]
+            alpha = sum(p[3] for p in samples)
+            color = [
+                (sum(p[c] * p[3] for p in samples) + alpha // 2) // alpha if alpha else 0
+                for c in range(3)
+            ]
+            reduced.append((*color, (alpha + 2) // 4))
+    result.putdata(reduced)
+    return result
 
 
 def remove_green(image):
@@ -53,16 +73,21 @@ def prepare(source, output):
         x = index * FRAME_SIZE[0] + (FRAME_SIZE[0] - frame.width) // 2
         sheet.alpha_composite(frame, (x, FRAME_SIZE[1] - 2 - frame.height))
 
+    sheet = half_size(sheet)
     sheet.putdata([p if p[3] else (0, 0, 0, 0) for p in sheet.get_flattened_data()])
     output.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output.with_suffix(".png"))
-    output.with_suffix(".rgba").write_bytes(sheet.tobytes())
-    print(f"Prepared {output.name}: {FRAMES} frames, {FRAME_SIZE[0]}x{FRAME_SIZE[1]} each")
+    packed = lzma.compress(
+        sheet.tobytes(), format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32,
+        filters=[{"id": lzma.FILTER_LZMA2, "preset": 9, "dict_size": 256 * 1024}],
+    )
+    output.with_suffix(".rgba.xz").write_bytes(packed)
+    print(f"Prepared {output.name}: {FRAMES} frames, {STORED_SIZE[0]}x{STORED_SIZE[1]}, {len(packed)} packed bytes")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
-    parser.add_argument("output", type=Path, help="Output stem; writes .png and .rgba")
+    parser.add_argument("output", type=Path, help="Output stem; writes .png and .rgba.xz")
     args = parser.parse_args()
     prepare(args.source, args.output)

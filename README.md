@@ -61,7 +61,7 @@ One supported terminal to drive, and at least one agent CLI on your `PATH`.
 | **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44   | The stack layout is simulated by full screen floating windows.                                                                            |
 | **[tmux](https://github.com/tmux/tmux)** ≥ 3.2              | One window per session.                                                                                                                   |
 
-Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Click it to summon an anime kitten walking along the empty lane below the title bar: a ginger tabby, a tuxedo, or a rare pink kitten. Repeated clicks summon more kittens, up to twelve at once. Everywhere else it's a `🐾` glyph and clicking it does nothing.
+Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Click it to summon an anime kitten walking along the empty lane below the title bar: a ginger tabby, tuxedo, or calico (32% each), or a rare pink kitten (4%). Repeated clicks summon more kittens, up to twelve at once. Everywhere else it's a `🐾` glyph and clicking it does nothing.
 
 ### Agents
 

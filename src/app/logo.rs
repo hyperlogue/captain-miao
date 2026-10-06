@@ -622,13 +622,23 @@ mod tests {
     }
 
     #[test]
-    fn coat_selection_keeps_the_pink_kitten_rare() {
-        let mut counts = [0; 3];
-        for seed in 0..4000 {
-            counts[cat::select_coat(splitmix64(seed))] += 1;
+    fn coat_selection_gives_three_regular_cats_32_percent_and_pink_4_percent() {
+        let mut counts = [0; 4];
+        for roll in 0..10_000 {
+            counts[cat::select_coat(roll)] += 1;
         }
-        assert!(counts[0] > 1500 && counts[1] > 1500, "{counts:?}");
-        assert!((140..=280).contains(&counts[2]), "{counts:?}");
-        assert_eq!(cat::select_coat(cat::RARE_ONE_IN), 2);
+        assert_eq!(counts, [3200, 3200, 3200, 400]);
+        for (roll, coat) in [
+            (0, 0),
+            (31, 0),
+            (32, 1),
+            (63, 1),
+            (64, 2),
+            (95, 2),
+            (96, 3),
+            (99, 3),
+        ] {
+            assert_eq!(cat::select_coat(roll), coat);
+        }
     }
 }
