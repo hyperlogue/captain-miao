@@ -22,6 +22,16 @@ captain-miao uses this for Codex image paste; clipboard policy and encoding stay
 outside libshpool. Detach cancels a pending image fetch, and the launcher owns
 the attachment files' lifetime across reattachments.
 
+PTY input writes also observe attachment cancellation under backpressure.
+The master becomes nonblocking before its relay threads start and stays so
+across attachments; its shared output reader handles `EAGAIN` and `EINTR`.
+Both direct input and `SessionInput` adapters use a writer that waits for
+writability in bounded intervals and checks the stop flag between waits.
+Detach can therefore join the old input thread and release the session lock
+even while the application is not reading. Pending input from that client is
+discarded on cancellation; bytes already accepted by the PTY stay queued.
+The existing force-attach retries and wire protocol are unchanged.
+
 Patch points: `src/lib.rs`, `src/hooks.rs`, `src/daemon/server.rs`, and
 `src/daemon/shell.rs`. Keep the extension confined to those points when
 updating the pinned source. The caller and regression tests live in

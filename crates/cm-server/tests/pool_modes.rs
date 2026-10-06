@@ -5,7 +5,7 @@
 //! newly attached terminal receives before the application's next response.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -25,6 +25,13 @@ fn send(stream: &UnixStream, message: &impl Serialize) {
 
 fn receive<T: DeserializeOwned>(stream: &UnixStream) -> T {
     rmp_serde::from_read(stream).unwrap()
+}
+
+fn tool(name: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.join(name).is_file())
+        .find_map(|dir| dir.canonicalize().ok().map(|dir| dir.join(name)))
+        .expect("tool on test PATH")
 }
 
 struct Pool {
@@ -155,12 +162,6 @@ done
     }
 
     fn input_fixture(&self, agent: &str) {
-        let tool = |name: &str| {
-            std::env::split_paths(&std::env::var_os("PATH").unwrap())
-                .filter(|dir| dir.join(name).is_file())
-                .find_map(|dir| dir.canonicalize().ok().map(|dir| dir.join(name)))
-                .expect("tool on test PATH")
-        };
         // GNU stty's raw mode leaves IEXTEN set; macOS still interprets Ctrl+V
         // as literal-next with that flag, even when canonical mode is off.
         std::fs::write(
@@ -202,6 +203,43 @@ done
         assert!(cm_core::state::read_json::<cm_core::state::LauncherState>(&path).is_some());
     }
 
+    fn paused_input_fixture(&self) {
+        std::fs::write(
+            self.root.path().join("app.sh"),
+            format!(
+                "{} raw -echo -iexten\nprintf '%s' \"$$\" > app.pid\nprintf '\\033[?2004hREADY'\n\
+                 IFS= read -r command < control\nprintf 'RESUMED:%s!' \"$$\"\nexec {}\n",
+                shell_words::quote(&tool("stty").to_string_lossy()),
+                shell_words::quote(&tool("cat").to_string_lossy()),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn resume_input(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(self.root.path().join("control"))
+            {
+                Ok(mut control) => {
+                    control.write_all(b"resume\n").unwrap();
+                    return;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "application never opened its FIFO"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("opening application control FIFO: {e}"),
+            }
+        }
+    }
+
     fn clipboard(&self) -> UnixListener {
         let path = self.root.path().join("run/captain-miao/clipboard.sock");
         cm_core::state::create_dir_all_private(path.parent().unwrap()).unwrap();
@@ -233,33 +271,198 @@ impl Drop for Pool {
     }
 }
 
+fn read_chunk(stream: &mut UnixStream) -> (u8, Vec<u8>) {
+    let mut kind = [0];
+    stream.read_exact(&mut kind).unwrap();
+    let mut header = [0; 4];
+    stream.read_exact(&mut header).unwrap();
+    if kind[0] == 2 {
+        return (2, header.to_vec());
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    assert!(length < 65536);
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).unwrap();
+    (kind[0], bytes)
+}
+
 fn read_until(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        assert!(Instant::now() < deadline, "no application response");
-        let mut kind = [0];
-        stream.read_exact(&mut kind).unwrap();
-        if kind[0] == 1 {
+        assert!(
+            Instant::now() < deadline,
+            "no application response for {marker:?}"
+        );
+        let (kind, bytes) = read_chunk(stream);
+        if kind == 1 {
             continue;
         }
         assert_eq!(
-            kind[0],
+            kind,
             0,
             "session exited unexpectedly: {}",
             String::from_utf8_lossy(&output)
         );
-        let mut length = [0; 4];
-        stream.read_exact(&mut length).unwrap();
-        let length = u32::from_le_bytes(length) as usize;
-        assert!(length < 65536);
-        let start = output.len();
-        output.resize(start + length, 0);
-        stream.read_exact(&mut output[start..]).unwrap();
-        if output.windows(marker.len()).any(|part| part == marker) {
+        let start = output.len().saturating_sub(marker.len() - 1);
+        output.extend(bytes);
+        if output[start..]
+            .windows(marker.len())
+            .any(|part| part == marker)
+        {
             return output;
         }
     }
+}
+
+#[test]
+fn force_attach_releases_a_client_blocked_on_pty_input() {
+    let pool = Pool::new();
+    pool.paused_input_fixture();
+    let mut first = pool.attach(true);
+    read_until(&mut first, b"READY");
+    let pid = std::fs::read_to_string(pool.root.path().join("app.pid")).unwrap();
+
+    // The application stays on its control FIFO throughout takeover. Fill
+    // both the PTY and client socket so the old relay must have pending input.
+    first
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut queued = 0;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "input never encountered backpressure"
+        );
+        match first.write(&[b'x'; 16384]) {
+            Ok(0) => panic!("client disconnected before takeover"),
+            Ok(n) => queued += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(e) => panic!("filling the old client's input: {e}"),
+        }
+    }
+    assert!(queued > 0);
+
+    // Background mode runs the real force-attach retry loop, then detaches
+    // after it acquires the session. No terminal emulator or second CLI attempt.
+    let mut force = Command::new(env!("CARGO_BIN_EXE_miao-server"))
+        .args(["attach", "--force", "--background", "mode-test"])
+        .env("HOME", pool.root.path())
+        .env("XDG_RUNTIME_DIR", pool.root.path().join("run"))
+        .env("XDG_STATE_HOME", pool.root.path().join("state"))
+        .env("XDG_CONFIG_HOME", pool.root.path().join("config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while force.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = force.kill();
+            let _ = force.wait();
+            panic!("force attach did not finish while the application was blocked");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = force.wait_with_output().unwrap();
+
+    // Even the broken implementation kicks out the original client cleanly.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "original client was not kicked");
+        let (kind, bytes) = read_chunk(&mut first);
+        if kind == 2 {
+            assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), 0);
+            break;
+        }
+        assert_eq!(kind, 1, "only heartbeats precede the kick");
+    }
+    assert!(
+        output.status.success(),
+        "first force attach failed after kicking the old client: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut next = pool.attach(false);
+    // Attach's header precedes the output relay's handoff. Wait for restored
+    // modes before letting the application emit its one-shot resumed marker.
+    read_until(&mut next, b"\x1b[?2004h");
+    pool.resume_input();
+    read_until(&mut next, format!("RESUMED:{pid}!").as_bytes());
+    next.write_all(b"NEW_CLIENT_INPUT!").unwrap();
+    read_until(&mut next, b"NEW_CLIENT_INPUT!");
+    pool.detach();
+    let mut last = pool.attach(false);
+    last.write_all(b"REATTACHED!").unwrap();
+    read_until(&mut last, b"REATTACHED!");
+}
+
+#[test]
+fn a_large_paste_survives_pty_backpressure_without_losing_bytes() {
+    let pool = Pool::new();
+    pool.input_fixture("codex");
+    pool.paused_input_fixture();
+    let clipboard = pool.clipboard();
+    clipboard.set_nonblocking(true).unwrap();
+    let mut client = pool.attach(true);
+    read_until(&mut client, b"READY");
+    let pid = std::fs::read_to_string(pool.root.path().join("app.pid")).unwrap();
+
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend(b"pasted text with literal \x16 and \x1b[118;5u\n".repeat(32768));
+    paste.extend(b"\x1b[201~PASTE_END!");
+    client
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut queued = 0;
+    while queued < paste.len() {
+        match client.write(&paste[queued..]) {
+            Ok(0) => panic!("client disconnected during paste"),
+            Ok(n) => queued += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(e) => panic!("queuing paste: {e}"),
+        }
+    }
+    assert!(
+        queued > 0 && queued < paste.len(),
+        "paste must encounter backpressure"
+    );
+
+    client
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = client.try_clone().unwrap();
+    std::thread::scope(|scope| {
+        let writing = scope.spawn(|| writer.write_all(&paste[queued..]).unwrap());
+        pool.resume_input();
+        let output = read_until(&mut client, b"PASTE_END!");
+        let prefix = format!("RESUMED:{pid}!");
+        assert!(
+            output.strip_prefix(prefix.as_bytes()) == Some(paste.as_slice()),
+            "a paste must arrive byte-for-byte after PTY backpressure clears"
+        );
+        writing.join().unwrap();
+    });
+    assert_eq!(
+        clipboard.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

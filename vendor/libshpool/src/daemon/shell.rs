@@ -27,7 +27,14 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use nix::{poll, poll::PollFlags, sys::signal, unistd::Pid};
+use nix::{
+    errno::Errno,
+    fcntl::{fcntl, FcntlArg, OFlag},
+    poll,
+    poll::PollFlags,
+    sys::signal,
+    unistd::{self, Pid},
+};
 use parking_lot::Mutex;
 use shpool_protocol::{Attachment, Chunk, ChunkKind, MaybeSwitch, TtySize};
 use tracing::{debug, error, info, instrument, span, trace, warn, Level};
@@ -58,6 +65,9 @@ const REATTACH_RESIZE_DELAY: time::Duration = time::Duration::from_millis(50);
 // The shell->client thread should poll frequently so detach/reattach control
 // messages are noticed quickly without spinning the CPU.
 const SHELL_TO_CLIENT_POLL_MS: u16 = 50;
+
+// Bound how long backpressure can keep an input writer from noticing detach.
+const PTY_INPUT_POLL_MS: u16 = 50;
 
 // How long to wait before giving up while trying to talk to the
 // shell->client thread.
@@ -263,6 +273,39 @@ pub struct ShellToClientArgs {
     pub child_exit_notifier: Arc<ExitNotifier>,
 }
 
+/// The PTY master stays nonblocking across attachments. Both ordinary input
+/// and SessionInput adapters write through this cancellation-aware view, so a
+/// full PTY cannot hold SessionInner's attachment lock after the client exits.
+struct PtyInputWriter<'a> {
+    master: &'a shpool_pty::fork::Master,
+    stop: &'a AtomicBool,
+}
+
+impl Write for PtyInputWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "attachment detached"));
+            }
+            match unistd::write(self.master.borrow_fd(), buf) {
+                Ok(n) => return Ok(n),
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => {}
+                Err(err) => return Err(err.into()),
+            }
+            let mut fds = [poll::PollFd::new(self.master.borrow_fd(), PollFlags::POLLOUT)];
+            match poll::poll(&mut fds, PTY_INPUT_POLL_MS) {
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl SessionInner {
     /// Spawn the shell-to-client thread which continually reads from the pty
     /// and sends data both to the output spool and to the client,
@@ -283,7 +326,13 @@ impl SessionInner {
         let daily_messenger = Arc::clone(&self.daily_messenger);
         let mut needs_initial_motd_dump = self.needs_initial_motd_dump;
 
-        let mut pty_master = self.pty_master.is_parent()?;
+        let pty_master = self.pty_master.is_parent()?;
+        // Master clones share the same descriptor. Set this once before either
+        // relay starts, and leave it set across attachments. The output reader
+        // below handles EAGAIN too; toggling flags per write would race it.
+        let flags = OFlag::from_bits_truncate(fcntl(pty_master.borrow_fd(), FcntlArg::F_GETFL)?);
+        fcntl(pty_master.borrow_fd(), FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+            .context("making PTY input cancellable")?;
         let watchable_master = pty_master.clone();
         let name = self.name.clone();
         let config = self.config.clone();
@@ -571,8 +620,9 @@ impl SessionInner {
                     }
                     return Ok(());
                 }
-                let len = match pty_master.read(&mut buf) {
+                let len = match unistd::read(pty_master.borrow_fd(), &mut buf) {
                     Ok(l) => l,
+                    Err(Errno::EAGAIN | Errno::EINTR) => continue,
                     Err(e) => {
                         error!("reading chunk from pty master: {:?}", e);
                         return Err(e).context("reading pty master chunk")?;
@@ -779,6 +829,16 @@ impl SessionInner {
 
             debug!("joining client_to_shell_h");
             match client_to_shell_h.join() {
+                Ok(Err(err))
+                    if stop.load(Ordering::Relaxed)
+                        && err.downcast_ref::<io::Error>().is_some_and(|e| {
+                            e.kind() == io::ErrorKind::ConnectionAborted
+                        }) =>
+                {
+                    // Discard pending input from the kicked client. Cancellation
+                    // ends only this attachment; the shell remains alive.
+                    debug!("cancelled pending PTY input");
+                }
                 Ok(v) => v.context("joining client_to_shell_h")?,
                 Err(panic_err) => {
                     debug!("client_to_shell panic_err = {:?}", panic_err);
@@ -841,7 +901,7 @@ impl SessionInner {
                     span!(Level::INFO, "client->shell", s = self.name, cid = conn_id).entered();
                 let mut bindings = bindings.context("compiling keybindings engine")?;
 
-                let mut master_writer = pty_master.clone();
+                let mut master_writer = PtyInputWriter { master: pty_master, stop };
 
                 let mut snip_sections = vec![]; // (<len>, <end offset>)
                 let mut keep_sections = vec![]; // (<start offset>, <end offset>)
