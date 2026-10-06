@@ -42,10 +42,10 @@ bytes. It resamples frames independently, retaining the same displayed size
 and travel speed. Rows above 32px repeat source pixels up to the existing
 64px display cap; the lower stored resolution is visible at those sizes.
 
-Eight poses play at 15.6 fps. Travel is 20 stored pixels per cycle
-(39 pixels per second), scaled with the sprite height: the planted paws
-move backward about 2.5 stored pixels
-per frame. Using cell width to set travel speed would make the feet slide at
+Eight poses play at 20 fps. Travel is 20 stored pixels per cycle
+(50 pixels per second, or 250 pixels over five seconds), scaled with the
+sprite height: the planted paws move backward about 2.5 stored pixels per
+frame. Using cell width to set travel speed would make the feet slide at
 different font aspect ratios. The outgoing frame is cropped at the lane edge.
 
 To rebuild a sheet from its committed source, install Pillow 12.1 or newer

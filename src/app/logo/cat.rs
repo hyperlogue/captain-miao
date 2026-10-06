@@ -11,9 +11,9 @@ const FRAME_W: u32 = 48;
 const FRAME_H: u32 = 32;
 const MAX_DISPLAY_H: u32 = 64;
 const FRAMES: u32 = 8;
-// Eight poses at exactly 15.6 fps; retain the fraction in both pose and travel.
-const FRAME_RATE_NUMERATOR: u128 = 78;
-const FRAME_RATE_DENOMINATOR: u128 = 5;
+// Eight poses at 20 fps: 50 pixels per second at the stored 32px height.
+const FRAME_RATE_NUMERATOR: u128 = 20;
+const FRAME_RATE_DENOMINATOR: u128 = 1;
 // Planted paws move back about 2.5 stored pixels per frame. Match that stride
 // at the displayed scale so the kitten walks instead of skating across cells.
 const STRIDE_PX: u32 = 20;
@@ -224,15 +224,15 @@ mod tests {
         let start = size.placement(42, 0, track, cell).unwrap();
         assert_eq!((start.col, start.row), (3, 1));
         assert_eq!(start.crop, Some((0, 0, 24, 16)));
-        let moving = size.placement(42, 65, track, cell).unwrap();
+        let moving = size.placement(42, 50, track, cell).unwrap();
         assert_eq!(moving.offset, (1, 0));
         assert_eq!(moving.crop, Some((24, 0, 24, 16)));
-        let exiting = size.placement(42, 3850, track, cell).unwrap();
+        let exiting = size.placement(42, 3000, track, cell).unwrap();
         assert_eq!(exiting.col, 12);
         assert_eq!(exiting.crop, Some((96, 0, 5, 16)));
-        let last_pixel = size.placement(42, 4102, track, cell).unwrap();
+        let last_pixel = size.placement(42, 3199, track, cell).unwrap();
         assert_eq!(last_pixel.crop, Some((168, 0, 1, 16)));
-        assert!(size.placement(42, 4103, track, cell).is_none());
+        assert!(size.placement(42, 3200, track, cell).is_none());
         assert!(size.placement(42, 0, Rect::default(), cell).is_none());
     }
 
@@ -245,7 +245,7 @@ mod tests {
                     h: height,
                 };
                 let size = FrameSize::for_cell(cell);
-                for (elapsed, distance, pose) in [(1000, 39, 7), (2000, 78, 7), (5000, 195, 6)] {
+                for (elapsed, distance, pose) in [(1000, 50, 4), (2000, 100, 0), (5000, 250, 4)] {
                     let p = size
                         .placement(42, elapsed, Rect::new(0, 1, 100, 1), cell)
                         .unwrap();
