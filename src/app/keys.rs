@@ -65,6 +65,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        // A background completion may select its new row only while the user
+        // has not moved on. Another launch arms its own focus after dispatch.
+        self.launches.cancel_focus();
         // Ctrl+c always quits, regardless of current mode. Extra modifiers
         // describe a different chord and must not silently turn it into quit.
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -92,6 +95,9 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        if !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+            self.launches.cancel_focus();
+        }
         if self.upgrade_notices.is_some() {
             return self.handle_upgrade_notices_mouse(mouse);
         }

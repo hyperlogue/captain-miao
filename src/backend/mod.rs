@@ -1238,6 +1238,36 @@ impl Backend {
         }
     }
 
+    /// Owned launch operation for the dashboard's background worker. Never
+    /// retry automatically: an unacknowledged reservation may have succeeded.
+    pub(crate) fn open_session_task(
+        &self,
+        spec: OpenSpec,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<LaunchPlan>> + Send>>
+    {
+        match self {
+            Backend::Local(host) => {
+                let plan = host.inner.open_session(&spec);
+                Box::pin(async move { plan })
+            }
+            Backend::Remote(remote) => {
+                let remote = Arc::clone(remote);
+                Box::pin(async move {
+                    let inherit_env = crate::config::get().remote.inherit_env.clone();
+                    let reply = remote
+                        .request_within(Duration::from_secs(30), |req_id| {
+                            ClientFrame::OpenSession { req_id, spec }
+                        })
+                        .await
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("remote host did not confirm the session reservation")
+                        })?;
+                    remote.opened_plan(Some(reply), &inherit_env)
+                })
+            }
+        }
+    }
+
     /// How to open a window onto an *already-running* pooled session on this
     /// host. `force` steals it from whatever client currently holds it (the
     /// pool is one client at a time — §10.2).
@@ -1997,7 +2027,18 @@ impl RemoteBackend {
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         let spec = spec.clone();
         let inherit_env = crate::config::get().remote.inherit_env.clone();
-        match self.request(|req_id| ClientFrame::OpenSession { req_id, spec }) {
+        self.opened_plan(
+            self.request(|req_id| ClientFrame::OpenSession { req_id, spec }),
+            &inherit_env,
+        )
+    }
+
+    fn opened_plan(
+        &self,
+        reply: Option<ServerFrame>,
+        inherit_env: &[String],
+    ) -> anyhow::Result<LaunchPlan> {
+        match reply {
             Some(ServerFrame::Opened {
                 session_name: Some(name),
                 ..
@@ -2010,7 +2051,7 @@ impl RemoteBackend {
                     // A session we just created can't already have a client, so
                     // the create path never steals.
                     false,
-                    &inherit_env,
+                    inherit_env,
                 ),
                 session_name: name,
             }),
@@ -5020,6 +5061,84 @@ fi
             LaunchPlan::SpawnLocal { .. } => panic!("expected AttachRemote from a remote backend"),
         }
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_open_yields_and_times_out_without_retrying_or_losing_the_spec() {
+        // Drive the production request/reply channel without a socket so the
+        // timeout is deterministic and no remote machine is needed.
+        let (remote, _shared, mut requests) = RemoteBackend::build(
+            &Transport::LocalSocket(PathBuf::new()),
+            HostId("mock".into()),
+        );
+        let backend = Backend::Remote(remote);
+        let spec = OpenSpec {
+            agent: AgentControl::Codex,
+            cwd: "/work/project".into(),
+            resume: None,
+            worktree: Some("topic".into()),
+        };
+        let task = tokio::spawn(backend.open_session_task(spec.clone()));
+        let pending = requests.recv().await.unwrap();
+        match pending.frame {
+            ClientFrame::OpenSession { spec: sent, .. } => {
+                assert_eq!(sent.agent, spec.agent);
+                assert_eq!(sent.cwd, spec.cwd);
+                assert_eq!(sent.resume, spec.resume);
+                assert_eq!(sent.worktree, spec.worktree);
+            }
+            _ => panic!("expected an open request"),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "reservation must yield until acknowledged"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(task.await.unwrap().is_err());
+        assert!(
+            requests.try_recv().is_err(),
+            "a timeout must never retry open"
+        );
+        assert!(pending.reply.is_closed());
+
+        let task = tokio::spawn(backend.open_session_task(spec.clone()));
+        let pending = requests.recv().await.unwrap();
+        assert!(
+            pending
+                .reply
+                .send(ServerFrame::Opened {
+                    req_id: pending.req_id,
+                    session_name: Some("pool-codex".into()),
+                    error: None,
+                })
+                .is_ok()
+        );
+        match task.await.unwrap().unwrap() {
+            LaunchPlan::AttachRemote { session_name, argv } => {
+                assert_eq!(session_name, "pool-codex");
+                assert_eq!(argv.last().map(String::as_str), Some("pool-codex"));
+                assert!(!argv.iter().any(|arg| arg == "--force"));
+            }
+            _ => panic!("expected an attach plan"),
+        }
+
+        let task = tokio::spawn(backend.open_session_task(spec));
+        let pending = requests.recv().await.unwrap();
+        assert!(
+            pending
+                .reply
+                .send(ServerFrame::Opened {
+                    req_id: pending.req_id,
+                    session_name: None,
+                    error: Some("reservation refused".into()),
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            task.await.unwrap().err().unwrap().to_string(),
+            "reservation refused"
+        );
     }
 
     /// The attached bit a direct-local dashboard cannot read off a file: it is

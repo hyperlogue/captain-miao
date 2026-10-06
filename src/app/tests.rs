@@ -239,6 +239,176 @@ fn host_row(label: &str, target: &str) -> super::HostRow {
 // Rendering the table, and moving in it
 // =============================================================================
 
+fn pending_launch(app: &mut App, token: &str) {
+    app.launches.start(
+        super::launch::Request {
+            agent: crate::agent::AgentControl::Codex,
+            window: super::launch::WindowLaunch {
+                local_token: token.into(),
+                host: crate::state::HostId::local(),
+                cwd: "/work/new-project".into(),
+                home: "/work".into(),
+                target: crate::terminal::SpawnTarget::SharedStackTab,
+                title: "Codex: new-project".into(),
+            },
+            owner: None,
+        },
+        std::future::pending(),
+    );
+}
+
+#[tokio::test]
+async fn pending_launch_is_visible_during_reservation_without_changing_session_actions() {
+    for width in [78, 120] {
+        let mut d = TestDashboard::new(width, 24);
+        d.app.preview_visible = false;
+        d.set_sessions(
+            (1..=30)
+                .map(|pid| session(pid, &format!("/work/project-{pid}"), SessionStatus::Idle))
+                .collect(),
+        );
+        d.app.table_state.select(Some(20));
+        let selected = d.app.selected_session().unwrap().launcher_pid;
+        for i in 0..4 {
+            pending_launch(&mut d.app, &format!("pending-{i}"));
+        }
+
+        // The reservation never resolves: rendering and navigation must still
+        // work, including when the real session list is scrolled.
+        let rendered = d.render();
+        assert!(rendered.contains("4 starting"), "{rendered}");
+        assert!(rendered.contains("Codex: new-project"), "{rendered}");
+        assert!(rendered.contains("2 more sessions…"), "{rendered}");
+        assert_eq!(d.app.sessions.len(), 30);
+        assert_eq!(d.app.visible_sessions().len(), 30);
+        assert_eq!(d.app.selected_session().unwrap().launcher_pid, selected);
+        assert!(d.app.table_state.offset() > 0);
+
+        let rect = d.app.last_table_rect.unwrap();
+        for y in rect.y + 2..rect.y + 2 + d.app.launch_header_rows {
+            assert_eq!(d.app.visible_index_at(y, rect), None);
+            assert!(d.click(rect.x + 2, y).is_none());
+            assert_eq!(d.app.selected_session().unwrap().launcher_pid, selected);
+        }
+        let first_data = rect.y + 2 + d.app.launch_header_rows;
+        let offset = d.app.table_state.offset();
+        d.click(rect.x + 2, first_data);
+        assert_eq!(d.selected(), Some(offset));
+        d.press(KeyCode::Down);
+        assert_eq!(d.selected(), Some(offset + 1));
+
+        // Confirmation/removal returns the space to the real rows and mouse
+        // indexing follows the new header height on the same frame.
+        d.app.launches = Default::default();
+        assert!(!d.render().contains("4 starting"));
+        assert_eq!(d.app.launch_header_rows, 0);
+        assert_eq!(
+            d.app.visible_index_at(rect.y + 2, rect),
+            Some(d.app.table_state.offset())
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_launch_on_empty_and_resized_dashboards_never_becomes_a_session() {
+    for (width, height) in [(78, 24), (120, 24), (78, 8), (120, 12)] {
+        let mut d = TestDashboard::new(width, height);
+        d.app.preview_visible = false;
+        pending_launch(&mut d.app, "pending");
+        let rendered = d.render();
+        assert!(rendered.contains("1 starting"), "{rendered}");
+        assert!(d.app.sessions.is_empty());
+        assert!(d.app.selected_session().is_none());
+        assert!(d.press(KeyCode::Enter).is_none());
+        if d.app.launch_header_rows > 0 {
+            assert!(rendered.contains("Starting"), "{rendered}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_early_session_row_waits_for_its_window_before_becoming_selectable() {
+    use crate::backend::LaunchPlan;
+    use crate::state::HostId;
+    use crate::terminal::SpawnResult;
+    use std::time::{Duration, Instant};
+
+    let mut d = TestDashboard::new(120, 24);
+    let request = super::launch::Request {
+        agent: crate::agent::AgentControl::Codex,
+        window: super::launch::WindowLaunch {
+            local_token: "new-launch".into(),
+            host: HostId::local(),
+            cwd: "/work/new-project".into(),
+            home: "/work".into(),
+            target: crate::terminal::SpawnTarget::NewTab,
+            title: "Codex: new-project".into(),
+        },
+        owner: None,
+    };
+    d.app.launches.start(request, async {
+        Ok(LaunchPlan::SpawnLocal {
+            argv: vec!["miao".into()],
+        })
+    });
+    tokio::task::yield_now().await;
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let progress = d.app.launches.poll(
+        |_| true,
+        |_| {
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok(SpawnResult {
+                    window: Some(WindowId::from(42)),
+                    tab: None,
+                })
+            }
+        },
+        Instant::now(),
+    );
+    assert!(progress.changed);
+    let mut early = session(42, "/work/new-project", SessionStatus::Starting);
+    early.launch_id = Some("new-launch".into());
+    early.window_id = None;
+    d.set_sessions(vec![early]);
+    assert!(d.render().contains("1 starting"));
+    assert!(d.app.visible_sessions().is_empty());
+    assert!(
+        d.press(KeyCode::Enter).is_none(),
+        "must not attach a second window"
+    );
+
+    gate.notify_one();
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let progress = d.app.launches.poll(
+                |_| true,
+                |_| async { panic!("window was already requested") },
+                Instant::now(),
+            );
+            if let Some(finished) = progress.finished.into_iter().next() {
+                break finished;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    d.app.record_window_binding(
+        finished.host,
+        finished.token.unwrap(),
+        finished.result.unwrap().window.unwrap(),
+    );
+    assert!(d.app.reconcile_launches(Instant::now()));
+    assert_eq!(d.app.visible_sessions().len(), 1);
+    assert!(!d.render().contains("1 starting"));
+    d.app.table_state.select(Some(0));
+    assert!(
+        matches!(d.press(KeyCode::Enter), Some(Action::FocusWindow(w)) if w == WindowId::from(42))
+    );
+}
+
 #[test]
 fn auto_title_from_first_prompt_is_truncated() {
     use super::format::session_display_name;

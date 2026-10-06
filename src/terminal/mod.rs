@@ -484,6 +484,23 @@ fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
 
 static BACKEND: OnceLock<Box<dyn Terminal>> = OnceLock::new();
 
+// Creating a shared sessions tab is a lookup followed by a create. Background
+// launches and foreground work/attach/restart commands must not race that pair.
+static SPAWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn spawn(spec: SpawnSpec) -> anyhow::Result<SpawnResult> {
+    let _guard = SPAWN_LOCK.lock().await;
+    get().spawn(spec).await
+}
+
+pub(crate) async fn spawn_work_tab(
+    spec: SpawnSpec,
+    work_tabs: &[TabId],
+) -> anyhow::Result<SpawnResult> {
+    let _guard = SPAWN_LOCK.lock().await;
+    get().spawn_work_tab(spec, work_tabs).await
+}
+
 /// Which backends the environment says are actually **live** — each one's own
 /// `from_env` having already vouched for it — as one snapshot.
 ///

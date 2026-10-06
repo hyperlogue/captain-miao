@@ -39,6 +39,7 @@ mod hosts;
 mod keybind_log;
 mod keymap;
 mod keys;
+mod launch;
 mod logo;
 mod messages;
 mod notifications;
@@ -869,6 +870,9 @@ pub(super) struct WorkdirCompletion {
 /// rediscover across several. The module doc has the rest.
 pub(super) struct App {
     pub(super) sessions: Vec<LauncherState>,
+    pub(in crate::app) launches: launch::Launches,
+    /// Fixed, non-selectable launch rows beneath the table's column headings.
+    pub(super) launch_header_rows: u16,
     pub(super) table_state: TableState,
     pub(super) should_quit: bool,
     pub(super) home_dir: String,
@@ -1638,6 +1642,8 @@ impl App {
 
         let mut app = Self {
             sessions: Vec::new(),
+            launches: Default::default(),
+            launch_header_rows: 0,
             table_state: TableState::default(),
             should_quit: false,
             home_dir,
@@ -3223,15 +3229,18 @@ impl App {
         {
             self.table_state.select(Some(idx));
             self.pending_focus_window = None;
+            self.reconcile_launches(Instant::now());
             return;
         }
         if let Some(key) = &prior_selected_key
             && let Some(idx) = visible.iter().position(|s| matches_key(s, key))
         {
             self.table_state.select(Some(idx));
+            self.reconcile_launches(Instant::now());
             return;
         }
         self.clamp_selection();
+        self.reconcile_launches(Instant::now());
     }
 
     // =============================================================================
@@ -3288,7 +3297,7 @@ impl App {
     pub(super) fn visible_index_at(&self, screen_row: u16, table_rect: Rect) -> Option<usize> {
         // Top border (1) + header (1) rows above the first data row.
         const CHROME_ROWS: u16 = 2;
-        let first_row_y = table_rect.y + CHROME_ROWS;
+        let first_row_y = table_rect.y + CHROME_ROWS + self.launch_header_rows;
         if screen_row < first_row_y {
             return None;
         }
@@ -3302,6 +3311,7 @@ impl App {
             .sessions
             .iter()
             .enumerate()
+            .filter(|(_, s)| !self.launches.awaiting_window(s))
             .filter(|(_, s)| match query {
                 None => true,
                 Some(q) => {
@@ -3649,6 +3659,11 @@ impl App {
     ) -> bool {
         let mut changed = false;
         for report in reports {
+            match self.launches.defer_report(&report) {
+                launch::Report::Deferred => continue,
+                launch::Report::Closed => changed = true,
+                launch::Report::Other => {}
+            }
             let host = HostId(report.host.clone());
             let Some(retired) = self.window_bindings.prune_token(&host, &report.token) else {
                 continue;

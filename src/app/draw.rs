@@ -979,7 +979,11 @@ impl App {
         self.last_table_rect = Some(area);
         // Chrome above the data rows is the top rule + the table header (2
         // rows); there's no bottom border to subtract now.
-        let visible_rows = area.height.saturating_sub(2) as usize;
+        let pending_count = self.launches.visible(&self.sessions).len();
+        // Keep at least one real row available. Extra launches are summarized
+        // in the last fixed row instead of consuming the whole session table.
+        self.launch_header_rows = (pending_count.min(3) as u16).min(area.height.saturating_sub(3));
+        let visible_rows = area.height.saturating_sub(2 + self.launch_header_rows) as usize;
         let total_visible = self.visible_len();
         let has_overflow = total_visible > visible_rows;
 
@@ -1008,6 +1012,12 @@ impl App {
 
         let title = {
             let mut spans = vec![Span::styled(" Sessions", Style::default().bold())];
+            if pending_count > 0 {
+                spans.push(Span::styled(
+                    format!(" · {pending_count} starting"),
+                    Style::default().fg(ui.header_fg),
+                ));
+            }
             // Surface the name filter on the panel label (moved here from the
             // header) so it sits next to the list it filters. It appears the
             // moment Search mode opens — showing the live buffer, even while
@@ -1053,27 +1063,78 @@ impl App {
         // Indented past the override indicator the rows carry in this same cell,
         // so the header sits over the status labels rather than over the glyphs.
         let status_header = format!("{}Status", " ".repeat(OVERRIDE_COL_WIDTH as usize));
-        let header_cells = if narrow {
-            vec![
-                Cell::from(status_header),
-                Cell::from(""),
-                Cell::from("Name"),
-            ]
+        let labels = if narrow {
+            vec![status_header, String::new(), "Name".into()]
         } else {
             vec![
-                Cell::from(status_header),
-                Cell::from(""),
-                Cell::from("Name"),
-                Cell::from(Line::from("Ctx").alignment(Alignment::Right)),
-                Cell::from("Last prompt"),
-                Cell::from(Line::from("Updated").alignment(Alignment::Right)),
+                status_header,
+                String::new(),
+                "Name".into(),
+                "Ctx".into(),
+                "Last prompt".into(),
+                "Updated".into(),
             ]
         };
-        let header = Row::new(header_cells).style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(ui.header_fg),
-        );
+        let heading = Style::default().bold().fg(ui.header_fg);
+        let mut columns: Vec<Vec<Line<'static>>> = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
+                vec![Line::styled(label, heading).alignment(if i == 3 || i == 5 {
+                    Alignment::Right
+                } else {
+                    Alignment::Left
+                })]
+            })
+            .collect();
+        let pending = self.launches.visible(&self.sessions);
+        for (i, pending) in pending
+            .iter()
+            .take(self.launch_header_rows as usize)
+            .enumerate()
+        {
+            let summarized = i + 1 == self.launch_header_rows as usize
+                && pending_count > self.launch_header_rows as usize;
+            let request = &pending.request;
+            let label = if summarized {
+                format!("{} more sessions…", pending_count - i)
+            } else {
+                format!(
+                    "{}: {}",
+                    request.agent.label(),
+                    super::display_basename(&request.window.cwd)
+                )
+            };
+            let style = Style::default().fg(ui.header_fg);
+            columns[0].push(Line::styled(
+                format!("{}Starting", " ".repeat(OVERRIDE_COL_WIDTH as usize)),
+                style,
+            ));
+            columns[1].push(Line::raw(if show_host && !summarized {
+                format!("{} ", self.host_icon(&request.window.host))
+            } else {
+                String::new()
+            }));
+            columns[2].push(Line::styled(label, style));
+            if !narrow {
+                columns[3].push(Line::raw(""));
+                columns[4].push(Line::styled(
+                    if summarized {
+                        String::new()
+                    } else {
+                        request.window.cwd.clone()
+                    },
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                columns[5].push(Line::raw(""));
+            }
+        }
+        let header = Row::new(
+            columns
+                .into_iter()
+                .map(|lines| Cell::from(Text::from(lines))),
+        )
+        .height(1 + self.launch_header_rows);
 
         // Resolve every visible row's icon up front so we can size the icon
         // column from the widest one before building cells. Custom 2- or

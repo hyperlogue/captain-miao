@@ -367,6 +367,10 @@ preparation, the operation stops; invoke it again to retry. These checks do not
 lock out other programs using the checkout.
 
 Dashboard notifications float in the bottom-right corner and stack vertically.
+New sessions show a `Starting` placeholder immediately while the window opens.
+It becomes a normal session row when the launcher reports in. You can keep
+navigating while it starts; doing so keeps the new row from moving your cursor.
+If you quit during a launch, the dashboard finishes recording its window first.
 Session launches only show a notification if an error occurs. Successful session
 termination is silent.
 Git progress updates one popup until the operation finishes. Information and

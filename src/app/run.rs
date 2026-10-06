@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use super::notifications::Level;
 use super::render_backend::DashboardTerminal;
 use crate::agent::AgentControl;
-use crate::backend::{Backend, CleanupPolicy, KillOutcome, LaunchPlan, OpenSpec, ShellPlan};
+use crate::backend::{Backend, CleanupPolicy, KillOutcome, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId, SessionKey};
 use crate::terminal::{
@@ -1225,116 +1225,150 @@ async fn launch_agent(
             return None;
         }
     };
-    let mut argv = plan.argv().to_vec();
-    // The (host, token) the appearing row will carry home, so we can bind the
-    // window we're about to open to it (§6). A pooled open reuses the
-    // server-minted pool session name; a direct local spawn gets a fresh
-    // dashboard-minted `launch_id` threaded onto the launcher as `--launch-id`.
-    let (bind_host, bind_token) = match &plan {
-        LaunchPlan::AttachRemote { session_name, .. } => (host.clone(), session_name.clone()),
-        LaunchPlan::SpawnLocal { .. } => {
-            let launch_id = app.mint_launch_id();
-            argv.push("--launch-id".to_string());
-            argv.push(launch_id.clone());
-            (host.clone(), launch_id)
-        }
-    };
-    // A remote *open* lands in an attach window exactly like `Enter` on a
-    // detached row, so it gets the same wrapper (`attach_pool_session`): without
-    // it this window is the one attach that never reports its own end — its
-    // binding waits on the 60s prune, closing it never reads as the user's, and
-    // a refusal has nothing to hold it open. A direct-local spawn *is* the
-    // launcher, which does its own holding (`hold_failed_launch`), so it is left
-    // alone.
-    if matches!(plan, LaunchPlan::AttachRemote { .. }) {
-        let exe = crate::backend::reporter_exe();
-        argv = crate::backend::report_on_exit_argv(argv, exe.as_deref(), &bind_host.0, &bind_token);
-    }
-
-    let cfg = config::get();
-    let launcher_cfg = &cfg.launcher;
-    // The configured titles are templates ({agent}/{basename}/{cwd}), so the
-    // tab names the session's project instead of a generic "Claude (new)".
-    let template = if copy.is_resume {
-        &launcher_cfg.resume_tab_title
-    } else {
-        &launcher_cfg.new_tab_title
-    };
-    let tab_title = expand_tab_title(template, agent, cwd);
-    let target = resolve_spawn_target(app.capabilities, app.sessions_layout);
-    // The expanded title names a NewTab spawn's tab, a Floating spawn's pane, or
-    // a SharedStackTab window (whose shared tab stays fixed-titled `miao:sessions`).
-    let wants_title = matches!(
-        target,
-        SpawnTarget::NewTab | SpawnTarget::Floating | SpawnTarget::SharedStackTab
-    );
-    // The **window's** cwd, which is a chdir the local terminal performs — not a
-    // shell word and not the session's cwd on its own host. Two distinct cases:
-    //
-    // * a direct-local spawn: the window *is* the launcher, so it starts in the
-    //   session's directory — expanded, since `cwd` arrived in the
-    //   host-canonical `~` form (§3) and no shell is involved to expand it;
-    // * a pooled spawn: the window only runs an `attach`, and the session's
-    //   directory belongs to *another machine*, where chdir'ing to it locally
-    //   would fail (or, worse, land somewhere unrelated). Start it at home,
-    //   matching `attach_pool_session`.
-    let window_cwd = match &plan {
-        LaunchPlan::SpawnLocal { .. } => cm_core::paths::expand_home(cwd, &app.home_dir),
-        LaunchPlan::AttachRemote { .. } => app.home_dir.clone(),
-    };
-    let spec = SpawnSpec {
-        cwd: window_cwd,
-        target,
-        command: SpawnCommand::Exec(argv),
-        title: wants_title.then_some(tab_title),
-        // Whoever occupies the window holds it, never the terminal — kitty's
-        // `--hold` runs the user's *login shell* once the command exits, so a
-        // held window is a live local shell wearing a session's title rather
-        // than the readable corpse this used to assume. Both occupants already
-        // do their own: a remote attach through the wrapper above, and a direct
-        // local launcher through `hold_failed_launch`, which writes the
-        // `FailedToStart` row and then blocks until the window is closed or the
-        // row killed. What is lost is a *crashed* agent's last frame, which only
-        // the terminal's hold was keeping — the launcher exits as soon as the
-        // agent does, whatever its status.
-        hold: false,
-        take_focus: false,
-        // Kitty reads the flag on a NewTab / SharedStackTab spawn (`goto-layout
-        // stack` on the tab it creates). zellij session spawns are Floating and
-        // ignore it.
-        stack: true,
-    };
-    match terminal::get().spawn(spec).await {
+    let launch = launch_window(app, agent, cwd, host, copy);
+    let (token, spec) = launch.prepare(plan);
+    match terminal::spawn(spec).await {
         Ok(result) => {
-            // A kitty/Floating spawn always recovers its window; a `None` here
-            // would mean the backend created the target but lost the id, which
-            // this path can't bind — surface it rather than proceed.
-            let Some(id) = result.window else {
+            let Some(id) = result.window.clone() else {
                 app.set_status(format!("{} failed: no window id", copy.failed), true);
                 return None;
             };
-            // Bind the window to the session's token so the dashboard resolves it
-            // (preview / focus / move-to-tab) and prunes it when the window dies —
-            // local and remote uniformly (§6, §8).
-            app.record_window_binding(bind_host, bind_token.clone(), id.clone());
-            // Seed the display-only window→tab cache from the spawn itself when
-            // the backend reported the tab (zellij does; kitty's `launch` prints
-            // only a window id). Otherwise the next reload sees an unresolved
-            // local window and pays a full `snapshot()` for a fact we just
-            // learned for free — on zellij that's a `list-panes`, ~20ms per pane.
-            // A snapshot still overwrites the whole map when one does run, so a
-            // seeded entry can't outlive the truth.
-            if let Some(tab) = result.tab {
-                app.window_tab_cache.insert(id.clone(), tab);
-            }
+            record_launch_window(app, host.clone(), token.clone(), result);
             app.pending_focus_window = Some((id, Instant::now()));
-            Some(bind_token)
+            Some(token)
         }
         Err(e) => {
             app.set_status(format!("{} failed: {e}", copy.failed), true);
             None
         }
     }
+}
+
+fn launch_window(
+    app: &mut App,
+    agent: AgentControl,
+    cwd: &str,
+    host: &HostId,
+    copy: &LaunchCopy,
+) -> super::launch::WindowLaunch {
+    let cfg = config::get();
+    let template = if copy.is_resume {
+        &cfg.launcher.resume_tab_title
+    } else {
+        &cfg.launcher.new_tab_title
+    };
+    super::launch::WindowLaunch {
+        local_token: app.mint_launch_id(),
+        host: host.clone(),
+        cwd: cwd.to_string(),
+        home: app.home_dir.clone(),
+        target: resolve_spawn_target(app.capabilities, app.sessions_layout),
+        title: expand_tab_title(template, agent, cwd),
+    }
+}
+
+fn record_launch_window(app: &mut App, host: HostId, token: String, result: terminal::SpawnResult) {
+    if let Some(window) = result.window {
+        // Background spawning can receive FailedToStart before Kitty returns
+        // the window id. The reload already saw the status transition but had
+        // no binding to focus; finish that one-time notification now.
+        if host.is_local()
+            && app.sessions.iter().any(|s| {
+                s.host == host
+                    && s.binding_token() == Some(token.as_str())
+                    && s.status == state::SessionStatus::FailedToStart
+            })
+        {
+            app.failed_launch_focus_queue.push(window.clone());
+        }
+        app.record_window_binding(host, token, window.clone());
+        if let Some(tab) = result.tab {
+            app.window_tab_cache.insert(window, tab);
+        }
+    }
+}
+
+fn start_new_session(
+    app: &mut App,
+    agent: AgentControl,
+    cwd: String,
+    host: HostId,
+    worktree: Option<String>,
+) {
+    let spec = OpenSpec {
+        agent,
+        cwd: cwd.clone(),
+        resume: None,
+        worktree,
+    };
+    let Some(backend) = app.backend_for(&host) else {
+        app.set_status(format!("Launch failed: unknown host {}", host.0), true);
+        return;
+    };
+    // Preserve queued opens while a host is connecting. The backend fails
+    // known-down hosts promptly and bounds an unanswered reservation.
+    if matches!(
+        backend.conn_state(),
+        crate::backend::ConnState::Disconnected | crate::backend::ConnState::Failed(_)
+    ) {
+        app.set_status(
+            format!("Launch failed: host {} is disconnected", host.0),
+            true,
+        );
+        return;
+    }
+    let owner = match backend {
+        Backend::Local(_) => None,
+        Backend::Remote(remote) => Some(Arc::clone(remote)),
+    };
+    let open = backend.open_session_task(spec);
+    let window = launch_window(app, agent, &cwd, &host, &LAUNCH_COPY_NEW);
+    app.record_launch_cwd(&host, &cwd);
+    app.launches.start(
+        super::launch::Request {
+            agent,
+            window,
+            owner,
+        },
+        open,
+    );
+}
+
+fn poll_launches(app: &mut App, fs_dirty: &mut bool) -> bool {
+    let backends = &app.backends;
+    let progress = app.launches.poll(
+        |request| {
+            backends.iter().any(|backend| {
+                backend.host_id() == request.window.host
+                    && backend.conn_state().is_connected()
+                    && match (backend, &request.owner) {
+                        (Backend::Local(_), None) => true,
+                        (Backend::Remote(current), Some(owner)) => Arc::ptr_eq(current, owner),
+                        _ => false,
+                    }
+            })
+        },
+        terminal::spawn,
+        Instant::now(),
+    );
+    let mut changed = progress.changed;
+    if changed {
+        app.mark_dirty(super::Cursor::FollowSession);
+    }
+    for finished in progress.finished {
+        match finished.result {
+            Ok(result) => {
+                record_launch_window(app, finished.host, finished.token.unwrap(), result);
+                app.apply_detach_reports(finished.reports, ReportOrigin::Live);
+                // The real row may have arrived before the window result. Reload
+                // even without a fresh host event so binding and selection settle.
+                *fs_dirty = true;
+            }
+            Err(error) => app.set_status(format!("Launch failed: {error}"), true),
+        }
+    }
+    changed |= app.reconcile_launches(Instant::now());
+    changed
 }
 
 /// Spawn a local window attached to a running pool session and bind it, so the
@@ -1402,7 +1436,7 @@ async fn attach_pool_session(
         take_focus: false,
         stack: true,
     };
-    match terminal::get().spawn(spec).await {
+    match terminal::spawn(spec).await {
         // A Floating/NewTab attach spawn always recovers its window; a `None`
         // can't be bound, so report it rather than proceed.
         Ok(result) => match result.window {
@@ -2037,7 +2071,7 @@ async fn drain_background_results(
     fs_dirty: &mut bool,
     hosts_panel_open: &mut bool,
 ) -> bool {
-    let mut redraw = false;
+    let mut redraw = poll_launches(app, fs_dirty);
     // An attach window reporting that its session ended — the event that
     // makes detachment prompt without polling the window tree (§5). Handled
     // before the reload block so the retired binding is already gone if a
@@ -2096,7 +2130,7 @@ async fn drain_background_results(
             })
     });
     // Advance one replacement per frame; cleanup waits own no App borrow.
-    if advance_restart(app, &mut inboxes.restarts).await {
+    if !app.should_quit && advance_restart(app, &mut inboxes.restarts).await {
         arm_settle_reload(settle_reload_at);
         redraw = true;
     }
@@ -2347,9 +2381,9 @@ fn next_wakeup(
     settle_reload_at: Option<Instant>,
     logo_recompose_at: Option<Instant>,
 ) -> Duration {
-    // Tick fast while a cat walks so its motion stays smooth; otherwise idle at
-    // the configured poll interval, waking only on input/timers.
-    let mut poll_timeout = if app.cat_walking() {
+    // Tick fast for cat motion and launch handoffs. A worker's reply must not
+    // add a full configured poll interval before starting the attach window.
+    let mut poll_timeout = if app.cat_walking() || !app.launches.is_empty() {
         event_poll.min(Duration::from_millis(30))
     } else {
         event_poll
@@ -2447,6 +2481,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // kitty images are rebuilt — a resize clears the screen, and that frees
     // them terminal-side.
     let mut logo_recompose_at: Option<Instant> = None;
+    let mut waiting_to_quit = false;
     loop {
         let wants_paste = app.input_mode == InputMode::HostEdit
             && app
@@ -2606,6 +2641,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                 needs_redraw = true;
             }
             let maybe_action = match evt {
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_) if app.should_quit => None,
                 Event::Key(key) => {
                     // Capture the mode *before* dispatch — handlers can
                     // change input_mode (e.g. `/` -> Search), and we want
@@ -2735,16 +2771,10 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         host,
                         worktree,
                     } => {
-                        let _ = launch_agent(
-                            &mut app,
-                            agent,
-                            &cwd,
-                            None,
-                            &LAUNCH_COPY_NEW,
-                            &host,
-                            worktree,
-                        )
-                        .await;
+                        start_new_session(&mut app, agent, cwd, host, worktree);
+                        // Acknowledge this keystroke before any further terminal
+                        // reads or background maintenance on the next pass.
+                        terminal.draw(|frame| app.draw(frame))?;
                     }
                     Action::FetchTabsForMove(window_id) => match terminal::get().snapshot().await {
                         Ok(tabs) => app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs)),
@@ -2877,20 +2907,19 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                 .values()
                                 .map(|work| work.tab_id.clone())
                                 .collect();
-                            match terminal::get()
-                                .spawn_work_tab(
-                                    SpawnSpec {
-                                        cwd: spawn_cwd.clone(),
-                                        target: SpawnTarget::NewTab,
-                                        command,
-                                        title: Some(title),
-                                        hold: false,
-                                        take_focus: true,
-                                        stack: false,
-                                    },
-                                    &work_tabs,
-                                )
-                                .await
+                            match terminal::spawn_work_tab(
+                                SpawnSpec {
+                                    cwd: spawn_cwd.clone(),
+                                    target: SpawnTarget::NewTab,
+                                    command,
+                                    title: Some(title),
+                                    hold: false,
+                                    take_focus: true,
+                                    stack: false,
+                                },
+                                &work_tabs,
+                            )
+                            .await
                             {
                                 Ok(result) => {
                                     // Record the tab so the next `w` on this cwd
@@ -3048,7 +3077,17 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         }
 
         if app.should_quit {
-            break;
+            if app.launches.is_empty() {
+                // A row can precede its spawn result. The binding may have been
+                // recorded after this tick's reload (or during its debounce).
+                app.write_window_bindings_file();
+                break;
+            }
+            if !waiting_to_quit {
+                app.set_status("Finishing session launch before quitting…".into(), false);
+                needs_redraw = true;
+                waiting_to_quit = true;
+            }
         }
     }
 
@@ -3102,6 +3141,69 @@ mod tests {
         app.mark_dirty(super::super::Cursor::HoldIndex);
         app.table_state.select(Some(0));
         app
+    }
+
+    #[tokio::test]
+    async fn starting_a_session_returns_before_the_rpc_and_keeps_handoffs_responsive() {
+        for conn in [
+            crate::backend::ConnState::Connecting,
+            crate::backend::ConnState::Connected,
+        ] {
+            let mut app = vcs_app();
+            let host = HostId("mock".into());
+            let remote = crate::backend::RemoteBackend::unconnected_for_tests(host.clone(), vec![]);
+            remote.simulate_link_for_tests(conn, true);
+            app.backends.push(Backend::Remote(remote));
+            start_new_session(
+                &mut app,
+                AgentControl::Codex,
+                "/work/project".into(),
+                host,
+                None,
+            );
+
+            assert_eq!(app.launches.visible(&app.sessions).len(), 1);
+            assert_eq!(app.sessions.len(), 1, "a placeholder is not launcher state");
+            assert!(
+                next_wakeup(&app, Duration::from_secs(1), None, None) <= Duration::from_millis(30)
+            );
+            // The channel has no server. Its failure is delivered on a later pass,
+            // leaving the keystroke free to paint the placeholder immediately.
+            tokio::task::yield_now().await;
+            let mut fs_dirty = false;
+            assert!(poll_launches(&mut app, &mut fs_dirty));
+            assert!(app.launches.is_empty());
+            assert!(!fs_dirty, "a failed reservation creates no window");
+            assert!(app.window_bindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_local_failure_before_the_spawn_reply_still_focuses_its_held_window() {
+        let mut app = vcs_app();
+        app.sessions[0].host = HostId::local();
+        app.sessions[0].launch_id = Some("failed-launch".into());
+        app.sessions[0].status = state::SessionStatus::FailedToStart;
+        assert!(app.failed_launch_focus_queue.is_empty());
+        record_launch_window(
+            &mut app,
+            HostId::local(),
+            "failed-launch".into(),
+            terminal::SpawnResult {
+                window: Some(WindowId::from(42)),
+                tab: None,
+            },
+        );
+        assert_eq!(app.failed_launch_focus_queue, [WindowId::from(42)]);
+        let previous = app
+            .sessions
+            .iter()
+            .map(|s| (super::super::flag_key(s), s.status.clone()))
+            .collect();
+        assert!(
+            app.newly_failed_windows(&previous, &app.sessions)
+                .is_empty()
+        );
     }
 
     #[test]
