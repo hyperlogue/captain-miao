@@ -277,7 +277,8 @@ async fn pending_launch_is_visible_during_reservation_without_changing_session_a
         // work, including when the real session list is scrolled.
         let rendered = d.render();
         assert!(rendered.contains("4 starting"), "{rendered}");
-        assert!(rendered.contains("Codex: new-project"), "{rendered}");
+        assert!(rendered.contains("new-session"), "{rendered}");
+        assert!(!rendered.contains("Codex: new-project"), "{rendered}");
         assert!(rendered.contains("2 more sessions…"), "{rendered}");
         assert_eq!(d.app.sessions.len(), 30);
         assert_eq!(d.app.visible_sessions().len(), 30);
@@ -322,6 +323,79 @@ async fn pending_launch_on_empty_and_resized_dashboards_never_becomes_a_session(
         assert!(d.press(KeyCode::Enter).is_none());
         if d.app.launch_header_rows > 0 {
             assert!(rendered.contains("Starting"), "{rendered}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_and_confirmed_rows_use_identical_session_styling() {
+    use crate::agent::AgentControl;
+    use crate::state::HostId;
+
+    for width in [78, 120] {
+        for host in [HostId::local(), HostId("remote".into())] {
+            for searching in [false, true] {
+                let mut d = TestDashboard::new(width, 24);
+                d.app.panels_initialized = true;
+                d.app.preview_visible = false;
+                d.app.detail_visible = false;
+                if searching {
+                    d.app.input_mode = InputMode::Search;
+                }
+                d.app.host_icons.insert(host.clone(), "⭐".into());
+                let cwd = "/work/new-project";
+                d.app.launches.start(
+                    super::launch::Request {
+                        agent: AgentControl::Codex,
+                        window: super::launch::WindowLaunch {
+                            local_token: "pending".into(),
+                            host: host.clone(),
+                            cwd: cwd.into(),
+                            home: "/work".into(),
+                            target: crate::terminal::SpawnTarget::SharedStackTab,
+                            title: "Codex: new-project".into(),
+                        },
+                        owner: None,
+                    },
+                    std::future::pending(),
+                );
+                let rendered = d.render();
+                assert!(!rendered.contains(cwd), "a cwd is not a last prompt");
+                let y = d.app.last_table_rect.unwrap().y + 2;
+                let pending: Vec<_> = (0..width)
+                    .map(|x| d.terminal.backend().buffer()[(x, y)].clone())
+                    .collect();
+
+                d.app.launches = Default::default();
+                let mut confirmed = session(42, cwd, SessionStatus::Starting);
+                confirmed.agent = AgentControl::Codex;
+                confirmed.host = host.clone();
+                confirmed.name = Some("new-session".into());
+                d.app
+                    .record_window_binding(host.clone(), "launch-42".into(), WindowId::from(4200));
+                d.set_sessions(vec![confirmed]);
+                // Neither row is selected: compare the session's presentation,
+                // not the cursor that appears only on an actionable real row.
+                d.app.table_state.select(None);
+                d.render();
+                let y = d.app.last_table_rect.unwrap().y + 2;
+                for x in 0..width {
+                    let before = &pending[x as usize];
+                    let after = &d.terminal.backend().buffer()[(x, y)];
+                    assert_eq!(
+                        before.symbol(),
+                        after.symbol(),
+                        "cell {x}, width {width}, host {host}"
+                    );
+                    if !before.symbol().trim().is_empty() {
+                        assert_eq!(
+                            before.style(),
+                            after.style(),
+                            "cell {x}, width {width}, host {host}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

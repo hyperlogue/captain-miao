@@ -367,8 +367,8 @@ preparation, the operation stops; invoke it again to retry. These checks do not
 lock out other programs using the checkout.
 
 Dashboard notifications float in the bottom-right corner and stack vertically.
-New sessions show a `Starting` placeholder immediately while the window opens.
-It becomes a normal session row when the launcher reports in. You can keep
+New sessions immediately show a `Starting` row in the usual session styling,
+named `new-session` until the launcher reports the real session. You can keep
 navigating while it starts; doing so keeps the new row from moving your cursor.
 If you quit during a launch, the dashboard finishes recording its window first.
 Session launches only show a notification if an error occurs. Successful session

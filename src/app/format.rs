@@ -23,7 +23,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Clear};
+use ratatui::widgets::Clear;
 
 use crate::agent::SessionIndex;
 use crate::state::{LauncherState, SessionStatus};
@@ -1012,12 +1012,12 @@ pub(super) fn format_log_age(secs: u64) -> String {
     }
 }
 
-/// Build the "Updated" cell with the unit suffixes tinted: `h` yellow, `m`
+/// Build the "Updated" text with the unit suffixes tinted: `h` yellow, `m`
 /// blue. Digits and the `>` overflow marker stay default — coloring the units
 /// alone makes the magnitude scannable without flooding the row in color.
 /// Right-aligned so values stack flush against the column edge regardless of
 /// width.
-pub(super) fn elapsed_cell(secs: u64) -> Cell<'static> {
+pub(super) fn elapsed_line(secs: u64) -> Line<'static> {
     let text = format_elapsed(secs);
     // Emit runs, not a span per char: a default-styled digit run then the
     // tinted unit letter, at most twice (`1h05m` → "1", "h", "05", "m"). Same
@@ -1041,7 +1041,7 @@ pub(super) fn elapsed_cell(secs: u64) -> Cell<'static> {
     if run_start < text.len() {
         spans.push(Span::raw(text[run_start..].to_string()));
     }
-    Cell::from(Line::from(spans).alignment(Alignment::Right))
+    Line::from(spans).alignment(Alignment::Right)
 }
 
 // =============================================================================

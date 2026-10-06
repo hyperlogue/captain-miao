@@ -38,7 +38,7 @@ use crate::state::{HostId, LauncherState, SessionStatus};
 use super::format::{
     ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH, ansi_to_lines,
     bar_segments, bar_style, centered_rect, clear_overlay, context_pressure_style, dir_icon_width,
-    elapsed_cell, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
+    elapsed_line, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
     hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans, pill,
     session_display_name, truncate_str,
 };
@@ -939,35 +939,26 @@ impl App {
         );
     }
 
-    /// The host half of a row's icon cell, and whether it's a *foreign-terminal*
-    /// marker rather than a host: the host's **emoji** (§9) — configurable per
-    /// host in the hosts panel exactly like the workdir icons, with a
-    /// deterministic fallback — or the "lives in another terminal instance"
-    /// glyph for a local row this backend can't drive.
-    ///
-    /// This used to be its own `Host` column. It now shares the workdir-icon
-    /// column as `<host>│<workdir>`: both answer "where is this?", they read
-    /// better as one glyph pair than as two columns a table apart, and the merge
-    /// hands the freed width back to the elastic last-prompt column.
-    ///
-    /// An icon rather than a name because it's a glance-level "which box is
-    /// this?", and a name either truncates to noise or eats six cells. `None`
-    /// for a row on this machine, which is the common case. Drives both the
-    /// column width and the cell so the two can't disagree.
-    ///
-    /// A row living in **another terminal instance** used to get a glyph of its
-    /// own here. It was dropped: running two dashboards in two terminals at once
-    /// is rare enough not to earn a permanent slot in every row's icon column,
-    /// and it was paying for that rarity twice over — the glyph was the one
-    /// non-emoji in a column of emoji (`U+29C9` ⧉, from a Unicode block
-    /// monospace fonts routinely skip), so on Ghostty it drew as a missing-glyph
-    /// box next to every session. The state still reads: the row is dimmed, and
-    /// the detail panel names the instance it lives in.
-    fn host_icon_cell(&self, s: &LauncherState) -> Option<String> {
-        if self.runs_on_this_machine(s) {
-            return None;
+    /// The same host/workdir slots for pending and confirmed sessions. Host
+    /// glyphs align right and directory glyphs left, keeping the pair together
+    /// without shifting columns when a glyph is absent or a custom mark is wide.
+    /// Foreign terminal instances are identified in the detail panel, not here.
+    fn session_icon_line(&self, host: &HostId, cwd: &str, show_host: bool) -> Line<'static> {
+        let mut spans = Vec::new();
+        if show_host {
+            let on_this_machine = self.backends.first().is_some_and(|b| b.host_id() == *host);
+            let glyph = (!on_this_machine).then(|| self.host_icon(host));
+            let width = glyph.as_deref().map_or(0, dir_icon_width);
+            spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - width)));
+            if let Some(glyph) = glyph {
+                spans.push(Span::raw(glyph));
+            }
         }
-        Some(self.host_icon(&s.host))
+        let (icon, color, _) = self.effective_dir_mark(cwd);
+        let width = dir_icon_width(&icon);
+        spans.push(Span::styled(icon, Style::default().fg(color)));
+        spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - width)));
+        Line::from(spans)
     }
 
     // =============================================================================
@@ -1059,6 +1050,10 @@ impl App {
         // host half is dropped there along with the other extra columns; that is
         // a switch between two layouts, not a shift within one.
         let show_host = !narrow;
+        let search_active = self.input_mode == InputMode::Search;
+        // Names use the same maximum width and truncation before and after
+        // confirmation, including when a narrow viewport clips the column.
+        let name_col_max = cfg.ui.table.name_truncate as u16 + 10;
 
         // Indented past the override indicator the rows carry in this same cell,
         // so the header sits over the status labels rather than over the glyphs.
@@ -1099,34 +1094,42 @@ impl App {
             let label = if summarized {
                 format!("{} more sessions…", pending_count - i)
             } else {
-                format!(
-                    "{}: {}",
-                    request.agent.label(),
-                    super::display_basename(&request.window.cwd)
-                )
+                "new-session".into()
             };
-            let style = Style::default().fg(ui.header_fg);
-            columns[0].push(Line::styled(
-                format!("{}Starting", " ".repeat(OVERRIDE_COL_WIDTH as usize)),
-                style,
-            ));
-            columns[1].push(Line::raw(if show_host && !summarized {
-                format!("{} ", self.host_icon(&request.window.host))
+            let style = if search_active {
+                Style::default().add_modifier(Modifier::DIM)
             } else {
-                String::new()
-            }));
-            columns[2].push(Line::styled(label, style));
+                Style::default()
+            };
+            let mut status = override_indicator_spans(false, false, None);
+            status.push(Span::styled(
+                SessionStatus::Starting.label(),
+                Style::default().fg(super::format::status_fg(&SessionStatus::Starting, false)),
+            ));
+            columns[0].push(Line::from(status).style(style));
+            columns[1].push(if summarized {
+                Line::raw("")
+            } else {
+                self.session_icon_line(&request.window.host, &request.window.cwd, show_host)
+                    .style(style)
+            });
+            columns[2].push(Line::from(truncate_str(&label, name_col_max as usize)));
             if !narrow {
-                columns[3].push(Line::raw(""));
-                columns[4].push(Line::styled(
-                    if summarized {
-                        String::new()
-                    } else {
-                        request.window.cwd.clone()
-                    },
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-                columns[5].push(Line::raw(""));
+                let ctx = if summarized || request.agent.capabilities().context_tokens {
+                    ""
+                } else {
+                    "n/a"
+                };
+                columns[3].push(
+                    Line::styled(ctx, Style::default().add_modifier(Modifier::DIM))
+                        .alignment(Alignment::Right),
+                );
+                columns[4].push(Line::raw(""));
+                columns[5].push(if summarized {
+                    Line::raw("")
+                } else {
+                    elapsed_line(0).style(style)
+                });
             }
         }
         let header = Row::new(
@@ -1136,51 +1139,20 @@ impl App {
         )
         .height(1 + self.launch_header_rows);
 
-        // Resolve every visible row's icon up front so we can size the icon
-        // column from the widest one before building cells. Custom 2- or
-        // 3-char icons (e.g. "py", "TS") need to fit without truncation.
         let now = LauncherState::now();
-        let icon_marks: Vec<(String, Color)> = visible
-            .iter()
-            .map(|s| {
-                let (icon, color, _) = self.effective_dir_mark(&s.cwd);
-                (icon, color)
-            })
-            .collect();
-        // The host glyphs share that column (see `host_icon_cell`). Both halves
-        // are fixed slots, so a row with no host glyph reserves one anyway and
-        // nothing to the right of the column moves when hosts connect.
-        let host_icons: Vec<Option<String>> = if show_host {
-            visible.iter().map(|s| self.host_icon_cell(s)).collect()
-        } else {
-            Vec::new()
-        };
-
-        // The Name column is a fixed max-width column (a dynamic fill looked
-        // untidy): the truncate width plus 10 cells of headroom. The title is
-        // truncated to the *same* width so the ellipsis lands at the column edge
-        // rather than short of it.
-        let name_col_max = crate::config::get().ui.table.name_truncate as u16 + 10;
 
         // In search mode, dim every column except the Name column so the eye
         // lands on the titles being filtered. The row-level DIM below covers
         // all cells; the Name cell removes it to stay bright.
-        let search_active = self.input_mode == InputMode::Search;
         let mut rows: Vec<Row> = visible
             .iter()
-            // Zip the pre-resolved icon marks in by value so each row's icon
-            // String isn't cloned a second time.
-            .zip(icon_marks)
-            .enumerate()
-            .map(|(row_idx, (s, (icon, icon_color)))| {
+            .map(|s| {
                 let flags = self.flags_of(&super::flag_key(s));
                 let important = flags.pinned;
                 let follow_up = flags.follow_up;
                 // A row that lives in another terminal instance is visible but
                 // window-inert (D6). Dimming is the whole of the signal now —
-                // it carried a glyph in the icon column's host half too, which
-                // `host_icon_cell` records the removal of — with the detail
-                // panel naming the instance for the row you are actually on.
+                // the detail panel names the instance for the selected row.
                 let foreign = self.foreign_terminal(s).is_some();
                 // Running on its host with no window on this screen (§9). It
                 // already sinks to its own sort tier; dimming says the same
@@ -1211,27 +1183,7 @@ impl App {
                 } else {
                     Cell::from(name)
                 };
-                // `<host><workdir>`, each in a fixed `ICON_SLOT_WIDTH` slot and
-                // the two flush against each other — the halves meet in the
-                // middle because the host is right-aligned in its slot and the
-                // workdir left-aligned in its. That is what puts the slack at the
-                // column's outer edges instead of between the glyphs, so a
-                // narrower glyph on either side never moves the other one. A row
-                // with no host glyph leaves its slot blank rather than closing
-                // it up.
-                let mut icon_spans: Vec<Span<'static>> = Vec::new();
-                if show_host {
-                    let host_glyph = host_icons.get(row_idx).and_then(|o| o.as_ref());
-                    let glyph_w = host_glyph.map_or(0, |g| dir_icon_width(g));
-                    icon_spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - glyph_w)));
-                    if let Some(glyph) = host_glyph {
-                        icon_spans.push(Span::raw(glyph.clone()));
-                    }
-                }
-                let icon_w = dir_icon_width(&icon);
-                icon_spans.push(Span::styled(icon, Style::default().fg(icon_color)));
-                icon_spans.push(Span::raw(" ".repeat(ICON_SLOT_WIDTH - icon_w)));
-                let icon_cell = Cell::from(Line::from(icon_spans));
+                let icon_cell = Cell::from(self.session_icon_line(&s.host, &s.cwd, show_host));
                 // The narrow layout keeps only status / workdir icon / name; the
                 // context, last-prompt and updated columns are dropped.
                 let mut row_cells = vec![status_cell, icon_cell, name_cell];
@@ -1256,7 +1208,7 @@ impl App {
                         .map(last_prompt_text)
                         .map(|p| p.replace('\n', " "))
                         .unwrap_or_default();
-                    let elapsed = elapsed_cell(now.saturating_sub(s.updated_at));
+                    let elapsed = Cell::from(elapsed_line(now.saturating_sub(s.updated_at)));
                     row_cells.push(
                         Cell::from(Line::from(ctx).alignment(Alignment::Right)).style(ctx_style),
                     );
