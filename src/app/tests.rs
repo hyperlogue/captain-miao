@@ -853,6 +853,7 @@ fn shortcut_notice_copies_a_working_restore_snippet_without_acknowledging() {
         }
         let out = d.render();
         let at = find_cell(d.terminal.backend().buffer(), "Copy snippet").expect(&out);
+        let done_at = find_cell(d.terminal.backend().buffer(), "Enter: Got it").expect(&out);
         let selected = d.selected();
         for action in [d.click(at.0, at.1), d.press(KeyCode::Char('c'))] {
             let Some(Action::CopyUpgradeSnippet(text)) = action else {
@@ -878,6 +879,18 @@ fn shortcut_notice_copies_a_working_restore_snippet_without_acknowledging() {
         d.app.upgrade_notices.as_mut().unwrap().copy_feedback = Some("Snippet copied".into());
         let out = d.render();
         assert!(out.contains("Snippet copied"), "{out}");
+        assert!(!out.contains("Copy snippet"), "{out}");
+        let copied_at = find_cell(d.terminal.backend().buffer(), "Snippet copied").expect(&out);
+        assert_eq!(copied_at.1, at.1, "feedback replaces the border hint");
+        assert_eq!(
+            find_cell(d.terminal.backend().buffer(), "Enter: Got it"),
+            Some(done_at),
+            "copy feedback must not move the controls"
+        );
+        assert!(matches!(
+            d.click(copied_at.0, copied_at.1),
+            Some(Action::CopyUpgradeSnippet(_))
+        ));
         d.press(KeyCode::Enter);
         assert!(matches!(
             d.press(KeyCode::Char('x')),

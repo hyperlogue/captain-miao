@@ -308,7 +308,11 @@ impl App {
         } else {
             " j/k: scroll · Tab: updates · Esc: later "
         };
-        let copy_label = " c: Copy snippet ";
+        let copy_label = format!(
+            " {} ",
+            notice.copy_feedback.as_deref().unwrap_or("c: Copy snippet")
+        );
+        let copy_width = Line::from(copy_label.as_str()).width();
         let has_snippet = item.content.iter().any(|c| matches!(c, Content::Code(_)));
         let mut block = Block::default()
             .borders(Borders::ALL)
@@ -320,9 +324,9 @@ impl App {
                 accent,
             ));
         if has_snippet {
-            block = block.title_bottom(Line::styled(copy_label, accent));
+            block = block.title_bottom(Line::styled(copy_label.as_str(), accent));
         }
-        let hints_width = hint.chars().count() + if has_snippet { copy_label.len() + 2 } else { 0 };
+        let hints_width = hint.chars().count() + if has_snippet { copy_width + 2 } else { 0 };
         if hints_width <= usize::from(width.saturating_sub(2)) {
             block = block.title_bottom(Line::styled(hint, muted).alignment(Alignment::Right));
         }
@@ -333,7 +337,7 @@ impl App {
             Rect::new(
                 popup.x + 1,
                 popup.bottom() - 1,
-                (copy_label.len() as u16).min(popup.width.saturating_sub(2)),
+                copy_width.min(usize::from(popup.width.saturating_sub(2))) as u16,
                 1,
             )
         } else {
@@ -341,16 +345,7 @@ impl App {
         };
 
         let button_rows = inner.height.min(1);
-        let feedback = Paragraph::new(notice.copy_feedback.as_deref().unwrap_or(""))
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false });
-        let feedback_height = if notice.copy_feedback.is_some() {
-            (feedback.line_count(inner.width).clamp(1, 3) as u16)
-                .min(inner.height.saturating_sub(button_rows))
-        } else {
-            0
-        };
-        let content_height = inner.height.saturating_sub(button_rows + feedback_height);
+        let content_height = inner.height.saturating_sub(button_rows);
         // Details get most of the space. Keep at least one list row on compact
         // terminals; both panes can scroll independently.
         let list_height = (notice.items.len().min(5) as u16 + 2)
@@ -453,11 +448,6 @@ impl App {
             list_rect,
             &mut notice.list,
         );
-        frame.render_widget(
-            feedback,
-            Rect::new(inner.x, list_rect.bottom(), inner.width, feedback_height),
-        );
-
         let label = if read_count == notice.items.len() {
             " Enter: Got it "
         } else {
