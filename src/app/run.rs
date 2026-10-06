@@ -868,7 +868,7 @@ pub(super) fn apply_kill_result(app: &mut App, result: KillResult) {
         return;
     }
     match outcome {
-        KillOutcome::Signalled => app.set_status("Session terminated".to_string(), false),
+        KillOutcome::Signalled => {}
         // Not an error: the row leaving is what `X` was for, and it has.
         KillOutcome::AlreadyGone => app.set_status("Session had already ended".to_string(), false),
         KillOutcome::Forced(reason) => {

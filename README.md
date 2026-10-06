@@ -367,7 +367,8 @@ preparation, the operation stops; invoke it again to retry. These checks do not
 lock out other programs using the checkout.
 
 Dashboard notifications float in the bottom-right corner and stack vertically.
-Session launches only show a notification if an error occurs.
+Session launches only show a notification if an error occurs. Successful session
+termination is silent.
 Git progress updates one popup until the operation finishes. Information and
 successful results disappear after five seconds; warnings and errors stay until
 you dismiss them. Click a popup's `×` to close it, or press `x` to dismiss
