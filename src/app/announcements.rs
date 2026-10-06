@@ -4,8 +4,9 @@
 //! with a unique, permanent id, its introduction version, and its content.
 //! Text, headings and code snippets cover general migrations; `Binding` resolves
 //! a command through the active keymap when the notice concerns shortcuts.
-//! Acknowledgements follow ids, so a new item in an existing version still
-//! appears once. Keep old ids and versions unchanged so skipped releases work.
+//! Acknowledgements follow ids and control automatic opening. Each release
+//! with an unseen item shows all its announcements, including acknowledged ones.
+//! Keep old ids and versions unchanged so skipped releases work.
 //! Dashboard state migrates the original version-only shortcut acknowledgement.
 
 use anyhow::Context;
@@ -98,8 +99,9 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
     },
 ];
 
-/// Select unacknowledged announcements, oldest first. Items in one release
-/// retain their catalog order. Build metadata does not affect precedence.
+/// Select complete releases containing an unacknowledged item, oldest first.
+/// Acknowledgement controls whether the inbox opens, not which items can be
+/// browsed within a release. Build metadata does not affect precedence.
 pub(super) fn pending(
     catalog: &'static [Announcement],
     acknowledged: &[String],
@@ -109,12 +111,20 @@ pub(super) fn pending(
     for change in catalog {
         let introduced = Version::parse(change.introduced)
             .with_context(|| format!("invalid version for announcement '{}'", change.id))?;
-        if !introduced.cmp_precedence(current).is_gt()
-            && !acknowledged.iter().any(|id| id == change.id)
-        {
+        if !introduced.cmp_precedence(current).is_gt() {
             changes.push((introduced, change));
         }
     }
+    let unseen_releases: Vec<_> = changes
+        .iter()
+        .filter(|(_, item)| !acknowledged.iter().any(|id| id == item.id))
+        .map(|(version, _)| version.clone())
+        .collect();
+    changes.retain(|(version, _)| {
+        unseen_releases
+            .iter()
+            .any(|unseen| unseen.cmp_precedence(version).is_eq())
+    });
     changes.sort_by(|(a, _), (b, _)| a.cmp_precedence(b));
     Ok(changes.into_iter().map(|(_, change)| change).collect())
 }
@@ -205,5 +215,19 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|change| change.introduced == "0.12.0"));
+    }
+
+    #[test]
+    fn an_unseen_item_shows_its_whole_release_but_not_other_releases() {
+        let pending = pending(
+            EXAMPLE_ANNOUNCEMENTS,
+            &["session-shortcuts-x".into(), "config-format".into()],
+            &Version::new(0, 12, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            ["config-format", "connection-policy"]
+        );
     }
 }

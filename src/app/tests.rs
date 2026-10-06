@@ -637,7 +637,8 @@ fn update_inbox_delivers_new_items_after_the_shortcut_notice_was_acknowledged() 
     let out = d.render();
     assert!(out.contains("What's new"), "{out}");
     assert!(out.contains("Upgrade servers for the yellow dot"), "{out}");
-    assert!(!out.contains("Session shortcuts changed"), "{out}");
+    assert!(out.contains("Session shortcuts changed"), "{out}");
+    assert!(out.contains("2/2"), "{out}");
     assert!(out.contains("Warning"), "{out}");
     assert!(out.contains("miao-server"), "{out}");
     d.app.save_overrides();
@@ -647,7 +648,7 @@ fn update_inbox_delivers_new_items_after_the_shortcut_notice_was_acknowledged() 
             .begin_startup(&bindings, super::announcements::ANNOUNCEMENTS)
             .unwrap()
             .len(),
-        1
+        2
     );
     d.press(KeyCode::Enter);
     d.app.save_overrides();
@@ -1039,7 +1040,7 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
             .as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert!(
+    assert_eq!(
         d.app
             .dashboard_state
             .begin_startup(
@@ -1048,7 +1049,9 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
             )
             .unwrap()
             .iter()
-            .all(|item| item.id == "server-owned-attention")
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        ["session-shortcuts-x", "server-owned-attention"]
     );
 }
 

@@ -4,6 +4,7 @@
 //! existing announcements. Other users acknowledge the entire displayed batch;
 //! browsing or saving preferences never dismisses it. Stable ids allow new items
 //! within an already seen version, including feature promotions and warnings.
+//! An unseen item opens the whole release so its other updates remain browsable.
 
 use std::path::{Path, PathBuf};
 
@@ -62,7 +63,7 @@ impl DashboardState {
         state::write_json_atomic(&self.path, &overrides)
     }
 
-    /// Collect every unseen, released announcement. The caller must do
+    /// Collect complete releases with unseen announcements. The caller must do
     /// this before the first session reload writes window bindings.
     pub(super) fn begin_startup(
         &self,
@@ -221,11 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_version_only_acknowledges_the_original_shortcut_item() {
-        for (previous, expected) in [
-            ("0.10.10", 2),
-            ("0.11.0-rc.1", 2),
-            ("unrecognized", 2),
+    fn legacy_acknowledgement_keeps_the_original_item_in_the_release_overview() {
+        for (previous, acknowledged_count) in [
+            ("0.10.10", 0),
+            ("0.11.0-rc.1", 0),
+            ("unrecognized", 0),
             ("0.11.0", 1),
             ("0.11.0+local", 1),
             ("0.12.0", 1),
@@ -240,7 +241,13 @@ mod tests {
             let pending = dashboard
                 .begin_startup(&temp.path().join("window-bindings.json"), ANNOUNCEMENTS)
                 .unwrap();
-            assert_eq!(pending.len(), expected, "{previous}");
+            assert_eq!(pending.len(), 2, "{previous}");
+            assert_eq!(
+                acknowledged(&dashboard.read_document().unwrap())
+                    .unwrap()
+                    .len(),
+                acknowledged_count
+            );
             assert_eq!(
                 dashboard.load().unwrap().last_dashboard_version.as_deref(),
                 Some(previous)
@@ -260,15 +267,16 @@ mod tests {
                 .is_empty()
         );
         let notices = dashboard.begin_startup(&bindings, ANNOUNCEMENTS).unwrap();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].id, "server-owned-attention");
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].id, "session-shortcuts-x");
+        assert_eq!(notices[1].id, "server-owned-attention");
         dashboard.save(DashboardOverrides::default()).unwrap();
         assert_eq!(
             dashboard
                 .begin_startup(&bindings, ANNOUNCEMENTS)
                 .unwrap()
                 .len(),
-            1
+            2
         );
         dashboard.finish_startup(&notices).unwrap();
         assert!(

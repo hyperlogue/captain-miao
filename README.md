@@ -451,11 +451,13 @@ them. The acknowledgement survives restarts; your configured
 Fresh installs skip existing announcements. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
 The dashboard stores announcement IDs and `last_dashboard_version` in
-`dashboard-overrides.json`. Unseen items appear once their introduction version
-is reached, including new items added to a version you already acknowledged.
-The server-upgrade warning therefore still appears if you dismissed the earlier
-shortcut notice. Skipping releases includes all unseen announcements, oldest
-first, with each item's version shown in the list and details. Quitting with
+`dashboard-overrides.json`. Unseen items open the inbox once their introduction
+version is reached, including additions to a version you already acknowledged.
+The list shows all announcements from each release with unseen items, including
+previously acknowledged updates. The server-upgrade warning therefore opens an
+overview containing both it and the earlier shortcut notice. Skipping releases
+includes every release with unseen announcements, oldest first, with each item's
+version shown in the list and details. Quitting with
 Ctrl+C before acknowledgement leaves the batch pending for the next launch.
 Ordinary preference saves preserve acknowledgements.
 
