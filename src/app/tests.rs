@@ -305,6 +305,7 @@ async fn pending_launch_ranks_after_follow_up_before_and_after_confirmation() {
 
 #[tokio::test]
 async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets() {
+    use super::launch::TableRow;
     for width in [78, 120] {
         let mut d = TestDashboard::new(width, 24);
         d.app.panels_initialized = true;
@@ -330,6 +331,11 @@ async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets()
         for i in 0..4 {
             pending_launch(&mut d.app, &format!("pending-{i}"));
         }
+        assert_eq!(
+            d.app.selected_table_row(),
+            Some(TableRow::Launch("pending-3".into()))
+        );
+        d.app.select_table_row(TableRow::Session(20));
 
         // The reservation never resolves. All four launches rank between the
         // attention rows and the older idle rows, within a scrolled viewport.
@@ -339,7 +345,12 @@ async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets()
         assert_eq!(d.app.sessions.len(), 30);
         assert_eq!(d.app.visible_sessions().len(), 30);
         assert_eq!(d.app.selected_session().unwrap().launcher_pid, selected);
-        assert_eq!(&d.app.table_rows[10..14], &[None; 4]);
+        assert_eq!(
+            &d.app.table_rows[10..14],
+            &(0..4)
+                .map(|i| TableRow::Launch(format!("pending-{i}")))
+                .collect::<Vec<_>>()
+        );
         let offset = d.app.table_state.offset();
         assert!(offset > 0);
         d.render();
@@ -353,18 +364,25 @@ async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets()
         let targets: Vec<_> = (rect.y + 2..rect.bottom())
             .map(|y| {
                 let index = offset + usize::from(y - rect.y - 2);
-                (y, d.app.table_rows.get(index).copied().flatten())
+                (y, d.app.table_rows.get(index).cloned())
             })
             .collect();
         for (y, target) in targets {
-            assert_eq!(d.app.visible_index_at(y, rect), target);
-            let before = d.selected();
+            assert_eq!(d.app.table_row_at(y, rect), target);
+            let before = d.app.selected_table_row();
             d.click(rect.x + 2, y);
-            assert_eq!(d.selected(), target.or(before));
+            assert_eq!(d.app.selected_table_row(), target.or(before));
         }
 
-        // Keyboard navigation crosses the pending rows without selecting one.
-        d.app.table_state.select(Some(9));
+        // Keyboard navigation follows the same order, including placeholders.
+        d.app.select_table_row(TableRow::Session(9));
+        for i in 0..4 {
+            d.press(KeyCode::Down);
+            assert_eq!(
+                d.app.selected_table_row(),
+                Some(TableRow::Launch(format!("pending-{i}")))
+            );
+        }
         d.press(KeyCode::Down);
         assert_eq!(d.selected(), Some(10));
         d.render();
@@ -372,7 +390,7 @@ async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets()
             .app
             .table_rows
             .iter()
-            .position(|row| *row == Some(10))
+            .position(|row| *row == TableRow::Session(10))
             .unwrap();
         let y = rect.y + 2 + (visual_index - d.app.table_state.offset()) as u16;
         let symbol = crate::config::get()
@@ -385,15 +403,21 @@ async fn ranked_pending_launches_preserve_selection_and_scrolled_mouse_targets()
             .to_string();
         assert_eq!(d.terminal.backend().buffer()[(rect.x, y)].symbol(), symbol);
         d.press(KeyCode::Up);
-        assert_eq!(d.selected(), Some(9));
+        assert_eq!(
+            d.app.selected_table_row(),
+            Some(TableRow::Launch("pending-3".into()))
+        );
 
         // Removal returns to the ordinary scroll/click mapping immediately.
         d.app.launches = Default::default();
         assert!(!d.render().contains("4 starting"));
-        assert_eq!(d.app.table_rows, (0..30).map(Some).collect::<Vec<_>>());
         assert_eq!(
-            d.app.visible_index_at(rect.y + 2, rect),
-            Some(d.app.table_state.offset())
+            d.app.table_rows,
+            (0..30).map(TableRow::Session).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            d.app.table_row_at(rect.y + 2, rect),
+            Some(TableRow::Session(d.app.table_state.offset()))
         );
     }
 }
@@ -412,6 +436,213 @@ async fn pending_launch_on_empty_and_resized_dashboards_never_becomes_a_session(
         if d.app.last_table_rect.unwrap().height > 2 {
             assert!(rendered.contains("Starting"), "{rendered}");
         }
+    }
+}
+
+#[tokio::test]
+async fn pending_enter_waits_for_confirmation_and_respects_later_input() {
+    use super::launch::{Request, TableRow, WindowLaunch};
+    use crate::backend::LaunchPlan;
+    use crate::state::HostId;
+    use crate::terminal::{SpawnResult, SpawnTarget};
+    use std::time::{Duration, Instant};
+
+    for next in [
+        "focus",
+        "double-click",
+        "ctrl-digit",
+        "no-enter",
+        "navigate",
+        "escape",
+        "quit",
+        "focus-lost",
+        "ready-navigate",
+    ] {
+        let mut d = TestDashboard::new(120, 24);
+        d.app.panels_initialized = true;
+        d.app.preview_visible = false;
+        d.app.detail_visible = false;
+        let mut first = session(1, "/work/project", SessionStatus::Idle);
+        first.name = Some("follow-up".into());
+        d.app
+            .flags
+            .entry(super::flag_key(&first))
+            .or_default()
+            .follow_up = true;
+        d.set_sessions(vec![first.clone()]);
+        let host = HostId("remote".into());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        d.app.launches.start(
+            Request {
+                agent: crate::agent::AgentControl::Codex,
+                window: WindowLaunch {
+                    local_token: "new-launch".into(),
+                    host: host.clone(),
+                    cwd: "/work/project".into(),
+                    home: "/work".into(),
+                    target: SpawnTarget::NewTab,
+                    title: "Codex: project".into(),
+                },
+                owner: None,
+            },
+            async { rx.await.unwrap() },
+        );
+
+        assert_eq!(
+            d.app.selected_table_row(),
+            Some(TableRow::Launch("new-launch".into()))
+        );
+        assert!(
+            d.app.selected_session().is_none(),
+            "actions must not target the old row"
+        );
+        for key in ['X', 'D', 'f', 'p', 'i'] {
+            assert!(
+                d.press(KeyCode::Char(key)).is_none(),
+                "pending row action {key}"
+            );
+        }
+        assert!(d.app.flags_of(&super::flag_key(&first)).follow_up);
+        assert!(!d.app.flags_of(&super::flag_key(&first)).pinned);
+        d.render();
+        let y = find_cell(d.terminal.backend().buffer(), "new-session")
+            .unwrap()
+            .1;
+        assert_eq!(
+            y,
+            find_cell(d.terminal.backend().buffer(), "follow-up")
+                .unwrap()
+                .1
+                + 1
+        );
+        let x = d.app.last_table_rect.unwrap().x;
+        assert_eq!(
+            d.terminal.backend().buffer()[(x, y)].symbol(),
+            crate::config::get()
+                .colors
+                .ui
+                .selection_symbol
+                .chars()
+                .next()
+                .unwrap()
+                .to_string()
+        );
+        // Repeating o while the row is pending retains its host and directory.
+        assert!(
+            matches!(d.press(KeyCode::Char('o')), Some(Action::NewSessionSplit { host: h, cwd, .. })
+            if h == host && cwd == "/work/project")
+        );
+        match next {
+            "no-enter" => {}
+            "double-click" => {
+                assert!(d.click(x + 2, y).is_none());
+                assert!(d.click(x + 2, y).is_none());
+            }
+            "ctrl-digit" => {
+                assert!(d.press_ctrl(KeyCode::Char('2')).is_none());
+            }
+            _ => {
+                for _ in 0..3 {
+                    assert!(d.press(KeyCode::Enter).is_none());
+                }
+            }
+        }
+        assert!(
+            d.app.take_launch_focus().is_none(),
+            "reservation is still held"
+        );
+        assert!(
+            tx.send(Ok(LaunchPlan::AttachRemote {
+                session_name: "pool-new".into(),
+                argv: vec!["remote-client".into()],
+            }))
+            .is_ok()
+        );
+
+        let spawn_calls = std::cell::Cell::new(0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while d.app.launches.working() {
+                let progress = d.app.launches.poll(
+                    |_| true,
+                    |_| {
+                        spawn_calls.set(spawn_calls.get() + 1);
+                        async {
+                            Ok(SpawnResult {
+                                window: Some(WindowId::from(42)),
+                                tab: None,
+                            })
+                        }
+                    },
+                    Instant::now(),
+                );
+                for finished in progress.finished {
+                    d.app.record_window_binding(
+                        finished.host,
+                        finished.token.unwrap(),
+                        finished.result.unwrap().window.unwrap(),
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            spawn_calls.get(),
+            1,
+            "repeated Enter must not spawn or attach twice"
+        );
+        assert!(!d.app.reconcile_launches(Instant::now()));
+        assert!(
+            d.app.take_launch_focus().is_none(),
+            "window alone is not confirmation"
+        );
+
+        // Same host and cwd are insufficient: wait for the matching token.
+        let mut confirmed = session(2, "/work/project", SessionStatus::Starting);
+        confirmed.host = host;
+        confirmed.window_id = None;
+        confirmed.pool_session = Some("pool-other".into());
+        d.set_sessions(vec![first.clone(), confirmed.clone()]);
+        assert!(!d.app.reconcile_launches(Instant::now()));
+        assert!(d.app.take_launch_focus().is_none());
+        match next {
+            "navigate" => {
+                d.press(KeyCode::Up);
+            }
+            "escape" => {
+                d.press(KeyCode::Esc);
+            }
+            "quit" => {
+                d.press(KeyCode::Char('q'));
+            }
+            "focus-lost" => {
+                d.app.focused = false;
+            }
+            _ => {}
+        }
+        confirmed.pool_session = Some("pool-new".into());
+        d.set_sessions(vec![first, confirmed]);
+        assert!(d.app.reconcile_launches(Instant::now()));
+        if next == "ready-navigate" {
+            d.press(KeyCode::Up);
+        }
+        let expected_pid = if matches!(next, "navigate" | "ready-navigate") {
+            1
+        } else {
+            2
+        };
+        assert_eq!(d.app.selected_pid(), Some(expected_pid), "{next}");
+        let action = d.app.take_launch_focus();
+        if matches!(next, "focus" | "double-click" | "ctrl-digit") {
+            assert!(matches!(action, Some(Action::FocusWindow(w)) if w == WindowId::from(42)));
+        } else {
+            assert!(action.is_none(), "{next}: must not switch windows");
+        }
+        assert!(
+            d.app.take_launch_focus().is_none(),
+            "deferred focus is consumed once"
+        );
     }
 }
 
@@ -447,6 +678,7 @@ async fn pending_and_confirmed_rows_use_identical_session_styling() {
                     },
                     std::future::pending(),
                 );
+                d.app.launches.clear_selection();
                 let rendered = d.render();
                 assert!(!rendered.contains(cwd), "a cwd is not a last prompt");
                 let y = d.app.last_table_rect.unwrap().y + 2;
@@ -462,8 +694,8 @@ async fn pending_and_confirmed_rows_use_identical_session_styling() {
                 d.app
                     .record_window_binding(host.clone(), "launch-42".into(), WindowId::from(4200));
                 d.set_sessions(vec![confirmed]);
-                // Neither row is selected: compare the session's presentation,
-                // not the cursor that appears only on an actionable real row.
+                // Neither row is selected: compare session presentation
+                // independently of the cursor highlight.
                 d.app.table_state.select(None);
                 d.render();
                 let y = d.app.last_table_rect.unwrap().y + 2;
@@ -489,7 +721,7 @@ async fn pending_and_confirmed_rows_use_identical_session_styling() {
 }
 
 #[tokio::test]
-async fn an_early_session_row_waits_for_its_window_before_becoming_selectable() {
+async fn enter_on_an_early_session_waits_for_its_window_without_attaching_twice() {
     use crate::backend::LaunchPlan;
     use crate::state::HostId;
     use crate::terminal::SpawnResult;
@@ -565,7 +797,14 @@ async fn an_early_session_row_waits_for_its_window_before_becoming_selectable() 
     assert!(d.app.reconcile_launches(Instant::now()));
     assert_eq!(d.app.visible_sessions().len(), 1);
     assert!(!d.render().contains("1 starting"));
-    d.app.table_state.select(Some(0));
+    assert_eq!(d.app.selected_pid(), Some(42));
+    assert!(
+        matches!(d.app.take_launch_focus(), Some(Action::FocusWindow(w)) if w == WindowId::from(42))
+    );
+    assert!(
+        d.app.take_launch_focus().is_none(),
+        "queued Enter is delivered only once"
+    );
     assert!(
         matches!(d.press(KeyCode::Enter), Some(Action::FocusWindow(w)) if w == WindowId::from(42))
     );

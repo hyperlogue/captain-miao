@@ -2626,72 +2626,85 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         }
 
         let poll_timeout = next_wakeup(&app, event_poll, settle_reload_at, logo_recompose_at);
-        if event::poll(poll_timeout)? {
-            let evt = event::read()?;
-            // Any input event can mutate state (selection, status, input mode,
-            // scroll offsets, etc.), so redraw on the next iteration — except a
-            // bare mouse-motion event, which `handle_mouse` ignores entirely.
-            // `EnableMouseCapture` turns on any-motion tracking, so the pointer
-            // crossing the dashboard streams `Moved` events; repainting a full
-            // frame for each is pure waste. A split-resize `Drag` still repaints,
-            // and so does any motion seen while a drag is in progress.
-            if !matches!(&evt, Event::Mouse(m)
+        // Prefer buffered input over a deferred Enter, so moving away while
+        // a launch completes can still cancel its focus request.
+        let has_event = event::poll(if app.launches.has_activation() {
+            Duration::ZERO
+        } else {
+            poll_timeout
+        })?;
+        if has_event || app.launches.has_activation() {
+            let maybe_action = if has_event {
+                let evt = event::read()?;
+                // Any input event can mutate state (selection, status, input mode,
+                // scroll offsets, etc.), so redraw on the next iteration — except a
+                // bare mouse-motion event, which `handle_mouse` ignores entirely.
+                // `EnableMouseCapture` turns on any-motion tracking, so the pointer
+                // crossing the dashboard streams `Moved` events; repainting a full
+                // frame for each is pure waste. A split-resize `Drag` still repaints,
+                // and so does any motion seen while a drag is in progress.
+                if !matches!(&evt, Event::Mouse(m)
                 if matches!(m.kind, MouseEventKind::Moved) && app.drag.is_none())
-            {
+                {
+                    needs_redraw = true;
+                }
+                match evt {
+                    Event::Key(_) | Event::Mouse(_) | Event::Paste(_) if app.should_quit => None,
+                    Event::Key(key) => {
+                        // Capture the mode *before* dispatch — handlers can
+                        // change input_mode (e.g. `/` -> Search), and we want
+                        // to attribute the keystroke to the mode it was pressed
+                        // in for frequency analysis.
+                        let mode_before = app.input_mode;
+                        let action = app.handle_key(key);
+                        super::keybind_log::record(mode_before, key, action.as_ref());
+                        action
+                    }
+                    Event::Paste(text) => {
+                        app.paste_port_forward(&text);
+                        None
+                    }
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::FocusGained => {
+                        app.focused = true;
+                        app.request_preview_refresh();
+                        // The user just came back to the dashboard — which is
+                        // exactly the move that follows closing an attach window,
+                        // and the moment a stale binding starts lying (no detached
+                        // marker, no detached tier, `Enter` aiming at a dead
+                        // window). Closing a window is invisible to every change
+                        // signal we have, so this is the closest thing to an event
+                        // for it: arm the prune now instead of waiting out up to a
+                        // full `DETACH_PRUNE_MIN_INTERVAL` of heartbeat.
+                        arm_detach_prune(&mut last_detach_prune, Instant::now());
+                        None
+                    }
+                    Event::FocusLost => {
+                        app.focused = false;
+                        app.launches.cancel_activation();
+                        None
+                    }
+                    Event::Resize(_, _) => {
+                        // Refresh the cell size (a kitty font-zoom, Ctrl+Shift+=, alters
+                        // it — it feeds the cat's sub-cell offset) and arm the logo
+                        // rebuild. The images themselves are geometry-independent — a
+                        // fixed-size mask kitty rescales into the cell box on its own —
+                        // but they don't *survive* a resize: ratatui clears the screen on
+                        // one, and kitty frees every image the clear leaves without a
+                        // placement (`App::invalidate_logo_graphics`). Re-placing alone
+                        // draws nothing and the failure is silent, so the rebuild is not
+                        // optional; debouncing it (`arm_logo_recompose`) is what keeps a
+                        // drag-resize from re-uploading per event. (Graphics capability
+                        // is fixed for the process on kitty, so this never needs to tear
+                        // down.)
+                        app.logo.caps = terminal::graphics::capability();
+                        arm_logo_recompose(&mut logo_recompose_at);
+                        None
+                    }
+                }
+            } else {
                 needs_redraw = true;
-            }
-            let maybe_action = match evt {
-                Event::Key(_) | Event::Mouse(_) | Event::Paste(_) if app.should_quit => None,
-                Event::Key(key) => {
-                    // Capture the mode *before* dispatch — handlers can
-                    // change input_mode (e.g. `/` -> Search), and we want
-                    // to attribute the keystroke to the mode it was pressed
-                    // in for frequency analysis.
-                    let mode_before = app.input_mode;
-                    let action = app.handle_key(key);
-                    super::keybind_log::record(mode_before, key, action.as_ref());
-                    action
-                }
-                Event::Paste(text) => {
-                    app.paste_port_forward(&text);
-                    None
-                }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::FocusGained => {
-                    app.focused = true;
-                    app.request_preview_refresh();
-                    // The user just came back to the dashboard — which is
-                    // exactly the move that follows closing an attach window,
-                    // and the moment a stale binding starts lying (no detached
-                    // marker, no detached tier, `Enter` aiming at a dead
-                    // window). Closing a window is invisible to every change
-                    // signal we have, so this is the closest thing to an event
-                    // for it: arm the prune now instead of waiting out up to a
-                    // full `DETACH_PRUNE_MIN_INTERVAL` of heartbeat.
-                    arm_detach_prune(&mut last_detach_prune, Instant::now());
-                    None
-                }
-                Event::FocusLost => {
-                    app.focused = false;
-                    None
-                }
-                Event::Resize(_, _) => {
-                    // Refresh the cell size (a kitty font-zoom, Ctrl+Shift+=, alters
-                    // it — it feeds the cat's sub-cell offset) and arm the logo
-                    // rebuild. The images themselves are geometry-independent — a
-                    // fixed-size mask kitty rescales into the cell box on its own —
-                    // but they don't *survive* a resize: ratatui clears the screen on
-                    // one, and kitty frees every image the clear leaves without a
-                    // placement (`App::invalidate_logo_graphics`). Re-placing alone
-                    // draws nothing and the failure is silent, so the rebuild is not
-                    // optional; debouncing it (`arm_logo_recompose`) is what keeps a
-                    // drag-resize from re-uploading per event. (Graphics capability
-                    // is fixed for the process on kitty, so this never needs to tear
-                    // down.)
-                    app.logo.caps = terminal::graphics::capability();
-                    arm_logo_recompose(&mut logo_recompose_at);
-                    None
-                }
+                app.take_launch_focus()
             };
             if let Some(action) = maybe_action {
                 // An attach is the slowest action here — it spawns a window and,
@@ -3163,6 +3176,15 @@ mod tests {
             );
 
             assert_eq!(app.launches.visible(&app.sessions).len(), 1);
+            assert!(
+                app.launches.selected().is_some(),
+                "select before the RPC replies"
+            );
+            assert!(app.selected_session().is_none());
+            assert!(
+                app.focus_selected().is_none(),
+                "Enter queues without blocking"
+            );
             assert_eq!(app.sessions.len(), 1, "a placeholder is not launcher state");
             assert!(
                 next_wakeup(&app, Duration::from_secs(1), None, None) <= Duration::from_millis(30)
@@ -3173,6 +3195,12 @@ mod tests {
             let mut fs_dirty = false;
             assert!(poll_launches(&mut app, &mut fs_dirty));
             assert!(app.launches.is_empty());
+            assert!(app.launches.selected().is_none());
+            assert!(app.take_launch_focus().is_none());
+            assert!(
+                app.selected_session().is_some(),
+                "failure restores a real selection"
+            );
             assert!(!fs_dirty, "a failed reservation creates no window");
             assert!(app.window_bindings.is_empty());
         }

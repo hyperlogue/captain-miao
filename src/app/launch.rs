@@ -5,6 +5,11 @@
 //! starts a window, so even an immediate attach-exit report can be retained.
 //! Host + token is the only reconciliation key. Directory, agent and arrival
 //! order cannot distinguish two launches requested in the same directory.
+//!
+//! The newest placeholder takes the cursor immediately. Enter queues one
+//! focus request until both its window and matching session are available;
+//! further input cancels that request. Other session actions require real
+//! launcher state. Selection and rendering share the same ranked row order.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -116,7 +121,8 @@ pub(super) struct Pending {
     pub created_at: u64,
     token: Option<String>,
     phase: Phase,
-    focus: bool,
+    selected: bool,
+    activate: bool,
     reports: Vec<DetachReport>,
 }
 
@@ -152,6 +158,8 @@ pub(super) enum Report {
 #[derive(Default)]
 pub(super) struct Launches {
     pending: Vec<Pending>,
+    /// Enter on a placeholder becomes a normal focus action after confirmation.
+    activation: Option<FlagKey>,
 }
 
 impl Launches {
@@ -160,13 +168,14 @@ impl Launches {
         request: Request,
         open: impl Future<Output = anyhow::Result<LaunchPlan>> + Send + 'static,
     ) {
-        self.cancel_focus();
+        self.clear_selection();
         self.pending.push(Pending {
             request,
             created_at: LauncherState::now(),
             token: None,
             phase: Phase::Opening(work(open)),
-            focus: true,
+            selected: true,
+            activate: false,
             reports: Vec::new(),
         });
     }
@@ -248,14 +257,18 @@ impl Launches {
         now: Instant,
     ) -> (Option<FlagKey>, Vec<HostId>) {
         let mut focus = None;
+        let mut activation = None;
         let mut expired = Vec::new();
         self.pending.retain(|pending| {
             let Phase::Waiting(since) = pending.phase else {
                 return true;
             };
             if let Some(session) = sessions.iter().find(|s| pending.matches(s)) {
-                if pending.focus {
+                if pending.selected {
                     focus = Some(super::flag_key(session));
+                    if pending.activate {
+                        activation = focus.clone();
+                    }
                 }
                 return false;
             }
@@ -265,13 +278,55 @@ impl Launches {
             }
             true
         });
+        if activation.is_some() {
+            self.activation = activation;
+        }
         (focus, expired)
     }
 
-    pub fn cancel_focus(&mut self) {
+    pub fn clear_selection(&mut self) {
+        self.cancel_activation();
         for pending in &mut self.pending {
-            pending.focus = false;
+            pending.selected = false;
         }
+    }
+
+    pub fn selected(&self) -> Option<&Pending> {
+        self.pending.iter().find(|pending| pending.selected)
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Pending> {
+        self.pending
+            .iter()
+            .find(|p| p.request.window.local_token == id)
+    }
+
+    fn select(&mut self, id: &str) {
+        self.clear_selection();
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|p| p.request.window.local_token == id)
+        {
+            pending.selected = true;
+        }
+    }
+
+    pub fn cancel_activation(&mut self) {
+        self.activation = None;
+        for pending in &mut self.pending {
+            pending.activate = false;
+        }
+    }
+
+    pub fn request_activation(&mut self) {
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.selected) {
+            pending.activate = true;
+        }
+    }
+
+    pub fn has_activation(&self) -> bool {
+        self.activation.is_some()
     }
 
     /// A window can exit before its spawn command reports the id. Keep that
@@ -310,7 +365,85 @@ impl Launches {
     }
 }
 
+/// Real-session indices keep existing command and cache semantics; launch IDs
+/// give placeholders a stable cursor target without inventing launcher state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TableRow {
+    Session(usize),
+    Launch(String),
+}
+
 impl super::App {
+    pub(super) fn ranked_table_rows(&self) -> Vec<TableRow> {
+        let pending = self.launches.visible(&self.sessions);
+        if pending.is_empty() {
+            return (0..self.visible_len()).map(TableRow::Session).collect();
+        }
+        let mut rows: Vec<_> = self
+            .visible_sessions()
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                (
+                    super::session_sort_key(
+                        &s.status,
+                        self.flags_of(&super::flag_key(s)),
+                        self.is_detached_row(s),
+                        s.updated_at,
+                        s.active_since,
+                    ),
+                    TableRow::Session(index),
+                )
+            })
+            .collect();
+        rows.extend(pending.into_iter().map(|p| {
+            (
+                super::session_sort_key(
+                    &crate::state::SessionStatus::Starting,
+                    super::SessionFlags::default(),
+                    false,
+                    p.created_at,
+                    None,
+                ),
+                TableRow::Launch(p.request.window.local_token.clone()),
+            )
+        }));
+        rows.sort_by_key(|(key, _)| *key);
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    pub(super) fn selected_table_row(&self) -> Option<TableRow> {
+        self.launches
+            .selected()
+            .map(|p| TableRow::Launch(p.request.window.local_token.clone()))
+            .or_else(|| self.table_state.selected().map(TableRow::Session))
+    }
+
+    pub(super) fn select_table_row(&mut self, row: TableRow) {
+        match row {
+            TableRow::Session(index) => {
+                self.launches.clear_selection();
+                self.table_state.select(Some(index));
+            }
+            TableRow::Launch(id) => self.launches.select(&id),
+        }
+    }
+
+    /// Deliver a queued Enter through the ordinary focus path, once, and only
+    /// if the user still points at its session on the focused dashboard.
+    pub(super) fn take_launch_focus(&mut self) -> Option<super::Action> {
+        let key = self.launches.activation.take()?;
+        if self.should_quit
+            || !self.focused
+            || self.input_mode != super::InputMode::Normal
+            || self.session_detail
+            || self.selected_key().as_ref() != Some(&key)
+        {
+            return None;
+        }
+        self.focus_selected()
+    }
+
     pub(super) fn reconcile_launches(&mut self, now: Instant) -> bool {
         let before = self.launches.pending.len();
         let (focus, expired) = self.launches.reconcile(&self.sessions, now);
@@ -470,7 +603,9 @@ mod tests {
     async fn repeated_launches_reconcile_independently_and_only_latest_can_select() {
         let mut launches = Launches::default();
         launches.start(request("remote", "L1"), async { Ok(plan("pool-a")) });
+        launches.request_activation();
         launches.start(request("remote", "L2"), async { Ok(plan("pool-b")) });
+        launches.request_activation();
         assert_eq!(launches.visible(&[]).len(), 2);
         assert_eq!(finish(&mut launches).await.len(), 2);
         assert!(!launches.working());
@@ -480,6 +615,7 @@ mod tests {
         );
         let first = row("remote", "pool-a", 1);
         assert!(launches.reconcile(&[first], Instant::now()).0.is_none());
+        assert!(!launches.has_activation());
         assert_eq!(launches.visible(&[]).len(), 1);
         let second = row("remote", "pool-b", 2);
         assert_eq!(
@@ -487,6 +623,7 @@ mod tests {
             Some((HostId("remote".into()), 2))
         );
         assert!(launches.visible(&[]).is_empty());
+        assert_eq!(launches.activation, Some((HostId("remote".into()), 2)));
     }
 
     #[tokio::test]
@@ -494,7 +631,7 @@ mod tests {
         let mut launches = Launches::default();
         launches.start(request("remote", "L1"), async { Ok(plan("pool-a")) });
         finish(&mut launches).await;
-        launches.cancel_focus();
+        launches.clear_selection();
         assert!(
             launches
                 .reconcile(&[row("remote", "pool-a", 1)], Instant::now())
@@ -503,6 +640,7 @@ mod tests {
         );
 
         launches.start(request("remote", "L2"), async { Ok(plan("pool-b")) });
+        launches.request_activation();
         finish(&mut launches).await;
         let now = Instant::now();
         assert!(launches.reconcile(&[], now).1.is_empty());
@@ -511,6 +649,8 @@ mod tests {
         assert_eq!(expired, vec![HostId("remote".into())]);
         assert!(launches.visible(&[]).is_empty());
         assert!(launches.is_empty(), "confirmation timeout also allows quit");
+        assert!(launches.selected().is_none());
+        assert!(!launches.has_activation());
         assert!(
             launches
                 .reconcile(&[row("remote", "pool-b", 2)], now + CONFIRM_TIMEOUT)
@@ -572,6 +712,7 @@ mod tests {
                 }
                 Ok(plan("pool-a"))
             });
+            launches.request_activation();
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let finished = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -604,6 +745,8 @@ mod tests {
             assert_eq!(finished.len(), 1, "{failure}");
             assert!(finished[0].result.is_err(), "{failure}");
             assert!(launches.visible(&[]).is_empty(), "{failure}");
+            assert!(launches.selected().is_none(), "{failure}");
+            assert!(!launches.has_activation(), "{failure}");
             assert!(!launches.working(), "{failure}");
             assert_eq!(
                 calls.load(Ordering::Relaxed),

@@ -65,9 +65,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        // A background completion may select its new row only while the user
-        // has not moved on. Another launch arms its own focus after dispatch.
-        self.launches.cancel_focus();
+        // Further input cancels a queued Enter. FocusSelected re-arms it;
+        // ordinary cursor movement explicitly selects its new row below.
+        self.launches.cancel_activation();
         // Ctrl+c always quits, regardless of current mode. Extra modifiers
         // describe a different chord and must not silently turn it into quit.
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -96,7 +96,7 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
         if !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
-            self.launches.cancel_focus();
+            self.launches.cancel_activation();
         }
         if self.upgrade_notices.is_some() {
             return self.handle_upgrade_notices_mouse(mouse);
@@ -221,15 +221,15 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if in_table => {
                 let rect = self.last_table_rect?;
-                let Some(idx) = self.visible_index_at(mouse.row, rect) else {
+                let Some(row) = self.table_row_at(mouse.row, rect) else {
                     self.last_click = None;
                     return None;
                 };
-                self.table_state.select(Some(idx));
+                self.select_table_row(row.clone());
 
                 let now = Instant::now();
-                let is_double = self.last_click.is_some_and(|(t, r)| {
-                    r == idx && now.duration_since(t) <= DOUBLE_CLICK_THRESHOLD
+                let is_double = self.last_click.as_ref().is_some_and(|(t, r)| {
+                    *r == row && now.duration_since(*t) <= DOUBLE_CLICK_THRESHOLD
                 });
                 if is_double {
                     self.last_click = None;
@@ -238,7 +238,7 @@ impl App {
                     // remote row with no local window attaches it over ssh.
                     return self.focus_selected();
                 }
-                self.last_click = Some((now, idx));
+                self.last_click = Some((now, row));
                 None
             }
             MouseEventKind::ScrollUp if in_preview => {
@@ -335,9 +335,8 @@ impl App {
         // configured prefix. An unknown g X sequence must never kill a row.
         // A configured binding/prefix on g takes precedence when it begins.
         if was_g {
-            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() && self.visible_len() != 0
-            {
-                self.table_state.select(Some(0));
+            if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+                self.select_visible_by_index(0);
             }
             return None;
         }
@@ -391,9 +390,8 @@ impl App {
                 None
             }
             Command::JumpBottom => {
-                let len = self.visible_len();
-                if len > 0 {
-                    self.table_state.select(Some(len - 1));
+                if let Some(row) = self.ranked_table_rows().pop() {
+                    self.select_table_row(row);
                 }
                 None
             }
@@ -407,10 +405,7 @@ impl App {
                         // session's* host, so `o` on a remote row starts another
                         // session on that server (its pty pool) in the same
                         // workdir. Falls back to local when nothing's selected.
-                        host: self
-                            .selected_session_ref()
-                            .map(|s| s.host.clone())
-                            .unwrap_or_else(HostId::local),
+                        host: self.selected_host().cloned().unwrap_or_else(HostId::local),
                         // `o` is the no-questions path — same cwd, straight to a
                         // window. Isolation is a decision, so it lives on `O`'s
                         // picker (`Ctrl-w`) where it can be seen before Enter.

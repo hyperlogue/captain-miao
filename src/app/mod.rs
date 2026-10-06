@@ -871,10 +871,10 @@ pub(super) struct WorkdirCompletion {
 pub(super) struct App {
     pub(super) sessions: Vec<LauncherState>,
     pub(in crate::app) launches: launch::Launches,
-    /// Last rendered order: a real row's visible-session index, or `None` for
-    /// a pending launch. Mouse hit-testing uses the same order as rendering.
-    pub(super) table_rows: Vec<Option<usize>>,
-    /// Selection indexes visible sessions (only real rows are actionable).
+    /// Last rendered order, shared with mouse hit-testing.
+    pub(in crate::app) table_rows: Vec<launch::TableRow>,
+    /// Selection indexes real sessions. A selected launch takes precedence,
+    /// retaining this index as a fallback if that launch fails.
     /// The scroll offset indexes `table_rows`, including pending launches.
     pub(super) table_state: TableState,
     pub(super) should_quit: bool,
@@ -1172,10 +1172,10 @@ pub(super) struct App {
     /// flags — user toggles are the only source of truth.
     pub(super) panels_initialized: bool,
     pub(super) drag: Option<DragTarget>,
-    /// Timestamp + visible-row index of the last left-click in the table. A
+    /// Timestamp + row target of the last left-click in the table. A
     /// second click on the same row within `DOUBLE_CLICK_THRESHOLD` is treated
     /// as a double-click and focuses that session's window.
-    pub(super) last_click: Option<(Instant, usize)>,
+    pub(in crate::app) last_click: Option<(Instant, launch::TableRow)>,
     /// Presentation copy of host-owned pins and follow-up flags. The backend
     /// owns automatic transitions and persistence; pin ordering stays local.
     pub(super) flags: HashMap<FlagKey, SessionFlags>,
@@ -3364,12 +3364,16 @@ impl App {
         Some(&self.sessions[idx])
     }
 
-    /// Map a screen row (a mouse event's `row`) to the visible-session index it
-    /// lands on, or `None` for chrome, pending launches, or empty space.
+    /// Map a screen row (a mouse event's `row`) to the table row it
+    /// lands on, or `None` for chrome or empty space.
     /// `draw_table` uses a top border and a header, so data starts two rows
     /// below the rect's top. Both the scroll offset and the hit map use the
     /// rendered order, which includes pending launches between real sessions.
-    pub(super) fn visible_index_at(&self, screen_row: u16, table_rect: Rect) -> Option<usize> {
+    pub(in crate::app) fn table_row_at(
+        &self,
+        screen_row: u16,
+        table_rect: Rect,
+    ) -> Option<launch::TableRow> {
         // Top border (1) + header (1) rows above the first data row.
         const CHROME_ROWS: u16 = 2;
         let first_row_y = table_rect.y + CHROME_ROWS;
@@ -3377,7 +3381,7 @@ impl App {
             return None;
         }
         let idx = self.table_state.offset() + (screen_row - first_row_y) as usize;
-        self.table_rows.get(idx).copied().flatten()
+        self.table_rows.get(idx).cloned()
     }
 
     fn compute_visible_indices(&self) -> Vec<usize> {
@@ -4079,6 +4083,7 @@ impl App {
     }
 
     pub(super) fn reset_selection(&mut self) {
+        self.launches.clear_selection();
         let len = self.visible_len();
         self.table_state
             .select(if len == 0 { None } else { Some(0) });
@@ -4110,6 +4115,9 @@ impl App {
     /// since the reference points into `self.sessions`, not the temporary
     /// `visible_sessions` Vec, so it outlives that Vec.
     pub(super) fn selected_session_ref(&self) -> Option<&LauncherState> {
+        if self.launches.selected().is_some() {
+            return None;
+        }
         let i = self.table_state.selected()?;
         self.nth_visible(i)
     }
@@ -4635,6 +4643,10 @@ impl App {
     /// aren't attached to yet); the follow-up bell is cleared when an action is
     /// produced, like `Enter`.
     pub(super) fn focus_selected(&mut self) -> Option<Action> {
+        if self.launches.selected().is_some() {
+            self.launches.request_activation();
+            return None;
+        }
         let s = self.selected_session()?;
         let action = self.focus_or_attach(&s);
         if action.is_some()
@@ -4658,13 +4670,23 @@ impl App {
             .visible_sessions()
             .iter()
             .position(|s| matches_key(s, key))?;
-        self.table_state.select(Some(idx));
+        self.select_table_row(launch::TableRow::Session(idx));
         let s = self.selected_session()?;
         self.focus_or_attach(&s)
     }
 
     pub(super) fn selected_cwd(&self) -> Option<String> {
-        self.selected_session_ref().map(|s| s.cwd.clone())
+        self.launches
+            .selected()
+            .map(|p| p.request.window.cwd.clone())
+            .or_else(|| self.selected_session_ref().map(|s| s.cwd.clone()))
+    }
+
+    pub(super) fn selected_host(&self) -> Option<&HostId> {
+        self.launches
+            .selected()
+            .map(|p| &p.request.window.host)
+            .or_else(|| self.selected_session_ref().map(|s| &s.host))
     }
 
     /// The selected session's flag-map key (host + pid).
@@ -4819,7 +4841,11 @@ impl App {
     /// otherwise.
     pub(super) fn jump_to_next_attention(&mut self) {
         let visible = self.visible_sessions();
-        let current = self.table_state.selected().unwrap_or(usize::MAX);
+        let current = if self.launches.selected().is_some() {
+            usize::MAX
+        } else {
+            self.table_state.selected().unwrap_or(usize::MAX)
+        };
         let mut skipped_detached = false;
         let attention_indices: Vec<usize> = visible
             .iter()
@@ -4883,28 +4909,27 @@ impl App {
             self.set_status("Only one session needs attention".to_string(), false);
             return;
         }
-        self.table_state.select(Some(next));
+        self.select_table_row(launch::TableRow::Session(next));
     }
 
-    /// Select the N-th visible session (0-indexed). Returns None always —
+    /// Select the N-th displayed row, including pending launches (0-indexed).
+    /// Returns None always —
     /// pure cursor move, no Kitty interaction.
     pub(super) fn select_visible_by_index(&mut self, idx: usize) -> Option<Action> {
-        if idx < self.visible_len() {
-            self.table_state.select(Some(idx));
+        if let Some(row) = self.ranked_table_rows().into_iter().nth(idx) {
+            self.select_table_row(row);
         }
         None
     }
 
-    /// Select the N-th visible session (0-indexed) and focus (or attach to) it,
+    /// Select the N-th displayed row (0-indexed) and focus (or attach to) it,
     /// clearing the follow_up flag like Enter does. Routes through
     /// `focus_selected`, so a running remote row with no local window attaches
     /// over ssh exactly as Enter would. Returns None when the index is out of
     /// range or the session has nothing to focus/attach.
     pub(super) fn focus_visible_by_index(&mut self, idx: usize) -> Option<Action> {
-        if idx >= self.visible_len() {
-            return None;
-        }
-        self.table_state.select(Some(idx));
+        let row = self.ranked_table_rows().into_iter().nth(idx)?;
+        self.select_table_row(row);
         self.focus_selected()
     }
 
@@ -5269,27 +5294,30 @@ impl App {
     // =============================================================================
 
     pub(super) fn select_next(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            return;
-        }
-        let i = self
-            .table_state
-            .selected()
-            .map_or(0, |i| (i + 1).min(len - 1));
-        self.table_state.select(Some(i));
+        self.move_table_selection(true);
     }
 
     pub(super) fn select_prev(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
+        self.move_table_selection(false);
+    }
+
+    fn move_table_selection(&mut self, forward: bool) {
+        let rows = self.ranked_table_rows();
+        if rows.is_empty() {
             return;
         }
-        let i = self
-            .table_state
-            .selected()
-            .map_or(0, |i| i.saturating_sub(1));
-        self.table_state.select(Some(i));
+        let selected = self.selected_table_row();
+        let i = rows
+            .iter()
+            .position(|row| Some(row) == selected.as_ref())
+            .map_or(0, |i| {
+                if forward {
+                    (i + 1).min(rows.len() - 1)
+                } else {
+                    i.saturating_sub(1)
+                }
+            });
+        self.select_table_row(rows[i].clone());
     }
 
     pub(super) fn scroll_preview_up(&mut self) {

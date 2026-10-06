@@ -1081,162 +1081,145 @@ impl App {
         // In search mode, dim every column except the Name column so the eye
         // lands on the titles being filtered. The row-level DIM below covers
         // all cells; the Name cell removes it to stay bright.
-        let mut ranked_rows: Vec<_> = visible
+        let table_rows = self.ranked_table_rows();
+        let mut rows: Vec<Row> = table_rows
             .iter()
-            .enumerate()
-            .map(|(index, s)| {
-                let flags = self.flags_of(&super::flag_key(s));
-                let important = flags.pinned;
-                let follow_up = flags.follow_up;
-                // A row that lives in another terminal instance is visible but
-                // window-inert (D6). Dimming is the whole of the signal now —
-                // the detail panel names the instance for the selected row.
-                let foreign = self.foreign_terminal(s).is_some();
-                // Running on its host with no window on this screen (§9). It
-                // already sinks to its own sort tier; dimming says the same
-                // thing where the eye lands first, so a screenful of detached
-                // rows reads as background rather than as a list you're behind
-                // on. The override glyph alone was too quiet for that.
-                // …and *which* detached it is picks the glyph: nobody there, or
-                // another client holding it.
-                let detached_kind = self.detached_kind(s);
-                let detached = detached_kind.is_some();
-                let status_text = s.status_label();
-                let name = truncate_str(
-                    &session_display_name(s, self.index_of(s), &self.random_names),
-                    name_col_max as usize,
-                );
+            .map(|entry| match entry {
+                super::launch::TableRow::Session(index) => {
+                    let s = visible[*index];
+                    let flags = self.flags_of(&super::flag_key(s));
+                    let important = flags.pinned;
+                    let follow_up = flags.follow_up;
+                    // A row that lives in another terminal instance is visible but
+                    // window-inert (D6). Dimming is the whole of the signal now —
+                    // the detail panel names the instance for the selected row.
+                    let foreign = self.foreign_terminal(s).is_some();
+                    // Running on its host with no window on this screen (§9). It
+                    // already sinks to its own sort tier; dimming says the same
+                    // thing where the eye lands first, so a screenful of detached
+                    // rows reads as background rather than as a list you're behind
+                    // on. The override glyph alone was too quiet for that.
+                    // …and *which* detached it is picks the glyph: nobody there, or
+                    // another client holding it.
+                    let detached_kind = self.detached_kind(s);
+                    let detached = detached_kind.is_some();
+                    let status_text = s.status_label();
+                    let name = truncate_str(
+                        &session_display_name(s, self.index_of(s), &self.random_names),
+                        name_col_max as usize,
+                    );
 
-                // The override indicator is the status cell's indent, not a
-                // column — see `override_indicator_spans`. It brings its own
-                // padding, so the status label always starts at the same offset.
-                let status_fg = super::format::status_fg(&s.status, follow_up);
-                let mut status_spans =
-                    override_indicator_spans(follow_up, important, detached_kind);
-                status_spans.push(Span::styled(status_text, Style::default().fg(status_fg)));
-                let status_cell = Cell::from(Line::from(status_spans));
-                let name_cell = if search_active {
-                    // Cancel the row-level DIM so the name column stays bright.
-                    Cell::from(name).style(Style::default().remove_modifier(Modifier::DIM))
-                } else {
-                    Cell::from(name)
-                };
-                let icon_cell = Cell::from(self.session_icon_line(&s.host, &s.cwd, show_host));
-                // The narrow layout keeps only status / workdir icon / name; the
-                // context, last-prompt and updated columns are dropped.
-                let mut row_cells = vec![status_cell, icon_cell, name_cell];
-                if !narrow {
-                    let ctx_tokens = s.context_tokens;
-                    // Blank is "no number yet". A backend that persists no
-                    // context total at all (`AgentCapabilities::context_tokens`)
-                    // would otherwise leave this column permanently blank and
-                    // indistinguishable from a session still on its first turn —
-                    // so it says `n/a`, dimmed.
-                    let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
-                        (Some(t), _) => format_tokens(t),
-                        (None, true) => String::new(),
-                        (None, false) => "n/a".to_string(),
+                    // The override indicator is the status cell's indent, not a
+                    // column — see `override_indicator_spans`. It brings its own
+                    // padding, so the status label always starts at the same offset.
+                    let status_fg = super::format::status_fg(&s.status, follow_up);
+                    let mut status_spans =
+                        override_indicator_spans(follow_up, important, detached_kind);
+                    status_spans.push(Span::styled(status_text, Style::default().fg(status_fg)));
+                    let status_cell = Cell::from(Line::from(status_spans));
+                    let name_cell = if search_active {
+                        // Cancel the row-level DIM so the name column stays bright.
+                        Cell::from(name).style(Style::default().remove_modifier(Modifier::DIM))
+                    } else {
+                        Cell::from(name)
                     };
-                    let ctx_style = ctx_tokens
-                        .map(|t| context_pressure_style(t, s.context_window))
-                        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
-                    let last_prompt = s
-                        .last_prompt
-                        .as_deref()
-                        .map(last_prompt_text)
-                        .map(|p| p.replace('\n', " "))
-                        .unwrap_or_default();
-                    let elapsed = Cell::from(elapsed_line(now.saturating_sub(s.updated_at)));
-                    row_cells.push(
-                        Cell::from(Line::from(ctx).alignment(Alignment::Right)).style(ctx_style),
-                    );
-                    row_cells.push(
-                        Cell::from(last_prompt).style(Style::default().add_modifier(Modifier::DIM)),
-                    );
-                    row_cells.push(elapsed);
+                    let icon_cell = Cell::from(self.session_icon_line(&s.host, &s.cwd, show_host));
+                    // The narrow layout keeps only status / workdir icon / name; the
+                    // context, last-prompt and updated columns are dropped.
+                    let mut row_cells = vec![status_cell, icon_cell, name_cell];
+                    if !narrow {
+                        let ctx_tokens = s.context_tokens;
+                        // Blank is "no number yet". A backend that persists no
+                        // context total at all (`AgentCapabilities::context_tokens`)
+                        // would otherwise leave this column permanently blank and
+                        // indistinguishable from a session still on its first turn —
+                        // so it says `n/a`, dimmed.
+                        let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
+                            (Some(t), _) => format_tokens(t),
+                            (None, true) => String::new(),
+                            (None, false) => "n/a".to_string(),
+                        };
+                        let ctx_style = ctx_tokens
+                            .map(|t| context_pressure_style(t, s.context_window))
+                            .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
+                        let last_prompt = s
+                            .last_prompt
+                            .as_deref()
+                            .map(last_prompt_text)
+                            .map(|p| p.replace('\n', " "))
+                            .unwrap_or_default();
+                        let elapsed = Cell::from(elapsed_line(now.saturating_sub(s.updated_at)));
+                        row_cells.push(
+                            Cell::from(Line::from(ctx).alignment(Alignment::Right))
+                                .style(ctx_style),
+                        );
+                        row_cells.push(
+                            Cell::from(last_prompt)
+                                .style(Style::default().add_modifier(Modifier::DIM)),
+                        );
+                        row_cells.push(elapsed);
+                    }
+                    let row = Row::new(row_cells);
+                    if search_active || foreign || detached {
+                        row.style(Style::default().add_modifier(Modifier::DIM))
+                    } else {
+                        row
+                    }
                 }
-                let row = Row::new(row_cells);
-                let row = if search_active || foreign || detached {
-                    row.style(Style::default().add_modifier(Modifier::DIM))
-                } else {
-                    row
-                };
-                let order = super::session_sort_key(
-                    &s.status,
-                    flags,
-                    detached,
-                    s.updated_at,
-                    s.active_since,
-                );
-                (order, Some(index), row)
+                super::launch::TableRow::Launch(id) => {
+                    let pending = self.launches.get(id).expect("rendered launch exists");
+                    let request = &pending.request;
+                    let mut status = override_indicator_spans(false, false, None);
+                    status.push(Span::styled(
+                        SessionStatus::Starting.label(),
+                        Style::default()
+                            .fg(super::format::status_fg(&SessionStatus::Starting, false)),
+                    ));
+                    let name = Cell::from(truncate_str("new-session", name_col_max as usize))
+                        .style(Style::default().remove_modifier(Modifier::DIM));
+                    let mut cells = vec![
+                        Cell::from(Line::from(status)),
+                        Cell::from(self.session_icon_line(
+                            &request.window.host,
+                            &request.window.cwd,
+                            show_host,
+                        )),
+                        name,
+                    ];
+                    if !narrow {
+                        let ctx = if request.agent.capabilities().context_tokens {
+                            ""
+                        } else {
+                            "n/a"
+                        };
+                        cells.push(
+                            Cell::from(Line::from(ctx).alignment(Alignment::Right))
+                                .style(Style::default().add_modifier(Modifier::DIM)),
+                        );
+                        cells.push(
+                            Cell::from("").style(Style::default().add_modifier(Modifier::DIM)),
+                        );
+                        cells.push(Cell::from(elapsed_line(
+                            now.saturating_sub(pending.created_at),
+                        )));
+                    }
+                    let row = Row::new(cells);
+                    if search_active {
+                        row.style(Style::default().add_modifier(Modifier::DIM))
+                    } else {
+                        row
+                    }
+                }
             })
             .collect();
-
-        for pending in self.launches.visible(&self.sessions) {
-            let request = &pending.request;
-            let mut status = override_indicator_spans(false, false, None);
-            status.push(Span::styled(
-                SessionStatus::Starting.label(),
-                Style::default().fg(super::format::status_fg(&SessionStatus::Starting, false)),
-            ));
-            let name = Cell::from(truncate_str("new-session", name_col_max as usize))
-                .style(Style::default().remove_modifier(Modifier::DIM));
-            let mut cells = vec![
-                Cell::from(Line::from(status)),
-                Cell::from(self.session_icon_line(
-                    &request.window.host,
-                    &request.window.cwd,
-                    show_host,
-                )),
-                name,
-            ];
-            if !narrow {
-                let ctx = if request.agent.capabilities().context_tokens {
-                    ""
-                } else {
-                    "n/a"
-                };
-                cells.push(
-                    Cell::from(Line::from(ctx).alignment(Alignment::Right))
-                        .style(Style::default().add_modifier(Modifier::DIM)),
-                );
-                cells.push(Cell::from("").style(Style::default().add_modifier(Modifier::DIM)));
-                cells.push(Cell::from(elapsed_line(
-                    now.saturating_sub(pending.created_at),
-                )));
-            }
-            let row = Row::new(cells);
-            let row = if search_active {
-                row.style(Style::default().add_modifier(Modifier::DIM))
-            } else {
-                row
-            };
-            let order = super::session_sort_key(
-                &SessionStatus::Starting,
-                super::SessionFlags::default(),
-                false,
-                pending.created_at,
-                None,
-            );
-            ranked_rows.push((order, None, row));
-        }
-        // Use the same sort key for both kinds of row. A pending launch has
-        // the ordinary Starting/Idle rank, below pins and attention sessions.
-        if pending_count > 0 {
-            ranked_rows.sort_by_key(|(order, _, _)| *order);
-        }
-        let (table_rows, mut rows): (Vec<_>, Vec<_>) = ranked_rows
-            .into_iter()
-            .map(|(_, index, row)| (index, row))
-            .unzip();
-        // Commands and keyboard movement index only real sessions. Translate
-        // that selection for ratatui, whose rows also include pending launches.
-        // Its scroll offset is already in this combined display order.
+        // Ratatui indexes the combined order; real-session commands retain
+        // their existing indices while placeholders are selected by launch ID.
         let mut render_state = self.table_state;
+        let selected = self.selected_table_row();
         render_state.select(
-            self.table_state
-                .selected()
-                .and_then(|selected| table_rows.iter().position(|index| *index == Some(selected))),
+            table_rows
+                .iter()
+                .position(|row| Some(row) == selected.as_ref()),
         );
 
         // A host still dialing mirrors no sessions yet, so the table would
@@ -1244,7 +1227,7 @@ impl App {
         // at startup, where an empty list looks like an answer. The line goes
         // *in the table*, where the missing rows will appear, rather than in the
         // panel title. It is chrome, not a session: dim, unselectable
-        // (absent from the real-row hit map), and uncounted by
+        // (absent from the row hit map), and uncounted by
         // the title's total, so a full list simply clips it like any other
         // trailing row.
         if let Some(label) = connecting_row_label(&self.connecting_hosts()) {
