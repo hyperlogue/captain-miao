@@ -494,10 +494,6 @@ struct DashboardOverrides {
     /// Dashboard version last used past any startup announcements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_dashboard_version: Option<String>,
-    /// Stable announcement ids, shared with preferences so new items can be
-    /// delivered even when their release version was already acknowledged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    acknowledged_announcements: Option<Vec<String>>,
     /// Presentation order only. Legacy pin flags are imported by cm-core;
     /// their former array still supplies the initial local ordering.
     #[serde(default, alias = "pinned")]

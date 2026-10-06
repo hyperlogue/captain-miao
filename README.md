@@ -450,23 +450,25 @@ them. The acknowledgement survives restarts; your configured
 `close_session` (or `kill`) and `dismiss_notification` bindings remain in effect.
 Fresh installs skip existing announcements. Existing use is detected from saved
 dashboard preferences or window bindings before startup writes new state.
-The dashboard stores announcement IDs and `last_dashboard_version` in
-`dashboard-overrides.json`. Unseen items open the inbox once their introduction
-version is reached, including additions to a version you already acknowledged.
-The list shows all announcements from each release with unseen items, including
-previously acknowledged updates. The server-upgrade warning therefore opens an
-overview containing both it and the earlier shortcut notice. Skipping releases
-includes every release with unseen announcements, oldest first, with each item's
-version shown in the list and details. Quitting with
-Ctrl+C before acknowledgement leaves the batch pending for the next launch.
-Ordinary preference saves preserve acknowledgements.
+The dashboard stores only `last_dashboard_version` in
+`dashboard-overrides.json` to track announcements. Upgrading from version `x`
+to `y` shows every announcement introduced in `(x, y]`, oldest first, with each
+item's version shown in the list and details. This includes all announcements
+from skipped releases. The same version and downgrades show no announcements;
+adding an item to an already-seen version does not reopen the inbox.
+Acknowledging the batch records `y`. Quitting with Ctrl+C first leaves `x`
+unchanged, so the batch appears on the next launch. Ordinary preference saves
+preserve the version. Fresh installs and launches without announcements record
+the current version immediately. Existing dashboards without a recorded version
+see all applicable announcements once.
 
 New announcements are declared in the
 [`ANNOUNCEMENTS` catalog](src/app/announcements.rs) with a stable ID,
 introduction version, title, kind (`Update` or `Warning`), and content.
 Feature promotions and migrations use the same inbox. Text, headings, code
 snippets, and active shortcut bindings share its rendering and persistence;
-keep existing IDs stable and give each new announcement a new ID.
+keep introduction versions stable and give each new announcement a new ID.
+IDs identify catalog entries; acknowledgement is tracked only by version.
 
 Codex can also run through a shared app-server, selected **per execution host**.
 Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix

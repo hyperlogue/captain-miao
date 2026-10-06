@@ -617,13 +617,13 @@ fn the_message_log_opens_at_the_newest_entry() {
 }
 
 #[test]
-fn update_inbox_delivers_new_items_after_the_shortcut_notice_was_acknowledged() {
+fn update_inbox_shows_the_whole_new_release_until_the_version_is_acknowledged() {
     let temp = tempfile::tempdir().unwrap();
     let overrides = temp.path().join("dashboard-overrides.json");
     let bindings = temp.path().join("window-bindings.json");
     crate::state::write_json_atomic(
         &overrides,
-        &serde_json::json!({"last_dashboard_version": "0.11.0"}),
+        &serde_json::json!({"last_dashboard_version": "0.10.0"}),
     )
     .unwrap();
     let mut d = TestDashboard::new(100, 30);
@@ -958,7 +958,7 @@ fn update_inbox_list_scrolling_keeps_mouse_targets_on_visible_items() {
     use super::announcements::tests::EXAMPLE_ANNOUNCEMENTS;
     let mut d = TestDashboard::new(60, 16);
     d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
-        super::announcements::pending(EXAMPLE_ANNOUNCEMENTS, &[], &semver::Version::new(0, 13, 0))
+        super::announcements::pending(EXAMPLE_ANNOUNCEMENTS, None, &semver::Version::new(0, 13, 0))
             .unwrap(),
     );
     d.press(KeyCode::End);
@@ -1046,7 +1046,7 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
             .as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(
+    assert!(
         d.app
             .dashboard_state
             .begin_startup(
@@ -1054,10 +1054,7 @@ fn preference_migrations_and_saves_preserve_the_dashboard_version() {
                 super::announcements::ANNOUNCEMENTS
             )
             .unwrap()
-            .iter()
-            .map(|item| item.id)
-            .collect::<Vec<_>>(),
-        ["session-shortcuts-x", "server-owned-attention"]
+            .is_empty()
     );
 }
 

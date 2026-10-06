@@ -2,7 +2,7 @@
 //!
 //! The overlay preserves the underlying input mode, including crash recovery.
 //! Browsing never acknowledges items. Got it acknowledges the displayed batch;
-//! quitting first leaves it pending. Dashboard state owns durable receipts.
+//! quitting first leaves it pending. Dashboard state tracks the saved version.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -101,12 +101,12 @@ impl UpgradeNotices {
 
 impl App {
     fn acknowledge_upgrade_notices(&mut self) {
-        let Some(notices) = self.upgrade_notices.take() else {
+        if self.upgrade_notices.take().is_none() {
             return;
-        };
-        if let Err(error) = self.dashboard_state.finish_startup(&notices.items) {
+        }
+        if let Err(error) = self.dashboard_state.finish_startup() {
             self.set_status(
-                format!("Could not save announcement acknowledgements; updates may appear again: {error}"),
+                format!("Could not save the dashboard version; updates may appear again: {error}"),
                 true,
             );
         }
