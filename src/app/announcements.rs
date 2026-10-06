@@ -52,7 +52,7 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
         kind: Kind::Update,
         content: &[
             Content::Text(
-                "The default key for closing session is moved from x to X (Shift+x).\nBy default, x now dismisses the notification.",
+                "To avoid closing a session by mistake, the default close key moved from x to X (Shift+x).\nBy default, x now dismisses the notification.",
             ),
             Content::Text(""),
             Content::Heading("Your active shortcuts"),
@@ -70,30 +70,25 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
     Announcement {
         id: "server-owned-attention",
         introduced: "0.11.0",
-        title: "Upgrade servers for the yellow dot",
+        title: "Upgrade servers for the notification yellow dot",
         kind: Kind::Warning,
         content: &[
-            Content::Heading("Action required for pooled sessions"),
+            Content::Heading("Action required"),
             Content::Text(
-                "Upgrade miao-server on every host running pooled sessions, including pooled localhost, to the build matching your dashboard.",
+                "Upgrade miao-server on every host, including pooled localhost, to the build matching your dashboard.",
             ),
             Content::Text(""),
             Content::Text(
-                "The logic that marks a finished turn as needing attention (the yellow dot) moved from the dashboard to the server. With an older server, finished turns will not arm the yellow dot.",
+                "The logic that marks a finished turn as needing attention (the notification yellow dot) moved from the dashboard to the server. With an older server, finished turns will not arm the yellow dot. Your dashboard will not arm it either. Therefore, you will not see the yellow dot on any session on that server when a turn finishes.",
             ),
             Content::Text(""),
             Content::Heading("How to upgrade"),
             Content::Binding(
                 Command::ManageHosts,
-                "Open Hosts; select a host, then press u to upgrade when offered.",
+                "Open Hosts; select a host, then press u to upgrade.",
             ),
             Content::Text(
                 "If you manage miao-server yourself, update its installation and restart the daemon. Direct-local sessions do not need a server upgrade.",
-            ),
-            Content::Text(""),
-            Content::Heading("After upgrading"),
-            Content::Text(
-                "Completion flags are shared across dashboards and persist while you are disconnected.",
             ),
         ],
     },

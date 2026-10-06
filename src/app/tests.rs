@@ -636,7 +636,10 @@ fn update_inbox_delivers_new_items_after_the_shortcut_notice_was_acknowledged() 
     );
     let out = d.render();
     assert!(out.contains("What's new"), "{out}");
-    assert!(out.contains("Upgrade servers for the yellow dot"), "{out}");
+    assert!(
+        out.contains("Upgrade servers for the notification yellow dot"),
+        "{out}"
+    );
     assert!(out.contains("Session shortcuts changed"), "{out}");
     assert!(out.contains("2/2"), "{out}");
     assert!(out.contains("Warning"), "{out}");
@@ -916,8 +919,11 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
     );
     let out = d.render();
     assert!(out.contains("2/2"), "{out}");
-    assert!(out.contains("Upgrade servers for the yellow dot"), "{out}");
-    assert!(!out.contains("Completion flags are shared"), "{out}");
+    assert!(
+        out.contains("Upgrade servers for the notification yellow dot"),
+        "{out}"
+    );
+    assert!(!out.contains("Direct-local sessions"), "{out}");
     assert!(out.contains("more ↓"), "{out}");
     let at = find_cell(d.terminal.backend().buffer(), "Action required").expect(&out);
     message_mouse(&mut d, MouseEventKind::ScrollDown, at);
@@ -931,7 +937,7 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
     let out = d.render();
     assert!(out.contains("F6  Open Hosts"), "{out}");
     assert!(out.contains("↑ more"), "{out}");
-    assert!(out.contains("Completion flags are shared"), "{out}");
+    assert!(out.contains("Direct-local sessions"), "{out}");
     assert!(out.contains("2/2"), "{out}");
     // Scrolling outside the overlay never moves either panel.
     message_mouse(&mut d, MouseEventKind::ScrollUp, (0, 0));
@@ -941,7 +947,7 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
     let out = d.render();
     assert!(out.contains("1/2"), "{out}");
     assert!(
-        out.contains("The default key"),
+        out.contains("To avoid closing a session by mistake"),
         "selection resets detail scroll: {out}"
     );
     assert!(out.contains("Copy snippet"), "{out}");
