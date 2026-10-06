@@ -8,8 +8,10 @@ use crate::terminal::graphics::{CellSize, Placement};
 const FRAME_W: u32 = 96;
 const FRAME_H: u32 = 64;
 const FRAMES: u32 = 8;
-const FRAME_MS: u128 = 100;
-const SPEED_CELLS_PER_S: f64 = 6.0;
+const FRAME_MS: u128 = 125;
+// Planted paws move back about five source pixels per frame. Match that stride
+// at the displayed scale so the kitten walks instead of skating across cells.
+const STRIDE_PX: u32 = 40;
 pub(super) const RARE_ONE_IN: u64 = 20;
 
 const SHEETS: [&[u8]; 3] = [
@@ -96,10 +98,12 @@ impl FrameSize {
         }
         let cell_w = u32::from(cell.w).max(1);
         let track_px = u32::from(track.width) * cell_w;
-        let x = (elapsed_ms as f64 * SPEED_CELLS_PER_S * f64::from(cell_w) / 1000.0) as u32;
-        if x >= track_px {
+        let x = elapsed_ms.saturating_mul(u128::from(STRIDE_PX * self.height))
+            / (FRAME_MS * u128::from(FRAMES * FRAME_H));
+        if x >= u128::from(track_px) {
             return None;
         }
+        let x = x as u32;
         let frame = (elapsed_ms / FRAME_MS % u128::from(FRAMES)) as u32;
         Some(Placement {
             image,
@@ -176,14 +180,33 @@ mod tests {
         let start = size.placement(42, 0, track, cell).unwrap();
         assert_eq!((start.col, start.row), (3, 1));
         assert_eq!(start.crop, Some((0, 0, 24, 16)));
-        let moving = size.placement(42, 100, track, cell).unwrap();
-        assert_eq!(moving.offset, (4, 0));
+        let moving = size.placement(42, 125, track, cell).unwrap();
+        assert_eq!(moving.offset, (1, 0));
         assert_eq!(moving.crop, Some((24, 0, 24, 16)));
-        let exiting = size.placement(42, 1600, track, cell).unwrap();
+        let exiting = size.placement(42, 7500, track, cell).unwrap();
         assert_eq!(exiting.col, 12);
-        assert_eq!(exiting.crop, Some((0, 0, 4, 16)));
-        assert!(size.placement(42, 1700, track, cell).is_none());
+        assert_eq!(exiting.crop, Some((96, 0, 5, 16)));
+        assert!(size.placement(42, 8000, track, cell).is_none());
         assert!(size.placement(42, 0, Rect::default(), cell).is_none());
+    }
+
+    #[test]
+    fn a_stride_scales_with_the_sprite_not_the_cell_width() {
+        for height in [16, 32, 64, 96] {
+            for width in [8, 16, 24] {
+                let cell = CellSize {
+                    w: width,
+                    h: height,
+                };
+                let size = FrameSize::for_cell(cell);
+                let p = size
+                    .placement(42, 1000, Rect::new(0, 1, 100, 1), cell)
+                    .unwrap();
+                let traveled = u32::from(p.col) * u32::from(width) + u32::from(p.offset.0);
+                assert_eq!(traveled, 40 * size.height / 64);
+                assert_eq!(p.crop.unwrap().0, 0, "one complete walk cycle");
+            }
+        }
     }
 
     #[test]
