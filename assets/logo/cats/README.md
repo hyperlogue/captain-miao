@@ -42,11 +42,11 @@ bytes. It resamples frames independently, retaining the same displayed size
 and travel speed. Rows above 32px repeat source pixels up to the existing
 64px display cap; the lower stored resolution is visible at those sizes.
 
-Eight poses play at 20 fps. Travel is 20 stored pixels per cycle
-(50 pixels per second, or 250 pixels over five seconds), scaled with the
-sprite height: the planted paws move backward about 2.5 stored pixels per
-frame. Using cell width to set travel speed would make the feet slide at
-different font aspect ratios. The outgoing frame is cropped at the lane edge.
+Eight poses play at 14 fps, independently of travel speed. At the stored
+32px height, the kitten travels 50 pixels per second, or 250 pixels over
+five seconds. Travel scales with the displayed sprite height instead of
+cell width, keeping the relative speed consistent across font aspect ratios.
+The outgoing frame is cropped at the lane edge.
 
 To rebuild a sheet from its committed source, install Pillow 12.1 or newer
 in a Python environment and run from the repository root:

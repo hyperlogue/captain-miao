@@ -11,12 +11,10 @@ const FRAME_W: u32 = 48;
 const FRAME_H: u32 = 32;
 const MAX_DISPLAY_H: u32 = 64;
 const FRAMES: u32 = 8;
-// Eight poses at 20 fps: 50 pixels per second at the stored 32px height.
-const FRAME_RATE_NUMERATOR: u128 = 20;
-const FRAME_RATE_DENOMINATOR: u128 = 1;
-// Planted paws move back about 2.5 stored pixels per frame. Match that stride
-// at the displayed scale so the kitten walks instead of skating across cells.
-const STRIDE_PX: u32 = 20;
+// Pose playback and travel are tuned independently. Travel is specified at the
+// stored 32px height and scales with the displayed sprite.
+const FRAMES_PER_SECOND: u128 = 14;
+const TRAVEL_PX_PER_SECOND: u32 = 50;
 
 const PACKED: [&[u8]; 4] = [
     include_bytes!("../../../assets/logo/cats/tabby.rgba.xz"),
@@ -123,17 +121,14 @@ impl FrameSize {
         }
         let cell_w = u32::from(cell.w).max(1);
         let track_px = u32::from(track.width) * cell_w;
-        // Keep pose and travel on the same clock so changing the playback rate
-        // preserves the distance covered by each step.
-        let frame_time = elapsed_ms.saturating_mul(FRAME_RATE_NUMERATOR);
-        let time_scale = 1000 * FRAME_RATE_DENOMINATOR;
-        let x = frame_time.saturating_mul(u128::from(STRIDE_PX * self.height))
-            / (time_scale * u128::from(FRAMES * FRAME_H));
+        let x = elapsed_ms.saturating_mul(u128::from(TRAVEL_PX_PER_SECOND * self.height))
+            / (1000 * u128::from(FRAME_H));
         if x >= u128::from(track_px) {
             return None;
         }
         let x = x as u32;
-        let frame = (frame_time / time_scale % u128::from(FRAMES)) as u32;
+        let frame =
+            (elapsed_ms.saturating_mul(FRAMES_PER_SECOND) / 1000 % u128::from(FRAMES)) as u32;
         Some(Placement {
             image,
             placement: 2,
@@ -224,20 +219,23 @@ mod tests {
         let start = size.placement(42, 0, track, cell).unwrap();
         assert_eq!((start.col, start.row), (3, 1));
         assert_eq!(start.crop, Some((0, 0, 24, 16)));
-        let moving = size.placement(42, 50, track, cell).unwrap();
+        let before_pose_change = size.placement(42, 71, track, cell).unwrap();
+        assert_eq!(before_pose_change.offset, (1, 0));
+        assert_eq!(before_pose_change.crop, Some((0, 0, 24, 16)));
+        let moving = size.placement(42, 72, track, cell).unwrap();
         assert_eq!(moving.offset, (1, 0));
         assert_eq!(moving.crop, Some((24, 0, 24, 16)));
         let exiting = size.placement(42, 3000, track, cell).unwrap();
         assert_eq!(exiting.col, 12);
-        assert_eq!(exiting.crop, Some((96, 0, 5, 16)));
+        assert_eq!(exiting.crop, Some((48, 0, 5, 16)));
         let last_pixel = size.placement(42, 3199, track, cell).unwrap();
-        assert_eq!(last_pixel.crop, Some((168, 0, 1, 16)));
+        assert_eq!(last_pixel.crop, Some((96, 0, 1, 16)));
         assert!(size.placement(42, 3200, track, cell).is_none());
         assert!(size.placement(42, 0, Rect::default(), cell).is_none());
     }
 
     #[test]
-    fn a_stride_scales_with_the_sprite_not_the_cell_width() {
+    fn travel_scales_with_the_sprite_not_the_cell_width() {
         for height in [16, 32, 64, 96] {
             for width in [8, 16, 24] {
                 let cell = CellSize {
@@ -245,7 +243,7 @@ mod tests {
                     h: height,
                 };
                 let size = FrameSize::for_cell(cell);
-                for (elapsed, distance, pose) in [(1000, 50, 4), (2000, 100, 0), (5000, 250, 4)] {
+                for (elapsed, distance, pose) in [(1000, 50, 6), (2000, 100, 4), (5000, 250, 6)] {
                     let p = size
                         .placement(42, elapsed, Rect::new(0, 1, 100, 1), cell)
                         .unwrap();
