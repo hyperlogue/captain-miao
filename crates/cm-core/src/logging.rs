@@ -128,19 +128,19 @@ pub fn init_tracing(role: &str) {
     );
 }
 
-/// The level filter for our own log files, from `RUST_LOG` plus two pinned
-/// directives.
+/// The level filter for our own log files, from `RUST_LOG` plus pinned
+/// application targets.
 ///
-/// Both crate roots are pinned: most launcher/hook events carry an explicit
-/// `target: "captain_miao::…"`, but any plain `tracing::debug!` in cm-core
-/// defaults to its own module path (`cm_core::…`), and the crate split left
-/// those silently filtered out — including the watcher/transcript diagnostics.
+/// Explicit events use `target: "captain_miao::…"`; plain `tracing::debug!`
+/// uses the emitting crate's module path. Pin both `cm_core` and the dashboard
+/// binary's `miao` root, so watcher diagnostics and terminal-command timings
+/// reach the log even though the package is named `captain-miao`.
 ///
 /// [`Targets`] rather than `EnvFilter`: both parse the same `target=level`
 /// `RUST_LOG` syntax, but `EnvFilter` additionally supports span-field
 /// predicates (`span[field=value]`), which nothing here uses and which cost a
 /// whole regex engine in the dependency tree (matchers → regex-automata →
-/// regex-syntax). An unparseable `RUST_LOG` falls back to the two directives
+/// regex-syntax). An unparseable `RUST_LOG` falls back to these directives
 /// rather than to silence, since these files are the only place this process
 /// logs at all.
 ///
@@ -151,6 +151,7 @@ fn log_filter(rust_log: Option<String>) -> tracing_subscriber::filter::Targets {
         .unwrap_or_default()
         .with_target("captain_miao", tracing::Level::DEBUG)
         .with_target("cm_core", tracing::Level::DEBUG)
+        .with_target("miao", tracing::Level::DEBUG)
 }
 
 /// Remove `launcher-{pid}.log` files for launchers that have exited. Runs
@@ -185,11 +186,12 @@ mod tests {
     use tracing::Level;
 
     #[test]
-    fn our_two_crate_roots_always_log_at_debug() {
+    fn our_log_targets_always_log_at_debug() {
         let f = log_filter(None);
         assert!(f.would_enable("captain_miao", &Level::DEBUG));
         assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
         assert!(f.would_enable("cm_core::launcher", &Level::DEBUG));
+        assert!(f.would_enable("miao::terminal", &Level::DEBUG));
         // Nothing else, so a chatty dependency can't fill the log by default.
         assert!(!f.would_enable("notify::inotify", &Level::ERROR));
     }
@@ -203,8 +205,14 @@ mod tests {
 
         // …and one aimed at us loses to the pinned directives, exactly as the
         // `EnvFilter::add_directive` calls this replaced did.
-        let f = log_filter(Some("captain_miao=error".into()));
-        assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
+        for (root, target) in [
+            ("captain_miao", "captain_miao::launch"),
+            ("cm_core", "cm_core::launcher"),
+            ("miao", "miao::terminal"),
+        ] {
+            let f = log_filter(Some(format!("{root}=error")));
+            assert!(f.would_enable(target, &Level::DEBUG));
+        }
     }
 
     #[test]
@@ -214,5 +222,6 @@ mod tests {
         let f = log_filter(Some("captain_miao[request]=debug".into()));
         assert!(f.would_enable("captain_miao::launch", &Level::DEBUG));
         assert!(f.would_enable("cm_core::launcher", &Level::DEBUG));
+        assert!(f.would_enable("miao::terminal", &Level::DEBUG));
     }
 }
