@@ -10985,17 +10985,17 @@ fn kitten_cooldown_ignores_extra_clicks_and_survives_resize_and_departure() {
 
     d.app.invalidate_logo_graphics();
     d.app.logo.pulse_pending = false;
-    d.app.start_logo_anim(start + Duration::from_millis(2999));
+    d.app.start_logo_anim(start + Duration::from_millis(1999));
     assert_eq!(d.app.logo.cats.len(), 1);
     assert!(d.app.logo.pulse_pending);
-    d.app.start_logo_anim(start + Duration::from_secs(3));
+    d.app.start_logo_anim(start + Duration::from_secs(2));
     assert_eq!(d.app.logo.cats.len(), 2);
 
     // An empty lane must not allow rapid summons after a resize or departure.
     d.app.logo.cats.clear();
-    d.app.start_logo_anim(start + Duration::from_secs(4));
+    d.app.start_logo_anim(start + Duration::from_secs(3));
     assert!(!d.app.cat_walking());
-    d.app.start_logo_anim(start + Duration::from_secs(6));
+    d.app.start_logo_anim(start + Duration::from_secs(4));
     assert_eq!(d.app.logo.cats.len(), 1);
 }
 
@@ -11007,11 +11007,11 @@ fn kitten_pool_stays_capped_and_full_pool_clicks_do_not_start_a_cooldown() {
     d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
     let start = Instant::now();
     for i in 0..12 {
-        d.app.start_logo_anim(start + Duration::from_secs(i * 3));
+        d.app.start_logo_anim(start + Duration::from_secs(i * 2));
     }
     assert_eq!(d.app.logo.cats.len(), 12);
     d.app.logo.pulse_pending = false;
-    let next = start + Duration::from_secs(36);
+    let next = start + Duration::from_secs(24);
     d.app.start_logo_anim(next);
     assert_eq!(d.app.logo.cats.len(), 12);
     assert!(d.app.logo.pulse_pending);

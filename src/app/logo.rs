@@ -15,7 +15,7 @@
 //! nothing per frame and its event loop stays idle during the pulse.
 //!
 //! A click also sends a **cat** trotting across the header's blank padding row
-//! (the second row), with a three-second cooldown between summons.
+//! (the second row), with a two-second cooldown between summons.
 //! Unlike the pulse, the cat *moves*, which kitty's in-place
 //! frame animation can't do, so this one is **client-driven**: a full-color anime
 //! walk sheet is selected on each summon, sized to the terminal's row height, and
@@ -94,7 +94,7 @@ const PAW_MASK_DIM: u32 = 64;
 /// clicks past that still pulse the paw, they just don't spawn another cat.
 const CAT_IMAGE_ID: u32 = PAW_IMAGE_ID + 10;
 const CAT_MAX: u32 = 12;
-const CAT_SPAWN_COOLDOWN: Duration = Duration::from_secs(3);
+const CAT_SPAWN_COOLDOWN: Duration = Duration::from_secs(2);
 /// One summoned kitten: its start time drives both position and pose, independent
 /// of redraw frequency. The coat persists across resize and graphics re-uploads.
 pub(crate) struct CatWalk {
