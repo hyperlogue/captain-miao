@@ -10942,7 +10942,7 @@ fn pruning_a_dead_window_rewrites_the_bindings_file() {
 // =============================================================================
 
 #[test]
-fn paw_clicks_summon_kittens_only_with_graphics_and_cap_the_pool() {
+fn paw_clicks_summon_kittens_only_with_graphics_and_throttle_bursts() {
     use ratatui::layout::Rect;
 
     let mut d = TestDashboard::new(80, 24);
@@ -10956,15 +10956,65 @@ fn paw_clicks_summon_kittens_only_with_graphics_and_cap_the_pool() {
     d.render();
     d.click(paw.x, paw.y);
     d.click(paw.x + 1, paw.y);
-    assert_eq!(d.app.logo.cats.len(), 2);
+    assert_eq!(d.app.logo.cats.len(), 1);
     assert!(d.app.logo.pulse_pending);
     assert_eq!(
         d.app.logo.cat_track.unwrap(),
         Rect::new(0, paw.y + 1, 80, 1)
     );
+    d.app.logo.pulse_pending = false;
     for _ in 0..20 {
         d.click(paw.x, paw.y);
     }
+    assert_eq!(d.app.logo.cats.len(), 1);
+    assert!(d.app.logo.pulse_pending);
+}
+
+#[test]
+fn kitten_cooldown_ignores_extra_clicks_and_survives_resize_and_departure() {
+    use std::time::{Duration, Instant};
+
+    let mut d = TestDashboard::new(80, 24);
+    d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    let start = Instant::now();
+    d.app.start_logo_anim(start);
+    assert_eq!(d.app.logo.cats.len(), 1);
+
+    d.app.invalidate_logo_graphics();
+    d.app.logo.pulse_pending = false;
+    d.app.start_logo_anim(start + Duration::from_millis(2999));
+    assert_eq!(d.app.logo.cats.len(), 1);
+    assert!(d.app.logo.pulse_pending);
+    d.app.start_logo_anim(start + Duration::from_secs(3));
+    assert_eq!(d.app.logo.cats.len(), 2);
+
+    // An empty lane must not allow rapid summons after a resize or departure.
+    d.app.logo.cats.clear();
+    d.app.start_logo_anim(start + Duration::from_secs(4));
+    assert!(!d.app.cat_walking());
+    d.app.start_logo_anim(start + Duration::from_secs(6));
+    assert_eq!(d.app.logo.cats.len(), 1);
+}
+
+#[test]
+fn kitten_pool_stays_capped_and_full_pool_clicks_do_not_start_a_cooldown() {
+    use std::time::{Duration, Instant};
+
+    let mut d = TestDashboard::new(80, 24);
+    d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    let start = Instant::now();
+    for i in 0..12 {
+        d.app.start_logo_anim(start + Duration::from_secs(i * 3));
+    }
+    assert_eq!(d.app.logo.cats.len(), 12);
+    d.app.logo.pulse_pending = false;
+    let next = start + Duration::from_secs(36);
+    d.app.start_logo_anim(next);
+    assert_eq!(d.app.logo.cats.len(), 12);
+    assert!(d.app.logo.pulse_pending);
+
+    d.app.logo.cats.pop();
+    d.app.start_logo_anim(next);
     assert_eq!(d.app.logo.cats.len(), 12);
 }
 
@@ -10981,7 +11031,7 @@ fn resize_invalidation_forces_a_logo_re_upload() {
     d.app.logo.composed = true;
     d.app.logo.placed_color = Some(super::logo::PawState::Idle);
     // A cat mid-walk, its sheet already uploaded.
-    d.app.start_logo_anim();
+    d.app.start_logo_anim(std::time::Instant::now());
     assert!(d.app.cat_walking(), "precondition: a cat should be walking");
 
     d.app.invalidate_logo_graphics();

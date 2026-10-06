@@ -11,7 +11,8 @@ const FRAME_W: u32 = 48;
 const FRAME_H: u32 = 32;
 const MAX_DISPLAY_H: u32 = 64;
 const FRAMES: u32 = 8;
-const FRAME_MS: u128 = 125;
+// Eight poses at 12 fps: three complete strides every two seconds.
+const FRAMES_PER_SECOND: u128 = 12;
 // Planted paws move back about 2.5 stored pixels per frame. Match that stride
 // at the displayed scale so the kitten walks instead of skating across cells.
 const STRIDE_PX: u32 = 20;
@@ -121,13 +122,16 @@ impl FrameSize {
         }
         let cell_w = u32::from(cell.w).max(1);
         let track_px = u32::from(track.width) * cell_w;
-        let x = elapsed_ms.saturating_mul(u128::from(STRIDE_PX * self.height))
-            / (FRAME_MS * u128::from(FRAMES * FRAME_H));
+        // Keep pose and travel on the same clock so changing the playback rate
+        // preserves the distance covered by each step.
+        let frame_time = elapsed_ms.saturating_mul(FRAMES_PER_SECOND);
+        let x = frame_time.saturating_mul(u128::from(STRIDE_PX * self.height))
+            / (1000 * u128::from(FRAMES * FRAME_H));
         if x >= u128::from(track_px) {
             return None;
         }
         let x = x as u32;
-        let frame = (elapsed_ms / FRAME_MS % u128::from(FRAMES)) as u32;
+        let frame = (frame_time / 1000 % u128::from(FRAMES)) as u32;
         Some(Placement {
             image,
             placement: 2,
@@ -218,13 +222,13 @@ mod tests {
         let start = size.placement(42, 0, track, cell).unwrap();
         assert_eq!((start.col, start.row), (3, 1));
         assert_eq!(start.crop, Some((0, 0, 24, 16)));
-        let moving = size.placement(42, 125, track, cell).unwrap();
+        let moving = size.placement(42, 84, track, cell).unwrap();
         assert_eq!(moving.offset, (1, 0));
         assert_eq!(moving.crop, Some((24, 0, 24, 16)));
-        let exiting = size.placement(42, 7500, track, cell).unwrap();
+        let exiting = size.placement(42, 5000, track, cell).unwrap();
         assert_eq!(exiting.col, 12);
         assert_eq!(exiting.crop, Some((96, 0, 5, 16)));
-        assert!(size.placement(42, 8000, track, cell).is_none());
+        assert!(size.placement(42, 5334, track, cell).is_none());
         assert!(size.placement(42, 0, Rect::default(), cell).is_none());
     }
 
@@ -237,12 +241,14 @@ mod tests {
                     h: height,
                 };
                 let size = FrameSize::for_cell(cell);
-                let p = size
-                    .placement(42, 1000, Rect::new(0, 1, 100, 1), cell)
-                    .unwrap();
-                let traveled = u32::from(p.col) * u32::from(width) + u32::from(p.offset.0);
-                assert_eq!(traveled, 40 * size.height / 64);
-                assert_eq!(p.crop.unwrap().0, 0, "one complete walk cycle");
+                for (elapsed, distance, pose) in [(1000, 30, 4), (2000, 60, 0)] {
+                    let p = size
+                        .placement(42, elapsed, Rect::new(0, 1, 100, 1), cell)
+                        .unwrap();
+                    let traveled = u32::from(p.col) * u32::from(width) + u32::from(p.offset.0);
+                    assert_eq!(traveled, distance * size.height / 32);
+                    assert_eq!(p.crop.unwrap().0, pose * size.width);
+                }
             }
         }
     }

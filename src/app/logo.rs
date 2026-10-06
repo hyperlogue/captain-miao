@@ -15,15 +15,16 @@
 //! nothing per frame and its event loop stays idle during the pulse.
 //!
 //! A click also sends a **cat** trotting across the header's blank padding row
-//! (the second row). Unlike the pulse, the cat *moves*, which kitty's in-place
+//! (the second row), with a three-second cooldown between summons.
+//! Unlike the pulse, the cat *moves*, which kitty's in-place
 //! frame animation can't do, so this one is **client-driven**: a full-color anime
-//! walk sheet is selected on each click, sized to the terminal's row height, and
+//! walk sheet is selected on each summon, sized to the terminal's row height, and
 //! uploaded once. Each render crops the next pose and advances the placement by
 //! a column + sub-cell offset. The run loop ticks fast (`App::cat_walking`) until
 //! all kittens leave the lane. See `assets/logo/cats/README.md` for the artwork.
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -93,6 +94,7 @@ const PAW_MASK_DIM: u32 = 64;
 /// clicks past that still pulse the paw, they just don't spawn another cat.
 const CAT_IMAGE_ID: u32 = PAW_IMAGE_ID + 10;
 const CAT_MAX: u32 = 12;
+const CAT_SPAWN_COOLDOWN: Duration = Duration::from_secs(3);
 /// One summoned kitten: its start time drives both position and pose, independent
 /// of redraw frequency. The coat persists across resize and graphics re-uploads.
 pub(crate) struct CatWalk {
@@ -125,18 +127,26 @@ impl App {
     /// Request a paw-click pulse on the next render. Only meaningful with kitty
     /// graphics (the emoji fallback doesn't animate); a no-op otherwise. The click
     /// event triggers a redraw, so `render_logo_graphics` fires it promptly.
-    pub(super) fn start_logo_anim(&mut self) {
+    pub(super) fn start_logo_anim(&mut self, now: Instant) {
         if self.logo.caps.is_some() {
             self.logo.pulse_pending = true;
-            // Each click summons another kitten, until the pool is full. The
-            // paw still pulses when every slot is occupied.
+            // Keep the paw responsive while spacing out successful summons.
+            // Ignored clicks neither queue a kitten nor extend the cooldown.
+            if self
+                .logo
+                .last_cat_spawn
+                .is_some_and(|last| now.duration_since(last) < CAT_SPAWN_COOLDOWN)
+            {
+                return;
+            }
             if let Some(image_id) = self.alloc_cat_image_id() {
                 self.logo.cats.push(CatWalk {
-                    started: Instant::now(),
+                    started: now,
                     coat: self.pick_cat_coat(),
                     image_id,
                     transmitted: false,
                 });
+                self.logo.last_cat_spawn = Some(now);
             }
         }
     }
@@ -534,11 +544,13 @@ pub(crate) struct LogoState {
     /// from `DEFAULT_PAW_COLORS` and overlaid at startup with the terminal's own
     /// palette so the paw matches the Sessions status symbols. Baked into the frames.
     pub(in crate::app) paw_colors: [(u8, u8, u8); 3],
-    /// Cats currently walking the padding row — each paw click spawns one (up to a
-    /// pool cap), so several can trot at once. Client-driven: `render_cat_walk`
+    /// Cats currently walking the padding row — paw clicks spawn one after the
+    /// cooldown (up to a pool cap). Client-driven: `render_cat_walk`
     /// advances them from wall-clock elapsed, and the run loop ticks fast while any
     /// are live (see `App::cat_walking`).
     pub(in crate::app) cats: Vec<CatWalk>,
+    /// Last successful summon; preserved across resize and cats leaving the lane.
+    last_cat_spawn: Option<Instant>,
     /// The header's blank padding row (full width, one cell tall) the cat walks
     /// across. Set by `draw_header` each frame; `None` before the first draw.
     pub(in crate::app) cat_track: Option<Rect>,
@@ -556,6 +568,7 @@ impl LogoState {
             pulse_pending: false,
             paw_colors: probed_paw_colors(),
             cats: Vec::new(),
+            last_cat_spawn: None,
             cat_track: None,
         }
     }

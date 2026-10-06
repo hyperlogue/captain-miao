@@ -156,7 +156,7 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if in_logo => {
                 // Clicking the paw logo kicks off its little celebration.
-                self.start_logo_anim();
+                self.start_logo_anim(Instant::now());
                 return None;
             }
             MouseEventKind::Down(MouseButton::Left) if on_vsplit => {
