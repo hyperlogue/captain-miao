@@ -619,11 +619,14 @@ impl App {
                 desired.remove(view.cursor);
                 self.apply_forward_rules(desired);
             }
-        } else if !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            match key.code {
+        } else {
+            let code = match (key.code, key.modifiers) {
+                (KeyCode::Char('n'), KeyModifiers::CONTROL) => KeyCode::Down,
+                (KeyCode::Char('p'), KeyModifiers::CONTROL) => KeyCode::Up,
+                (code, mods) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => code,
+                _ => return,
+            };
+            match code {
                 KeyCode::Esc | KeyCode::Char('q') => state.forward_view = None,
                 KeyCode::Down | KeyCode::Char('j') => {
                     view.cursor = (view.cursor + 1).min(rules.len().saturating_sub(1))
@@ -640,7 +643,7 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('e' | 'y') if !rules.is_empty() => {
                     let mut draft = Draft::new(
                         rules.get(view.cursor),
-                        (key.code != KeyCode::Char('y')).then_some(view.cursor),
+                        (code != KeyCode::Char('y')).then_some(view.cursor),
                     );
                     if draft.raw.is_some() {
                         draft.focus = Field::Raw;
@@ -799,7 +802,9 @@ impl App {
                 }
                 help.push("a Add one forward   i Import several (or paste here)");
             } else {
-                help.push("↑/↓ or j/k Select   a Add   Enter Edit   Space Enable/disable");
+                help.push(
+                    "↑/↓, j/k or Ctrl-n/p Select   a Add   Enter Edit   Space Enable/disable",
+                );
                 help.push("y Duplicate   i Import (or paste)   d Delete   r Retry failures");
                 help.push("Listening means SSH accepted the port; app health is unchecked.");
             }

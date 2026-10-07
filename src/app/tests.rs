@@ -8694,10 +8694,29 @@ fn forwarding_list_scrolls_and_socket_hosts_hide_ssh_controls() {
     }]);
     d.app.host_edit.as_mut().unwrap().cursor = 1;
     d.press(KeyCode::Char('f'));
-    for _ in 0..15 {
+    for _ in 0..14 {
         d.press(KeyCode::Down);
     }
+    d.press_ctrl(KeyCode::Char('n'));
+    d.press_ctrl(KeyCode::Char('n')); // Stay on the last forward.
     assert!(d.render().contains("3015"));
+    d.press(KeyCode::Enter);
+    assert!(
+        d.render()
+            .lines()
+            .any(|line| line.contains("Local port") && line.contains("3015"))
+    );
+    d.press(KeyCode::Esc);
+    for _ in 0..16 {
+        d.press_ctrl(KeyCode::Char('p'));
+    }
+    d.press(KeyCode::Enter);
+    assert!(
+        d.render()
+            .lines()
+            .any(|line| line.contains("Local port") && line.contains("3000"))
+    );
+    d.press(KeyCode::Esc);
     d.press(KeyCode::Esc);
     d.app.host_edit.as_mut().unwrap().rows[1].is_socket = true;
     assert!(!d.app.selected_host_has_forwards());
