@@ -1901,6 +1901,38 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use serde_json::{Value, json};
         use tokio_tungstenite::tungstenite::Message;
+
+        if std::env::var_os("CM_TEST_CLEANUP_RETRY").is_none() {
+            // State writes and failed-write fixtures belong to this child only.
+            // A shared state reader can otherwise reap our synthetic launcher.
+            // Keep socket paths short even with macOS's long default TMPDIR.
+            let root = tempfile::Builder::new()
+                .prefix("cm-cleanup-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let test = if block_state_write {
+                "launcher::tests::rejected_cleanup_remains_retryable_when_state_cannot_be_written"
+            } else {
+                "launcher::tests::rejected_cleanup_keeps_the_launcher_and_tui_alive_until_a_successful_retry"
+            };
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env("CM_TEST_CLEANUP_RETRY", "1")
+                .env("XDG_STATE_HOME", root.path())
+                .env("XDG_RUNTIME_DIR", root.path())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated cleanup retry failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let watchdog = app_server::CONTROL_TIMEOUT + Duration::from_secs(5);
         state::ensure_sessions_dir().unwrap();
         let root = state::runtime_dir().join(format!(
             "cleanup-test-{}-{block_state_write}",
@@ -1959,7 +1991,7 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap();
         let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
-        row.launcher_pid = std::process::id() + 100 + u32::from(block_state_write);
+        row.launcher_pid = std::process::id();
         let state_path = state::sessions_dir().join(format!("{}.json", row.launcher_pid));
         if block_state_write {
             std::fs::create_dir(&state_path).unwrap();
@@ -1992,14 +2024,12 @@ mod tests {
             crate::protocol::write_frame(&mut stream, &"Stop")
                 .await
                 .unwrap();
-            let reply: Value = tokio::time::timeout(
-                Duration::from_secs(3),
-                crate::protocol::read_frame(&mut stream),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let reply: Value =
+                tokio::time::timeout(watchdog, crate::protocol::read_frame(&mut stream))
+                    .await
+                    .expect("cleanup control reply did not arrive before the watchdog expired")
+                    .unwrap()
+                    .unwrap();
             if attempt == 0 {
                 assert!(reply["error"].as_str().unwrap().contains("cleanup denied"));
                 assert!(!supervisor.is_finished());
@@ -2009,7 +2039,7 @@ mod tests {
                 );
                 if block_state_write {
                     std::fs::remove_dir(&state_path).unwrap();
-                    tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::time::timeout(watchdog, async {
                         loop {
                             if let Ok(bytes) = std::fs::read(&state_path)
                                 && let Ok(saved) = serde_json::from_slice::<LauncherState>(&bytes)

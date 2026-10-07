@@ -1460,6 +1460,34 @@ struct PendingRequest {
     reply: oneshot::Sender<ServerFrame>,
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Exercise the real request/reply path without sockets or subprocesses.
+    pub(crate) fn connected(host: HostId) -> (Arc<RemoteBackend>, Peer) {
+        let (backend, _, requests) =
+            RemoteBackend::build(&Transport::LocalSocket(PathBuf::new()), host);
+        backend.simulate_link_for_tests(ConnState::Connected, true);
+        (backend, Peer { requests })
+    }
+
+    pub(crate) struct Peer {
+        requests: mpsc::UnboundedReceiver<PendingRequest>,
+    }
+
+    impl Peer {
+        pub(crate) async fn recv(&mut self) -> (ClientFrame, oneshot::Sender<ServerFrame>) {
+            let request = self.requests.recv().await.expect("backend dropped");
+            (request.frame, request.reply)
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.requests.is_empty()
+        }
+    }
+}
+
 /// Backend for a session running on another host, reached over a (possibly
 /// ssh-forwarded) unix socket. A background task owns the connection: it keeps
 /// an in-memory **mirror** of the host's sessions current (driven by the

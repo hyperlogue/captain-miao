@@ -56,6 +56,15 @@ the full suite; broader checks are warranted by cross-crate changes or release
 preparation. Rerun affected checks after fixes; a passing check needs repeating
 only if subsequent changes affect it.
 
+For async tests, synchronize on requests, replies or observable readiness.
+Use paused Tokio time for in-memory timers; subprocesses and OS I/O need real
+time. Keep UI behavior tests independent of subprocess speed, with separate
+integration coverage. Real-I/O watchdogs must exceed the production deadline
+and identify the awaited phase on failure. Exercise timing fixes with delayed
+replies or processes; an unloaded local pass alone does not cover a CI flake.
+Tests that write through global state paths need a child process with private
+XDG roots, isolated from parallel tests and running applications.
+
 For documentation or skill-only changes, check links, examples, instruction
 consistency and skill frontmatter; Rust tests add no coverage to prose. Changes
 to executable scripts or CI need checks of their actual behavior.

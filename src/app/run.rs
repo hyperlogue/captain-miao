@@ -3264,8 +3264,127 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // A watchdog for missing messages, not a Git performance assertion. Leave
+    // room for the production deadline to return its own diagnostic, including
+    // on a loaded macOS runner. Paused-clock tests use the same bound virtually.
+    async fn vcs_reply(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<VcsMsg>,
+        phase: &str,
+    ) -> VcsMsg {
+        tokio::time::timeout(VCS_COMMAND_TIMEOUT + Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no VCS {phase} reply before the watchdog expired"))
+            .unwrap_or_else(|| panic!("VCS channel closed during {phase}"))
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn push_and_pull_run_without_prompt_after_navigation_with_hidden_details() {
+        use cm_core::protocol::{ClientFrame, ServerFrame};
+
+        let mut app = vcs_app();
+        let host = HostId("vcs-test".into());
+        let cwd = app.sessions[0].cwd.clone();
+        let (backend, mut peer) = crate::backend::test_support::connected(host.clone());
+        app.backends.push(Backend::Remote(backend));
+        app.sessions[0].host = host.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for push in [true, false] {
+            app.sessions[0].cwd = cwd.clone();
+            app.input_mode = InputMode::Normal;
+            prepare_vcs_command(&mut app, &tx, host.clone(), cwd.clone(), push);
+            assert_eq!(app.vcs_commands.len(), 1);
+            // A second keystroke warns without starting another command.
+            prepare_vcs_command(&mut app, &tx, host.clone(), cwd.clone(), push);
+            assert_eq!(app.vcs_commands.len(), 1);
+            let id = app.vcs_commands[&(host.clone(), cwd.clone())];
+            let plan = Box::new(cm_core::vcs::VcsPlan::for_test(push));
+            let (prepared, ()) = tokio::join!(vcs_reply(&mut rx, "preparation"), async {
+                let (request, reply) = peer.recv().await;
+                let ClientFrame::PrepareVcs {
+                    req_id,
+                    cwd: target,
+                    push: requested_push,
+                    ..
+                } = request
+                else {
+                    panic!("expected VCS preparation");
+                };
+                assert_eq!(target, cwd);
+                assert_eq!(requested_push, push);
+                // Navigate while the request is outstanding. Ten virtual seconds
+                // exceeds the old test timeout without relying on runner speed.
+                app.sessions[0].cwd = "/tmp/elsewhere".into();
+                app.input_mode = InputMode::Search;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                reply
+                    .send(ServerFrame::VcsPrepared {
+                        req_id,
+                        plan: Some(plan.clone()),
+                        error: None,
+                    })
+                    .unwrap();
+            });
+            apply_vcs(&mut app, &tx, prepared);
+            assert!(app.pending_confirm.is_none());
+            assert_eq!(app.input_mode, InputMode::Search);
+            assert_eq!(app.vcs_commands[&(host.clone(), cwd.clone())], id);
+            let (done, ()) = tokio::join!(vcs_reply(&mut rx, "command"), async {
+                let (request, reply) = peer.recv().await;
+                let ClientFrame::RunVcs {
+                    req_id,
+                    cwd: target,
+                    plan: submitted,
+                    ..
+                } = request
+                else {
+                    panic!("expected VCS command");
+                };
+                assert_eq!(target, cwd);
+                assert_eq!(submitted, plan);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                reply
+                    .send(ServerFrame::VcsCommandDone {
+                        req_id,
+                        ok: true,
+                        message: if push { "pushed" } else { "pulled" }.into(),
+                    })
+                    .unwrap();
+            });
+            apply_vcs(&mut app, &tx, done);
+            assert!(app.vcs_commands.is_empty());
+            assert!(!app.status_is_error);
+            assert!(peer.is_empty(), "duplicate keystroke submitted another RPC");
+            assert!(rx.try_recv().is_err(), "unexpected VCS result");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresponsive_vcs_host_reports_its_timeout_before_the_test_watchdog() {
+        let mut app = vcs_app();
+        let host = HostId("silent-vcs-test".into());
+        let cwd = app.sessions[0].cwd.clone();
+        let (backend, mut peer) = crate::backend::test_support::connected(host.clone());
+        app.backends.push(Backend::Remote(backend));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        prepare_vcs_command(&mut app, &tx, host, cwd, true);
+
+        // Hold the reply sender open so this exercises the production timeout,
+        // not a disconnected channel. Both timers advance without a real wait.
+        let (prepared, (_, reply)) =
+            tokio::join!(vcs_reply(&mut rx, "silent host preparation"), peer.recv());
+        assert!(reply.is_closed());
+        assert!(matches!(&prepared, VcsMsg::Prepared { result: Err(_), .. }));
+        apply_vcs(&mut app, &tx, prepared);
+        assert!(app.vcs_commands.is_empty());
+        assert!(app.status_is_error);
+        assert!(
+            peer.is_empty(),
+            "failed preparation must not submit a command"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_vcs_push_and_pull_complete_through_the_run_loop() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         assert!(
@@ -3304,28 +3423,16 @@ mod tests {
         app.sessions[0].cwd = cwd.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for push in [true, false] {
-            app.input_mode = InputMode::Normal;
             prepare_vcs_command(&mut app, &tx, HostId::local(), cwd.clone(), push);
-            assert_eq!(app.vcs_commands.len(), 1);
-            // A second keystroke warns without starting another command.
-            prepare_vcs_command(&mut app, &tx, HostId::local(), cwd.clone(), push);
-            assert_eq!(app.vcs_commands.len(), 1);
-            let id = app.vcs_commands[&(HostId::local(), cwd.clone())];
-            let prepared = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(&prepared, VcsMsg::Prepared { result: Ok(_), .. }));
-            app.sessions[0].cwd = "/tmp/elsewhere".into();
-            app.input_mode = InputMode::Search;
+            let prepared = vcs_reply(&mut rx, "local preparation").await;
+            match &prepared {
+                VcsMsg::Prepared { result, .. } => {
+                    assert!(result.is_ok(), "preparation failed: {result:?}");
+                }
+                _ => panic!("expected a preparation result"),
+            }
             apply_vcs(&mut app, &tx, prepared);
-            assert!(app.pending_confirm.is_none());
-            assert_eq!(app.input_mode, InputMode::Search);
-            assert_eq!(app.vcs_commands[&(HostId::local(), cwd.clone())], id);
-            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let done = vcs_reply(&mut rx, "local command").await;
             match &done {
                 VcsMsg::Command {
                     ok,
@@ -3341,14 +3448,10 @@ mod tests {
             apply_vcs(&mut app, &tx, done);
             assert!(app.vcs_commands.is_empty());
             assert!(!app.status_is_error);
-            assert!(
-                rx.try_recv().is_err(),
-                "duplicate keystroke must not start another task"
-            );
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn disconnected_vcs_preparation_finishes_with_a_persistent_error() {
         let mut app = vcs_app();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3359,10 +3462,7 @@ mod tests {
             "/tmp/checkout".into(),
             false,
         );
-        let prepared = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let prepared = vcs_reply(&mut rx, "disconnected preparation").await;
         apply_vcs(&mut app, &tx, prepared);
         assert!(app.vcs_commands.is_empty());
         assert!(app.status_is_error);
