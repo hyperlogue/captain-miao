@@ -17,36 +17,15 @@
 //! `docs/remote-sessions.md` §8 has the full table.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 
-static CONFIG: OnceLock<RwLock<Arc<CoreConfig>>> = OnceLock::new();
+static CONFIG: OnceLock<Arc<CoreConfig>> = OnceLock::new();
 
-fn slot() -> &'static RwLock<Arc<CoreConfig>> {
-    CONFIG.get_or_init(|| RwLock::new(Arc::new(CoreConfig::load())))
-}
-
-/// Read the in-memory core config. Does not hit disk — call [`reload`] for that.
+/// Read the cached core config, loading it from disk on first access.
 pub fn get() -> Arc<CoreConfig> {
-    slot()
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-}
-
-/// Re-read `config_path()` into the process slot.
-#[allow(dead_code)] // dashboard watchers call this once prefs land
-pub fn reload() -> Arc<CoreConfig> {
-    reload_from(&config_path())
-}
-
-/// Re-read `path` into the process slot.
-#[allow(dead_code)] // see [`reload`]
-pub fn reload_from(path: &Path) -> Arc<CoreConfig> {
-    let cfg = Arc::new(CoreConfig::load_from(path));
-    *slot().write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&cfg);
-    cfg
+    Arc::clone(CONFIG.get_or_init(|| Arc::new(CoreConfig::load())))
 }
 
 /// Path to `config.toml`. Public so the dashboard's fuller loader reuses it

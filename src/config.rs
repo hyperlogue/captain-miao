@@ -23,29 +23,12 @@ fn slot() -> &'static RwLock<Arc<Config>> {
     CONFIG.get_or_init(|| RwLock::new(Arc::new(Config::load())))
 }
 
-/// Read the in-memory config. Does not hit disk — call [`reload`] for that.
+/// Read the in-memory config, loading it from disk on first access.
 pub fn get() -> Arc<Config> {
     slot()
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
-}
-
-/// Re-read `config_path()` and merge `dashboard-overrides.json`.
-#[allow(dead_code)] // watchers call this once they land
-pub fn reload() -> Arc<Config> {
-    reload_from(&config_path())
-}
-
-/// Re-read `path` into the process slot. Tests pass a tempfile; production
-/// uses [`reload`].
-#[allow(dead_code)] // see [`reload`]
-pub fn reload_from(path: &Path) -> Arc<Config> {
-    let mut cfg = Config::from_path(path);
-    merge_dashboard_overrides(&mut cfg);
-    let cfg = Arc::new(cfg);
-    *slot().write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&cfg);
-    cfg
 }
 
 /// Overlay `dashboard-overrides.json` onto a TOML-loaded config. Unknown or
@@ -127,14 +110,12 @@ fn merge_dashboard_overrides(cfg: &mut Config) {
 }
 
 /// Install an already-built Config (skips disk). Tests use [`ConfigSlotGuard`].
-#[allow(dead_code)] // tests + later pref writes
 pub fn replace(cfg: Config) -> Arc<Config> {
     replace_arc(Arc::new(cfg))
 }
 
 /// Swap the process slot. Returns the previous `Arc` so a guard can restore it.
-#[allow(dead_code)] // [`ConfigSlotGuard`] and [`replace`]
-pub fn replace_arc(cfg: Arc<Config>) -> Arc<Config> {
+fn replace_arc(cfg: Arc<Config>) -> Arc<Config> {
     let mut g = slot().write().unwrap_or_else(PoisonError::into_inner);
     std::mem::replace(&mut *g, cfg)
 }
@@ -230,7 +211,7 @@ impl Config {
 
     /// Load TOML from disk without touching the process slot (and without
     /// merging `dashboard-overrides.json` — callers that want the overlay
-    /// apply it themselves, or go through [`reload`]).
+    /// apply it themselves).
     pub(crate) fn from_disk() -> Self {
         Self::from_path(&config_path())
     }
@@ -739,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn get_reads_the_slot_without_reload() {
+    fn get_reads_the_replaced_slot() {
         let mut cfg = Config::default();
         cfg.ui.table.name_truncate = 77;
         let _guard = ConfigSlotGuard::install(cfg);

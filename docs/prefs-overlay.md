@@ -4,6 +4,12 @@
 **Date:** 2026-08-22
 **Author:** captain-miao design
 
+**Implementation note:** The reload and watcher APIs proposed below are
+historical design. The unused `reload()` / `reload_from()` helpers have been
+removed. Current preference edits use `App::reapply_live_config()` to read TOML
+through `Config::from_disk()`, apply overrides, and install the result with
+`config::replace()`. Core configuration is cached on first access.
+
 A keyboard-first ratatui overlay for the handful of tunables you actually
 change while using the dashboard. It writes
 `~/.local/state/captain-miao/dashboard-overrides.json`. It never writes
