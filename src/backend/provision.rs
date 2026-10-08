@@ -62,7 +62,6 @@ const SERVER_BIN: &str = "miao-server";
 const REMOTE_BIN_DIR_REL: &str = ".cache/captain-miao/bin";
 
 /// Where a deployed miao-server lives on the remote, relative to `$HOME`.
-/// Shared with `redeploy.sh`, which uploads to exactly this path.
 const REMOTE_CACHE_REL: &str = ".cache/captain-miao/bin/miao-server";
 
 /// Where an in-flight upload is staged before it's verified and published,
@@ -75,8 +74,7 @@ const REMOTE_INCOMING_REL: &str = ".cache/captain-miao/bin/miao-server.incoming"
 /// The digest exists because a version match is not identity: dev builds never
 /// bump the version, so `0.2.1` on the host tells us nothing about *which*
 /// `0.2.1`. The marker closes that — rebuild, reconnect, and the host gets the
-/// new server — which is what makes `redeploy.sh`'s whole reason for existing go
-/// away for payload-carrying builds.
+/// new server when the supplied payload changes.
 ///
 /// The **target** is what makes the candidate loop terminate. With more than one
 /// candidate per arch, the digest on the host is whichever one the host proved
@@ -838,8 +836,6 @@ fn provision_failure(
         )
     };
     Some(match found.as_slice() {
-        // No `redeploy.sh` in the advice: that script is a dev-loop convenience
-        // in this repo, not something an installed user has.
         [] => format!(
             "miao-server not found (need {local_version}); {cannot_deploy} — \
              install it on the host"
@@ -2078,7 +2074,7 @@ mod tests {
         assert_eq!(p.path_version, None);
         assert_eq!(p.cache_version.as_deref(), Some("0.2.0"));
         assert_eq!(p.cache_sha.as_deref(), Some("deadbeef"));
-        // A host deployed by an older build (or by redeploy.sh) has no marker.
+        // An older build or a manual upload may leave no marker.
         let p = parse_probe("/root\nDarwin arm64\n-\nmiao-server 0.2.0").unwrap();
         assert_eq!(p.cache_sha, None);
         // Truncated/garbage output → None rather than a half-built probe.
@@ -2539,7 +2535,7 @@ mod tests {
             upload("abc123")
         );
 
-        // No marker at all (redeploy.sh, or a pre-marker dashboard). We own this
+        // No marker at all (manual upload, or a pre-marker dashboard). We own this
         // path, so we take it over rather than trusting an unlabelled binary.
         p.cache_sha = None;
         assert_eq!(
@@ -2909,9 +2905,8 @@ mod tests {
         // "this build carries nothing" would be true of the binary and useless
         // as a diagnosis to someone with CAPTAIN_MIAO_SERVER_DIR set.
         assert!(msg.contains("no server available"), "{msg}");
-        // The advice has to be something an installed user can act on — this
-        // repo's dev-loop script isn't on their machine.
-        assert!(!msg.contains("redeploy.sh"), "{msg}");
+        // Missing payloads must leave an installed user an actionable remedy.
+        assert!(msg.contains("install it on the host"), "{msg}");
 
         let stale = probe(lx, Some("0.1.0"), None);
         let msg = provision_failure("0.2.0", &stale, &Provision::FallBack, None, &[]).unwrap();

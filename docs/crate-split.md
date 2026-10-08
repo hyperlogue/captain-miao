@@ -445,9 +445,9 @@ Three things that turned out to matter, each verified rather than assumed:
   on the machine.
 - **A version match is not identity.** Dev builds never bump the version, so
   `0.2.1` on a host says nothing about *which* `0.2.1`. The digest marker closes
-  that: rebuild, reconnect, and the host gets the new server. This is what
-  retires `redeploy.sh` for payload-carrying builds — and the same observation is
-  why staging by version could not tell a current payload from a stale one.
+  that: rebuild, reconnect, and the host gets the new server when its supplied
+  payload changes. Staging by version could not tell a current payload from a
+  stale one.
 - **A failed deploy must not repeat on every reconnect.** The backoff caps at
   30s, so a host that accepts ssh but refuses the write would be re-sent
   megabytes twice a minute forever. `UploadGate` remembers the failure, keyed on

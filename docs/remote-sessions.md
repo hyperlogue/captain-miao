@@ -581,8 +581,8 @@ the full sequence and re-runs it on every reconnect:
    riscv64 (this build carries x86_64-unknown-linux-gnu) — install it on the
    host"*, *"could not deploy miao-server: <what the host
    said>"*) that becomes the host's `ConnState::Failed` text and shows verbatim
-   in the hosts panel. The advice names no repo script: `redeploy.sh` is a
-   dev-loop convenience here, not something an installed user has.
+   in the hosts panel. The advice describes actions available to an installed
+   user, including installing a compatible server on the host.
 
    That text is **held across the retry**. The reconnect loop re-dials on a
    backoff, and storing `Connecting` at the top of each pass blinked the reason
@@ -1862,15 +1862,6 @@ has no remote. Until it has, the feature ships off by default behind the
   `miao focus` bell are both client-side and only meaningful for sessions with a
   local window; a remote session that wants attention currently reaches the
   user through the row, not the OS.
-- ~~**A `deploy` command** wrapping `redeploy.sh`'s scp step~~ — superseded.
-  The dashboard now deploys its own embedded server on connect (§4 step 1), so
-  a version mismatch fixes itself rather than needing a keystroke. What's left
-  here is a **packaging** decision: release CI builds only the dashboard, so the
-  binaries on npm and GitHub Releases carry no payload. Wiring the server into
-  the release matrix (both Linux arches already build natively there) is what
-  would make this zero-touch for users rather than only for source builds —
-  worth doing when `remote` comes out from behind its cargo feature, and not
-  before, since it adds ~7 MB to every download for a feature that's off.
 - ~~**A musl payload.**~~ — done. The two musl targets are built and published,
   the deploy loops `[gnu, musl]` and keeps the first the host proves it can run,
   and a released (gnu-only) dashboard downloads the published musl asset when it
