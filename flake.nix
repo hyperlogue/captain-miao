@@ -165,26 +165,13 @@
           inherit craneLibCross commonArgs;
         };
 
-        # The dashboard with the remote-hosts gate on. Required by the wrapper
-        # below and not merely nice to have: `REMOTE_ENABLED` is
-        # `cfg!(feature = "remote")`, so a plain build never reads `hosts.json`
-        # and never constructs a remote backend — it would carry a link farm it
-        # has no code path to reach, and the whole package would be inert.
-        captain-miao-remote = craneLib.buildPackage (commonArgs
-          // {
-            inherit cargoArtifacts;
-            pname = "captain-miao-remote";
-            cargoExtraArgs = "--locked --features remote";
-            meta.mainProgram = "miao";
-          });
-
         captain-miao-with-servers = pkgs.callPackage ./nix/with-servers.nix {
-          inherit captain-miao-remote captain-miao-server-payloads;
+          inherit captain-miao captain-miao-server-payloads;
         };
       in {
         packages = {
           default = captain-miao;
-          inherit captain-miao captain-miao-server captain-miao-remote captain-miao-server-payloads captain-miao-with-servers;
+          inherit captain-miao captain-miao-server captain-miao-server-payloads captain-miao-with-servers;
         };
 
         devShells.default = import ./nix/shell.nix {

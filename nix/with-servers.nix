@@ -10,7 +10,7 @@
   lib,
   symlinkJoin,
   makeWrapper,
-  captain-miao-remote,
+  captain-miao,
   captain-miao-server-payloads,
   # Passed straight through to `captain-miao-server-payloads`. `null` means "whatever
   # that package defaults to" — the default lives there and only there, so the
@@ -24,11 +24,8 @@
 in
   symlinkJoin {
     name = "captain-miao-with-servers";
-    # `captain-miao-remote`, not `captain-miao`: `REMOTE_ENABLED` is
-    # `cfg!(feature = "remote")`, so a plain build never reads `hosts.json` and
-    # never constructs a remote backend — it would carry a link farm it has no
-    # code path to reach, and the whole package would be inert.
-    paths = [captain-miao-remote];
+    # The default dashboard already enables remote hosts.
+    paths = [captain-miao];
     nativeBuildInputs = [makeWrapper];
     # `--set-default`, not `--set`: the chain's whole premise is that explicit
     # configuration beats a build-time default, so a user who exports their own
