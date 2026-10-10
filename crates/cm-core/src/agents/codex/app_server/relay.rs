@@ -17,6 +17,9 @@ pub(crate) struct Relay {
     pause_ack: watch::Receiver<InputState>,
     path: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    environment: Option<Arc<Mutex<super::Environments>>>,
+    upstream: PathBuf,
+    maintenance: tokio::task::JoinHandle<()>,
 }
 
 impl Relay {
@@ -42,7 +45,26 @@ impl Relay {
         let (tx, events) = mpsc::channel(128);
         let (input_paused, mut pause_rx) = watch::channel(false);
         let (ack_tx, pause_ack) = watch::channel(InputState::Running);
+        let maintenance = {
+            let environment = environment.clone();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let Some(environment) = environment else {
+                    return;
+                };
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let root = environment.lock().await.root();
+                    super::Environments::collect(&root, &upstream).await;
+                }
+            })
+        };
+        let task_environment = environment.clone();
+        let task_upstream = upstream.clone();
         let task = tokio::spawn(async move {
+            let environment = task_environment;
+            let upstream = task_upstream;
             let mut gate = InputGate::default();
             // Extra clients (the in-session resume picker) outlive one session
             // connection. Aborting this task drops the set and stops them too.
@@ -67,7 +89,9 @@ impl Relay {
                         tokio_tungstenite::accept_async_with_config(stream, Some(transport::limits())))
                         .await??;
                     let mut server = transport::connect(&upstream).await?;
+                    let daemon = server.get_ref().peer_cred().ok().and_then(|cred| cred.pid());
                     let mut accept_extras = true;
+                    let mut environment_requests = HashSet::new();
                     loop {
                         tokio::select! {
                             biased;
@@ -81,10 +105,14 @@ impl Relay {
                             frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
                                 let mut frame = frame?;
-                                if let Err(reply) = prepare_environment(&mut frame, environment.as_ref(), &upstream, &mut pause_rx).await {
-                                    client.send(reply).await?;
-                                    gate.acknowledge(*pause_rx.borrow(), &ack_tx);
-                                    continue;
+                                match prepare_environment(&mut frame, environment.as_ref(), &upstream, &mut pause_rx, daemon).await {
+                                    Ok(Some(id)) => { environment_requests.insert(id); }
+                                    Ok(None) => {}
+                                    Err(reply) => {
+                                        client.send(reply).await?;
+                                        gate.acknowledge(*pause_rx.borrow(), &ack_tx);
+                                        continue;
+                                    }
                                 }
                                 if let Message::Text(text) = &frame
                                     && let Ok(value) = serde_json::from_str::<Value>(text) {
@@ -124,6 +152,7 @@ impl Relay {
                                 let frame = frame?;
                                 if let Message::Text(text) = &frame
                                     && let Ok(value) = serde_json::from_str::<Value>(text) {
+                                    settle_environment(&value, &mut environment_requests, environment.as_ref(), daemon).await;
                                     // Settle after enqueueing metadata: a pause ACK
                                     // must never overtake selection of its thread.
                                     if observable(&value) && tx.send(Observation::Server(value.clone())).await.is_err() { break; }
@@ -155,8 +184,21 @@ impl Relay {
             pause_ack,
             path: path.to_owned(),
             task,
+            environment,
+            upstream,
+            maintenance,
         })
     }
+    pub(crate) async fn cleanup_environment(&mut self) {
+        self.task.abort();
+        self.maintenance.abort();
+        let _ = (&mut self.task).await;
+        let _ = (&mut self.maintenance).await;
+        if let Some(environment) = self.environment.take() {
+            environment.lock().await.finish(&self.upstream).await;
+        }
+    }
+
     /// Fence new input and wait for already forwarded thread/turn operations.
     /// The owned future lets the supervisor drain observations concurrently.
     /// A lost response is uncertainty, never evidence that no work started.
@@ -252,6 +294,12 @@ async fn forward_unobserved(
     )
     .await??;
     let mut server = transport::connect(upstream).await?;
+    let daemon = server
+        .get_ref()
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid());
+    let mut environment_requests = HashSet::new();
     loop {
         tokio::select! {
             biased;
@@ -262,9 +310,10 @@ async fn forward_unobserved(
             frame = client.next(), if !*pause_rx.borrow() => {
                 let Some(frame) = frame else { break };
                 let mut frame = frame?;
-                if let Err(reply) = prepare_environment(&mut frame, environment.as_ref(), upstream, pause_rx).await {
-                    client.send(reply).await?;
-                    continue;
+                match prepare_environment(&mut frame, environment.as_ref(), upstream, pause_rx, daemon).await {
+                    Ok(Some(id)) => { environment_requests.insert(id); }
+                    Ok(None) => {}
+                    Err(reply) => { client.send(reply).await?; continue; }
                 }
                 let closed = frame.is_close();
                 server.send(frame).await?;
@@ -273,6 +322,10 @@ async fn forward_unobserved(
             frame = server.next() => {
                 let Some(frame) = frame else { break };
                 let frame = frame?;
+                if let Message::Text(text) = &frame
+                    && let Ok(value) = serde_json::from_str::<Value>(text) {
+                    settle_environment(&value, &mut environment_requests, environment.as_ref(), daemon).await;
+                }
                 let closed = frame.is_close();
                 client.send(frame).await?;
                 if closed { break; }
@@ -287,28 +340,45 @@ async fn prepare_environment(
     environment: Option<&Arc<Mutex<super::Environments>>>,
     upstream: &Path,
     pause_rx: &mut watch::Receiver<bool>,
-) -> std::result::Result<(), Message> {
+    daemon: Option<i32>,
+) -> std::result::Result<Option<String>, Message> {
     let (Some(environment), Message::Text(text)) = (environment, &*frame) else {
-        return Ok(());
+        return Ok(None);
     };
     let Ok(mut value) = serde_json::from_str::<Value>(text) else {
-        return Ok(());
+        return Ok(None);
     };
     if !super::environment::needs_environment(&value) {
-        return Ok(());
+        return Ok(None);
     }
     let result = tokio::select! {
         biased;
         _ = pause_rx.wait_for(|paused| *paused) => Err(anyhow::anyhow!("session cleanup is in progress; retry after cleanup")),
-        result = async { environment.lock().await.request(&mut value, upstream).await } => result,
+        result = async { environment.lock().await.request(&mut value, upstream, daemon).await } => result,
     };
-    if let Err(error) = result {
-        return Err(Message::Text(serde_json::json!({
+    let applied = match result {
+        Ok(applied) => applied,
+        Err(error) => return Err(Message::Text(serde_json::json!({
             "id":value["id"], "error":{"code":-32000,"message":format!("miao direnv setup failed: {error:#}")}
-        }).to_string().into()));
-    }
+        }).to_string().into())),
+    };
     *frame = Message::Text(value.to_string().into());
-    Ok(())
+    Ok(applied.then(|| value["id"].to_string()))
+}
+
+async fn settle_environment(
+    value: &Value,
+    pending: &mut HashSet<String>,
+    environment: Option<&Arc<Mutex<super::Environments>>>,
+    daemon: Option<i32>,
+) {
+    if value.get("method").is_none()
+        && let Some(id) = value.get("id")
+        && pending.remove(&id.to_string())
+        && let Some(environment) = environment
+    {
+        environment.lock().await.response(value, daemon);
+    }
 }
 
 /// Only request identities cross this gate; prompts/configuration stay on the
@@ -441,6 +511,7 @@ fn observable(value: &Value) -> bool {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.task.abort();
+        self.maintenance.abort();
         let _ = std::fs::remove_file(&self.path);
     }
 }

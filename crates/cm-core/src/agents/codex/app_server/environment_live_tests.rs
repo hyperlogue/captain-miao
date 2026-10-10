@@ -247,6 +247,7 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
             .env("XDG_RUNTIME_DIR", root.path().join("run"))
             .env("CM_TEST_LIVE_DIRENV", "1")
             .env("REMOVED", "daemon-value")
+            .env("UNRELATED_CREDENTIAL", "unchanged-launcher-credential-7d51")
             .kill_on_drop(true)
             .output()
             .await
@@ -263,7 +264,7 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
     let codex_home = root.join("codex");
     std::fs::create_dir_all(&codex_home).unwrap();
     let (port, model, model_task) = model_fixture().await;
-    std::fs::write(codex_home.join("config.toml"), format!("model = \"test-model\"\nmodel_provider = \"fixture\"\napproval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n[model_providers.fixture]\nname = \"Loopback test fixture\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n")).unwrap();
+    std::fs::write(codex_home.join("config.toml"), format!("model = \"test-model\"\nmodel_provider = \"fixture\"\napproval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n[model_providers.fixture]\nname = \"Loopback test fixture\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n[shell_environment_policy]\nignore_default_excludes = false\n[shell_environment_policy.filters]\n\"aws_*\" = \"exclude\"\n[shell_environment_policy.set]\nCONFIG_WINS = \"explicit\"\n")).unwrap();
     for project in ["alpha", "beta"] {
         let cwd = root.join(project);
         std::fs::create_dir_all(cwd.join("bin")).unwrap();
@@ -271,7 +272,7 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
         let executable = cwd.join("bin/project-only");
         std::fs::write(&executable, format!("#!/bin/sh\nprintf {project}\n")).unwrap();
         std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(cwd.join(".envrc"), format!("export PROJECT={project}\nexport PRIVATE_MARKER=private-direnv-value-9b28\nunset REMOVED\nPATH_add bin\n")).unwrap();
+        std::fs::write(cwd.join(".envrc"), format!("export PROJECT={project}\nexport PRIVATE_MARKER=private-direnv-value-9b28\nexport PROJECT_SECRET=excluded-direnv-secret-3c42\nexport AWS_CREDENTIAL=excluded-direnv-aws-6a12\nexport CONFIG_WINS=direnv\nunset REMOVED\nPATH_add bin\n")).unwrap();
         assert!(
             Command::new("direnv")
                 .arg("allow")
@@ -307,7 +308,7 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
     }
     for (index, project) in [(0, "alpha"), (1, "beta"), (0, "alpha")] {
         let command = format!(
-            "test \"$(project-only | cat)\" = {project} && test \"$PROJECT\" = {project} && test -n \"$PRIVATE_MARKER\" && test -z \"${{REMOVED+x}}\" && printf verified"
+            "test \"$(project-only | cat)\" = {project} && test \"$PROJECT\" = {project} && test -n \"$PRIVATE_MARKER\" && test -z \"${{REMOVED+x}}${{PROJECT_SECRET+x}}${{AWS_CREDENTIAL+x}}\" && test \"$CONFIG_WINS\" = explicit && test \"$UNRELATED_CREDENTIAL\" = unchanged-launcher-credential-7d51 && printf verified"
         );
         client
             .request(
@@ -322,6 +323,19 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
             client.completed_command(&threads[index]).await;
         }
     }
+    let restricted = client
+        .request(
+            "thread/start",
+            json!({"cwd":root.join("alpha"),"config":{
+                "shell_environment_policy.inherit":"none",
+                "shell_environment_policy.include_only":["ALLOWED"],
+                "shell_environment_policy.set.ALLOWED":"explicit"
+            }}),
+        )
+        .await;
+    let restricted = restricted["thread"]["id"].as_str().unwrap();
+    client.request("thread/shellCommand", json!({"threadId":restricted,"command":"test \"$ALLOWED\" = explicit && test -z \"${PROJECT+x}${PRIVATE_MARKER+x}${UNRELATED_CREDENTIAL+x}\" && printf verified"})).await;
+    client.completed_command(restricted).await;
     server.kill().await.unwrap();
     server.wait().await.unwrap();
     drop(client);
@@ -341,11 +355,32 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
         .await;
     client.request("thread/shellCommand", json!({"threadId":threads[0],"command":"test \"$(project-only)\" = alpha && printf verified"})).await;
     client.completed_command(&threads[0]).await;
+    // Let the relay settle the last lifecycle reply before releasing its lease.
+    relay.cleanup_environment().await;
+    let snapshot_root = root.join("state/captain-miao/codex-environments");
+    for marker in [
+        b"unchanged-launcher-credential-7d51".as_slice(),
+        b"excluded-direnv-secret-3c42",
+        b"excluded-direnv-aws-6a12",
+    ] {
+        assert_marker_absent(&snapshot_root, marker);
+    }
     server.kill().await.unwrap();
     server.wait().await.unwrap();
     drop(client);
     drop(relay);
+    // A restarted daemon has no loaded references; the next sweep removes the
+    // old launcher's private files without recapturing its now-broken .envrc.
+    server = start_server(&root).await;
+    super::environment_store::collect(&snapshot_root, &root.join("server.sock"))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&snapshot_root).unwrap().count(), 0);
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
     model_task.abort();
     assert_marker_absent(&codex_home, b"private-direnv-value-9b28");
-    println!("Real Codex: 10 environment checks passed; private marker absent from Codex files");
+    println!(
+        "Real Codex: 11 environment checks passed; exclusions, delta-only capture, and restart cleanup verified"
+    );
 }

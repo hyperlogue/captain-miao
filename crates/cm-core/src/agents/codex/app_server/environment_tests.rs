@@ -14,18 +14,12 @@ fn snapshot_restores_path_and_values_without_reinitializing_child_shells() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let value = "quote'\n$(exit 49) `exit 50` \\";
     let vars = BTreeMap::from([
-        ("PATH".into(), bin.to_str().unwrap().into()),
-        ("PROJECT_SECRET".into(), value.into()),
-        ("HTTP_PROXY".into(), "project-proxy".into()),
+        ("PATH".into(), Some(bin.to_str().unwrap().into())),
+        ("PROJECT_SECRET".into(), Some(value.into())),
+        ("HTTP_PROXY".into(), Some("project-proxy".into())),
+        ("REMOVED".into(), None),
     ]);
-    let settings = persist(
-        root.path(),
-        &script(
-            &vars,
-            ["REMOVED".into(), "CODEX_THREAD_ID".into()].into_iter(),
-        ),
-    )
-    .unwrap();
+    let settings = persist(root.path(), &script(&vars)).unwrap();
     assert!(!settings.to_string().contains(value));
     let hook = settings["set"]["BASH_ENV"].as_str().unwrap();
     assert_eq!(
@@ -94,10 +88,10 @@ fn zsh_snapshot_runs_once_for_login_and_nonlogin_commands() {
     };
     let root = tempfile::tempdir().unwrap();
     let variables = BTreeMap::from([
-        ("PATH".into(), "project-path".into()),
-        ("PROJECT".into(), "captured".into()),
+        ("PATH".into(), Some("project-path".into())),
+        ("PROJECT".into(), Some("captured".into())),
     ]);
-    let settings = persist(root.path(), &script(&variables, std::iter::empty())).unwrap();
+    let settings = persist(root.path(), &script(&variables)).unwrap();
     for login in [false, true] {
         let output = std::process::Command::new(&zsh)
             .arg(if login { "-lc" } else { "-c" })
@@ -138,6 +132,13 @@ async fn initialize(listener: &UnixListener) -> transport::Socket {
     socket
 }
 
+async fn config_read(listener: &UnixListener) {
+    let mut socket = initialize(listener).await;
+    let read = receive(&mut socket).await;
+    assert_eq!(read["method"], "config/read");
+    send(&mut socket, json!({"id":read["id"],"result":{"config":{}}})).await;
+}
+
 #[tokio::test]
 async fn relay_applies_snapshots_to_start_resume_and_fork_and_preserves_other_config() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -153,27 +154,30 @@ async fn relay_applies_snapshots_to_start_resume_and_fork_and_preserves_other_co
     let mut env = Environments::new(&cwd, cwd.join("snapshots"));
     for project in [&cwd, &other] {
         let vars = BTreeMap::from([
-            ("PATH".into(), project.to_string_lossy().into_owned()),
-            ("PRIVATE_MARKER".into(), "only-in-private-file".into()),
+            ("PATH".into(), Some(project.to_string_lossy().into_owned())),
+            ("PRIVATE_MARKER".into(), Some("only-in-private-file".into())),
         ]);
-        env.snapshots.insert(
-            project.clone(),
-            Some(persist(&env.root, &script(&vars, std::iter::empty())).unwrap()),
-        );
+        env.snapshots.insert(project.clone(), Some(vars));
     }
-    let expected = env.snapshots[&cwd].clone().unwrap();
-    let other_expected = env.snapshots[&other].clone().unwrap();
+
     let server = tokio::spawn(async move {
         drop(initialize(&listener).await); // preflight
         // New connection simulates the TUI reconnecting after a daemon restart.
         for connection in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            config_read(&listener).await;
             let start = receive(&mut socket).await;
             assert_eq!(
-                start["params"]["config"]["shell_environment_policy"],
-                expected
+                start["params"]["config"]["shell_environment_policy"]["exclude"],
+                json!(["PRIVATE_*"])
             );
+            let policy = &start["params"]["config"]["shell_environment_policy"];
+            assert_eq!(policy["set"]["PATH"], "wrong");
+            let hook =
+                std::fs::read_to_string(policy["set"]["BASH_ENV"].as_str().unwrap()).unwrap();
+            assert!(hook.contains("export PATH='wrong'"));
+            assert!(!hook.contains("only-in-private-file"));
             assert_eq!(
                 start["params"]["config"]["features"]["shell_snapshot"],
                 false
@@ -200,6 +204,8 @@ async fn relay_applies_snapshots_to_start_resume_and_fork_and_preserves_other_co
                 json!({"id":read["id"],"result":{"thread":{"cwd":other}}}),
             )
             .await;
+            drop(metadata);
+            config_read(&listener).await;
             let fork = receive(&mut socket).await;
             assert_eq!(
                 fork["method"],
@@ -209,10 +215,16 @@ async fn relay_applies_snapshots_to_start_resume_and_fork_and_preserves_other_co
                     "thread/resume"
                 }
             );
-            assert_eq!(
-                fork["params"]["config"]["shell_environment_policy"],
-                other_expected
-            );
+            let hook = std::fs::read_to_string(
+                fork["params"]["config"]["shell_environment_policy"]["set"]["BASH_ENV"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(hook.contains(&format!(
+                "export PATH={}",
+                shell_quote(other.to_str().unwrap())
+            )));
             send(
                 &mut socket,
                 json!({"id":3,"result":{"thread":{"id":"other"}}}),
@@ -236,7 +248,8 @@ async fn relay_applies_snapshots_to_start_resume_and_fork_and_preserves_other_co
             &mut client,
             json!({"id":1,"method":"thread/start","params":{"config":{
                 "futureSetting":"preserved","features":{"futureFeature":true,"shell_snapshot":true},
-                "shell_environment_policy.set.PATH":"wrong"
+                "shell_environment_policy.set.PATH":"wrong",
+                "shell_environment_policy.exclude":["PRIVATE_*"]
             }}}),
         )
         .await;
@@ -260,7 +273,7 @@ async fn no_envrc_leaves_requests_unchanged() {
     let mut request =
         json!({"id":1,"method":"thread/start","params":{"config":{"allow_login_shell":true}}});
     let original = request.clone();
-    env.request(&mut request, Path::new("unused.sock"))
+    env.request(&mut request, Path::new("unused.sock"), None)
         .await
         .unwrap();
     assert_eq!(request, original);
@@ -337,7 +350,7 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let fake = bin.join("direnv");
-        std::fs::write(&fake, "#!/bin/sh\ncase $1 in\nstatus) if [ -f denied ]; then printf '{\"state\":{\"foundRC\":{\"allowed\":1}}}'; else printf '{\"state\":{\"foundRC\":{\"allowed\":0}}}'; fi;;\nexec) if [ -f failed ]; then echo private-output >&2; exit 1; fi; shift 2; export CAPTURED_PROJECT=yes; unset REMOVED; exec \"$@\";;\nesac\n").unwrap();
+        std::fs::write(&fake, "#!/bin/sh\ncase $1 in\nstatus) if [ -f denied ]; then printf '{\"state\":{\"foundRC\":{\"allowed\":1}}}'; else printf '{\"state\":{\"foundRC\":{\"allowed\":0}}}'; fi;;\nexec) if [ ! -f .envrc ]; then shift 2; exec \"$@\"; fi; if [ -f failed ]; then echo private-output >&2; exit 1; fi; shift 2; export CAPTURED_PROJECT=yes; unset REMOVED; exec \"$@\";;\nesac\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = std::env::join_paths(
             std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -352,6 +365,7 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
             .env("XDG_STATE_HOME", root.path())
             .env("XDG_RUNTIME_DIR", root.path())
             .env("REMOVED", "parent")
+            .env("UNRELATED_CREDENTIAL", "unchanged-launcher-secret")
             .env("CM_TEST_DIRENV_CAPTURE", "1")
             .output()
             .await
@@ -387,8 +401,8 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
         .await
         .unwrap();
     let settings = environments.snapshot(&project).await.unwrap().unwrap();
-    let hook = settings["set"]["BASH_ENV"].as_str().unwrap();
-    let script = std::fs::read_to_string(hook).unwrap();
+    let script = script(&settings);
+    assert!(!script.contains("unchanged-launcher-secret"));
     assert!(script.contains("export CAPTURED_PROJECT='yes'"));
     assert!(script.contains("unset REMOVED"));
     // Capture is once per project per launcher, including subsequent resumes.
@@ -396,5 +410,76 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
     assert_eq!(
         environments.snapshot(&project).await.unwrap(),
         Some(settings)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires installed direnv; uses isolated HOME and XDG roots"]
+async fn real_direnv_capture_recovers_changes_from_an_already_activated_project() {
+    const TEST: &str = "agents::codex::app_server::environment::tests::real_direnv_capture_recovers_changes_from_an_already_activated_project";
+    if std::env::var_os("CM_TEST_DIRENV_ACTIVATED").is_some() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(std::env::var("PROJECT").unwrap(), "activated");
+        assert!(std::env::var_os("DIRENV_DIFF").is_some());
+        let delta = capture(&cwd).await.unwrap().unwrap();
+        assert_eq!(delta["PROJECT"].as_deref(), Some("activated"));
+        assert_eq!(delta["REMOVED"], None);
+        assert!(!delta.contains_key("UNCHANGED_LAUNCHER"));
+        assert!(!delta.keys().any(|name| name.starts_with("DIRENV_")));
+        return;
+    }
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join(".envrc"),
+        "export PROJECT=activated\nunset REMOVED\nPATH_add bin\n",
+    )
+    .unwrap();
+    let clean = |cmd: &mut Command| {
+        cmd.env_clear()
+            .env("HOME", root.path())
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"));
+    };
+    let mut allow = Command::new("direnv");
+    clean(&mut allow);
+    assert!(
+        allow
+            .arg("allow")
+            .arg(&project)
+            .output()
+            .await
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut child = Command::new("direnv");
+    clean(&mut child);
+    let output = tokio::time::timeout(
+        Duration::from_secs(150),
+        child
+            .arg("exec")
+            .arg(&project)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--ignored", "--nocapture"])
+            .current_dir(&project)
+            .env("CM_TEST_DIRENV_ACTIVATED", "1")
+            .env("UNCHANGED_LAUNCHER", "unrelated")
+            .env("REMOVED", "baseline")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("waiting for activated direnv capture child")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -216,8 +216,25 @@ does not change a running thread's environment. Shell snapshots and login
 initialization for agent commands are disabled for these sessions, and managed
 startup files restore the capture for Bash and zsh. Shell functions and aliases
 are not captured; explicitly choosing another execution shell bypasses these
-startup files. Miao owns the shell-environment policy for direnv-enabled threads.
-MCP servers and the shared daemon itself still use their own environments.
+startup files. Miao reads the daemon's effective project configuration and merges
+thread overrides before applying its environment policy to direnv's changes.
+This preserves `inherit`, explicit exclusions, include-only filters, automatic
+secret-name exclusions when enabled, and explicit `set` values. Both legacy
+arrays and the newer `filters` table are supported; matches are case-insensitive.
+An explicit Codex `set` value wins over direnv and exclusions, subject to the
+include-only filter, following [Codex's normal precedence](https://learn.chatgpt.com/docs/config-file/config-advanced#shell-environment-policy). `inherit = "none"`
+therefore prevents direnv additions unless explicitly supplied through `set`.
+
+Only added, changed, and removed variables are captured, comparing with direnv's
+unloaded environment even when the launcher starts inside an activated project.
+Unchanged launcher variables and direnv's internal metadata are omitted. The
+daemon still supplies its ordinary filtered environment. Startup controls
+(`BASH_ENV`, `ZDOTDIR`, and `SHLVL`) are the small policy exception needed to load
+the private hook. Bash login profiles are filtered again before applying the
+changes. Runtime Codex identity and managed proxy values remain authoritative.
+Unrecognized policy settings and `experimental_use_profile = true` fail with an
+error instead of silently dropping restrictions. MCP servers and the shared
+daemon itself still use their own environments.
 
 Codex ignores configuration overrides when resuming an **already-loaded
 thread**, so it keeps its original environment. This also means a thread started
@@ -231,12 +248,28 @@ Captured values are stored in immutable files under
 `~/.local/state/captain-miao/codex-environments/` (honoring `XDG_STATE_HOME`),
 with directories `0700` and files `0600`. Only startup-file paths are passed in
 Codex configuration: putting values directly in its environment overrides can
-copy secrets into Codex's trace logs. Snapshots remain after launcher exit
-because loaded threads and their children may still reference them. This
-directory can be removed after stopping the Codex daemon; the next launch
-recreates the needed snapshots. As with other local state, treat these files
-as private when backing up or sharing diagnostics. Native mode keeps its
-existing process-per-session environment behavior.
+copy secrets into Codex's trace logs. Snapshots contain the allowed direnv delta
+and explicit Codex overrides needed to restore values after shell startup.
+
+Each launcher holds a filesystem lease and records the threads using its files.
+Cleanup runs when a relay starts, every minute while it runs, and when its
+launcher exits. It removes an inactive launcher's snapshots only after Codex
+confirms its threads and their descendants are unloaded. A lost creation reply
+retains the files until its owning daemon process has exited: an empty inventory
+alone cannot rule out an in-flight creation. The daemon PID comes from kernel
+credentials on the actual relay socket. Missing credentials or a reused PID
+conservatively delay cleanup. Unreachable daemons,
+unsupported inventory, and incomplete ancestry information defer collection;
+failed inventory is never treated as proof that a file is unused. Crashed
+launchers release their leases automatically, allowing a later relay to clean
+up. If the last launcher exits before Codex unloads its thread, cleanup waits
+for a subsequent miao app-server session.
+
+Snapshots from the older implementation have no ownership records and are
+retained. The entire directory can be removed after stopping all Codex daemons
+that used it; the next launch recreates the needed snapshots. As with other
+local state, treat these files as private when backing up or sharing diagnostics.
+Native mode keeps its existing process-per-session environment behavior.
 
 The integration is exercised against Codex 0.162.0 by the optional
 [live environment test](testing-sessions.md#real-codex-and-direnv).

@@ -6,6 +6,8 @@
 //! SQLite connection belongs to this mode.
 mod control;
 mod environment;
+mod environment_policy;
+mod environment_store;
 mod kill;
 mod lifecycle;
 mod listener;

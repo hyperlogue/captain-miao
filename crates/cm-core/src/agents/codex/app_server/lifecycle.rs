@@ -120,6 +120,7 @@ pub(crate) async fn supervise(
                     let result = child.wait().await.context("waiting for Codex TUI to exit");
                     request.reply(result.as_ref().err().map(|error| format!("{error:#}"))).await;
                     result?;
+                    relay.cleanup_environment().await;
                     return Ok(exit_code);
                 }
                 if stopping.is_some() {
@@ -159,6 +160,7 @@ pub(crate) async fn supervise(
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         if let Some(reply) = reply.take() { reply.reply(None).await; }
+                        relay.cleanup_environment().await;
                         return Ok(exit_code);
                     }
                     Err(error) => {

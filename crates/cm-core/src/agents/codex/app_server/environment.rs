@@ -4,6 +4,8 @@
 //! `shell_environment_policy.set` makes Codex log its values for manual `!`
 //! commands. Immutable, owner-only snapshots instead outlive the launcher: a
 //! loaded Codex thread ignores resume overrides and may still use its old file.
+//! Store leases and loaded-thread inventory govern automatic collection. Only
+//! direnv changes and explicit Codex overrides are serialized, after filtering.
 //! Bash reads BASH_ENV after login profiles; zsh's .zshenv disables further rc
 //! processing. Both load the snapshot once, preserving deliberate changes in
 //! child shells. Other execution shells are outside this integration's scope.
@@ -16,16 +18,19 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
-use super::transport;
+use super::{environment_policy::Policy, environment_store::Store, transport};
 use crate::agents::{find_in_path, shell_quote};
 use crate::state;
+
+pub(super) type Delta = BTreeMap<String, Option<String>>;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct Environments {
     cwd: PathBuf,
     root: PathBuf,
-    snapshots: HashMap<PathBuf, Option<Value>>,
+    snapshots: HashMap<PathBuf, Option<Delta>>,
+    store: Option<Store>,
 }
 
 impl Environments {
@@ -43,15 +48,16 @@ impl Environments {
             cwd: cwd.to_owned(),
             root,
             snapshots: HashMap::new(),
+            store: None,
         }
     }
 
-    async fn snapshot(&mut self, cwd: &Path) -> Result<Option<Value>> {
+    async fn snapshot(&mut self, cwd: &Path) -> Result<Option<Delta>> {
         let cwd = std::fs::canonicalize(cwd).context("resolving Codex project directory")?;
         if let Some(snapshot) = self.snapshots.get(&cwd) {
             return Ok(snapshot.clone());
         }
-        let snapshot = capture(&cwd, &self.root).await?;
+        let snapshot = capture(&cwd).await?;
         self.snapshots.insert(cwd, snapshot.clone());
         Ok(snapshot)
     }
@@ -59,9 +65,14 @@ impl Environments {
     /// Resolve the actual project when the TUI's /resume picker switches cwd.
     /// Metadata reads use a separate, unsubscribed connection and never retry
     /// the user's operation. Unknown requests and internal helpers pass through.
-    pub(super) async fn request(&mut self, value: &mut Value, upstream: &Path) -> Result<()> {
+    pub(super) async fn request(
+        &mut self,
+        value: &mut Value,
+        upstream: &Path,
+        daemon: Option<i32>,
+    ) -> Result<bool> {
         if !needs_environment(value) {
-            return Ok(());
+            return Ok(false);
         }
         let cwd = if let Some(cwd) = value["params"]["cwd"].as_str() {
             let path = Path::new(cwd);
@@ -83,9 +94,28 @@ impl Environments {
         } else {
             self.cwd.clone()
         };
-        let Some(settings) = self.snapshot(&cwd).await? else {
-            return Ok(());
+        let Some(delta) = self.snapshot(&cwd).await? else {
+            return Ok(false);
         };
+        let mut client = transport::Client::connect(upstream).await?;
+        ensure!(
+            daemon.is_none() || client.peer_pid() == daemon,
+            "Codex daemon changed during environment preparation; reconnect the TUI"
+        );
+        let result = client
+            .request("config/read", json!({"cwd":cwd,"includeLayers":false}))
+            .await?;
+        let (policy, effective) = Policy::resolve(&result["config"], &value["params"]["config"])?;
+        let filtered = policy.apply(&delta);
+        if self.store.is_none() {
+            self.store = Some(Store::new(&self.root, upstream)?);
+        }
+        let hooks = self
+            .store
+            .as_mut()
+            .unwrap()
+            .prepare(&(policy.scrub_script() + &script(&filtered)), daemon)?;
+        let settings = policy.bootstrap(effective, &hooks)?;
         let params = value["params"]
             .as_object_mut()
             .context("invalid Codex thread parameters")?;
@@ -108,7 +138,36 @@ impl Environments {
             .insert("shell_snapshot".into(), json!(false));
         config.insert("allow_login_shell".into(), json!(false));
         config.insert("shell_environment_policy".into(), settings);
-        Ok(())
+        Ok(true)
+    }
+    pub(super) fn response(&mut self, response: &Value, daemon: Option<i32>) {
+        if let Some(store) = &mut self.store
+            && store.response(response, daemon).is_err()
+        {
+            tracing::warn!("Could not update Codex environment ownership; retaining snapshots");
+        }
+    }
+
+    pub(super) fn root(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    pub(super) async fn collect(root: &Path, upstream: &Path) {
+        if !matches!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                super::environment_store::collect(root, upstream)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("Codex environment cleanup deferred until inventory is available");
+        }
+    }
+
+    pub(super) async fn finish(&mut self, upstream: &Path) {
+        self.store = None;
+        Self::collect(&self.root, upstream).await;
     }
 }
 
@@ -133,7 +192,7 @@ async fn output(command: &mut Command, phase: &str) -> Result<std::process::Outp
     .with_context(|| format!("could not run direnv while {phase}"))
 }
 
-async fn capture(cwd: &Path, root: &Path) -> Result<Option<Value>> {
+async fn capture(cwd: &Path) -> Result<Option<Delta>> {
     if !cwd.ancestors().any(|dir| dir.join(".envrc").is_file()) {
         return Ok(None);
     }
@@ -156,10 +215,10 @@ async fn capture(cwd: &Path, root: &Path) -> Result<Option<Value>> {
     );
     let env = find_in_path("env").context("env is not on PATH")?;
     let captured = output(
-        Command::new(direnv)
+        Command::new(&direnv)
             .arg("exec")
             .arg(cwd)
-            .arg(env)
+            .arg(&env)
             .arg("-0")
             .current_dir(cwd),
         "capturing the project environment",
@@ -171,11 +230,39 @@ async fn capture(cwd: &Path, root: &Path) -> Result<Option<Value>> {
         cwd.display()
     );
     let variables = parse(&captured.stdout)?;
-    let script = script(
-        &variables,
-        std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()),
+    // `direnv exec` reverses DIRENV_DIFF even if the launcher was started in
+    // an already activated project. Comparing with std::env would lose those
+    // project's changes (or import changes from a previously active project).
+    let empty = tempfile::tempdir_in("/tmp")?;
+    ensure!(
+        !empty
+            .path()
+            .ancestors()
+            .any(|dir| dir.join(".envrc").is_file() || dir.join(".env").is_file()),
+        "cannot capture a clean direnv baseline beneath an .envrc or .env"
     );
-    Ok(Some(persist(root, &script)?))
+    let baseline = output(
+        Command::new(&direnv)
+            .arg("exec")
+            .arg(empty.path())
+            .arg(&env)
+            .arg("-0")
+            .current_dir(empty.path()),
+        "unloading the inherited project environment",
+    )
+    .await?;
+    ensure!(
+        baseline.status.success(),
+        "could not unload inherited direnv environment"
+    );
+    let baseline = parse(&baseline.stdout)?;
+    let mut delta = Delta::new();
+    for key in baseline.keys().chain(variables.keys()) {
+        if baseline.get(key) != variables.get(key) {
+            delta.insert(key.clone(), variables.get(key).cloned());
+        }
+    }
+    Ok(Some(delta))
 }
 
 fn parse(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
@@ -202,7 +289,7 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
     Ok(variables)
 }
 
-fn variable_name(key: &str) -> bool {
+pub(super) fn variable_name(key: &str) -> bool {
     !key.is_empty()
         && key
             .bytes()
@@ -210,9 +297,20 @@ fn variable_name(key: &str) -> bool {
             .all(|(i, c)| c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
-fn reserved(key: &str) -> bool {
+pub(super) fn reserved(key: &str) -> bool {
+    if matches!(
+        key.to_ascii_uppercase().as_str(),
+        "NODE_REPL_AUTH_TOKEN"
+            | "OPENAI_FEDERATION_RULE_ID"
+            | "OPENAI_IDENTITY_TOKEN_FILE"
+            | "OPENAI_WORKLOAD_IDENTITY_CONTEXT"
+    ) {
+        return true;
+    }
     // Codex supplies these at execution time (including sandbox/proxy metadata).
     key.starts_with("CODEX_")
+        || key.starts_with("DIRENV_")
+        || key.starts_with("_CM_DIRENV_")
         || matches!(
             key,
             "BASH_ENV"
@@ -228,23 +326,17 @@ fn reserved(key: &str) -> bool {
         )
 }
 
-fn script(variables: &BTreeMap<String, String>, inherited: impl Iterator<Item = String>) -> String {
+pub(super) fn script(delta: &Delta) -> String {
     let mut script =
-        String::from("# Captured by captain-miao; contains private environment values.\n");
-    let removed: std::collections::BTreeSet<_> = inherited
-        .filter(|key| variable_name(key) && !reserved(key) && !variables.contains_key(key))
-        .collect();
-    for key in removed {
-        assignment(&mut script, &key, &format!("unset {key}"));
+        String::from("# Captured direnv changes; contains private environment values.\n");
+    for (key, value) in delta {
+        let command = match value {
+            Some(value) => format!("export {key}={}", shell_quote(value)),
+            None => format!("unset {key}"),
+        };
+        assignment(&mut script, key, &command);
     }
-    for (key, value) in variables {
-        assignment(
-            &mut script,
-            key,
-            &format!("export {key}={}", shell_quote(value)),
-        );
-    }
-    if !variables.contains_key("ZDOTDIR") {
+    if !delta.contains_key("ZDOTDIR") {
         script.push_str("unset ZDOTDIR\n");
     }
     script.push_str("export BASH_ENV=/dev/null\n");
@@ -287,9 +379,9 @@ fn assignment(script: &mut String, key: &str, command: &str) {
     }
 }
 
-fn persist(root: &Path, script: &str) -> Result<Value> {
-    // Content addressing lets concurrent launchers share an identical immutable
-    // snapshot, and leaves old loaded threads' environments intact on restart.
+pub(super) fn persist(root: &Path, script: &str) -> Result<Value> {
+    // Identical scripts share a file within one launcher's lease. Different
+    // launchers retain independent ownership, even when their values match.
     let digest: String = Sha256::digest(script.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -302,7 +394,7 @@ fn persist(root: &Path, script: &str) -> Result<Value> {
         &dir.join(".zshenv"),
         &format!("unsetopt RCS\n. {}\n", shell_quote(&path.to_string_lossy())),
     )?;
-    Ok(json!({"inherit":"none", "set":{"BASH_ENV":path,"ZDOTDIR":dir,"SHLVL":"1"}}))
+    Ok(json!({"set":{"BASH_ENV":path,"ZDOTDIR":dir,"SHLVL":"1"}}))
 }
 
 fn write_once(path: &Path, contents: &str) -> Result<()> {

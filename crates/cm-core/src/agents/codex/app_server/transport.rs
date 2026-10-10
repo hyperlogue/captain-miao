@@ -137,6 +137,14 @@ impl Client {
         Ok(client)
     }
 
+    pub(super) fn peer_pid(&self) -> Option<i32> {
+        self.socket
+            .get_ref()
+            .peer_cred()
+            .ok()
+            .and_then(|cred| cred.pid())
+    }
+
     pub(super) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;

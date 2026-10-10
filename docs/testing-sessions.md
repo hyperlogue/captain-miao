@@ -56,9 +56,21 @@ allow this local listener and Codex's subprocess sandbox.
 
 It checks bare project binaries and pipelines through both agent and manual
 commands, separate projects, subdirectories, non-login commands, and cold
-resume after restarting the isolated server. Changing `.envrc` to fail after
-capture verifies that commands use the saved environment. An unprinted dummy
-secret must not appear in Codex's files. The regular suite separately checks
-approval failures, private file modes, quoting, removal of variables, child
-shells, and preservation of unrelated relay configuration. The zsh startup test
-runs when zsh is on PATH; Bash coverage is unconditional.
+resume after restarting the isolated server. It exercises effective daemon
+exclusions, automatic secret-name exclusions, explicit overrides, and a thread
+with `inherit = "none"` and an allowlist. Changing `.envrc` to fail after capture
+verifies that commands use the saved environment. Unchanged launcher credentials
+and excluded direnv values must not appear in snapshot files; an unprinted dummy
+secret must not appear in Codex's files. Restarting the daemon makes the inactive
+launcher's snapshots collectible.
+
+The regular suite separately checks approval failures, private file modes,
+quoting, removal of variables, child shells, and preservation of unrelated relay
+configuration. Collection tests retain active leases, loaded descendants, and
+uncertain requests, and refuse cleanup when inventory is unavailable. The zsh
+startup tests run when zsh is on PATH; Bash coverage is unconditional. An
+additional isolated test verifies capture from an already activated project:
+
+```sh
+nix develop -c cargo test -p cm-core --locked real_direnv_capture_recovers_changes_from_an_already_activated_project -- --ignored --nocapture
+```

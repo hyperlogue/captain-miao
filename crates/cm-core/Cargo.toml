@@ -39,6 +39,7 @@ libc = "0.2"
 notify = "8"
 toml = "1.1"
 toml_edit = "0.25"
+tempfile = "3"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # `bundled` statically compiles SQLite into the binary, so reading Codex's
@@ -49,9 +50,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 [dev-dependencies]
 # Exercise deferred title refreshes with a paused clock, without wall sleeps.
 tokio = { version = "1", features = ["test-util"] }
-# `TempDir` for the resume-candidate fixture trees, so a test cannot leave a
-# sessions directory behind and two runs never collide on a path.
-tempfile = "3"
 
 # macOS only, and only for the clipboard bridge: `NSPasteboard` is the sole way
 # to get a screenshot's image bytes off the pasteboard (`pbpaste` serves text
