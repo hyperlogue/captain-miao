@@ -39,3 +39,26 @@ particular installed Codex release. Actual PTY attach/detach, clipboard input an
 terminal restoration are covered separately by `pool_modes`; dashboard tests
 cover optimistic rollback, diagnostic rendering, and remapped actions. Live
 SSH provisioning still requires an explicitly designated disposable host.
+
+## Real Codex and direnv
+
+With `codex` and `direnv` installed on the execution host, run:
+
+```sh
+nix develop -c cargo test -p cm-core --locked real_codex_loads_direnv_for_agent_and_manual_commands -- --ignored --nocapture
+```
+
+This test runs the actual relay, an isolated Codex app-server and synthetic,
+explicitly approved direnv projects. All homes and XDG directories are private
+temporary fixtures. A loopback Responses server supplies deterministic tool
+calls; it uses no account, credentials or external model API. The sandbox must
+allow this local listener and Codex's subprocess sandbox.
+
+It checks bare project binaries and pipelines through both agent and manual
+commands, separate projects, subdirectories, non-login commands, and cold
+resume after restarting the isolated server. Changing `.envrc` to fail after
+capture verifies that commands use the saved environment. An unprinted dummy
+secret must not appear in Codex's files. The regular suite separately checks
+approval failures, private file modes, quoting, removal of variables, child
+shells, and preservation of unrelated relay configuration. The zsh startup test
+runs when zsh is on PATH; Bash coverage is unconditional.

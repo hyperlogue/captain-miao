@@ -414,7 +414,8 @@ async fn run_codex_app_server(
         prepared = async {
             state.write()?;
             crate::agents::codex::wait_for_handoff(args, state.launcher_pid).await?;
-            let relay = app_server::Relay::start(config, &socket).await?;
+            let environment = app_server::Environments::prepare(cwd).await?;
+            let relay = app_server::Relay::start_with_environment(config, &socket, Some(environment)).await?;
             let command = app_server::command(cwd, args, &socket, shim)?;
             Ok((relay, command))
         } => prepared,

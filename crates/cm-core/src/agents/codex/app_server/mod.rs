@@ -5,6 +5,7 @@
 //! observations into its own state file. No hook profile, rollout reader or
 //! SQLite connection belongs to this mode.
 mod control;
+mod environment;
 mod kill;
 mod lifecycle;
 mod listener;
@@ -21,6 +22,7 @@ use super::CodexConfig;
 use crate::agent::{AgentControl, ResumeCandidate};
 use crate::state::LauncherState;
 pub(crate) use control::{Control, StopRequest};
+pub(crate) use environment::Environments;
 pub(crate) use kill::kill;
 pub(crate) use lifecycle::supervise;
 pub(crate) use monitor::Monitor;
@@ -272,6 +274,9 @@ pub(crate) fn command(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod environment_live_tests;
 
 #[cfg(test)]
 mod recovery_tests;

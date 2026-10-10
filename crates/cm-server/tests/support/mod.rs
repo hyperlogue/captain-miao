@@ -379,6 +379,7 @@ enum Cleanup {
 
 #[derive(Default)]
 struct Script {
+    root: PathBuf,
     cleanup: Mutex<HashMap<String, Cleanup>>,
     requests: Mutex<Vec<(String, String)>>,
     active: Mutex<HashSet<String>>,
@@ -395,7 +396,10 @@ impl CodexServer {
     pub async fn start(path: PathBuf) -> Self {
         let listener = UnixListener::bind(&path).unwrap();
         let (events, _) = broadcast::channel(128);
-        let script = Arc::new(Script::default());
+        let script = Arc::new(Script {
+            root: path.parent().unwrap().to_owned(),
+            ..Script::default()
+        });
         let task = {
             let script = script.clone();
             let events = events.clone();
@@ -514,10 +518,14 @@ async fn serve_codex(
                 let result = match method {
                     "initialize" => json!({}),
                     "initialized" => continue,
+                    // The relay resolves a resumed thread's project before
+                    // selecting its direnv snapshot. This is an unsubscribed
+                    // metadata read, not a selection of the fixture's row.
+                    "thread/read" => json!({"thread":{"id":id,"cwd":script.root.join(id)}}),
                     "thread/resume" => {
                         thread = Some(id.to_string());
                         json!({"thread":{
-                            "id":id,"name":format!("Title {id}"),"preview":format!("Prompt {id}"),
+                            "id":id,"cwd":script.root.join(id),"name":format!("Title {id}"),"preview":format!("Prompt {id}"),
                             "source":"cli","status":{"type":"idle"},"turns":[{
                                 "id":"previous-turn","status":"completed","items":[{
                                     "type":"userMessage","content":[{"type":"text","text":format!("Prompt {id}")}]

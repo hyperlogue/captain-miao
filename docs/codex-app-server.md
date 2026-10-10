@@ -57,7 +57,8 @@ the existing Codex capability table: fork, approval reporting and context usage
 are supported; agent-created worktrees remain unavailable.
 
 The launcher owns a private Unix WebSocket relay between the Codex TUI and the
-configured app-server. It forwards requests, replies, approvals and unknown
+configured app-server. It adds the project environment to user thread
+start/resume/fork requests, and forwards replies, approvals and unknown
 protocol extensions without interpreting their control behavior. Codex retains
 its composer, slash commands, approval UI, queued prompts and reconnect logic.
 The relay observes metadata and lifecycle events; it never answers an approval
@@ -200,12 +201,45 @@ keeps the row available for retry. Explicit Kill can force removal under the
 conditions above. Losing the dashboard's connection to the host itself still
 restores the row: only that host can terminate its processes and remove its state.
 
-Execution environment is an inherent difference: server-side tools and services
-run in the daemon's environment. A launcher-side `direnv` environment is not
-automatically inherited by an already-running server. Configure the daemon and
-Codex's project/shell environment settings accordingly. Miao does not copy the
-launcher's environment into persisted thread configuration. Native mode retains
-its process-per-session environment behavior.
+## Project environments
+
+App-server sessions automatically capture an approved `direnv` environment on
+the execution host. Bash and zsh commands can use project binaries by name,
+including plain `! cargo test`, pipelines and commands in subdirectories.
+The TUI's `/resume` picker resolves the selected thread's project before loading
+its environment. Projects without an `.envrc` retain Codex's normal behavior.
+An unapproved `.envrc` or failed capture reports an error; miao never approves
+the file automatically. Parent-directory `.envrc` files are supported too.
+
+The environment is captured once per project per launcher. Editing `.envrc`
+does not change a running thread's environment. Shell snapshots and login
+initialization for agent commands are disabled for these sessions, and managed
+startup files restore the capture for Bash and zsh. Shell functions and aliases
+are not captured; explicitly choosing another execution shell bypasses these
+startup files. Miao owns the shell-environment policy for direnv-enabled threads.
+MCP servers and the shared daemon itself still use their own environments.
+
+Codex ignores configuration overrides when resuming an **already-loaded
+thread**, so it keeps its original environment. This also means a thread started
+before this integration needs to be unloaded before direnv can take effect.
+Close its clients and wait for Codex to unload it, or restart the Codex daemon
+when its sessions are idle, then resume. A new launcher captures fresh values
+for new or unloaded threads. Reconnection after a daemon restart reapplies the
+existing launcher's capture without replaying a prompt.
+
+Captured values are stored in immutable files under
+`~/.local/state/captain-miao/codex-environments/` (honoring `XDG_STATE_HOME`),
+with directories `0700` and files `0600`. Only startup-file paths are passed in
+Codex configuration: putting values directly in its environment overrides can
+copy secrets into Codex's trace logs. Snapshots remain after launcher exit
+because loaded threads and their children may still reference them. This
+directory can be removed after stopping the Codex daemon; the next launch
+recreates the needed snapshots. As with other local state, treat these files
+as private when backing up or sharing diagnostics. Native mode keeps its
+existing process-per-session environment behavior.
+
+The integration is exercised against Codex 0.162.0 by the optional
+[live environment test](testing-sessions.md#real-codex-and-direnv).
 
 The adapter was developed against Codex 0.153.4's Unix WebSocket protocol. Some
 control methods, including background-terminal cleanup, require the experimental

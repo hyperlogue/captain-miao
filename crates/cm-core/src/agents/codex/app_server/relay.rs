@@ -5,8 +5,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -19,7 +20,17 @@ pub(crate) struct Relay {
 }
 
 impl Relay {
+    #[cfg(test)]
     pub(crate) async fn start(config: &CodexConfig, path: &Path) -> Result<Self> {
+        Self::start_with_environment(config, path, None).await
+    }
+
+    pub(crate) async fn start_with_environment(
+        config: &CodexConfig,
+        path: &Path,
+        environment: Option<super::Environments>,
+    ) -> Result<Self> {
+        let environment = environment.map(|env| Arc::new(Mutex::new(env)));
         let upstream = config.socket_path()?;
         // Fail before launching the TUI, with the ordinary FailedToStart row.
         // No fallback may change the host's selected execution mode.
@@ -69,7 +80,12 @@ impl Relay {
                             // busy turn cannot starve the picker handshake.
                             frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
-                                let frame = frame?;
+                                let mut frame = frame?;
+                                if let Err(reply) = prepare_environment(&mut frame, environment.as_ref(), &upstream, &mut pause_rx).await {
+                                    client.send(reply).await?;
+                                    gate.acknowledge(*pause_rx.borrow(), &ack_tx);
+                                    continue;
+                                }
                                 if let Message::Text(text) = &frame
                                     && let Ok(value) = serde_json::from_str::<Value>(text) {
                                     // Requests are reduced before crossing the channel;
@@ -87,8 +103,9 @@ impl Relay {
                                     Ok(stream) => {
                                         let upstream = upstream.clone();
                                         let mut pause_rx = pause_rx.clone();
+                                        let environment = environment.clone();
                                         extras.spawn(async move {
-                                            if forward_unobserved(stream, &upstream, &mut pause_rx).await.is_err() {
+                                            if forward_unobserved(stream, &upstream, &mut pause_rx, environment).await.is_err() {
                                                 tracing::debug!("Codex relay connection ended");
                                             }
                                         });
@@ -227,6 +244,7 @@ async fn forward_unobserved(
     stream: UnixStream,
     upstream: &std::path::Path,
     pause_rx: &mut watch::Receiver<bool>,
+    environment: Option<Arc<Mutex<super::Environments>>>,
 ) -> Result<()> {
     let mut client = tokio::time::timeout(
         transport::DEADLINE,
@@ -243,7 +261,11 @@ async fn forward_unobserved(
             }
             frame = client.next(), if !*pause_rx.borrow() => {
                 let Some(frame) = frame else { break };
-                let frame = frame?;
+                let mut frame = frame?;
+                if let Err(reply) = prepare_environment(&mut frame, environment.as_ref(), upstream, pause_rx).await {
+                    client.send(reply).await?;
+                    continue;
+                }
                 let closed = frame.is_close();
                 server.send(frame).await?;
                 if closed { break; }
@@ -257,6 +279,35 @@ async fn forward_unobserved(
             }
         }
     }
+    Ok(())
+}
+
+async fn prepare_environment(
+    frame: &mut Message,
+    environment: Option<&Arc<Mutex<super::Environments>>>,
+    upstream: &Path,
+    pause_rx: &mut watch::Receiver<bool>,
+) -> std::result::Result<(), Message> {
+    let (Some(environment), Message::Text(text)) = (environment, &*frame) else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    if !super::environment::needs_environment(&value) {
+        return Ok(());
+    }
+    let result = tokio::select! {
+        biased;
+        _ = pause_rx.wait_for(|paused| *paused) => Err(anyhow::anyhow!("session cleanup is in progress; retry after cleanup")),
+        result = async { environment.lock().await.request(&mut value, upstream).await } => result,
+    };
+    if let Err(error) = result {
+        return Err(Message::Text(serde_json::json!({
+            "id":value["id"], "error":{"code":-32000,"message":format!("miao direnv setup failed: {error:#}")}
+        }).to_string().into()));
+    }
+    *frame = Message::Text(value.to_string().into());
     Ok(())
 }
 
