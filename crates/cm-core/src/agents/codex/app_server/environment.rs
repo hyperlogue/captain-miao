@@ -5,7 +5,7 @@
 //! commands. Immutable, owner-only snapshots instead outlive the launcher: a
 //! loaded Codex thread ignores resume overrides and may still use its old file.
 //! Store leases and loaded-thread inventory govern automatic collection. Only
-//! direnv changes and explicit Codex overrides are serialized, after filtering.
+//! direnv changes and overlapping Codex overrides are serialized, after filtering.
 //! Bash reads BASH_ENV after login profiles; zsh's .zshenv disables further rc
 //! processing. Both load the snapshot once, preserving deliberate changes in
 //! child shells. Other execution shells are outside this integration's scope.
@@ -34,13 +34,13 @@ pub(crate) struct Environments {
 }
 
 impl Environments {
-    pub(crate) async fn prepare(cwd: &str) -> Result<Self> {
-        let mut environments = Self::new(
+    pub(crate) fn for_project(cwd: &str) -> Self {
+        // The client TUI does not execute project commands. Capture only when
+        // it actually starts, resumes or forks a user thread (possibly elsewhere).
+        Self::new(
             Path::new(cwd),
             state::state_dir().join("codex-environments"),
-        );
-        environments.snapshot(Path::new(cwd)).await?;
-        Ok(environments)
+        )
     }
 
     pub(super) fn new(cwd: &Path, root: PathBuf) -> Self {
@@ -365,21 +365,20 @@ fn assignment(script: &mut String, key: &str, command: &str) {
     if proxy {
         script.push_str("if [ -z \"${CODEX_NETWORK_PROXY_ACTIVE+x}\" ]; then\n");
     }
-    let broker = !matches!(key, "PATH" | "ZDOTDIR");
-    if broker {
-        script.push_str(&format!("if [ -z \"${{CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE+x}}\" ] || [ -z \"${{{key}+x}}\" ]; then\n"));
-    }
     script.push_str(command);
     script.push('\n');
-    if broker {
-        script.push_str("fi\n");
-    }
     if proxy {
         script.push_str("fi\n");
     }
 }
 
 pub(super) fn persist(root: &Path, script: &str) -> Result<Value> {
+    // Broker policy can change after thread creation. These startup files run
+    // after brokering, so injecting any raw value would bypass it. Stop the
+    // shell itself (returning from BASH_ENV would still execute the command).
+    let script = format!(
+        "if [ -n \"${{CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE+x}}\" ]; then\nprintf '%s\\n' 'miao: direnv is unsupported with the Codex credential broker' >&2\nexit 1\nfi\n{script}"
+    );
     // Identical scripts share a file within one launcher's lease. Different
     // launchers retain independent ownership, even when their values match.
     let digest: String = Sha256::digest(script.as_bytes())
@@ -389,7 +388,7 @@ pub(super) fn persist(root: &Path, script: &str) -> Result<Value> {
     let dir = root.join(digest);
     state::create_dir_all_private(&dir)?;
     let path = dir.join("env.sh");
-    write_once(&path, script)?;
+    write_once(&path, &script)?;
     write_once(
         &dir.join(".zshenv"),
         &format!("unsetopt RCS\n. {}\n", shell_quote(&path.to_string_lossy())),
@@ -400,6 +399,11 @@ pub(super) fn persist(root: &Path, script: &str) -> Result<Value> {
 fn write_once(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    // The directory is content-addressed and privately owned by this launcher.
+    // Repeated resumes still need cold-load overrides, but not fresh copies.
+    if path.try_exists()? {
+        return Ok(());
+    }
     // Publish complete files atomically without a shared temporary filename.
     // A racing writer has identical bytes. No thread sees a partial script.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

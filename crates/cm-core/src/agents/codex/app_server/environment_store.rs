@@ -124,7 +124,12 @@ pub(super) async fn collect(root: &Path, endpoint: &Path) -> Result<()> {
         let Ok(references) = serde_json::from_slice::<References>(&bytes) else {
             continue;
         };
-        if references.endpoint == endpoint {
+        if references.endpoint == endpoint
+            && references
+                .pending_daemons
+                .iter()
+                .all(|pid| daemon_exited(*pid))
+        {
             candidates.push((dir, lease, references));
         }
     }
@@ -133,6 +138,12 @@ pub(super) async fn collect(root: &Path, endpoint: &Path) -> Result<()> {
     }
     let mut client = transport::Client::connect(endpoint).await?;
     let loaded = super::loaded_threads(&mut client).await?;
+    // Live/uncertain requests above and directly loaded owners here already
+    // pin their entire lease. Ancestry cannot make those leases collectible.
+    candidates.retain(|(_, _, refs)| !refs.threads.iter().any(|id| loaded.contains(id)));
+    if candidates.is_empty() {
+        return Ok(());
+    }
     let mut referenced = loaded.clone();
     // A subagent inherits its parent's shell configuration. Follow the whole
     // ancestry, including saved parents that have already unloaded.
@@ -156,12 +167,7 @@ pub(super) async fn collect(root: &Path, endpoint: &Path) -> Result<()> {
         }
     }
     for (dir, _lease, references) in candidates {
-        if references.threads.iter().any(|id| referenced.contains(id))
-            || references
-                .pending_daemons
-                .iter()
-                .any(|pid| !daemon_exited(*pid))
-        {
+        if references.threads.iter().any(|id| referenced.contains(id)) {
             continue;
         }
         // The lease stays locked through deletion. A live launcher never
@@ -284,6 +290,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_live_or_unknown_daemon_skips_inventory() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = root.path().join("missing.sock");
+        for daemon in [None, Some(std::process::id() as i32)] {
+            let mut store = Store::new(root.path(), &endpoint).unwrap();
+            store.prepare("private", daemon).unwrap();
+            let dir = store.dir.clone();
+            drop(store);
+            collect(root.path(), &endpoint).await.unwrap();
+            assert!(dir.join("references.json").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn directly_loaded_owner_skips_ancestry_reads() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = root.path().join("server.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        let mut store = Store::new(root.path(), &endpoint).unwrap();
+        store.prepare("private", None).unwrap();
+        store
+            .response(&json!({"result":{"thread":{"id":"owner"}}}), None)
+            .unwrap();
+        let dir = store.dir.clone();
+        drop(store);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for method in ["initialize", "thread/loaded/list"] {
+                let frame = socket.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                let result = if method == "initialize" {
+                    json!({})
+                } else {
+                    json!({"data":["owner"],"nextCursor":null})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "initialize" {
+                    socket.next().await.unwrap().unwrap();
+                }
+            }
+            // A collector that unnecessarily reads ancestry sees a closed socket.
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            collect(root.path(), &endpoint).await.unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .expect("waiting for directly loaded ownership inventory");
+        assert!(dir.join("references.json").exists());
+    }
+
+    #[tokio::test]
     async fn unreachable_inventory_never_proves_a_snapshot_unused() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let endpoint = root.path().join("missing.sock");
@@ -292,6 +359,9 @@ mod tests {
         let dir = store.dir.clone();
         // A live lease skips inventory entirely, even during request preparation.
         collect(root.path(), &endpoint).await.unwrap();
+        store
+            .response(&json!({"result":{"thread":{"id":"owner"}}}), None)
+            .unwrap();
         // dup shares the same open-file description, just like a descriptor
         // inherited by a child between fork and exec. Store drop must unlock
         // even while that duplicate remains open.

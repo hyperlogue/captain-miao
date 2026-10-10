@@ -265,7 +265,12 @@ pub(crate) fn command(
             .any(|arg| arg == "--remote" || arg.starts_with("--remote=")),
         "Codex --remote is owned by the host's app-server setting"
     );
-    let mut command = crate::agents::common::agent_command(super::BIN, cwd, shim)?;
+    // Project commands execute in the daemon. Wrapping this client in direnv
+    // evaluates .envrc a second time and can block opening the resume picker.
+    let executable = crate::agents::find_in_path(super::BIN).context("codex not found in PATH")?;
+    let mut command = tokio::process::Command::new(executable);
+    command.current_dir(cwd);
+    crate::agents::with_shim_path(&mut command, shim);
     command
         .arg("--remote")
         .arg(format!("unix://{}", socket.display()));

@@ -19,6 +19,10 @@ pub(super) struct Policy {
 
 impl Policy {
     pub(super) fn resolve(base: &Value, overrides: &Value) -> Result<(Self, Value)> {
+        // Codex preserves broker settings when a boolean network_proxy
+        // override toggles only the proxy. Reject the daemon setting too,
+        // rather than letting a merged boolean accidentally mask the broker.
+        reject_credential_broker(base)?;
         let mut config = base.clone();
         ensure!(config.is_object(), "invalid Codex effective configuration");
         if let Some(overrides) = overrides.as_object() {
@@ -35,6 +39,7 @@ impl Policy {
         } else {
             ensure!(overrides.is_null(), "invalid Codex thread configuration");
         }
+        reject_credential_broker(&config)?;
         let mut value = config["shell_environment_policy"].clone();
         if value.is_null() {
             value = json!({});
@@ -116,10 +121,11 @@ impl Policy {
         }
         // Explicit Codex overrides have their ordinary precedence over direnv,
         // including an intentional restoration after exclusion. The allowlist
-        // still applies, just as it does in Codex itself.
+        // still applies, just as it does in Codex itself. Unrelated explicit
+        // values are already supplied by Codex; don't duplicate them on disk.
         for (key, value) in &self.set {
-            if variable_name(key) && !reserved(key) {
-                filtered.insert(key.clone(), self.included(key).then(|| value.clone()));
+            if let Some(changed) = filtered.get_mut(key) {
+                *changed = self.included(key).then(|| value.clone());
             }
         }
         filtered
@@ -147,9 +153,6 @@ impl Policy {
             false,
         );
         // Preserve the proxy environment Codex adds after native filtering.
-        script.push_str(
-            "if [ -n \"${CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE+x}\" ]; then continue; fi\n",
-        );
         script.push_str("if [ -n \"${CODEX_NETWORK_PROXY_ACTIVE+x}\" ]; then\ncase \"$_CM_DIRENV_NAME\" in *[pP][rR][oO][xX][yY]*|GIT_SSH_COMMAND|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|NODE_EXTRA_CA_CERTS|GIT_SSL_CAINFO|CARGO_HTTP_CAINFO|PIP_CERT|BUNDLE_SSL_CA_CERT|npm_config_cafile|NPM_CONFIG_CAFILE) continue;; esac\nfi\n");
         // Explicit set follows exclusions but still obeys the allowlist.
         let sets: Vec<_> = self
@@ -270,6 +273,14 @@ impl Policy {
     }
 }
 
+fn reject_credential_broker(config: &Value) -> Result<()> {
+    ensure!(
+        config["features"]["network_proxy"]["credential_broker"] != true,
+        "direnv is unsupported with the Codex credential broker"
+    );
+    Ok(())
+}
+
 fn merge(base: &mut Value, overlay: Value) {
     if let (Some(base), Some(overlay)) = (base.as_object_mut(), overlay.as_object()) {
         for (key, value) in overlay {
@@ -336,6 +347,52 @@ fn shell_case(script: &mut String, patterns: &[String], command: &str, invert: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_rejection_covers_thread_overrides_and_proxy_toggles() {
+        let enabled = json!({"features":{"network_proxy":{"credential_broker":true}}});
+        assert!(Policy::resolve(&enabled, &Value::Null).is_err());
+        assert!(Policy::resolve(&enabled, &json!({"features.network_proxy":false})).is_err());
+        assert!(Policy::resolve(&json!({}), &enabled).is_err());
+        assert!(
+            Policy::resolve(
+                &json!({}),
+                &json!({"features.network_proxy.credential_broker":true})
+            )
+            .is_err()
+        );
+        for proxy in [
+            json!(false),
+            json!(true),
+            json!({"credential_broker":false}),
+        ] {
+            assert!(
+                Policy::resolve(&json!({"features":{"network_proxy":proxy}}), &Value::Null).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_explicit_values_stay_in_native_policy_only() {
+        let (policy, effective) = Policy::resolve(
+            &json!({"shell_environment_policy":{
+                "set":{"UNRELATED_CREDENTIAL":"dummy-config-credential","PROJECT":"explicit"}
+            }}),
+            &Value::Null,
+        )
+        .unwrap();
+        let delta = BTreeMap::from([("PROJECT".into(), Some("direnv".into()))]);
+        let filtered = policy.apply(&delta);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered["PROJECT"].as_deref(), Some("explicit"));
+        let script = policy.scrub_script() + &super::super::environment::script(&filtered);
+        assert!(!script.contains("dummy-config-credential"));
+        let native = policy.bootstrap(effective, &json!({"set":{}})).unwrap();
+        assert_eq!(
+            native["set"]["UNRELATED_CREDENTIAL"],
+            "dummy-config-credential"
+        );
+    }
 
     #[test]
     fn filters_apply_to_direnv_before_explicit_overrides_and_allowlists() {
@@ -442,6 +499,7 @@ mod tests {
                     .env("ZDOTDIR", settings["set"]["ZDOTDIR"].as_str().unwrap())
                     .env("SHLVL", "1").env("aws_old", "excluded").env("DROP1", "excluded")
                     .env("PROJECT_SECRET", "excluded").env("OUTSIDE", "excluded")
+                    .env("RESTORED", "intentional")
                     .env("HTTP_PROXY", "managed-proxy").env("CODEX_NETWORK_PROXY_ACTIVE", "1")
                     .output().unwrap();
                 assert!(

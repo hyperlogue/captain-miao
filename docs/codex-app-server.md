@@ -211,8 +211,9 @@ its environment. Projects without an `.envrc` retain Codex's normal behavior.
 An unapproved `.envrc` or failed capture reports an error; miao never approves
 the file automatically. Parent-directory `.envrc` files are supported too.
 
-The environment is captured once per project per launcher. Editing `.envrc`
-does not change a running thread's environment. Shell snapshots and login
+The client TUI starts without evaluating direnv; capture is deferred until a
+thread request, once per project per launcher. Editing `.envrc` does not change
+a running thread's environment. Shell snapshots and login
 initialization for agent commands are disabled for these sessions, and managed
 startup files restore the capture for Bash and zsh. Shell functions and aliases
 are not captured; explicitly choosing another execution shell bypasses these
@@ -233,8 +234,12 @@ daemon still supplies its ordinary filtered environment. Startup controls
 the private hook. Bash login profiles are filtered again before applying the
 changes. Runtime Codex identity and managed proxy values remain authoritative.
 Unrecognized policy settings and `experimental_use_profile = true` fail with an
-error instead of silently dropping restrictions. MCP servers and the shared
-daemon itself still use their own environments.
+error instead of silently dropping restrictions. Credential brokering is not
+supported: miao rejects enabled `features.network_proxy.credential_broker`
+settings before writing a snapshot. The startup hook also stops the shell if
+Codex activates the broker later, before applying any captured values. Threads
+already loaded with older hooks must unload before receiving this protection.
+MCP servers and the shared daemon itself still use their own environments.
 
 Codex ignores configuration overrides when resuming an **already-loaded
 thread**, so it keeps its original environment. This also means a thread started
@@ -244,12 +249,20 @@ when its sessions are idle, then resume. A new launcher captures fresh values
 for new or unloaded threads. Reconnection after a daemon restart reapplies the
 existing launcher's capture without replaying a prompt.
 
+Resume requests still prepare environment overrides as a fallback if the thread
+has unloaded. Codex has no atomic loaded-only resume; checking its status first
+could race with unloading and lose the environment. Consequently a new launcher
+still requires a valid `.envrc` even when resuming a loaded thread. Identical
+hooks within a launcher are reused without rewriting their files.
+
 Captured values are stored in immutable files under
 `~/.local/state/captain-miao/codex-environments/` (honoring `XDG_STATE_HOME`),
 with directories `0700` and files `0600`. Only startup-file paths are passed in
 Codex configuration: putting values directly in its environment overrides can
 copy secrets into Codex's trace logs. Snapshots contain the allowed direnv delta
-and explicit Codex overrides needed to restore values after shell startup.
+and explicit Codex overrides only for names in that delta. Unrelated `set`
+values remain in Codex's native environment and are not copied into snapshots;
+ordinary shell startup behavior applies to those values.
 
 Each launcher holds a filesystem lease and records the threads using its files.
 Cleanup runs when a relay starts, every minute while it runs, and when its

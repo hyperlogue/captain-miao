@@ -1,8 +1,90 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tokio::net::UnixListener;
 use tokio_tungstenite::tungstenite::Message;
+
+#[test]
+fn credential_broker_stops_shell_before_exposing_direnv_values() {
+    let root = tempfile::tempdir().unwrap();
+    let delta = BTreeMap::from([
+        ("GH_TOKEN".into(), Some("dummy-direnv-credential".into())),
+        ("PROJECT".into(), Some("project-update".into())),
+        ("REMOVED".into(), None),
+    ]);
+    let settings = persist(root.path(), &script(&delta)).unwrap();
+    for shell in ["bash", "zsh"] {
+        let Some(bin) = find_in_path(shell) else {
+            continue;
+        };
+        for login in [false, true] {
+            for token in [None, Some("dummy-broker-replacement")] {
+                let mut command = std::process::Command::new(&bin);
+                command
+                    .arg(if login { "-lc" } else { "-c" })
+                    .arg("printf 'command-ran:%s' \"${GH_TOKEN-}\"")
+                    .env_clear()
+                    .env("PATH", "/bin:/usr/bin")
+                    .env("BASH_ENV", settings["set"]["BASH_ENV"].as_str().unwrap())
+                    .env("ZDOTDIR", settings["set"]["ZDOTDIR"].as_str().unwrap())
+                    .env("SHLVL", "1")
+                    .env("PROJECT", "old")
+                    .env("REMOVED", "old")
+                    .env("CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE", "1");
+                if let Some(token) = token {
+                    command.env("GH_TOKEN", token);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    !output.status.success(),
+                    "{shell} login={login} token={token:?}"
+                );
+                // System login profiles may print before BASH_ENV runs.
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(!stdout.contains("command-ran"), "{shell} login={login}");
+                assert!(!stdout.contains("dummy-direnv-credential"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("credential broker"));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("dummy-"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn broker_configuration_is_rejected_before_persisting_values() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let cwd = std::fs::canonicalize(root.path()).unwrap();
+    let upstream = cwd.join("server.sock");
+    let listener = UnixListener::bind(&upstream).unwrap();
+    let mut env = Environments::new(&cwd, cwd.join("snapshots"));
+    env.snapshots.insert(
+        cwd.clone(),
+        Some(BTreeMap::from([(
+            "GH_TOKEN".into(),
+            Some("dummy-direnv-credential".into()),
+        )])),
+    );
+    let server = tokio::spawn(async move {
+        let mut socket = initialize(&listener).await;
+        let read = receive(&mut socket).await;
+        assert_eq!(read["method"], "config/read");
+        send(
+            &mut socket,
+            json!({"id":read["id"],"result":{"config":{
+                "features":{"network_proxy":{"credential_broker":true}}
+            }}}),
+        )
+        .await;
+    });
+    let mut request = json!({"id":1,"method":"thread/start","params":{}});
+    let error = env
+        .request(&mut request, &upstream, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("credential broker"));
+    assert!(!env.root.exists());
+    server.await.unwrap();
+}
 
 #[test]
 fn snapshot_restores_path_and_values_without_reinitializing_child_shells() {
@@ -22,6 +104,13 @@ fn snapshot_restores_path_and_values_without_reinitializing_child_shells() {
     let settings = persist(root.path(), &script(&vars)).unwrap();
     assert!(!settings.to_string().contains(value));
     let hook = settings["set"]["BASH_ENV"].as_str().unwrap();
+    let inode = std::fs::metadata(hook).unwrap().ino();
+    assert_eq!(persist(root.path(), &script(&vars)).unwrap(), settings);
+    assert_eq!(
+        std::fs::metadata(hook).unwrap().ino(),
+        inode,
+        "reusing a capture must not rewrite immutable files"
+    );
     assert_eq!(
         std::fs::metadata(hook).unwrap().permissions().mode() & 0o777,
         0o600
@@ -352,6 +441,9 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
         let fake = bin.join("direnv");
         std::fs::write(&fake, "#!/bin/sh\ncase $1 in\nstatus) if [ -f denied ]; then printf '{\"state\":{\"foundRC\":{\"allowed\":1}}}'; else printf '{\"state\":{\"foundRC\":{\"allowed\":0}}}'; fi;;\nexec) if [ ! -f .envrc ]; then shift 2; exec \"$@\"; fi; if [ -f failed ]; then echo private-output >&2; exit 1; fi; shift 2; export CAPTURED_PROJECT=yes; unset REMOVED; exec \"$@\";;\nesac\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = bin.join("codex");
+        std::fs::write(&client, "#!/bin/sh\nprintf client-started\n").unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = std::env::join_paths(
             std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
         )
@@ -383,23 +475,27 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
     std::fs::create_dir(&project).unwrap();
     std::fs::write(project.join(".envrc"), "synthetic fixture").unwrap();
     std::fs::write(project.join("denied"), "").unwrap();
-    let error = Environments::prepare(project.to_str().unwrap())
-        .await
-        .err()
-        .unwrap();
+    let mut environments = Environments::for_project(project.to_str().unwrap());
+    let output = super::super::command(
+        project.to_str().unwrap(),
+        &[],
+        Path::new("unused.sock"),
+        None,
+    )
+    .unwrap()
+    .output()
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"client-started");
+    let error = environments.snapshot(&project).await.unwrap_err();
     assert!(error.to_string().contains("direnv allow"));
     std::fs::remove_file(project.join("denied")).unwrap();
     std::fs::write(project.join("failed"), "").unwrap();
-    let error = Environments::prepare(project.to_str().unwrap())
-        .await
-        .err()
-        .unwrap();
+    let error = environments.snapshot(&project).await.unwrap_err();
     assert!(error.to_string().contains("capture failed"));
     assert!(!format!("{error:#}").contains("private-output"));
     std::fs::remove_file(project.join("failed")).unwrap();
-    let mut environments = Environments::prepare(project.to_str().unwrap())
-        .await
-        .unwrap();
     let settings = environments.snapshot(&project).await.unwrap().unwrap();
     let script = script(&settings);
     assert!(!script.contains("unchanged-launcher-secret"));

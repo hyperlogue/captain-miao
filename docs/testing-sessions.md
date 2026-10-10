@@ -67,7 +67,13 @@ launcher's snapshots collectible.
 The regular suite separately checks approval failures, private file modes,
 quoting, removal of variables, child shells, and preservation of unrelated relay
 configuration. Collection tests retain active leases, loaded descendants, and
-uncertain requests, and refuse cleanup when inventory is unavailable. The zsh
+uncertain requests, skip inventory or ancestry RPCs when retention is already
+known, and refuse cleanup when inventory is unavailable. Broker tests reject
+enabled configuration before persistence and stop Bash/zsh commands before raw
+credentials can be injected, with or without an existing broker replacement.
+They exercise the runtime marker using dummy values, not a live credential
+broker. Other regressions keep unrelated Codex overrides out of snapshots and
+start the client TUI without evaluating an unapproved `.envrc`. The zsh
 startup tests run when zsh is on PATH; Bash coverage is unconditional. An
 additional isolated test verifies capture from an already activated project:
 

@@ -289,9 +289,7 @@ async fn real_codex_loads_direnv_for_agent_and_manual_commands() {
         mode: super::super::CodexMode::AppServer,
         endpoint: format!("unix://{}", root.join("server.sock").display()),
     };
-    let environments = Environments::prepare(root.join("alpha").to_str().unwrap())
-        .await
-        .unwrap();
+    let environments = Environments::for_project(root.join("alpha").to_str().unwrap());
     let mut relay =
         Relay::start_with_environment(&config, &root.join("relay.sock"), Some(environments))
             .await
