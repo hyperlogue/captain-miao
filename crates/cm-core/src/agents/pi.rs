@@ -1,149 +1,58 @@
-//! Pi CLI backend. Owns every Pi-specific path, argv flag and hook payload
-//! shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Pi`'s match arms.
+//! Pi CLI backend: per-run extension injection, lifecycle events and resume
+//! discovery. The dashboard reaches this through `AgentControl::Pi`.
 //!
-//! **Source-verified against `earendil-works/pi@main`, never run.** No `pi`
-//! binary was available when this was written. Every claim below is cited to the
-//! doc it came from — `packages/coding-agent/docs/{extensions,usage,sessions,
-//! session-format,security}.md` — so a later probe knows which file to re-read
-//! rather than which guess to re-derive. What a probe still has to settle is at
-//! the bottom of this doc.
+//! Verified with Pi 1.1.0 and upstream `earendil-works/pi` at `7bd01fb`.
+//! The opt-in test in `live_tests` runs the real RPC CLI against a loopback
+//! model fixture: startup, a read tool, drafting, rename, model selection,
+//! interrupted inference, manual compaction, a new session, cold resume and
+//! fork. It needs no account or external model API. See
+//! `docs/testing-sessions.md` for the command and remaining coverage limits.
 //!
-//! Pi is the first backend that is **neither a synthetic home nor a shell
-//! hook**, and the two facts that follow are the whole reason it exists here.
+//! # Extension ownership and delivery
 //!
-//! # Injection is an argv flag, so there is no synthetic home
+//! `pi -e <path.ts>` loads our generated extension for this process without
+//! changing the user's configuration or home. Explicit CLI extensions load
+//! before project trust is resolved. The launcher relocates its opaque settings
+//! file to a shared `.ts` path through [`Extension::command`]. Only the miao
+//! executable is embedded; the per-session socket arrives in
+//! `$CAPTAIN_MIAO_SOCK` and is inherited by the spawned hook child.
 //!
-//! `pi -e <path.ts>` loads an extension from an arbitrary path for that run
-//! (`usage.md`: *"`-e, --extension <source>` — Load an extension from path, npm,
-//! or git; repeatable"*). That is Claude's `--settings` shape, not a home
-//! override or persistent profile: per-run, torn down with the process, nothing
-//! of the user's touched. **Pi needs no [`super::synth_home::SynthHome`] at
-//! all** — the only backend of the five that doesn't.
+//! [`FORWARDED`] defines the observed events. The shared Pi/omp transport
+//! captures metadata immediately and serializes hook subprocesses, including
+//! notifications Pi does not await (`session_info_changed`). A five-second
+//! child deadline prevents a failed launcher connection from blocking Pi.
+//! Handlers always resolve without a value: they observe events without
+//! modifying Pi's prompt, tool result or compaction decision.
 //!
-//! Trust is not in the way either, which is the fact that makes the flag usable
-//! rather than merely available. `project_trust` fires *before* project-local
-//! extensions load, and `extensions.md` is explicit: *"Only user/global
-//! extensions and CLI `-e` extensions participate; project-local extensions are
-//! not loaded until after trust is resolved."* A `-e` extension is trusted by
-//! virtue of being on the command line, so there is **no seeding step** — no
-//! trust-state builder, no content hash to keep stable for its sake, none of
-//! what Codex pays for.
+//! # Status and metadata
 //!
-//! # The file is generated TypeScript, and it is contained on purpose
+//! `before_agent_start` starts a turn; `agent_settled` ends it only after
+//! automatic retries, compaction and queued continuations have finished. An
+//! aborted run settles through the same event. Manual compaction has its own
+//! success/failure pair because no agent run need be active. A failed
+//! compaction stays active only when `willRetry` is true.
 //!
-//! Pi has no shell-command hooks; its event surface is an extension module. So
-//! [`build_hooks_settings`] returns **TypeScript source** rather than JSON —
-//! the seam calls it "the per-session hook-settings file", and nothing requires
-//! its contents to be JSON (Kimi already puts TOML through the same channel).
-//! Its scope stays small, and Rust owns status decisions:
+//! `ctx.getContextUsage()`, `ctx.model` and `pi.getSessionName()` supply live
+//! metadata. Model selections and tree navigation refresh it even while idle.
+//! Unknown token counts remain absent, and model references include the
+//! provider. Changing session IDs clears metadata belonging to the old draft;
+//! a rename in the same session preserves its prompt and token count.
 //!
-//! - **The extension carries no logic.** It holds one table ([`FORWARDED`],
-//!   rendered into the source) and one function that serializes a fixed payload
-//!   and spawns `miao hook --agent pi <event>`. No filtering, no state, no
-//!   retries. Every decision — what a status means, how a failed tool is
-//!   classified — is made in Rust, below.
-//! - **The socket arrives via `$CAPTAIN_MIAO_SOCK`**, never spliced into the
-//!   source, so the file is byte-identical for every session on a machine.
-//!   That is what lets [`Extension::command`] keep **one shared file** instead of
-//!   one per launch (see it for why that matters more here than elsewhere), and
-//!   it means nothing in the TypeScript needs shell quoting: `spawn(MIAO,
-//!   [args])` runs no shell at all.
-//! - **Tests cover generation and delivery.** A controlled Node host executes
-//!   [`Extension::source`] to verify metadata and compaction outcomes through
-//!   the real Rust parser and dispatcher.
+//! Live facts come exclusively from hooks. Pi's JSONL transcript is a tree,
+//! so a naive tail can read usage from an abandoned branch. The resume picker
+//! instead reads session-wide metadata: header ID/cwd, first user text and
+//! latest `session_info` name. It honors `PI_CODING_AGENT_DIR` and the flat
+//! `PI_CODING_AGENT_SESSION_DIR` override. Per-invocation `--session-dir` and
+//! project-specific storage settings are not discovered by the dashboard.
 //!
-//! # `agent_settled` is the turn-end signal, and it removes two mechanisms
+//! # Limits
 //!
-//! `extensions.md` documents it for exactly this use: *"`agent_end` fires when
-//! that run ends, but Pi may still auto-retry, auto-compact and retry, or
-//! continue with queued follow-up messages. Use `agent_settled` for status
-//! integrations that need to know Pi will not continue running automatically."*
-//!
-//! So `agent_settled` maps to [`HookEvent::Stop`] for turn completion. Manual
-//! compaction runs outside that lifecycle: `session_compact_failed` must also
-//! settle a failed or cancelled compaction. Its `willRetry` flag keeps an
-//! automatic retry active instead of reporting an idle session.
-//! Two absences follow for ordinary turns:
-//!
-//! - **No interrupt detection.** A settled interrupt is still "Pi will not
-//!   continue", so it settles too — which is the case that costs Codex a
-//!   rollout sentinel and Claude a session-file fold.
-//!   [`crate::agent::AgentControl::scan_transcript_signals`] is the empty
-//!   default and `agent_activity` is `None` with nothing lost. (That
-//!   `agent_settled` really does fire on a cancelled run is the one claim here
-//!   the docs imply rather than state — see the probe list.)
-//! - **[`crate::state::SessionStatus::WaitingForApproval`] is structurally
-//!   unreachable.** `security.md`: *"Pi does not include a built-in sandbox.
-//!   Built-in tools can read files, write files, edit files, and run shell
-//!   commands with the permissions of the pi process."* Its `--approve` / trust
-//!   machinery is **project-trust** — a guard on loading settings and
-//!   extensions — not a per-tool gate. There is no approval prompt to reflect
-//!   and no second mechanism to go find, so nothing is being left on the table.
-//!   Noted here so nobody re-derives it.
-//!
-//! The one moment a Pi session *does* block on the user is the built-in project
-//! trust prompt at startup, and it is deliberately not surfaced: it fires before
-//! `session_start`, so the row is still `Starting` and there is no paired
-//! "answered" event to leave that state on. A Pi row that never leaves
-//! `Starting` is therefore more likely waiting on that prompt than missing a
-//! hook — which the README says out loud, because the two look identical from
-//! the dashboard.
-//!
-//! # Tokens, model and title come off the hook — not the transcript
-//!
-//! `ctx.getContextUsage()`, `ctx.model` and `pi.getSessionName()` are all
-//! reachable inside a handler, so the extension puts the numbers on every
-//! payload and [`common::adopt_session_facts`] stamps them onto the row. No
-//! title store, no sqlite overlay, no `out_of_band_watch_paths` entry.
-//!
-//! That is a *choice against* a transcript fold, not an inability to do one:
-//! `session-format.md` documents the JSONL schema outright (assistant entries
-//! carry `provider`, `model`, `usage.totalTokens` and `stopReason`). The reason
-//! is that **the session file is a tree, not a log** — `sessions.md`: *"Every
-//! entry has an `id` and `parentId`, and the current position is the active
-//! leaf."* A naive tail reads the last *appended* entry, which after a `/tree`
-//! jump belongs to an abandoned branch, so a correct fold has to walk `parentId`
-//! back from the active leaf on every read. The hook route sidesteps that
-//! entirely, and `adopt_session_facts` is explicit that one fact gets one
-//! source: a backend reports them **or** folds them, never both. Hence
-//! [`read_transcript_stats`] returns the default and `transcript_path` is
-//! `None`, which also keeps the launcher's whole transcript pipeline (stats
-//! fold, signal scan, stat poll) inert for Pi by construction.
-//!
-//! [`read_transcript_stats`]: crate::agent::AgentControl::read_transcript_stats
-//!
-//! # What a probe against a real binary must settle
-//!
-//! - **That every name in [`FORWARDED`] is still a live Pi event.** The
-//!   registration loop swallows a throwing `pi.on` so one renamed event costs
-//!   one transition instead of the whole extension — which is the right trade
-//!   and also the reason a rename is *invisible*. Run a full session (prompt →
-//!   tool → compact → settle) with the launcher log open and check all nine
-//!   arrive.
-//! - **That `agent_settled` fires on an interrupted run.** Press Esc mid-turn.
-//!   The whole no-interrupt-detection claim rests on it; if it doesn't fire, a
-//!   Pi row stays `Active` until the next prompt (Grok's standing defect).
-//! - **That `ctx.sessionManager.getSessionId()` is the id `--session <id>`
-//!   accepts.** `usage.md` documents `--session <path|id>` as taking a "partial
-//!   UUID"; that the SessionManager's id is that UUID is implied by the naming
-//!   and not stated. If they differ, resume is aimed at the wrong namespace.
-//! - **That a `-e` extension outside any package resolves `node:child_process`.**
-//!   `extensions.md` says extensions run on Node with builtins available and
-//!   *"No native Bun.spawn: uses Node.js `child_process` API only"*, and jiti
-//!   loads the file without compilation — but our file has no `package.json`
-//!   beside it, which no doc explicitly blesses.
-//! - **Whether an `undefined` return from `before_agent_start` /
-//!   `session_before_compact` is accepted as "no change".** Both are documented
-//!   as returning an optional patch object, so it should be; a wrong guess here
-//!   would break the user's turn rather than merely lose a status.
-//! - **whether `Ctrl+V` reaches the dashboard's clipboard in a pooled session.**
-//!   The launch is shimmed like every backend's ([`super::with_shim_path`]), so
-//!   this works if the agent reads the clipboard by shelling out to
-//!   `xclip`/`wl-paste`, and silently does nothing if it reads it in-process the
-//!   way Codex does — the one case no shim can serve. Untested either way, and
-//!   the only unknown here a *user* meets rather than a probe runner.
-//!   `clipboard-paste` in the session is the fallback that works regardless.
+//! Pi has no built-in per-tool approval gate. Project trust can leave the row
+//! at `Starting` until answered. Extension UI decision prompts and background
+//! jobs are not tracked. Real terminal attach/detach, keyboard Escape and
+//! pooled-session clipboard paste still need interactive validation; the RPC
+//! abort test verifies lifecycle settlement, not terminal key handling.
+//! `clipboard-paste` remains the pooled clipboard fallback.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -157,6 +66,15 @@ use crate::state::{HookEvent, HookMessage, LauncherState};
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "pi";
 
+mod sessions;
+
+#[cfg(test)]
+mod live_tests;
+
+pub fn list_resumable(limit: usize) -> Result<Vec<crate::agent::ResumeCandidate>> {
+    sessions::list_resumable(limit)
+}
+
 // =============================================================================
 // The event table — the module's claim about what it subscribes to
 // =============================================================================
@@ -165,7 +83,7 @@ pub(crate) const BIN: &str = "pi";
 /// [`HookEvent`] it is forwarded as. This const **is** the claim; the emitted
 /// JavaScript renders it, so the two cannot disagree.
 ///
-/// The four choices in here that aren't 1:1:
+/// The choices in here that aren't 1:1:
 ///
 /// - **`tool_execution_start` / `tool_execution_end`, not `tool_call` /
 ///   `tool_result`.** All four fire on every tool (`extensions.md`'s lifecycle
@@ -193,19 +111,23 @@ pub(crate) const BIN: &str = "pi";
 ///   compaction has no later `agent_settled` to clear `Compacting`. Rust uses
 ///   its `aborted` and `willRetry` fields to distinguish cancellation, failure
 ///   and an automatic retry; only a terminal failure surfaces error text.
+/// - **`model_select` and `session_tree` use [`HookEvent::ModelSwitch`].** Both
+///   refresh metadata without making a claim about whether Pi is working.
 ///
 /// Deliberately not registered: `agent_start` / `agent_end` / `turn_*` /
 /// `message_*` / `context` / `before_provider_*` / `after_provider_response`
 /// (too fine-grained — each would spawn a subprocess per LLM call to discard its
 /// payload), `session_shutdown` (the launcher owns exit), `session_before_switch`
-/// / `session_before_fork` / `session_before_tree` / `session_tree` (a
+/// / `session_before_fork` / `session_before_tree` (a
 /// replacement session re-emits `session_start`, which we do register),
-/// `user_bash`, `model_select` and `thinking_level_select` (the model rides
-/// every payload already), and `project_trust` / `resources_discover` (see the
+/// `user_bash` and `thinking_level_select` (no corresponding dashboard field),
+/// and `project_trust` / `resources_discover` (see the
 /// module doc).
 const FORWARDED: &[(&str, HookEvent)] = &[
     ("session_start", HookEvent::SessionStart),
     ("session_info_changed", HookEvent::SessionStart),
+    ("model_select", HookEvent::ModelSwitch),
+    ("session_tree", HookEvent::ModelSwitch),
     ("before_agent_start", HookEvent::PromptSubmit),
     ("tool_execution_start", HookEvent::PreToolUse),
     ("tool_execution_end", HookEvent::PostToolUse),
@@ -284,7 +206,7 @@ pub fn build_launch_command(
 /// events), `event.prompt` (`before_agent_start`), `event.isError`
 /// (`tool_execution_end`), `event.aborted` / `event.willRetry` /
 /// `event.errorMessage` (`session_compact_failed`), `ctx.getContextUsage().tokens`
-/// and `ctx.model.id`.
+/// and `ctx.model.provider` / `ctx.model.id`.
 #[derive(Deserialize)]
 struct HookPayload {
     session_id: Option<String>,
@@ -358,15 +280,24 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 // Hook event → status mapping
 // =============================================================================
 
-/// Pi departs from [`common::dispatch_default`] nowhere. The native → normalized
-/// renaming is done in the generated table ([`FORWARDED`]) rather than here, the
-/// payload-driven corrections are done in [`parse_hook_payload`], and
-/// `agent_settled` means the shared `Stop` arm needs no help from a session file
-/// or a rollout scan.
-///
-/// The wrapper stays so the seam keeps one callee per backend, and so the day Pi
-/// grows a case of its own it has a place to land.
+/// Forget the old conversation's metadata on an in-process session switch,
+/// then apply the shared status transitions. Renames retain the session ID and
+/// therefore preserve its other facts.
 pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+    if msg.event == HookEvent::SessionStart
+        && let Some(id) = msg.session_id.as_deref().filter(|id| !id.trim().is_empty())
+        && state.session_id.as_deref().is_some_and(|old| old != id)
+    {
+        // /new, /resume and /fork reuse the process. Missing metadata belongs
+        // to the new conversation, not to the draft previously on this row.
+        state.name = None;
+        state.last_prompt = None;
+        state.last_tool = None;
+        state.context_tokens = None;
+        state.model = None;
+        state.set_last_error(None);
+        state.status = crate::state::SessionStatus::Idle;
+    }
     common::dispatch_default(state, msg)
 }
 
@@ -384,9 +315,8 @@ mod tests {
     const EXE: &str = "/home/miao/.local/bin/miao";
 
     /// A payload in the shape our own forwarder builds. Hand-written from
-    /// [`Extension::source`] rather than captured, because no `pi` was available
-    /// — but unlike the other backends' fixtures, the thing it mirrors is *our*
-    /// code, so it can only drift by someone editing the template.
+    /// [`Extension::source`]; the separate opt-in live test checks that Pi's
+    /// actual extension context still supplies these fields.
     fn payload(extra: &str) -> String {
         format!(
             r#"{{"session_id":"s1","session_title":"wire up the parser",
@@ -417,6 +347,8 @@ mod tests {
             [
                 "session_start",
                 "session_info_changed",
+                "model_select",
+                "session_tree",
                 "before_agent_start",
                 "tool_execution_start",
                 "tool_execution_end",
@@ -622,6 +554,51 @@ mod tests {
             feed(&mut state, event, &body);
             assert_eq!(state.status, status);
         }
+    }
+
+    #[test]
+    fn model_selection_and_tree_navigation_refresh_idle_metadata() {
+        let messages =
+            super::super::forwarder_test::run(&EXTENSION.source("/path/to/miao"), "pi_metadata");
+        let mut state = state_at(SessionStatus::Idle);
+        state.context_tokens = Some(9000);
+        assert_eq!(messages.len(), 2);
+        for (index, (event, body)) in messages.into_iter().enumerate() {
+            feed(&mut state, event, &body);
+            assert_eq!(state.status, SessionStatus::Idle);
+            assert_eq!(
+                state.model.as_deref(),
+                Some("openrouter/google/gemini-3.8-flash")
+            );
+            assert_eq!(
+                state.context_tokens,
+                Some(if index == 0 { 9000 } else { 4321 })
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_the_previous_drafts_metadata() {
+        let mut state = state_at(SessionStatus::Idle);
+        feed(
+            &mut state,
+            HookEvent::PromptSubmit,
+            &payload(r#", "prompt": "Old draft""#),
+        );
+        feed(&mut state, HookEvent::Stop, &payload(""));
+        state.set_last_error(Some("An old failure".into()));
+        feed(
+            &mut state,
+            HookEvent::SessionStart,
+            r#"{"session_id":"new"}"#,
+        );
+        assert_eq!(state.session_id.as_deref(), Some("new"));
+        assert_eq!(state.name, None);
+        assert_eq!(state.last_prompt, None);
+        assert_eq!(state.context_tokens, None);
+        assert_eq!(state.model, None);
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.status, SessionStatus::Idle);
     }
 
     /// No transcript path, ever — the field the launcher gates its whole

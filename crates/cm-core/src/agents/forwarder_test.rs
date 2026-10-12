@@ -67,7 +67,7 @@ const context = vm.createContext({
 });
 const spawn = (_exe, args) => {
   assert.deepEqual(Array.from(args.slice(0, 3)), ['hook', '--agent', scenario.split('_')[0]]);
-  if (++spawnAttempts === 1 && scenario === 'opencode_spawn_throw') {
+  if (++spawnAttempts === 1 && scenario.endsWith('_spawn_throw')) {
     throw new Error('spawn threw');
   }
   const child = new EventEmitter();
@@ -136,6 +136,65 @@ if (scenario.startsWith('opencode_')) {
   if (scenario === 'opencode_direct') {
     assert.equal(delivered[1].body.payload[0].tool, 'original');
   }
+} else if (scenario.endsWith('_concurrent')) {
+  const handlers = new Map();
+  module.namespace.default({ on(name, fn) { handlers.set(name, fn); } });
+  const rename = scenario.startsWith('pi_') ? 'session_info_changed' : 'session_switch';
+  const first = handlers.get(rename)({}, {});
+  const event = { prompt: 'Original prompt' };
+  const second = handlers.get('before_agent_start')(event, {});
+  event.prompt = 'Mutated prompt';
+  await tick();
+  if (pending.length > 1) complete(pending[1]);
+  complete(pending[0]);
+  await tick();
+  complete(pending[1]);
+  await Promise.all([first, second]);
+  assert.equal(delivered[0].event, 'session-start', 'unawaited events must keep invocation order');
+  assert.equal(delivered[1].body.prompt, 'Original prompt', 'capture payload before queueing');
+} else if (scenario === 'pi_metadata') {
+  const handlers = new Map();
+  const pi = { on(name, fn) { handlers.set(name, fn); } };
+  module.namespace.default(pi);
+  const ctx = {
+    sessionManager: { getSessionId: () => 'root' },
+    model: { provider: 'openrouter', id: 'google/gemini-3.8-flash' },
+    getContextUsage: () => ({ tokens: null }),
+  };
+  for (const type of ['model_select', 'session_tree']) {
+    assert.ok(handlers.has(type), `missing handler: ${type}`);
+    const sent = handlers.get(type)({ type, model: ctx.model }, ctx);
+    await tick();
+    complete(pending.at(-1));
+    await sent;
+    ctx.getContextUsage = () => ({ tokens: 4321 });
+  }
+} else if (/^(pi|omp)_(timeout|spawn_throw|spawn_error|stdin_error)$/.test(scenario)) {
+  const handlers = new Map();
+  module.namespace.default({ on(name, fn) { handlers.set(name, fn); } });
+  let settled = false;
+  const sent = handlers.get('before_agent_start')({ prompt: 'Draft an essay' }, {});
+  sent.then(value => { assert.equal(value, undefined); settled = true; });
+  await tick();
+  if (scenario.endsWith('_timeout')) {
+    assert.ok(timers.size > 0, 'a stuck hook must not freeze Pi or omp');
+    [...timers.values()][0]();
+    assert.equal(pending[0].killed, true);
+  } else if (scenario.endsWith('_spawn_error')) {
+    pending[0].emit('error', new Error('spawn failed'));
+  } else if (scenario.endsWith('_stdin_error')) {
+    pending[0].stdin.emit('error', new Error('EPIPE'));
+  }
+  await tick();
+  assert.equal(settled, true, 'failed delivery must release the agent');
+  assert.equal(timers.size, 0, 'failure must clear the deadline');
+  await sent;
+  const next = handlers.get('tool_execution_start')({ toolName: 'read' }, {});
+  await tick();
+  complete(pending.at(-1));
+  await next;
+  assert.equal(spawnAttempts, 2);
+  assert.equal(timers.size, 0);
 } else if (scenario.endsWith('_extension')) {
   const handlers = new Map();
   const pi = {

@@ -1,5 +1,34 @@
 # Session lifecycle verification
 
+## Real Pi
+
+With Pi installed, run:
+
+```sh
+nix develop -c cargo test -p cm-core --locked real_pi_loads_extension_and_tracks_conversations -- --ignored --nocapture
+```
+
+Set `CM_TEST_PI_BIN` to an absolute executable path if Pi is not on `PATH`.
+Verified with Pi 1.1.0. The test uses private temporary Pi configuration and
+XDG directories, and a loopback OpenAI-compatible model fixture. It needs no
+account, credentials or external inference. The sandbox must allow the local
+listener. It removes its files and stops its fixture processes afterward.
+
+The real CLI loads miao's generated extension and performs a read tool call,
+drafting, rename, model change, interrupted inference, manual compaction, a new
+conversation, cold resume and fork. Captured hook payloads pass through the real
+Rust parser and status dispatcher. RPC replies, provider request arrival and
+observed hook writes synchronize the test; each phase has a watchdog longer
+than the hook delivery deadline.
+
+The regular suite separately covers resume discovery, malformed/large records,
+storage environment overrides, event ordering, delivery failures and metadata
+refresh after tree navigation. The live test captures hook subprocess output;
+it does not exercise the launcher's socket, terminal attach/detach, keyboard
+Escape or clipboard paste.
+
+## Pooled sessions
+
 Run the process-level lifecycle scenario with:
 
 ```sh

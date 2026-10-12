@@ -74,17 +74,24 @@ const FORWARD = [
 {table}];
 
 export default function (pi) {{
+  let pending = Promise.resolve();
   for (const [name, forwarded] of FORWARD) {{
     // An unavailable event must not prevent the others from being registered.
     try {{
-      pi.on(name, (event, ctx) => send(forwarded, pi, event, ctx));
+      pi.on(name, (event, ctx) => {{
+        const body = capture(pi, event, ctx);
+        const deliver = () => send(forwarded, body);
+        pending = pending.then(deliver, deliver);
+        return pending;
+      }});
     }} catch {{}}
   }}
 }}
 
-function send(forwarded, pi, event, ctx) {{
+function capture(pi, event, ctx) {{
   let body = "{{}}";
   try {{
+    const tokens = ctx?.getContextUsage?.()?.tokens;
     body = JSON.stringify({{
       session_id: ctx?.sessionManager?.getSessionId?.(),
       session_title: pi?.getSessionName?.(),
@@ -92,17 +99,28 @@ function send(forwarded, pi, event, ctx) {{
       tool_name: event?.toolName,
       prompt: event?.prompt,
       is_error: event?.isError,
-{extra}      // Round fractional estimates; an absent estimate serializes as null.
-      context_tokens: Math.round(ctx?.getContextUsage?.()?.tokens),
-      model: ctx?.model?.id,
+{extra}      // Pi may report null after compaction; that is unknown, not zero.
+      context_tokens: Number.isFinite(tokens) && tokens >= 0 ? Math.round(tokens) : undefined,
+      model: ctx?.model?.provider && ctx?.model?.id
+        ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id,
     }});
   }} catch {{
     // A throwing getter must not cost the event, which is carried in argv.
   }}
+  return body;
+}}
+
+function send(forwarded, body) {{
   // Resolve without a value, even on failure: handlers may return patches.
-  // Awaiting the child also preserves the host's order of awaited events.
+  // The queue also orders notifications the host does not await (Pi renames).
   return new Promise((resolve) => {{
     let child;
+    let timer;
+    const finish = () => {{ clearTimeout(timer); resolve(); }};
+    const abort = () => {{
+      try {{ child?.kill("SIGKILL"); }} catch {{}}
+      finish();
+    }};
     try {{
       child = spawn(MIAO, ["hook", "--agent", "{agent}", forwarded], {{
         stdio: ["pipe", "ignore", "ignore"],
@@ -111,10 +129,11 @@ function send(forwarded, pi, event, ctx) {{
       resolve();
       return;
     }}
-    child.on("error", () => resolve());
-    child.on("close", () => resolve());
-    child.stdin.on("error", () => {{}});
-    child.stdin.end(body);
+    timer = setTimeout(abort, 5000);
+    child.on("error", finish);
+    child.on("close", finish);
+    child.stdin.on("error", abort);
+    try {{ child.stdin.end(body); }} catch {{ abort(); }}
   }});
 }}
 "#
@@ -128,6 +147,31 @@ mod tests {
     use crate::agent::AgentControl;
     use crate::state::{LauncherState, SessionStatus};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn unawaited_hooks_keep_order_and_capture_the_original_payload() {
+        for agent in [AgentControl::Pi, AgentControl::Omp] {
+            let delivered = super::super::forwarder_test::run(
+                &agent.hooks_settings_json("/unused.sock"),
+                &format!("{}_concurrent", agent.cli_subcommand()),
+            );
+            assert_eq!(delivered.len(), 2);
+        }
+    }
+
+    #[test]
+    fn hook_delivery_failures_cannot_block_the_agent() {
+        for agent in [AgentControl::Pi, AgentControl::Omp] {
+            for failure in ["timeout", "spawn_throw", "spawn_error", "stdin_error"] {
+                let delivered = super::super::forwarder_test::run(
+                    &agent.hooks_settings_json("/unused.sock"),
+                    &format!("{}_{failure}", agent.cli_subcommand()),
+                );
+                assert_eq!(delivered.len(), 1);
+                assert_eq!(delivered[0].0, HookEvent::PreToolUse);
+            }
+        }
+    }
 
     #[test]
     fn generated_extensions_preserve_metadata_and_distinct_turn_outcomes() {

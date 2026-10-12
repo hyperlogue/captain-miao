@@ -865,14 +865,8 @@ impl AgentControl {
             AgentControl::Kimi => kimi::list_resumable(limit),
             AgentControl::Grok => grok::list_resumable(limit),
             AgentControl::OpenCode => opencode::list_resumable(limit),
-            // Empty for now. Pi's sessions are plain JSONL under
-            // `~/.pi/agent/sessions/`, grouped by working directory, so this is
-            // reachable — but a candidate needs a cwd, a first prompt and an id,
-            // and reading them means committing to the same active-branch walk
-            // `read_transcript_stats` declines. `pi -r` opens Pi's own session
-            // picker in the meantime, which is the usable answer until this and
-            // that fold land together.
-            AgentControl::Pi => Ok(vec![]),
+            // Picker metadata is session-wide; it needs no active-branch walk.
+            AgentControl::Pi => pi::list_resumable(limit),
             AgentControl::Antigravity => antigravity::list_resumable(limit),
             // Read off disk the way the other file-backed backends are: every
             // field a candidate needs sits in the head of
@@ -1140,9 +1134,8 @@ impl AgentControl {
             // Neither carries an interrupt *flag*; Pi instead has a turn-end
             // event that fires once the run will not continue at all
             // (`agent_settled`), and a cancelled run is exactly that. So the
-            // case that forced Codex to read its rollout cannot arise, and no
-            // transcript of Pi's is read for any purpose (`agents::pi` names
-            // none).
+            // case that forced Codex to read its rollout cannot arise. Pi's
+            // transcript is read only for the resume picker, never live status.
             AgentControl::Pi => TranscriptScan::default(),
             // Empty for the reason Codex's is not: the one signal worth
             // reading a transcript for is an interrupt, and Antigravity's
@@ -1471,9 +1464,7 @@ impl AgentControl {
 /// mechanism for this at all*, never *we haven't wired it up yet*: the
 /// dashboard's answer to a missing capability is to stop offering the thing, and
 /// doing that to work that merely hasn't been done buries it as impossible.
-/// Pi's absent resume-picker entries are an unfinished fold against data that
-/// exists, so they are not a field here — they are a tracker item. Pi's missing
-/// approval gate is the opposite: `security.md` says the agent runs shell
+/// Pi's approval gate is a structural limit: `security.md` says it runs shell
 /// commands with its own permissions and has no per-tool prompt, so there is
 /// nothing to reflect however much code we write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2172,6 +2163,7 @@ mod tests {
                     StopFailure,
                     PreCompact,
                     PostCompact,
+                    ModelSwitch,
                 ],
             ),
             // Shorter still, and none of the three absences is a gap of ours:
