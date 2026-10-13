@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-13
+
+### New
+
+- **Codex app-server sessions** load approved direnv environments for Bash and
+  zsh commands while respecting Codex environment policies, with already-loaded
+  threads keeping their original environment until unloaded and resumed.
+- **The port forwarding list** supports `Ctrl-N` and `Ctrl-P` for navigation.
+- **New sessions** immediately appear as selected `Starting` rows while launching
+  in the background, with `Enter` opening the session once ready unless further
+  input cancels the request.
+- **Successful session termination** no longer shows a notification.
+
+### Fixed
+
+- **Pi's resume picker** shows session names and first prompts, and honors
+  custom locations set through `PI_CODING_AGENT_DIR` or
+  `PI_CODING_AGENT_SESSION_DIR`.
+- **Pi session details** refresh model and context information after model
+  changes or conversation-tree navigation, and clear stale draft metadata when
+  switching sessions.
+- **Pi and omp hooks** preserve event order and time out failed deliveries so
+  an unresponsive hook cannot stall the agent indefinitely.
+
+### Removed
+
+- **The `captain-miao-remote` Nix package** has been removed because the default
+  `captain-miao` package already includes remote support, and
+  `captain-miao-with-servers` now wraps it directly.
+
 ## [0.12.0] - 2026-10-06
 
 Thanks to @TomGrozev for improving omp status tracking and the resume picker
@@ -787,7 +817,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...v0.10.0

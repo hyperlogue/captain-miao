@@ -13,8 +13,9 @@ For a dated release, insert `## [X.Y.Z] - YYYY-MM-DD` above the previous release
 using the release date. For an unreleased entry, preserve the requested heading
 without inventing a release version or date.
 
-- Group entries under Added, Changed, Fixed, Removed or Security, in that order,
-  including only populated groups.
+- Group entries under New, Fixed and Removed, in that order, including only
+  populated groups. New covers additions and behavior changes; Fixed includes
+  security fixes.
 - Describe user-visible behavior, fold related commits together and lead each
   bullet with the project's bold feature label. Keep one sentence per bullet;
   fold a necessary caveat into it. Detailed mechanics belong in module docs,
