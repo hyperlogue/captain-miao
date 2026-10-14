@@ -763,6 +763,24 @@ captain-miao is built around a strict unidirectional data flow:
 
 State lives under `~/.local/state/captain-miao/`, with daemon control and pool sockets in its `run/` directory. Launcher and clipboard sockets use `$XDG_RUNTIME_DIR/captain-miao/`, falling back to that state `run/` directory. These directories are owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For implementation rules and architecture references, see [AGENTS.md](AGENTS.md).
 
+## Agent logos
+
+In Kitty, the wide session table shows a one-cell harness logo immediately
+before Context. Logos are enabled by default and hidden in narrow layouts or
+unsupported terminals, including tmux and zellij. Missing artwork uses an initial.
+
+Turn them off with `,` → **Display → Agent logos**, or in
+`~/.config/captain-miao/config.toml`:
+
+```toml
+[ui.table]
+agent_logos = false
+```
+
+Preferences take precedence over the config file. Press `r` on the setting to
+inherit the file again. This setting controls session logos independently of
+the title-bar paw.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

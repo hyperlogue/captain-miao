@@ -2508,6 +2508,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         if logo_recompose_at.is_some_and(|t| Instant::now() >= t) {
             logo_recompose_at = None;
             app.invalidate_logo_graphics();
+            app.agent_logos.invalidate();
             needs_redraw = true;
         }
         needs_redraw |= drain_background_results(
@@ -2608,6 +2609,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             // autonomously, so the loop needn't drive frames; the cat walk is the
             // one thing this repaint drives (an advancing placement).
             app.render_logo_graphics();
+            let _ = app
+                .agent_logos
+                .render(&mut std::io::stdout().lock(), app.logo.caps);
             needs_redraw = false;
         }
 
@@ -2698,6 +2702,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // is fixed for the process on kitty, so this never needs to tear
                         // down.)
                         app.logo.caps = terminal::graphics::capability();
+                        app.agent_logos.invalidate();
                         arm_logo_recompose(&mut logo_recompose_at);
                         None
                     }
@@ -2725,6 +2730,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                 // regular frame at the top of the next iteration.
                 terminal.draw(|frame| app.draw(frame))?;
                 app.render_logo_graphics();
+                let _ = app
+                    .agent_logos
+                    .render(&mut std::io::stdout().lock(), app.logo.caps);
                 match action {
                     Action::FocusWindow(id) => {
                         // The row's identity, captured before the call: the
@@ -2766,6 +2774,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                 }) => {
                                     app.attaching = Some(pool_session.clone());
                                     terminal.draw(|frame| app.draw(frame))?;
+                                    let _ = app
+                                        .agent_logos
+                                        .render(&mut std::io::stdout().lock(), app.logo.caps);
                                     attach_pool_session(&mut app, host, pool_session, force, true)
                                         .await;
                                     app.attaching = None;
@@ -2788,6 +2799,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // Acknowledge this keystroke before any further terminal
                         // reads or background maintenance on the next pass.
                         terminal.draw(|frame| app.draw(frame))?;
+                        let _ = app
+                            .agent_logos
+                            .render(&mut std::io::stdout().lock(), app.logo.caps);
                     }
                     Action::FetchTabsForMove(window_id) => match terminal::get().snapshot().await {
                         Ok(tabs) => app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs)),
@@ -3119,8 +3133,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     }
     while forward_cleanup.join_next().await.is_some() {}
 
-    // Free the paw image from kitty before we drop the alt screen.
+    // Free header and session artwork before we drop the alt screen.
     app.clear_logo_graphics();
+    let _ = app.agent_logos.clear(&mut std::io::stdout().lock());
     Ok(())
 }
 

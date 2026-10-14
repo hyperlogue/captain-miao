@@ -128,6 +128,10 @@ impl App {
         }
         self.draw_notifications(frame, body);
         self.draw_upgrade_notices(frame, frame.area());
+        // Resolve image cells only after every overlay has cleared/painted its
+        // area, so images cannot leak over preferences, dialogs or notifications.
+        self.agent_logos
+            .collect(frame.buffer_mut(), self.last_table_rect.unwrap_or_default());
     }
 
     /// The "Attaching…" overlay shown while an attach is in flight.
@@ -1054,8 +1058,11 @@ impl App {
 
         // Indented past the override indicator the rows carry in this same cell,
         // so the header sits over the status labels rather than over the glyphs.
+        let show_agent_logos = !narrow
+            && cfg.ui.table.agent_logos
+            && self.logo.caps.is_some_and(|s| s.w > 0 && s.h > 0);
         let status_header = format!("{}Status", " ".repeat(OVERRIDE_COL_WIDTH as usize));
-        let labels = if narrow {
+        let mut labels = if narrow {
             vec![status_header, String::new(), "Name".into()]
         } else {
             vec![
@@ -1067,12 +1074,16 @@ impl App {
                 "Updated".into(),
             ]
         };
-        let header = Row::new(labels.into_iter().enumerate().map(|(i, label)| {
-            Cell::from(Line::from(label).alignment(if i == 3 || i == 5 {
+        if show_agent_logos {
+            labels.insert(3, String::new());
+        }
+        let header = Row::new(labels.into_iter().map(|label| {
+            let alignment = if label == "Ctx" || label == "Updated" {
                 Alignment::Right
             } else {
                 Alignment::Left
-            }))
+            };
+            Cell::from(Line::from(label).alignment(alignment))
         }))
         .style(Style::default().bold().fg(ui.header_fg));
 
@@ -1127,6 +1138,9 @@ impl App {
                     // The narrow layout keeps only status / workdir icon / name; the
                     // context, last-prompt and updated columns are dropped.
                     let mut row_cells = vec![status_cell, icon_cell, name_cell];
+                    if show_agent_logos {
+                        row_cells.push(super::agent_logos::cell(s.agent));
+                    }
                     if !narrow {
                         let ctx_tokens = s.context_tokens;
                         // Blank is "no number yet". A backend that persists no
@@ -1186,6 +1200,9 @@ impl App {
                         )),
                         name,
                     ];
+                    if show_agent_logos {
+                        cells.push(super::agent_logos::cell(request.agent));
+                    }
                     if !narrow {
                         let ctx = if request.agent.capabilities().context_tokens {
                             ""
@@ -1256,7 +1273,7 @@ impl App {
         // bounded), so they get hard `Length` constraints. Name and prompt
         // share the leftover space — name caps at the truncate width but
         // shrinks before status does on narrow viewports.
-        let constraints = if narrow {
+        let mut constraints = if narrow {
             // Status / icon stay fixed-width; the name column fills the rest and
             // the ratatui table clips it when it doesn't fit. The icon column is
             // the workdir slot alone here — no host half in this layout.
@@ -1279,6 +1296,9 @@ impl App {
                 Constraint::Length(ELAPSED_MAX_WIDTH),
             ]
         };
+        if show_agent_logos {
+            constraints.insert(3, Constraint::Length(1));
+        }
         let table = Table::new(rows, constraints)
             .header(header)
             // Top rule only — no side or bottom borders, so the list runs flush

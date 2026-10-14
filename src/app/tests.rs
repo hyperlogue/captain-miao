@@ -66,6 +66,9 @@ impl TestDashboard {
         // default; tests that exercise an unsupported path flip a flag
         // themselves.
         app.capabilities = crate::terminal::Capabilities::default();
+        // Graphics tests opt in explicitly; running tests in a real Kitty must
+        // not change the default table's geometry or emit image placeholders.
+        app.logo.caps = None;
         // `App::new` seeds this from the test process's terminal env (zellij/kitty/
         // none — nondeterministic across machines). Pin it to `None` so the default
         // harness treats every terminal-less mock session/binding as same-terminal
@@ -2134,6 +2137,139 @@ fn prefs_r_on_layout_clears_the_override() {
         d.app.extra_prefs.sessions_layout.is_none(),
         "r must delete the override so TOML wins, not write stacked"
     );
+}
+
+#[test]
+fn agent_logos_preferences_persist_and_reset_to_the_config_file() {
+    const CHILD: &str = "CM_TEST_AGENT_LOGO_PREFS";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config/captain-miao");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[ui.table]\nagent_logos = false\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::agent_logos_preferences_persist_and_reset_to_the_config_file",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "logo preferences failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut d = TestDashboard::new(140, 30);
+    assert!(!crate::config::get().ui.table.agent_logos);
+    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char('l'));
+    d.press(KeyCode::Char('l'));
+    for _ in 0..4 {
+        d.press(KeyCode::Char('j'));
+    }
+    assert!(d.render().contains("Agent logos"));
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.extra_prefs.agent_logos, Some(true));
+    assert!(crate::config::get().ui.table.agent_logos);
+    let mut reopened = TestDashboard::new(140, 30);
+    reopened.app.load_overrides();
+    assert_eq!(reopened.app.extra_prefs.agent_logos, Some(true));
+    d.press(KeyCode::Char('r'));
+    assert_eq!(d.app.extra_prefs.agent_logos, None);
+    assert!(!crate::config::get().ui.table.agent_logos);
+    reopened.app.load_overrides();
+    assert_eq!(reopened.app.extra_prefs.agent_logos, None);
+}
+
+#[test]
+fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
+    use crate::agent::AgentControl;
+    let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
+    let mut d = TestDashboard::new(140, 24);
+    d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    let mut s = session(1, "/home/test/proj", SessionStatus::Active);
+    s.context_tokens = Some(1000);
+    d.set_sessions(vec![s.clone()]);
+    let text = d.render();
+    assert!(!text.contains('\u{100000}'));
+    let ctx = text
+        .lines()
+        .find(|line| line.contains("Ctx"))
+        .unwrap()
+        .find("Ctx")
+        .unwrap() as u16;
+    let icon_x = ctx - 3; // One-cell logo, column gap, then the right-aligned Ctx label.
+    let row = d.app.last_table_rect.unwrap().y + 2;
+    let mut wire = Vec::new();
+    d.app
+        .agent_logos
+        .render(&mut wire, d.app.logo.caps)
+        .unwrap();
+    let wire = String::from_utf8(wire).unwrap();
+    assert!(
+        wire.contains(&format!("\x1b[{};{}H", row + 1, icon_x + 1)),
+        "{text}"
+    );
+    assert!(wire.contains("c=1,r=1"));
+
+    // Missing artwork remains identifiable without confusing it with a logo.
+    s.agent = AgentControl::Grok;
+    d.set_sessions(vec![s]);
+    d.render();
+    assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), "G");
+
+    let mut off = crate::config::Config::default();
+    off.ui.table.agent_logos = false;
+    {
+        crate::config::replace(off);
+        let text = d.render();
+        let off_ctx = text
+            .lines()
+            .find(|line| line.contains("Ctx"))
+            .unwrap()
+            .find("Ctx")
+            .unwrap() as u16;
+        assert_eq!(
+            off_ctx + 2,
+            ctx,
+            "the slot and its column gap must collapse"
+        );
+        crate::config::replace(crate::config::Config::default());
+    }
+    d.app.logo.caps = None;
+    let unsupported = d.render();
+    let unsupported_ctx = unsupported
+        .lines()
+        .find(|line| line.contains("Ctx"))
+        .unwrap()
+        .find("Ctx")
+        .unwrap() as u16;
+    assert_eq!(unsupported_ctx + 2, ctx);
+
+    let mut narrow = TestDashboard::new(80, 24);
+    narrow.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
+    narrow.set_sessions(vec![session(2, "/home/test/proj", SessionStatus::Active)]);
+    assert!(!narrow.render().contains("Ctx"));
+    let mut wire = Vec::new();
+    narrow
+        .app
+        .agent_logos
+        .render(&mut wire, narrow.app.logo.caps)
+        .unwrap();
+    assert!(wire.is_empty());
 }
 
 // =============================================================================

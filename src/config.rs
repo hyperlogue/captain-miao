@@ -42,6 +42,12 @@ fn merge_dashboard_overrides(cfg: &mut Config) {
         return;
     };
     let prefs = v.get("prefs");
+    if let Some(enabled) = prefs
+        .and_then(|p| p.get("agent_logos"))
+        .and_then(|x| x.as_bool())
+    {
+        cfg.ui.table.agent_logos = enabled;
+    }
     let layout = prefs
         .and_then(|p| p.get("sessions_layout"))
         .and_then(|x| x.as_str())
@@ -501,11 +507,16 @@ impl Default for PanelsConfig {
 #[serde(default)]
 pub struct TableConfig {
     pub name_truncate: usize,
+    /// Show one-cell harness logos when the terminal supports Kitty graphics.
+    pub agent_logos: bool,
 }
 
 impl Default for TableConfig {
     fn default() -> Self {
-        Self { name_truncate: 35 }
+        Self {
+            name_truncate: 35,
+            agent_logos: true,
+        }
     }
 }
 
@@ -632,6 +643,14 @@ pub(crate) fn format_color(c: Color) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_logos_default_on_and_can_be_disabled_in_toml() {
+        let default: Config = toml::from_str("").unwrap();
+        assert!(default.ui.table.agent_logos);
+        let off: Config = toml::from_str("[ui.table]\nagent_logos = false\n").unwrap();
+        assert!(!off.ui.table.agent_logos);
+    }
 
     #[test]
     fn keybinds_table_parses_string_and_list_forms() {

@@ -1,11 +1,11 @@
 //! Kitty graphics-protocol primitives, used to overlay the header paw logo, its
-//! click pulse, and the walking cat as real raw-RGBA images on top of the ratatui
-//! frame.
+//! click pulse, the walking cat, and session harness logos as real raw-RGBA
+//! images on top of the ratatui frame.
 //!
 //! This is presentation-only and kitty-specific, so it lives in the dashboard's
 //! terminal layer rather than `cm-core`. Every operation degrades to a no-op /
 //! `None` when the terminal can't do graphics (multiplexed under zellij/tmux, or
-//! not kitty at all) — the caller draws an emoji glyph instead.
+//! not kitty at all) — callers choose a text fallback or omit the image slot.
 //!
 //! Escapes are written straight to stdout *after* `terminal.draw()` has flushed
 //! its frame, so there is no interleaving with ratatui's own writes (the event
@@ -209,8 +209,18 @@ const CHUNK: usize = 4096;
 /// **frame 1** of the animation.
 pub fn transmit_rgba(id: u32, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
-    transmit_to(&mut out, &format!("f=32,t=d,s={w},v={h},i={id},a=t"), rgba)?;
+    transmit_rgba_to(&mut out, id, w, h, rgba)?;
     out.flush()
+}
+
+pub(crate) fn transmit_rgba_to(
+    out: &mut impl Write,
+    id: u32,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> std::io::Result<()> {
+    transmit_to(out, &format!("f=32,t=d,s={w},v={h},i={id},a=t"), rgba)
 }
 
 /// Append an animation frame to image `id` (`a=f`). `X=1` makes it a **full
@@ -305,9 +315,22 @@ fn transmit_to(out: &mut impl Write, header: &str, data: &[u8]) -> std::io::Resu
 /// (we don't want ratatui's next diff to fight a moved cursor).
 pub fn place(p: &Placement) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
-    queue!(out, MoveTo(p.col, p.row))?;
-    write_cmd(&mut out, &place_control(p), "")?;
+    place_to(&mut out, p)?;
     out.flush()
+}
+
+pub(crate) fn place_to(out: &mut impl Write, p: &Placement) -> std::io::Result<()> {
+    queue!(out, MoveTo(p.col, p.row))?;
+    write_cmd(out, &place_control(p), "")
+}
+
+/// Drop one placement while keeping the shared image and its other rows.
+pub(crate) fn delete_placement_to(
+    out: &mut impl Write,
+    image: u32,
+    placement: u32,
+) -> std::io::Result<()> {
+    write_cmd(out, &format!("a=d,d=i,i={image},p={placement},q=2"), "")
 }
 
 /// The `a=p` control-data string for a placement (everything after `_G`, minus
@@ -338,8 +361,12 @@ fn place_control(p: &Placement) -> String {
 /// Remove placements of `id` *and* free the image data (teardown).
 pub fn free_image(id: u32) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
-    write_cmd(&mut out, &format!("a=d,d=I,i={id},q=2"), "")?;
+    free_image_to(&mut out, id)?;
     out.flush()
+}
+
+pub(crate) fn free_image_to(out: &mut impl Write, id: u32) -> std::io::Result<()> {
+    write_cmd(out, &format!("a=d,d=I,i={id},q=2"), "")
 }
 
 #[cfg(test)]

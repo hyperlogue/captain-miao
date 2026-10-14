@@ -175,6 +175,8 @@ pub(crate) struct PrefsOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_stale_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_logos: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight_bg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_fg: Option<String>,
@@ -205,6 +207,7 @@ impl PrefsOverrides {
             && self.context_critical_tokens.is_none()
             && self.preview_auto_refresh_secs.is_none()
             && self.preview_stale_secs.is_none()
+            && self.agent_logos.is_none()
             && self.highlight_bg.is_none()
             && self.selection_fg.is_none()
             && self.attention_fg.is_none()
@@ -291,6 +294,9 @@ pub(super) fn first_enabled_agent(list: &[(AgentControl, bool)]) -> AgentControl
 /// only: this reads the overrides and writes the config, never the reverse, so
 /// a `None` leaves whatever `config.toml` and the compiled default settled on.
 pub(super) fn apply_prefs_to_config(cfg: &mut config::Config, prefs: &PrefsOverrides) {
+    if let Some(v) = prefs.agent_logos {
+        cfg.ui.table.agent_logos = v;
+    }
     if let Some(ref s) = prefs.sessions_layout
         && let Some(l) = SessionsLayout::from_label(s)
     {
@@ -370,6 +376,7 @@ enum DisplayRow {
     CritTokens,
     PreviewRefresh,
     PreviewStale,
+    AgentLogos,
 }
 
 const DISPLAY_ROWS: &[DisplayRow] = &[
@@ -377,6 +384,7 @@ const DISPLAY_ROWS: &[DisplayRow] = &[
     DisplayRow::CritTokens,
     DisplayRow::PreviewRefresh,
     DisplayRow::PreviewStale,
+    DisplayRow::AgentLogos,
 ];
 
 #[derive(Clone, Copy)]
@@ -720,8 +728,14 @@ impl App {
                 None => {}
             },
             PrefsCategory::Display => {
-                let seed = self.display_row_value(st.cursor);
-                self.open_prefs_field(seed);
+                if matches!(DISPLAY_ROWS.get(st.cursor), Some(DisplayRow::AgentLogos)) {
+                    self.extra_prefs.agent_logos = Some(!config::get().ui.table.agent_logos);
+                    self.save_overrides();
+                    self.reapply_live_config();
+                } else {
+                    let seed = self.display_row_value(st.cursor);
+                    self.open_prefs_field(seed);
+                }
             }
             PrefsCategory::Colors => match COLOR_ROWS.get(st.cursor) {
                 Some(ColorRow::Reset) => {
@@ -761,6 +775,7 @@ impl App {
             Some(DisplayRow::CritTokens) => cfg.thresholds.context_critical_tokens.to_string(),
             Some(DisplayRow::PreviewRefresh) => cfg.polling.preview_auto_refresh_secs.to_string(),
             Some(DisplayRow::PreviewStale) => cfg.thresholds.preview_stale_secs.to_string(),
+            Some(DisplayRow::AgentLogos) => cfg.ui.table.agent_logos.to_string(),
             None => String::new(),
         }
     }
@@ -811,7 +826,7 @@ impl App {
                     Some(DisplayRow::PreviewStale) => {
                         self.extra_prefs.preview_stale_secs = Some(n.min(600));
                     }
-                    None => {}
+                    Some(DisplayRow::AgentLogos) | None => {}
                 }
             }
             PrefsCategory::Colors => {
@@ -870,7 +885,7 @@ impl App {
             ),
             Some(DisplayRow::PreviewRefresh) => (cfg.polling.preview_auto_refresh_secs, 1, 0, 120),
             Some(DisplayRow::PreviewStale) => (cfg.thresholds.preview_stale_secs, 5, 0, 600),
-            None => return,
+            Some(DisplayRow::AgentLogos) | None => return,
         };
         let next = (cur as i64 + dir * step as i64).clamp(min as i64, max as i64) as u64;
         self.commit_prefs_field(PrefsCategory::Display, cursor, next.to_string());
@@ -910,6 +925,7 @@ impl App {
                     self.extra_prefs.preview_auto_refresh_secs = None
                 }
                 Some(DisplayRow::PreviewStale) => self.extra_prefs.preview_stale_secs = None,
+                Some(DisplayRow::AgentLogos) => self.extra_prefs.agent_logos = None,
                 None => {}
             },
             PrefsCategory::Colors => match COLOR_ROWS.get(st.cursor) {
@@ -1120,10 +1136,23 @@ impl App {
                         "Preview stale after (s)     {}{cap_warn}",
                         cfg.thresholds.preview_stale_secs
                     ),
+                    format!(
+                        "Agent logos                 {}{}",
+                        if cfg.ui.table.agent_logos {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        if self.logo.caps.is_none() {
+                            "  (unavailable in this terminal)"
+                        } else {
+                            ""
+                        },
+                    ),
                 ];
                 (
                     rows,
-                    "-/+ step. Enter types a value. Absolute tokens only.".into(),
+                    "Enter edits or toggles. -/+ step numbers. r inherits config.".into(),
                 )
             }
             PrefsCategory::Colors => {
@@ -1167,6 +1196,24 @@ impl App {
 mod tests {
     use super::*;
     use crate::agent::AgentControl;
+
+    #[test]
+    fn agent_logos_override_round_trips_and_none_inherits_toml() {
+        let mut cfg: config::Config = toml::from_str("[ui.table]\nagent_logos = false").unwrap();
+        let mut prefs = PrefsOverrides::default();
+        assert!(prefs.is_empty());
+        apply_prefs_to_config(&mut cfg, &prefs);
+        assert!(!cfg.ui.table.agent_logos);
+        prefs.agent_logos = Some(true);
+        assert!(!prefs.is_empty());
+        let restored: PrefsOverrides =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        apply_prefs_to_config(&mut cfg, &restored);
+        assert!(cfg.ui.table.agent_logos);
+        prefs.agent_logos = Some(false);
+        apply_prefs_to_config(&mut cfg, &prefs);
+        assert!(!cfg.ui.table.agent_logos);
+    }
 
     #[test]
     fn prefer_agent_first_promotes_and_enables() {

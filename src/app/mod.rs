@@ -27,6 +27,7 @@
 //! `window_bindings` directly, since those re-anchor the cursor as well as
 //! marking dirty.
 
+mod agent_logos;
 mod announcements;
 mod bindings;
 mod dashboard_state;
@@ -1147,6 +1148,7 @@ pub(super) struct App {
     pub(super) last_detail_rect: Option<Rect>,
     /// The header paw and its cats — see [`logo::LogoState`].
     pub(super) logo: logo::LogoState,
+    pub(super) agent_logos: agent_logos::AgentLogos,
     pub(super) detail_width: u16,
     pub(super) preview_height: u16,
     /// Whether the last frame used the narrow vertical-stack layout (body width
@@ -1797,6 +1799,7 @@ impl App {
             last_preview_rect: None,
             last_detail_rect: None,
             logo: logo::LogoState::new(),
+            agent_logos: agent_logos::AgentLogos::default(),
             detail_width: crate::config::get().ui.panels.detail_default_width,
             preview_height: 0,
             narrow_layout: false,

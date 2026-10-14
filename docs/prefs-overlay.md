@@ -314,6 +314,7 @@ Stored as `prefs.agents: [{ "id": "claude", "enabled": true }, …]`.
 | `thresholds.context_critical_tokens` | Context critical | u64 / `400000` | Live | yes |
 | `polling.preview_auto_refresh_secs` | Preview auto-refresh | u64 / `10` (`0` off) | Live | yes. Warning if `!capabilities.capture` ("this terminal cannot capture preview"). |
 | `thresholds.preview_stale_secs` | Preview stale after | u64 / `20` (`0` = always fresh) | Live | yes. Same capture warning. |
+| `ui.table.agent_logos` | Agent logos | bool / `true` | Live | yes. Enter toggles; unavailable terminals show a note. Only the wide table reserves the one-cell logo column, and only with Kitty graphics support. |
 
 No `context_*_pct` keys. `context_pressure_style` uses only these
 token cuts, whether or not `context_window` is known.
