@@ -43,16 +43,52 @@ fn startup_and_cancelled_turns_settle_without_a_stop_hook() {
     assert!(state.last_tool.is_none());
     assert_eq!(state.last_prompt.as_deref(), Some("keep this prompt"));
     assert_eq!(state.last_error.as_deref(), Some("keep this failure"));
-    assert_eq!(state.context_tokens, Some(17276));
+    assert_eq!(state.context_tokens, Some(17288));
     assert_eq!(state.session_id.as_deref(), Some("conversation-a"));
     assert_eq!(state.model.as_deref(), Some("Gemini 3.1 Pro (Low)"));
     assert!(snapshot("idle", 42).transcript_path.is_none());
     dispatch_hook(&mut state, snapshot("idle", 42));
     assert_eq!(
         state.context_tokens,
-        Some(42),
+        Some(54),
         "context may shrink after compaction"
     );
+}
+
+#[test]
+fn context_usage_includes_outputs_to_match_agys_reported_percentage() {
+    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    let payload = r#"{"agent_state":"idle","context_window":{"total_input_tokens":88244,"total_output_tokens":61074,"context_window_size":1048576,"used_percentage":14.24}}"#;
+    dispatch_hook(&mut state, parse_status_payload(payload).unwrap());
+    assert_eq!(state.context_tokens, Some(149_318));
+    let percentage =
+        state.context_tokens.unwrap() as f64 * 100.0 / state.context_window.unwrap() as f64;
+    assert!((percentage - 14.24).abs() < 0.01);
+    dispatch_hook(&mut state, snapshot("idle", 42));
+    assert_eq!(
+        state.context_tokens,
+        Some(54),
+        "usage can shrink after compaction"
+    );
+}
+
+#[test]
+fn context_capacity_tracks_the_model_and_ignores_uninitialized_snapshots() {
+    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    for (reported, expected) in [(1_048_576, 1_048_576), (200_000, 200_000), (0, 200_000)] {
+        dispatch_hook(
+            &mut state,
+            parse_status_payload(
+                &serde_json::json!({
+                    "agent_state": "idle",
+                    "context_window": {"total_input_tokens": 42, "context_window_size": reported}
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(state.context_window, Some(expected));
+    }
 }
 
 #[test]
@@ -214,6 +250,36 @@ fn cli_mirror_keeps_state_shared_and_settings_private_across_relaunches() {
 }
 
 #[test]
+fn removing_global_settings_resets_the_managed_copy_once() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let dir = root.path().join("managed");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(
+        real.join("settings.json"),
+        r#"{"modelProvider":"gemini","model":"old-model"}"#,
+    )
+    .unwrap();
+    ensure_cli_home(&real, &dir, &injected()).unwrap();
+    std::fs::remove_file(real.join("settings.json")).unwrap();
+    ensure_cli_home(&real, &dir, &injected()).unwrap();
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+    assert!(settings.get("modelProvider").is_none());
+    assert!(settings.get("model").is_none());
+    settings["model"] = "managed-model".into();
+    std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+    ensure_cli_home(&real, &dir, &injected()).unwrap();
+    let again: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        again, settings,
+        "unchanged absent source preserves managed settings"
+    );
+    assert!(!real.join("settings.json").exists());
+}
+
+#[test]
 fn legacy_first_login_directories_are_adopted_before_seeding() {
     let root = tempfile::tempdir().unwrap();
     let real = root.path().join("real");
@@ -233,4 +299,38 @@ fn legacy_first_login_directories_are_adopted_before_seeding() {
             .is_symlink()
     );
     assert!(!real.join("settings.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_cross_filesystem_adoption_keeps_legacy_conversations_visible() {
+    use std::os::unix::fs::MetadataExt;
+
+    let source = tempfile::tempdir().unwrap();
+    let Ok(destination) = tempfile::tempdir_in("/dev/shm") else {
+        eprintln!("skipping cross-filesystem migration: /dev/shm is not writable");
+        return;
+    };
+    if source.path().metadata().unwrap().dev() == destination.path().metadata().unwrap().dev() {
+        eprintln!("skipping cross-filesystem migration: temp and /dev/shm share a filesystem");
+        return;
+    }
+    let real = destination.path().join("real");
+    let dir = source.path().join("managed");
+    std::fs::create_dir_all(dir.join("conversations")).unwrap();
+    std::fs::write(
+        dir.join("conversations/session.db"),
+        "existing conversation",
+    )
+    .unwrap();
+    let result = ensure_cli_home(&real, &dir, &injected());
+    assert!(
+        result.is_err(),
+        "a failed migration must not silently start an empty store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("conversations/session.db")).unwrap(),
+        "existing conversation"
+    );
+    assert!(!real.join("conversations").exists());
 }

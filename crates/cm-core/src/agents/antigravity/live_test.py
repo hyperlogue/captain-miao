@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -22,26 +23,52 @@ event_file = root / 'events.jsonl'
 event_file.touch()
 delayed_request = threading.Event()
 release_response = threading.Event()
+tool_started = threading.Event()
+release_tool = threading.Event()
 
 
 class Model(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_GET(self):
+        assert self.path == '/held-tool', self.path
+        tool_started.set()
+        release_tool.wait(45)
+        try:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'42\n')
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         title = 'title generator' in json.dumps(body.get('systemInstruction', {}))
-        parts = [p for c in body.get('contents', []) for p in c.get('parts', [])]
-        latest_prompt = next((p.get('text', '') for c in reversed(body.get('contents', []))
-                              if c.get('role') == 'user' for p in reversed(c.get('parts', []))
-                              if 'text' in p), '')
+        contents = body.get('contents', [])
+        prompt_index = next((i for i in range(len(contents) - 1, -1, -1)
+                             if contents[i].get('role') == 'user'
+                             and any('text' in p for p in contents[i].get('parts', []))), 0)
+        current_turn = contents[prompt_index:]
+        parts = [p for c in current_turn for p in c.get('parts', [])]
+        latest_prompt = next((p['text'] for c in current_turn[:1]
+                              for p in reversed(c.get('parts', [])) if 'text' in p), '')
         if 'cancel_fixture' in latest_prompt and not title:
             delayed_request.set()
             release_response.wait(45)
+        tool_result = any('functionResponse' in p for p in parts)
+        if 'accept_fixture' in latest_prompt and not title and tool_result:
+            # Agy may background the held command. Keep the follow-up model
+            # call active until the test has observed approval being released.
+            release_tool.wait(45)
         response_parts = [{'text': 'Local fixture response.'}]
-        if 'approval_fixture' in latest_prompt and not title and not any('functionResponse' in p for p in parts):
+        if any(marker in latest_prompt for marker in ['approval_fixture', 'accept_fixture']) and not title and not tool_result:
+            command = 'python3 -c "print(42)"'
+            if 'accept_fixture' in latest_prompt:
+                command = shlex.join([sys.executable, '-c',
+                    f"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:{server.server_port}/held-tool', timeout=50).read().decode())"])
             response_parts = [{'functionCall': {'name': 'run_command', 'args': {
-                'CommandLine': 'python3 -c "print(42)"', 'Cwd': str(work),
+                'CommandLine': command, 'Cwd': str(work),
                 'WaitMsBeforeAsync': 1000, 'toolAction': 'Running command',
                 'toolSummary': 'Local fixture print',
             }}}]
@@ -138,6 +165,11 @@ def status(activity):
     return bool(snapshots) and snapshots[-1]['body'].get('agent_state') == activity
 
 
+def approval_pending():
+    snapshots = [e for e in current() if e['event'] == 'status-update']
+    return bool(snapshots) and bool(snapshots[-1]['body'].get('tool_confirmation_pending'))
+
+
 def checkpoint(phase):
     global offset
     all_events = events()
@@ -166,14 +198,29 @@ try:
     release_response.set()
     terminal.prompt('approval_fixture')
     terminal.wait('native permission prompt', lambda: b'Run this command?' in terminal.output
-                  and any(e['event'] == 'status-update' and e['body'].get('tool_confirmation_pending')
-                          for e in current()))
+                  and approval_pending())
     checkpoint('approval')
     terminal.send(b'\x1b')
     terminal.wait('idle after cancelling permission', lambda: status('idle'))
     checkpoint('cancel-approval')
+    terminal.prompt('accept_fixture')
+    terminal.wait('native permission before accepting', lambda: approval_pending())
+    checkpoint('accept-approval')
+    terminal.send(b'\r')
+    terminal.wait('active execution after accepting permission', lambda: tool_started.is_set()
+                  and not approval_pending() and (status('working') or status('tool_use')))
+    checkpoint('accepted')
+    release_tool.set()
+    terminal.wait('idle after accepted tool finishes', lambda: status('idle'))
+    checkpoint('accepted-complete')
+    terminal.prompt('/clear')
+    terminal.wait('new conversation after clear', lambda: status('idle') and any(
+        e['event'] == 'status-update' and e['body'].get('conversation_id')
+        and e['body']['conversation_id'] != conversation for e in current()))
+    checkpoint('clear')
 finally:
     release_response.set()
+    release_tool.set()
     terminal.close()
 
 offset = len(events())

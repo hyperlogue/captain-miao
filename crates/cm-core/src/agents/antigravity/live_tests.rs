@@ -83,11 +83,30 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 parse_hook_payload(kind, &event["body"].to_string()).unwrap(),
             );
         }
+        // Check against agy's independently reported percentage, not just a
+        // second implementation of our input/output sum.
+        if let Some(window) = events
+            .iter()
+            .rev()
+            .find(|e| e["event"] == "status-update")
+            .and_then(|e| e["body"].get("context_window"))
+            && window["context_window_size"]
+                .as_u64()
+                .is_some_and(|size| size > 0)
+        {
+            let percentage =
+                state.context_tokens.unwrap() as f64 * 100.0 / state.context_window.unwrap() as f64;
+            assert!(
+                (percentage - window["used_percentage"].as_f64().unwrap()).abs() < 0.01,
+                "context percentage disagrees with agy during {phase}"
+            );
+        }
         match phase {
             "startup" => assert_eq!(state.status, SessionStatus::Idle),
             "complete" => {
                 assert_eq!(state.status, SessionStatus::Idle);
                 assert!(state.context_tokens.is_some_and(|n| n > 0));
+                assert!(state.context_window.is_some_and(|n| n > 0));
                 assert!(state.model.is_some());
                 conversation = state.session_id.clone();
                 assert!(conversation.is_some());
@@ -101,11 +120,19 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 assert!(events.iter().any(|e| e["body"]["agent_state"] == "working"));
                 assert_eq!(state.status, SessionStatus::Idle, "{checkpoint}");
             }
-            "approval" => {
+            "approval" | "accept-approval" => {
                 assert_eq!(state.status, SessionStatus::WaitingForApproval);
                 assert!(AgentControl::Antigravity.capabilities().approval_gate);
             }
             "cancel-approval" => assert_eq!(state.status, SessionStatus::Idle),
+            "accepted" => assert_eq!(state.status, SessionStatus::Active),
+            "accepted-complete" => assert_eq!(state.status, SessionStatus::Idle),
+            "clear" => {
+                assert_eq!(state.status, SessionStatus::Idle);
+                assert!(state.session_id.is_some());
+                assert_ne!(state.session_id, conversation);
+                assert_eq!(state.context_tokens, Some(0));
+            }
             "resume" => {
                 assert_eq!(state.status, SessionStatus::Idle);
                 assert_eq!(state.session_id, conversation);

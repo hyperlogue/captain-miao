@@ -13,8 +13,9 @@
 //! when the model changes, and when context usage changes. Its `agent_state`
 //! distinguishes idle from working/thinking/tool_use. Unknown states leave
 //! status unchanged; snapshots do not reset prompt facts or failure messages.
-//! `context_window.total_input_tokens` is the context estimate used for its
-//! percentage display. `current_usage` instead describes the last API call.
+//! The sum of `context_window.total_input_tokens` and `total_output_tokens`,
+//! divided by `context_window_size`, matches its reported usage percentage.
+//! `current_usage` instead describes the last API call.
 //! The snapshot's transcript_path incorrectly names the GUI's state directory
 //! in 1.3.5, so it is deliberately ignored.
 //!
@@ -34,11 +35,12 @@
 //! Real global and workspace hook/config files are never changed.
 //!
 //! The writable settings copy retains changes made inside managed sessions
-//! until the real settings file changes. Such changes remain local to managed
-//! sessions. The original status-line configuration is reread from the real
+//! until the real settings file changes or is deleted. Edits made inside those
+//! sessions remain local. The original status-line configuration is reread from the real
 //! file on each launch, preventing nested observers. Conversations and state
 //! directories are linked to the real tree, including on a first launch;
 //! legacy synthetic-home state is adopted before seeding those directories.
+//! A failed migration aborts launch with the original state still in place.
 //! Agent-created root files are adopted on subsequent launches, excluding
 //! the settings copy and its source snapshot.
 //!
@@ -49,7 +51,7 @@
 //! `Ctrl+V` was verified with 1.1.11: agy shells out to xclip for TARGETS and
 //! image/png without requiring DISPLAY, matching the pooled clipboard bridge.
 //! The opt-in live test uses a disposable home, a loopback Gemini fixture and
-//! a PTY to check the current startup, completion, cancellation and resume
+//! a PTY to check startup, completion, cancellation, approval, clear and resume
 //! contracts without credentials or external inference.
 
 use anyhow::{Context, Result};
@@ -216,6 +218,8 @@ fn ensure_synth_home_at(real: &Path, dir: &Path, settings: &serde_json::Value) -
 /// real settings file refreshes the copy on the next launch.
 fn ensure_cli_home(real: &Path, dir: &Path, injected: &serde_json::Value) -> Result<()> {
     const SNAPSHOT: &str = ".captain-miao-settings-source";
+    // Cannot collide with a valid JSON settings file.
+    const ABSENT_SOURCE: &str = "\0absent";
     crate::state::create_dir_all_private(real)?;
     // Older launches linked the entire CLI directory. Remove only the link,
     // never its target, before creating the settings mirror.
@@ -249,6 +253,24 @@ fn ensure_cli_home(real: &Path, dir: &Path, injected: &serde_json::Value) -> Res
         prune: false,
     };
     home.ensure()?;
+    // Adoption is best-effort in the generic mirror. Here seeding a missing
+    // destination would make the next mirror pass quarantine the only copy
+    // of a conversation tree after a failed rename (e.g. across filesystems).
+    // Leave that tree in place and report the migration failure instead.
+    for name in &names {
+        let source = dir.join(name);
+        let destination = real.join(name);
+        if std::fs::symlink_metadata(&source).is_ok_and(|m| !m.file_type().is_symlink())
+            && std::fs::symlink_metadata(&destination)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            anyhow::bail!(
+                "could not migrate Antigravity state from {} to {}; existing state was preserved",
+                source.display(),
+                destination.display()
+            );
+        }
+    }
     // Seed directories before agy creates them so atomic renames, SQLite WALs
     // and first-login state within them all land directly in the real tree.
     for name in [
@@ -289,17 +311,28 @@ fn ensure_cli_home(real: &Path, dir: &Path, injected: &serde_json::Value) -> Res
             }
         }
     }
-    let parse = |path: &Path| -> Result<serde_json::Value> {
+    let read = |path: &Path| -> Result<Option<String>> {
         match std::fs::read_to_string(path) {
-            Ok(body) if !body.trim().is_empty() => serde_json::from_str(&body)
-                .with_context(|| format!("reading Antigravity settings {}", path.display())),
-            Ok(_) => Ok(serde_json::json!({})),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+            Ok(body) => Ok(Some(body)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     };
-    let mut settings = parse(&dir.join("settings.json"))?;
-    let original = parse(&real.join("settings.json"))?;
+    let parse = |body: Option<&str>| -> Result<serde_json::Value> {
+        match body.filter(|body| !body.trim().is_empty()) {
+            Some(body) => serde_json::from_str(body).context("reading Antigravity settings"),
+            None => Ok(serde_json::json!({})),
+        }
+    };
+    let source = read(&real.join("settings.json"))?;
+    let source_removed =
+        source.is_none() && read(&dir.join(SNAPSHOT))?.is_some_and(|last| last != ABSENT_SOURCE);
+    let mut settings = if source_removed {
+        serde_json::json!({})
+    } else {
+        parse(read(&dir.join("settings.json"))?.as_deref())?
+    };
+    let original = parse(source.as_deref())?;
     let object = settings
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Antigravity settings must be a JSON object"))?;
@@ -313,6 +346,9 @@ fn ensure_cli_home(real: &Path, dir: &Path, injected: &serde_json::Value) -> Res
     // Settings is a copied entry. Replace it atomically without writing
     // through to the user's real configuration.
     super::synth_home::write_if_changed(&dir.join("settings.json"), &settings.to_string())?;
+    if source.is_none() {
+        super::synth_home::write_if_changed(&dir.join(SNAPSHOT), ABSENT_SOURCE)?;
+    }
     Ok(())
 }
 
@@ -582,9 +618,9 @@ struct HookPayload {
     tool_call: Option<ToolCall>,
 }
 
-/// The separate status-line schema, captured from agy 1.3.5. Its input total
-/// is the context estimate used by `used_percentage`, not cumulative billing
-/// and not the last model call's `current_usage.input_tokens`.
+/// The separate status-line schema, captured from agy 1.3.5. Its input plus
+/// output totals match `used_percentage`; `current_usage` is only the last
+/// model call and does not describe the whole context window.
 #[derive(Deserialize)]
 struct StatusPayload {
     #[serde(default)]
@@ -604,6 +640,7 @@ struct StatusModel {
 #[derive(Deserialize)]
 struct StatusContext {
     total_input_tokens: Option<u64>,
+    total_output_tokens: Option<u64>,
     context_window_size: Option<u64>,
 }
 
@@ -617,7 +654,10 @@ fn parse_status_payload(stdin: &str) -> Result<HookMessage> {
         context_tokens: payload
             .context_window
             .filter(|ctx| ctx.context_window_size.is_some_and(|size| size > 0))
-            .and_then(|ctx| ctx.total_input_tokens),
+            .and_then(|ctx| {
+                ctx.total_input_tokens
+                    .map(|input| input.saturating_add(ctx.total_output_tokens.unwrap_or(0)))
+            }),
         tool_name: None,
         message: None,
         cwd: None,
@@ -667,9 +707,8 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 
 /// Antigravity reports a failed tool and a failed turn through the *same* events
 /// as their successes, with `error` set — there is no `PostToolUseFailure` or
-/// `StopFailure` to register. Splitting them here is what lets the shared
-/// dispatcher surface the text as `last_error`, and it is the same synthesis
-/// Codex's backend does for four of its events.
+/// `StopFailure` to register. The shared dispatcher retains turn failures as
+/// `last_error`; tool failures keep the turn active while the agent recovers.
 fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
     if payload.error.trim().is_empty() {
         return event;
@@ -688,24 +727,31 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 /// Apply the observed activity before adopting snapshot facts. Ordinary
 /// lifecycle hooks retain the shared dispatcher's semantics.
 pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
-    if msg.event == HookEvent::StatusUpdate {
-        let activity = msg
+    if msg.event == HookEvent::StatusUpdate
+        && let Some(payload) = msg
             .raw
             .as_deref()
             .and_then(|raw| serde_json::from_str::<StatusPayload>(raw).ok())
-            .map(|payload| (payload.agent_state, payload.tool_confirmation_pending));
+    {
+        if let Some(capacity) = payload
+            .context_window
+            .and_then(|window| window.context_window_size)
+            .filter(|capacity| *capacity > 0)
+        {
+            state.context_window = Some(capacity);
+        }
         // A snapshot is not a new prompt: preserve errors and prompt/tool
         // facts. Coarse busy states must not erase a more specific hook state.
-        match activity
-            .as_ref()
-            .map(|(activity, pending)| (activity.as_str(), *pending))
-        {
-            Some((_, true)) => state.status = SessionStatus::WaitingForApproval,
-            Some(("idle", false)) => {
+        match (
+            payload.agent_state.as_str(),
+            payload.tool_confirmation_pending,
+        ) {
+            (_, true) => state.status = SessionStatus::WaitingForApproval,
+            ("idle", false) => {
                 state.status = SessionStatus::Idle;
                 state.last_tool = None;
             }
-            Some(("working" | "thinking" | "tool_use", false))
+            ("working" | "thinking" | "tool_use", false)
                 if matches!(
                     state.status,
                     SessionStatus::Starting
