@@ -220,7 +220,7 @@ impl AgentLogos {
 }
 
 /// Remove transparent margins, then fit the artwork to two columns and one row.
-/// Limit artwork to 75% of the row height so adjacent logos stay separated.
+/// Limit artwork to 85% of the row height so adjacent logos stay separated.
 /// All source pixels retain their color; dim rows reduce alpha instead.
 fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
     let (mut left, mut top, mut right, mut bottom) = (SIZE, SIZE, 0, 0);
@@ -242,7 +242,7 @@ fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
         u32::from(cell.w).max(1) * u32::from(COLUMNS),
         u32::from(cell.h).max(1),
     );
-    let min_h = (art_h * 4).div_ceil(3).max(art_h + 2);
+    let min_h = (art_h * 100).div_ceil(85).max(art_h + 2);
     let (w, h) = if art_w * cell_h >= min_h * cell_w {
         (art_w, (art_w * cell_h).div_ceil(cell_w).min(1024))
     } else {
@@ -447,7 +447,7 @@ mod tests {
                 let top = *rows.first().unwrap();
                 let bottom = *rows.last().unwrap();
                 assert!(top > 0 && bottom < h - 1, "padding above and below");
-                assert!((bottom - top + 1) * 4 <= h * 3, "at most 75% tall");
+                assert!((bottom - top + 1) * 100 <= h * 85, "at most 85% tall");
             }
         }
         let solid = vec![255; (SIZE * SIZE * 4) as usize];
@@ -459,7 +459,7 @@ mod tests {
                 padded[offset..offset + 4].fill(255);
             }
         }
-        for (cell, expected) in [(CELL, (27, 27)), (CellSize { w: 20, h: 10 }, (108, 27))] {
+        for (cell, expected) in [(CELL, (24, 24)), (CellSize { w: 20, h: 10 }, (96, 24))] {
             let (w, h, pixels) = canvas(&padded, cell, false);
             assert_eq!((w, h), expected);
             let visible: Vec<_> = pixels
@@ -478,7 +478,7 @@ mod tests {
             canvas(&vec![0; solid.len()], CELL, false),
             (1, 1, vec![0; 4])
         );
-        for (cell, expected) in [(CELL, (43, 43)), (CellSize { w: 20, h: 10 }, (172, 43))] {
+        for (cell, expected) in [(CELL, (38, 38)), (CellSize { w: 20, h: 10 }, (152, 38))] {
             let (w, h, pixels) = canvas(&solid, cell, false);
             assert_eq!((w, h), expected);
             assert_eq!(
