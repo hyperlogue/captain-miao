@@ -139,8 +139,8 @@ impl AgentControl {
     /// absent, which is what keeps it out of the `Space a` picker and the
     /// `Ctrl-t` cycle.
     ///
-    /// **Append, never reorder**: this order *is* the `Ctrl-t` cycle order and
-    /// the `Space a` picker order, both of which users learn by muscle memory.
+    /// **Append, never reorder**: this seeds the default `Ctrl-t` cycle and
+    /// agent picker order. Preferences can reorder or disable entries.
     pub const ALL: &'static [AgentControl] = &[
         AgentControl::Claude,
         AgentControl::Codex,
@@ -185,16 +185,10 @@ impl AgentControl {
 
     /// Whether this agent's binary resolves on `$PATH`.
     ///
-    /// **Advisory, and it gates the cycle rather than the launch.** `Ctrl-t`
-    /// steps through [`Self::ALL`] modulo its length: at two backends that was a
-    /// toggle, but each new one adds a stop the user most likely has not
-    /// installed, and an affordance that degrades with every agent we add is the
-    /// kind of cost that should not ride along silently. Choosing an agent
-    /// *deliberately* — `Space a`'s picker, a config value, `--agent` — is never
-    /// filtered: the answer here can only be stale (a `PATH` we can't see, an
-    /// agent installed a second ago), so it must not be able to make a session
-    /// unlaunchable. A missing binary still errors honestly, and from the one
-    /// place that actually knows: `build_launch_command`.
+    /// Advisory for this process's environment only: it cannot determine
+    /// availability on another host or under a different launch environment.
+    /// Picker inclusion follows enabled preferences, not this probe; a missing
+    /// binary is reported by `build_launch_command` when launching.
     pub fn is_available(self) -> bool {
         self.bin().is_some_and(agents::binary_available)
     }
@@ -1912,11 +1906,11 @@ mod tests {
     }
 
     /// `Unknown` out of `ALL` is what keeps it out of the `Space a` picker and
-    /// the workdir picker's `Ctrl-t` cycle — both iterate exactly this.
+    /// the workdir picker's `Ctrl-t` cycle — both derive their lists from this.
     #[test]
     fn all_excludes_unknown() {
         assert!(!AgentControl::ALL.contains(&AgentControl::Unknown));
-        // Order is the `Ctrl-t` cycle and the picker order, so this pins it:
+        // Order seeds the `Ctrl-t` cycle and picker defaults, so this pins it:
         // a new backend appends, it never inserts.
         assert_eq!(
             AgentControl::ALL,

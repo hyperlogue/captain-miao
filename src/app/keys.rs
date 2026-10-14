@@ -37,25 +37,14 @@ const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 // Entry points: one per input device
 // =============================================================================
 
-/// The backend `Ctrl-t` lands on next, given the ones currently installed.
+/// The backend `Ctrl-t` lands on next, in the enabled preference order.
 ///
-/// Pure and separate from the key handler for its two edge cases, both of which
-/// only became reachable once the cycle stopped walking the full set:
-///
-/// - **`available` is empty** — nothing resolved on `$PATH`, which is as likely
-///   to mean a `PATH` we can't see as an empty machine. Fall back to every
-///   backend so the key still does something rather than silently going inert.
-/// - **`current` isn't in the list** — a disabled or remapped default can
-///   sit outside the cycle. Land on the first stop rather than skipping it.
-pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> AgentControl {
-    let all: &[AgentControl] = if available.is_empty() {
-        AgentControl::ALL
-    } else {
-        available
-    };
-    match all.iter().position(|a| *a == current) {
-        Some(cur) => all[(cur + 1) % all.len()],
-        None => all[0],
+/// A default outside the list lands on the first enabled agent. An empty list
+/// leaves it unchanged rather than offering a disabled agent.
+pub(super) fn cycle_agent(current: AgentControl, enabled: &[AgentControl]) -> AgentControl {
+    match enabled.iter().position(|a| *a == current) {
+        Some(cur) => enabled[(cur + 1) % enabled.len()],
+        None => enabled.first().copied().unwrap_or(current),
     }
 }
 
@@ -961,29 +950,15 @@ impl App {
                 agent, worktree, ..
             } = &mut active.kind
         {
-            // Cycle only the backends actually installed. At two this key was a
-            // toggle; every agent we add is another stop the user probably
-            // doesn't have, so without the filter the key gets worse each time
-            // we add one (see `AgentControl::is_available`).
+            // Preferences own both inclusion and order. Local PATH detection
+            // can miss enabled agents, especially when launching on a remote host.
             let enabled: Vec<AgentControl> = self
                 .agent_order
                 .iter()
                 .filter(|(_, on)| *on)
                 .map(|(a, _)| *a)
                 .collect();
-            let installed: Vec<AgentControl> = enabled
-                .iter()
-                .copied()
-                .filter(|a| a.is_available())
-                .collect();
-            let cycle = if installed.is_empty() {
-                &enabled
-            } else {
-                &installed
-            };
-            if !cycle.is_empty() {
-                *agent = cycle_agent(*agent, cycle);
-            }
+            *agent = cycle_agent(*agent, &enabled);
             // Switching onto an agent without worktrees disarms the request
             // rather than holding it: it would be dropped at launch, and the
             // footer hides it, so it would sit invisibly armed and then reappear

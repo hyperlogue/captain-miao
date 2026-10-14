@@ -2170,6 +2170,79 @@ fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
 }
 
 #[test]
+fn workdir_picker_ctrl_t_cycles_every_enabled_agent_in_order() {
+    use crate::agent::AgentControl;
+
+    // A private PATH makes availability deterministic without changing the
+    // environment of other tests. Only Claude is installed, but every enabled
+    // agent must remain selectable, including those used on another host.
+    const CHILD: &str = "CM_TEST_PICKER_AGENT_CYCLE";
+    if std::env::var_os(CHILD).is_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::workdir_picker_ctrl_t_cycles_every_enabled_agent_in_order",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", bin)
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "picker cycle failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
+    for agent in AgentControl::ALL {
+        assert_eq!(agent.is_available(), *agent == AgentControl::Claude);
+    }
+    let all: Vec<_> = AgentControl::ALL.iter().map(|a| (*a, true)).collect();
+    let reordered: Vec<_> = AgentControl::ALL
+        .iter()
+        .rev()
+        .map(|a| (*a, *a != AgentControl::Codex))
+        .collect();
+    for order in [all, reordered] {
+        let enabled: Vec<_> = order
+            .iter()
+            .filter_map(|(agent, on)| on.then_some(*agent))
+            .collect();
+        let mut d = TestDashboard::new(120, 20);
+        d.app.agent_order = order;
+        d.app.new_session_agent = enabled[0];
+        d.press(KeyCode::Char('O'));
+
+        for expected in enabled.iter().skip(1).chain(enabled.first()) {
+            assert!(d.press_ctrl(KeyCode::Char('t')).is_none());
+            let super::PickerKind::Workdir { agent, .. } = &d.app.picker.as_ref().unwrap().kind
+            else {
+                panic!("expected the workdir picker");
+            };
+            assert_eq!(agent, expected, "Ctrl-T skipped an enabled agent");
+            assert!(d.render().contains(&format!("Agent {}", expected.label())));
+            assert_eq!(d.app.new_session_agent, enabled[0]);
+        }
+    }
+}
+
+#[test]
 fn worktree_paths_resolve_to_their_repo_root() {
     use crate::app::{dir_mark_key, display_basename, split_worktree};
 
@@ -11794,41 +11867,36 @@ fn resize_invalidation_forces_a_logo_re_upload() {
 // The backend cycle (Ctrl-t)
 // =============================================================================
 
-/// The ordinary case, and the one the key was designed for when there were two
-/// backends: step through the installed set and wrap.
+/// Step through the enabled preference order and wrap, skipping disabled agents.
 #[test]
-fn the_backend_cycle_walks_only_what_is_installed() {
+fn the_backend_cycle_walks_only_what_is_enabled() {
     use super::keys::cycle_agent;
     use crate::agent::AgentControl::{Claude, Codex, Reasonix};
 
-    let installed = [Claude, Reasonix];
-    assert_eq!(cycle_agent(Claude, &installed), Reasonix);
+    let enabled = [Claude, Reasonix];
+    assert_eq!(cycle_agent(Claude, &enabled), Reasonix);
     // Wraps rather than stopping at the end.
-    assert_eq!(cycle_agent(Reasonix, &installed), Claude);
-    // A single installed backend is a no-op, not a panic on `% 1`.
+    assert_eq!(cycle_agent(Reasonix, &enabled), Claude);
+    // A single enabled backend is a no-op, not a panic on `% 1`.
     assert_eq!(cycle_agent(Claude, &[Claude]), Claude);
-    // Codex isn't installed here, so the cycle never offers it.
-    assert!(!installed.contains(&Codex));
+    // Codex is disabled here, so the cycle never offers it.
+    assert!(!enabled.contains(&Codex));
 }
 
-/// Both cases that only became reachable once the cycle stopped walking
-/// `ALL` — an uninstalled current agent, and nothing installed at all.
+/// A default outside the enabled list and an empty list both stay well-defined.
 #[test]
-fn the_backend_cycle_survives_an_agent_it_cannot_see() {
+fn the_backend_cycle_handles_a_default_outside_the_enabled_list() {
     use super::keys::cycle_agent;
-    use crate::agent::AgentControl::{self, Claude, Codex, Reasonix};
+    use crate::agent::AgentControl::{Claude, Codex, Reasonix};
 
-    // Selected deliberately (Preferences, `--agent`, config) but not on `$PATH`.
     // The first press must reach the first stop, not skip past it.
     assert_eq!(cycle_agent(Codex, &[Claude, Reasonix]), Claude);
 
-    // Nothing resolved: far more likely a `PATH` we can't read than a machine
-    // with no agents, so the key falls back to the full set instead of going
-    // inert.
+    // Never offer a disabled agent as a fallback.
     assert_eq!(
         cycle_agent(Claude, &[]),
-        AgentControl::ALL[1],
-        "an empty available set must still advance through ALL"
+        Claude,
+        "an empty enabled set must leave the current agent unchanged"
     );
 }
 
