@@ -284,6 +284,8 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
         // fallback mid-turn, so *any* status written here would be wrong half
         // the time — and would overwrite a live one with a guess.
         HookEvent::ModelSwitch => {}
+        // The backend has already applied its snapshot's activity vocabulary.
+        HookEvent::StatusUpdate => {}
     }
 }
 

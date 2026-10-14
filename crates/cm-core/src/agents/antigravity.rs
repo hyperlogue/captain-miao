@@ -1,163 +1,55 @@
-//! Antigravity CLI backend — Google's `agy`, the terminal agent it shipped as
-//! Gemini CLI's successor. Owns every Antigravity-specific path, env var and
-//! hook payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Antigravity`'s match arms.
+//! Antigravity CLI integration, verified with `agy` 1.3.5. Only the current
+//! CLI contract is supported; no compatibility layer for older versions.
 //!
-//! **Probe-verified against `agy` 1.1.11**, not read off a repo: every payload
-//! quoted below was captured from a real session, and the two places the
-//! shipped documentation is *wrong* are called out where they bite. The doc
-//! itself travels with the binary — `~/.gemini/antigravity-cli/builtin/skills/
-//! agy-customizations/docs/hooks.md` — so a later version's contract is
-//! readable from an installed copy rather than from the web.
+//! # Hooks and status snapshots
 //!
-//! # Five events, and the useful ones are three
+//! `SessionStart`, `PreInvocation`, `PostToolUse` and `Stop` provide identity,
+//! normal turn transitions and failures (`error` on a tool or Stop payload).
+//! SessionStart still waits until a conversation is created: a fresh TUI can
+//! sit at its empty prompt without a conversation id.
 //!
-//! Antigravity's whole hook vocabulary is `PreToolUse`, `PostToolUse`,
-//! `PreInvocation`, `PostInvocation`, `Stop`. We register three:
+//! The CLI's `statusLine` command supplies the missing observations. It runs
+//! at initial idle, after Escape cancellation (which still emits no Stop),
+//! when the model changes, and when context usage changes. Its `agent_state`
+//! distinguishes idle from working/thinking/tool_use. Unknown states leave
+//! status unchanged; snapshots do not reset prompt facts or failure messages.
+//! `context_window.total_input_tokens` is the context estimate used for its
+//! percentage display. `current_usage` instead describes the last API call.
+//! The snapshot's transcript_path incorrectly names the GUI's state directory
+//! in 1.3.5, so it is deliberately ignored.
 //!
-//! - **`PreInvocation` → [`HookEvent::PromptSubmit`].** It fires before each
-//!   model call, so it is the row's "working" edge. It is *not* once per user
-//!   prompt — a turn that calls tools fires it again after each — but every arm
-//!   it reaches assigns `Active` unconditionally, so repeating is free.
-//! - **`PostToolUse` → [`HookEvent::PostToolUse`]**, with `"*"` as the matcher.
-//! - **`Stop` → [`HookEvent::Stop`]**, the turn-end signal.
+//! **Approval remains unsupported.** A real permission prompt reports
+//! `tool_use` followed by `working`, and no permission notification hook fires.
+//! PreToolUse is a permission gate, so we leave it alone. Background tasks and
+//! compaction have no verified separate states either. Fork and worktree flags
+//! are absent from 1.3.5's argv interface, although `/fork` exists in the TUI.
 //!
-//! `PostInvocation` is deliberately unregistered: it fires between the other
-//! three and would say only what they already said, at the price of a
-//! subprocess per model call on a hook path that **blocks the agent loop**
-//! (`hooks.md`, "Current Limitations").
+//! # Configuration and state
 //!
-//! Two of our events are synthesized rather than subscribed, from a payload
-//! field instead of a second registration: a non-empty `error` turns
-//! `PostToolUse` into [`HookEvent::PostToolUseFailure`] and `Stop` into
-//! [`HookEvent::StopFailure`] ([`normalize_event`]). That is the same shape as
-//! Codex's four synthesized events, and it is why
-//! `AgentControl::forwarded_events` — which reads the generated config — lists
-//! three where the dispatcher handles five.
+//! Hooks are merged into a synthetic home's `.gemini/config/hooks.json`.
+//! A second mirror shadows `.gemini/antigravity-cli/settings.json` to wrap the
+//! user's status-line command: both receive the same JSON and the user's
+//! stdout remains visible. Without a custom command the built-in line stays.
+//! Real global and workspace hook/config files are never changed.
 //!
-//! # `PreToolUse` is left alone on purpose, and it costs the approval state
+//! The writable settings copy retains changes made inside managed sessions
+//! until the real settings file changes. Such changes remain local to managed
+//! sessions. The original status-line configuration is reread from the real
+//! file on each launch, preventing nested observers. Conversations and state
+//! directories are linked to the real tree, including on a first launch;
+//! legacy synthetic-home state is adopted before seeding those directories.
+//! Agent-created root files are adopted on subsequent launches, excluding
+//! the settings copy and its source snapshot.
 //!
-//! [`crate::state::SessionStatus::WaitingForApproval`] is **unreachable**, and
-//! not for want of an event: Antigravity blocks on its own permission prompt
-//! without firing any hook at all (probed — a session sitting on "Do you want
-//! to proceed?" had emitted `PreInvocation` and nothing since).
+//! All child tools still inherit the synthetic HOME. Existing home entries
+//! resolve through links; newly created top-level entries may remain there.
+//! No config-dir or app-data override tested with 1.3.5 avoids this requirement.
 //!
-//! `PreToolUse` fires before that prompt, so it looks like the way in. It is
-//! not, because it is a *gate*, not an observer: its `decision` field is
-//! **required** and every legal value changes what the agent does — `allow`
-//! silently disables the user's permission preset, `ask`/`force_ask` add
-//! prompts they didn't ask for, `deny` breaks the session. There is no
-//! "no opinion" value, and an output that omits the field fails closed: cmux
-//! injected a `PreToolUse` hook returning `{}` and every tool call in the
-//! session was denied with `error (invalid_args)` (manaflow-ai/cmux#5358).
-//! Antigravity's own bundled plugin registers `PostInvocation`, `PostToolUse`,
-//! `PreInvocation` and `Stop` — everything except `PreToolUse` — which is the
-//! same conclusion reached from the other side.
-//!
-//! So a blocked Antigravity row reads as working, `capabilities().approval_gate`
-//! is false, and the dashboard says so rather than implying the sweep was
-//! exhaustive. The cost is real and it is the agent's, not ours; the day
-//! Antigravity grows a notification hook, this is a one-line registration.
-//!
-//! # There is no session-start event, so a row waits at `Starting`
-//!
-//! Nothing fires when `agy` starts — the first hook of a session is the
-//! `PreInvocation` of its first turn. A launched Antigravity row therefore sits
-//! at `Starting` until the user submits something, which is also when its
-//! `conversationId` first reaches us and the row becomes resumable.
-//!
-//! `ANTIGRAVITY_CONVERSATION_ID` in the binary's strings looks like the escape
-//! hatch and isn't: setting it at launch is ignored (probed — `agy` minted its
-//! own id anyway), because the variable is *exported* to the tools the agent
-//! runs rather than read from the environment it was given.
-//!
-//! # Hooks can only be discovered from `$HOME`, so the whole home is synthetic
-//!
-//! There is no `--settings` equivalent and no config-dir environment variable;
-//! `hooks.json` is read from `.agents/` in the workspace (the user's repo — not
-//! ours to write) or `~/.gemini/config/` (their global config — the one thing
-//! this project never writes). `~` there is the process's `$HOME`, which is the
-//! lever, so a session runs under a synthetic home that mirrors the real one
-//! ([`super::synth_home`]), three levels deep: `$HOME` owns `.gemini`, which
-//! owns `config`, which owns `hooks.json`.
-//!
-//! That is one level wider than the agent-directory homes used by the other
-//! synthetic backends, and the extra width is the cost worth knowing: **every
-//! tool the agent runs inherits the synthetic `$HOME` too.** Everything in it
-//! resolves through a symlink to the real home, so reads and writes to existing
-//! paths land where they always did; a
-//! brand-new top-level dotfile created inside a session lands in the synthetic
-//! home instead, and the next launch quarantines it as `.shadow-…` with a
-//! warning rather than deleting it.
-//!
-//! The user's own `hooks.json` is **merged, not shadowed** ([`merge_hooks`]).
-//! `hooks.json` is a map of named hook bundles, so ours goes in under
-//! [`HOOK_NAME`] beside theirs and everything else in the file keeps working.
-//! Their workspace-level `.agents/hooks.json` is untouched by construction.
-//!
-//! # The stdout contract is why our commands don't end at the event name
-//!
-//! Antigravity reads a hook's stdout as JSON, and `miao hook` prints nothing.
-//! Every generated command therefore ends `>/dev/null; echo '{}'`: the
-//! forwarder's own output is discarded, the object the agent expects is
-//! emitted, and a launcher that has gone away can neither wedge a turn nor
-//! print into the session. Its stderr is left alone so a real failure is still
-//! visible. (This suffix is what made `AgentControl::mentions_event` stop
-//! requiring a quote right after the event name.)
-//!
-//! # Tokens, titles and the transcript
-//!
-//! `capabilities().context_tokens` is false: no hook payload carries a token
-//! count and nothing on disk records one — the per-conversation store is
-//! `conversations/<id>.db`, a SQLite file of protobuf blobs with no published
-//! schema. The model *is* on every payload (`modelName`, e.g.
-//! `gemini-3.6-flash-high`), so that column works.
-//!
-//! `transcriptPath` is on every payload too, and is deliberately **not**
-//! returned in [`HookMessage::transcript_path`]: that field is what the
-//! launcher gates its entire transcript pipeline on, and there is nothing in
-//! the file for it to fold yet. [`list_resumable`] reads the same transcripts
-//! directly, which keeps the one thing we do want out of a per-event path.
-//!
-//! # `Ctrl+V` reaches the dashboard's clipboard
-//!
-//! Confirmed against 1.1.11 rather than assumed, which for a shimmed backend is
-//! the whole difference between working and silently doing nothing: `agy` reads
-//! pasted media by *shelling out*, issuing
-//! `xclip -selection clipboard -t TARGETS -o` and then, off that answer,
-//! `xclip -selection clipboard -t image/png -o` — the two calls
-//! [`crate::clipboard::classify`] recognizes, argument for argument. It does
-//! **not** gate them on `DISPLAY`, which is what makes the bridge work in a
-//! pooled session at all: neither `DISPLAY` nor `WAYLAND_DISPLAY` is set there,
-//! and a tool that checked first would never reach the shim. Probed with a
-//! logging `xclip` ahead of the real one on `PATH`, with both unset — the
-//! prompt came back `1 media attached (clipboard, image/png)`.
-//!
-//! # An interrupted turn keeps reading as working
-//!
-//! Esc ends the turn without firing `Stop` — probed, and the row sat at
-//! `Active` indefinitely while the session was back at its prompt. The
-//! transcript is no help either: the cancelled step lands as an ordinary
-//! `PLANNER_RESPONSE` with `status: "DONE"` and a `thinking` field, carrying no
-//! sentinel for [`crate::agent::AgentControl::scan_transcript_signals`] to find
-//! the way Codex's rollout carries one.
-//!
-//! So the row stays `Active` until the next prompt — the Grok standing, and the
-//! limit most likely to be felt day to day. Nothing here guesses at it from
-//! timing or from an empty step: a status that is *usually* right costs more
-//! than one that is late, because the dashboard exists to be trusted at a
-//! glance.
-//!
-//! What a probe still has to settle:
-//! - **whether `Stop`'s `fullyIdle: false` is worth a background tier.** It is
-//!   documented as "all background tasks are done" and `run_command` really
-//!   does background long commands (`WaitMsBeforeAsync` is in every tool call),
-//!   but nothing enumerates those tasks, so there is no tier to put a row in
-//!   yet.
-//! - **whether `terminationReason` has a stable vocabulary.** The shipped doc
-//!   says `model_stop` / `max_steps_exceeded` / `error`; the binary emits
-//!   `NO_TOOL_CALL`. Nothing here branches on it for exactly that reason —
-//!   failure is decided by `error` being non-empty.
+//! `Ctrl+V` was verified with 1.1.11: agy shells out to xclip for TARGETS and
+//! image/png without requiring DISPLAY, matching the pooled clipboard bridge.
+//! The opt-in live test uses a disposable home, a loopback Gemini fixture and
+//! a PTY to check the current startup, completion, cancellation and resume
+//! contracts without credentials or external inference.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -167,9 +59,9 @@ use tokio::process::Command;
 
 use super::common;
 use super::shell_quote;
-use super::synth_home::SynthHome;
+use super::synth_home::{CopiedEntry, SynthHome};
 use crate::agent::ResumeCandidate;
-use crate::state::{HookEvent, HookMessage, LauncherState};
+use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`]. The product
 /// is "Antigravity"; `agy` is what it installs as.
@@ -201,12 +93,6 @@ fn gemini_dir() -> Option<PathBuf> {
 /// `agy` and the other way round.
 fn cli_dir() -> Option<PathBuf> {
     gemini_dir().map(|g| g.join("antigravity-cli"))
-}
-
-/// The global customization root: `hooks.json`, `mcp_config.json`, `config.json`,
-/// `projects/`. This is the directory the synthetic home shadows.
-fn config_dir() -> Option<PathBuf> {
-    gemini_dir().map(|g| g.join("config"))
 }
 
 /// A single shared synthetic `$HOME` for every Antigravity session, for the same
@@ -241,12 +127,12 @@ pub fn build_launch_command(
     extra_args: &[String],
     shim_dir: Option<&Path>,
 ) -> Result<Command> {
-    // The launcher already wrote our hooks.json contents to `settings_path`;
-    // relocate them into the synthetic home, which is the only place
-    // Antigravity looks for global hooks.
+    // The launcher wrote our hook and status-line configuration here;
+    // install each part at the path the CLI actually reads.
     let hooks_json =
         std::fs::read_to_string(settings_path).context("reading antigravity hook settings")?;
-    let home = ensure_synth_home(&hooks_json)?;
+    let settings: serde_json::Value = serde_json::from_str(&hooks_json)?;
+    let home = ensure_synth_home(&settings)?;
 
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
     cmd.env("HOME", &home);
@@ -261,19 +147,23 @@ pub fn build_launch_command(
     Ok(cmd)
 }
 
-/// Create / refresh the synthetic home and return it. Three nested mirrors,
-/// each one owning the single entry the next level down needs to be ours:
-/// `$HOME` owns `.gemini`, `.gemini` owns `config`, `config` owns `hooks.json`.
-/// Everything else at every level is a symlink to the real thing, so a session's
-/// conversations, credentials and MCP config are the user's own.
+/// Mirror the home and both Gemini configuration directories. Only hooks and
+/// the CLI settings copy are ours; the rest resolves to the real home.
 ///
 /// Nothing is **pruned** at any level. These are state mirrors: a dangling link
 /// is load-bearing, because the agent recreating that file writes *through* the
 /// link into the real home and the two stay converged.
-fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
+fn ensure_synth_home(settings: &serde_json::Value) -> Result<PathBuf> {
+    let real = dirs::home_dir().context("no home directory for Antigravity")?;
+    let dir = synth_home();
+    ensure_synth_home_at(&real, &dir, settings)?;
+    Ok(dir)
+}
+
+fn ensure_synth_home_at(real: &Path, dir: &Path, settings: &serde_json::Value) -> Result<()> {
     let home = SynthHome {
-        dir: synth_home(),
-        real: dirs::home_dir(),
+        dir: dir.to_path_buf(),
+        real: Some(real.to_path_buf()),
         owned: &[".gemini"],
         copied: &[],
         // Nothing at this level is Antigravity's alone — every file it writes
@@ -285,21 +175,17 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
 
     let gemini = SynthHome {
         dir: home.dir.join(".gemini"),
-        real: gemini_dir(),
-        owned: &["config"],
+        real: Some(real.join(".gemini")),
+        owned: &["config", "antigravity-cli"],
         copied: &[],
-        // The agent's entire state tree — conversations, transcripts and the
-        // OAuth token — and ours by nothing. On a machine where `agy` has never
-        // run, `~/.gemini/antigravity-cli` does not exist, so the linking pass
-        // cannot mirror it and a first session would strand all of that here.
-        adopted: &["antigravity-cli"],
+        adopted: &[],
         prune: false,
     };
     gemini.ensure()?;
 
     let config = SynthHome {
         dir: gemini.dir.join("config"),
-        real: config_dir(),
+        real: Some(real.join(".gemini/config")),
         owned: &[HOOKS_FILE],
         copied: &[],
         // `hooks.json` is ours and the rest of this directory is configuration
@@ -311,12 +197,152 @@ fn ensure_synth_home(hooks_json: &str) -> Result<PathBuf> {
     // Merge rather than replace: `hooks.json` is a map of named bundles, and
     // the user's own live in the same file. Re-read every launch so an edit to
     // the real file shows up in the next session.
-    let theirs = config_dir()
-        .map(|d| d.join(HOOKS_FILE))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    config.write_owned(HOOKS_FILE, &merge_hooks(&theirs, hooks_json))?;
-    Ok(home.dir)
+    let theirs =
+        std::fs::read_to_string(real.join(".gemini/config").join(HOOKS_FILE)).unwrap_or_default();
+    config.write_owned(
+        HOOKS_FILE,
+        &merge_hooks(&theirs, &settings["hooks"].to_string()),
+    )?;
+    ensure_cli_home(
+        &real.join(".gemini/antigravity-cli"),
+        &gemini.dir.join("antigravity-cli"),
+        settings,
+    )
+}
+
+/// Shadow only CLI settings, keeping conversations, credentials and caches in
+/// the real state tree. Settings stay writable in managed sessions; a changed
+/// real settings file refreshes the copy on the next launch.
+fn ensure_cli_home(real: &Path, dir: &Path, injected: &serde_json::Value) -> Result<()> {
+    const SNAPSHOT: &str = ".captain-miao-settings-source";
+    crate::state::create_dir_all_private(real)?;
+    // Older launches linked the entire CLI directory. Remove only the link,
+    // never its target, before creating the settings mirror.
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        match std::fs::remove_file(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Every other entry in this dedicated agent directory is agent-owned.
+    // Adopt first, before seeding directories, so first-login state left by
+    // the previous layout can move back without becoming a shadow.
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != "settings.json" && name != SNAPSHOT && !name.starts_with('.'))
+        .collect();
+    let adopted: Vec<&str> = names.iter().map(String::as_str).collect();
+    let home = SynthHome {
+        dir: dir.to_path_buf(),
+        real: Some(real.to_path_buf()),
+        owned: &[SNAPSHOT],
+        copied: &[CopiedEntry {
+            name: "settings.json",
+            snapshot: SNAPSHOT,
+        }],
+        adopted: &adopted,
+        prune: false,
+    };
+    home.ensure()?;
+    // Seed directories before agy creates them so atomic renames, SQLite WALs
+    // and first-login state within them all land directly in the real tree.
+    for name in [
+        "annotations",
+        "bin",
+        "brain",
+        "builtin",
+        "cache",
+        "conversations",
+        "crashes",
+        "implicit",
+        "log",
+        "presence",
+        "updater",
+    ] {
+        crate::state::create_dir_all_private(&real.join(name))?;
+    }
+    home.ensure()?;
+    // Root-level stores need links even on a fresh install. In particular,
+    // never split a SQLite database from its WAL and shared-memory companions.
+    for name in [
+        "conversation_summaries.db",
+        "conversation_summaries.db-wal",
+        "conversation_summaries.db-shm",
+        "history.jsonl",
+        "installation_id",
+        "jetski_state.pbtxt",
+        "jetbox_summaries_proto.pb",
+        "last_check.timestamp",
+        "cli.log",
+    ] {
+        let link = dir.join(name);
+        if std::fs::symlink_metadata(&link).is_err() {
+            match std::os::unix::fs::symlink(real.join(name), &link) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let parse = |path: &Path| -> Result<serde_json::Value> {
+        match std::fs::read_to_string(path) {
+            Ok(body) if !body.trim().is_empty() => serde_json::from_str(&body)
+                .with_context(|| format!("reading Antigravity settings {}", path.display())),
+            Ok(_) => Ok(serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let mut settings = parse(&dir.join("settings.json"))?;
+    let original = parse(&real.join("settings.json"))?;
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Antigravity settings must be a JSON object"))?;
+    let forwarder = injected["statusLine"]["command"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing Antigravity status observer"))?;
+    object.insert(
+        "statusLine".into(),
+        status_line_settings(&original["statusLine"], forwarder),
+    );
+    // Settings is a copied entry. Replace it atomically without writing
+    // through to the user's real configuration.
+    super::synth_home::write_if_changed(&dir.join("settings.json"), &settings.to_string())?;
+    Ok(())
+}
+
+/// Feed the same JSON to our observer and the user's command. Keep its stdout,
+/// padding and stacking behavior; absent/disabled custom output leaves the
+/// built-in status line visible. The real config is always the source, so
+/// repeated launches cannot nest our wrapper.
+fn status_line_settings(original: &serde_json::Value, forwarder: &str) -> serde_json::Value {
+    let command = original
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .filter(|_| original["enabled"] != false);
+    let mut settings = original.as_object().cloned().unwrap_or_default();
+    settings.insert("type".into(), "command".into());
+    settings.insert("enabled".into(), true.into());
+    if command.is_none() {
+        settings.insert("stack_with_default".into(), true.into());
+    }
+    let output = command
+        .map(|cmd| {
+            format!(
+                "printf '%s' \"$cm_agy_status_payload\" | /bin/sh -c {}",
+                shell_quote(cmd)
+            )
+        })
+        .unwrap_or_else(|| ":".into());
+    settings.insert("command".into(), format!(
+        "cm_agy_status_payload=$(cat); printf '%s' \"$cm_agy_status_payload\" | {forwarder} >/dev/null; {output}"
+    ).into());
+    serde_json::Value::Object(settings)
 }
 
 /// Put our hook bundle into the user's `hooks.json` under [`HOOK_NAME`],
@@ -345,7 +371,8 @@ fn merge_hooks(theirs: &str, ours: &str) -> String {
     serde_json::Value::Object(merged).to_string()
 }
 
-/// Build the Antigravity `hooks.json`. Its shape is `{<name>: {<Event>: […]}}`,
+/// Build launch settings containing hooks and the status observer. The hook
+/// bundle shape is `{<name>: {<Event>: […]}}`,
 /// where the tool events wrap their handlers in a `{matcher, hooks}` group and
 /// the rest list handlers directly — a split Antigravity's own doc calls
 /// "Grouped" vs "Flat".
@@ -359,6 +386,10 @@ fn merge_hooks(theirs: &str, ours: &str) -> String {
 /// session. It ends in the stdout contract the module doc explains.
 pub fn build_hooks_settings(_sock_path: &str) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("miao"));
+    build_settings_for(&exe)
+}
+
+fn build_settings_for(exe: &Path) -> String {
     let exe_q = shell_quote(&exe.to_string_lossy());
 
     let command = |event: HookEvent| -> String {
@@ -378,11 +409,16 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
     };
 
     serde_json::json!({
-        HOOK_NAME: {
+        "statusLine": {
+            "type": "command",
+            "command": format!("{exe_q} hook --agent antigravity status-update"),
+        },
+        "hooks": {HOOK_NAME: {
+            "SessionStart": flat(HookEvent::SessionStart),
             "PreInvocation": flat(HookEvent::PromptSubmit),
             "PostToolUse":   grouped(HookEvent::PostToolUse),
             "Stop":          flat(HookEvent::Stop),
-        }
+        }}
     })
     .to_string()
 }
@@ -461,8 +497,8 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
             session_id,
             cwd,
             first_prompt: first_prompt(&path),
-            // Antigravity has no rename: `/usage` and friends are slash
-            // commands, not titles, and nothing on disk holds a user-chosen one.
+            // The current title store is not integrated; use the opening
+            // request as the resume picker's label.
             custom_title: None,
             git_branch: None,
             mtime,
@@ -545,10 +581,60 @@ struct HookPayload {
     tool_call: Option<ToolCall>,
 }
 
+/// The separate status-line schema, captured from agy 1.3.5. Its input total
+/// is the context estimate used by `used_percentage`, not cumulative billing
+/// and not the last model call's `current_usage.input_tokens`.
+#[derive(Deserialize)]
+struct StatusPayload {
+    #[serde(default)]
+    agent_state: String,
+    conversation_id: Option<String>,
+    model: Option<StatusModel>,
+    context_window: Option<StatusContext>,
+}
+
+#[derive(Deserialize)]
+struct StatusModel {
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StatusContext {
+    total_input_tokens: Option<u64>,
+    context_window_size: Option<u64>,
+}
+
+fn parse_status_payload(stdin: &str) -> Result<HookMessage> {
+    let payload: StatusPayload =
+        serde_json::from_str(stdin).context("parsing Antigravity status-line JSON")?;
+    Ok(HookMessage {
+        event: HookEvent::StatusUpdate,
+        session_id: payload.conversation_id.filter(|s| !s.trim().is_empty()),
+        model: payload.model.and_then(|m| m.id),
+        context_tokens: payload
+            .context_window
+            .filter(|ctx| ctx.context_window_size.is_some_and(|size| size > 0))
+            .and_then(|ctx| ctx.total_input_tokens),
+        tool_name: None,
+        message: None,
+        cwd: None,
+        prompt: None,
+        session_title: None,
+        // The feed's transcript_path points at the GUI's state directory even
+        // in the CLI. Never arm a watcher from that incorrect path.
+        transcript_path: None,
+        raw: Some(stdin.to_string()),
+        session_is_child: None,
+    })
+}
+
 /// Normalize one Antigravity hook payload. Its event names differ from ours and
 /// two of our variants have no event of their own, so both are synthesized here
 /// from the payload rather than mapped later.
 pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> {
+    if event == HookEvent::StatusUpdate {
+        return parse_status_payload(stdin);
+    }
     let payload: HookPayload =
         serde_json::from_str(stdin).context("Failed to parse antigravity hook JSON from stdin")?;
     Ok(HookMessage {
@@ -564,8 +650,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // describes the model call, not what asked for it.
         prompt: None,
         session_title: None,
-        // Neither the payload nor anything on disk carries a token total — see
-        // the module doc.
+        // Usage arrives through the status-line command, not lifecycle hooks.
         context_tokens: None,
         model: payload.model_name,
         // Deliberately dropped rather than absent: `transcriptPath` is on every
@@ -597,17 +682,45 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 // Hook event → status mapping
 // =============================================================================
 
-/// Antigravity departs from [`common::dispatch_default`] nowhere: each of the
-/// three events it registers is one of ours under a different spelling, and the
-/// two failure variants are synthesized in [`parse_hook_payload`] before they
-/// get here. The wrapper stays so the seam keeps one callee per backend.
+/// Apply the observed activity before adopting snapshot facts. Ordinary
+/// lifecycle hooks retain the shared dispatcher's semantics.
 pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+    if msg.event == HookEvent::StatusUpdate {
+        let activity = msg
+            .raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<StatusPayload>(raw).ok())
+            .map(|payload| payload.agent_state);
+        // A snapshot is not a new prompt: preserve errors and prompt/tool
+        // facts. Coarse busy states must not erase a more specific hook state.
+        match activity.as_deref() {
+            Some("idle") => {
+                state.status = SessionStatus::Idle;
+                state.last_tool = None;
+            }
+            Some("working" | "thinking" | "tool_use")
+                if matches!(
+                    state.status,
+                    SessionStatus::Starting | SessionStatus::Idle | SessionStatus::Active
+                ) =>
+            {
+                state.status = SessionStatus::Active;
+            }
+            _ => {}
+        }
+    }
     common::dispatch_default(state, msg)
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+#[cfg(test)]
+mod status_tests;
+
+#[cfg(test)]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {
@@ -639,7 +752,7 @@ mod tests {
         format!("brain/{id}/.system_generated/logs/transcript.jsonl")
     }
 
-    /// The generated config registers exactly the three events the module doc
+    /// The generated config registers exactly the four events the module doc
     /// claims, in the two structural shapes Antigravity requires: `matcher` +
     /// `hooks` for the tool event, a flat handler list for the others. Getting
     /// the shape wrong is silent — the hook simply never fires.
@@ -647,8 +760,9 @@ mod tests {
     fn the_hook_config_uses_the_shape_each_event_requires() {
         let json: serde_json::Value =
             serde_json::from_str(&build_hooks_settings("/tmp/sock")).unwrap();
-        let ours = &json[HOOK_NAME];
+        let ours = &json["hooks"][HOOK_NAME];
 
+        assert!(ours["SessionStart"][0]["command"].is_string());
         assert!(ours["PreInvocation"][0]["command"].is_string());
         assert!(ours["Stop"][0]["command"].is_string());
         assert!(
@@ -666,7 +780,7 @@ mod tests {
         );
         assert!(
             ours["PostInvocation"].is_null(),
-            "PostInvocation says nothing the other three don't, on a path that \
+            "PostInvocation says nothing the other hooks don't, on a path that \
              blocks the agent loop"
         );
     }
@@ -677,7 +791,7 @@ mod tests {
     fn every_hook_command_emits_the_object_antigravity_expects() {
         let json: serde_json::Value =
             serde_json::from_str(&build_hooks_settings("/tmp/sock")).unwrap();
-        let commands: Vec<String> = json[HOOK_NAME]
+        let commands: Vec<String> = json["hooks"][HOOK_NAME]
             .as_object()
             .unwrap()
             .values()
@@ -692,7 +806,7 @@ mod tests {
             .map(|h| h["command"].as_str().unwrap().to_string())
             .collect();
 
-        assert_eq!(commands.len(), 3, "one command per registered event");
+        assert_eq!(commands.len(), 4, "one command per registered event");
         for command in commands {
             assert!(
                 command.ends_with(">/dev/null; echo '{}'"),
@@ -707,8 +821,13 @@ mod tests {
     #[test]
     fn our_bundle_joins_the_users_hooks_instead_of_replacing_them() {
         let theirs = r#"{"lint-checker":{"PostToolUse":[{"matcher":"run_command","hooks":[]}]}}"#;
-        let merged: serde_json::Value =
-            serde_json::from_str(&merge_hooks(theirs, &build_hooks_settings("/tmp/sock"))).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&merge_hooks(
+            theirs,
+            &serde_json::from_str::<serde_json::Value>(&build_hooks_settings("/tmp/sock")).unwrap()
+                ["hooks"]
+                .to_string(),
+        ))
+        .unwrap();
 
         assert_eq!(
             merged["lint-checker"]["PostToolUse"][0]["matcher"],
@@ -717,11 +836,16 @@ mod tests {
         assert!(merged[HOOK_NAME]["Stop"][0]["command"].is_string());
 
         // Re-merging our own output leaves one copy of each.
-        let again: serde_json::Value = serde_json::from_str(&merge_hooks(
-            &merged.to_string(),
-            &build_hooks_settings("/x"),
-        ))
-        .unwrap();
+        let again: serde_json::Value =
+            serde_json::from_str(
+                &merge_hooks(
+                    &merged.to_string(),
+                    &serde_json::from_str::<serde_json::Value>(&build_hooks_settings("/x"))
+                        .unwrap()["hooks"]
+                        .to_string(),
+                ),
+            )
+            .unwrap();
         assert_eq!(again.as_object().unwrap().len(), 2);
     }
 
@@ -731,7 +855,9 @@ mod tests {
     fn an_unparseable_hooks_file_still_leaves_us_registered() {
         let merged: serde_json::Value = serde_json::from_str(&merge_hooks(
             "{not json",
-            &build_hooks_settings("/tmp/sock"),
+            &serde_json::from_str::<serde_json::Value>(&build_hooks_settings("/tmp/sock")).unwrap()
+                ["hooks"]
+                .to_string(),
         ))
         .unwrap();
         assert!(merged[HOOK_NAME]["PreInvocation"][0]["command"].is_string());

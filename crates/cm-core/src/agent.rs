@@ -586,13 +586,9 @@ impl AgentControl {
             // so `approval_gate` is `true`. Fork via `--fork`, no worktree flag,
             // and tokens/model come off the hook — the opencode row.
             AgentControl::Omp => caps(true, false, true, true),
-            // Every field false, and every one of them the *agent's* limit
-            // rather than an unfinished wiring: no argv forks a conversation, no
-            // flag opens a worktree, no hook fires while Antigravity blocks on
-            // its own approval prompt, and neither a payload nor anything on
-            // disk carries a token total. `agents::antigravity` has the evidence
-            // for each.
-            AgentControl::Antigravity => caps(false, false, false, false),
+            // The status-line observer supplies context usage. The CLI still
+            // has no fork/worktree flags or distinct approval observation.
+            AgentControl::Antigravity => caps(false, false, false, true),
             // Nothing may be claimed for a backend this build can't drive: it
             // launches nothing, writes no hook config and fills no column.
             AgentControl::Unknown => caps(false, false, false, false),
@@ -723,8 +719,8 @@ impl AgentControl {
             // write the host already watches. Codex needs one only because its
             // rename lands in sqlite with no hook at all.
             AgentControl::Pi => vec![],
-            // Nothing: Antigravity has no session rename at all, so no fact of
-            // a row's can change without a hook firing.
+            // Session titles are not read from Antigravity's store yet.
+            // Other facts arrive through hooks and status snapshots.
             AgentControl::Antigravity => vec![],
             // Nothing, for pi's reason: the title arrives on the *next hook
             // payload* — a `sessions/` write the host already watches. Codex
@@ -760,9 +756,8 @@ impl AgentControl {
             // No per-pid manifest: a Pi session's id (and name) arrive on every
             // hook payload, which is what this index is a fallback for.
             AgentControl::Pi => SessionIndex::default(),
-            // No per-pid manifest. An Antigravity session's id arrives on its
-            // first hook — which is the *first prompt*, not the launch, since
-            // nothing fires at startup (`agents::antigravity`).
+            // No per-pid manifest. Identity arrives through SessionStart and
+            // status snapshots; a fresh empty TUI has no conversation yet.
             AgentControl::Antigravity => SessionIndex::default(),
             // No per-pid manifest, for pi's reason: an omp session's id (and
             // name) arrive on every hook payload, which is what this index is a
@@ -829,11 +824,8 @@ impl AgentControl {
             // path, which is what makes this consistent rather than merely
             // unimplemented: one fact, one source.
             AgentControl::Pi => TranscriptStats::default(),
-            // Nothing to fold: Antigravity's transcript records steps, not
-            // usage, and its per-conversation store is protobuf blobs in SQLite
-            // with no published schema. `agents::antigravity` supplies no
-            // transcript path either, so this is consistent rather than merely
-            // unimplemented.
+            // Context usage and model arrive through the status observer.
+            // No live transcript fold is needed for those facts.
             AgentControl::Antigravity => TranscriptStats::default(),
             // Unreachable, for pi's decision rather than his schema: omp's
             // session file is a tree, not a log (the same `id`/`parentId` shape
@@ -1185,11 +1177,8 @@ impl AgentControl {
             // catch for Claude is covered by `agent_settled`, which fires when
             // Pi will not continue running — a cancelled run included.
             AgentControl::Pi => None,
-            // No status file, and the gap one would cover is real: an
-            // interrupted Antigravity turn fires no hook, so the row reads
-            // `Active` until the next prompt. Nothing in the process tree
-            // distinguishes that from a model call in flight, so nothing is
-            // claimed here rather than something being guessed.
+            // The status-line observer reports idle after cancellation;
+            // there is no separate status file to poll.
             AgentControl::Antigravity => None,
             // No status file, and none needed: the interrupt this exists to
             // catch for Claude is covered by `agent_end`, which fires on an
@@ -1242,9 +1231,9 @@ impl AgentControl {
             // this would be asked — the Kimi standing, reached from an
             // extension call rather than a documented payload field.
             AgentControl::Pi => None,
-            // Antigravity has no session title of any kind — no rename command,
-            // nothing on a payload, nothing in the store. The resume picker
-            // shows a session's opening request instead.
+            // Antigravity's title store is not integrated yet; the lifecycle
+            // and status payloads supply no title. The resume picker uses
+            // the opening request.
             AgentControl::Antigravity => None,
             // `None` for pi's reason: `pi.getSessionName()` rides every hook
             // payload as `session_title` and is already on `LauncherState.name`
@@ -2166,16 +2155,11 @@ mod tests {
                     ModelSwitch,
                 ],
             ),
-            // Shorter still, and none of the three absences is a gap of ours:
-            // Antigravity's entire vocabulary is five events, it fires none at
-            // session start or on compaction, and its one pre-tool event is a
-            // permission *gate* that cannot be observed without answering
-            // (`agents::antigravity`). `PostToolUseFailure` and `StopFailure`
-            // are absent here for the opposite reason to Codex's — the
-            // dispatcher does produce them, out of the `error` field on these.
+            // Lifecycle hooks plus the status-line observer. Failures are
+            // synthesized from each lifecycle payload's error field.
             (
                 AgentControl::Antigravity,
-                &[PromptSubmit, PostToolUse, Stop],
+                &[SessionStart, PromptSubmit, PostToolUse, Stop, StatusUpdate],
             ),
             // No `Elicitation`: omp's `tool_approval_requested` is the gate and
             // `tool_approval_resolved` releases it, so the approval pair carries
@@ -2346,7 +2330,7 @@ mod tests {
             (AgentControl::Grok, (true, true, true, true)),
             (AgentControl::OpenCode, (true, false, true, true)),
             (AgentControl::Pi, (true, false, false, true)),
-            (AgentControl::Antigravity, (false, false, false, false)),
+            (AgentControl::Antigravity, (false, false, false, true)),
             (AgentControl::Omp, (true, false, true, true)),
         ];
         assert_eq!(

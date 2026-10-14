@@ -897,9 +897,13 @@ pub enum HookEvent {
     CwdChanged,
     /// The session's model changed out of band — the user picked another one,
     /// or the agent fell back. Carries the new id on [`HookMessage::model`] and
-    /// says nothing about what the session is *doing*, which is why it is the
-    /// one event with no status mapping at all.
+    /// says nothing about what the session is *doing*. The default dispatcher
+    /// adopts the model without changing status.
     ModelSwitch,
+    /// An agent's current state and session facts, observed independently of
+    /// lifecycle hooks (Antigravity's status-line command). The backend owns
+    /// the snapshot's state vocabulary; the default dispatcher adopts facts.
+    StatusUpdate,
 }
 
 impl HookEvent {
@@ -918,6 +922,7 @@ impl HookEvent {
         Self::PostCompact,
         Self::CwdChanged,
         Self::ModelSwitch,
+        Self::StatusUpdate,
     ];
 
     pub fn as_kebab(&self) -> &'static str {
@@ -936,6 +941,7 @@ impl HookEvent {
             Self::PostCompact => "post-compact",
             Self::CwdChanged => "cwd-changed",
             Self::ModelSwitch => "model-switch",
+            Self::StatusUpdate => "status-update",
         }
     }
 
