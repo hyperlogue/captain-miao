@@ -6,6 +6,8 @@ The dashboard embeds the 32×32 straight-alpha `.rgba` files. Run
 trims transparent margins, preserves proportions, and leaves a small inset.
 The runtime removes the baked transparent margins and fits the visible artwork
 to a two-column, one-row slot, preserving its proportions and centering it.
+Artwork uses at most 75% of the row height, leaving vertical padding between
+adjacent logos.
 
 Sources retrieved 2026-10-14:
 

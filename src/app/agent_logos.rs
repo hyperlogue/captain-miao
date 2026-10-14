@@ -220,6 +220,7 @@ impl AgentLogos {
 }
 
 /// Remove transparent margins, then fit the artwork to two columns and one row.
+/// Limit artwork to 75% of the row height so adjacent logos stay separated.
 /// All source pixels retain their color; dim rows reduce alpha instead.
 fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
     let (mut left, mut top, mut right, mut bottom) = (SIZE, SIZE, 0, 0);
@@ -241,10 +242,11 @@ fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
         u32::from(cell.w).max(1) * u32::from(COLUMNS),
         u32::from(cell.h).max(1),
     );
-    let (w, h) = if art_w * cell_h >= art_h * cell_w {
+    let min_h = (art_h * 4).div_ceil(3).max(art_h + 2);
+    let (w, h) = if art_w * cell_h >= min_h * cell_w {
         (art_w, (art_w * cell_h).div_ceil(cell_w).min(1024))
     } else {
-        ((art_h * cell_w).div_ceil(cell_h).min(1024), art_h)
+        ((min_h * cell_w).div_ceil(cell_h).min(1024), min_h)
     };
     let mut rgba = vec![0; (w * h * 4) as usize];
     let pad_x = (w - art_w) / 2;
@@ -425,14 +427,31 @@ mod tests {
     }
 
     #[test]
-    fn assets_fit_the_cell_without_distortion_and_dim_with_the_row() {
+    fn assets_keep_vertical_padding_proportions_and_row_dimming() {
         for source in SOURCES {
             assert_eq!(source.len(), (SIZE * SIZE * 4) as usize);
             assert!(source.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
+            for cell in [
+                CELL,
+                CellSize { w: 12, h: 24 },
+                CellSize { w: 19, h: 38 },
+                CellSize { w: 20, h: 10 },
+            ] {
+                let (w, h, pixels) = canvas(source, cell, false);
+                let rows: Vec<_> = pixels
+                    .chunks_exact(w as usize * 4)
+                    .enumerate()
+                    .filter(|(_, row)| row.as_chunks::<4>().0.iter().any(|px| px[3] > 0))
+                    .map(|(y, _)| y as u32)
+                    .collect();
+                let top = *rows.first().unwrap();
+                let bottom = *rows.last().unwrap();
+                assert!(top > 0 && bottom < h - 1, "padding above and below");
+                assert!((bottom - top + 1) * 4 <= h * 3, "at most 75% tall");
+            }
         }
         let solid = vec![255; (SIZE * SIZE * 4) as usize];
-        // A tall logo baked into a padded square should fill the slot height,
-        // rather than shrinking its visible artwork to fit that square.
+        // Remove baked margins, then center the visible artwork with row padding.
         let mut padded = vec![0; solid.len()];
         for y in 6..26 {
             for x in 10..22 {
@@ -440,7 +459,7 @@ mod tests {
                 padded[offset..offset + 4].fill(255);
             }
         }
-        for (cell, expected) in [(CELL, (20, 20)), (CellSize { w: 20, h: 10 }, (80, 20))] {
+        for (cell, expected) in [(CELL, (27, 27)), (CellSize { w: 20, h: 10 }, (108, 27))] {
             let (w, h, pixels) = canvas(&padded, cell, false);
             assert_eq!((w, h), expected);
             let visible: Vec<_> = pixels
@@ -459,7 +478,7 @@ mod tests {
             canvas(&vec![0; solid.len()], CELL, false),
             (1, 1, vec![0; 4])
         );
-        for (cell, expected) in [(CELL, (32, 32)), (CellSize { w: 20, h: 10 }, (128, 32))] {
+        for (cell, expected) in [(CELL, (43, 43)), (CellSize { w: 20, h: 10 }, (172, 43))] {
             let (w, h, pixels) = canvas(&solid, cell, false);
             assert_eq!((w, h), expected);
             assert_eq!(
