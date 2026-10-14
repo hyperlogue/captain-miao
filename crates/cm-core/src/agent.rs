@@ -586,9 +586,9 @@ impl AgentControl {
             // so `approval_gate` is `true`. Fork via `--fork`, no worktree flag,
             // and tokens/model come off the hook — the opencode row.
             AgentControl::Omp => caps(true, false, true, true),
-            // The status-line observer supplies context usage. The CLI still
-            // has no fork/worktree flags or distinct approval observation.
-            AgentControl::Antigravity => caps(false, false, false, true),
+            // The status-line observer supplies context usage and approval.
+            // The CLI still has no fork/worktree flags.
+            AgentControl::Antigravity => caps(false, false, true, true),
             // Nothing may be claimed for a backend this build can't drive: it
             // launches nothing, writes no hook config and fills no column.
             AgentControl::Unknown => caps(false, false, false, false),
@@ -2284,6 +2284,8 @@ mod tests {
     /// state, per backend, why the agent has no number to give.
     #[test]
     fn the_capability_matrix_agrees_with_the_implementations() {
+        use crate::state::SessionStatus;
+
         for &agent in AgentControl::ALL {
             let c = agent.capabilities();
             assert_eq!(
@@ -2297,8 +2299,23 @@ mod tests {
                 "{agent:?}: the declared worktree capability is not what its worktree argv does"
             );
             let forwarded = agent.forwarded_events();
+            // Snapshot feeds may carry approval without a dedicated hook.
+            // Exercise the actual parser/dispatcher as well as requiring the
+            // subscription, so the declaration cannot outlive its wiring.
+            let snapshot_gate = forwarded.contains(&HookEvent::StatusUpdate) && {
+                let mut state = LauncherState::for_test(agent, SessionStatus::Active);
+                let msg = agent
+                    .parse_hook_payload(
+                        HookEvent::StatusUpdate,
+                        r#"{"agent_state":"tool_use","tool_confirmation_pending":true}"#,
+                    )
+                    .unwrap();
+                agent.dispatch_hook(&mut state, msg);
+                state.status == SessionStatus::WaitingForApproval
+            };
             let gates = forwarded.contains(&HookEvent::PermissionRequest)
-                || forwarded.contains(&HookEvent::Elicitation);
+                || forwarded.contains(&HookEvent::Elicitation)
+                || snapshot_gate;
             assert_eq!(
                 c.approval_gate, gates,
                 "{agent:?}: the declared approval gate is not what its hook config registers \
@@ -2330,7 +2347,7 @@ mod tests {
             (AgentControl::Grok, (true, true, true, true)),
             (AgentControl::OpenCode, (true, false, true, true)),
             (AgentControl::Pi, (true, false, false, true)),
-            (AgentControl::Antigravity, (false, false, false, true)),
+            (AgentControl::Antigravity, (false, false, true, true)),
             (AgentControl::Omp, (true, false, true, true)),
         ];
         assert_eq!(

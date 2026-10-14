@@ -18,8 +18,9 @@
 //! The snapshot's transcript_path incorrectly names the GUI's state directory
 //! in 1.3.5, so it is deliberately ignored.
 //!
-//! **Approval remains unsupported.** A real permission prompt reports
-//! `tool_use` followed by `working`, and no permission notification hook fires.
+//! `tool_confirmation_pending` identifies a native permission prompt; its
+//! absence on the next busy snapshot releases the approval state. The coarse
+//! `agent_state` alone cannot distinguish approval from ordinary tool use.
 //! PreToolUse is a permission gate, so we leave it alone. Background tasks and
 //! compaction have no verified separate states either. Fork and worktree flags
 //! are absent from 1.3.5's argv interface, although `/fork` exists in the TUI.
@@ -588,6 +589,8 @@ struct HookPayload {
 struct StatusPayload {
     #[serde(default)]
     agent_state: String,
+    #[serde(default)]
+    tool_confirmation_pending: bool,
     conversation_id: Option<String>,
     model: Option<StatusModel>,
     context_window: Option<StatusContext>,
@@ -690,18 +693,25 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
             .raw
             .as_deref()
             .and_then(|raw| serde_json::from_str::<StatusPayload>(raw).ok())
-            .map(|payload| payload.agent_state);
+            .map(|payload| (payload.agent_state, payload.tool_confirmation_pending));
         // A snapshot is not a new prompt: preserve errors and prompt/tool
         // facts. Coarse busy states must not erase a more specific hook state.
-        match activity.as_deref() {
-            Some("idle") => {
+        match activity
+            .as_ref()
+            .map(|(activity, pending)| (activity.as_str(), *pending))
+        {
+            Some((_, true)) => state.status = SessionStatus::WaitingForApproval,
+            Some(("idle", false)) => {
                 state.status = SessionStatus::Idle;
                 state.last_tool = None;
             }
-            Some("working" | "thinking" | "tool_use")
+            Some(("working" | "thinking" | "tool_use", false))
                 if matches!(
                     state.status,
-                    SessionStatus::Starting | SessionStatus::Idle | SessionStatus::Active
+                    SessionStatus::Starting
+                        | SessionStatus::Idle
+                        | SessionStatus::Active
+                        | SessionStatus::WaitingForApproval
                 ) =>
             {
                 state.status = SessionStatus::Active;

@@ -102,9 +102,10 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 assert_eq!(state.status, SessionStatus::Idle, "{checkpoint}");
             }
             "approval" => {
-                assert_eq!(state.status, SessionStatus::Active);
-                assert!(!AgentControl::Antigravity.capabilities().approval_gate);
+                assert_eq!(state.status, SessionStatus::WaitingForApproval);
+                assert!(AgentControl::Antigravity.capabilities().approval_gate);
             }
+            "cancel-approval" => assert_eq!(state.status, SessionStatus::Idle),
             "resume" => {
                 assert_eq!(state.status, SessionStatus::Idle);
                 assert_eq!(state.session_id, conversation);

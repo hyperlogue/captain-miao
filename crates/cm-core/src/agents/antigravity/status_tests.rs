@@ -56,6 +56,28 @@ fn startup_and_cancelled_turns_settle_without_a_stop_hook() {
 }
 
 #[test]
+fn approval_snapshots_distinguish_waiting_from_tool_execution() {
+    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    for after in ["working", "tool_use", "idle"] {
+        dispatch_hook(
+            &mut state,
+            parse_status_payload(r#"{"agent_state":"tool_use","tool_confirmation_pending":true}"#)
+                .unwrap(),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+        dispatch_hook(&mut state, snapshot(after, 10));
+        assert_eq!(
+            state.status,
+            if after == "idle" {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Active
+            }
+        );
+    }
+}
+
+#[test]
 fn unknown_and_coarse_states_preserve_more_specific_hook_status() {
     let mut state =
         LauncherState::for_test(AgentControl::Antigravity, SessionStatus::WaitingForDecision);

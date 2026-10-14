@@ -166,10 +166,12 @@ try:
     release_response.set()
     terminal.prompt('approval_fixture')
     terminal.wait('native permission prompt', lambda: b'Run this command?' in terminal.output
-                  and any(e['body'].get('agent_state') == 'tool_use' for e in current()))
+                  and any(e['event'] == 'status-update' and e['body'].get('tool_confirmation_pending')
+                          for e in current()))
     checkpoint('approval')
     terminal.send(b'\x1b')
     terminal.wait('idle after cancelling permission', lambda: status('idle'))
+    checkpoint('cancel-approval')
 finally:
     release_response.set()
     terminal.close()
