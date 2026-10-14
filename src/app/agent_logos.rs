@@ -204,19 +204,37 @@ impl AgentLogos {
     }
 }
 
-/// Pad the square asset to the cell's aspect ratio before Kitty scales it.
+/// Remove transparent margins, then fit the artwork to the full cell.
 /// All source pixels retain their color; dim rows reduce alpha instead.
 fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
-    let shortest = u32::from(cell.w.min(cell.h)).max(1);
-    let w = (SIZE * u32::from(cell.w) / shortest).clamp(SIZE, 1024);
-    let h = (SIZE * u32::from(cell.h) / shortest).clamp(SIZE, 1024);
-    let mut rgba = vec![0; (w * h * 4) as usize];
-    let left = (w - SIZE) / 2;
-    let top = (h - SIZE) / 2;
+    let (mut left, mut top, mut right, mut bottom) = (SIZE, SIZE, 0, 0);
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let src = ((y * SIZE + x) * 4) as usize;
-            let dst = (((y + top) * w + x + left) * 4) as usize;
+            if source[((y * SIZE + x) * 4 + 3) as usize] > 0 {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+    }
+    if right == 0 {
+        return (1, 1, vec![0; 4]);
+    }
+    let (art_w, art_h) = (right - left, bottom - top);
+    let (cell_w, cell_h) = (u32::from(cell.w).max(1), u32::from(cell.h).max(1));
+    let (w, h) = if art_w * cell_h >= art_h * cell_w {
+        (art_w, (art_w * cell_h).div_ceil(cell_w).min(1024))
+    } else {
+        ((art_h * cell_w).div_ceil(cell_h).min(1024), art_h)
+    };
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    let pad_x = (w - art_w) / 2;
+    let pad_y = (h - art_h) / 2;
+    for y in 0..art_h {
+        for x in 0..art_w {
+            let src = (((y + top) * SIZE + x + left) * 4) as usize;
+            let dst = (((y + pad_y) * w + x + pad_x) * 4) as usize;
             rgba[dst..dst + 4].copy_from_slice(&source[src..src + 4]);
             if dim {
                 rgba[dst + 3] /= 2;
@@ -382,6 +400,34 @@ mod tests {
             assert!(source.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         }
         let solid = vec![255; (SIZE * SIZE * 4) as usize];
+        // A tall logo baked into a padded square should fill the cell width,
+        // rather than shrinking its visible artwork to fit that square.
+        let mut padded = vec![0; solid.len()];
+        for y in 6..26 {
+            for x in 10..22 {
+                let offset = ((y * SIZE + x) * 4) as usize;
+                padded[offset..offset + 4].fill(255);
+            }
+        }
+        for (cell, expected) in [(CELL, (12, 24)), (CellSize { w: 20, h: 10 }, (40, 20))] {
+            let (w, h, pixels) = canvas(&padded, cell, false);
+            assert_eq!((w, h), expected);
+            let visible: Vec<_> = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p[3] > 0)
+                .map(|(i, _)| (i as u32 % w, i as u32 / w))
+                .collect();
+            assert_eq!(visible.len(), 12 * 20);
+            assert_eq!(visible.first(), Some(&((w - 12) / 2, (h - 20) / 2)));
+            assert_eq!(visible.last(), Some(&((w + 12) / 2 - 1, (h + 20) / 2 - 1)));
+        }
+        assert_eq!(
+            canvas(&vec![0; solid.len()], CELL, false),
+            (1, 1, vec![0; 4])
+        );
         for (cell, expected) in [(CELL, (32, 64)), (CellSize { w: 20, h: 10 }, (64, 32))] {
             let (w, h, pixels) = canvas(&solid, cell, false);
             assert_eq!((w, h), expected);

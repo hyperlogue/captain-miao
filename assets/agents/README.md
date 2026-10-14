@@ -4,7 +4,8 @@ The dashboard embeds the 32×32 straight-alpha `.rgba` files. Run
 `python3 assets/agents/generate.py` with `rsvg-convert` and ImageMagick's
 `magick` on PATH to rebuild them from the checked-in SVGs. The generator
 trims transparent margins, preserves proportions, and leaves a small inset.
-The runtime centers the artwork within one terminal cell without stretching.
+The runtime removes the baked transparent margins and fits the visible artwork
+to the full cell width or height, preserving its proportions and centering it.
 
 Sources retrieved 2026-10-14:
 
