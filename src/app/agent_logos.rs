@@ -22,7 +22,7 @@ use crate::terminal::graphics::{self, CellSize, Placement};
 
 const SIZE: u32 = 32;
 const FIRST_IMAGE: u32 = 7200; // Separate from the header's paw/cat pool.
-const SOURCES: [&[u8]; 8] = [
+const SOURCES: [&[u8]; 9] = [
     include_bytes!("../../assets/agents/claude.rgba"),
     include_bytes!("../../assets/agents/codex.rgba"),
     include_bytes!("../../assets/agents/reasonix.rgba"),
@@ -31,8 +31,9 @@ const SOURCES: [&[u8]; 8] = [
     include_bytes!("../../assets/agents/pi.rgba"),
     include_bytes!("../../assets/agents/antigravity.rgba"),
     include_bytes!("../../assets/agents/omp.rgba"),
+    include_bytes!("../../assets/agents/grok.rgba"),
 ];
-const MARKERS: [&str; 8] = [
+const MARKERS: [&str; 9] = [
     "\u{100000}",
     "\u{100001}",
     "\u{100002}",
@@ -41,6 +42,7 @@ const MARKERS: [&str; 8] = [
     "\u{100005}",
     "\u{100006}",
     "\u{100007}",
+    "\u{100008}",
 ];
 
 /// The actual image cell is blank by the time ratatui flushes its frame.
@@ -54,7 +56,7 @@ pub(super) fn cell(agent: AgentControl) -> Cell<'static> {
         AgentControl::Pi => MARKERS[5],
         AgentControl::Antigravity => MARKERS[6],
         AgentControl::Omp => MARKERS[7],
-        AgentControl::Grok => return Cell::from("G"),
+        AgentControl::Grok => MARKERS[8],
         AgentControl::Unknown => return Cell::from("?"),
     };
     // The tag prevents a matching private-use character in a user title from

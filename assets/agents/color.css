@@ -1,2 +1,2 @@
-/* Resolve upstream currentColor for the Kimi outline. */
-svg { color: #a0a0a0; }
+/* Resolve Kimi's currentColor and xAI's inherited fill to neutral gray. */
+svg { color: #a0a0a0; fill: currentColor; }

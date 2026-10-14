@@ -2225,11 +2225,23 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
     );
     assert!(wire.contains("c=1,r=1"));
 
-    // Missing artwork remains identifiable without confusing it with a logo.
+    // Grok uses the xAI image in the same one-cell slot.
     s.agent = AgentControl::Grok;
+    d.set_sessions(vec![s.clone()]);
+    d.render();
+    let mut wire = Vec::new();
+    d.app
+        .agent_logos
+        .render(&mut wire, d.app.logo.caps)
+        .unwrap();
+    assert!(String::from_utf8(wire).unwrap().contains("a=p,i=7216,"));
+    assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), " ");
+
+    // Unknown kinds remain identifiable without confusing them with a logo.
+    s.agent = AgentControl::Unknown;
     d.set_sessions(vec![s]);
     d.render();
-    assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), "G");
+    assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), "?");
 
     let mut off = crate::config::Config::default();
     off.ui.table.agent_logos = false;
