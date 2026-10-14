@@ -765,7 +765,7 @@ State lives under `~/.local/state/captain-miao/`, with daemon control and pool s
 
 ## Agent logos
 
-In Kitty, the wide session table shows a one-cell harness logo immediately
+In Kitty, the wide session table shows a two-cell-wide harness logo immediately
 before Context. Logos are enabled by default and hidden in narrow layouts or
 unsupported terminals, including tmux and zellij. Missing artwork uses an initial.
 

@@ -507,7 +507,7 @@ impl Default for PanelsConfig {
 #[serde(default)]
 pub struct TableConfig {
     pub name_truncate: usize,
-    /// Show one-cell harness logos when the terminal supports Kitty graphics.
+    /// Show two-column harness logos when the terminal supports Kitty graphics.
     pub agent_logos: bool,
 }
 

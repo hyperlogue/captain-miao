@@ -2195,7 +2195,7 @@ fn agent_logos_preferences_persist_and_reset_to_the_config_file() {
 }
 
 #[test]
-fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
+fn agent_logos_occupy_two_cells_before_context_and_obey_display_gates() {
     use crate::agent::AgentControl;
     let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
     let mut d = TestDashboard::new(140, 24);
@@ -2211,7 +2211,7 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
         .unwrap()
         .find("Ctx")
         .unwrap() as u16;
-    let icon_x = ctx - 3; // One-cell logo, column gap, then the right-aligned Ctx label.
+    let icon_x = ctx - 4; // Two-cell logo, column gap, then the right-aligned Ctx label.
     let row = d.app.last_table_rect.unwrap().y + 2;
     let mut wire = Vec::new();
     d.app
@@ -2223,9 +2223,9 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
         wire.contains(&format!("\x1b[{};{}H", row + 1, icon_x + 1)),
         "{text}"
     );
-    assert!(wire.contains("c=1,r=1"));
+    assert!(wire.contains("c=2,r=1"));
 
-    // Grok uses the xAI image in the same one-cell slot.
+    // Grok uses the xAI image in the same two-cell slot.
     s.agent = AgentControl::Grok;
     d.set_sessions(vec![s.clone()]);
     d.render();
@@ -2236,6 +2236,10 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
         .unwrap();
     assert!(String::from_utf8(wire).unwrap().contains("a=p,i=7216,"));
     assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), " ");
+    assert_eq!(
+        d.terminal.backend().buffer()[(icon_x + 1, row)].symbol(),
+        " "
+    );
 
     // Unknown kinds remain identifiable without confusing them with a logo.
     s.agent = AgentControl::Unknown;
@@ -2255,7 +2259,7 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
             .find("Ctx")
             .unwrap() as u16;
         assert_eq!(
-            off_ctx + 2,
+            off_ctx + 3,
             ctx,
             "the slot and its column gap must collapse"
         );
@@ -2269,7 +2273,7 @@ fn agent_logos_occupy_one_cell_before_context_and_obey_display_gates() {
         .unwrap()
         .find("Ctx")
         .unwrap() as u16;
-    assert_eq!(unsupported_ctx + 2, ctx);
+    assert_eq!(unsupported_ctx + 3, ctx);
 
     let mut narrow = TestDashboard::new(80, 24);
     narrow.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });

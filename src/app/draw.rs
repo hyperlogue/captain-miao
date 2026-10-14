@@ -1297,7 +1297,7 @@ impl App {
             ]
         };
         if show_agent_logos {
-            constraints.insert(3, Constraint::Length(1));
+            constraints.insert(3, Constraint::Length(super::agent_logos::COLUMNS));
         }
         let table = Table::new(rows, constraints)
             .header(header)

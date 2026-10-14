@@ -1,8 +1,9 @@
-//! One-cell harness artwork in the session table.
+//! Two-column harness artwork in the session table.
 //!
 //! Private-use markers travel through ratatui's table layout and overlay clears.
 //! At the end of `draw`, we replace surviving markers with spaces and record
-//! their exact cells. They never reach the terminal. This lets ratatui own column
+//! their exact cells. Both cells must survive, so a partially covered logo stays
+//! hidden. Markers never reach the terminal. This lets ratatui own column
 //! widths, scrolling and occlusion without a second copy of its layout algorithm.
 //! Only this module emits these markers, and collection is confined to the table.
 //!
@@ -21,6 +22,8 @@ use crate::agent::AgentControl;
 use crate::terminal::graphics::{self, CellSize, Placement};
 
 const SIZE: u32 = 32;
+pub(super) const COLUMNS: u16 = 2;
+const END_MARKER: &str = "\u{10fffd}";
 const FIRST_IMAGE: u32 = 7200; // Separate from the header's paw/cat pool.
 const SOURCES: [&[u8]; 9] = [
     include_bytes!("../../assets/agents/claude.rgba"),
@@ -45,7 +48,7 @@ const MARKERS: [&str; 9] = [
     "\u{100008}",
 ];
 
-/// The actual image cell is blank by the time ratatui flushes its frame.
+/// Both image cells are blank by the time ratatui flushes its frame.
 pub(super) fn cell(agent: AgentControl) -> Cell<'static> {
     let marker = match agent {
         AgentControl::Claude => MARKERS[0],
@@ -61,7 +64,8 @@ pub(super) fn cell(agent: AgentControl) -> Cell<'static> {
     };
     // The tag prevents a matching private-use character in a user title from
     // being interpreted as one of our placeholders.
-    Cell::from(marker).style(Style::default().add_modifier(Modifier::HIDDEN))
+    Cell::from(format!("{marker}{END_MARKER}"))
+        .style(Style::default().add_modifier(Modifier::HIDDEN))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,15 +99,26 @@ impl AgentLogos {
         let area = area.intersection(buffer.area);
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
-                let cell = &mut buffer[(x, y)];
-                if cell.modifier.contains(Modifier::HIDDEN)
-                    && let Some(kind) = MARKERS.iter().position(|m| *m == cell.symbol())
-                {
+                let cell = &buffer[(x, y)];
+                if !cell.modifier.contains(Modifier::HIDDEN) {
+                    continue;
+                }
+                let kind = MARKERS.iter().position(|m| *m == cell.symbol());
+                if let Some(kind) = kind {
                     let dim = cell.modifier.contains(Modifier::DIM);
-                    self.desired.push(Target {
-                        icon: kind * 2 + usize::from(dim),
-                        pos: Position::new(x, y),
-                    });
+                    let end_x = x.saturating_add(COLUMNS - 1);
+                    if end_x < area.right()
+                        && buffer[(end_x, y)].symbol() == END_MARKER
+                        && buffer[(end_x, y)].modifier.contains(Modifier::HIDDEN)
+                    {
+                        self.desired.push(Target {
+                            icon: kind * 2 + usize::from(dim),
+                            pos: Position::new(x, y),
+                        });
+                    }
+                }
+                if kind.is_some() || cell.symbol() == END_MARKER {
+                    let cell = &mut buffer[(x, y)];
                     cell.set_symbol(" ");
                     cell.modifier.remove(Modifier::HIDDEN);
                 }
@@ -175,7 +190,7 @@ impl AgentLogos {
                         placement: target.placement(),
                         col: target.pos.x,
                         row: target.pos.y,
-                        cells: Some((1, 1)),
+                        cells: Some((COLUMNS, 1)),
                         z: 1,
                         crop: None,
                         offset: (0, 0),
@@ -204,7 +219,7 @@ impl AgentLogos {
     }
 }
 
-/// Remove transparent margins, then fit the artwork to the full cell.
+/// Remove transparent margins, then fit the artwork to two columns and one row.
 /// All source pixels retain their color; dim rows reduce alpha instead.
 fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
     let (mut left, mut top, mut right, mut bottom) = (SIZE, SIZE, 0, 0);
@@ -222,7 +237,10 @@ fn canvas(source: &[u8], cell: CellSize, dim: bool) -> (u32, u32, Vec<u8>) {
         return (1, 1, vec![0; 4]);
     }
     let (art_w, art_h) = (right - left, bottom - top);
-    let (cell_w, cell_h) = (u32::from(cell.w).max(1), u32::from(cell.h).max(1));
+    let (cell_w, cell_h) = (
+        u32::from(cell.w).max(1) * u32::from(COLUMNS),
+        u32::from(cell.h).max(1),
+    );
     let (w, h) = if art_w * cell_h >= art_h * cell_w {
         (art_w, (art_w * cell_h).div_ceil(cell_w).min(1024))
     } else {
@@ -252,6 +270,9 @@ mod tests {
     const CELL: CellSize = CellSize { w: 8, h: 16 };
 
     fn mark(buf: &mut Buffer, x: u16, y: u16, kind: usize, dim: bool) {
+        let end = &mut buf[(x + COLUMNS - 1, y)];
+        end.set_symbol(END_MARKER);
+        end.modifier = Modifier::HIDDEN;
         let c = &mut buf[(x, y)];
         c.set_symbol(MARKERS[kind]);
         c.modifier = Modifier::HIDDEN;
@@ -267,8 +288,13 @@ mod tests {
         mark(&mut buffer, 2, 1, 0, false);
         mark(&mut buffer, 2, 2, 1, true);
         mark(&mut buffer, 2, 3, 2, false);
+        mark(&mut buffer, 2, 4, 3, false);
         buffer[(8, 1)].set_symbol(MARKERS[0]); // A user title, without our tag.
-        Clear.render(Rect::new(1, 3, 3, 1), &mut buffer);
+        Clear.render(Rect::new(2, 3, 1, 1), &mut buffer); // Covered first cell.
+        Clear.render(Rect::new(3, 4, 1, 1), &mut buffer); // Covered second cell.
+        buffer[(3, 4)].set_symbol("M"); // Popup text must survive collection.
+        buffer[(9, 0)].set_symbol(MARKERS[0]); // Second cell clipped offscreen.
+        buffer[(9, 0)].modifier = Modifier::HIDDEN;
         let mut logos = AgentLogos::default();
         logos.collect(&mut buffer, area);
         assert_eq!(
@@ -287,6 +313,11 @@ mod tests {
         assert_eq!(buffer[(2, 1)].symbol(), " ");
         assert!(!buffer[(2, 1)].modifier.contains(Modifier::HIDDEN));
         assert_eq!(buffer[(8, 1)].symbol(), MARKERS[0]);
+        for pos in [(3, 1), (3, 3), (2, 4), (9, 0)] {
+            assert_eq!(buffer[pos].symbol(), " ");
+            assert!(!buffer[pos].modifier.contains(Modifier::HIDDEN));
+        }
+        assert_eq!(buffer[(3, 4)].symbol(), "M");
         logos.collect(&mut buffer, area);
         assert!(logos.desired.is_empty());
     }
@@ -311,7 +342,7 @@ mod tests {
         let wire = String::from_utf8(out.clone()).unwrap();
         assert_eq!(wire.matches("a=t").count(), 1);
         assert_eq!(wire.matches("a=p").count(), 2);
-        assert!(wire.contains("c=1,r=1"));
+        assert!(wire.contains("c=2,r=1"));
         assert!(wire.starts_with("\x1b7") && wire.ends_with("\x1b8"));
         out.clear();
         logos.render(&mut out, Some(CELL)).unwrap();
@@ -400,7 +431,7 @@ mod tests {
             assert!(source.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
         }
         let solid = vec![255; (SIZE * SIZE * 4) as usize];
-        // A tall logo baked into a padded square should fill the cell width,
+        // A tall logo baked into a padded square should fill the slot height,
         // rather than shrinking its visible artwork to fit that square.
         let mut padded = vec![0; solid.len()];
         for y in 6..26 {
@@ -409,7 +440,7 @@ mod tests {
                 padded[offset..offset + 4].fill(255);
             }
         }
-        for (cell, expected) in [(CELL, (12, 24)), (CellSize { w: 20, h: 10 }, (40, 20))] {
+        for (cell, expected) in [(CELL, (20, 20)), (CellSize { w: 20, h: 10 }, (80, 20))] {
             let (w, h, pixels) = canvas(&padded, cell, false);
             assert_eq!((w, h), expected);
             let visible: Vec<_> = pixels
@@ -428,10 +459,13 @@ mod tests {
             canvas(&vec![0; solid.len()], CELL, false),
             (1, 1, vec![0; 4])
         );
-        for (cell, expected) in [(CELL, (32, 64)), (CellSize { w: 20, h: 10 }, (64, 32))] {
+        for (cell, expected) in [(CELL, (32, 32)), (CellSize { w: 20, h: 10 }, (128, 32))] {
             let (w, h, pixels) = canvas(&solid, cell, false);
             assert_eq!((w, h), expected);
-            assert_eq!(w * u32::from(cell.h), h * u32::from(cell.w));
+            assert_eq!(
+                w * u32::from(cell.h),
+                h * u32::from(cell.w) * u32::from(COLUMNS)
+            );
             assert_eq!(
                 pixels
                     .as_chunks::<4>()
