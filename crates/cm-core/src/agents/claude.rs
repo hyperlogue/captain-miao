@@ -2540,18 +2540,50 @@ mod tests {
     /// [`child_cmdlines`] of our own pid (children are recorded per-process, so
     /// the test-runner thread doesn't matter).
     #[cfg(target_os = "linux")]
-    #[test]
-    fn child_cmdlines_sees_own_child() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let cmds = child_cmdlines(std::process::id()).expect("read /proc");
-        assert!(
-            cmds.iter().any(|c| c.contains("sleep 30")),
-            "children: {cmds:?}"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
+    #[tokio::test]
+    async fn child_cmdlines_sees_own_child() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for delay in ["0", "0.1"] {
+            let marker = format!("miao-claude-child-{}-{delay}", std::process::id());
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-s")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn child command-line fixture");
+            let mut input = child.stdin.take().unwrap();
+            // Keep the marker out of the initial shell's argv. Only the final
+            // exec exposes it, and delayed startup exercises the readiness wait.
+            input
+                .write_all(
+                    format!("sleep {delay}\nexec sh -c 'printf ready; read -r line' {marker}\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write child command-line fixture");
+
+            // spawn() alone is not our readiness signal. The final shell tells
+            // us it is running, then stays alive on stdin until we clean up.
+            let mut ready = [0; 5];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                child.stdout.as_mut().unwrap().read_exact(&mut ready),
+            )
+            .await
+            .expect("timed out waiting for child command-line fixture readiness")
+            .expect("read child command-line fixture readiness");
+            assert_eq!(&ready, b"ready");
+
+            let cmds = child_cmdlines(std::process::id()).expect("read /proc");
+            child.kill().await.expect("kill and reap fixture");
+            assert!(
+                cmds.iter()
+                    .any(|cmd| cmd.split_whitespace().last() == Some(marker.as_str())),
+                "expected child {marker}; children: {cmds:?}"
+            );
+        }
     }
 }
