@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-15
+
+### New
+
+- **Harness logos in Kitty** identify agents in the wide session table, with
+  an **Agent logos** toggle under **Display** preferences or `ui.table.agent_logos`
+  in the config file.
+- **Antigravity prompts and titles** update as you work, with generated titles
+  and renames reflected in the dashboard and resume picker.
+
+### Fixed
+
+- **Antigravity integration** improves idle, cancellation, approval and context
+  tracking with `agy` 1.3.5, preserves conversation state and custom status lines,
+  resets managed configuration when global settings are deleted, and avoids
+  rescanning conversation history at startup and resume.
+- **The new-session picker** cycles through every enabled harness with `Ctrl-T`
+  in preference order, including agents absent from the dashboard's local `PATH`.
+
 ## [0.13.0] - 2026-10-13
 
 ### New
@@ -817,7 +836,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...v0.11.0
