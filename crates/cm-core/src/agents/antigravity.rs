@@ -30,31 +30,39 @@
 //!
 //! # Configuration and state
 //!
-//! Hooks are merged into a synthetic home's `.gemini/config/hooks.json`.
-//! A second mirror shadows `.gemini/antigravity-cli/settings.json` to wrap the
+//! The hidden `--gemini_dir` flag selects a managed Gemini root while agy,
+//! hooks and child tools retain the real HOME. Verified with 1.3.4 and 1.3.5;
+//! the flag is absent from `--help`. `--app_data_dir` alone is insufficient:
+//! hooks still use the Gemini root, and legacy hook migration can overwrite
+//! its global hooks file.
+//!
+//! Hooks are merged into the managed root's `config/hooks.json`.
+//! A second mirror shadows `antigravity-cli/settings.json` to wrap the
 //! user's status-line command: both receive the same JSON and the user's
 //! stdout remains visible. Without a custom command the built-in line stays.
 //! Real global and workspace hook/config files are never changed.
 //!
 //! The writable settings copy retains changes made inside managed sessions
 //! until the real settings file changes or is deleted. Edits made inside those
-//! sessions remain local. The original status-line configuration is reread from the real
-//! file on each launch, preventing nested observers. Conversations and state
-//! directories are linked to the real tree, including on a first launch;
-//! legacy synthetic-home state is adopted before seeding those directories.
+//! sessions remain local. The original status-line configuration is reread
+//! from the real file on each launch, preventing nested observers.
+//! Conversations and state directories are linked to the real tree, including
+//! on a first launch. Legacy synthetic-home state is adopted before seeding
+//! those directories.
 //! A failed migration aborts launch with the original state still in place.
 //! Agent-created root files are adopted on subsequent launches, excluding
 //! the settings copy and its source snapshot.
 //!
-//! All child tools still inherit the synthetic HOME. Existing home entries
-//! resolve through links; newly created top-level entries may remain there.
-//! No config-dir or app-data override tested with 1.3.5 avoids this requirement.
+//! The managed root reuses `antigravity-home/.gemini` from the old synthetic
+//! home. Its parent is no longer mirrored; existing entries there are left
+//! untouched because earlier sessions may have written user files into it.
 //!
 //! `Ctrl+V` was verified with 1.1.11: agy shells out to xclip for TARGETS and
 //! image/png without requiring DISPLAY, matching the pooled clipboard bridge.
 //! The opt-in live test uses a disposable home, a loopback Gemini fixture and
-//! a PTY to check startup, completion, cancellation, approval, clear and resume
-//! contracts without credentials or external inference.
+//! a PTY to check startup, completion, cancellation, approval, clear, managed
+//! and bare resume, real HOME and global config preservation without credentials
+//! or external inference.
 
 mod metadata;
 pub use metadata::{
@@ -91,8 +99,6 @@ const HOOK_NAME: &str = "captain-miao";
 // =============================================================================
 
 /// The real `~/.gemini` — Antigravity's root for both its config and its state.
-/// The path is hardcoded relative to `$HOME` in the binary (no `GEMINI_HOME`,
-/// no `XDG` override for it), which is what forces the synthetic home.
 fn gemini_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".gemini"))
 }
@@ -105,12 +111,12 @@ fn cli_dir() -> Option<PathBuf> {
     gemini_dir().map(|g| g.join("antigravity-cli"))
 }
 
-/// A single shared synthetic `$HOME` for every Antigravity session, for the same
-/// reason Reasonix's is shared: it is a symlink farm over the user's home, and
-/// one stable copy is cheaper to build and to reason about than one per launch.
-/// That sharing is also why the hook command can carry no per-session data.
-fn synth_home() -> PathBuf {
-    crate::state::state_dir().join("antigravity-home")
+/// Keep the previous mirror's path so managed settings and existing sessions
+/// survive the switch from a synthetic HOME to an explicit Gemini root.
+fn managed_gemini_dir() -> PathBuf {
+    crate::state::state_dir()
+        .join("antigravity-home")
+        .join(".gemini")
 }
 
 /// A conversation's readable transcript. `transcript.jsonl` rather than the
@@ -137,12 +143,11 @@ fn live_transcript_path(id: Option<&str>) -> Option<String> {
 }
 
 // =============================================================================
-// Launcher: process spawn + synthetic $HOME
+// Launcher: process spawn + managed Gemini directory
 // =============================================================================
 
-/// Build the argv for an Antigravity session. Antigravity reads global hooks
-/// from one place only, so the config the launcher wrote is relocated into a
-/// synthetic `$HOME` rather than passed on a flag.
+/// Build the argv for an Antigravity session, redirecting only its Gemini
+/// directory so hooks and tools inherit the real HOME.
 pub fn build_launch_command(
     cwd: &str,
     sock_path: &Path,
@@ -155,12 +160,12 @@ pub fn build_launch_command(
     let hooks_json =
         std::fs::read_to_string(settings_path).context("reading antigravity hook settings")?;
     let settings: serde_json::Value = serde_json::from_str(&hooks_json)?;
-    let home = ensure_synth_home(&settings)?;
+    let gemini = ensure_managed_gemini_dir(&settings)?;
 
     let mut cmd = common::agent_command(BIN, cwd, shim_dir)?;
-    cmd.env("HOME", &home);
+    cmd.arg("--gemini_dir").arg(gemini);
     // The hook subprocess reads the launcher socket from here rather than from
-    // an argv flag: the synthetic home is shared by every session, so its
+    // an argv flag: the managed root is shared by every session, so its
     // hooks.json cannot carry a per-session path.
     cmd.env("CAPTAIN_MIAO_SOCK", sock_path);
     // No positional for the working directory: `agy` takes the workspace from
@@ -170,35 +175,27 @@ pub fn build_launch_command(
     Ok(cmd)
 }
 
-/// Mirror the home and both Gemini configuration directories. Only hooks and
-/// the CLI settings copy are ours; the rest resolves to the real home.
+/// Mirror only the Gemini directories. Hooks and the CLI settings copy are
+/// ours; the rest resolves to the real Gemini root.
 ///
 /// Nothing is **pruned** at any level. These are state mirrors: a dangling link
 /// is load-bearing, because the agent recreating that file writes *through* the
 /// link into the real home and the two stay converged.
-fn ensure_synth_home(settings: &serde_json::Value) -> Result<PathBuf> {
-    let real = dirs::home_dir().context("no home directory for Antigravity")?;
-    let dir = synth_home();
-    ensure_synth_home_at(&real, &dir, settings)?;
+fn ensure_managed_gemini_dir(settings: &serde_json::Value) -> Result<PathBuf> {
+    let real = gemini_dir().context("no home directory for Antigravity")?;
+    let dir = managed_gemini_dir();
+    ensure_managed_gemini_dir_at(&real, &dir, settings)?;
     Ok(dir)
 }
 
-fn ensure_synth_home_at(real: &Path, dir: &Path, settings: &serde_json::Value) -> Result<()> {
-    let home = SynthHome {
+fn ensure_managed_gemini_dir_at(
+    real: &Path,
+    dir: &Path,
+    settings: &serde_json::Value,
+) -> Result<()> {
+    let gemini = SynthHome {
         dir: dir.to_path_buf(),
         real: Some(real.to_path_buf()),
-        owned: &[".gemini"],
-        copied: &[],
-        // Nothing at this level is Antigravity's alone — every file it writes
-        // lives under `.gemini`, which the next mirror down handles.
-        adopted: &[],
-        prune: false,
-    };
-    home.ensure()?;
-
-    let gemini = SynthHome {
-        dir: home.dir.join(".gemini"),
-        real: Some(real.join(".gemini")),
         owned: &["config", "antigravity-cli"],
         copied: &[],
         adopted: &[],
@@ -208,7 +205,7 @@ fn ensure_synth_home_at(real: &Path, dir: &Path, settings: &serde_json::Value) -
 
     let config = SynthHome {
         dir: gemini.dir.join("config"),
-        real: Some(real.join(".gemini/config")),
+        real: Some(real.join("config")),
         owned: &[HOOKS_FILE],
         copied: &[],
         // `hooks.json` is ours and the rest of this directory is configuration
@@ -220,14 +217,13 @@ fn ensure_synth_home_at(real: &Path, dir: &Path, settings: &serde_json::Value) -
     // Merge rather than replace: `hooks.json` is a map of named bundles, and
     // the user's own live in the same file. Re-read every launch so an edit to
     // the real file shows up in the next session.
-    let theirs =
-        std::fs::read_to_string(real.join(".gemini/config").join(HOOKS_FILE)).unwrap_or_default();
+    let theirs = std::fs::read_to_string(real.join("config").join(HOOKS_FILE)).unwrap_or_default();
     config.write_owned(
         HOOKS_FILE,
         &merge_hooks(&theirs, &settings["hooks"].to_string()),
     )?;
     ensure_cli_home(
-        &real.join(".gemini/antigravity-cli"),
+        &real.join("antigravity-cli"),
         &gemini.dir.join("antigravity-cli"),
         settings,
     )

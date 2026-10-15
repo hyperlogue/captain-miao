@@ -194,6 +194,105 @@ fn injected() -> serde_json::Value {
     serde_json::from_str(&build_settings_for(Path::new("miao"))).unwrap()
 }
 
+#[tokio::test]
+async fn launch_redirects_gemini_without_mirroring_or_replacing_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const TEST: &str = "agents::antigravity::status_tests::launch_redirects_gemini_without_mirroring_or_replacing_home";
+    let Some(root) = std::env::var_os("CM_TEST_AGY_HOME") else {
+        // The production launcher resolves global state paths. Keep every
+        // write in a child process with its own HOME and XDG roots.
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let agy = bin.join("agy");
+        std::fs::write(
+            &agy,
+            "#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$PWD\" \"$CAPTAIN_MIAO_SOCK\" \"$@\"\nprintf 'real home' > \"$HOME/new-agent-file\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env_clear()
+            .env("CM_TEST_AGY_HOME", &root)
+            .env("PATH", &bin)
+            .env("HOME", root.join("real"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let root = PathBuf::from(root);
+    let real = root.join("real");
+    let config = real.join(".gemini/config");
+    std::fs::create_dir_all(&config).unwrap();
+    let original_hooks = r#"{"user":{"Stop":[{"type":"command","command":"true"}]}}"#;
+    std::fs::write(config.join(HOOKS_FILE), original_hooks).unwrap();
+    std::fs::write(real.join("unrelated-home-file"), "unrelated").unwrap();
+    let legacy_home = crate::state::state_dir().join("antigravity-home");
+    std::fs::create_dir_all(&legacy_home).unwrap();
+    std::fs::write(legacy_home.join("legacy-user-file"), "keep me").unwrap();
+    let settings = root.join("injected.json");
+    std::fs::write(&settings, injected().to_string()).unwrap();
+    let work = root.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let socket = root.join("launcher.sock");
+    let output = build_launch_command(
+        work.to_str().unwrap(),
+        &socket,
+        &settings,
+        &["--conversation".into(), "existing-conversation".into()],
+        None,
+    )
+    .unwrap()
+    .output()
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    let gemini = legacy_home.join(".gemini");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}\n{}\n{}\n--gemini_dir\n{}\n--conversation\nexisting-conversation\n",
+            real.display(),
+            work.display(),
+            socket.display(),
+            gemini.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(real.join("new-agent-file")).unwrap(),
+        "real home"
+    );
+    assert!(!legacy_home.join("new-agent-file").exists());
+    assert!(!legacy_home.join("unrelated-home-file").exists());
+    assert_eq!(
+        std::fs::read_to_string(legacy_home.join("legacy-user-file")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.join(HOOKS_FILE)).unwrap(),
+        original_hooks
+    );
+    let hooks: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gemini.join("config/hooks.json")).unwrap())
+            .unwrap();
+    assert!(hooks.get("user").is_some());
+    assert!(hooks.get(HOOK_NAME).is_some());
+}
+
 #[test]
 fn cli_mirror_keeps_state_shared_and_settings_private_across_relaunches() {
     let root = tempfile::tempdir().unwrap();

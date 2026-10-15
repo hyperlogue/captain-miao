@@ -23,6 +23,8 @@ work = root / 'work'
 work.mkdir()
 event_file = root / 'events.jsonl'
 event_file.touch()
+real_settings = Path(config['home']) / '.gemini/antigravity-cli/settings.json'
+original_settings = real_settings.read_bytes()
 delayed_request = threading.Event()
 release_response = threading.Event()
 tool_started = threading.Event()
@@ -68,7 +70,10 @@ class Model(http.server.BaseHTTPRequestHandler):
             command = 'python3 -c "print(42)"'
             if 'accept_fixture' in latest_prompt:
                 command = shlex.join([sys.executable, '-c',
-                    f"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:{server.server_port}/held-tool', timeout=50).read().decode())"])
+                    "import os, pathlib, urllib.request; "
+                    "pathlib.Path('child-home.txt').write_text(os.environ['HOME']); "
+                    "pathlib.Path('~/new-top-level.txt').expanduser().write_text('real home'); "
+                    f"print(urllib.request.urlopen('http://127.0.0.1:{server.server_port}/held-tool', timeout=50).read().decode())"])
             response_parts = [{'functionCall': {'name': 'run_command', 'args': {
                 'CommandLine': command, 'Cwd': str(work),
                 'WaitMsBeforeAsync': 1000, 'toolAction': 'Running command',
@@ -109,10 +114,11 @@ def events():
 
 
 class Terminal:
-    def __init__(self, extra=()):
+    def __init__(self, extra=(), managed=True):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 140, 0, 0))
-        self.process = subprocess.Popen([config['binary'], *extra], cwd=work, env=env,
+        launch_args = config['launch_args'] if managed else []
+        self.process = subprocess.Popen([config['binary'], *launch_args, *extra], cwd=work, env=env,
                                         stdin=slave, stdout=slave, stderr=slave,
                                         start_new_session=True)
         os.close(slave)
@@ -266,6 +272,22 @@ try:
         and e['body'].get('context_window', {}).get('total_input_tokens', 0) > 0
         for e in current()))
     checkpoint('resume')
+finally:
+    terminal.close()
+
+# A normal agy can update its own settings (e.g. workspace trust). Check our
+# preservation contract before starting that independent bare invocation.
+assert real_settings.read_bytes() == original_settings, 'managed launches changed global settings'
+offset = len(events())
+terminal = Terminal(['--conversation', conversation], managed=False)
+try:
+    terminal.wait('bare resume from shared real-home state', lambda: any(
+        e['event'] == 'user-status' and e['body'].get('agent_state') == 'idle'
+        and e['body'].get('conversation_id') == conversation
+        and e['body'].get('context_window', {}).get('total_input_tokens', 0) > 0
+        for e in current()) and b'custom-status-visible' in terminal.output)
+    assert all(e['event'] == 'user-status' and e['home'] == config['home']
+               for e in current()), 'bare agy must use only the original status command'
 finally:
     terminal.close()
     server.shutdown()

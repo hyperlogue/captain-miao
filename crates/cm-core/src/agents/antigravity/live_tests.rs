@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 fn real_agy_tracks_startup_completion_cancellation_and_resume() {
     let root = tempfile::tempdir().unwrap();
     let real = root.path().join("real");
-    let managed = root.path().join("managed");
+    let managed = root.path().join("managed/.gemini");
     let cli = real.join(".gemini/antigravity-cli");
     std::fs::create_dir_all(cli.join("cache")).unwrap();
     std::fs::write(cli.join("cache/onboarding.json"), r#"{"onboardingComplete":true,"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":true}"#).unwrap();
@@ -22,7 +22,7 @@ fn real_agy_tracks_startup_completion_cancellation_and_resume() {
         r#"#!/usr/bin/env python3
 import json, os, sys
 body = json.load(sys.stdin)
-line = json.dumps({'event': sys.argv[-1], 'body': body}) + '\n'
+line = json.dumps({'event': sys.argv[-1], 'body': body, 'home': os.environ['HOME']}) + '\n'
 fd = os.open(os.environ['CM_AGY_TEST_EVENTS'], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.write(fd, line.encode())
 os.close(fd)
@@ -33,11 +33,20 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
     std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o700)).unwrap();
     let settings = serde_json::json!({
         "modelProvider":"gemini",
+        "enableTelemetry":false,
         "statusLine":{"command":format!("{} user-status", shell_quote(&recorder.to_string_lossy())),"stack_with_default":true}
     }).to_string();
     std::fs::write(cli.join("settings.json"), &settings).unwrap();
+    let hooks = serde_json::json!({"user": {"Stop": [{
+        "type":"command", "timeout":10,
+        "command":format!("{} user-stop", shell_quote(&recorder.to_string_lossy()))
+    }]}})
+    .to_string();
+    let config = real.join(".gemini/config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join(HOOKS_FILE), &hooks).unwrap();
     let injection = serde_json::from_str(&build_settings_for(&recorder)).unwrap();
-    ensure_synth_home_at(&real, &managed, &injection).unwrap();
+    ensure_managed_gemini_dir_at(&real.join(".gemini"), &managed, &injection).unwrap();
     let mut child = Command::new("python3")
         .args(["-c", include_str!("live_test.py")])
         .stdin(Stdio::piped())
@@ -51,7 +60,8 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
         .unwrap()
         .write_all(
             serde_json::json!({
-                "root":root.path(),"home":managed,
+                "root":root.path(),"home":real,
+                "launch_args":["--gemini_dir",managed],
                 "binary":std::env::var("CM_TEST_AGY_BIN").unwrap_or_else(|_| "agy".into())
             })
             .to_string()
@@ -67,6 +77,7 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
     let checkpoints: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
     let mut conversation = None;
+    let mut user_hook_ran = false;
     for checkpoint in checkpoints.as_array().unwrap() {
         let phase = checkpoint["phase"].as_str().unwrap();
         if phase == "resume" {
@@ -74,6 +85,11 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
         }
         let events = checkpoint["events"].as_array().unwrap();
         for event in events {
+            assert_eq!(event["home"].as_str(), real.to_str(), "{phase}");
+            if event["event"] == "user-stop" {
+                user_hook_ran = true;
+                continue;
+            }
             if event["event"] == "user-status" {
                 continue;
             }
@@ -165,10 +181,31 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
             );
         }
     }
-    assert_eq!(
-        std::fs::read_to_string(cli.join("settings.json")).unwrap(),
-        settings
+    assert!(
+        user_hook_ran,
+        "the user's original Stop hook must still run"
     );
+    assert_eq!(
+        std::fs::read_to_string(config.join(HOOKS_FILE)).unwrap(),
+        hooks
+    );
+    // Python checked byte-for-byte preservation before the bare resume; bare
+    // agy itself may update trustedWorkspaces and serialize default fields.
+    let final_settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cli.join("settings.json")).unwrap()).unwrap();
+    let original_settings: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    for (key, value) in original_settings["statusLine"].as_object().unwrap() {
+        assert_eq!(&final_settings["statusLine"][key], value);
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("work/child-home.txt")).unwrap(),
+        real.to_str().unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(real.join("new-top-level.txt")).unwrap(),
+        "real home"
+    );
+    assert!(!managed.parent().unwrap().join("new-top-level.txt").exists());
     let candidates = list_resumable_in(&cli, 10);
     assert!(
         candidates
