@@ -17,7 +17,9 @@
 //! divided by `context_window_size`, matches its reported usage percentage.
 //! `current_usage` instead describes the last API call.
 //! The snapshot's transcript_path incorrectly names the GUI's state directory
-//! in 1.3.5, so it is deliberately ignored.
+//! in 1.3.5, so we resolve the CLI log from the conversation id instead.
+//! The launcher incrementally folds first/last prompts from that log; the host
+//! overlays titles from `conversation_summaries.db` through its shared cache.
 //!
 //! `tool_confirmation_pending` identifies a native permission prompt; its
 //! absence on the next busy snapshot releases the approval state. The coarse
@@ -53,6 +55,11 @@
 //! The opt-in live test uses a disposable home, a loopback Gemini fixture and
 //! a PTY to check startup, completion, cancellation, approval, clear and resume
 //! contracts without credentials or external inference.
+
+mod metadata;
+pub use metadata::{
+    PromptCursor, read_titles, read_transcript_stats, title_store_mtimes, title_watch_paths,
+};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -114,6 +121,19 @@ fn transcript_path(cli_dir: &Path, id: &str) -> PathBuf {
         .join("brain")
         .join(id)
         .join(".system_generated/logs/transcript.jsonl")
+}
+
+/// Both hook schemas report the conversation id. Resolve the CLI's actual
+/// log even before it exists; the launcher retries arming on subsequent hooks.
+fn live_transcript_path(id: Option<&str>) -> Option<String> {
+    let id = id.filter(|id| {
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })?;
+    Some(
+        transcript_path(&cli_dir()?, id)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 // =============================================================================
@@ -527,16 +547,17 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         found.push(((id, cwd, path), mtime));
     }
 
-    common::newest_first(found, limit)
+    let found = common::newest_first(found, limit);
+    let ids: Vec<_> = found.iter().map(|((id, _, _), _)| id.clone()).collect();
+    let titles = metadata::read_titles_at(root, &ids);
+    found
         .into_iter()
         .map(|((session_id, cwd, path), mtime)| ResumeCandidate {
             agent: crate::agent::AgentControl::Antigravity,
+            custom_title: titles.get(&session_id).cloned(),
             session_id,
             cwd,
             first_prompt: first_prompt(&path),
-            // The current title store is not integrated; use the opening
-            // request as the resume picker's label.
-            custom_title: None,
             git_branch: None,
             mtime,
         })
@@ -550,34 +571,12 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
 /// blocks of its own, so the tags are what to read between. A step without them
 /// is a synthetic one (`CONVERSATION_HISTORY`, `CHECKPOINT`) and yields nothing.
 fn first_prompt(transcript: &Path) -> Option<String> {
-    const OPEN: &str = "<USER_REQUEST>";
-    const CLOSE: &str = "</USER_REQUEST>";
-
-    #[derive(Deserialize)]
-    struct Step {
-        #[serde(default)]
-        r#type: String,
-        #[serde(default)]
-        content: String,
-    }
-
-    let body = std::fs::read_to_string(transcript).ok()?;
-    for line in body.lines() {
-        let Ok(step) = serde_json::from_str::<Step>(line) else {
-            continue;
-        };
-        if step.r#type != "USER_INPUT" {
-            continue;
-        }
-        let Some(start) = step.content.find(OPEN) else {
-            continue;
-        };
-        let rest = &step.content[start + OPEN.len()..];
-        let end = rest.find(CLOSE)?;
-        let prompt = super::collapse_whitespace(&rest[..end]);
-        return (!prompt.is_empty()).then_some(prompt);
-    }
-    None
+    use std::io::{BufRead, BufReader};
+    let reader = BufReader::new(std::fs::File::open(transcript).ok()?);
+    reader
+        .split(b'\n')
+        .map_while(Result::ok)
+        .find_map(|line| metadata::user_prompt(&line))
 }
 
 // =============================================================================
@@ -649,6 +648,7 @@ fn parse_status_payload(stdin: &str) -> Result<HookMessage> {
         serde_json::from_str(stdin).context("parsing Antigravity status-line JSON")?;
     Ok(HookMessage {
         event: HookEvent::StatusUpdate,
+        transcript_path: live_transcript_path(payload.conversation_id.as_deref()),
         session_id: payload.conversation_id.filter(|s| !s.trim().is_empty()),
         model: payload.model.and_then(|m| m.id),
         context_tokens: payload
@@ -663,9 +663,6 @@ fn parse_status_payload(stdin: &str) -> Result<HookMessage> {
         cwd: None,
         prompt: None,
         session_title: None,
-        // The feed's transcript_path points at the GUI's state directory even
-        // in the CLI. Never arm a watcher from that incorrect path.
-        transcript_path: None,
         raw: Some(stdin.to_string()),
         session_is_child: None,
     })
@@ -682,6 +679,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         serde_json::from_str(stdin).context("Failed to parse antigravity hook JSON from stdin")?;
     Ok(HookMessage {
         event: normalize_event(event, &payload),
+        transcript_path: live_transcript_path(payload.conversation_id.as_deref()),
         session_id: payload.conversation_id,
         tool_name: payload
             .tool_call
@@ -696,10 +694,6 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Usage arrives through the status-line command, not lifecycle hooks.
         context_tokens: None,
         model: payload.model_name,
-        // Deliberately dropped rather than absent: `transcriptPath` is on every
-        // payload, and returning it would start the launcher's transcript
-        // pipeline over a file we fold nothing out of yet.
-        transcript_path: None,
         raw: Some(stdin.to_string()),
         session_is_child: None,
     })
@@ -1038,8 +1032,10 @@ mod tests {
             "an empty error is success"
         );
         assert!(
-            msg.transcript_path.is_none(),
-            "the path is on the payload and deliberately not forwarded"
+            msg.transcript_path.as_deref().unwrap().ends_with(
+                "brain/65a4b172-9aaa-41cf-b921-bb0bf9f1fe6c/.system_generated/logs/transcript.jsonl"
+            ),
+            "the CLI path is derived from the id"
         );
         assert!(msg.context_tokens.is_none());
     }

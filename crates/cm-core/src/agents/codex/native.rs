@@ -85,11 +85,9 @@ fn state_db_path() -> Option<PathBuf> {
 /// The title store's WAL sidecar — the file whose change means "a title may
 /// have moved". `state_5` runs in WAL mode: writes land here (the main db
 /// updates only on checkpoint), so this is what the host's out-of-band watcher
-/// registers. Watching just this file, not `~/.codex`, keeps the churny
-/// `logs_2.sqlite-wal` telemetry sibling from waking anything. If the WAL is
-/// momentarily absent (before the first write or just after a checkpoint), the
-/// watch fails silently and the title overlay refreshes on the next session
-/// event instead.
+/// selects. The host watches its parent directory and filters to this path,
+/// surviving WAL creation/checkpoint replacement without telemetry siblings
+/// such as `logs_2.sqlite-wal` waking subscribers.
 pub fn title_watch_path() -> Option<PathBuf> {
     // Derive it beside `state_5.sqlite` rather than resolving the sidecar on its
     // own: a checkpoint regularly deletes the wal, and an absent sidecar must
@@ -355,6 +353,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
         // Codex recomputes from a bounded tail each refresh — no incremental
         // cursor to carry.
         cursor: None,
+        antigravity_cursor: None,
     }
 }
 

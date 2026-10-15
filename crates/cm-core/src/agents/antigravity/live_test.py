@@ -8,6 +8,8 @@ import pty
 import select
 import shlex
 import signal
+import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -173,7 +175,24 @@ def approval_pending():
 def checkpoint(phase):
     global offset
     all_events = events()
-    checkpoints.append({'phase': phase, 'events': all_events[offset:]})
+    # Freeze actual files at the observed phase so Rust can check its reader
+    # against startup, in-flight prompts, clear and resume independently.
+    cli = Path(config['home']) / '.gemini/antigravity-cli'
+    snapshot = root / 'checkpoints' / phase
+    snapshot.mkdir(parents=True)
+    sid = next((e['body'].get('conversation_id') or e['body'].get('conversationId')
+                for e in reversed(all_events)
+                if e['body'].get('conversation_id') or e['body'].get('conversationId')), None)
+    if sid:
+        transcript = cli / 'brain' / sid / '.system_generated/logs/transcript.jsonl'
+        if transcript.exists():
+            shutil.copyfile(transcript, snapshot / 'transcript.jsonl')
+        database = cli / 'conversation_summaries.db'
+        if database.exists():
+            with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as source:
+                with sqlite3.connect(snapshot / 'conversation_summaries.db') as dest:
+                    source.backup(dest)
+    checkpoints.append({'phase': phase, 'events': all_events[offset:], 'snapshot': str(snapshot)})
     offset = len(all_events)
 
 
@@ -189,9 +208,24 @@ try:
         for e in current()) and any(e['event'] == 'stop' for e in current()))
     conversation = next(e['body']['conversation_id'] for e in current()
                         if e['event'] == 'status-update' and e['body'].get('conversation_id'))
+    def current_title():
+        database = Path(config['home']) / '.gemini/antigravity-cli/conversation_summaries.db'
+        if not database.exists():
+            return None
+        try:
+            with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as conn:
+                return conn.execute('SELECT title FROM conversation_summaries WHERE conversation_id = ?',
+                                    (conversation,)).fetchone()
+        except sqlite3.Error:
+            return None
+    terminal.wait('generated title persisted', lambda: current_title() == ('Local fixture response.',))
     checkpoint('complete')
+    terminal.prompt('/rename Renamed fixture')
+    terminal.wait('rename persisted without another turn', lambda: current_title() == ('Renamed fixture',))
+    checkpoint('rename')
     terminal.prompt('cancel_fixture')
     terminal.wait('delayed request in flight', lambda: delayed_request.is_set() and status('working'))
+    checkpoint('working')
     terminal.send(b'\x1b')
     terminal.wait('idle after Escape', lambda: status('idle'))
     checkpoint('cancel')

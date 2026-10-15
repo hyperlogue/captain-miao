@@ -34,7 +34,7 @@ use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCach
 /// authority on the names. Both binaries' clap enums must spell it the same way;
 /// each has a test that parses an argv built here to make sure they do.
 pub const LAUNCH_VERB: &str = "launch";
-use crate::agents::codex;
+use crate::agents::{antigravity, codex};
 use crate::paths;
 use crate::session_flags::SessionFlagsStore;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus};
@@ -126,20 +126,20 @@ impl LaunchPlan {
 }
 
 // =============================================================================
-// Codex thread titles
+// Host-owned session titles
 // =============================================================================
 
 /// Bound reads during WAL churn without making a rename visibly lag. A change
 /// inside the window schedules one reload at its end, even if nothing else
 /// happens. New launchers, thread switches and status transitions read eagerly.
-const CODEX_TITLE_REFRESH_FLOOR: Duration = Duration::from_secs(1);
+const TITLE_REFRESH_FLOOR: Duration = Duration::from_secs(1);
 
-/// The per-host Codex title cache behind [`LocalBackend`]'s overlay. Exactly
+/// The per-host, per-agent title cache behind [`LocalBackend`]'s overlay. Exactly
 /// one exists per host process (the dashboard's local backend, or the daemon's
 /// server-core shared across every connection), so there is a **single sqlite
-/// reader per host** no matter how many Codex sessions run.
+/// reader per host** no matter how many sessions of that agent run.
 #[derive(Default)]
-struct CodexTitles {
+struct SessionTitles {
     /// session id → title at the last read. `None` = queried, no usable title
     /// row yet — the entry still marks the id *known*, so an untitled session
     /// doesn't re-trigger the first-sight read on every overlay pass.
@@ -170,13 +170,17 @@ impl Drop for TitleRetry {
     }
 }
 
-/// Stamp cached titles onto the Codex rows (matched by session id), leaving
-/// every other row — and untitled Codex rows — untouched so the display falls
+/// Stamp cached titles onto matching agent/session rows, leaving
+/// every other row and untitled sessions untouched so the display falls
 /// through to the folded first prompt. Split from the cache upkeep for tests.
-fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<String>>) {
+fn stamp_titles(
+    agent: AgentControl,
+    sessions: &mut [LauncherState],
+    titles: &HashMap<String, Option<String>>,
+) {
     for s in sessions
         .iter_mut()
-        .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
+        .filter(|s| s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native()))
     {
         if let Some(title) = s
             .session_id
@@ -194,14 +198,14 @@ fn stamp_titles(sessions: &mut [LauncherState], titles: &HashMap<String, Option<
 // =============================================================================
 
 /// In-process backend: read the local filesystem and signal local processes
-/// directly. Owns the per-agent session-name cache and the per-host Codex
-/// title overlay (per-host state that a remote backend keeps on its own
+/// directly. Owns the per-agent session-name cache and the per-host
+/// title overlays (per-host state that a remote backend keeps on its own
 /// server). Also the server-core (see module docs), so `miao-server`
 /// calls the same operations.
 #[derive(Default)]
 pub struct LocalBackend {
     session_index_caches: HashMap<AgentControl, SessionIndexCache>,
-    codex_titles: Mutex<CodexTitles>,
+    title_caches: Mutex<HashMap<AgentControl, SessionTitles>>,
     /// The owning host's existing change channel. Deferred title reads and
     /// automatic flag writes wake it so every subscriber can refresh.
     change_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -265,7 +269,7 @@ impl LocalBackend {
 
     pub fn list_sessions(&self) -> Vec<LauncherState> {
         let mut sessions = self.read_flagged_sessions();
-        self.overlay_codex_titles(&mut sessions);
+        self.overlay_titles(&mut sessions);
         // Every path leaving the backend is host-canonical, so the client can
         // display it verbatim and hand it straight back (§3).
         for s in sessions.iter_mut() {
@@ -319,39 +323,49 @@ impl LocalBackend {
         }
     }
 
-    /// Overlay Codex display names from the host's single title cache onto the
-    /// rows. Codex stores titles (renames *and* its own auto-titles) in
-    /// `state_5.sqlite` only — no hook, no rollout line — so this per-host
+    /// Overlay Codex and Antigravity names from one cache per agent/host.
+    /// Both store titles independently of hooks and transcripts, so this
     /// reader stamps them onto `name` before the sessions are served, which
     /// reaches remote rows for free (the daemon's `LocalBackend` overlays
-    /// before `Snapshot`/`Delta`). No Codex sessions means no store IO; otherwise
-    /// one batched read-only query runs when the store mtime changes, at most
+    /// before `Snapshot`/`Delta`). No sessions of that agent means no store IO;
+    /// otherwise one batched read runs when the store mtime changes, at most
     /// once per second except on launch, thread switch or status change. Those
     /// lifecycle boundaries read eagerly even if the store stamp is unchanged,
     /// so restarting a known thread cannot retain an earlier cached miss.
     /// A deferred change arms one reload through the host's notifier. Its
     /// deadline stays fixed during a burst, so an idle rename arrives without
     /// another event and a busy store cannot keep postponing the refresh.
-    fn overlay_codex_titles(&self, sessions: &mut [LauncherState]) {
-        self.overlay_codex_titles_with(
+    fn overlay_titles(&self, sessions: &mut [LauncherState]) {
+        self.overlay_titles_with(
+            AgentControl::Codex,
             sessions,
             codex::title_store_mtimes,
             codex::read_thread_titles,
         );
+        self.overlay_titles_with(
+            AgentControl::Antigravity,
+            sessions,
+            antigravity::title_store_mtimes,
+            antigravity::read_titles,
+        );
     }
 
-    fn overlay_codex_titles_with(
+    fn overlay_titles_with(
         &self,
+        agent: AgentControl,
         sessions: &mut [LauncherState],
         store_stamp: impl FnOnce() -> (Option<SystemTime>, Option<SystemTime>),
         read_titles: impl FnOnce(&[String]) -> HashMap<String, String>,
     ) {
         let ids: Vec<String> = sessions
             .iter()
-            .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
+            .filter(|s| {
+                s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native())
+            })
             .filter_map(|s| s.session_id.clone())
             .collect();
-        let mut cache = self.codex_titles.lock().unwrap();
+        let mut caches = self.title_caches.lock().unwrap();
+        let cache = caches.entry(agent).or_default();
         if cache
             .retry
             .as_ref()
@@ -367,7 +381,9 @@ impl LocalBackend {
         }
         let live: HashMap<_, _> = sessions
             .iter()
-            .filter(|s| s.agent == AgentControl::Codex && s.codex_mode.is_native())
+            .filter(|s| {
+                s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native())
+            })
             .filter_map(|s| Some(((s.launcher_pid, s.session_id.clone()?), s.status.clone())))
             .collect();
         let eager = live
@@ -375,7 +391,7 @@ impl LocalBackend {
             .any(|(key, status)| cache.sessions.get(key) != Some(status));
         cache.sessions = live;
         let stamp = store_stamp();
-        let next_read = cache.last_read.map(|t| t + CODEX_TITLE_REFRESH_FLOOR);
+        let next_read = cache.last_read.map(|t| t + TITLE_REFRESH_FLOOR);
         let changed = stamp != cache.store_stamp;
         if eager || (changed && next_read.is_none_or(|t| Instant::now() >= t)) {
             // Keep any armed wake: this read may serve a newly subscribing
@@ -408,7 +424,7 @@ impl LocalBackend {
                 cache.retry = Some(TitleRetry { fired, task });
             }
         }
-        stamp_titles(sessions, &cache.titles);
+        stamp_titles(agent, sessions, &cache.titles);
     }
 
     pub fn session_index(&mut self) -> SessionIndex {
@@ -703,7 +719,8 @@ mod tests {
             name: Some("RPC title".into()),
             ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
         }];
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || panic!("app-server mode must not stat native SQLite"),
             |_| panic!("app-server mode must not query native SQLite"),
@@ -712,6 +729,54 @@ mod tests {
     }
     use super::*;
     use crate::state::SessionStatus;
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_titles_share_a_throttled_cache_separate_from_codex() {
+        let wakes = Arc::new(AtomicBool::new(false));
+        let signal = wakes.clone();
+        let backend = LocalBackend::new().with_change_notifier(move || {
+            signal.store(true, Ordering::Relaxed);
+        });
+        let mut sessions: Vec<_> = (0..16)
+            .map(|pid| {
+                let mut s = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+                s.launcher_pid = pid;
+                s.session_id = Some(format!("session-{pid}"));
+                s
+            })
+            .collect();
+        let mut codex = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        codex.session_id = Some("session-0".into());
+        codex.name = Some("Codex title".into());
+        sessions.push(codex);
+        let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
+        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, stamp, |ids| {
+            assert_eq!(ids.len(), 16);
+            ids.iter()
+                .map(|id| (id.clone(), format!("Title {id}")))
+                .collect()
+        });
+        for _ in 0..20 {
+            backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, stamp, |_| {
+                panic!("unchanged store/subscriber must reuse the shared cache")
+            });
+        }
+        let changed = || (None, Some(SystemTime::UNIX_EPOCH));
+        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, changed, |_| {
+            panic!("busy store must defer its read")
+        });
+        tokio::time::advance(TITLE_REFRESH_FLOOR).await;
+        tokio::task::yield_now().await;
+        assert!(
+            wakes.load(Ordering::Relaxed),
+            "idle rename must schedule its own refresh"
+        );
+        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, changed, |_| {
+            HashMap::from([("session-0".into(), "Renamed".into())])
+        });
+        assert_eq!(sessions[0].name.as_deref(), Some("Renamed"));
+        assert_eq!(sessions[16].name.as_deref(), Some("Codex title"));
+    }
 
     /// The picker sends back what it was shown, and what it was shown came out
     /// of `recent_dirs` — i.e. collapsed. So the match has to be made in that
@@ -766,7 +831,9 @@ mod tests {
             })
             .collect();
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| HashMap::new());
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+            HashMap::new()
+        });
 
         // Restart resumes the same Codex threads under new launchers. A
         // missing cached title must not survive this lifecycle boundary just
@@ -776,7 +843,7 @@ mod tests {
         }
         let reads = std::cell::Cell::new(0);
         for _subscriber in 0..2 {
-            backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
                 reads.set(reads.get() + 1);
                 assert_eq!(ids.len(), 8, "restart all shares one batch");
                 ids.iter()
@@ -802,7 +869,9 @@ mod tests {
         let mut sessions = [codex_state(Some("starting-session"))];
         sessions[0].status = SessionStatus::Starting;
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| HashMap::new());
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+            HashMap::new()
+        });
 
         // Startup, a new turn, an approval prompt, and completion are useful
         // chances to recover a stale title even if its watcher missed a write.
@@ -814,7 +883,7 @@ mod tests {
         ] {
             sessions[0].status = status.clone();
             let title = format!("Title at {status:?}");
-            backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
                 HashMap::from([("starting-session".into(), title.clone())])
             });
             assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
@@ -823,7 +892,7 @@ mod tests {
             // ordinary cache hits, as is another dashboard's same snapshot.
             sessions[0].name = None;
             sessions[0].updated_at += 1;
-            backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
                 panic!("an unchanged lifecycle must reuse the eager read")
             });
             assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
@@ -840,15 +909,22 @@ mod tests {
                 Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(revision)),
             )
         };
-        backend.overlay_codex_titles_with(&mut sessions, || stamp(0), |_| HashMap::new());
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
+            &mut sessions,
+            || stamp(0),
+            |_| HashMap::new(),
+        );
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || stamp(1),
             |_| panic!("an ordinary store write must be throttled"),
         );
         tokio::time::advance(Duration::from_millis(500)).await;
         sessions[0].status = SessionStatus::Active;
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || stamp(1),
             |_| HashMap::from([("session".into(), "Eager title".into())]),
@@ -858,7 +934,8 @@ mod tests {
             .await
             .expect("other subscribers still need their original wake")
             .unwrap();
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || stamp(2),
             |_| panic!("the eager read starts a new throttle window"),
@@ -867,7 +944,8 @@ mod tests {
             .await
             .expect("a later store change still needs its own wake")
             .unwrap();
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || stamp(2),
             |_| HashMap::from([("session".into(), "Later title".into())]),
@@ -886,7 +964,8 @@ mod tests {
             if tick > 0 {
                 tokio::time::advance(Duration::from_millis(100)).await;
             }
-            backend.overlay_codex_titles_with(
+            backend.overlay_titles_with(
+                AgentControl::Codex,
                 &mut sessions,
                 || {
                     (
@@ -909,10 +988,11 @@ mod tests {
             .await
             .expect("continuous writes must not starve the refresh")
             .unwrap();
-        assert_eq!(Instant::now() - start, CODEX_TITLE_REFRESH_FLOOR);
+        assert_eq!(Instant::now() - start, TITLE_REFRESH_FLOOR);
         other_changes.try_recv().expect("wake every subscriber");
         for _subscriber in 0..2 {
-            backend.overlay_codex_titles_with(
+            backend.overlay_titles_with(
+                AgentControl::Codex,
                 &mut sessions,
                 || (None, Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(9))),
                 |_| {
@@ -935,7 +1015,8 @@ mod tests {
         let (backend, mut changes) = title_backend_with_notifications();
         let mut sessions = [codex_state(Some("renamed-session"))];
         let stamp = SystemTime::UNIX_EPOCH;
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || (Some(stamp), Some(stamp)),
             |_| HashMap::from([("renamed-session".into(), "Original title".into())]),
@@ -945,7 +1026,7 @@ mod tests {
         // A rename is the only event: the agent stays idle and writes no
         // launcher state. Defer the read, but schedule a wake to finish it.
         let renamed_stamp = || (Some(stamp), Some(stamp + Duration::from_nanos(1)));
-        backend.overlay_codex_titles_with(&mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("a rename inside the throttle window must defer its read")
         });
         assert_eq!(sessions[0].name.as_deref(), Some("Original title"));
@@ -953,7 +1034,7 @@ mod tests {
             .await
             .expect("an idle rename needs a retry without any more file events")
             .unwrap();
-        backend.overlay_codex_titles_with(&mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
             HashMap::from([("renamed-session".into(), "Renamed title".into())])
         });
         assert_eq!(sessions[0].name.as_deref(), Some("Renamed title"));
@@ -963,13 +1044,14 @@ mod tests {
     async fn codex_new_session_read_keeps_the_pending_wake_for_other_subscribers() {
         let (backend, mut changes) = title_backend_with_notifications();
         let mut sessions = vec![codex_state(Some("first-session"))];
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || (None, Some(SystemTime::UNIX_EPOCH)),
             |_| HashMap::from([("first-session".into(), "Original title".into())]),
         );
         let renamed_stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_codex_titles_with(&mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("the rename should be deferred")
         });
 
@@ -977,10 +1059,10 @@ mod tests {
         // Existing subscribers still hold the original title, so their pending
         // notification must survive both this read and an unchanged-store pass.
         sessions.push(codex_state(Some("new-session")));
-        backend.overlay_codex_titles_with(&mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
             HashMap::from([("first-session".into(), "Renamed title".into())])
         });
-        backend.overlay_codex_titles_with(&mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("the title store is already cached")
         });
         tokio::time::timeout(Duration::from_millis(1100), changes.recv())
@@ -1008,12 +1090,14 @@ mod tests {
                     // write that needs its own retry inside the next window.
                     let backend = weak.upgrade().unwrap();
                     let mut sessions = [codex_state(Some("busy-session"))];
-                    backend.overlay_codex_titles_with(
+                    backend.overlay_titles_with(
+                        AgentControl::Codex,
                         &mut sessions,
                         || stamp(1),
                         |_| HashMap::new(),
                     );
-                    backend.overlay_codex_titles_with(
+                    backend.overlay_titles_with(
+                        AgentControl::Codex,
                         &mut sessions,
                         || stamp(2),
                         |_| panic!("the next change must be throttled too"),
@@ -1023,8 +1107,14 @@ mod tests {
             })
         });
         let mut sessions = [codex_state(Some("busy-session"))];
-        backend.overlay_codex_titles_with(&mut sessions, || stamp(0), |_| HashMap::new());
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
+            &mut sessions,
+            || stamp(0),
+            |_| HashMap::new(),
+        );
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut sessions,
             || stamp(1),
             |_| panic!("the first change should be deferred"),
@@ -1042,12 +1132,14 @@ mod tests {
         for drop_backend in [false, true] {
             let (backend, mut changes) = title_backend_with_notifications();
             let mut sessions = [codex_state(Some("ending-session"))];
-            backend.overlay_codex_titles_with(
+            backend.overlay_titles_with(
+                AgentControl::Codex,
                 &mut sessions,
                 || (None, Some(SystemTime::UNIX_EPOCH)),
                 |_| HashMap::new(),
             );
-            backend.overlay_codex_titles_with(
+            backend.overlay_titles_with(
+                AgentControl::Codex,
                 &mut sessions,
                 || (Some(SystemTime::UNIX_EPOCH), None),
                 |_| panic!("a changed store should be throttled"),
@@ -1055,7 +1147,8 @@ mod tests {
             if drop_backend {
                 drop(backend);
             } else {
-                backend.overlay_codex_titles_with(
+                backend.overlay_titles_with(
+                    AgentControl::Codex,
                     &mut [],
                     || panic!("no sessions should mean no store IO"),
                     |_| panic!("no sessions should mean no read"),
@@ -1074,14 +1167,14 @@ mod tests {
         let backend = LocalBackend::default();
         let mut sessions = vec![codex_state(Some("first-session"))];
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
             assert_eq!(ids, ["first-session"]);
             HashMap::from([("first-session".into(), "First title".into())])
         });
 
         // A state-file event does not query the unchanged title store.
         sessions[0].name = None;
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
             panic!("unchanged store should use cached titles")
         });
         assert_eq!(sessions[0].name.as_deref(), Some("First title"));
@@ -1089,28 +1182,38 @@ mod tests {
         // A new session must be queried even if the database has not changed.
         // An absent title is cached too, so that id will not trigger more reads.
         sessions.push(codex_state(Some("untitled-session")));
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |ids| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
             assert_eq!(ids, ["first-session", "untitled-session"]);
             HashMap::from([("first-session".into(), "First title".into())])
         });
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
             panic!("untitled sessions should also be cached")
         });
         assert_eq!(sessions[1].name, None);
 
         sessions.remove(0);
-        backend.overlay_codex_titles_with(&mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
             panic!("removing a session does not need another read")
         });
-        assert_eq!(backend.codex_titles.lock().unwrap().titles.len(), 1);
+        assert_eq!(
+            backend.title_caches.lock().unwrap()[&AgentControl::Codex]
+                .titles
+                .len(),
+            1
+        );
 
         // Hosts without Codex sessions do not even stat the title store.
-        backend.overlay_codex_titles_with(
+        backend.overlay_titles_with(
+            AgentControl::Codex,
             &mut [],
             || panic!("no Codex sessions should mean no store IO"),
             |_| panic!("no Codex sessions should mean no title reads"),
         );
-        assert!(backend.codex_titles.lock().unwrap().titles.is_empty());
+        assert!(
+            backend.title_caches.lock().unwrap()[&AgentControl::Codex]
+                .titles
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1127,7 +1230,7 @@ mod tests {
             codex_state(None),
             claude,
         ];
-        stamp_titles(&mut sessions, &titles);
+        stamp_titles(AgentControl::Codex, &mut sessions, &titles);
         // Titled Codex row gets the sqlite title on `name`.
         assert_eq!(sessions[0].name.as_deref(), Some("My Rename"));
         // Untitled / id-less Codex rows keep `name` empty → first-prompt shows.

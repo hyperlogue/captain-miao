@@ -46,7 +46,12 @@ fn startup_and_cancelled_turns_settle_without_a_stop_hook() {
     assert_eq!(state.context_tokens, Some(17288));
     assert_eq!(state.session_id.as_deref(), Some("conversation-a"));
     assert_eq!(state.model.as_deref(), Some("Gemini 3.1 Pro (Low)"));
-    assert!(snapshot("idle", 42).transcript_path.is_none());
+    assert!(
+        snapshot("idle", 42)
+            .transcript_path
+            .unwrap()
+            .ends_with("brain/conversation-a/.system_generated/logs/transcript.jsonl")
+    );
     dispatch_hook(&mut state, snapshot("idle", 42));
     assert_eq!(
         state.context_tokens,

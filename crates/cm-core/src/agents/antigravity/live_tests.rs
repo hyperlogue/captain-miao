@@ -103,6 +103,8 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
         }
         match phase {
             "startup" => assert_eq!(state.status, SessionStatus::Idle),
+            "rename" => assert_eq!(state.status, SessionStatus::Idle),
+            "working" => assert_eq!(state.status, SessionStatus::Active),
             "complete" => {
                 assert_eq!(state.status, SessionStatus::Idle);
                 assert!(state.context_tokens.is_some_and(|n| n > 0));
@@ -117,7 +119,6 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                     !events.iter().any(|e| e["event"] == "stop"),
                     "probe must exercise cancellation without Stop"
                 );
-                assert!(events.iter().any(|e| e["body"]["agent_state"] == "working"));
                 assert_eq!(state.status, SessionStatus::Idle, "{checkpoint}");
             }
             "approval" | "accept-approval" => {
@@ -140,6 +141,29 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
             }
             other => panic!("unexpected phase {other}"),
         }
+        let snapshot = Path::new(checkpoint["snapshot"].as_str().unwrap());
+        let stats = read_transcript_stats(&snapshot.join("transcript.jsonl"), None);
+        let expected_prompt = match phase {
+            "startup" | "clear" => None,
+            "complete" | "rename" => Some("completion_fixture"),
+            "working" | "cancel" => Some("cancel_fixture"),
+            "approval" | "cancel-approval" => Some("approval_fixture"),
+            _ => Some("accept_fixture"),
+        };
+        assert_eq!(stats.last_prompt.as_deref(), expected_prompt, "{phase}");
+        if let Some(id) = state.session_id.as_ref() {
+            let titles = metadata::read_titles_at(snapshot, std::slice::from_ref(id));
+            let expected_title = match phase {
+                "startup" | "clear" => None,
+                "complete" => Some("Local fixture response."),
+                _ => Some("Renamed fixture"),
+            };
+            assert_eq!(
+                titles.get(id).map(String::as_str),
+                expected_title,
+                "{phase}"
+            );
+        }
     }
     assert_eq!(
         std::fs::read_to_string(cli.join("settings.json")).unwrap(),
@@ -150,6 +174,7 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
         candidates
             .iter()
             .any(|c| Some(&c.session_id) == conversation.as_ref()
-                && c.first_prompt.as_deref() == Some("completion_fixture"))
+                && c.first_prompt.as_deref() == Some("completion_fixture")
+                && c.custom_title.as_deref() == Some("Renamed fixture"))
     );
 }

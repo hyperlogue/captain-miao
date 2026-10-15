@@ -436,6 +436,7 @@ impl StatsCursor {
             context_window: None,
             cwd: self.cwd.clone(),
             cursor: Some(self),
+            antigravity_cursor: None,
         }
     }
 }

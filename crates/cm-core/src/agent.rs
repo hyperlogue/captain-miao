@@ -646,10 +646,8 @@ impl AgentControl {
             // payload, and nothing of ours reads a Pi file at all. There is no
             // file whose change could make a Pi row stale.
             AgentControl::Pi => vec![],
-            // Nothing, on the same footing: an Antigravity row's id, model and
-            // status all ride hook payloads. Its conversation store *does*
-            // change constantly, and holds nothing the dashboard reads.
-            AgentControl::Antigravity => vec![],
+            // Auto-titles and renames land in SQLite, independently of hooks.
+            AgentControl::Antigravity => antigravity::title_watch_paths(),
             // Nothing, and for the strongest reason of any backend, the same as
             // pi's: every fact an omp row carries — status, title, tokens,
             // model — rides a hook payload. `list_resumable` does read omp's
@@ -713,9 +711,8 @@ impl AgentControl {
             // write the host already watches. Codex needs one only because its
             // rename lands in sqlite with no hook at all.
             AgentControl::Pi => vec![],
-            // Session titles are not read from Antigravity's store yet.
-            // Other facts arrive through hooks and status snapshots.
-            AgentControl::Antigravity => vec![],
+            // The host overlays SQLite titles before serving local/remote rows.
+            AgentControl::Antigravity => antigravity::title_watch_paths(),
             // Nothing, for pi's reason: the title arrives on the *next hook
             // payload* — a `sessions/` write the host already watches. Codex
             // needs an entry here only because its rename lands in sqlite with
@@ -818,9 +815,8 @@ impl AgentControl {
             // path, which is what makes this consistent rather than merely
             // unimplemented: one fact, one source.
             AgentControl::Pi => TranscriptStats::default(),
-            // Context usage and model arrive through the status observer.
-            // No live transcript fold is needed for those facts.
-            AgentControl::Antigravity => TranscriptStats::default(),
+            // Only prompts: usage/model still come from status snapshots.
+            AgentControl::Antigravity => antigravity::read_transcript_stats(transcript, prior),
             // Unreachable, for pi's decision rather than his schema: omp's
             // session file is a tree, not a log (the same `id`/`parentId` shape
             // pi's docs describe), so a correct fold would walk back from the
@@ -1123,11 +1119,8 @@ impl AgentControl {
             // case that forced Codex to read its rollout cannot arise. Pi's
             // transcript is read only for the resume picker, never live status.
             AgentControl::Pi => TranscriptScan::default(),
-            // Empty for the reason Codex's is not: the one signal worth
-            // reading a transcript for is an interrupt, and Antigravity's
-            // records none — a cancelled turn is an ordinary `DONE` step. So
-            // `agents::antigravity` supplies no transcript path, and there is
-            // no file here to scan.
+            // The log supplies prompts only; cancellation comes from status
+            // snapshots, so no second read for activity signals is needed.
             AgentControl::Antigravity => TranscriptScan::default(),
             // Empty, for pi's reason reached via `agent_end`: omp's turn-end
             // event fires on an abort too (`stopReason === "aborted"` calls the
@@ -1225,9 +1218,8 @@ impl AgentControl {
             // this would be asked — the Kimi standing, reached from an
             // extension call rather than a documented payload field.
             AgentControl::Pi => None,
-            // Antigravity's title store is not integrated yet; the lifecycle
-            // and status payloads supply no title. The resume picker uses
-            // the opening request.
+            // Titles are keyed by conversation id, overlaid by the host's
+            // shared SQLite cache rather than a per-pid session file.
             AgentControl::Antigravity => None,
             // `None` for pi's reason: `pi.getSessionName()` rides every hook
             // payload as `session_title` and is already on `LauncherState.name`
@@ -1337,8 +1329,10 @@ impl AgentControl {
             // want of one, so the launcher starts no watch of either kind for a
             // Pi session and there is no poll for this to configure.
             AgentControl::Pi => None,
-            // Moot for the same reason, and by the same decision: no transcript
-            // path reaches the launcher, so neither watch starts.
+            // The CLI appends its log. As with Kimi, conservatively use a
+            // busy-only poll on macOS (not verified there); Linux receives
+            // inotify writes directly.
+            AgentControl::Antigravity if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
             AgentControl::Antigravity => None,
             // Moot, and by the same decision as pi's: `agents::omp` supplies no
             // transcript path, so the launcher starts no watch of either kind
@@ -1680,10 +1674,9 @@ pub struct TranscriptStats {
     /// backends whose title arrives some other way (Claude's session file,
     /// Codex sqlite, a hook payload).
     pub name: Option<String>,
-    /// Fill for [`crate::state::LauncherState::last_prompt`] from a sidecar
-    /// recap (Grok's `last_turn_summary`). Applied only when the row is not
-    /// mid-turn, so a `PromptSubmit` value is left alone until the turn ends.
-    /// `None` for backends whose last prompt arrives only on the hook.
+    /// Latest prompt from Antigravity's log, or Grok's sidecar recap. The
+    /// recap is applied only at rest to preserve a live hook's user prompt;
+    /// Antigravity's actual prompt is also applied during a turn.
     pub last_prompt: Option<String>,
     /// The directory the agent's latest turn ran in, when the fold reads one
     /// (Claude stamps `cwd` on every transcript entry). Stamped onto
@@ -1704,6 +1697,8 @@ pub struct TranscriptStats {
     /// tail) and before the first parse. Opaque to the dashboard, which reads
     /// only the two fields above.
     pub cursor: Option<claude::StatsCursor>,
+    /// Antigravity prompt-log cursor; no token/model accumulators.
+    pub antigravity_cursor: Option<antigravity::PromptCursor>,
 }
 
 impl TranscriptStats {

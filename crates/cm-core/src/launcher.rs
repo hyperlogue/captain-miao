@@ -958,6 +958,13 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 {
                     let path = PathBuf::from(p);
                     if transcript_path.as_ref() != Some(&path) {
+                        if agent == AgentControl::Antigravity {
+                            state.first_prompt = None;
+                            state.last_prompt = None;
+                            transcript_data = None;
+                            transcript_path = None;
+                            transcript_watcher = None;
+                        }
                         let adopted = if agent.transcript_poll_interval().is_some() {
                             transcript_watcher = None;
                             true
@@ -1577,20 +1584,22 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
     // Grok's `last_turn_summary`: the glance column on an idle/resumed row.
     // Skip while the turn is in flight — `PromptSubmit` just wrote the user's
     // question, and a sidecar rewrite from the *previous* turn must not
-    // clobber it. Waiting/compacting count as in-flight too.
+    // clobber it. Waiting/compacting count as in-flight too. Antigravity folds
+    // the actual user input, so its prompt also updates during a turn.
     if let Some(prompt) = data
         .last_prompt
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        && !matches!(
-            state.status,
-            SessionStatus::Active
-                | SessionStatus::Compacting
-                | SessionStatus::WaitingForApproval
-                | SessionStatus::WaitingForDecision
-                | SessionStatus::BackgroundActive
-        )
+        && (state.agent == AgentControl::Antigravity
+            || !matches!(
+                state.status,
+                SessionStatus::Active
+                    | SessionStatus::Compacting
+                    | SessionStatus::WaitingForApproval
+                    | SessionStatus::WaitingForDecision
+                    | SessionStatus::BackgroundActive
+            ))
         && state.last_prompt.as_deref() != Some(prompt)
     {
         state.last_prompt = Some(prompt.to_string());
@@ -3140,6 +3149,39 @@ mod tests {
         active.last_prompt = Some("make it darker".into());
         assert!(!apply_transcript_data(&mut active, &recap));
         assert_eq!(active.last_prompt.as_deref(), Some("make it darker"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_prompt_appends_update_working_and_waiting_rows() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut data = None;
+        let mut offset = 0;
+        let mut held = false;
+        let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+        for (status, prompt) in [
+            (SessionStatus::Active, "first"),
+            (SessionStatus::WaitingForApproval, "next"),
+        ] {
+            state.status = status.clone();
+            writeln!(file, "{}", serde_json::json!({"type":"USER_INPUT", "content":format!("<USER_REQUEST>{prompt}</USER_REQUEST>")})).unwrap();
+            assert!(
+                rescan_transcript(
+                    AgentControl::Antigravity,
+                    &path,
+                    &mut offset,
+                    &mut data,
+                    &mut held,
+                    &mut state
+                )
+                .await
+            );
+            assert_eq!(state.last_prompt.as_deref(), Some(prompt));
+            assert_eq!(state.first_prompt.as_deref(), Some("first"));
+            assert_eq!(state.status, status, "prompt reads do not change activity");
+        }
     }
 
     /// The settings file carries every backend's format, so it must be
