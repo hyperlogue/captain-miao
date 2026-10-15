@@ -994,11 +994,11 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                             // resumed session aren't replayed as fresh.
                             let scan = agent.scan_transcript_signals(&path, 0);
                             transcript_offset = scan.new_offset;
-                            // Fold the derived fields from the top so a
+                            // Seed the derived fields so a
                             // resumed/idle session shows context, model,
                             // title, and first prompt before its next write.
-                            // (Synchronous like the seed scan above — the same
-                            // one-shot whole-file read at path set.)
+                            // (Synchronous one-shot initialization; the backend
+                            // chooses a full scan or head/tail reads.)
                             let data = agent.read_transcript_stats(&path, None);
                             apply_transcript_data(state, &data);
                             transcript_data = Some(data);

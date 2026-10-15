@@ -763,8 +763,9 @@ impl AgentControl {
     /// is the previously folded value for this session, if any: Claude folds only
     /// the transcript bytes appended since `prior`'s cursor (so an active session
     /// isn't rescanned end-to-end), while Codex recomputes stats from a bounded
-    /// tail but reuses `prior`'s first prompt once found. The launcher folds this
-    /// and stamps the fields onto the session's state file, so the dashboard never
+    /// tail but reuses `prior`'s first prompt once found. Antigravity seeds its
+    /// prompts from the log's head and tail, then reads appends. The launcher
+    /// stamps the fields onto the session's state file, so the dashboard never
     /// reads a transcript itself. Fields are None before the first relevant entry
     /// (no assistant turn → no `context_tokens`/`model`; no rename → no `name`).
     pub fn read_transcript_stats(

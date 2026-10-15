@@ -1,9 +1,10 @@
 //! Prompt logs are append-only; titles live in a separate SQLite store.
-//! The launcher reads only new log bytes. The host shares one cached title
-//! reader across its sessions, including remote subscribers.
+//! The launcher seeds prompts from the log's ends, then reads only new bytes.
+//! The host shares one cached title reader across its sessions, including
+//! remote subscribers.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -49,6 +50,73 @@ pub(super) fn user_prompt(line: &[u8]) -> Option<String> {
     (!prompt.is_empty()).then_some(prompt)
 }
 
+const PROMPT_READ_BLOCK: usize = 8 * 1024;
+
+/// Stop the head read at the first real prompt, then search backward for the
+/// latest one. Typical resumes read two small blocks regardless of history
+/// size. A long tool-only suffix may require more backward blocks; there is
+/// no fixed cutoff that could silently substitute an older prompt.
+///
+/// Read only the statted length so concurrent appends remain for the cursor.
+/// The returned offset excludes any incomplete final JSONL record.
+fn read_prompt_ends(file: &mut (impl Read + Seek), len: u64) -> io::Result<(TranscriptStats, u64)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut stats = TranscriptStats::default();
+    let mut head_end = 0;
+    {
+        let mut reader = BufReader::with_capacity(PROMPT_READ_BLOCK, (&mut *file).take(len));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 || !line.ends_with(b"\n") {
+                return Ok((stats, head_end));
+            }
+            head_end += n as u64;
+            if let Some(prompt) = user_prompt(&line) {
+                stats.first_prompt = Some(prompt.clone());
+                stats.last_prompt = Some(prompt);
+                break;
+            }
+        }
+    }
+
+    let mut block = [0; PROMPT_READ_BLOCK];
+    let mut position = len;
+    let mut committed_end = None;
+    let mut reversed_line = Vec::new();
+    while position > head_end {
+        let size = (position - head_end).min(block.len() as u64) as usize;
+        position -= size as u64;
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut block[..size])?;
+        for (i, &byte) in block[..size].iter().enumerate().rev() {
+            if byte == b'\n' {
+                if let Some(end) = committed_end {
+                    reversed_line.reverse();
+                    if let Some(prompt) = user_prompt(&reversed_line) {
+                        stats.last_prompt = Some(prompt);
+                        return Ok((stats, end));
+                    }
+                    reversed_line.clear();
+                } else {
+                    // Discard the unfinished suffix after this last newline.
+                    committed_end = Some(position + i as u64 + 1);
+                }
+            } else if committed_end.is_some() {
+                reversed_line.push(byte);
+            }
+        }
+    }
+    // The first line after the opening prompt has no preceding delimiter in
+    // the searched range: head_end is already just past that delimiter.
+    reversed_line.reverse();
+    if let Some(prompt) = user_prompt(&reversed_line) {
+        stats.last_prompt = Some(prompt);
+    }
+    Ok((stats, committed_end.unwrap_or(head_end)))
+}
+
 pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> TranscriptStats {
     let mut stats = prior.cloned().unwrap_or_default();
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -64,29 +132,35 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
             || meta.len() < c.offset
             || (meta.len() == c.offset && meta.modified().ok() != c.modified)
     });
-    if reset {
-        stats = TranscriptStats::default();
-    }
-    let mut offset = stats.antigravity_cursor.as_ref().map_or(0, |c| c.offset);
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return stats;
-    }
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let Ok(n) = reader.read_until(b'\n', &mut line) else {
-            break;
+    let offset = if reset {
+        let Ok((seed, offset)) = read_prompt_ends(&mut file, meta.len()) else {
+            return TranscriptStats::default();
         };
-        if n == 0 || !line.ends_with(b"\n") {
-            break;
+        stats = seed;
+        offset
+    } else {
+        let mut offset = stats.antigravity_cursor.as_ref().unwrap().offset;
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return stats;
         }
-        offset += n as u64;
-        if let Some(prompt) = user_prompt(&line) {
-            stats.first_prompt.get_or_insert_with(|| prompt.clone());
-            stats.last_prompt = Some(prompt);
+        let mut reader = BufReader::new(file.take(meta.len() - offset));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(n) = reader.read_until(b'\n', &mut line) else {
+                break;
+            };
+            if n == 0 || !line.ends_with(b"\n") {
+                break;
+            }
+            offset += n as u64;
+            if let Some(prompt) = user_prompt(&line) {
+                stats.first_prompt.get_or_insert_with(|| prompt.clone());
+                stats.last_prompt = Some(prompt);
+            }
         }
-    }
+        offset
+    };
     stats.antigravity_cursor = Some(PromptCursor {
         offset,
         device: meta.dev(),
@@ -149,12 +223,119 @@ pub(super) fn read_titles_at(root: &Path, ids: &[String]) -> HashMap<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     fn prompt(text: &str) -> String {
         serde_json::json!({"type":"USER_INPUT", "content":format!(
             "<USER_REQUEST>\n{text}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>private metadata</ADDITIONAL_METADATA>"
         )}).to_string() + "\n"
+    }
+
+    #[test]
+    fn startup_reads_only_head_and_tail_blocks_with_large_history_between() {
+        struct CountReads<'a> {
+            reader: Cursor<&'a [u8]>,
+            bytes: usize,
+        }
+        impl Read for CountReads<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let n = self.reader.read(buffer)?;
+                self.bytes += n;
+                Ok(n)
+            }
+        }
+        impl Seek for CountReads<'_> {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.reader.seek(position)
+            }
+        }
+
+        let body = format!(
+            "{}{}\n{}",
+            prompt("opening"),
+            "x".repeat(4 * 1024 * 1024),
+            prompt("latest")
+        );
+        let mut reader = CountReads {
+            reader: Cursor::new(body.as_bytes()),
+            bytes: 0,
+        };
+        let (stats, offset) = read_prompt_ends(&mut reader, body.len() as u64).unwrap();
+        assert_eq!(stats.first_prompt.as_deref(), Some("opening"));
+        assert_eq!(stats.last_prompt.as_deref(), Some("latest"));
+        assert_eq!(offset, body.len() as u64);
+        assert_eq!(
+            reader.bytes,
+            2 * PROMPT_READ_BLOCK,
+            "startup must skip the history between the prompts"
+        );
+    }
+
+    #[test]
+    fn backward_search_crosses_blocks_and_skips_synthetic_and_partial_records() {
+        let latest = "雪".repeat(PROMPT_READ_BLOCK);
+        for tail_len in [
+            0,
+            1,
+            PROMPT_READ_BLOCK - 1,
+            PROMPT_READ_BLOCK,
+            PROMPT_READ_BLOCK + 1,
+            3 * PROMPT_READ_BLOCK,
+        ] {
+            let mut body = prompt("opening");
+            body.push_str(&prompt(&latest));
+            body.push_str(
+                &serde_json::json!({"type":"TOOL_RESULT", "content":"x".repeat(tail_len)})
+                    .to_string(),
+            );
+            body.push_str("\ninvalid\n{\"type\":\"USER_INPUT\",\"content\":\"CHECKPOINT\"}\n");
+            let committed = body.len() as u64;
+            body.push_str(prompt("not committed yet").trim_end());
+            let (stats, offset) =
+                read_prompt_ends(&mut Cursor::new(body.as_bytes()), body.len() as u64).unwrap();
+            assert_eq!(stats.first_prompt.as_deref(), Some("opening"));
+            assert_eq!(
+                stats.last_prompt.as_deref(),
+                Some(latest.as_str()),
+                "tail length {tail_len}"
+            );
+            assert_eq!(offset, committed);
+        }
+    }
+
+    #[test]
+    fn startup_cursor_retries_uncommitted_input_even_without_an_opening_prompt() {
+        for prefix in [
+            String::new(),
+            prompt("opening"),
+            prompt("opening") + &prompt("latest"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("transcript.jsonl");
+            let pending = prompt("finished later");
+            let split = pending.len() / 2;
+            std::fs::write(&path, prefix.clone() + &pending[..split]).unwrap();
+            let before = read_transcript_stats(&path, None);
+            assert_eq!(
+                before.antigravity_cursor.as_ref().unwrap().offset,
+                prefix.len() as u64
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&pending.as_bytes()[split..]).unwrap();
+            let after = read_transcript_stats(&path, Some(&before));
+            assert_eq!(after.last_prompt.as_deref(), Some("finished later"));
+            assert_eq!(
+                after.first_prompt.as_deref(),
+                Some(if prefix.is_empty() {
+                    "finished later"
+                } else {
+                    "opening"
+                })
+            );
+        }
     }
 
     #[test]
