@@ -9635,7 +9635,9 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
-    let plan = Box::new(cm_core::vcs::PreparedVcsPush::for_test(
+    queue_test_push_commits(
+        app,
+        cwd,
         (0..count)
             .map(|i| cm_core::vcs::VcsCommit {
                 time: "2025-03-05 14:15:16 -0400".into(),
@@ -9643,7 +9645,11 @@ fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
                 subject: format!("Change {i:02}: {} END", "日本語 message ".repeat(12)),
             })
             .collect(),
-    ));
+    );
+}
+
+fn queue_test_push_commits(app: &mut App, cwd: &str, commits: Vec<cm_core::vcs::VcsCommit>) {
+    let plan = Box::new(cm_core::vcs::PreparedVcsPush::for_test(commits));
     let host = crate::state::HostId::local();
     let id = app.notify(
         super::notifications::Level::Info,
@@ -9660,6 +9666,8 @@ fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
 
 #[test]
 fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
+    use crate::config;
+    use ratatui::style::Modifier;
     for (width, height) in [(40, 30), (80, 12), (80, 30), (140, 30)] {
         let mut d = TestDashboard::new(width, height);
         queue_test_push(&mut d.app, "/work/repo", 25);
@@ -9668,7 +9676,7 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
         for text in [
             "Confirm push",
             "25 commits",
-            "2025-03-05 14:15:16 -0400",
+            "2025-03-05 14:15:16",
             "Example Author",
             "Change 00:",
             "…",
@@ -9680,6 +9688,21 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
                 "missing {text} at {width} columns:\n{rendered}"
             );
         }
+        let buffer = d.terminal.backend().buffer();
+        let style = |text| buffer[find_cell(buffer, text).unwrap()].style();
+        let ui = &config::get().colors.ui;
+        assert_eq!(style("25 commits").fg, Some(ui.attention_fg));
+        assert_eq!(style("origin/main").fg, Some(ui.title_fg));
+        assert_eq!(style("y/Y").fg, Some(ui.attention_fg));
+        for text in ["Commit time", "2025-03-05", "/work/repo", "Enter/Esc"] {
+            assert!(style(text).add_modifier.contains(Modifier::DIM), "{text}");
+        }
+        assert!(style("Change 00:").add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !style("Example Author")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert!(!rendered.contains("END"), "long subjects must be truncated");
         assert!(!rendered.contains("Change 24:"));
         assert!(d.press(KeyCode::End).is_none());
@@ -9694,6 +9717,43 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
             let (x, _) = find_cell(d.terminal.backend().buffer(), "Confirm push").unwrap();
             assert!(x > 10);
         }
+    }
+}
+
+#[test]
+fn vcs_confirmation_packs_authors_across_the_whole_table() {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    for longest in ["Li", "日本語の長い名前 Author"] {
+        let mut d = TestDashboard::new(140, 30);
+        let commits = (0..25)
+            .map(|i| cm_core::vcs::VcsCommit {
+                time: "2025-03-05 14:15:16 -0400".into(),
+                author: if i == 24 { longest.into() } else { "Li".into() },
+                subject: format!("Change {i:02}"),
+            })
+            .collect();
+        queue_test_push_commits(&mut d.app, "/work/repo", commits);
+        d.app.show_vcs_confirmation();
+        d.render();
+        let buffer = d.terminal.backend().buffer();
+        let author = find_cell(buffer, "Author").unwrap();
+        let message = find_cell(buffer, "Message").unwrap();
+        assert_eq!(
+            message.0 - author.0,
+            longest.width().max("Author".len()) as u16 + 2
+        );
+        d.press(KeyCode::End);
+        let rendered = d.render();
+        let buffer = d.terminal.backend().buffer();
+        let row = find_cell(buffer, "Change 24").unwrap().1;
+        let mut x = author.0;
+        // TestBackend retains hidden continuation cells under wide glyphs;
+        // inspect visible cells rather than flattening those cells into text.
+        for c in longest.chars() {
+            assert_eq!(buffer[(x, row)].symbol(), c.to_string(), "{rendered}");
+            x += c.width().unwrap_or(0) as u16;
+        }
+        assert_eq!(find_cell(buffer, "Message").unwrap(), message);
     }
 }
 
