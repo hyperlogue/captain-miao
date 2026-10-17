@@ -51,6 +51,7 @@ mod render_backend;
 mod restart;
 mod run;
 mod upgrade_notices;
+mod vcs_confirm;
 
 /// The hosts panel's types stay reachable as `super::X` from every module
 /// that already named them; the panel owns them, `mod.rs` no longer declares
@@ -115,6 +116,7 @@ pub(super) enum InputMode {
     Picker,
     Help,
     Confirm,
+    VcsConfirm,
     /// Modal popup for editing the icon + color of the selected session's
     /// directory. See `DirEditState`.
     DirEdit,
@@ -236,6 +238,8 @@ pub(super) enum Action {
         cwd: String,
         push: bool,
     },
+    /// Execute the exact push reviewed in the commit popup.
+    VcsRun(vcs_confirm::PreparedPush),
     /// Attach a local window to an already-running remote pool session (§5):
     /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
     AttachRemoteRunning {
@@ -334,6 +338,7 @@ impl Action {
             Action::UpgradeHost { .. } => "UpgradeHost",
             Action::GrantConsent(_) => "GrantConsent",
             Action::VcsPrepare { .. } => "VcsPrepare",
+            Action::VcsRun(_) => "VcsRun",
         }
     }
 }
@@ -1167,6 +1172,8 @@ pub(super) struct App {
     pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
     /// One command per checkout; unrelated checkouts can run concurrently.
     pub(super) vcs_commands: HashMap<(HostId, String), notifications::NotificationId>,
+    pub(super) vcs_pushes: std::collections::VecDeque<vcs_confirm::PreparedPush>,
+    pub(super) vcs_scroll: usize,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,
     /// First-draw defaults have been picked based on the initial viewport
@@ -1808,6 +1815,8 @@ impl App {
             session_detail_scroll: 0,
             vcs: HashMap::new(),
             vcs_commands: HashMap::new(),
+            vcs_pushes: std::collections::VecDeque::new(),
+            vcs_scroll: 0,
             detail_visible: true,
             panels_initialized: false,
             drag: None,

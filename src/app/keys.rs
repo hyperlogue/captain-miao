@@ -73,6 +73,7 @@ impl App {
             InputMode::Picker => self.handle_picker_key(key),
             InputMode::Help => self.handle_help_key(key),
             InputMode::Confirm => self.handle_confirm_key(key),
+            InputMode::VcsConfirm => self.handle_vcs_confirm_key(key),
             InputMode::DirEdit => self.handle_dir_edit_key(key),
             InputMode::HostEdit => self.handle_host_edit_key(key),
             InputMode::Messages => {
@@ -89,6 +90,14 @@ impl App {
         }
         if self.upgrade_notices.is_some() {
             return self.handle_upgrade_notices_mouse(mouse);
+        }
+        if self.input_mode == InputMode::VcsConfirm {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_vcs_confirm(-3),
+                MouseEventKind::ScrollDown => self.scroll_vcs_confirm(3),
+                _ => {}
+            }
+            return None;
         }
         if self.input_mode == InputMode::Messages {
             return self.handle_message_log_mouse(mouse);

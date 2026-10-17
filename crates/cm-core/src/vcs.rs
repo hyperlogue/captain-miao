@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 mod command;
 mod process;
-pub use command::{VcsPlan, execute, execute_with_agent, prepare, prepare_with_agent};
+pub use command::{VcsCommit, VcsPlan, execute, execute_with_agent, prepare, prepare_with_agent};
 use process::{GitOut, RunFail, run_git, run_git_read};
 
 pub const STATUS_LIMIT: Duration = Duration::from_secs(30);

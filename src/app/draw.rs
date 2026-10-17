@@ -127,6 +127,9 @@ impl App {
             self.draw_attaching(frame, frame.area());
         }
         self.draw_notifications(frame, body);
+        if self.input_mode == InputMode::VcsConfirm {
+            self.draw_vcs_confirm(frame, frame.area());
+        }
         self.draw_upgrade_notices(frame, frame.area());
         // Resolve image cells only after every overlay has cleared/painted its
         // area, so images cannot leak over preferences, dialogs or notifications.
@@ -1786,6 +1789,12 @@ impl App {
             InputMode::Confirm => {
                 let mut spans = hint_pair("y/Y", "confirm");
                 spans.extend(hint_pair("Enter/Esc/other", "cancel"));
+                spans
+            }
+            InputMode::VcsConfirm => {
+                let mut spans = hint_pair("y/Y", "push");
+                spans.extend(hint_pair("Enter/Esc", "cancel"));
+                spans.extend(hint_pair("↑↓/PgUp/PgDn", "scroll"));
                 spans
             }
             InputMode::DirEdit => {

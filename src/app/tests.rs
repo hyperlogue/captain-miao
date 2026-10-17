@@ -9634,6 +9634,95 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // Leader keys, remaps, and panel toggles
 // =============================================================================
 
+fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
+    let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(true));
+    plan.outgoing_commits = Some(
+        (0..count)
+            .map(|i| cm_core::vcs::VcsCommit {
+                time: "2025-03-05 14:15:16 -0400".into(),
+                author: "Example Author".into(),
+                subject: format!("Change {i:02}: {} END", "日本語 message ".repeat(12)),
+            })
+            .collect(),
+    );
+    let host = crate::state::HostId::local();
+    let id = app.notify(
+        super::notifications::Level::Info,
+        "Awaiting confirmation".into(),
+    );
+    app.vcs_commands.insert((host.clone(), cwd.into()), id);
+    app.vcs_pushes.push_back(super::vcs_confirm::PreparedPush {
+        host,
+        cwd: cwd.into(),
+        plan,
+    });
+}
+
+#[test]
+fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
+    for (width, height) in [(40, 30), (80, 12), (80, 30), (140, 30)] {
+        let mut d = TestDashboard::new(width, height);
+        queue_test_push(&mut d.app, "/work/repo", 25);
+        assert!(d.app.show_vcs_confirmation());
+        let rendered = d.render();
+        for text in [
+            "Confirm push",
+            "25 commits",
+            "2025-03-05 14:15:16 -0400",
+            "Example Author",
+            "Change 00:",
+            "…",
+            "y/Y",
+            "Enter/Esc",
+        ] {
+            assert!(
+                rendered.contains(text),
+                "missing {text} at {width} columns:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("END"), "long subjects must be truncated");
+        assert!(!rendered.contains("Change 24:"));
+        assert!(d.press(KeyCode::End).is_none());
+        let rendered = d.render();
+        assert!(rendered.contains("Change 24:"), "{rendered}");
+        assert!(!rendered.contains("Change 00:"));
+        assert_eq!(d.app.input_mode, InputMode::VcsConfirm);
+        d.press(KeyCode::Home);
+        assert!(d.render().contains("Change 00:"));
+        // The bounded dialog does not grow to fill a wide terminal.
+        if width == 140 {
+            let (x, _) = find_cell(d.terminal.backend().buffer(), "Confirm push").unwrap();
+            assert!(x > 10);
+        }
+    }
+}
+
+#[test]
+fn vcs_confirmation_cancel_releases_checkout_and_preserves_queued_reviews() {
+    for key in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('n')] {
+        let mut d = TestDashboard::new(100, 30);
+        queue_test_push(&mut d.app, "/work/first", 1);
+        queue_test_push(&mut d.app, "/work/second", 1);
+        d.app.input_mode = InputMode::Help;
+        assert!(!d.app.show_vcs_confirmation());
+        d.app.input_mode = InputMode::Normal;
+        assert!(d.app.show_vcs_confirmation());
+        assert!(d.press(key).is_none());
+        assert!(
+            !d.app
+                .vcs_commands
+                .contains_key(&(crate::state::HostId::local(), "/work/first".into()))
+        );
+        assert_eq!(d.app.vcs_pushes.len(), 1);
+        assert!(d.app.show_vcs_confirmation());
+        let Some(Action::VcsRun(push)) = d.press(KeyCode::Char('y')) else {
+            panic!("expected reviewed push");
+        };
+        assert_eq!(push.cwd, "/work/second");
+        assert!(d.app.vcs_pushes.is_empty());
+    }
+}
+
 #[test]
 fn vcs_commands_request_status_when_details_are_hidden() {
     let mut d = TestDashboard::new(120, 30);
@@ -9686,7 +9775,7 @@ fn gone_upstream_warns_and_offers_republication() {
 }
 
 #[test]
-fn space_v_p_starts_without_prompt_and_the_detail_panel_shows_the_checkout() {
+fn space_v_p_prepares_a_push_and_the_detail_panel_shows_the_checkout() {
     let mut d = TestDashboard::new(160, 40);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;

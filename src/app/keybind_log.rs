@@ -126,6 +126,7 @@ fn mode_repr(mode: InputMode) -> &'static str {
         InputMode::Picker => "Picker",
         InputMode::Help => "Help",
         InputMode::Confirm => "Confirm",
+        InputMode::VcsConfirm => "VcsConfirm",
         InputMode::DirEdit => "DirEdit",
         InputMode::HostEdit => "HostEdit",
         InputMode::Messages => "Messages",

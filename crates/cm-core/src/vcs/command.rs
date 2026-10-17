@@ -24,9 +24,21 @@ pub struct VcsPlan {
     pub target_ref: String,
     /// Pull's fetched commit. Push always sends `commit`, never a moving HEAD.
     pub target_commit: Option<String>,
+    /// Push candidates relative to the destination's local tracking refs.
+    /// None identifies older servers that cannot supply a commit preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing_commits: Option<Vec<VcsCommit>>,
     /// An opaque digest, so host paths and credential-bearing URLs stay local.
     identity: String,
     set_upstream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcsCommit {
+    /// Committer time, including seconds and the commit's timezone offset.
+    pub time: String,
+    pub author: String,
+    pub subject: String,
 }
 
 impl VcsPlan {
@@ -49,6 +61,7 @@ impl VcsPlan {
             remote: "origin".into(),
             target_ref: "refs/heads/main".into(),
             target_commit: (!push).then(|| "b".repeat(40)),
+            outgoing_commits: push.then(Vec::new),
             identity: "test".into(),
             set_upstream: false,
         }
@@ -82,7 +95,9 @@ pub fn prepare_with_agent(
         .canonicalize()
         .map_err(|_| "directory is gone")?;
     let mut checkout = inspect(&cwd, push, deadline)?;
-    if !push {
+    if push {
+        checkout.plan.outgoing_commits = Some(outgoing_commits(&cwd, &checkout, deadline)?);
+    } else {
         let commit = remote_tip(
             &cwd,
             &checkout.url,
@@ -271,6 +286,9 @@ fn refresh_tracking(
 fn validate(cwd: &Path, expected: &VcsPlan, deadline: Instant) -> Result<Checkout, String> {
     let mut current = inspect(cwd, expected.push, deadline)?;
     current.plan.target_commit = expected.target_commit.clone();
+    // Display metadata is not part of the immutable checkout identity. HEAD
+    // and the destination are still revalidated after the user confirms.
+    current.plan.outgoing_commits = expected.outgoing_commits.clone();
     if current.plan != *expected {
         return Err(CHANGED.into());
     }
@@ -460,6 +478,7 @@ fn inspect(cwd: &Path, push: bool, deadline: Instant) -> Result<Checkout, String
         remote,
         target_ref,
         target_commit: None,
+        outgoing_commits: None,
         identity: identity
             .finalize()
             .iter()
@@ -472,6 +491,52 @@ fn inspect(cwd: &Path, push: bool, deadline: Instant) -> Result<Checkout, String
         url,
         tracking,
     })
+}
+
+fn outgoing_commits(
+    cwd: &Path,
+    checkout: &Checkout,
+    deadline: Instant,
+) -> Result<Vec<VcsCommit>, String> {
+    let excluded: Vec<_> = checkout
+        .tracking
+        .iter()
+        .filter_map(|name| optional_ref(cwd, name, deadline))
+        .map(|oid| format!("^{oid}"))
+        .collect();
+    // Explicit formatting ignores log.date, color and signature settings.
+    // NULs keep tabs and other punctuation in names/subjects unambiguous.
+    let mut args = vec![
+        "log",
+        "--no-color",
+        "--no-show-signature",
+        "--encoding=UTF-8",
+        "-z",
+        "--format=%ci%x00%an%x00%s",
+        &checkout.plan.commit,
+    ];
+    args.extend(excluded.iter().map(String::as_str));
+    args.push("--");
+    let output = run_git(cwd, &args, deadline).map_err(failure)?;
+    if !output.status_ok {
+        return Err("could not read outgoing commits".into());
+    }
+    if output.stdout.len() >= super::OUTPUT_CAP as usize {
+        return Err("outgoing commit preview exceeds the command output limit".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_terminator('\0');
+    let mut commits = Vec::new();
+    while let Some(time) = fields.next() {
+        let author = fields.next().ok_or("incomplete outgoing commit preview")?;
+        let subject = fields.next().ok_or("incomplete outgoing commit preview")?;
+        commits.push(VcsCommit {
+            time: time.into(),
+            author: author.into(),
+            subject: subject.into(),
+        });
+    }
+    Ok(commits)
 }
 
 fn digest_part(digest: &mut Sha256, value: &[u8]) {
@@ -699,6 +764,57 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn push_preview_uses_destination_history_and_commit_metadata() {
+        let repo = Repo::new();
+        let initial = repo.plan(true);
+        assert_eq!(
+            initial.outgoing_commits.as_ref().unwrap()[0].subject,
+            "initial"
+        );
+        repo.publish();
+        assert!(repo.plan(true).outgoing_commits.unwrap().is_empty());
+        let status = Command::new("git")
+            .current_dir(&repo.work)
+            .args([
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Add 日本語\tpreview\n\nLonger body",
+            ])
+            .env("GIT_AUTHOR_NAME", "Example Author")
+            .env("GIT_AUTHOR_DATE", "2025-03-04T01:02:03+05:30")
+            .env("GIT_COMMITTER_DATE", "2025-03-05T14:15:16-04:00")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let preview = repo.plan(true).outgoing_commits.unwrap();
+        assert_eq!(
+            preview,
+            vec![VcsCommit {
+                time: "2025-03-05 14:15:16 -0400".into(),
+                author: "Example Author".into(),
+                subject: "Add 日本語\tpreview".into(),
+            }]
+        );
+        // A different publication branch must not use main's upstream count.
+        git(&repo.work, &["config", "remote.origin.push", "main:review"]);
+        assert_eq!(repo.plan(true).outgoing_commits.unwrap().len(), 2);
+        repo.publish();
+        assert!(repo.plan(true).outgoing_commits.unwrap().is_empty());
+        git(&repo.work, &["config", "--unset", "remote.origin.push"]);
+        assert_eq!(repo.plan(true).outgoing_commits.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_plans_distinguish_missing_previews_from_empty_ones() {
+        let mut value = serde_json::to_value(VcsPlan::for_test(true)).unwrap();
+        value.as_object_mut().unwrap().remove("outgoing_commits");
+        let legacy: VcsPlan = serde_json::from_value(value).unwrap();
+        assert!(legacy.outgoing_commits.is_none());
     }
 
     #[test]

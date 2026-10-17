@@ -344,11 +344,35 @@ fn apply_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>, msg
     match msg {
         VcsMsg::Prepared { host, cwd, result } => {
             // The command belongs to the checkout captured at the keystroke.
-            // Navigation and open dialogs must neither cancel it nor retarget it.
+            // Navigation must not retarget it; confirmations wait for an idle UI.
             if !app.vcs_commands.contains_key(&(host.clone(), cwd.clone())) {
                 return;
             }
             match result {
+                Ok(plan) if plan.push => match &plan.outgoing_commits {
+                    None => finish_vcs_command(
+                        app,
+                        host,
+                        cwd,
+                        false,
+                        "host cannot preview outgoing commits; update its server and retry".into(),
+                    ),
+                    Some(commits) if !commits.is_empty() => {
+                        let id = app.vcs_commands[&(host.clone(), cwd.clone())];
+                        app.update_notification(
+                            id,
+                            Level::Info,
+                            vcs_notice(&host, &cwd, "Push awaiting confirmation"),
+                        );
+                        app.vcs_pushes.push_back(super::vcs_confirm::PreparedPush {
+                            host,
+                            cwd,
+                            plan,
+                        });
+                        app.show_vcs_confirmation();
+                    }
+                    Some(_) => start_vcs_command(app, tx, host, cwd, plan),
+                },
                 Ok(plan) => start_vcs_command(app, tx, host, cwd, plan),
                 Err(error) => finish_vcs_command(app, host, cwd, false, error),
             }
@@ -2181,6 +2205,7 @@ async fn drain_background_results(
         apply_vcs(app, &inboxes.vcs_tx, msg);
         redraw = true;
     }
+    redraw |= app.show_vcs_confirmation();
     let vitals_moved = app
         .backend_events
         .iter()
@@ -3043,6 +3068,15 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::VcsPrepare { host, cwd, push } => {
                         prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
                     }
+                    Action::VcsRun(push) => {
+                        start_vcs_command(
+                            &mut app,
+                            &inboxes.vcs_tx,
+                            push.host,
+                            push.cwd,
+                            push.plan,
+                        );
+                    }
                     Action::CopyMessageSelection(text) => {
                         let feedback = match emit_osc52(&text) {
                             Ok(()) => "Selection sent to clipboard".to_string(),
@@ -3293,8 +3327,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn push_and_pull_run_without_prompt_after_navigation_with_hidden_details() {
+    async fn vcs_waits_for_push_review_and_preserves_targets_after_navigation() {
         use cm_core::protocol::{ClientFrame, ServerFrame};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut app = vcs_app();
         let host = HostId("vcs-test".into());
@@ -3303,7 +3338,7 @@ mod tests {
         app.backends.push(Backend::Remote(backend));
         app.sessions[0].host = host.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        for push in [true, false] {
+        for (push, outgoing) in [(true, true), (true, false), (false, false)] {
             app.sessions[0].cwd = cwd.clone();
             app.input_mode = InputMode::Normal;
             prepare_vcs_command(&mut app, &tx, host.clone(), cwd.clone(), push);
@@ -3312,7 +3347,14 @@ mod tests {
             prepare_vcs_command(&mut app, &tx, host.clone(), cwd.clone(), push);
             assert_eq!(app.vcs_commands.len(), 1);
             let id = app.vcs_commands[&(host.clone(), cwd.clone())];
-            let plan = Box::new(cm_core::vcs::VcsPlan::for_test(push));
+            let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(push));
+            if outgoing {
+                plan.outgoing_commits = Some(vec![cm_core::vcs::VcsCommit {
+                    time: "2025-03-05 14:15:16 +0000".into(),
+                    author: "Test".into(),
+                    subject: "Review this commit".into(),
+                }]);
+            }
             let (prepared, ()) = tokio::join!(vcs_reply(&mut rx, "preparation"), async {
                 let (request, reply) = peer.recv().await;
                 let ClientFrame::PrepareVcs {
@@ -3343,6 +3385,19 @@ mod tests {
             assert!(app.pending_confirm.is_none());
             assert_eq!(app.input_mode, InputMode::Search);
             assert_eq!(app.vcs_commands[&(host.clone(), cwd.clone())], id);
+            if outgoing {
+                assert!(peer.is_empty(), "push ran before confirmation");
+                assert!(!app.show_vcs_confirmation(), "search must keep its input");
+                app.input_mode = InputMode::Normal;
+                assert!(app.show_vcs_confirmation());
+                assert_eq!(app.input_mode, InputMode::VcsConfirm);
+                let Some(Action::VcsRun(reviewed)) =
+                    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                else {
+                    panic!("confirmation must return the prepared push");
+                };
+                start_vcs_command(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
+            }
             let (done, ()) = tokio::join!(vcs_reply(&mut rx, "command"), async {
                 let (request, reply) = peer.recv().await;
                 let ClientFrame::RunVcs {
@@ -3373,6 +3428,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vcs_missing_preview_does_not_bypass_confirmation() {
+        let mut app = vcs_app();
+        let host = HostId::local();
+        let cwd = "/work/repo".to_string();
+        let id = app.notify(Level::Progress, "Preparing push".into());
+        app.vcs_commands.insert((host.clone(), cwd.clone()), id);
+        let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(true));
+        plan.outgoing_commits = None;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        apply_vcs(
+            &mut app,
+            &tx,
+            VcsMsg::Prepared {
+                host,
+                cwd,
+                result: Ok(plan),
+            },
+        );
+        assert!(app.vcs_commands.is_empty());
+        assert!(app.vcs_pushes.is_empty());
+        assert!(app.status_is_error);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unresponsive_vcs_host_reports_its_timeout_before_the_test_watchdog() {
         let mut app = vcs_app();
@@ -3400,6 +3480,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_vcs_push_and_pull_complete_through_the_run_loop() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         assert!(
@@ -3447,6 +3528,15 @@ mod tests {
                 _ => panic!("expected a preparation result"),
             }
             apply_vcs(&mut app, &tx, prepared);
+            if push {
+                assert_eq!(app.input_mode, InputMode::VcsConfirm);
+                let Some(Action::VcsRun(reviewed)) =
+                    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                else {
+                    panic!("expected push confirmation");
+                };
+                start_vcs_command(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
+            }
             let done = vcs_reply(&mut rx, "local command").await;
             match &done {
                 VcsMsg::Command {
