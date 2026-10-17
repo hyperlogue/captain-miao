@@ -8,7 +8,49 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 const AGENT_SESSION_SCRIPT: &str = "echo \"$HOME\"; echo \"$SSH_AUTH_SOCK\"; exec cat >/dev/null";
 
 impl RemoteBackend {
-    pub(crate) async fn prepare_vcs_within(
+    pub(crate) async fn prepare_push_within(
+        &self,
+        within: Duration,
+        cwd: String,
+    ) -> Result<Box<cm_core::vcs::PreparedVcsPush>, String> {
+        let plan = prepared_reply(self.prepare_vcs_within(within, cwd, true).await)?;
+        plan.into_prepared_push().map(Box::new)
+    }
+
+    pub(crate) async fn prepare_pull_within(
+        &self,
+        within: Duration,
+        cwd: String,
+    ) -> Result<Box<cm_core::vcs::PreparedVcsPull>, String> {
+        let plan = prepared_reply(self.prepare_vcs_within(within, cwd, false).await)?;
+        plan.into_prepared_pull().map(Box::new)
+    }
+
+    pub(crate) async fn execute_push_within(
+        &self,
+        within: Duration,
+        cwd: String,
+        prepared: Box<cm_core::vcs::PreparedVcsPush>,
+    ) -> Result<String, String> {
+        command_reply(
+            self.run_vcs_within(within, cwd, Box::new((*prepared).into()))
+                .await,
+        )
+    }
+
+    pub(crate) async fn execute_pull_within(
+        &self,
+        within: Duration,
+        cwd: String,
+        prepared: Box<cm_core::vcs::PreparedVcsPull>,
+    ) -> Result<String, String> {
+        command_reply(
+            self.run_vcs_within(within, cwd, Box::new((*prepared).into()))
+                .await,
+        )
+    }
+
+    async fn prepare_vcs_within(
         &self,
         within: Duration,
         cwd: String,
@@ -26,11 +68,11 @@ impl RemoteBackend {
         .await
     }
 
-    pub(crate) async fn run_vcs_within(
+    async fn run_vcs_within(
         &self,
         within: Duration,
         cwd: String,
-        plan: Box<cm_core::vcs::VcsPlan>,
+        plan: Box<cm_core::protocol::VcsPlan>,
     ) -> Result<Option<ServerFrame>, String> {
         self.vcs_request_within(within, true, |req_id, ssh_auth_sock| ClientFrame::RunVcs {
             req_id,
@@ -111,6 +153,36 @@ impl RemoteBackend {
                 None
             }
         }
+    }
+}
+
+fn prepared_reply(
+    reply: Result<Option<ServerFrame>, String>,
+) -> Result<Box<cm_core::protocol::VcsPlan>, String> {
+    match reply? {
+        Some(ServerFrame::VcsPrepared {
+            plan: Some(plan),
+            error: None,
+            ..
+        }) => Ok(plan),
+        Some(ServerFrame::VcsPrepared {
+            error: Some(error), ..
+        }) => Err(error),
+        _ => {
+            Err("host did not prepare the command; check its connection and server version".into())
+        }
+    }
+}
+
+fn command_reply(reply: Result<Option<ServerFrame>, String>) -> Result<String, String> {
+    match reply? {
+        Some(ServerFrame::VcsCommandDone {
+            ok: true, message, ..
+        }) => Ok(message),
+        Some(ServerFrame::VcsCommandDone {
+            ok: false, message, ..
+        }) => Err(message),
+        _ => Err("no answer from the host; outcome unknown — verify before retrying".into()),
     }
 }
 

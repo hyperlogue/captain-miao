@@ -16,10 +16,10 @@ use crate::config;
 use crate::state::HostId;
 
 #[derive(Debug)]
-pub(crate) struct PreparedPush {
+pub(crate) struct PushConfirmation {
     pub host: HostId,
     pub cwd: String,
-    pub plan: Box<cm_core::vcs::VcsPlan>,
+    pub plan: Box<cm_core::vcs::PreparedVcsPush>,
 }
 
 impl App {
@@ -40,8 +40,7 @@ impl App {
         let count = self
             .vcs_pushes
             .front()
-            .and_then(|push| push.plan.outgoing_commits.as_ref())
-            .map_or(0, Vec::len);
+            .map_or(0, |push| push.plan.outgoing_commits().len());
         self.vcs_scroll = self
             .vcs_scroll
             .saturating_add_signed(delta)
@@ -102,9 +101,7 @@ impl App {
         let Some(push) = self.vcs_pushes.front() else {
             return;
         };
-        let Some(commits) = push.plan.outgoing_commits.as_ref() else {
-            return;
-        };
+        let commits = push.plan.outgoing_commits();
         let width = area.width.saturating_sub(2).min(106);
         let content_width = width.saturating_sub(4) as usize;
         let compact = content_width < 60;

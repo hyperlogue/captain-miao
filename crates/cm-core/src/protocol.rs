@@ -7,6 +7,9 @@
 //! existing derives on `LauncherState` / `ResumeCandidate`; the payloads are
 //! small (state is snippet-capped) so the overhead is irrelevant.
 
+mod vcs;
+pub use vcs::VcsPlan;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -126,7 +129,7 @@ pub enum ClientFrame {
     RunVcs {
         req_id: u64,
         cwd: String,
-        plan: Box<crate::vcs::VcsPlan>,
+        plan: Box<VcsPlan>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh_auth_sock: Option<String>,
     },
@@ -226,7 +229,7 @@ pub enum ServerFrame {
     },
     VcsPrepared {
         req_id: u64,
-        plan: Option<Box<crate::vcs::VcsPlan>>,
+        plan: Option<Box<VcsPlan>>,
         error: Option<String>,
     },
     /// A frame this build doesn't know — see [`ClientFrame::Unknown`].
@@ -320,7 +323,7 @@ mod tests {
     fn old_git_requests_inherit_host_authentication() {
         for frame in [
             serde_json::json!({"frame": "PrepareVcs", "req_id": 1, "cwd": "~/project", "push": false}),
-            serde_json::json!({"frame": "RunVcs", "req_id": 2, "cwd": "~/project", "plan": crate::vcs::VcsPlan::for_test(true)}),
+            serde_json::json!({"frame": "RunVcs", "req_id": 2, "cwd": "~/project", "plan": VcsPlan::for_test(true)}),
         ] {
             let request: ClientFrame = serde_json::from_value(frame).unwrap();
             match request {
@@ -348,7 +351,7 @@ mod tests {
             ClientFrame::RunVcs {
                 req_id: 11,
                 cwd: "~/project".into(),
-                plan: Box::new(crate::vcs::VcsPlan::for_test(true)),
+                plan: Box::new(VcsPlan::for_test(true)),
                 ssh_auth_sock: None,
             },
             ClientFrame::ListResumable {

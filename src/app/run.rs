@@ -126,10 +126,15 @@ struct LoopInboxes {
 }
 
 enum VcsMsg {
-    Prepared {
+    PushPrepared {
         host: HostId,
         cwd: String,
-        result: Result<Box<cm_core::vcs::VcsPlan>, String>,
+        result: Result<Box<cm_core::vcs::PreparedVcsPush>, String>,
+    },
+    PullPrepared {
+        host: HostId,
+        cwd: String,
+        result: Result<Box<cm_core::vcs::PreparedVcsPull>, String>,
     },
     Status {
         host: HostId,
@@ -240,40 +245,46 @@ fn prepare_vcs_command(
     let tx = tx.clone();
     let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
-        let result = match remote {
-            RemoteReach::Down => Err("disconnected".to_string()),
-            RemoteReach::Local => {
-                let work_cwd = cwd.clone();
-                tokio::task::spawn_blocking(move || {
-                    cm_core::vcs::prepare(&work_cwd, push, deadline)
-                })
-                .await
-                .unwrap_or_else(|_| Err("git failed".into()))
-                .map(Box::new)
-            }
-            RemoteReach::Up(remote) => {
-                match remote
-                    .prepare_vcs_within(VCS_COMMAND_TIMEOUT, cwd.clone(), push)
+        let msg = if push {
+            let result = match remote {
+                RemoteReach::Down => Err("disconnected".into()),
+                RemoteReach::Local => {
+                    let work_cwd = cwd.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cm_core::vcs::prepare_push(&work_cwd, deadline)
+                    })
                     .await
-                {
-                    Ok(Some(cm_core::protocol::ServerFrame::VcsPrepared {
-                        plan: Some(plan),
-                        error: None,
-                        ..
-                    })) => Ok(plan),
-                    Ok(Some(cm_core::protocol::ServerFrame::VcsPrepared {
-                        error: Some(error),
-                        ..
-                    })) => Err(error),
-                    Err(error) => Err(error),
-                    _ => Err(
-                        "host did not prepare the command; check its connection and server version"
-                            .into(),
-                    ),
+                    .unwrap_or_else(|_| Err("git failed".into()))
+                    .map(Box::new)
                 }
-            }
+                RemoteReach::Up(remote) => {
+                    remote
+                        .prepare_push_within(VCS_COMMAND_TIMEOUT, cwd.clone())
+                        .await
+                }
+            };
+            VcsMsg::PushPrepared { host, cwd, result }
+        } else {
+            let result = match remote {
+                RemoteReach::Down => Err("disconnected".into()),
+                RemoteReach::Local => {
+                    let work_cwd = cwd.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cm_core::vcs::prepare_pull(&work_cwd, deadline)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("git failed".into()))
+                    .map(Box::new)
+                }
+                RemoteReach::Up(remote) => {
+                    remote
+                        .prepare_pull_within(VCS_COMMAND_TIMEOUT, cwd.clone())
+                        .await
+                }
+            };
+            VcsMsg::PullPrepared { host, cwd, result }
         };
-        let _ = tx.send(VcsMsg::Prepared { host, cwd, result });
+        let _ = tx.send(msg);
     });
 }
 
@@ -342,38 +353,33 @@ fn finish_vcs_command(app: &mut App, host: HostId, cwd: String, ok: bool, messag
 
 fn apply_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>, msg: VcsMsg) {
     match msg {
-        VcsMsg::Prepared { host, cwd, result } => {
-            // The command belongs to the checkout captured at the keystroke.
-            // Navigation must not retarget it; confirmations wait for an idle UI.
+        VcsMsg::PushPrepared { host, cwd, result } => {
+            // Navigation must not retarget the prepared command. Reviews wait
+            // for an idle UI and retain the checkout captured at the keystroke.
+            let Some(&id) = app.vcs_commands.get(&(host.clone(), cwd.clone())) else {
+                return;
+            };
+            match result {
+                Ok(plan) if !plan.outgoing_commits().is_empty() => {
+                    app.update_notification(
+                        id,
+                        Level::Info,
+                        vcs_notice(&host, &cwd, "Push awaiting confirmation"),
+                    );
+                    app.vcs_pushes
+                        .push_back(super::vcs_confirm::PushConfirmation { host, cwd, plan });
+                    app.show_vcs_confirmation();
+                }
+                Ok(plan) => start_vcs_push(app, tx, host, cwd, plan),
+                Err(error) => finish_vcs_command(app, host, cwd, false, error),
+            }
+        }
+        VcsMsg::PullPrepared { host, cwd, result } => {
             if !app.vcs_commands.contains_key(&(host.clone(), cwd.clone())) {
                 return;
             }
             match result {
-                Ok(plan) if plan.push => match &plan.outgoing_commits {
-                    None => finish_vcs_command(
-                        app,
-                        host,
-                        cwd,
-                        false,
-                        "host cannot preview outgoing commits; update its server and retry".into(),
-                    ),
-                    Some(commits) if !commits.is_empty() => {
-                        let id = app.vcs_commands[&(host.clone(), cwd.clone())];
-                        app.update_notification(
-                            id,
-                            Level::Info,
-                            vcs_notice(&host, &cwd, "Push awaiting confirmation"),
-                        );
-                        app.vcs_pushes.push_back(super::vcs_confirm::PreparedPush {
-                            host,
-                            cwd,
-                            plan,
-                        });
-                        app.show_vcs_confirmation();
-                    }
-                    Some(_) => start_vcs_command(app, tx, host, cwd, plan),
-                },
-                Ok(plan) => start_vcs_command(app, tx, host, cwd, plan),
+                Ok(plan) => start_vcs_pull(app, tx, host, cwd, plan),
                 Err(error) => finish_vcs_command(app, host, cwd, false, error),
             }
         }
@@ -400,60 +406,101 @@ fn apply_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>, msg
     }
 }
 
-fn start_vcs_command(
+fn start_vcs_push(
     app: &mut App,
     tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
     host: HostId,
     cwd: String,
-    plan: Box<cm_core::vcs::VcsPlan>,
+    plan: Box<cm_core::vcs::PreparedVcsPush>,
 ) {
+    let summary = format!("Pushing {} ↔ {}…", plan.branch(), plan.destination());
+    start_vcs_command(
+        app,
+        tx,
+        host,
+        cwd,
+        "pushing",
+        summary,
+        |remote, cwd, deadline| async move {
+            match remote {
+                Some(remote) => {
+                    remote
+                        .execute_push_within(VCS_COMMAND_TIMEOUT, cwd, plan)
+                        .await
+                }
+                None => tokio::task::spawn_blocking(move || {
+                    cm_core::vcs::execute_push(&cwd, &plan, deadline)
+                })
+                .await
+                .unwrap_or_else(|_| Err("git failed".into())),
+            }
+        },
+    );
+}
+
+fn start_vcs_pull(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
+    host: HostId,
+    cwd: String,
+    plan: Box<cm_core::vcs::PreparedVcsPull>,
+) {
+    let summary = format!("Pulling {} ↔ {}…", plan.branch(), plan.destination());
+    start_vcs_command(
+        app,
+        tx,
+        host,
+        cwd,
+        "pulling",
+        summary,
+        |remote, cwd, deadline| async move {
+            match remote {
+                Some(remote) => {
+                    remote
+                        .execute_pull_within(VCS_COMMAND_TIMEOUT, cwd, plan)
+                        .await
+                }
+                None => tokio::task::spawn_blocking(move || {
+                    cm_core::vcs::execute_pull(&cwd, &plan, deadline)
+                })
+                .await
+                .unwrap_or_else(|_| Err("git failed".into())),
+            }
+        },
+    );
+}
+
+fn start_vcs_command<Fut>(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
+    host: HostId,
+    cwd: String,
+    title: &'static str,
+    summary: String,
+    run: impl FnOnce(Option<std::sync::Arc<crate::backend::RemoteBackend>>, String, Instant) -> Fut
+    + Send
+    + 'static,
+) where
+    Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+{
     let remote = match remote_reach(app, &host) {
         RemoteReach::Up(backend) => Some(backend),
         RemoteReach::Down => {
-            finish_vcs_command(app, host, cwd, false, "disconnected".to_string());
+            finish_vcs_command(app, host, cwd, false, "disconnected".into());
             return;
         }
         RemoteReach::Local => None,
     };
     let id = app.vcs_commands[&(host.clone(), cwd.clone())];
-    let verb = if plan.push { "Pushing" } else { "Pulling" };
-    app.update_notification(
-        id,
-        Level::Progress,
-        vcs_notice(
-            &host,
-            &cwd,
-            &format!("{verb} {} ↔ {}…", plan.branch, plan.destination()),
-        ),
-    );
-    app.notifications
-        .set_progress_title(id, if plan.push { "pushing" } else { "pulling" });
+    app.update_notification(id, Level::Progress, vcs_notice(&host, &cwd, &summary));
+    app.notifications.set_progress_title(id, title);
     let report_cwd = cwd.clone();
     let tx = tx.clone();
     let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
-        let (ok, message) = if let Some(remote) = remote {
-            let reply = remote
-                .run_vcs_within(VCS_COMMAND_TIMEOUT, cwd.clone(), plan)
-                .await;
-            match reply {
-                Ok(Some(cm_core::protocol::ServerFrame::VcsCommandDone {
-                    ok, message, ..
-                })) => (ok, message),
-                Err(message) => (false, message),
-                _ => (
-                    false,
-                    "no answer from the host; outcome unknown — verify before retrying".to_string(),
-                ),
-            }
-        } else {
-            match tokio::task::spawn_blocking(move || cm_core::vcs::execute(&cwd, &plan, deadline))
-                .await
-            {
-                Ok(Ok(message)) => (true, message),
-                Ok(Err(message)) => (false, message),
-                Err(_) => (false, "git failed".to_string()),
-            }
+        let (ok, message) = match run(remote, cwd, deadline).await {
+            Ok(message) => (true, message),
+            Err(message) => (false, message),
         };
         let _ = tx.send(VcsMsg::Command {
             host,
@@ -3069,13 +3116,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
                     }
                     Action::VcsRun(push) => {
-                        start_vcs_command(
-                            &mut app,
-                            &inboxes.vcs_tx,
-                            push.host,
-                            push.cwd,
-                            push.plan,
-                        );
+                        start_vcs_push(&mut app, &inboxes.vcs_tx, push.host, push.cwd, push.plan);
                     }
                     Action::CopyMessageSelection(text) => {
                         let feedback = match emit_osc52(&text) {
@@ -3347,14 +3388,20 @@ mod tests {
             prepare_vcs_command(&mut app, &tx, host.clone(), cwd.clone(), push);
             assert_eq!(app.vcs_commands.len(), 1);
             let id = app.vcs_commands[&(host.clone(), cwd.clone())];
-            let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(push));
-            if outgoing {
-                plan.outgoing_commits = Some(vec![cm_core::vcs::VcsCommit {
-                    time: "2025-03-05 14:15:16 +0000".into(),
-                    author: "Test".into(),
-                    subject: "Review this commit".into(),
-                }]);
-            }
+            let plan = Box::new(if push {
+                cm_core::vcs::PreparedVcsPush::for_test(if outgoing {
+                    vec![cm_core::vcs::VcsCommit {
+                        time: "2025-03-05 14:15:16 +0000".into(),
+                        author: "Test".into(),
+                        subject: "Review this commit".into(),
+                    }]
+                } else {
+                    Vec::new()
+                })
+                .into()
+            } else {
+                cm_core::protocol::VcsPlan::from(cm_core::vcs::PreparedVcsPull::for_test())
+            });
             let (prepared, ()) = tokio::join!(vcs_reply(&mut rx, "preparation"), async {
                 let (request, reply) = peer.recv().await;
                 let ClientFrame::PrepareVcs {
@@ -3396,7 +3443,7 @@ mod tests {
                 else {
                     panic!("confirmation must return the prepared push");
                 };
-                start_vcs_command(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
+                start_vcs_push(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
             }
             let (done, ()) = tokio::join!(vcs_reply(&mut rx, "command"), async {
                 let (request, reply) = peer.recv().await;
@@ -3428,28 +3475,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vcs_missing_preview_does_not_bypass_confirmation() {
+    #[tokio::test(start_paused = true)]
+    async fn vcs_missing_preview_does_not_bypass_confirmation() {
+        use cm_core::protocol::{ClientFrame, ServerFrame, VcsPlan};
         let mut app = vcs_app();
-        let host = HostId::local();
+        let host = HostId("legacy-vcs".into());
         let cwd = "/work/repo".to_string();
-        let id = app.notify(Level::Progress, "Preparing push".into());
-        app.vcs_commands.insert((host.clone(), cwd.clone()), id);
-        let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(true));
-        plan.outgoing_commits = None;
+        let (backend, mut peer) = crate::backend::test_support::connected(host.clone());
+        app.backends.push(Backend::Remote(backend));
+        let mut value = serde_json::to_value(VcsPlan::for_test(true)).unwrap();
+        value.as_object_mut().unwrap().remove("outgoing_commits");
+        let legacy = serde_json::from_value(value).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        apply_vcs(
-            &mut app,
-            &tx,
-            VcsMsg::Prepared {
-                host,
-                cwd,
-                result: Ok(plan),
-            },
-        );
+        prepare_vcs_command(&mut app, &tx, host, cwd, true);
+        let (prepared, ()) = tokio::join!(vcs_reply(&mut rx, "legacy preparation"), async {
+            let (request, reply) = peer.recv().await;
+            let ClientFrame::PrepareVcs { req_id, .. } = request else {
+                panic!("expected push preparation");
+            };
+            reply
+                .send(ServerFrame::VcsPrepared {
+                    req_id,
+                    plan: Some(Box::new(legacy)),
+                    error: None,
+                })
+                .unwrap();
+        });
+        apply_vcs(&mut app, &tx, prepared);
         assert!(app.vcs_commands.is_empty());
         assert!(app.vcs_pushes.is_empty());
         assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("cannot preview outgoing commits")
+        );
+        assert!(peer.is_empty(), "missing preview must not execute a push");
         assert!(rx.try_recv().is_err());
     }
 
@@ -3468,7 +3530,10 @@ mod tests {
         let (prepared, (_, reply)) =
             tokio::join!(vcs_reply(&mut rx, "silent host preparation"), peer.recv());
         assert!(reply.is_closed());
-        assert!(matches!(&prepared, VcsMsg::Prepared { result: Err(_), .. }));
+        assert!(matches!(
+            &prepared,
+            VcsMsg::PushPrepared { result: Err(_), .. }
+        ));
         apply_vcs(&mut app, &tx, prepared);
         assert!(app.vcs_commands.is_empty());
         assert!(app.status_is_error);
@@ -3522,8 +3587,13 @@ mod tests {
             prepare_vcs_command(&mut app, &tx, HostId::local(), cwd.clone(), push);
             let prepared = vcs_reply(&mut rx, "local preparation").await;
             match &prepared {
-                VcsMsg::Prepared { result, .. } => {
-                    assert!(result.is_ok(), "preparation failed: {result:?}");
+                VcsMsg::PushPrepared { result, .. } => {
+                    assert!(push);
+                    assert!(result.is_ok(), "push preparation failed: {result:?}");
+                }
+                VcsMsg::PullPrepared { result, .. } => {
+                    assert!(!push);
+                    assert!(result.is_ok(), "pull preparation failed: {result:?}");
                 }
                 _ => panic!("expected a preparation result"),
             }
@@ -3535,7 +3605,7 @@ mod tests {
                 else {
                     panic!("expected push confirmation");
                 };
-                start_vcs_command(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
+                start_vcs_push(&mut app, &tx, reviewed.host, reviewed.cwd, reviewed.plan);
             }
             let done = vcs_reply(&mut rx, "local command").await;
             match &done {

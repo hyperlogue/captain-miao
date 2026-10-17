@@ -935,7 +935,11 @@ async fn handle_conn(
                         let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
                         let tx = replies_tx.clone();
                         tokio::spawn(async move {
-                            let result = tokio::task::spawn_blocking(move || cm_core::vcs::prepare_with_agent(&cwd, push, ssh_auth_sock.as_deref(), deadline))
+                            let result = tokio::task::spawn_blocking(move || if push {
+                                cm_core::vcs::prepare_push(&cwd, deadline).map(cm_core::protocol::VcsPlan::from)
+                            } else {
+                                cm_core::vcs::prepare_pull_with_agent(&cwd, ssh_auth_sock.as_deref(), deadline).map(cm_core::protocol::VcsPlan::from)
+                            })
                                 .await.unwrap_or_else(|_| Err("git failed".into()));
                             let (plan, error) = match result {
                                 Ok(plan) => (Some(Box::new(plan)), None),
@@ -1061,13 +1065,29 @@ fn spawn_vcs_command(
     tx: tokio::sync::mpsc::UnboundedSender<ServerFrame>,
     req_id: u64,
     cwd: String,
-    plan: Box<cm_core::vcs::VcsPlan>,
+    plan: Box<cm_core::protocol::VcsPlan>,
     ssh_auth_sock: Option<String>,
 ) {
     let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            cm_core::vcs::execute_with_agent(&cwd, &plan, ssh_auth_sock.as_deref(), deadline)
+            if plan.is_push() {
+                let prepared = plan.into_push_command()?;
+                cm_core::vcs::execute_push_with_agent(
+                    &cwd,
+                    &prepared,
+                    ssh_auth_sock.as_deref(),
+                    deadline,
+                )
+            } else {
+                let prepared = plan.into_prepared_pull()?;
+                cm_core::vcs::execute_pull_with_agent(
+                    &cwd,
+                    &prepared,
+                    ssh_auth_sock.as_deref(),
+                    deadline,
+                )
+            }
         })
         .await;
         let (ok, message) = match result {

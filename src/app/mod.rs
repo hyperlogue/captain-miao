@@ -239,7 +239,7 @@ pub(super) enum Action {
         push: bool,
     },
     /// Execute the exact push reviewed in the commit popup.
-    VcsRun(vcs_confirm::PreparedPush),
+    VcsRun(vcs_confirm::PushConfirmation),
     /// Attach a local window to an already-running remote pool session (§5):
     /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
     AttachRemoteRunning {
@@ -1172,7 +1172,7 @@ pub(super) struct App {
     pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
     /// One command per checkout; unrelated checkouts can run concurrently.
     pub(super) vcs_commands: HashMap<(HostId, String), notifications::NotificationId>,
-    pub(super) vcs_pushes: std::collections::VecDeque<vcs_confirm::PreparedPush>,
+    pub(super) vcs_pushes: std::collections::VecDeque<vcs_confirm::PushConfirmation>,
     pub(super) vcs_scroll: usize,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,

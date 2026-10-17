@@ -9635,8 +9635,7 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
-    let mut plan = Box::new(cm_core::vcs::VcsPlan::for_test(true));
-    plan.outgoing_commits = Some(
+    let plan = Box::new(cm_core::vcs::PreparedVcsPush::for_test(
         (0..count)
             .map(|i| cm_core::vcs::VcsCommit {
                 time: "2025-03-05 14:15:16 -0400".into(),
@@ -9644,18 +9643,19 @@ fn queue_test_push(app: &mut App, cwd: &str, count: usize) {
                 subject: format!("Change {i:02}: {} END", "日本語 message ".repeat(12)),
             })
             .collect(),
-    );
+    ));
     let host = crate::state::HostId::local();
     let id = app.notify(
         super::notifications::Level::Info,
         "Awaiting confirmation".into(),
     );
     app.vcs_commands.insert((host.clone(), cwd.into()), id);
-    app.vcs_pushes.push_back(super::vcs_confirm::PreparedPush {
-        host,
-        cwd: cwd.into(),
-        plan,
-    });
+    app.vcs_pushes
+        .push_back(super::vcs_confirm::PushConfirmation {
+            host,
+            cwd: cwd.into(),
+            plan,
+        });
 }
 
 #[test]

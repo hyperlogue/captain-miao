@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 mod command;
 mod process;
-pub use command::{VcsCommit, VcsPlan, execute, execute_with_agent, prepare, prepare_with_agent};
+pub use command::{
+    PreparedVcsPull, PreparedVcsPush, VcsCommit, execute_pull, execute_pull_with_agent,
+    execute_push, execute_push_with_agent, prepare_pull, prepare_pull_with_agent, prepare_push,
+};
 use process::{GitOut, RunFail, run_git, run_git_read};
 
 pub const STATUS_LIMIT: Duration = Duration::from_secs(30);
@@ -406,8 +409,8 @@ mod tests {
     use super::*;
 
     fn push(cwd: &str) -> Result<String, String> {
-        let plan = prepare(cwd, true, Instant::now() + COMMAND_LIMIT)?;
-        execute(cwd, &plan, Instant::now() + COMMAND_LIMIT)
+        let plan = prepare_push(cwd, Instant::now() + COMMAND_LIMIT)?;
+        execute_push(cwd, &plan, Instant::now() + COMMAND_LIMIT)
     }
 
     fn git(cwd: &Path, args: &[&str]) {

@@ -15,22 +15,32 @@ use super::{
     status_locked,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VcsPlan {
-    pub push: bool,
-    pub branch: String,
-    pub commit: String,
-    pub remote: String,
-    pub target_ref: String,
-    /// Pull's fetched commit. Push always sends `commit`, never a moving HEAD.
-    pub target_commit: Option<String>,
-    /// Push candidates relative to the destination's local tracking refs.
-    /// None identifies older servers that cannot supply a commit preview.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outgoing_commits: Option<Vec<VcsCommit>>,
-    /// An opaque digest, so host paths and credential-bearing URLs stay local.
-    identity: String,
+mod wire;
+
+/// A push bound to the checkout and destination inspected during preparation.
+/// Commit metadata is for review only and never participates in validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedVcsPush {
+    expected: CheckoutExpectation,
     set_upstream: bool,
+    outgoing_commits: Vec<VcsCommit>,
+}
+
+/// A fast-forward pull bound to one checkout, source and fetched commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedVcsPull {
+    expected: CheckoutExpectation,
+    fetched_commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutExpectation {
+    branch: String,
+    commit: String,
+    remote: String,
+    target_ref: String,
+    // Host paths, credential-bearing URLs and daemon identity stay opaque.
+    identity: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,8 +51,8 @@ pub struct VcsCommit {
     pub subject: String,
 }
 
-impl VcsPlan {
-    pub fn destination(&self) -> String {
+impl CheckoutExpectation {
+    fn destination(&self) -> String {
         format!(
             "{}/{}",
             self.remote,
@@ -53,40 +63,90 @@ impl VcsPlan {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test(push: bool) -> Self {
+    fn for_test() -> Self {
         Self {
-            push,
             branch: "main".into(),
             commit: "a".repeat(40),
             remote: "origin".into(),
             target_ref: "refs/heads/main".into(),
-            target_commit: (!push).then(|| "b".repeat(40)),
-            outgoing_commits: push.then(Vec::new),
             identity: "test".into(),
+        }
+    }
+}
+
+impl PreparedVcsPush {
+    pub fn branch(&self) -> &str {
+        &self.expected.branch
+    }
+    pub fn destination(&self) -> String {
+        self.expected.destination()
+    }
+    /// Candidates relative to local tracking refs; preparation does not query the remote.
+    pub fn outgoing_commits(&self) -> &[VcsCommit] {
+        &self.outgoing_commits
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(outgoing_commits: Vec<VcsCommit>) -> Self {
+        Self {
+            expected: CheckoutExpectation::for_test(),
             set_upstream: false,
+            outgoing_commits,
+        }
+    }
+}
+
+impl PreparedVcsPull {
+    pub fn branch(&self) -> &str {
+        &self.expected.branch
+    }
+    pub fn destination(&self) -> String {
+        self.expected.destination()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test() -> Self {
+        Self {
+            expected: CheckoutExpectation::for_test(),
+            fetched_commit: "b".repeat(40),
         }
     }
 }
 
 struct Checkout {
-    plan: VcsPlan,
+    expected: CheckoutExpectation,
+    set_upstream: bool,
     url: String,
     tracking: Vec<String>,
 }
 
 const CHANGED: &str = "checkout or destination changed; run the command again";
 
-pub fn prepare(cwd: &str, push: bool, deadline: Instant) -> Result<VcsPlan, String> {
-    prepare_with_agent(cwd, push, None, deadline)
+/// Push preparation reads local refs only; authentication is needed at execution.
+pub fn prepare_push(cwd: &str, deadline: Instant) -> Result<PreparedVcsPush, String> {
+    let _guard = lock_until(deadline).map_err(failure)?;
+    let cwd = expand(cwd)
+        .canonicalize()
+        .map_err(|_| "directory is gone")?;
+    let checkout = inspect(&cwd, true, deadline)?;
+    let outgoing_commits = outgoing_commits(&cwd, &checkout, deadline)?;
+    Ok(PreparedVcsPush {
+        expected: checkout.expected,
+        set_upstream: checkout.set_upstream,
+        outgoing_commits,
+    })
+}
+
+pub fn prepare_pull(cwd: &str, deadline: Instant) -> Result<PreparedVcsPull, String> {
+    prepare_pull_with_agent(cwd, None, deadline)
 }
 
 /// Prepare using this client's agent without changing the daemon environment.
-pub fn prepare_with_agent(
+pub fn prepare_pull_with_agent(
     cwd: &str,
-    push: bool,
     ssh_auth_sock: Option<&str>,
     deadline: Instant,
-) -> Result<VcsPlan, String> {
+) -> Result<PreparedVcsPull, String> {
     let ssh_auth_sock =
         ssh_auth_sock.map(|socket| crate::paths::expand_home(socket, &crate::paths::host_home()));
     let ssh_auth_sock = ssh_auth_sock.as_deref();
@@ -94,67 +154,67 @@ pub fn prepare_with_agent(
     let cwd = expand(cwd)
         .canonicalize()
         .map_err(|_| "directory is gone")?;
-    let mut checkout = inspect(&cwd, push, deadline)?;
-    if push {
-        checkout.plan.outgoing_commits = Some(outgoing_commits(&cwd, &checkout, deadline)?);
-    } else {
-        let commit = remote_tip(
-            &cwd,
-            &checkout.url,
-            &checkout.plan.target_ref,
-            ssh_auth_sock,
-            deadline,
-        )?;
-        // Fetch only the announced object. Another agent's FETCH_HEAD cannot
-        // replace the candidate, and no branch/worktree moves during preparation.
-        finish_command(
-            run_git_with_agent(
-                &cwd,
-                &[
-                    "fetch",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--no-write-fetch-head",
-                    "--",
-                    &checkout.url,
-                    &commit,
-                ],
-                ssh_auth_sock,
-                deadline,
-            ),
-            "fetched",
-        )?;
-        if inspect(&cwd, push, deadline)?.plan != checkout.plan {
-            return Err(CHANGED.into());
-        }
-        if !run_git(
+    let checkout = inspect(&cwd, false, deadline)?;
+    let commit = remote_tip(
+        &cwd,
+        &checkout.url,
+        &checkout.expected.target_ref,
+        ssh_auth_sock,
+        deadline,
+    )?;
+    // Fetch only the announced object. Another agent's FETCH_HEAD cannot
+    // replace the candidate, and no branch/worktree moves during preparation.
+    finish_command(
+        run_git_with_agent(
             &cwd,
             &[
-                "merge-base",
-                "--is-ancestor",
-                &checkout.plan.commit,
+                "fetch",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--",
+                &checkout.url,
                 &commit,
             ],
+            ssh_auth_sock,
             deadline,
-        )
-        .map_err(failure)?
-        .status_ok
-        {
-            return Err("branches have diverged; a fast-forward pull is not possible".into());
-        }
-        checkout.plan.target_commit = Some(commit);
+        ),
+        "fetched",
+    )?;
+    validate(&cwd, &checkout.expected, false, deadline)?;
+    if !run_git(
+        &cwd,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &checkout.expected.commit,
+            &commit,
+        ],
+        deadline,
+    )
+    .map_err(failure)?
+    .status_ok
+    {
+        return Err("branches have diverged; a fast-forward pull is not possible".into());
     }
-    Ok(checkout.plan)
+    Ok(PreparedVcsPull {
+        expected: checkout.expected,
+        fetched_commit: commit,
+    })
 }
 
-pub fn execute(cwd: &str, expected: &VcsPlan, deadline: Instant) -> Result<String, String> {
-    execute_with_agent(cwd, expected, None, deadline)
+pub fn execute_push(
+    cwd: &str,
+    prepared: &PreparedVcsPush,
+    deadline: Instant,
+) -> Result<String, String> {
+    execute_push_with_agent(cwd, prepared, None, deadline)
 }
 
 /// Execute using this client's current agent, which may change after reconnect.
-pub fn execute_with_agent(
+pub fn execute_push_with_agent(
     cwd: &str,
-    expected: &VcsPlan,
+    prepared: &PreparedVcsPush,
     ssh_auth_sock: Option<&str>,
     deadline: Instant,
 ) -> Result<String, String> {
@@ -163,109 +223,134 @@ pub fn execute_with_agent(
     let ssh_auth_sock = ssh_auth_sock.as_deref();
     let _guard = lock_until(deadline).map_err(failure)?;
     let cwd = expand(cwd).canonicalize().map_err(|_| CHANGED)?;
-    let checkout = validate(&cwd, expected, deadline)?;
+    let expected = &prepared.expected;
+    let checkout = validate(&cwd, expected, true, deadline)?;
     let tracking: Vec<_> = checkout
         .tracking
         .iter()
         .map(|name| (name.as_str(), optional_ref(&cwd, name, deadline)))
         .collect();
-    if expected.push {
-        let refspec = format!("{}:{}", expected.commit, expected.target_ref);
-        // Explicit URL and OID prevent config changes and moving local refs
-        // from redirecting this invocation or publishing unprepared commits.
-        finish_command(
-            run_git_with_agent(
-                &cwd,
-                &[
-                    "-c",
-                    "push.followTags=false",
-                    "-c",
-                    "push.recurseSubmodules=no",
-                    "push",
-                    "--no-force",
-                    "--no-follow-tags",
-                    "--recurse-submodules=no",
-                    "--",
-                    &checkout.url,
-                    &refspec,
-                ],
-                ssh_auth_sock,
-                deadline,
-            ),
-            "pushed",
-        )?;
-        let refreshed = refresh_tracking(&cwd, &tracking, &expected.commit, deadline);
-        if expected.set_upstream {
-            let prefix = format!("branch.{}", expected.branch);
-            let unchanged =
-                matches!(
-                    config(&cwd, &format!("{prefix}.remote"), deadline),
-                    Ok(None)
-                ) && matches!(config(&cwd, &format!("{prefix}.merge"), deadline), Ok(None));
-            if !unchanged {
-                return Ok("pushed; upstream configuration changed, so it was preserved".into());
-            }
-            for (key, value) in [
-                (format!("{prefix}.remote"), &expected.remote),
-                (format!("{prefix}.merge"), &expected.target_ref),
-            ] {
-                if success(&cwd, &["config", &key, value], deadline).is_err() {
-                    return Ok(
-                        "pushed; could not finish setting the upstream — check Git configuration"
-                            .into(),
-                    );
-                }
-            }
-        }
-        Ok(if refreshed {
-            "pushed"
-        } else {
-            "pushed; refresh tracking status before another command"
-        }
-        .into())
-    } else {
-        let commit = expected
-            .target_commit
-            .as_deref()
-            .filter(|oid| valid_oid(oid))
-            .ok_or(CHANGED)?;
-        if remote_tip(
+    if checkout.set_upstream != prepared.set_upstream {
+        return Err(CHANGED.into());
+    }
+    let refspec = format!("{}:{}", expected.commit, expected.target_ref);
+    // Explicit URL and OID prevent config changes and moving local refs
+    // from redirecting this invocation or publishing unprepared commits.
+    finish_command(
+        run_git_with_agent(
             &cwd,
-            &checkout.url,
-            &expected.target_ref,
+            &[
+                "-c",
+                "push.followTags=false",
+                "-c",
+                "push.recurseSubmodules=no",
+                "push",
+                "--no-force",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
+                "--",
+                &checkout.url,
+                &refspec,
+            ],
             ssh_auth_sock,
             deadline,
-        )? != commit
-        {
-            return Err(CHANGED.into());
+        ),
+        "pushed",
+    )?;
+    let refreshed = refresh_tracking(&cwd, &tracking, &expected.commit, deadline);
+    if prepared.set_upstream {
+        let prefix = format!("branch.{}", expected.branch);
+        let unchanged = matches!(
+            config(&cwd, &format!("{prefix}.remote"), deadline),
+            Ok(None)
+        ) && matches!(config(&cwd, &format!("{prefix}.merge"), deadline), Ok(None));
+        if !unchanged {
+            return Ok("pushed; upstream configuration changed, so it was preserved".into());
         }
-        // The network wait is a second opportunity for an agent to change the
-        // checkout. Revalidate after it, immediately before touching the tree.
-        validate(&cwd, expected, deadline)?;
-        finish_command(
-            run_git(
-                &cwd,
-                &[
-                    "-c",
-                    "merge.autostash=false",
-                    "merge",
-                    "--ff-only",
-                    "--no-edit",
-                    "--no-autostash",
-                    commit,
-                ],
-                deadline,
-            ),
-            "pulled",
-        )?;
-        let refreshed = refresh_tracking(&cwd, &tracking, commit, deadline);
-        Ok(if refreshed {
-            "pulled"
-        } else {
-            "pulled; refresh tracking status before another command"
+        for (key, value) in [
+            (format!("{prefix}.remote"), &expected.remote),
+            (format!("{prefix}.merge"), &expected.target_ref),
+        ] {
+            if success(&cwd, &["config", &key, value], deadline).is_err() {
+                return Ok(
+                    "pushed; could not finish setting the upstream — check Git configuration"
+                        .into(),
+                );
+            }
         }
-        .into())
     }
+    Ok(if refreshed {
+        "pushed"
+    } else {
+        "pushed; refresh tracking status before another command"
+    }
+    .into())
+}
+
+pub fn execute_pull(
+    cwd: &str,
+    prepared: &PreparedVcsPull,
+    deadline: Instant,
+) -> Result<String, String> {
+    execute_pull_with_agent(cwd, prepared, None, deadline)
+}
+
+/// Execute using this client's current agent, which may change after reconnect.
+pub fn execute_pull_with_agent(
+    cwd: &str,
+    prepared: &PreparedVcsPull,
+    ssh_auth_sock: Option<&str>,
+    deadline: Instant,
+) -> Result<String, String> {
+    let ssh_auth_sock =
+        ssh_auth_sock.map(|socket| crate::paths::expand_home(socket, &crate::paths::host_home()));
+    let ssh_auth_sock = ssh_auth_sock.as_deref();
+    let _guard = lock_until(deadline).map_err(failure)?;
+    let cwd = expand(cwd).canonicalize().map_err(|_| CHANGED)?;
+    let expected = &prepared.expected;
+    let checkout = validate(&cwd, expected, false, deadline)?;
+    let tracking: Vec<_> = checkout
+        .tracking
+        .iter()
+        .map(|name| (name.as_str(), optional_ref(&cwd, name, deadline)))
+        .collect();
+    let commit = prepared.fetched_commit.as_str();
+    if remote_tip(
+        &cwd,
+        &checkout.url,
+        &expected.target_ref,
+        ssh_auth_sock,
+        deadline,
+    )? != commit
+    {
+        return Err(CHANGED.into());
+    }
+    // The network wait is a second opportunity for an agent to change the
+    // checkout. Revalidate after it, immediately before touching the tree.
+    validate(&cwd, expected, false, deadline)?;
+    finish_command(
+        run_git(
+            &cwd,
+            &[
+                "-c",
+                "merge.autostash=false",
+                "merge",
+                "--ff-only",
+                "--no-edit",
+                "--no-autostash",
+                commit,
+            ],
+            deadline,
+        ),
+        "pulled",
+    )?;
+    let refreshed = refresh_tracking(&cwd, &tracking, commit, deadline);
+    Ok(if refreshed {
+        "pulled"
+    } else {
+        "pulled; refresh tracking status before another command"
+    }
+    .into())
 }
 
 fn refresh_tracking(
@@ -283,13 +368,14 @@ fn refresh_tracking(
     refreshed
 }
 
-fn validate(cwd: &Path, expected: &VcsPlan, deadline: Instant) -> Result<Checkout, String> {
-    let mut current = inspect(cwd, expected.push, deadline)?;
-    current.plan.target_commit = expected.target_commit.clone();
-    // Display metadata is not part of the immutable checkout identity. HEAD
-    // and the destination are still revalidated after the user confirms.
-    current.plan.outgoing_commits = expected.outgoing_commits.clone();
-    if current.plan != *expected {
+fn validate(
+    cwd: &Path,
+    expected: &CheckoutExpectation,
+    push: bool,
+    deadline: Instant,
+) -> Result<Checkout, String> {
+    let current = inspect(cwd, push, deadline)?;
+    if current.expected != *expected {
         return Err(CHANGED.into());
     }
     Ok(current)
@@ -471,23 +557,20 @@ fn inspect(cwd: &Path, push: bool, deadline: Instant) -> Result<Checkout, String
     if push && fetch_url != url {
         tracking.clear();
     }
-    let plan = VcsPlan {
-        push,
+    let expected = CheckoutExpectation {
         branch,
         commit,
         remote,
         target_ref,
-        target_commit: None,
-        outgoing_commits: None,
         identity: identity
             .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
-        set_upstream: push && upstream_remote.is_none() && upstream_ref.is_none(),
     };
     Ok(Checkout {
-        plan,
+        expected,
+        set_upstream: push && upstream_remote.is_none() && upstream_ref.is_none(),
         url,
         tracking,
     })
@@ -513,7 +596,7 @@ fn outgoing_commits(
         "--encoding=UTF-8",
         "-z",
         "--format=%ci%x00%an%x00%s",
-        &checkout.plan.commit,
+        &checkout.expected.commit,
     ];
     args.extend(excluded.iter().map(String::as_str));
     args.push("--");
@@ -702,14 +785,20 @@ mod tests {
             );
             Self { root, work, remote }
         }
-        fn plan(&self, push: bool) -> VcsPlan {
-            prepare(self.work.to_str().unwrap(), push, deadline()).unwrap()
+        fn push(&self) -> PreparedVcsPush {
+            prepare_push(self.work.to_str().unwrap(), deadline()).unwrap()
         }
-        fn run(&self, plan: &VcsPlan) -> Result<String, String> {
-            execute(self.work.to_str().unwrap(), plan, deadline())
+        fn pull(&self) -> PreparedVcsPull {
+            prepare_pull(self.work.to_str().unwrap(), deadline()).unwrap()
+        }
+        fn run_push(&self, plan: &PreparedVcsPush) -> Result<String, String> {
+            execute_push(self.work.to_str().unwrap(), plan, deadline())
+        }
+        fn run_pull(&self, plan: &PreparedVcsPull) -> Result<String, String> {
+            execute_pull(self.work.to_str().unwrap(), plan, deadline())
         }
         fn publish(&self) {
-            assert_eq!(self.run(&self.plan(true)).unwrap(), "pushed");
+            assert_eq!(self.run_push(&self.push()).unwrap(), "pushed");
         }
         fn advance_remote(&self) -> String {
             let peer = self.root.join("peer");
@@ -769,13 +858,10 @@ mod tests {
     #[test]
     fn push_preview_uses_destination_history_and_commit_metadata() {
         let repo = Repo::new();
-        let initial = repo.plan(true);
-        assert_eq!(
-            initial.outgoing_commits.as_ref().unwrap()[0].subject,
-            "initial"
-        );
+        let initial = repo.push();
+        assert_eq!(initial.outgoing_commits()[0].subject, "initial");
         repo.publish();
-        assert!(repo.plan(true).outgoing_commits.unwrap().is_empty());
+        assert!(repo.push().outgoing_commits().is_empty());
         let status = Command::new("git")
             .current_dir(&repo.work)
             .args([
@@ -791,9 +877,9 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let preview = repo.plan(true).outgoing_commits.unwrap();
+        let preview = repo.push();
         assert_eq!(
-            preview,
+            preview.outgoing_commits(),
             vec![VcsCommit {
                 time: "2025-03-05 14:15:16 -0400".into(),
                 author: "Example Author".into(),
@@ -802,19 +888,37 @@ mod tests {
         );
         // A different publication branch must not use main's upstream count.
         git(&repo.work, &["config", "remote.origin.push", "main:review"]);
-        assert_eq!(repo.plan(true).outgoing_commits.unwrap().len(), 2);
+        assert_eq!(repo.push().outgoing_commits().len(), 2);
         repo.publish();
-        assert!(repo.plan(true).outgoing_commits.unwrap().is_empty());
+        assert!(repo.push().outgoing_commits().is_empty());
         git(&repo.work, &["config", "--unset", "remote.origin.push"]);
-        assert_eq!(repo.plan(true).outgoing_commits.unwrap().len(), 1);
+        assert_eq!(repo.push().outgoing_commits().len(), 1);
     }
 
     #[test]
-    fn legacy_plans_distinguish_missing_previews_from_empty_ones() {
-        let mut value = serde_json::to_value(VcsPlan::for_test(true)).unwrap();
+    fn prepared_commands_execute_after_legacy_wire_roundtrips() {
+        use crate::protocol::VcsPlan;
+
+        let repo = Repo::new();
+        let push = repo.push();
+        let mut value = serde_json::to_value(VcsPlan::from(push)).unwrap();
+        // Older clients do not echo display metadata in RunVcs. The captured
+        // checkout and destination must still validate and set the upstream.
         value.as_object_mut().unwrap().remove("outgoing_commits");
-        let legacy: VcsPlan = serde_json::from_value(value).unwrap();
-        assert!(legacy.outgoing_commits.is_none());
+        let wire: VcsPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            repo.run_push(&wire.into_push_command().unwrap()).unwrap(),
+            "pushed"
+        );
+        let target = repo.advance_remote();
+        let pull = repo.pull();
+        let bytes = serde_json::to_vec(&VcsPlan::from(pull)).unwrap();
+        let wire: VcsPlan = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            repo.run_pull(&wire.into_prepared_pull().unwrap()).unwrap(),
+            "pulled"
+        );
+        assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
     }
 
     #[test]
@@ -860,18 +964,18 @@ exec sh -c "$last"
         let cwd = repo.work.to_str().unwrap();
         let process_agent = std::env::var_os("SSH_AUTH_SOCK");
         std::fs::write(&expected, "/tmp/agent-first.sock").unwrap();
-        let pull =
-            prepare_with_agent(cwd, false, Some("/tmp/agent-first.sock"), deadline()).unwrap();
+        let pull = prepare_pull_with_agent(cwd, Some("/tmp/agent-first.sock"), deadline()).unwrap();
         // Preparation authenticates both ls-remote and fetch. Execution uses a
         // replacement connection's agent and keeps the same prepared commit.
         std::fs::write(&expected, "/tmp/agent-second.sock").unwrap();
         assert!(
-            execute_with_agent(cwd, &pull, Some("/tmp/agent-first.sock"), deadline())
+            execute_pull_with_agent(cwd, &pull, Some("/tmp/agent-first.sock"), deadline())
                 .unwrap_err()
                 .contains("request agent missing")
         );
         assert_eq!(
-            execute_with_agent(cwd, &pull, Some("/tmp/agent-second.sock"), deadline()).unwrap(),
+            execute_pull_with_agent(cwd, &pull, Some("/tmp/agent-second.sock"), deadline())
+                .unwrap(),
             "pulled"
         );
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), remote_commit);
@@ -879,10 +983,10 @@ exec sh -c "$last"
             &repo.work,
             &["commit", "-q", "--allow-empty", "-m", "local change"],
         );
-        let push =
-            prepare_with_agent(cwd, true, Some("/tmp/agent-second.sock"), deadline()).unwrap();
+        let push = prepare_push(cwd, deadline()).unwrap();
         assert_eq!(
-            execute_with_agent(cwd, &push, Some("/tmp/agent-second.sock"), deadline()).unwrap(),
+            execute_push_with_agent(cwd, &push, Some("/tmp/agent-second.sock"), deadline())
+                .unwrap(),
             "pushed"
         );
         assert_eq!(
@@ -897,13 +1001,10 @@ exec sh -c "$last"
         let repo = Repo::new();
         git(&repo.work, &["tag", "-a", "release-test", "-m", "tag"]);
         git(&repo.work, &["config", "push.followTags", "true"]);
-        let plan = repo.plan(true);
+        let commit = git(&repo.work, &["rev-parse", "HEAD"]);
         repo.publish();
-        assert_eq!(
-            git(&repo.remote, &["rev-parse", "refs/heads/main"]),
-            plan.commit
-        );
-        assert_eq!(git(&repo.work, &["rev-parse", "@{upstream}"]), plan.commit);
+        assert_eq!(git(&repo.remote, &["rev-parse", "refs/heads/main"]), commit);
+        assert_eq!(git(&repo.work, &["rev-parse", "@{upstream}"]), commit);
         assert!(git(&repo.remote, &["tag"]).is_empty());
     }
 
@@ -921,21 +1022,19 @@ exec sh -c "$last"
             &["remote", "add", "publish", other.to_str().unwrap()],
         );
         git(&repo.work, &["config", "remote.pushDefault", "publish"]);
-        assert_eq!(repo.plan(true).remote, "publish");
+        assert_eq!(repo.push().destination(), "publish/main");
         git(&repo.work, &["config", "branch.main.pushRemote", "origin"]);
-        assert_eq!(repo.plan(true).remote, "origin");
+        assert_eq!(repo.push().destination(), "origin/main");
         git(&repo.work, &["config", "branch.main.pushRemote", "publish"]);
         git(
             &repo.work,
             &["config", "remote.publish.push", "main:review"],
         );
-        let plan = repo.plan(true);
+        let commit = git(&repo.work, &["rev-parse", "HEAD"]);
+        let plan = repo.push();
         assert_eq!(plan.destination(), "publish/review");
-        repo.run(&plan).unwrap();
-        assert_eq!(
-            git(&other, &["rev-parse", "refs/heads/review"]),
-            plan.commit
-        );
+        repo.run_push(&plan).unwrap();
+        assert_eq!(git(&other, &["rev-parse", "refs/heads/review"]), commit);
         assert_eq!(git(&repo.work, &["config", "branch.main.remote"]), "origin");
     }
 
@@ -954,7 +1053,7 @@ exec sh -c "$last"
         ] {
             git(&repo.work, &["config", key, value]);
             assert!(
-                prepare(repo.work.to_str().unwrap(), true, deadline()).is_err(),
+                prepare_push(repo.work.to_str().unwrap(), deadline()).is_err(),
                 "{key}={value}"
             );
             git(&repo.work, &["config", "--unset-all", key]);
@@ -967,7 +1066,7 @@ exec sh -c "$last"
             &repo.work,
             &["config", "--add", "remote.origin.push", "main:other"],
         );
-        assert!(prepare(repo.work.to_str().unwrap(), true, deadline()).is_err());
+        assert!(prepare_push(repo.work.to_str().unwrap(), deadline()).is_err());
         git(&repo.work, &["config", "--unset-all", "remote.origin.push"]);
         git(
             &repo.work,
@@ -987,7 +1086,7 @@ exec sh -c "$last"
                 repo.root.join("other").to_str().unwrap(),
             ],
         );
-        assert!(prepare(repo.work.to_str().unwrap(), true, deadline()).is_err());
+        assert!(prepare_push(repo.work.to_str().unwrap(), deadline()).is_err());
         assert!(git(&repo.remote, &["for-each-ref"]).is_empty());
     }
 
@@ -995,7 +1094,7 @@ exec sh -c "$last"
     fn changed_branch_commit_destination_or_checkout_requires_preparation() {
         for change in ["branch", "commit", "destination", "checkout"] {
             let repo = Repo::new();
-            let plan = repo.plan(true);
+            let plan = repo.push();
             match change {
                 "branch" => {
                     git(&repo.work, &["checkout", "-q", "-b", "other"]);
@@ -1033,7 +1132,7 @@ exec sh -c "$last"
                 }
                 _ => unreachable!(),
             }
-            assert!(repo.run(&plan).is_err(), "{change}");
+            assert!(repo.run_push(&plan).is_err(), "{change}");
             assert!(git(&repo.remote, &["for-each-ref"]).is_empty(), "{change}");
         }
     }
@@ -1044,18 +1143,17 @@ exec sh -c "$last"
         repo.publish();
         let old = git(&repo.work, &["rev-parse", "HEAD"]);
         let target = repo.advance_remote();
-        let plan = repo.plan(false);
-        assert_eq!(plan.target_commit.as_deref(), Some(target.as_str()));
+        let plan = repo.pull();
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), old);
         // An unrelated FETCH_HEAD cannot redirect the merge.
         std::fs::write(repo.work.join(".git/FETCH_HEAD"), "not the prepared commit").unwrap();
-        assert_eq!(repo.run(&plan).unwrap(), "pulled");
+        assert_eq!(repo.run_pull(&plan).unwrap(), "pulled");
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
         assert_eq!(git(&repo.work, &["rev-parse", "@{upstream}"]), target);
         let status = super::super::status(repo.work.to_str().unwrap());
         assert_eq!((status.ahead, status.behind), (0, 0));
 
-        let plan = repo.plan(false);
+        let plan = repo.pull();
         let peer = repo.root.join("peer");
         git(
             &peer,
@@ -1074,7 +1172,7 @@ exec sh -c "$last"
             ],
         );
         git(&peer, &["push", "-q", "origin", "main"]);
-        assert_eq!(repo.run(&plan).unwrap_err(), CHANGED);
+        assert_eq!(repo.run_pull(&plan).unwrap_err(), CHANGED);
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
     }
 
@@ -1087,9 +1185,9 @@ exec sh -c "$last"
             &repo.work,
             &["commit", "-q", "--allow-empty", "-m", "local"],
         );
-        assert!(repo.run(&repo.plan(true)).is_err());
+        assert!(repo.run_push(&repo.push()).is_err());
         assert_eq!(git(&repo.remote, &["rev-parse", "refs/heads/main"]), remote);
-        assert!(prepare(repo.work.to_str().unwrap(), false, deadline()).is_err());
+        assert!(prepare_pull(repo.work.to_str().unwrap(), deadline()).is_err());
     }
 
     #[test]
@@ -1097,7 +1195,7 @@ exec sh -c "$last"
         let guard = super::super::lock_until(deadline()).unwrap();
         let start = Instant::now();
         let result = std::thread::spawn(move || {
-            prepare("/tmp", true, start + std::time::Duration::from_millis(40))
+            prepare_push("/tmp", start + std::time::Duration::from_millis(40))
         })
         .join()
         .unwrap();
