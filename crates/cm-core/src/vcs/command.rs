@@ -362,8 +362,11 @@ fn refresh_tracking(
     let mut refreshed = true;
     for (name, old) in refs {
         let old = old.clone().unwrap_or_else(|| "0".repeat(commit.len()));
-        // Do not overwrite a newer fetch by another process.
-        refreshed &= success(cwd, &["update-ref", name, commit, &old], deadline).is_ok();
+        // Do not overwrite a newer fetch by another process. Git 2.56+ moves
+        // the ref itself when a pushed URL matches a configured remote, so a
+        // ref already at the commit is refreshed even though the swap fails.
+        refreshed &= success(cwd, &["update-ref", name, commit, &old], deadline).is_ok()
+            || optional_ref(cwd, name, deadline).as_deref() == Some(commit);
     }
     refreshed
 }
