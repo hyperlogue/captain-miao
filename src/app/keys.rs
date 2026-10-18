@@ -1,12 +1,13 @@
 //! Input dispatch: a crossterm key or mouse event becomes an [`Action`].
 //!
 //! One entry point per device — [`App::handle_key`] and [`App::handle_mouse`] —
-//! both of which first branch on [`InputMode`], because which keys mean what is
-//! entirely a function of what is on screen. Only Normal mode goes through the
+//! both of which give overlays priority before dispatching to [`InputMode`].
+//! Which keys mean what follows what is on screen. Only Normal mode goes through the
 //! remappable table: it resolves the event to a `Command` via the `Keymap` table and
 //! hands it to [`App::run_command`], which is the one place a `Command` becomes
 //! a side effect. Every other mode (Search, the pickers, DirEdit, HostEdit,
-//! Confirm, Help, Messages) keeps fixed keys and has its own `handle_*_key`.
+//! Help, Messages) keeps fixed keys and has its own `handle_*_key`. Confirmations
+//! overlay these modes and consume input before the underlying screen.
 //!
 //! The split from `keymap.rs` is deliberate: that module owns the *table* and
 //! nothing else, so a remap is a config question and never a code change here.
@@ -57,9 +58,17 @@ impl App {
         // Further input cancels a queued Enter. FocusSelected re-arms it;
         // ordinary cursor movement explicitly selects its new row below.
         self.launches.cancel_activation();
-        // Ctrl+c always quits, regardless of current mode. Extra modifiers
+        // The visible confirmation consumes Ctrl+C as rejection before quit.
+        // Startup announcements retain priority over a queued recovery prompt.
+        if self.upgrade_notices.is_none() && self.confirmation.is_some() {
+            return self.handle_confirmation_key(key);
+        }
+        // Ctrl+c quits when no confirmation owns the keyboard. Extra modifiers
         // describe a different chord and must not silently turn it into quit.
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+        if key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('c')
+            && key.kind == KeyEventKind::Press
+        {
             self.should_quit = true;
             return None;
         }
@@ -72,8 +81,6 @@ impl App {
             InputMode::Search => self.handle_search_key(key),
             InputMode::Picker => self.handle_picker_key(key),
             InputMode::Help => self.handle_help_key(key),
-            InputMode::Confirm => self.handle_confirm_key(key),
-            InputMode::VcsConfirm => self.handle_vcs_confirm_key(key),
             InputMode::DirEdit => self.handle_dir_edit_key(key),
             InputMode::HostEdit => self.handle_host_edit_key(key),
             InputMode::Messages => {
@@ -91,12 +98,8 @@ impl App {
         if self.upgrade_notices.is_some() {
             return self.handle_upgrade_notices_mouse(mouse);
         }
-        if self.input_mode == InputMode::VcsConfirm {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_vcs_confirm(-3),
-                MouseEventKind::ScrollDown => self.scroll_vcs_confirm(3),
-                _ => {}
-            }
+        if let Some(confirmation) = self.confirmation.as_mut() {
+            confirmation.handle_mouse(mouse.kind);
             return None;
         }
         if self.input_mode == InputMode::Messages {
@@ -696,15 +699,15 @@ impl App {
                         force: false,
                     });
                 }
-                self.pending_confirm = Some(super::PendingConfirm {
-                    prompt: "Another terminal is attached — kick it? [y/N]".to_string(),
-                    action: Action::AttachRemoteRunning {
+                self.confirm_action(
+                    "Another terminal is attached — kick it?".to_string(),
+                    "attach",
+                    Action::AttachRemoteRunning {
                         host: s.host,
                         pool_session,
                         force: true,
                     },
-                });
-                self.input_mode = InputMode::Confirm;
+                );
                 None
             }
             Command::AttachAll => self.request_attach_all(),
@@ -1243,19 +1246,25 @@ impl App {
         None
     }
 
-    fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y')
-                if (key.modifiers - KeyModifiers::SHIFT).is_empty() =>
-            {
-                self.input_mode = InputMode::Normal;
-                self.pending_confirm.take().map(|p| p.action)
+    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Option<Action> {
+        use super::{ConfirmAction, confirm::Decision};
+        let decision = self.confirmation.as_mut()?.handle_key(key)?;
+        let payload = self.confirmation.take()?.payload?;
+        if decision == Decision::Reject {
+            if let ConfirmAction::Run(Action::VcsRun(push)) = payload {
+                self.cancel_vcs_push(push);
             }
-            _ => {
-                self.input_mode = InputMode::Normal;
-                self.pending_confirm = None;
-                None
+            // Dropping GrantConsent's sender is the backend's refusal signal.
+            return None;
+        }
+        match payload {
+            ConfirmAction::Run(action) => return Some(action),
+            ConfirmAction::RemoveHost(host) => self.remove_confirmed_host(&host),
+            ConfirmAction::ResetPreferences => self.reset_all_prefs(),
+            ConfirmAction::DeleteForward { host, rule } => {
+                self.delete_confirmed_forward(&host, &rule)
             }
         }
+        None
     }
 }

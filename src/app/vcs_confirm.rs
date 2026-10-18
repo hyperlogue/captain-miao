@@ -1,17 +1,16 @@
-//! Review prepared pushes without interrupting another modal or changing targets.
+//! Caller-supplied commit review content and prepared-push lifecycle. The shared
+//! confirmation owns the overlay, scrolling and accept/reject interaction.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
     style::Style,
-    text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
+    text::{Line, Span, Text},
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::format::{clear_overlay, truncate_str};
+use super::confirm::{Body, Confirmation, Content};
+use super::format::truncate_str;
 use super::notifications::Level;
-use super::{Action, App, InputMode};
+use super::{Action, App, ConfirmAction, InputMode};
 use crate::config;
 use crate::state::HostId;
 
@@ -26,64 +25,28 @@ impl App {
     pub(super) fn show_vcs_confirmation(&mut self) -> bool {
         if self.input_mode != InputMode::Normal
             || self.upgrade_notices.is_some()
-            || self.pending_confirm.is_some()
-            || self.vcs_pushes.is_empty()
+            || self.confirmation.is_some()
         {
             return false;
         }
-        self.vcs_scroll = 0;
-        self.input_mode = InputMode::VcsConfirm;
+        let Some(push) = self.vcs_pushes.pop_front() else {
+            return false;
+        };
+        let review = PushReview {
+            destination: push.plan.destination(),
+            checkout: format!("{}: {}", push.host.0, push.cwd),
+            commits: push.plan.outgoing_commits().to_vec(),
+        };
+        self.confirmation = Some(Confirmation::question(
+            "Confirm push",
+            review,
+            "push",
+            ConfirmAction::Run(Action::VcsRun(push)),
+        ));
         true
     }
 
-    pub(super) fn scroll_vcs_confirm(&mut self, delta: isize) {
-        let count = self
-            .vcs_pushes
-            .front()
-            .map_or(0, |push| push.plan.outgoing_commits().len());
-        self.vcs_scroll = self
-            .vcs_scroll
-            .saturating_add_signed(delta)
-            .min(count.saturating_sub(1));
-    }
-
-    pub(super) fn handle_vcs_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.scroll_vcs_confirm(1);
-                    return None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.scroll_vcs_confirm(-1);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.scroll_vcs_confirm(10);
-                    return None;
-                }
-                KeyCode::PageUp => {
-                    self.scroll_vcs_confirm(-10);
-                    return None;
-                }
-                KeyCode::Home => {
-                    self.vcs_scroll = 0;
-                    return None;
-                }
-                KeyCode::End => {
-                    self.scroll_vcs_confirm(isize::MAX);
-                    return None;
-                }
-                _ => {}
-            }
-        }
-        self.input_mode = InputMode::Normal;
-        let push = self.vcs_pushes.pop_front()?;
-        if matches!(key.code, KeyCode::Char('y' | 'Y'))
-            && (key.modifiers - KeyModifiers::SHIFT).is_empty()
-        {
-            return Some(Action::VcsRun(push));
-        }
+    pub(super) fn cancel_vcs_push(&mut self, push: PushConfirmation) {
         if let Some(id) = self
             .vcs_commands
             .remove(&(push.host.clone(), push.cwd.clone()))
@@ -94,17 +57,21 @@ impl App {
                 format!("Push cancelled\n{}: {}", push.host.0, push.cwd),
             );
         }
-        None
     }
+}
 
-    pub(super) fn draw_vcs_confirm(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(push) = self.vcs_pushes.front() else {
-            return;
-        };
-        let commits = push.plan.outgoing_commits();
-        let width = area.width.saturating_sub(2).min(106);
-        let content_width = width.saturating_sub(4) as usize;
-        let times: Vec<_> = commits
+#[derive(Debug)]
+struct PushReview {
+    destination: String,
+    checkout: String,
+    commits: Vec<cm_core::vcs::VcsCommit>,
+}
+
+impl Content for PushReview {
+    fn layout(&self, width: u16) -> Body {
+        let content_width = usize::from(width);
+        let times: Vec<_> = self
+            .commits
             .iter()
             .map(|commit| commit_time(&commit.time))
             .collect();
@@ -114,9 +81,9 @@ impl App {
             .max()
             .unwrap_or(0)
             .max("Commit time".len());
-        // Measure the whole table so scrolling does not move the columns. Give
-        // names their natural display width, including wide Unicode glyphs.
-        let author_width = commits
+        // Measure every row so scrolling never moves the columns.
+        let author_width = self
+            .commits
             .iter()
             .map(|commit| single_line(&commit.author, usize::MAX).width())
             .max()
@@ -124,59 +91,17 @@ impl App {
             .max("Author".len());
         let message_width = content_width.saturating_sub(time_width + author_width + 4);
         let compact = message_width < 20;
-        let row_height = if compact { 3 } else { 1 };
-        let height = (commits.len().saturating_mul(row_height).saturating_add(8))
-            .min(24)
-            .min(area.height as usize) as u16;
-        let popup = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
         let ui = &config::get().colors.ui;
         let muted = Style::default().dim();
         let accent = Style::default().fg(ui.title_fg).bold();
         let attention = Style::default().fg(ui.attention_fg).bold();
         let message = Style::default().bold();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(muted)
-            .padding(Padding::horizontal(1))
-            .title(Span::styled(" Confirm push ", attention));
-        let inner = block.inner(popup);
-        clear_overlay(frame, popup);
-        frame.render_widget(block, popup);
-        let [summary, _, header, rows, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(2),
-        ])
-        .areas(inner);
-        let count = commits.len();
+        let count = self.commits.len();
         let noun = if count == 1 { "commit" } else { "commits" };
         let prompt = format!("Push {count} {noun} to ");
         let destination = single_line(
-            &push.plan.destination(),
+            &self.destination,
             content_width.saturating_sub(prompt.width() + 1),
-        );
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::raw("Push "),
-                    Span::styled(format!("{count} {noun}"), attention),
-                    Span::styled(" to ", muted),
-                    Span::styled(destination, accent),
-                    Span::raw("?"),
-                ]),
-                Line::styled(
-                    single_line(&format!("{}: {}", push.host.0, push.cwd), content_width),
-                    muted,
-                ),
-            ]),
-            summary,
         );
         let headings = if compact {
             "Commit time / author / message".into()
@@ -187,15 +112,20 @@ impl App {
                 column("Author", author_width)
             )
         };
-        frame.render_widget(Paragraph::new(headings).style(muted), header);
-        let visible = (rows.height as usize / row_height).max(1);
-        self.vcs_scroll = self.vcs_scroll.min(count.saturating_sub(visible));
-        let end = (self.vcs_scroll + visible).min(count);
+        let pinned = Text::from(vec![
+            Line::from(vec![
+                Span::raw("Push "),
+                Span::styled(format!("{count} {noun}"), attention),
+                Span::styled(" to ", muted),
+                Span::styled(destination, accent),
+                Span::raw("?"),
+            ]),
+            Line::styled(single_line(&self.checkout, content_width), muted),
+            Line::default(),
+            Line::styled(single_line(&headings, content_width), muted),
+        ]);
         let mut lines = Vec::new();
-        for (commit, time) in commits[self.vcs_scroll..end]
-            .iter()
-            .zip(&times[self.vcs_scroll..end])
-        {
+        for (commit, time) in self.commits.iter().zip(times) {
             if compact {
                 lines.push(Line::styled(single_line(time, content_width), muted));
                 lines.push(Line::from(single_line(&commit.author, content_width)));
@@ -213,27 +143,10 @@ impl App {
                 ]));
             }
         }
-        frame.render_widget(Paragraph::new(lines), rows);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    single_line(
-                        &format!(
-                            "{}–{end} of {count} · ↑↓/PgUp/PgDn scroll",
-                            self.vcs_scroll + 1
-                        ),
-                        content_width,
-                    ),
-                    muted,
-                ),
-                Line::from(vec![
-                    Span::styled("y/Y push", attention),
-                    Span::raw("   "),
-                    Span::styled("Enter/Esc cancel", muted),
-                ]),
-            ]),
-            footer,
-        );
+        Body {
+            pinned,
+            text: Text::from(lines),
+        }
     }
 }
 

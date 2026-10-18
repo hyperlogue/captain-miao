@@ -43,14 +43,6 @@ pub(crate) struct HostEditState {
     /// [`RowEdit`]. `None` in the list. Drawn as a card over the list rather
     /// than inside it, so this is what dims the panel behind it too.
     pub(in crate::app) edit: Option<RowEdit>,
-    /// The row a `d` press is asking about — the removal confirm (§9). `None`
-    /// when nothing is pending.
-    pub(in crate::app) pending_remove: Option<usize>,
-    /// What a `u` press put on screen — a question to answer, or a refusal to
-    /// acknowledge. Kept beside `pending_remove` rather than folded into the
-    /// global [`PendingConfirm`] because that one switches `InputMode`, which
-    /// would tear this panel down mid-question.
-    pub(in crate::app) pending_upgrade: Option<UpgradePrompt>,
     /// The connection log open over the list (`l`). `Some` replaces the list
     /// view entirely — it wants the whole popup, since the text it exists to
     /// show is what didn't fit on a row.
@@ -180,21 +172,6 @@ impl HostEditState {
     pub(in crate::app) fn focus(&self) -> Option<HostField> {
         self.edit.as_ref().map(|e| e.focus)
     }
-}
-
-/// The line a `u` press leaves in the hosts panel.
-///
-/// One type for both outcomes because they render identically and are dismissed
-/// identically; only `actionable` decides whether `y` does anything. Keeping the
-/// refusal on screen matters — this panel has no status line (its footer is key
-/// hints), so a message set anywhere else would surface stale, after the panel
-/// closed, or not at all.
-#[derive(Debug)]
-pub(crate) struct UpgradePrompt {
-    pub(in crate::app) row: usize,
-    pub(in crate::app) text: String,
-    /// `false` for a refusal: any key dismisses it and nothing happens.
-    pub(in crate::app) actionable: bool,
 }
 
 /// One rendered line of a host's connection log — see [`App::host_log_lines`].
@@ -523,7 +500,6 @@ impl App {
                 HostView::Help { .. } => self.draw_host_help(frame, area),
             }
             self.draw_host_form(frame, area);
-            self.draw_host_prompt(frame, area);
         }
     }
 
@@ -1077,50 +1053,6 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_host_prompt(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(state) = self.host_edit.as_ref() else {
-            return;
-        };
-        let (title, text) = if let Some(index) = state.pending_remove {
-            let label = state.rows.get(index).map(|r| r.label.text()).unwrap_or("");
-            (
-                " Remove host? ",
-                format!("Remove host \"{label}\" and its dashboard mirror? [y/N]"),
-            )
-        } else if let Some(prompt) = &state.pending_upgrade {
-            (" Upgrade server ", prompt.text.clone())
-        } else {
-            return;
-        };
-        let host_popup = Self::hosts_popup(area);
-        let width = host_popup.width.saturating_sub(4);
-        let lines: Vec<_> = wrap_ranges(&text, width.saturating_sub(6) as usize)
-            .into_iter()
-            .map(|r| Line::from(text[r].to_owned()))
-            .collect();
-        let height = (lines.len() as u16 + 4).min(area.height);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
-        frame
-            .buffer_mut()
-            .set_style(host_popup, Style::default().dim());
-        clear_overlay(frame, popup);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(2))
-            .title(title);
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().fg(config::get().colors.ui.attention_fg)),
-            inner,
-        );
-    }
-
     /// The selected row's fields, as a card floating over the list.
     ///
     /// Its own popup rather than the form pinned under the list that this was.
@@ -1382,14 +1314,6 @@ impl App {
             return vec![Span::raw(self.forward_hints())];
         } else if state.log_view.is_some() {
             vec![("j/k", "scroll"), ("g/G", "top/bottom"), ("Esc", "back")]
-        } else if state.pending_remove.is_some() {
-            vec![("y", "remove"), ("Esc", "cancel")]
-        } else if let Some(prompt) = &state.pending_upgrade {
-            if prompt.actionable {
-                vec![("y", "upgrade"), ("Esc", "cancel")]
-            } else {
-                vec![("Any key", "back")]
-            }
         } else if matches!(state.view, HostView::Help { .. }) {
             vec![("Esc", "back")]
         } else if let Some(focus) = state.focus() {
@@ -1487,9 +1411,7 @@ impl App {
             && !alt
             && key.code == KeyCode::Char('f')
             && self.host_edit.as_ref()?.edit.is_none()
-            && self.host_edit.as_ref()?.log_view.is_none()
-            && self.host_edit.as_ref()?.pending_remove.is_none()
-            && self.host_edit.as_ref()?.pending_upgrade.is_none())
+            && self.host_edit.as_ref()?.log_view.is_none())
             || (!ctrl
                 && !alt
                 && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
@@ -1504,31 +1426,6 @@ impl App {
         // so none of the list's keys are reachable behind it.
         if self.host_edit.as_ref()?.log_view.is_some() {
             self.handle_host_log_key(key);
-            return None;
-        }
-
-        // A pending upgrade owns the keyboard until answered — or, when it is a
-        // refusal rather than a question, until acknowledged.
-        if let Some(prompt) = self.host_edit.as_mut()?.pending_upgrade.take() {
-            if prompt.actionable && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                let host = self.host_edit.as_ref()?.rows.get(prompt.row)?.host();
-                return Some(Action::UpgradeHost { host });
-            }
-            return None;
-        }
-
-        // A pending removal owns the keyboard until answered.
-        if let Some(idx) = self.host_edit.as_ref()?.pending_remove {
-            let state = self.host_edit.as_mut()?;
-            state.pending_remove = None;
-            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                if idx < state.rows.len() {
-                    state.rows.remove(idx);
-                    state.cursor = state.cursor.min(state.rows.len());
-                }
-                self.apply_host_edits();
-                self.host_edit.as_mut()?.view = HostView::List;
-            }
             return None;
         }
 
@@ -1839,7 +1736,13 @@ impl App {
                 // Removal is destructive (it drops the host and its mirror), so
                 // it asks first.
                 KeyCode::Char('d') if state.cursor < n && !state.rows[state.cursor].is_local => {
-                    state.pending_remove = Some(state.cursor);
+                    let host = state.rows[state.cursor].host();
+                    self.confirmation = Some(super::confirm::Confirmation::question(
+                        "Remove host?",
+                        format!("Remove host \"{}\" and its dashboard mirror?", host.0),
+                        "remove",
+                        super::ConfirmAction::RemoveHost(host),
+                    ));
                 }
                 // Details and help expose upgrades only when the backend has
                 // an offer. The prompt reports its cost or why it is blocked.
@@ -1847,18 +1750,17 @@ impl App {
                     let row = state.cursor;
                     let host = state.rows[row].host();
                     let offer = self.selected_host_upgrade()?;
-                    let prompt = match self.upgrade_blocker(&host) {
-                        Some(why) => super::UpgradePrompt {
-                            row,
-                            text: format!("  Cannot upgrade \"{}\": {why}", host.0),
-                            actionable: false,
-                        },
+                    self.confirmation = Some(match self.upgrade_blocker(&host) {
+                        Some(why) => super::confirm::Confirmation::notice(
+                            "Upgrade server",
+                            format!("Cannot upgrade \"{}\": {why}", host.0),
+                        ),
                         None => {
                             let n = self.host_session_counts(&host).0;
-                            super::UpgradePrompt {
-                                row,
-                                text: format!(
-                                    "  Upgrade \"{}\" to {}? {} [y/N]",
+                            super::confirm::Confirmation::question(
+                                "Upgrade server",
+                                format!(
+                                    "Upgrade \"{}\" to {}? {}",
                                     host.0,
                                     offer.version,
                                     match n {
@@ -1869,11 +1771,11 @@ impl App {
                                         ),
                                     }
                                 ),
-                                actionable: true,
-                            }
+                                "upgrade",
+                                super::ConfirmAction::Run(Action::UpgradeHost { host }),
+                            )
                         }
-                    };
-                    self.host_edit.as_mut()?.pending_upgrade = Some(prompt);
+                    });
                 }
                 // Details explain the failure; the log adds the steps before it.
                 KeyCode::Char('l') if state.cursor < n && has_log => {
@@ -1888,6 +1790,23 @@ impl App {
             }
         }
         None
+    }
+
+    pub(super) fn remove_confirmed_host(&mut self, host: &HostId) {
+        let Some(state) = self.host_edit.as_mut() else {
+            return;
+        };
+        let Some(index) = state
+            .rows
+            .iter()
+            .position(|row| !row.is_local && row.host() == *host)
+        else {
+            return;
+        };
+        state.rows.remove(index);
+        state.cursor = state.cursor.min(state.rows.len());
+        state.view = HostView::List;
+        self.apply_host_edits();
     }
 
     /// Scroll keys for the connection log (`l`). Reading, not editing, so the

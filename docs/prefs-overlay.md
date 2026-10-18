@@ -225,8 +225,8 @@ state files owner-only via `write_json_atomic`. No new IPC. No
     `context_warning_tokens` / `context_critical_tokens`. Remove the
     hardcoded percentage branch in `context_pressure_style`.
 
-13. **Overlay, not full-screen; own `InputMode`.** Nested confirms
-    stay inside prefs state.
+13. **Overlay, not full-screen; own `InputMode`.** Confirmations use the
+    shared overlay while preserving the preferences panel and its input mode.
 
 14. **No IPC.**
 

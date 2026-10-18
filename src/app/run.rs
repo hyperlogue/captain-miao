@@ -44,8 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    Action, App, InputMode, KillOrigin, KillResult, KillWindow, PendingConfirm, PickerKind,
-    ReportOrigin, RestartSpec, ResumeLoad, SessionSnapshotEntry,
+    Action, App, InputMode, KillOrigin, KillResult, KillWindow, PickerKind, ReportOrigin,
+    RestartSpec, ResumeLoad, SessionSnapshotEntry,
 };
 
 /// Lines of terminal output captured for the preview panel — its vertical
@@ -1448,7 +1448,7 @@ fn poll_launches(app: &mut App, fs_dirty: &mut bool) -> bool {
 /// (§7) both come through here, so they can't drift on placement or binding.
 ///
 /// `force` steals the session from whichever client currently holds it — only
-/// ever set behind the y/N confirm, since the pool is one client at a time and
+/// ever set behind a confirmation, since the pool is one client at a time and
 /// attaching otherwise declines rather than kicking someone (§10.2).
 ///
 /// `focus` raises the new window when the attach was the user's own `Enter`, and
@@ -2599,7 +2599,8 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         // other. The asking task bounds its own wait, so nothing hangs if the
         // user never gets to it.
         if app.input_mode == InputMode::Normal
-            && app.pending_confirm.is_none()
+            && app.upgrade_notices.is_none()
+            && app.confirmation.is_none()
             // Skip questions nobody is waiting on any more. A prompt that
             // outlived its timeout while the user was in a picker would
             // otherwise be shown, answered, and silently do nothing — and the
@@ -2608,12 +2609,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             && let Some(prompt) = std::iter::from_fn(|| app.consent_prompts.try_recv().ok())
                 .find(|p| !p.reply.is_closed())
         {
-            app.pending_confirm = Some(PendingConfirm {
-                // The asker phrased it; this only adds the answer key.
-                prompt: format!("{} [y/N]", prompt.question),
-                action: Action::GrantConsent(prompt.reply),
-            });
-            app.input_mode = InputMode::Confirm;
+            app.confirm_action(prompt.question, "allow", Action::GrantConsent(prompt.reply));
             needs_redraw = true;
         }
         if fs_dirty && last_reload.is_none_or(|t| t.elapsed() >= reload_min_interval) {
@@ -2732,8 +2728,15 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // to attribute the keystroke to the mode it was pressed
                         // in for frequency analysis.
                         let mode_before = app.input_mode;
+                        let confirmation_before =
+                            app.confirmation.is_some() && app.upgrade_notices.is_none();
                         let action = app.handle_key(key);
-                        super::keybind_log::record(mode_before, key, action.as_ref());
+                        super::keybind_log::record(
+                            mode_before,
+                            confirmation_before,
+                            key,
+                            action.as_ref(),
+                        );
                         action
                     }
                     Event::Paste(text) => {
@@ -3107,7 +3110,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         queue_restarts(&mut app, &mut inboxes.restarts, vec![spec]);
                     }
                     // The only "yes" that is just an answer. A refusal never
-                    // reaches here: `handle_confirm_key` drops the action, and
+                    // reaches here: `handle_confirmation_key` drops the action, and
                     // the dropped sender is what the waiting task reads as no.
                     Action::GrantConsent(reply) => {
                         let _ = reply.send(true);
@@ -3429,7 +3432,7 @@ mod tests {
                     .unwrap();
             });
             apply_vcs(&mut app, &tx, prepared);
-            assert!(app.pending_confirm.is_none());
+            assert!(app.confirmation.is_none());
             assert_eq!(app.input_mode, InputMode::Search);
             assert_eq!(app.vcs_commands[&(host.clone(), cwd.clone())], id);
             if outgoing {
@@ -3437,7 +3440,8 @@ mod tests {
                 assert!(!app.show_vcs_confirmation(), "search must keep its input");
                 app.input_mode = InputMode::Normal;
                 assert!(app.show_vcs_confirmation());
-                assert_eq!(app.input_mode, InputMode::VcsConfirm);
+                assert!(app.confirmation.is_some());
+                assert_eq!(app.input_mode, InputMode::Normal);
                 let Some(Action::VcsRun(reviewed)) =
                     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 else {
@@ -3607,7 +3611,8 @@ mod tests {
             }
             apply_vcs(&mut app, &tx, prepared);
             if push {
-                assert_eq!(app.input_mode, InputMode::VcsConfirm);
+                assert!(app.confirmation.is_some());
+                assert_eq!(app.input_mode, InputMode::Normal);
                 let Some(Action::VcsRun(reviewed)) =
                     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 else {
@@ -3658,7 +3663,7 @@ mod tests {
         assert!(app.vcs_commands.is_empty());
         assert!(app.status_is_error);
         assert!(app.status_msg.as_deref().unwrap().contains("disconnected"));
-        assert!(app.pending_confirm.is_none());
+        assert!(app.confirmation.is_none());
         // Even a long poll interval wakes for the fade, then the error is idle.
         assert!(
             next_wakeup(&app, Duration::from_secs(60), None, None) <= Duration::from_millis(180)

@@ -30,6 +30,7 @@
 mod agent_logos;
 mod announcements;
 mod bindings;
+mod confirm;
 mod dashboard_state;
 mod diagnostics;
 mod dir_edit;
@@ -57,7 +58,7 @@ mod vcs_confirm;
 /// that already named them; the panel owns them, `mod.rs` no longer declares
 /// them.
 pub(in crate::app) use dir_edit::{DirEditFocus, DirEditState};
-pub(in crate::app) use host_edit::{HostEditState, HostField, HostLogLine, HostRow, UpgradePrompt};
+pub(in crate::app) use host_edit::{HostEditState, HostField, HostLogLine, HostRow};
 
 pub use run::{read_dashboard_window_id, run};
 
@@ -107,16 +108,14 @@ const PENDING_FOCUS_MAX_AGE: Duration = Duration::from_secs(30);
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-/// What the dashboard is currently accepting keys for. Every key handler
-/// branches on this first, because which keys mean what is entirely a function
-/// of what is on screen — and only `Normal` goes through the remappable table.
+/// The screen accepting keys when no confirmation or announcement overlays it.
+/// Only `Normal` goes through the remappable table; overlays preserve this mode
+/// so closing one returns input to the same screen.
 pub(super) enum InputMode {
     Normal,
     Search,
     Picker,
     Help,
-    Confirm,
-    VcsConfirm,
     /// Modal popup for editing the icon + color of the selected session's
     /// directory. See `DirEditState`.
     DirEdit,
@@ -246,7 +245,7 @@ pub(super) enum Action {
         host: HostId,
         pool_session: String,
         /// Steal the session from the client currently attached to it. Only ever
-        /// set behind an explicit y/N confirm — the pool is one client at a
+        /// set behind an explicit confirmation — the pool is one client at a
         /// time, so attaching otherwise declines rather than kicking someone.
         force: bool,
     },
@@ -267,9 +266,8 @@ pub(super) enum Action {
     /// The only action that carries a reply channel, because it answers a
     /// question the *backend* asked rather than starting something the user
     /// did. Firing it sends `true`; **dropping it is a refusal**, which is what
-    /// makes `n`, Esc and quitting all decline without a branch of their own —
-    /// `handle_confirm_key` already drops the pending action on anything but
-    /// `y`, so the safe answer is the default one.
+    /// makes cancellation and quitting decline without a reply of their own.
+    /// `handle_confirmation_key` returns this action only on `y` or Enter.
     GrantConsent(tokio::sync::oneshot::Sender<bool>),
 }
 
@@ -845,12 +843,17 @@ pub(super) enum VcsView {
     Unavailable,
 }
 
-/// A pending y/N confirmation. Set when the user invokes a destructive
-/// action (e.g. restart) — the action is fired only after Enter / y / Y.
+/// Captured operations awaiting a decision. Panel operations retain their host
+/// and rule identity, rather than resolving whichever row is selected later.
 #[derive(Debug)]
-pub(super) struct PendingConfirm {
-    pub(super) prompt: String,
-    pub(super) action: Action,
+pub(super) enum ConfirmAction {
+    Run(Action),
+    RemoveHost(HostId),
+    ResetPreferences,
+    DeleteForward {
+        host: HostId,
+        rule: crate::ssh_forward::Rule,
+    },
 }
 
 /// Cached Tab-completion list for the workdir picker. Stored per-App so
@@ -961,9 +964,8 @@ pub(super) struct App {
     /// Active picker popup (move-tab or resume) — `Some` iff
     /// `input_mode == InputMode::Picker`.
     pub(super) picker: Option<ActivePicker>,
-    /// A queued action waiting on a y/N confirmation. `Some` iff
-    /// `input_mode == InputMode::Confirm`.
-    pub(super) pending_confirm: Option<PendingConfirm>,
+    /// The active confirmation overlays, and preserves, the current input mode.
+    pub(in crate::app) confirmation: Option<confirm::Confirmation<ConfirmAction>>,
     /// Download-consent questions from the hosts' connection tasks.
     ///
     /// The backends run on their own tasks and cannot open a popup; this is how
@@ -1173,7 +1175,6 @@ pub(super) struct App {
     /// One command per checkout; unrelated checkouts can run concurrently.
     pub(super) vcs_commands: HashMap<(HostId, String), notifications::NotificationId>,
     pub(super) vcs_pushes: std::collections::VecDeque<vcs_confirm::PushConfirmation>,
-    pub(super) vcs_scroll: usize,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,
     /// First-draw defaults have been picked based on the initial viewport
@@ -1764,7 +1765,7 @@ impl App {
             preview_fetched_at: None,
             preview_updated_at: None,
             picker: None,
-            pending_confirm: None,
+            confirmation: None,
             consent_prompts: consent_rx,
             upgrading: HashSet::new(),
             upgrade_restores: HashMap::new(),
@@ -1816,7 +1817,6 @@ impl App {
             vcs: HashMap::new(),
             vcs_commands: HashMap::new(),
             vcs_pushes: std::collections::VecDeque::new(),
-            vcs_scroll: 0,
             detail_visible: true,
             panels_initialized: false,
             drag: None,
@@ -2835,8 +2835,6 @@ impl App {
             detail_scroll: 0,
             detail_rows: 0,
             edit: None,
-            pending_remove: None,
-            pending_upgrade: None,
             log_view: None,
             forward_view: None,
             rows,
@@ -3043,7 +3041,7 @@ impl App {
         *self.last_snapshot.borrow_mut() = Some(sessions);
     }
 
-    /// Pop a queued y/N confirmation that asks the user to restart sessions
+    /// Pop a queued confirmation that asks the user to restart sessions
     /// missing from the previous run. `specs` is pre-filtered to entries whose
     /// launcher pid is no longer alive; an empty list is a no-op.
     pub(super) fn prompt_restart_missing(&mut self, specs: Vec<RestartSpec>) {
@@ -3054,7 +3052,7 @@ impl App {
         let noun = plural_sessions(n);
         self.confirm_restart_all(
             specs,
-            format!("Previous dashboard exited with {n} live {noun}. Restart them? [y/N]"),
+            format!("Previous dashboard exited with {n} live {noun}. Restart them?"),
         );
     }
 
@@ -4264,15 +4262,15 @@ impl App {
         // guessing "held" from a pool we couldn't read would put a confirm in
         // front of every row.
         if s.attached == Some(true) {
-            self.pending_confirm = Some(PendingConfirm {
-                prompt: "Another terminal is attached — kick it? [y/N]".to_string(),
-                action: Action::AttachRemoteRunning {
+            self.confirm_action(
+                "Another terminal is attached — kick it?".to_string(),
+                "attach",
+                Action::AttachRemoteRunning {
                     host: s.host.clone(),
                     pool_session: pool.clone(),
                     force: true,
                 },
-            });
-            self.input_mode = InputMode::Confirm;
+            );
             return None;
         }
         Some(Action::AttachRemoteRunning {
@@ -5012,11 +5010,11 @@ impl App {
             &format::session_display_name(&s, self.index_of(&s), &self.random_names),
             crate::config::get().ui.table.name_truncate,
         );
-        self.pending_confirm = Some(PendingConfirm {
-            prompt: format!("Restart session \"{name}\"? [y/N]"),
-            action: Action::RestartSession(spec),
-        });
-        self.input_mode = InputMode::Confirm;
+        self.confirm_action(
+            format!("Restart session \"{name}\"?"),
+            "restart",
+            Action::RestartSession(spec),
+        );
     }
 
     /// Queue a confirmation to restart every session. Refuses if any session
@@ -5051,18 +5049,23 @@ impl App {
         }
         let n = specs.len();
         let noun = plural_sessions(n);
-        self.confirm_restart_all(specs, format!("Restart all {n} {noun}? [y/N]"));
+        self.confirm_restart_all(specs, format!("Restart all {n} {noun}?"));
     }
 
-    /// Queue a y/N confirmation whose Yes restarts every session in `specs`.
+    /// Queue a confirmation whose Yes restarts every session in `specs`.
     /// Shared by `request_restart_all` and `prompt_restart_missing` (each supplies
-    /// its own prompt wording) so the `PendingConfirm` construction lives once.
+    /// its own prompt wording) so the confirmation construction lives once.
     fn confirm_restart_all(&mut self, specs: Vec<RestartSpec>, prompt: String) {
-        self.pending_confirm = Some(PendingConfirm {
+        self.confirm_action(prompt, "restart", Action::RestartAll { sessions: specs });
+    }
+
+    pub(super) fn confirm_action(&mut self, prompt: String, accept: &'static str, action: Action) {
+        self.confirmation = Some(confirm::Confirmation::question(
+            "Confirm",
             prompt,
-            action: Action::RestartAll { sessions: specs },
-        });
-        self.input_mode = InputMode::Confirm;
+            accept,
+            ConfirmAction::Run(action),
+        ));
     }
 
     // =============================================================================

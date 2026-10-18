@@ -6,10 +6,10 @@
 //! `config.toml` overlays user remaps on top (see [`Keymap::from_config`]).
 //!
 //! Scope: only Normal-mode commands are remappable. The text-input modes
-//! (Search / Picker / DirEdit / Confirm / Help) keep fixed keys,
-//! as does `Ctrl-c` (always quit). The structural `g g` prefix (jump-to-top)
-//! and digit selectors `1..9` / `Ctrl-1..9` are built-in fallbacks; explicit
-//! configured bindings take precedence over them.
+//! (Search / Picker / DirEdit / Help) and confirmation overlays keep fixed keys.
+//! `Ctrl-c` cancels a confirmation, otherwise quits. The structural `g g` prefix
+//! (jump-to-top) and digit selectors `1..9` / `Ctrl-1..9` are built-in fallbacks;
+//! explicit configured bindings take precedence over them.
 //!
 //! A [`KeySeq`] is one, two, or three [`Chord`]s. Longer sequences (e.g. `Space e`,
 //! `Space v p`) work via a generic prefix mechanism in `keys.rs`: every proper
@@ -311,7 +311,7 @@ pub(super) enum Command {
     SessionsLayout,
     ManageHosts,
     /// Attach to the selected pooled session, kicking whatever client currently
-    /// holds it. Behind a y/N confirm: the pool is one client at a time, so this
+    /// holds it. Behind a confirmation: the pool is one client at a time, so this
     /// takes someone else's terminal away (§10.2).
     StealAttach,
     /// Attach a window to every detached pooled session that is free to take —

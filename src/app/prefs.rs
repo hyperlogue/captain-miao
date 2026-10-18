@@ -125,9 +125,6 @@ pub(crate) struct PrefsState {
     pane: PrefsPane,
     /// The in-place editor for a text row, `Some` only while it is open.
     field: Option<TextInput>,
-    /// "Reset everything" is armed by one keypress and fired by a second, since
-    /// it is the only row here that cannot be undone by re-typing a value.
-    pending_reset_all: bool,
 }
 
 impl PrefsState {
@@ -137,7 +134,6 @@ impl PrefsState {
             cursor: 0,
             pane: PrefsPane::Items,
             field: None,
-            pending_reset_all: false,
         }
     }
 }
@@ -465,23 +461,6 @@ impl App {
     /// is a text-input mode like the pickers, and an open field must be able to
     /// swallow any character.
     pub(super) fn handle_prefs_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if self.prefs.as_ref().is_some_and(|p| p.pending_reset_all) {
-            match key.code {
-                KeyCode::Char('y' | 'Y') => {
-                    self.reset_all_prefs();
-                    if let Some(p) = self.prefs.as_mut() {
-                        p.pending_reset_all = false;
-                    }
-                }
-                _ => {
-                    if let Some(p) = self.prefs.as_mut() {
-                        p.pending_reset_all = false;
-                    }
-                }
-            }
-            return None;
-        }
-
         if self.prefs.as_ref().is_some_and(|p| p.field.is_some()) {
             match key.code {
                 KeyCode::Enter => {
@@ -519,9 +498,12 @@ impl App {
         match key.code {
             KeyCode::Esc => self.close_prefs(),
             KeyCode::Char('R') => {
-                if let Some(p) = self.prefs.as_mut() {
-                    p.pending_reset_all = true;
-                }
+                self.confirmation = Some(super::confirm::Confirmation::question(
+                    "Reset preferences?",
+                    "Clear all preference overrides?".to_string(),
+                    "reset",
+                    super::ConfirmAction::ResetPreferences,
+                ));
             }
             KeyCode::Tab => {
                 if let Some(p) = self.prefs.as_mut() {
@@ -950,7 +932,7 @@ impl App {
     /// The armed half of "reset everything": drop every override at once and
     /// re-derive what depends on them, so the dashboard matches a fresh install
     /// reading this user's `config.toml`.
-    fn reset_all_prefs(&mut self) {
+    pub(super) fn reset_all_prefs(&mut self) {
         self.extra_prefs = PrefsOverrides::default();
         self.agent_order = default_agent_list();
         self.new_session_agent = first_enabled_agent(&self.agent_order);
@@ -981,11 +963,7 @@ impl App {
         };
         let popup = centered_rect(88, 76, area);
         clear_overlay(frame, popup);
-        let title = if st.pending_reset_all {
-            " Preferences  ·  clear all overrides? y/N "
-        } else {
-            " Preferences "
-        };
+        let title = " Preferences ";
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(title, Style::default().bold()));

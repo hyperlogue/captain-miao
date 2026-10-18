@@ -183,7 +183,7 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(90);
 /// A pending "may I download a server?" question, on its way to the UI.
 ///
 /// The download is the only step in this design that leaves the machine, so it
-/// asks first — through the same y/N machinery `Space e` and host removal use.
+/// asks first — through the same confirmation overlay as session restarts.
 pub(crate) struct ConsentPrompt {
     /// The question, already phrased by whoever is asking — the backend knows
     /// what it wants to do and the UI only renders it, so a second thing to ask

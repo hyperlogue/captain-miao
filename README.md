@@ -286,6 +286,11 @@ heavily-evolved fork of pi, and is hooked with a generated extension passed as
 
 ### Key bindings
 
+Confirmations accept with `y` or `Enter` and cancel with `Esc`, `Ctrl+C` or
+`n`. Other keys are ignored except navigation: `↑`/`↓`, `j`/`k`,
+`PageUp`/`PageDown`, `Home`/`End` and the mouse wheel scroll; `Ctrl+U`/`Ctrl+D`
+scroll half a page. Cancelling returns to the underlying screen.
+
 Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/Down, `g`/`G`, or the mouse wheel. The six you'll reach for most:
 
 | Key                            | Action                                                                                                             |

@@ -30,7 +30,6 @@ pub(super) struct ForwardView {
     cursor: usize,
     edit: Option<Draft>,
     import: Option<TextInput>,
-    remove: bool,
     message: Option<String>,
     pending: Option<Pending>,
 }
@@ -507,7 +506,6 @@ impl App {
                 }
                 view.edit = None;
                 view.import = None;
-                view.remove = false;
                 view.cursor = view
                     .cursor
                     .min(state.rows[state.cursor].forwards.len().saturating_sub(1));
@@ -516,7 +514,6 @@ impl App {
             }
             Err(error) => {
                 view.message = Some(error);
-                view.remove = false;
             }
         }
         true
@@ -525,7 +522,7 @@ impl App {
     /// A paste is text, never list commands or an implicit Enter. Multiline
     /// port lists become whitespace-separated input for the importer.
     pub(super) fn paste_port_forward(&mut self, text: &str) {
-        if self.input_mode != super::InputMode::HostEdit {
+        if self.confirmation.is_some() || self.input_mode != super::InputMode::HostEdit {
             return;
         }
         let Some(view) = self
@@ -612,13 +609,6 @@ impl App {
                     }
                 }
             }
-        } else if view.remove {
-            view.remove = false;
-            if key.code == KeyCode::Char('y') {
-                let mut desired = rules.clone();
-                desired.remove(view.cursor);
-                self.apply_forward_rules(desired);
-            }
         } else {
             let code = match (key.code, key.modifiers) {
                 (KeyCode::Char('n'), KeyModifiers::CONTROL) => KeyCode::Down,
@@ -661,12 +651,37 @@ impl App {
                     self.apply_forward_rules(desired);
                 }
                 KeyCode::Char('d') if !rules.is_empty() => {
-                    view.remove = true;
                     view.message = None;
+                    let rule = rules[view.cursor].clone();
+                    let host = state.rows[state.cursor].host();
+                    self.confirmation = Some(super::confirm::Confirmation::question(
+                        "Delete port forward?",
+                        format!("Delete {} on \"{}\"?", rule.forward, host.0),
+                        "delete",
+                        super::ConfirmAction::DeleteForward { host, rule },
+                    ));
                 }
                 _ => {}
             }
         }
+    }
+
+    pub(super) fn delete_confirmed_forward(&mut self, host: &crate::state::HostId, rule: &Rule) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
+        };
+        let Some(row) = state.rows.get(state.cursor) else {
+            return;
+        };
+        if row.host() != *host || state.forward_view.is_none() {
+            return;
+        }
+        let Some(index) = row.forwards.iter().position(|candidate| candidate == rule) else {
+            return;
+        };
+        let mut desired = row.forwards.clone();
+        desired.remove(index);
+        self.apply_forward_rules(desired);
     }
 
     pub(super) fn forward_hints(&self) -> &'static str {
@@ -677,8 +692,6 @@ impl App {
             .unwrap();
         if view.pending.is_some() {
             "Applying forwarding changes…"
-        } else if view.remove {
-            "y Delete and apply   Any other key Cancel"
         } else if view.import.is_some() {
             "Enter Import and apply   Esc Cancel"
         } else if view.edit.is_some() {
@@ -887,8 +900,6 @@ impl App {
         let help_height = (help_lines.len() as u16).min(inner.height / 2);
         let message = if view.pending.is_some() {
             Some("Applying forwarding changes…")
-        } else if view.remove {
-            Some("Delete this forward? y / N")
         } else {
             view.message.as_deref()
         };

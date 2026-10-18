@@ -1372,13 +1372,13 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     let temp = tempfile::tempdir().unwrap();
     let overrides = temp.path().join("dashboard-overrides.json");
     let mut d = TestDashboard::new(100, 36);
-    d.app.input_mode = InputMode::Confirm;
-    d.app.pending_confirm = Some(super::PendingConfirm {
-        prompt: "Restart missing sessions?".into(),
-        action: Action::RestartAll {
+    d.app.confirm_action(
+        "Restart missing sessions?".into(),
+        "restart",
+        Action::RestartAll {
             sessions: Vec::new(),
         },
-    });
+    );
     d.show_shortcut_notice(temp.path());
     let out = d.render();
     assert!(out.contains("Session shortcuts changed"), "{out}");
@@ -1391,7 +1391,7 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
     for key in [KeyCode::Char('x'), KeyCode::Char('X'), KeyCode::Char('y')] {
         assert!(d.press(key).is_none());
         assert!(d.app.upgrade_notices.is_some());
-        assert!(d.app.pending_confirm.is_some());
+        assert!(d.app.confirmation.is_some());
     }
     assert!(d.press(KeyCode::Enter).is_none());
     assert!(d.app.upgrade_notices.is_none());
@@ -1404,8 +1404,8 @@ fn shortcut_notice_acknowledges_once_without_triggering_the_underlying_prompt() 
             .as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
-    assert!(d.app.pending_confirm.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(d.app.confirmation.is_some());
     assert!(matches!(
         d.press(KeyCode::Char('y')),
         Some(Action::RestartAll { .. })
@@ -1531,11 +1531,11 @@ fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_promp
             .begin_startup(&bindings, EXAMPLE_ANNOUNCEMENTS)
             .unwrap(),
     );
-    d.app.input_mode = InputMode::Confirm;
-    d.app.pending_confirm = Some(super::PendingConfirm {
-        prompt: "Recover sessions?".into(),
-        action: Action::RestartAll { sessions: vec![] },
-    });
+    d.app.confirm_action(
+        "Recover sessions?".into(),
+        "restart",
+        Action::RestartAll { sessions: vec![] },
+    );
     let out = d.render();
     for text in [
         "What's new",
@@ -1600,8 +1600,8 @@ fn update_inbox_browses_without_acknowledging_and_preserves_the_underlying_promp
     let at = find_cell(d.terminal.backend().buffer(), "Got it").expect(&out);
     d.click(at.0, at.1);
     assert!(d.app.upgrade_notices.is_none());
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
-    assert!(d.app.pending_confirm.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(d.app.confirmation.is_some());
     assert!(
         d.app
             .dashboard_state
@@ -7396,16 +7396,21 @@ fn enter_on_a_row_another_client_holds_offers_the_steal() {
         d.app.focus_or_attach(&held).is_none(),
         "the action waits behind the confirm rather than firing"
     );
-    let confirm = d.app.pending_confirm.as_ref().expect("a confirm is armed");
-    assert!(confirm.prompt.contains("kick it"), "{}", confirm.prompt);
+    let rendered = d.render();
+    assert!(rendered.contains("kick it"), "{rendered}");
+    let confirm = d.app.confirmation.as_ref().expect("a confirm is armed");
     assert!(
         matches!(
-            confirm.action,
-            Action::AttachRemoteRunning { force: true, .. }
+            confirm.payload,
+            Some(super::ConfirmAction::Run(Action::AttachRemoteRunning {
+                force: true,
+                ..
+            }))
         ),
         "answering yes must steal, not re-attempt a plain attach"
     );
-    assert_eq!(d.app.input_mode, super::InputMode::Confirm);
+    assert!(d.app.confirmation.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
 
     // Free, and unknown, both attach as before — the second matters most: a
     // pool we couldn't read must not put a confirm in front of every row.
@@ -7423,7 +7428,7 @@ fn enter_on_a_row_another_client_holds_offers_the_steal() {
             ),
             "attached={bit:?} must attach directly"
         );
-        assert!(d.app.pending_confirm.is_none(), "attached={bit:?}");
+        assert!(d.app.confirmation.is_none(), "attached={bit:?}");
     }
 }
 
@@ -8024,7 +8029,7 @@ fn host_details_help_and_nested_views_keep_modal_ownership() {
     let panel = d.app.host_edit.as_ref().unwrap();
     assert_eq!(panel.host_order(), order);
     assert!(
-        panel.pending_remove.is_none()
+        d.app.confirmation.is_none()
             && panel.edit.is_none()
             && panel.log_view.is_none()
             && panel.forward_view.is_none()
@@ -8337,7 +8342,7 @@ fn host_order_follows_reordering_in_the_panel_and_both_pickers() {
         d.press(KeyCode::Char(key));
     }
     d.press_ctrl(KeyCode::Char('K'));
-    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(!d.app.host_edit.as_ref().unwrap().rows[2].disabled);
     assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 2);
     d.press(KeyCode::Down);
@@ -8490,7 +8495,7 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     d.press(KeyCode::Char('d'));
     d.press(KeyCode::Char('c'));
     assert_eq!(d.app.host_edit.as_ref().unwrap().rows.len(), count);
-    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(!d.app.host_edit.as_ref().unwrap().rows[0].disabled);
     let rendered = d.render();
     assert!(rendered.contains("local"));
@@ -8632,7 +8637,7 @@ fn l_opens_the_hosts_panel_connection_log_and_esc_returns() {
     // A stray key inside the log is swallowed, not re-read as a list command —
     // `d` here must never reach the removal confirm.
     d.press(KeyCode::Char('d'));
-    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(d.app.host_edit.as_ref().unwrap().log_view.is_some());
 
     // Esc backs out to the list, not out of the panel.
@@ -9432,7 +9437,7 @@ fn a_ctrl_key_does_not_trigger_the_hosts_lists_plain_commands() {
     state.cursor = 0;
 
     d.press_ctrl(KeyCode::Char('d'));
-    assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
+    assert!(d.app.confirmation.is_none());
     d.press_ctrl(KeyCode::Char('a'));
     assert_eq!(d.app.host_edit.as_ref().unwrap().rows.len(), 1);
     d.press_ctrl(KeyCode::Char('l'));
@@ -9680,8 +9685,8 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
             "Example Author",
             "Change 00:",
             "…",
-            "y/Y",
-            "Enter/Esc",
+            "y/Enter",
+            "Esc/Ctrl+C/n",
         ] {
             assert!(
                 rendered.contains(text),
@@ -9693,8 +9698,8 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
         let ui = &config::get().colors.ui;
         assert_eq!(style("25 commits").fg, Some(ui.attention_fg));
         assert_eq!(style("origin/main").fg, Some(ui.title_fg));
-        assert_eq!(style("y/Y").fg, Some(ui.attention_fg));
-        for text in ["Commit time", "2025-03-05", "/work/repo", "Enter/Esc"] {
+        assert_eq!(style("y/Enter").fg, Some(ui.attention_fg));
+        for text in ["Commit time", "2025-03-05", "/work/repo", "Esc/Ctrl+C/n"] {
             assert!(style(text).add_modifier.contains(Modifier::DIM), "{text}");
         }
         assert!(style("Change 00:").add_modifier.contains(Modifier::BOLD));
@@ -9709,7 +9714,8 @@ fn vcs_confirmation_renders_metadata_truncates_and_scrolls() {
         let rendered = d.render();
         assert!(rendered.contains("Change 24:"), "{rendered}");
         assert!(!rendered.contains("Change 00:"));
-        assert_eq!(d.app.input_mode, InputMode::VcsConfirm);
+        assert!(d.app.confirmation.is_some());
+        assert_eq!(d.app.input_mode, InputMode::Normal);
         d.press(KeyCode::Home);
         assert!(d.render().contains("Change 00:"));
         // The bounded dialog does not grow to fill a wide terminal.
@@ -9759,7 +9765,7 @@ fn vcs_confirmation_packs_authors_across_the_whole_table() {
 
 #[test]
 fn vcs_confirmation_cancel_releases_checkout_and_preserves_queued_reviews() {
-    for key in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('n')] {
+    for key in [KeyCode::Esc, KeyCode::Char('n')] {
         let mut d = TestDashboard::new(100, 30);
         queue_test_push(&mut d.app, "/work/first", 1);
         queue_test_push(&mut d.app, "/work/second", 1);
@@ -9794,7 +9800,7 @@ fn vcs_commands_request_status_when_details_are_hidden() {
         d.press(KeyCode::Char('v'));
         let action = d.press(KeyCode::Char(key));
         assert_eq!(action.as_ref().map(Action::name), Some("VcsPrepare"));
-        assert!(d.app.pending_confirm.is_none());
+        assert!(d.app.confirmation.is_none());
     }
 }
 
@@ -9831,7 +9837,7 @@ fn gone_upstream_warns_and_offers_republication() {
         d.press(KeyCode::Char('p')),
         Some(Action::VcsPrepare { push: true, .. })
     ));
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
 }
 
 #[test]
@@ -9961,7 +9967,7 @@ fn space_v_p_prepares_a_push_and_the_detail_panel_shows_the_checkout() {
         prepare,
         Some(Action::VcsPrepare { push: true, .. })
     ));
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
 
     let rebasing = cm_core::vcs::VcsSnapshot {
@@ -10446,24 +10452,73 @@ fn help_can_reach_every_shortcut_on_an_ordinary_terminal() {
 }
 
 #[test]
-fn negative_default_confirmations_need_an_explicit_unmodified_yes() {
+fn confirmation_keys_accept_reject_or_keep_the_overlay_open() {
+    use crossterm::event::KeyEventKind;
     for key in [
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
     ] {
         let mut d = TestDashboard::new(80, 24);
-        d.app.input_mode = InputMode::Confirm;
-        d.app.pending_confirm = Some(super::PendingConfirm {
-            prompt: "Restart sessions? [y/N]".into(),
-            action: Action::RestartAll { sessions: vec![] },
-        });
-        let out = d.render();
-        assert!(!out.contains("y/Y/Enter"), "{out}");
-        assert!(out.contains("Enter/Esc"), "{out}");
+        d.app.confirm_action(
+            "Restart sessions?".into(),
+            "restart",
+            Action::RestartAll { sessions: vec![] },
+        );
+        assert!(matches!(
+            d.app.handle_key(key),
+            Some(Action::RestartAll { .. })
+        ));
+        assert!(d.app.confirmation.is_none());
+        assert!(!d.app.should_quit);
+    }
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut d = TestDashboard::new(80, 24);
+        d.app.confirm_action(
+            "Restart sessions?".into(),
+            "restart",
+            Action::RestartAll { sessions: vec![] },
+        );
         assert!(d.app.handle_key(key).is_none());
-        assert!(d.app.pending_confirm.is_none());
-        assert_eq!(d.app.input_mode, InputMode::Normal);
+        assert!(d.app.confirmation.is_none());
+        assert!(!d.app.should_quit, "Ctrl+C rejects without quitting");
+        assert!(
+            d.app
+                .handle_key(KeyEvent::new_with_kind(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                    KeyEventKind::Repeat,
+                ))
+                .is_none()
+        );
+        assert!(
+            !d.app.should_quit,
+            "holding Ctrl+C must not turn rejection into quit"
+        );
+    }
+    let mut d = TestDashboard::new(80, 24);
+    d.app.confirm_action(
+        "Restart sessions?".into(),
+        "restart",
+        Action::RestartAll { sessions: vec![] },
+    );
+    for key in [
+        KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat),
+        KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release),
+    ] {
+        assert!(d.app.handle_key(key).is_none());
+        assert!(d.app.confirmation.is_some(), "{key:?} must be ignored");
+        assert!(!d.app.should_quit);
     }
 }
 
@@ -10862,9 +10917,8 @@ fn disconnected_codex_sessions_can_restart_selected_and_all() {
         assert_eq!(d.app.upgrade_blocker(&crate::state::HostId::local()), None);
         d.press(KeyCode::Char(' '));
         d.press(KeyCode::Char(key));
-        assert_eq!(
-            d.app.input_mode,
-            InputMode::Confirm,
+        assert!(
+            d.app.confirmation.is_some(),
             "Space {key} must allow recovering a disconnected Codex session"
         );
         let specs = match d.press(KeyCode::Char('y')) {
@@ -10904,7 +10958,7 @@ fn codex_restarts_still_require_disconnection_identity_and_cleanup_control() {
             d.press(KeyCode::Char(' '));
             d.press(KeyCode::Char(key));
             assert_eq!(d.app.input_mode, InputMode::Normal, "missing {missing}");
-            assert!(d.app.pending_confirm.is_none(), "missing {missing}");
+            assert!(d.app.confirmation.is_none(), "missing {missing}");
             assert!(d.app.status_is_error, "missing {missing}");
         }
     }
@@ -10922,13 +10976,13 @@ fn space_e_on_idle_session_confirms_then_restarts() {
     d.press(KeyCode::Char(' '));
     let action = d.press(KeyCode::Char('e'));
     assert!(action.is_none());
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
-    assert!(d.app.pending_confirm.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(d.app.confirmation.is_some());
 
     // y confirms — returns RestartSession action and exits Confirm mode.
     let action = d.press(KeyCode::Char('y'));
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
     match action {
         Some(Action::RestartSession(spec)) => {
             assert_eq!(spec.window_id, Some(WindowId::from(100)));
@@ -10952,7 +11006,7 @@ fn space_e_on_active_session_is_rejected() {
         InputMode::Normal,
         "should not enter Confirm when session is busy"
     );
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(d.app.status_is_error);
     let msg = d.app.status_msg.as_deref().unwrap_or("");
     assert!(
@@ -10975,7 +11029,7 @@ fn space_e_on_waiting_session_is_rejected() {
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('e'));
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(d.app.status_is_error);
 }
 
@@ -10985,12 +11039,13 @@ fn confirm_dialog_cancels_on_n() {
     d.set_sessions(vec![session(1, "/home/test/proj", SessionStatus::Idle)]);
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('e'));
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    assert!(d.app.confirmation.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
 
     let action = d.press(KeyCode::Char('n'));
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
 }
 
 #[test]
@@ -11002,7 +11057,7 @@ fn confirm_dialog_cancels_on_esc() {
     let action = d.press(KeyCode::Esc);
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
 }
 
 #[test]
@@ -11017,12 +11072,12 @@ fn confirm_dialog_renders_prompt() {
         out.contains("Restart session"),
         "should show restart prompt"
     );
-    assert!(out.contains("y/Y"), "should show confirm hint");
-    assert!(out.contains("Enter/Esc"), "should show cancellation hint");
+    assert!(out.contains("y/Enter"), "should show confirm hint");
     assert!(
-        !out.contains("y/Y/Enter"),
-        "Enter must not be offered as yes"
+        out.contains("Esc/Ctrl+C/n"),
+        "should show cancellation hint"
     );
+    assert!(!out.contains("y/Y"), "uppercase Y is not an acceptance key");
 }
 
 /// `Space E` with all idle sessions queues a RestartAll action whose specs
@@ -11038,7 +11093,8 @@ fn space_shift_e_restarts_all_when_all_idle() {
     d.press(KeyCode::Char(' '));
     let action = d.press(KeyCode::Char('E'));
     assert!(action.is_none());
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    assert!(d.app.confirmation.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
 
     let action = d.press(KeyCode::Char('y'));
     match action {
@@ -11073,7 +11129,7 @@ fn space_shift_e_rejects_when_any_session_busy() {
     let action = d.press(KeyCode::Char('E'));
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
     assert!(d.app.status_is_error);
 }
 
@@ -11095,9 +11151,8 @@ fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
         d.set_sessions(vec![session(1, "/home/test/proj", status.clone())]);
         d.press(KeyCode::Char(' '));
         d.press(KeyCode::Char('e'));
-        assert_eq!(
-            d.app.input_mode,
-            InputMode::Confirm,
+        assert!(
+            d.app.confirmation.is_some(),
             "{status:?} should confirm, not refuse"
         );
         assert!(matches!(
@@ -11116,7 +11171,8 @@ fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
     ]);
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('E'));
-    assert_eq!(d.app.input_mode, InputMode::Confirm);
+    assert!(d.app.confirmation.is_some());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
     match d.press(KeyCode::Char('y')) {
         Some(Action::RestartAll { sessions }) => assert_eq!(sessions.len(), 3),
         other => panic!("expected RestartAll over all three, got {other:?}"),
@@ -11130,7 +11186,7 @@ fn space_shift_e_with_no_sessions_is_a_noop() {
     let action = d.press(KeyCode::Char('E'));
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.pending_confirm.is_none());
+    assert!(d.app.confirmation.is_none());
 }
 
 #[test]
@@ -12455,4 +12511,177 @@ fn contextual_and_direct_notification_dismissal_follow_configured_bindings() {
     assert!(d.render().contains("Second notification"));
     d.press(KeyCode::F(9));
     assert!(!d.render().contains("Second notification"));
+}
+
+#[test]
+fn confirmation_review_navigation_preserves_the_prepared_target() {
+    for width in [40, 100] {
+        let mut d = TestDashboard::new(width, 24);
+        queue_test_push(&mut d.app, "/work/reviewed", 40);
+        assert!(d.app.show_vcs_confirmation());
+        assert!(d.render().contains("Change 00:"));
+        for (down, up) in [
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            ),
+            (
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            ),
+        ] {
+            assert!(d.app.handle_key(down).is_none());
+            let out = d.render();
+            assert!(!out.contains("Change 00:"), "{out}");
+            assert!(d.app.handle_key(up).is_none());
+            assert!(d.render().contains("Change 00:"));
+        }
+        message_mouse(&mut d, MouseEventKind::ScrollDown, (10, 10));
+        assert!(!d.render().contains("Change 00:"));
+        message_mouse(&mut d, MouseEventKind::ScrollUp, (10, 10));
+        assert!(d.render().contains("Change 00:"));
+        d.press(KeyCode::End);
+        assert!(d.render().contains("Change 39:"));
+        let Some(Action::VcsRun(push)) = d.press(KeyCode::Enter) else {
+            panic!("Enter must accept the review");
+        };
+        assert_eq!(push.cwd, "/work/reviewed");
+        assert!(d.app.confirmation.is_none());
+    }
+}
+
+#[test]
+fn cancelling_consent_drops_the_reply_and_a_notice_has_no_operation() {
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut d = TestDashboard::new(80, 24);
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        d.app.confirm_action(
+            "Install terminal definitions?".into(),
+            "allow",
+            Action::GrantConsent(reply),
+        );
+        queue_test_push(&mut d.app, "/work/queued", 1);
+        assert!(!d.app.show_vcs_confirmation());
+        assert!(d.app.handle_key(key).is_none());
+        assert!(matches!(
+            answer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(!d.app.should_quit);
+        assert!(d.app.show_vcs_confirmation());
+        assert!(d.press_ctrl(KeyCode::Char('c')).is_none());
+        assert!(d.app.vcs_commands.is_empty());
+        assert!(d.app.confirmation.is_none());
+        assert!(!d.app.should_quit);
+    }
+    let mut d = TestDashboard::new(80, 24);
+    d.app.input_mode = InputMode::HostEdit;
+    d.app.confirmation = Some(super::confirm::Confirmation::notice(
+        "Upgrade server",
+        "Cannot upgrade: a session is busy".into(),
+    ));
+    assert!(d.render().contains("Cannot upgrade"));
+    assert!(d.press(KeyCode::Enter).is_none());
+    assert!(d.app.confirmation.is_none());
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+}
+
+#[test]
+fn panel_confirmations_preserve_context_and_apply_only_the_captured_operation() {
+    const CHILD: &str = "CM_TEST_PANEL_CONFIRMATIONS";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app::tests::panel_confirmations_preserve_context_and_apply_only_the_captured_operation", "--nocapture"])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "panel confirmations failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use super::{host_edit::HostView, hosts::HostConfig};
+    let mut d = TestDashboard::new(100, 30);
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        options: shell_words::split("-L3000:localhost:3000 -D1080").unwrap(),
+        ..Default::default()
+    }]);
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        d.press(KeyCode::Char('d'));
+        assert!(d.render().contains("Remove host?"));
+        let order = d.app.host_edit.as_ref().unwrap().host_order();
+        d.press(KeyCode::Char('Y'));
+        d.press(KeyCode::Char('q'));
+        assert!(d.app.confirmation.is_some());
+        d.app.handle_key(key);
+        assert!(d.app.confirmation.is_none());
+        assert!(!d.app.should_quit);
+        let state = d.app.host_edit.as_ref().unwrap();
+        assert_eq!(state.host_order(), order);
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.view, HostView::Details);
+        assert_eq!(d.app.input_mode, InputMode::HostEdit);
+    }
+    d.press(KeyCode::Char('f'));
+    let first = d.app.host_edit.as_ref().unwrap().rows[1].forwards[0].clone();
+    d.press(KeyCode::Char('d'));
+    assert!(d.render().contains("Delete port forward?"));
+    d.app.paste_port_forward("9999"); // cannot open an importer behind the overlay
+    d.press_ctrl(KeyCode::Char('c'));
+    assert!(d.app.host_edit.as_ref().unwrap().forward_view.is_some());
+    assert_eq!(d.app.host_edit.as_ref().unwrap().rows[1].forwards.len(), 2);
+    d.press(KeyCode::Char('d'));
+    // Simulate refreshed ordering: accept must delete the reviewed rule.
+    d.app.host_edit.as_mut().unwrap().rows[1]
+        .forwards
+        .swap(0, 1);
+    d.press(KeyCode::Enter);
+    let state = d.app.host_edit.as_ref().unwrap();
+    assert_eq!(state.rows[1].forwards.len(), 1);
+    assert!(!state.rows[1].forwards.contains(&first));
+    assert!(state.forward_view.is_some());
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    d.press(KeyCode::Char('d'));
+    d.app.host_edit.as_mut().unwrap().cursor = 0; // selection cannot retarget removal
+    d.press(KeyCode::Enter);
+    let state = d.app.host_edit.as_ref().unwrap();
+    assert_eq!(state.rows.len(), 1);
+    assert!(state.rows[0].is_local);
+    assert_eq!(state.view, HostView::List);
+    assert_eq!(d.app.input_mode, InputMode::HostEdit);
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char(','));
+    d.app.extra_prefs.agent_logos = Some(false);
+    d.press(KeyCode::Char('R'));
+    assert!(d.render().contains("Reset preferences?"));
+    d.press_ctrl(KeyCode::Char('c'));
+    assert_eq!(d.app.extra_prefs.agent_logos, Some(false));
+    assert_eq!(d.app.input_mode, InputMode::Prefs);
+    d.press(KeyCode::Char('R'));
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.extra_prefs.agent_logos, None);
+    assert_eq!(d.app.input_mode, InputMode::Prefs);
+    assert!(d.render().contains("Preferences"));
 }

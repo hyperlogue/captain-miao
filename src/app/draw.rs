@@ -102,9 +102,6 @@ impl App {
         if self.input_mode == InputMode::Help {
             self.draw_help(frame, frame.area());
         }
-        if self.input_mode == InputMode::Confirm {
-            self.draw_confirm(frame, frame.area());
-        }
         if self.input_mode == InputMode::DirEdit {
             self.draw_dir_edit(frame, frame.area());
         }
@@ -127,8 +124,8 @@ impl App {
             self.draw_attaching(frame, frame.area());
         }
         self.draw_notifications(frame, body);
-        if self.input_mode == InputMode::VcsConfirm {
-            self.draw_vcs_confirm(frame, frame.area());
+        if let Some(confirmation) = self.confirmation.as_mut() {
+            confirmation.draw(frame, frame.area());
         }
         self.draw_upgrade_notices(frame, frame.area());
         // Resolve image cells only after every overlay has cleared/painted its
@@ -371,45 +368,6 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         Some(vitals_spinner_frame(since_epoch))
-    }
-
-    fn draw_confirm(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(pending) = self.pending_confirm.as_ref() else {
-            return;
-        };
-        let mut popup = centered_rect(60, 20, area);
-        let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            " Confirm ",
-            Style::default()
-                .fg(config::get().colors.ui.attention_fg)
-                .bold(),
-        ));
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::raw(pending.prompt.clone())),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("y/Y ", Style::default().bold()),
-                Span::raw("confirm   "),
-                Span::styled("Enter/Esc/other key ", Style::default().bold()),
-                Span::raw("cancel"),
-            ]),
-        ];
-        let para = Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false });
-        let needed = para
-            .line_count(popup.width.saturating_sub(2))
-            .saturating_add(2);
-        popup.height = popup
-            .height
-            .max(needed.min(u16::MAX as usize) as u16)
-            .min(area.height);
-        popup.y = area.y + area.height.saturating_sub(popup.height) / 2;
-        let inner = block.inner(popup);
-        clear_overlay(frame, popup);
-        frame.render_widget(block, popup);
-        frame.render_widget(para, inner);
     }
 
     // =============================================================================
@@ -1630,6 +1588,7 @@ impl App {
                 spans.extend(hint_pair("PgUp/PgDn", "scroll details"));
                 spans
             }
+            _ if self.confirmation.is_some() => self.confirmation.as_ref().unwrap().hints().spans,
             InputMode::Normal if self.session_detail => {
                 let mut spans = Vec::new();
                 spans.extend(hint_pair("j/k", "scroll"));
@@ -1784,17 +1743,6 @@ impl App {
                     }
                     _ => {}
                 }
-                spans
-            }
-            InputMode::Confirm => {
-                let mut spans = hint_pair("y/Y", "confirm");
-                spans.extend(hint_pair("Enter/Esc/other", "cancel"));
-                spans
-            }
-            InputMode::VcsConfirm => {
-                let mut spans = hint_pair("y/Y", "push");
-                spans.extend(hint_pair("Enter/Esc", "cancel"));
-                spans.extend(hint_pair("↑↓/PgUp/PgDn", "scroll"));
                 spans
             }
             InputMode::DirEdit => {

@@ -1059,7 +1059,7 @@ through the identical path.
   `attach_plan` → spawn the attach window → bind → **focus immediately**, so
   the user watches the ssh progress in the window rather than a frozen
   dashboard. `Enter` on an already-bound row just focuses.
-- **STEAL** (`Space s`): the same attach with `force`, behind a y/N confirm —
+- **STEAL** (`Space s`): the same attach with `force`, behind a confirmation —
   skipped entirely when the host's attached-bit overlay says nobody is there.
 - **ATTACH ALL** (`Space A`): the same attach, run over every detached row the
   attached-bit overlay reports free — the manual form of the auto-reattach
@@ -1261,7 +1261,7 @@ decides what they mean**.
   **no Save
   step**: adding a host persists and connects immediately — so its state
   animates live in the list — an edit applies when you commit the row, and `d`
-  removes behind a `y/N` confirm. **A commit reconnects only the hosts it
+  removes behind a confirmation. **A commit reconnects only the hosts it
   changed** (`App::reconcile_backends_from`): the panel's rows are matched
   against the live connections by `ConnIdentity` — the label and the transport
   argv, nothing else — so a host whose identity did not move keeps its
@@ -1316,9 +1316,9 @@ decides what they mean**.
     `ReviewPending` all read as at-rest by that narrower test and are exactly
     what you would hate to have restarted. An *unreadable* attached bit is not
     evidence of a second client, matching the detached glyph's rule.
-  - **The refusal renders in the panel**, on the same line the confirm uses.
-    This mode's footer is key hints, so there is no status line to put it on,
-    and a message set elsewhere would surface stale after the panel closed.
+  - **The refusal uses the shared confirmation overlay** above the hosts
+    panel, in acknowledgement mode. Closing it returns to the same panel;
+    it never queues an upgrade.
   - **A failure drops the restore list.** `set -e` puts everything destructive
     downstream of the host's own verdict, so the common failures stopped
     nothing — and resuming a session that never died would fork it into a live
@@ -1566,7 +1566,7 @@ decides what they mean**.
   session; contrast `X` kill), keyed on the capability rather than on locality
   so it works under pooled-localhost too.
 - **`Space s` steal** — attach, kicking whatever client holds the session,
-  behind a y/N confirm. Skipped when the host's attached-bit overlay says the
+  behind a confirmation. Skipped when the host's attached-bit overlay says the
   session is free. Hidden from `?` when no host pools its sessions.
 - **`Space A` attach-all** — one window per free detached row, no confirm: it
   only opens windows onto sessions already running, `D` puts any of them back,
@@ -1740,7 +1740,7 @@ statement about distance, not about capability.
 attach subargs, bypassing only the *busy* half of the pre-guard — the
 stale-name/resurrection guard is never forceable, since attaching to a dead name
 would silently mint a bare login shell wearing it) and through
-`miao-client attach`. In the TUI it's `Space s` behind a y/N confirm,
+`miao-client attach`. In the TUI it's `Space s` behind a confirmation,
 and the daemon overlays the pool's attached bit onto the rows it serves
 (`LauncherState.attached`, exactly like the Codex title overlay) so the UI can
 tell whether anyone is actually there and skip the confirm when nobody is.

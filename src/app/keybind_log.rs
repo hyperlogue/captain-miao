@@ -71,7 +71,7 @@ fn rotate_if_oversized(path: &std::path::Path) {
 
 /// Note one keypress and what it resolved to. Plain cursor movement is dropped:
 /// it is most of the traffic and none of the signal when a binding misbehaves.
-pub(super) fn record(mode: InputMode, key: KeyEvent, action: Option<&Action>) {
+pub(super) fn record(mode: InputMode, confirmation: bool, key: KeyEvent, action: Option<&Action>) {
     let Some(Some(sink)) = SINK.get() else { return };
     if is_basic_movement(key) {
         return;
@@ -80,7 +80,11 @@ pub(super) fn record(mode: InputMode, key: KeyEvent, action: Option<&Action>) {
         "{ts}\tdashboard\t{pid}\t{mode}\t{key}\t{action}\n",
         ts = LauncherState::now(),
         pid = std::process::id(),
-        mode = mode_repr(mode),
+        mode = if confirmation {
+            "Confirm"
+        } else {
+            mode_repr(mode)
+        },
         key = key_repr(key),
         action = action.map(|a| a.name()).unwrap_or("_"),
     );
@@ -125,8 +129,6 @@ fn mode_repr(mode: InputMode) -> &'static str {
         InputMode::Search => "Search",
         InputMode::Picker => "Picker",
         InputMode::Help => "Help",
-        InputMode::Confirm => "Confirm",
-        InputMode::VcsConfirm => "VcsConfirm",
         InputMode::DirEdit => "DirEdit",
         InputMode::HostEdit => "HostEdit",
         InputMode::Messages => "Messages",
