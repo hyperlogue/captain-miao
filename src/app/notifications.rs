@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap},
 };
@@ -204,7 +204,7 @@ impl Notifications {
                         ui.title_fg,
                     )
                 }
-                Level::Success => ("✓ Done".to_string(), ui.title_fg),
+                Level::Success => ("✓ Done".to_string(), Color::Green),
                 Level::Warning => ("! Warning".to_string(), ui.attention_fg),
                 Level::Error => ("× Error".to_string(), ui.error_fg),
             };
