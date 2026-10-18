@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-18
+
+Thanks to @neopot for fixing Git push tracking
+([#6](https://github.com/hyperlogue/captain-miao/pull/6)).
+
+### New
+
+- **Git push previews** show the destination and a scrollable list of outgoing
+  commits with timestamps, authors and subjects before asking for confirmation.
+- **Successful notifications** use green borders and labels.
+
+### Fixed
+
+- **Codex Kill and Restart** improve recovery after disconnected requests and
+  verify background terminal cleanup with Codex 0.153.4+ and an updated host
+  backend and session launcher.
+- **Antigravity sessions** use the real home directory while preserving isolated
+  settings and shared history.
+- **Git push tracking** avoids false refresh errors when Git has already updated
+  the remote-tracking branch.
+
 ## [0.14.0] - 2026-10-15
 
 ### New
@@ -836,7 +857,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/hyperlogue/captain-miao/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...v0.12.0
