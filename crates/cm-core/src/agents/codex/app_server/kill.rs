@@ -24,7 +24,12 @@ pub(super) async fn force_removal_reason(
     }
     if let Some(rpc) = error.downcast_ref::<transport::RpcError>()
         && rpc.code == Some(-32600)
-        && rpc.method == "thread/backgroundTerminals/clean"
+        && matches!(
+            rpc.method.as_str(),
+            "thread/backgroundTerminals/clean"
+                | "thread/backgroundTerminals/list"
+                | "thread/backgroundTerminals/terminate"
+        )
         && id.is_some_and(|id| rpc.message == format!("thread not found: {id}"))
     {
         return Some(ForceRemoval::ThreadMissing);

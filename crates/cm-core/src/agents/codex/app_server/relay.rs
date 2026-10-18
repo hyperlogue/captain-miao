@@ -45,6 +45,7 @@ impl Relay {
         let (tx, events) = mpsc::channel(128);
         let (input_paused, mut pause_rx) = watch::channel(false);
         let (ack_tx, pause_ack) = watch::channel(InputState::Running);
+        let ack_tx = GateAck::new(ack_tx);
         let maintenance = {
             let environment = environment.clone();
             let upstream = upstream.clone();
@@ -92,6 +93,8 @@ impl Relay {
                     let daemon = server.get_ref().peer_cred().ok().and_then(|cred| cred.pid());
                     let mut accept_extras = true;
                     let mut environment_requests = HashSet::new();
+                    let mut peer_closed = false;
+                    let result = async {
                     loop {
                         tokio::select! {
                             biased;
@@ -105,6 +108,9 @@ impl Relay {
                             frame = client.next(), if !*pause_rx.borrow() => {
                                 let Some(frame) = frame else { break };
                                 let mut frame = frame?;
+                                // Keep upstream open long enough to acknowledge
+                                // preceding mutations, even on a graceful close.
+                                if frame.is_close() { break; }
                                 match prepare_environment(&mut frame, environment.as_ref(), &upstream, &mut pause_rx, daemon).await {
                                     Ok(Some(id)) => { environment_requests.insert(id); }
                                     Ok(None) => {}
@@ -122,9 +128,7 @@ impl Relay {
                                     if let Some(request) = Observation::client(&value)
                                         && tx.send(request).await.is_err() { break; }
                                 }
-                                let closed = frame.is_close();
                                 server.send(frame).await?;
-                                if closed { break; }
                             }
                             accepted = listener.accept(), if accept_extras => {
                                 match accepted {
@@ -132,8 +136,9 @@ impl Relay {
                                         let upstream = upstream.clone();
                                         let mut pause_rx = pause_rx.clone();
                                         let environment = environment.clone();
+                                        let ack = ack_tx.fork();
                                         extras.spawn(async move {
-                                            if forward_unobserved(stream, &upstream, &mut pause_rx, environment).await.is_err() {
+                                            if forward_unobserved(stream, &upstream, &mut pause_rx, environment, ack).await.is_err() {
                                                 tracing::debug!("Codex relay connection ended");
                                             }
                                         });
@@ -148,30 +153,44 @@ impl Relay {
                                 }
                             }
                             frame = server.next() => {
-                                let Some(frame) = frame else { break };
-                                let frame = frame?;
+                                let Some(frame) = frame else { peer_closed = true; break };
+                                let frame = frame.inspect_err(|error| {
+                                    peer_closed = upstream_closed(error);
+                                })?;
                                 if let Message::Text(text) = &frame
                                     && let Ok(value) = serde_json::from_str::<Value>(text) {
                                     settle_environment(&value, &mut environment_requests, environment.as_ref(), daemon).await;
                                     // Settle after enqueueing metadata: a pause ACK
                                     // must never overtake selection of its thread.
                                     if observable(&value) && tx.send(Observation::Server(value.clone())).await.is_err() { break; }
-                                    gate.response(&value);
+                                    gate.response(&value, daemon);
                                     gate.acknowledge(*pause_rx.borrow(), &ack_tx);
                                 }
                                 let closed = frame.is_close();
+                                peer_closed |= closed;
                                 client.send(frame).await?;
                                 if closed { break; }
                             }
                         }
                     }
                     Ok::<_, anyhow::Error>(())
+                    }.await;
+                    // A local TUI disconnect must not let a new control socket
+                    // overtake bytes still unread on this upstream socket.
+                    // Codex's transport enqueues preceding JSON messages before
+                    // replying to Ping. Drain late replies while obtaining that
+                    // receipt; failure retains uncertainty until daemon exit.
+                    let received = peer_closed || gate.pending.is_empty() || receive_pending(
+                        &mut server, &mut gate, daemon, Some(&tx), &pause_rx, &ack_tx,
+                        &mut environment_requests, environment.as_ref(),
+                    ).await;
+                    gate.disconnected(daemon, received);
+                    result
                 }.await;
                 if result.is_err() {
                     // Transport errors can contain endpoint/authentication data.
                     tracing::debug!("Codex relay connection ended");
                 }
-                gate.disconnected();
                 gate.acknowledge(*pause_rx.borrow(), &ack_tx);
                 if tx.send(Observation::Disconnected).await.is_err() {
                     break;
@@ -241,35 +260,228 @@ enum InputState {
     Uncertain(UnsettledThreads),
 }
 
+fn upstream_closed(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+    matches!(
+        error,
+        Error::ConnectionClosed
+            | Error::AlreadyClosed
+            | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    ) || matches!(error, Error::Io(error) if matches!(error.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected))
+}
+
+/// Each websocket has independent request IDs. Its fence joins the primary
+/// connection's fence without letting picker replies retarget the dashboard.
+struct GateAck {
+    id: usize,
+    states: Arc<std::sync::Mutex<GateStates>>,
+    tx: watch::Sender<InputState>,
+    retain: bool,
+}
+
+struct GateStates {
+    next: usize,
+    states: HashMap<usize, InputState>,
+}
+
+impl GateAck {
+    fn new(tx: watch::Sender<InputState>) -> Self {
+        Self {
+            id: 0,
+            states: Arc::new(std::sync::Mutex::new(GateStates {
+                next: 1,
+                states: [(0, InputState::Running)].into(),
+            })),
+            tx,
+            retain: false,
+        }
+    }
+
+    fn fork(&self) -> Self {
+        let id = {
+            let mut states = self.states.lock().unwrap();
+            let id = states.next;
+            states.next += 1;
+            id
+        };
+        let ack = Self {
+            id,
+            states: Arc::clone(&self.states),
+            tx: self.tx.clone(),
+            retain: false,
+        };
+        ack.update(Some(InputState::Running));
+        ack
+    }
+
+    fn update(&self, state: Option<InputState>) {
+        let mut states = self.states.lock().unwrap();
+        if let Some(state) = state {
+            states.states.insert(self.id, state);
+        } else {
+            states.states.remove(&self.id);
+        }
+        let state = if states.states.values().any(|s| *s == InputState::Running) {
+            InputState::Running
+        } else {
+            let uncertain: HashSet<_> = states
+                .states
+                .values()
+                .filter_map(|s| match s {
+                    InputState::Uncertain(threads) => Some(&threads.0),
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect();
+            if uncertain.is_empty() {
+                InputState::Paused
+            } else {
+                InputState::Uncertain(UnsettledThreads(uncertain))
+            }
+        };
+        self.tx.send_if_modified(|previous| {
+            if *previous == state {
+                false
+            } else {
+                *previous = state;
+                true
+            }
+        });
+    }
+
+    fn finish(&mut self, gate: &InputGate) {
+        if !gate.uncertain.is_empty() {
+            gate.acknowledge(true, self);
+            self.retain = true;
+        }
+    }
+}
+
+impl Drop for GateAck {
+    fn drop(&mut self) {
+        if !self.retain {
+            self.update(None);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_pending(
+    server: &mut transport::Socket,
+    gate: &mut InputGate,
+    daemon: Option<i32>,
+    tx: Option<&mpsc::Sender<Observation>>,
+    paused: &watch::Receiver<bool>,
+    ack: &GateAck,
+    environment_requests: &mut HashSet<String>,
+    environment: Option<&Arc<Mutex<super::Environments>>>,
+) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_RECEIPT: AtomicU64 = AtomicU64::new(0);
+    let receipt = format!(
+        "miao-cleanup-{}-{}",
+        std::process::id(),
+        NEXT_RECEIPT.fetch_add(1, Ordering::Relaxed)
+    );
+    tokio::time::timeout(transport::DEADLINE, async {
+        server
+            .send(Message::Ping(receipt.as_bytes().to_vec().into()))
+            .await?;
+        while let Some(frame) = server.next().await {
+            if frame.as_ref().is_err_and(upstream_closed) {
+                return Ok(true);
+            }
+            match frame? {
+                Message::Pong(payload) if payload.as_ref() == receipt.as_bytes() => {
+                    return Ok(true);
+                }
+                Message::Close(_) => return Ok(true),
+                Message::Ping(_) => server.flush().await?,
+                Message::Text(text) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        settle_environment(&value, environment_requests, environment, daemon).await;
+                        if observable(&value)
+                            && let Some(tx) = tx
+                        {
+                            let _ = tx.send(Observation::Server(value.clone())).await;
+                        }
+                        gate.response(&value, daemon);
+                        gate.acknowledge(*paused.borrow(), ack);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(true)
+    })
+    .await
+    .is_ok_and(|result| result.unwrap_or(false))
+}
+
 /// Input is fenced, but lost replies leave these runtimes unaccounted for.
 /// Preserve their identities so the supervisor can prove they no longer run
 /// after a daemon restart without guessing from the currently displayed row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct UnsettledThreads(HashSet<UnsettledThread>);
+pub(super) struct UnsettledThreads(HashSet<UnsettledOperation>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UnsettledOperation {
+    thread: UnsettledThread,
+    daemon: Option<i32>,
+    received: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum UnsettledThread {
     Known(String),
+    // RPC completion only enqueues a Core operation; a thread read does not
+    // establish that Core has processed it (for example manual compaction).
+    Queued(String),
     Unknown,
     InternalCreation,
 }
 
 impl UnsettledThreads {
     pub(super) fn only_internal_creations(&self) -> bool {
-        self.0.len() == 1 && self.0.contains(&UnsettledThread::InternalCreation)
+        !self.0.is_empty()
+            && self
+                .0
+                .iter()
+                .all(|op| op.thread == UnsettledThread::InternalCreation)
     }
 
-    pub(super) fn may_be_running(&self, loaded: &HashSet<String>) -> bool {
-        self.0.iter().any(|thread| match thread {
-            UnsettledThread::Known(id) => loaded.contains(id),
-            UnsettledThread::Unknown | UnsettledThread::InternalCreation => !loaded.is_empty(),
-        })
+    pub(super) fn threads_to_fence(&self, daemon: Option<i32>) -> Result<HashSet<String>> {
+        let mut threads = HashSet::new();
+        for op in &self.0 {
+            // A reused PID delays recovery, never falsely proves process death.
+            if op.daemon.is_some_and(|pid| {
+                pid > 0
+                    && unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            }) {
+                continue;
+            }
+            if op.received
+                && op.daemon.is_some()
+                && op.daemon == daemon
+                && let UnsettledThread::Known(id) = &op.thread
+            {
+                threads.insert(id.clone());
+            } else {
+                return Err(self.clone().into());
+            }
+        }
+        Ok(threads)
     }
 }
 
 impl std::fmt::Display for UnsettledThreads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.iter().any(|thread| !matches!(thread, UnsettledThread::Known(_))) {
+        f.write_str(if self.0.iter().any(|op| matches!(op.thread, UnsettledThread::Unknown | UnsettledThread::InternalCreation)) {
             "Codex lost a thread-creation reply; cleanup cannot confirm which thread was created"
         } else {
             "Codex disconnected with an unresolved thread operation; reconnect that thread before retrying cleanup"
@@ -287,6 +499,7 @@ async fn forward_unobserved(
     upstream: &std::path::Path,
     pause_rx: &mut watch::Receiver<bool>,
     environment: Option<Arc<Mutex<super::Environments>>>,
+    mut ack: GateAck,
 ) -> Result<()> {
     let mut client = tokio::time::timeout(
         transport::DEADLINE,
@@ -300,39 +513,67 @@ async fn forward_unobserved(
         .ok()
         .and_then(|cred| cred.pid());
     let mut environment_requests = HashSet::new();
+    let mut gate = InputGate::default();
+    let mut peer_closed = false;
+    gate.acknowledge(*pause_rx.borrow(), &ack);
+    let result = async {
     loop {
         tokio::select! {
             biased;
             changed = pause_rx.changed() => {
                 if changed.is_err() { break; }
-                pause_rx.borrow_and_update();
+                gate.acknowledge(*pause_rx.borrow_and_update(), &ack);
             }
             frame = client.next(), if !*pause_rx.borrow() => {
                 let Some(frame) = frame else { break };
                 let mut frame = frame?;
+                if frame.is_close() { break; }
                 match prepare_environment(&mut frame, environment.as_ref(), upstream, pause_rx, daemon).await {
                     Ok(Some(id)) => { environment_requests.insert(id); }
                     Ok(None) => {}
                     Err(reply) => { client.send(reply).await?; continue; }
                 }
-                let closed = frame.is_close();
+                if let Message::Text(text) = &frame && let Ok(value) = serde_json::from_str::<Value>(text) {
+                    gate.request(&value);
+                }
                 server.send(frame).await?;
-                if closed { break; }
             }
             frame = server.next() => {
-                let Some(frame) = frame else { break };
-                let frame = frame?;
+                let Some(frame) = frame else { peer_closed = true; break };
+                let frame = frame.inspect_err(|error| {
+                    peer_closed = upstream_closed(error);
+                })?;
                 if let Message::Text(text) = &frame
                     && let Ok(value) = serde_json::from_str::<Value>(text) {
                     settle_environment(&value, &mut environment_requests, environment.as_ref(), daemon).await;
+                    gate.response(&value, daemon);
+                    gate.acknowledge(*pause_rx.borrow(), &ack);
                 }
                 let closed = frame.is_close();
+                peer_closed |= closed;
                 client.send(frame).await?;
                 if closed { break; }
             }
         }
     }
-    Ok(())
+    Ok::<_, anyhow::Error>(())
+    }.await;
+    let received = peer_closed
+        || gate.pending.is_empty()
+        || receive_pending(
+            &mut server,
+            &mut gate,
+            daemon,
+            None,
+            pause_rx,
+            &ack,
+            &mut environment_requests,
+            environment.as_ref(),
+        )
+        .await;
+    gate.disconnected(daemon, received);
+    ack.finish(&gate);
+    result
 }
 
 async fn prepare_environment(
@@ -387,7 +628,7 @@ async fn settle_environment(
 #[derive(Default)]
 struct InputGate {
     pending: HashMap<String, PendingOperation>,
-    uncertain: HashSet<UnsettledThread>,
+    uncertain: HashSet<UnsettledOperation>,
 }
 struct PendingOperation {
     selects_thread: bool,
@@ -423,12 +664,23 @@ impl InputGate {
                 // receiving this creation reply. Keep this narrow: ephemeral
                 // user threads, forks and lost turn replies are still strict.
                 UnsettledThread::InternalCreation
-            } else if matches!(method, "thread/start" | "thread/fork") {
+            } else if matches!(method, "thread/start" | "thread/fork")
+                || (method == "thread/resume"
+                    && (!value["params"]["path"].is_null()
+                        || !value["params"]["history"].is_null()))
+            {
                 UnsettledThread::Unknown
             } else {
                 value["params"]["threadId"]
                     .as_str()
-                    .map(|id| UnsettledThread::Known(id.to_owned()))
+                    .filter(|id| !id.is_empty())
+                    .map(|id| {
+                        if matches!(method, "thread/compact/start" | "thread/rollback") {
+                            UnsettledThread::Queued(id.to_owned())
+                        } else {
+                            UnsettledThread::Known(id.to_owned())
+                        }
+                    })
                     .unwrap_or(UnsettledThread::Unknown)
             };
             self.pending.insert(
@@ -440,7 +692,7 @@ impl InputGate {
             );
         }
     }
-    fn response(&mut self, value: &Value) {
+    fn response(&mut self, value: &Value, daemon: Option<i32>) {
         if value.get("method").is_some() {
             return;
         }
@@ -456,15 +708,26 @@ impl InputGate {
         {
             // Reconnecting B cannot settle lost work on A. A thread created
             // without any returned identity cannot be guessed from a new one.
-            self.uncertain
-                .remove(&UnsettledThread::Known(thread.to_owned()));
+            self.uncertain.retain(|op| {
+                !(op.received
+                    && op.daemon.is_some()
+                    && op.daemon == daemon
+                    && op.thread == UnsettledThread::Known(thread.to_owned()))
+            });
         }
     }
-    fn disconnected(&mut self) {
-        self.uncertain
-            .extend(self.pending.drain().map(|(_, operation)| operation.thread));
+    fn disconnected(&mut self, daemon: Option<i32>, received: bool) {
+        self.uncertain.extend(
+            self.pending
+                .drain()
+                .map(|(_, operation)| UnsettledOperation {
+                    thread: operation.thread,
+                    daemon,
+                    received,
+                }),
+        );
     }
-    fn acknowledge(&self, paused: bool, ack: &watch::Sender<InputState>) {
+    fn acknowledge(&self, paused: bool, ack: &GateAck) {
         // Inventory can settle a lost reply only after every newer forwarded
         // operation has replied too; otherwise a resume could still load work
         // just after the inventory reported it absent.
@@ -475,14 +738,7 @@ impl InputGate {
         } else {
             InputState::Paused
         };
-        ack.send_if_modified(|previous| {
-            if *previous == state {
-                false
-            } else {
-                *previous = state;
-                true
-            }
-        });
+        ack.update(Some(state));
     }
 }
 
@@ -513,5 +769,101 @@ impl Drop for Relay {
         self.task.abort();
         self.maintenance.abort();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recovery_requires_receipt_identity_and_the_original_daemon() {
+        let pid = std::process::id() as i32;
+        for (method, params, received, daemon, recovers) in [
+            (
+                "turn/start",
+                json!({"threadId":"known"}),
+                true,
+                Some(pid),
+                true,
+            ),
+            (
+                "turn/start",
+                json!({"threadId":"known"}),
+                false,
+                Some(pid),
+                false,
+            ),
+            ("turn/start", json!({"threadId":"known"}), true, None, false),
+            (
+                "thread/resume",
+                json!({"threadId":"known","path":"/other/history"}),
+                true,
+                Some(pid),
+                false,
+            ),
+            (
+                "thread/resume",
+                json!({"threadId":"known","history":[]}),
+                true,
+                Some(pid),
+                false,
+            ),
+            (
+                "thread/resume",
+                json!({"threadId":""}),
+                true,
+                Some(pid),
+                false,
+            ),
+            (
+                "thread/compact/start",
+                json!({"threadId":"known"}),
+                true,
+                Some(pid),
+                false,
+            ),
+            ("thread/start", json!({}), true, Some(pid), false),
+        ] {
+            let mut gate = InputGate::default();
+            gate.request(&json!({"id":1,"method":method,"params":params}));
+            gate.disconnected(daemon, received);
+            let lost = UnsettledThreads(gate.uncertain);
+            assert_eq!(
+                lost.threads_to_fence(Some(pid)).is_ok(),
+                recovers,
+                "{method}: {params}, received={received}, daemon={daemon:?}"
+            );
+            assert!(
+                lost.threads_to_fence(None).is_err(),
+                "a new peer of unknown identity cannot settle an old request"
+            );
+        }
+    }
+
+    #[test]
+    fn only_process_exit_settles_unidentified_creation() {
+        let mut daemon = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = daemon.id() as i32;
+        let mut gate = InputGate::default();
+        gate.request(&json!({"id":1,"method":"thread/start","params":{}}));
+        gate.disconnected(Some(pid), false);
+        let lost = UnsettledThreads(gate.uncertain);
+        let before = lost.threads_to_fence(Some(std::process::id() as i32));
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        assert!(
+            before.is_err(),
+            "an empty replacement daemon is not proof that the original stopped"
+        );
+        assert!(
+            lost.threads_to_fence(Some(std::process::id() as i32))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -96,6 +96,7 @@ pub fn list_resumable(config: &CodexConfig, limit: usize) -> Result<Vec<ResumeCa
 
 /// The selected thread is the unit of termination. Never signal the shared
 /// daemon, and never archive/delete conversation history as a way to stop work.
+#[cfg(test)]
 pub(crate) async fn stop(
     config: &CodexConfig,
     state: &LauncherState,
@@ -105,9 +106,43 @@ pub(crate) async fn stop(
         return Ok(());
     };
     let mut client = transport::Client::connect(&config.socket_path()?).await?;
-    let result = stop_loaded(&mut client, id, turn).await;
+    stop_with_client(&mut client, id, turn).await
+}
+
+async fn stop_after_quiescence(
+    config: &CodexConfig,
+    state: &LauncherState,
+    turn: Option<&str>,
+    paused: Result<()>,
+    explicit_kill: bool,
+) -> Result<()> {
+    // Keep the barrier and cleanup on the same daemon connection. Reopening
+    // its pathname between these steps could select a replacement daemon.
+    if state.session_id.is_none() && paused.is_ok() {
+        return Ok(());
+    }
+    let mut client = transport::Client::connect(&config.socket_path()?).await?;
+    confirm_quiescence(
+        &mut client,
+        paused,
+        explicit_kill,
+        state.session_id.as_deref(),
+    )
+    .await?;
+    if let Some(id) = state.session_id.as_deref() {
+        stop_with_client(&mut client, id, turn).await?;
+    }
+    Ok(())
+}
+
+async fn stop_with_client(
+    client: &mut transport::Client,
+    id: &str,
+    turn: Option<&str>,
+) -> Result<()> {
+    let result = stop_loaded(client, id, turn).await;
     if result.is_err()
-        && loaded_threads(&mut client)
+        && loaded_threads(client)
             .await
             .is_ok_and(|loaded| !loaded.contains(id))
     {
@@ -116,7 +151,11 @@ pub(crate) async fn stop(
         // a disconnected socket or a failed inventory read proves nothing.
         return Ok(());
     }
-    result
+    result?;
+    if client.ordered_thread_reads {
+        verify_stopped(client, id).await?;
+    }
+    Ok(())
 }
 
 async fn loaded_threads(
@@ -150,9 +189,10 @@ async fn loaded_threads(
 }
 
 async fn confirm_quiescence(
-    config: &CodexConfig,
+    client: &mut transport::Client,
     paused: Result<()>,
-    allow_internal_creations: bool,
+    explicit_kill: bool,
+    selected_thread: Option<&str>,
 ) -> Result<()> {
     let Err(error) = paused else {
         return Ok(());
@@ -161,16 +201,83 @@ async fn confirm_quiescence(
         // A timeout or a stopped relay has not acknowledged fencing new input.
         return Err(error);
     };
-    if allow_internal_creations && unsettled.only_internal_creations() {
-        // Input is fenced; only an internal helper's creation reply was lost.
-        // The caller must still stop the selected main thread before removal.
+    if explicit_kill && unsettled.only_internal_creations() {
         return Ok(());
     }
-    let mut client = transport::Client::connect(&config.socket_path()?).await?;
-    if unsettled.may_be_running(&loaded_threads(&mut client).await?) {
+    let threads = unsettled.threads_to_fence(client.peer_pid())?;
+    if !threads.is_empty() && !client.ordered_thread_reads {
         return Err(error);
     }
+    for id in threads {
+        // Unlike thread/loaded/list and thread/turns/list, this request shares
+        // the thread's mutation queue, across connections. A reply proves that
+        // earlier admitted handlers finished (including post-response effects).
+        let status = read_thread_status(client, &id).await?;
+        if status != "notLoaded" && selected_thread != Some(id.as_str()) {
+            return Err(error);
+        }
+    }
     Ok(())
+}
+
+async fn read_thread_status(client: &mut transport::Client, id: &str) -> Result<String> {
+    let result = client
+        .request("thread/read", json!({"threadId":id,"includeTurns":false}))
+        .await;
+    // A thread unloaded before its first persisted message has no stored view.
+    // This exact handler error is still an ordered reply; generic RPC failures
+    // and errors naming another thread do not establish absence.
+    if result.as_ref().is_err_and(|error| {
+        error
+            .downcast_ref::<transport::RpcError>()
+            .is_some_and(|rpc| {
+                rpc.code == Some(-32600) && rpc.message == format!("thread not loaded: {id}")
+            })
+    }) {
+        return Ok("notLoaded".into());
+    }
+    let result = result?;
+    anyhow::ensure!(
+        result["thread"]["id"] == id,
+        "Codex thread/read returned a different thread"
+    );
+    let status = result["thread"]["status"]["type"]
+        .as_str()
+        .context("invalid Codex thread status")?;
+    anyhow::ensure!(
+        matches!(status, "idle" | "active" | "notLoaded" | "systemError"),
+        "unknown Codex thread status"
+    );
+    Ok(status.to_owned())
+}
+
+async fn verify_stopped(client: &mut transport::Client, id: &str) -> Result<()> {
+    tokio::time::timeout(transport::DEADLINE, async {
+        loop {
+            // Also fences goal/set's runtime effects, which follow its reply.
+            let status = read_thread_status(client, id).await?;
+            if status == "notLoaded" {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                status == "idle",
+                "Codex thread is still active after cleanup; retry cleanup"
+            );
+            let terminals = client
+                .request("thread/backgroundTerminals/list", json!({"threadId":id}))
+                .await?;
+            let data = terminals["data"]
+                .as_array()
+                .context("invalid Codex background-terminal list")?;
+            if data.is_empty() && terminals["nextCursor"].is_null() {
+                return Ok(());
+            }
+            // A process admitted concurrently must not be silently abandoned.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("Codex background terminals did not finish cleanup")?
 }
 
 async fn stop_loaded(client: &mut transport::Client, id: &str, turn: Option<&str>) -> Result<()> {
@@ -247,10 +354,62 @@ async fn stop_loaded(client: &mut transport::Client, id: &str, turn: Option<&str
             Ok(())
         };
     // Cleanup still runs if the turn finished between the read and interrupt.
-    client
-        .request("thread/backgroundTerminals/clean", json!({"threadId":id}))
-        .await?;
+    if client.ordered_thread_reads {
+        terminate_background_terminals(client, id).await?;
+    } else {
+        client
+            .request("thread/backgroundTerminals/clean", json!({"threadId":id}))
+            .await?;
+    }
     paused.and(latest.map(|_| ())).and(interrupt)
+}
+
+async fn terminate_background_terminals(client: &mut transport::Client, id: &str) -> Result<()> {
+    tokio::time::timeout(transport::DEADLINE, async {
+        let mut terminated = std::collections::HashSet::new();
+        loop {
+            let page = client
+                .request("thread/backgroundTerminals/list", json!({"threadId":id}))
+                .await?;
+            let processes = page["data"]
+                .as_array()
+                .context("invalid Codex background-terminal list")?;
+            if processes.is_empty() {
+                anyhow::ensure!(
+                    page["nextCursor"].is_null(),
+                    "invalid Codex background-terminal cursor"
+                );
+                return Ok(());
+            }
+            for process in processes {
+                let process = process["processId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .context("invalid Codex background-terminal id")?;
+                anyhow::ensure!(
+                    terminated.insert(process.to_owned()),
+                    "Codex still reports a terminated background terminal"
+                );
+                // Bulk clean drains its registry before terminating processes,
+                // and its RPC only enqueues a Core operation. This endpoint
+                // awaits terminate_confirmed, including exec-server replies.
+                let result = client
+                    .request(
+                        "thread/backgroundTerminals/terminate",
+                        json!({"threadId":id,"processId":process}),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    result["terminated"] == true,
+                    "Codex did not confirm background-terminal termination"
+                );
+            }
+            // Deletion shifts pagination offsets. Re-read the first page so
+            // terminals beyond its limit cannot be skipped.
+        }
+    })
+    .await
+    .context("Codex background-terminal termination timed out")?
 }
 
 pub(crate) fn command(
@@ -287,6 +446,9 @@ mod environment_live_tests;
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod recovery_live_tests;
 
 #[cfg(test)]
 mod kill_tests;

@@ -69,6 +69,31 @@ terminal restoration are covered separately by `pool_modes`; dashboard tests
 cover optimistic rollback, diagnostic rendering, and remapped actions. Live
 SSH provisioning still requires an explicitly designated disposable host.
 
+## Real Codex disconnect recovery
+
+With `codex` installed and Node available (provided by the development shell), run:
+
+```sh
+nix develop -c cargo test -p cm-core --locked real_codex_serializes_recovery_after_disconnected_startup -- --ignored --nocapture
+```
+
+Verified against Codex 0.163.0. The test starts an isolated app-server with a
+private home and XDG roots. It uses a paused goal to persist its fixture thread
+without inference, and a local MCP initialize gate to hold resume or creation
+in progress. No account, credentials, external endpoint, or existing session
+is used. The sandbox must allow local sockets and child processes.
+
+After disconnecting the requester, it verifies that inventory can still be empty
+while startup is unfinished. Recovery of a known thread must wait for the real
+serialized read; recovery of an unidentified creation must refuse that empty
+inventory. It then replaces the daemon on the same socket, verifies both Kill
+and Restart cleanup despite the lost creation reply, and resumes the saved
+conversation. This exercises process replacement with the installed binary;
+it does not test every pair of Codex upgrade versions.
+The regular suite covers delayed upstream receipts, auxiliary
+connections, daemon identity and exit, cleanup failures, and asynchronous
+background-terminal removal.
+
 ## Real Codex and direnv
 
 With `codex` and `direnv` installed on the execution host, run:

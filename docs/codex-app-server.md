@@ -157,19 +157,52 @@ forwarded lifecycle, turn and goal requests to settle. Responses continue to
 flow while it waits. A lost response leaves cleanup uncertain: reconnecting a
 different thread cannot resolve it, and a lost creation reply without a thread
 ID cannot safely be guessed. Miao reports that uncertainty and retains control.
-After a daemon restart, cleanup can also resolve lost replies by verifying that
-every affected thread is absent from the daemon's loaded-thread inventory. A
-lost creation reply with no identity requires that inventory to be empty.
-Metadata and inventory reads do not create uncertainty.
+Lost replies are tied to the original daemon's kernel-reported process identity.
+If that process has exited, its pending handlers cannot create more threads.
+An empty inventory alone is not proof: Codex can finish starting a thread after
+the requesting client disconnects.
+Metadata and inventory reads do not themselves create uncertainty.
 
-Explicit **Kill** makes one narrow exception: a lost `thread/start` reply for
-an internal, ephemeral `system` helper does not block main-thread cleanup.
+**Kill** and **Restart** can recover lost resume, turn-input, and goal replies
+for the selected thread without requiring its TUI to reconnect. After a local client
+disconnect, the relay obtains an upstream WebSocket receipt for preceding
+requests. It then uses a serialized `thread/read` on the same daemon to wait
+for earlier handlers to finish. Reads for any other affected threads must prove
+those threads unloaded. Failed receipts, unrecognized daemon versions, changed
+daemon identities, and failed or malformed reads retain control. Auxiliary
+connections such as the resume picker participate in the same input fence.
+
+A lost `thread/start` reply for an internal, ephemeral `system` helper retains
+its existing narrow Kill exception and does not block main-thread cleanup.
 Miao still pauses the main thread's goal, interrupts its turn, and cleans its
-background terminals before removing the launcher. Other cleanup errors still
-retain control unless the server is unreachable or the main thread is missing.
-**Restart**, user-created ephemeral threads, unknown thread sources, and lost
-turn replies retain the strict checks above. This exception requires an updated
-host backend and launcher; older launchers retain strict behavior.
+background terminals before removing the launcher. On supported daemons it uses
+confirmed per-process termination and checks the final thread status and empty
+terminal list. Bulk clean only enqueues a Core operation and can empty its
+registry before termination finishes. Deleting a page of terminals shifts its
+cursors, so cleanup starts each subsequent listing from the first page. Other
+cleanup errors still retain control unless the server is unreachable or the
+main thread is missing.
+**Restart** requires verified cleanup and never uses forced removal when the
+daemon is unreachable.
+Unidentified creations, path/history-based resumes, and lost operations that
+only enqueue Core work (such as compaction) require the original daemon to exit.
+These checks cannot be bypassed by an empty loaded-thread inventory. Recovery
+requires an updated host backend and launcher; older launchers retain strict
+behavior.
+
+The ordered-read recovery requires Codex 0.153.4 or newer. Later versions,
+including newer prereleases and major releases, are accepted without an upper
+version limit. This assumes future protocol compatibility; runtime receipt,
+identity, and cleanup-response checks still apply. Older or unparseable versions
+retain strict behavior. Source was audited at
+[0.153.4](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/app-server/src/request_serialization.rs)
+and [0.163.0](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/app-server/src/request_serialization.rs).
+The queue key is the thread ID, independent of connection. In contrast,
+[`thread/loaded/list` and `thread/turns/list` are unsequenced](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/app-server-protocol/src/protocol/common.rs#L853).
+Closing a connection rejects queued requests but
+[lets started handlers finish](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/app-server/src/connection_rpc_gate.rs#L11).
+An [isolated live test](testing-sessions.md#real-codex-disconnect-recovery)
+checks these guarantees without credentials or an inference service.
 
 Codex submits a recap/title helper's prompt only after receiving its creation
 reply, so a lost creation reply leaves no helper generation to interrupt.

@@ -99,6 +99,7 @@ impl std::error::Error for RpcError {}
 pub(super) struct Client {
     socket: Socket,
     next_id: u64,
+    pub(super) ordered_thread_reads: bool,
 }
 
 impl Client {
@@ -106,8 +107,9 @@ impl Client {
         let mut client = Self {
             socket: connect(path).await?,
             next_id: 0,
+            ordered_thread_reads: false,
         };
-        client
+        let initialized = client
             .request(
                 "initialize",
                 json!({
@@ -126,6 +128,9 @@ impl Client {
                     error
                 }
             })?;
+        client.ordered_thread_reads = initialized["userAgent"]
+            .as_str()
+            .is_some_and(supports_ordered_thread_reads);
         client
             .socket
             .send(Message::Text(
@@ -191,6 +196,21 @@ impl Client {
     }
 }
 
+// The read barrier relies on Codex's cross-connection per-thread RPC queue.
+// Audited at rust-v0.153.4 and rust-v0.163.0. Keep the minimum protocol version,
+// but assume compatibility for all later releases, including prereleases and
+// new major versions. Cleanup still validates receipts and RPC responses.
+fn supports_ordered_thread_reads(user_agent: &str) -> bool {
+    let Some((_, version)) = user_agent
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.rsplit_once('/'))
+    else {
+        return false;
+    };
+    semver::Version::parse(version).is_ok_and(|version| version >= semver::Version::new(0, 153, 4))
+}
+
 /// Backend inventory is a synchronous interface. A dedicated thread keeps its
 /// short RPC runtime independent of the caller's Tokio runtime (including tests).
 pub(super) fn blocking<T: Send + 'static>(
@@ -204,4 +224,32 @@ pub(super) fn blocking<T: Send + 'static>(
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Codex inventory worker stopped"))?
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ordered_reads_accept_all_versions_after_the_protocol_minimum() {
+        for (agent, supported) in [
+            ("codex_cli_rs/0.163.0 (Linux)", true),
+            ("captain_miao/0.153.4", true),
+            ("codex_cli_rs/0.153.4+build.1", true),
+            ("codex_cli_rs/0.153.3", false),
+            ("codex_cli_rs/0.153.4-alpha.1", false),
+            ("codex_cli_rs/0.163.0-alpha.1", true),
+            ("codex_cli_rs/1.0.0", true),
+            ("codex_cli_rs/2.0.0-alpha.1+build.2", true),
+            ("codex_cli_rs/99.0.0", true),
+            ("codex_cli_rs/1.0", false),
+            ("codex_cli_rs/1.0.0-invalid!", false),
+            ("unknown", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                super::supports_ordered_thread_reads(agent),
+                supported,
+                "{agent}"
+            );
+        }
+    }
 }
