@@ -3463,13 +3463,21 @@ mod tests {
                     .send(ServerFrame::VcsCommandDone {
                         req_id,
                         ok: true,
-                        message: if push { "pushed" } else { "pulled" }.into(),
+                        message: if push { "pushed" } else { "pulled 3 commits" }.into(),
                     })
                     .unwrap();
             });
             apply_vcs(&mut app, &tx, done);
             assert!(app.vcs_commands.is_empty());
             assert!(!app.status_is_error);
+            assert_eq!(
+                app.status_msg,
+                Some(vcs_notice(
+                    &host,
+                    &cwd,
+                    if push { "pushed" } else { "pulled 3 commits" }
+                ))
+            );
             assert!(peer.is_empty(), "duplicate keystroke submitted another RPC");
             assert!(rx.try_recv().is_err(), "unexpected VCS result");
         }
@@ -3623,6 +3631,14 @@ mod tests {
             apply_vcs(&mut app, &tx, done);
             assert!(app.vcs_commands.is_empty());
             assert!(!app.status_is_error);
+            assert_eq!(
+                app.status_msg,
+                Some(vcs_notice(
+                    &HostId::local(),
+                    &cwd,
+                    if push { "pushed" } else { "pulled 0 commits" }
+                ))
+            );
         }
     }
 

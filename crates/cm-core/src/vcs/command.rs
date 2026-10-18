@@ -325,6 +325,10 @@ pub fn execute_pull_with_agent(
     {
         return Err(CHANGED.into());
     }
+    let range = format!("{}..{commit}", expected.commit);
+    let count = line(&cwd, &["rev-list", "--count", &range, "--"], deadline)?
+        .parse::<u64>()
+        .map_err(|_| "could not count incoming commits")?;
     // The network wait is a second opportunity for an agent to change the
     // checkout. Revalidate after it, immediately before touching the tree.
     validate(&cwd, expected, false, deadline)?;
@@ -345,12 +349,11 @@ pub fn execute_pull_with_agent(
         "pulled",
     )?;
     let refreshed = refresh_tracking(&cwd, &tracking, commit, deadline);
-    Ok(if refreshed {
-        "pulled"
-    } else {
-        "pulled; refresh tracking status before another command"
+    let mut message = format!("pulled {count} commit{}", if count == 1 { "" } else { "s" });
+    if !refreshed {
+        message.push_str("; refresh tracking status before another command");
     }
-    .into())
+    Ok(message)
 }
 
 fn refresh_tracking(
@@ -919,7 +922,7 @@ mod tests {
         let wire: VcsPlan = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             repo.run_pull(&wire.into_prepared_pull().unwrap()).unwrap(),
-            "pulled"
+            "pulled 1 commit"
         );
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
     }
@@ -979,7 +982,7 @@ exec sh -c "$last"
         assert_eq!(
             execute_pull_with_agent(cwd, &pull, Some("/tmp/agent-second.sock"), deadline())
                 .unwrap(),
-            "pulled"
+            "pulled 1 commit"
         );
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), remote_commit);
         git(
@@ -1150,7 +1153,7 @@ exec sh -c "$last"
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), old);
         // An unrelated FETCH_HEAD cannot redirect the merge.
         std::fs::write(repo.work.join(".git/FETCH_HEAD"), "not the prepared commit").unwrap();
-        assert_eq!(repo.run_pull(&plan).unwrap(), "pulled");
+        assert_eq!(repo.run_pull(&plan).unwrap(), "pulled 1 commit");
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
         assert_eq!(git(&repo.work, &["rev-parse", "@{upstream}"]), target);
         let status = super::super::status(repo.work.to_str().unwrap());
@@ -1177,6 +1180,44 @@ exec sh -c "$last"
         git(&peer, &["push", "-q", "origin", "main"]);
         assert_eq!(repo.run_pull(&plan).unwrap_err(), CHANGED);
         assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), target);
+    }
+
+    #[test]
+    fn pull_counts_incoming_commits_with_stale_tracking_refs_and_no_changes() {
+        let repo = Repo::new();
+        repo.publish();
+        repo.advance_remote();
+        let peer = repo.root.join("peer");
+        for subject in ["second change", "third change"] {
+            git(
+                &peer,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    subject,
+                ],
+            );
+        }
+        git(&peer, &["push", "-q", "origin", "main"]);
+        let plan = repo.pull();
+        // Preparation fetches the candidate without updating tracking refs.
+        // Count the fetched history even though cached status says up to date.
+        let status = super::super::status(repo.work.to_str().unwrap());
+        assert_eq!(status.behind, 0);
+        assert_eq!(repo.run_pull(&plan).unwrap(), "pulled 3 commits");
+        assert_eq!(
+            git(&repo.work, &["rev-parse", "HEAD"]),
+            git(&peer, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(repo.run_pull(&repo.pull()).unwrap(), "pulled 0 commits");
     }
 
     #[test]
