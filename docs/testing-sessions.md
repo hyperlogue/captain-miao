@@ -94,6 +94,28 @@ The regular suite covers delayed upstream receipts, auxiliary
 connections, daemon identity and exit, cleanup failures, and asynchronous
 background-terminal removal.
 
+## Native agent launches and direnv
+
+With `direnv` and Bash installed, run:
+
+```sh
+nix develop -c cargo test -p cm-core --locked real_direnv_launch_uses_nearest_approved_parent -- --ignored --nocapture
+```
+
+This exercises the shared native-agent command builder using real direnv and
+synthetic project binaries. It covers parent-directory lookup, symlinked
+working directories, paths containing spaces and quotes, and the nearest
+`.envrc` taking precedence. An unapproved, denied, or edited nearer file must
+block launch even when a higher ancestor is approved; the blocked script must
+never execute. Only the fixture's files are approved, with private HOME and XDG
+roots and no inherited credentials.
+
+The regular suite also checks missing direnv, failed or malformed approval
+responses, and keeping raw status output out of diagnostics. Projects without
+an `.envrc` still launch without direnv. The search follows direnv through the
+filesystem root; authorization comes from direnv's existing approval/trust
+policy, never an automatic `allow` or a fallback past a blocked file.
+
 ## Real Codex and direnv
 
 With `codex` and `direnv` installed on the execution host, run:

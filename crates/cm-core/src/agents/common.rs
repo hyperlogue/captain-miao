@@ -16,9 +16,10 @@ use tokio::process::Command;
 
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
-/// The first four lines of every backend's `build_launch_command`: resolve the
-/// binary, put `direnv` in front of it when the session's directory has an
-/// `.envrc`, enter that directory, and put the clipboard shim farm on `PATH`.
+/// The shared part of every backend's `build_launch_command`: resolve the
+/// binary, put `direnv` in front of it when the session's directory or an
+/// ancestor has an `.envrc`, enter that directory, and put the clipboard shim
+/// farm on `PATH`.
 /// The caller adds its own environment and argv on top.
 ///
 /// This existed seven times before it existed once, and the copies had drifted
@@ -28,65 +29,52 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// produced no agent, no state file and no visible reason — the exact failure
 /// [`check_direnv_allowed`] was written to prevent.
 ///
-/// `direnv exec <cwd> <bin>` rather than `direnv exec . <bin>`: the child's
-/// working directory is set below, but direnv resolves its own argument against
-/// *our* cwd, which is the launcher's.
+/// Search the real working directory and its ancestors through the filesystem
+/// root, matching direnv even when the session path contains symlinks. This
+/// presence check does not load any files: direnv selects the nearest one and
+/// enforces its approval policy. Never skip a blocked file to try a higher one.
 pub(super) fn agent_command(bin: &str, cwd: &str, shim_dir: Option<&Path>) -> Result<Command> {
     let exe = super::find_in_path(bin).with_context(|| format!("{bin} not found in PATH"))?;
-    let has_envrc = Path::new(cwd).join(".envrc").is_file();
-    let mut cmd = match has_envrc.then(|| super::find_in_path("direnv")).flatten() {
-        Some(direnv) => {
-            check_direnv_allowed(&direnv, cwd)?;
-            let mut c = Command::new(direnv);
-            c.args(["exec", cwd]).arg(&exe);
-            c
-        }
-        None => Command::new(&exe),
+    let project = std::fs::canonicalize(cwd).context("resolving session directory for direnv")?;
+    let has_envrc = project.ancestors().any(|dir| dir.join(".envrc").is_file());
+    let mut cmd = if has_envrc {
+        let direnv = super::find_in_path("direnv")
+            .context("project has an .envrc but direnv is not on PATH")?;
+        check_direnv_allowed(&direnv, &project)?;
+        let mut c = Command::new(direnv);
+        c.arg("exec").arg(&project).arg(&exe);
+        c
+    } else {
+        Command::new(&exe)
     };
     cmd.current_dir(cwd);
     super::with_shim_path(&mut cmd, shim_dir);
     Ok(cmd)
 }
 
-/// Refuse to launch if direnv would block on the session's `.envrc`. Running
-/// `direnv exec` against a blocked file just prints an error to stderr and
-/// exits non-zero — the user typically misses that in a `--hold`'d kitty tab.
-/// Surfacing it as a captain-miao error makes the fix (`direnv allow <cwd>`)
-/// explicit. `direnv status --json` schema: `state.foundRC.allowed` is `0`
-/// when approved, non-zero otherwise. Parse failures fall through so a
-/// surprise direnv version still gets to produce its own native error.
-fn check_direnv_allowed(direnv: &Path, cwd: &str) -> Result<()> {
+/// Refuse to launch unless direnv confirms approval of the nearest `.envrc`.
+/// `state.foundRC.allowed` is 0 when approved, 1 when unapproved, and 2 when
+/// denied. Failed or unrecognized responses are errors, never permission.
+/// Keep raw status output (including its reported path) out of diagnostics;
+/// values from the external process may contain private information.
+fn check_direnv_allowed(direnv: &Path, cwd: &Path) -> Result<()> {
     let output = std::process::Command::new(direnv)
         .args(["status", "--json"])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else { return Ok(()) };
-    if !output.status.success() {
-        return Ok(());
-    }
-    let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    let found = &parsed["state"]["foundRC"];
-    if found.is_null() {
-        return Ok(());
-    }
-    let Some(allowed) = found["allowed"].as_i64() else {
-        return Ok(());
-    };
-    if allowed == 0 {
-        return Ok(());
-    }
-    let envrc = found["path"].as_str().unwrap_or(".envrc");
-    let reason = if allowed == 2 {
-        "denied"
-    } else {
-        "not allowed"
+        .output()
+        .context("could not check direnv approval")?;
+    anyhow::ensure!(output.status.success(), "could not check direnv approval");
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow::anyhow!("invalid direnv approval response"))?;
+    let reason = match parsed["state"]["foundRC"]["allowed"].as_u64() {
+        Some(0) => return Ok(()),
+        Some(1) => "not allowed",
+        Some(2) => "denied",
+        _ => anyhow::bail!("invalid direnv approval response"),
     };
     anyhow::bail!(
-        "direnv: {envrc} is {reason}. Run `direnv allow {cwd}` to approve, or remove the .envrc to skip direnv."
+        "direnv: nearest .envrc is {reason}. Review it and run `direnv allow` in the session directory to approve it."
     );
 }
 
@@ -288,6 +276,10 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
         HookEvent::StatusUpdate => {}
     }
 }
+
+#[cfg(test)]
+#[path = "common_launch_tests.rs"]
+mod launch_tests;
 
 #[cfg(test)]
 mod tests {
