@@ -91,14 +91,13 @@
 //! never touch the disk — so no tree walk and no file read could find them, and
 //! a terminal `Stop` that still has bash jobs or `task` spawns running has no
 //! other witness. The payload list is the source. The `Stop` arm turns it into
-//! a tier — `Task` / `Server` / `Review` — instead of `Idle`.
+//! `Task`, with command identities for the dashboard's Idle preferences.
 //!
 //! An `agent_end` with `willContinue` (omp's `awaitingAsyncWork`) is *not* this
 //! case: it is already remapped to `PostToolUse` (divergence 1), so the tier is
 //! decided only at the genuine terminal `Stop` — the one that can arrive with
-//! work still running. And because a `bash` job's label *is* its command text,
-//! an `r3 watch` run as a bash job still reads `Review` through the shared
-//! text classifier, exactly as Grok's payload list does.
+//! work still running. A `bash` job's label is its command text, so the user
+//! can mark an `r3 watch` as Idle through the same preference as other tasks.
 //!
 //! # Unchanged from pi
 //!
@@ -153,10 +152,9 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-use super::claude;
 use super::common;
 use super::pi_extension::Extension;
-use crate::agent::{BgSeedKind, BgShell, ResumeCandidate};
+use crate::agent::{BgShell, ResumeCandidate};
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -406,10 +404,8 @@ fn shells_from_stop(raw: Option<&str>) -> Option<Vec<BgShell>> {
     Some(jobs.iter().map(shell_from_job).collect())
 }
 
-/// One async job as a shell. A `bash` job's label *is* its command, so the
-/// shared command-form heuristic applies and an `r3 watch` still reads
-/// `Review`; every other kind — `task`, `eval`, or a type omp adds later — is
-/// busy work by construction. A job is never dropped for having an unfamiliar
+/// One async job as a task identity. A `bash` job's label is its command;
+/// other jobs use their label or type. A job is never dropped for having an unfamiliar
 /// type: dropping a running job is the silent failure this exists to prevent.
 fn shell_from_job(job: &AsyncJob) -> BgShell {
     let label = job
@@ -417,38 +413,11 @@ fn shell_from_job(job: &AsyncJob) -> BgShell {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let kind = match job.job_type.as_deref() {
-        Some("bash") => {
-            let command = label.unwrap_or("bash");
-            if claude::is_r3_watch_command(command) {
-                BgSeedKind::ReviewWatch
-            } else if claude::is_long_running_command(command) {
-                BgSeedKind::LongRunning
-            } else {
-                BgSeedKind::Other
-            }
-        }
-        _ => BgSeedKind::Other,
-    };
     BgShell {
         key: label
             .or(job.job_type.as_deref())
             .unwrap_or("job")
             .to_string(),
-        kind,
-    }
-}
-
-/// Same precedence as the launcher's `classify_and_learn` (and Grok's `Stop`
-/// arm): any finite job keeps the row busy (`Task`); else any parked server is
-/// at-rest (`Server`); else every remaining job is an r3 review-watch (`Review`).
-fn status_from_shells(shells: &[BgShell]) -> SessionStatus {
-    if shells.iter().any(|s| s.kind == BgSeedKind::Other) {
-        SessionStatus::BackgroundActive
-    } else if shells.iter().any(|s| s.kind == BgSeedKind::LongRunning) {
-        SessionStatus::BackgroundServer
-    } else {
-        SessionStatus::ReviewPending
     }
 }
 
@@ -466,7 +435,7 @@ fn status_from_shells(shells: &[BgShell]) -> SessionStatus {
 /// The `Stop` arm is omp's background tier, the shape Grok's `Stop` arm takes.
 /// A genuine terminal turn end can arrive with async jobs still running, and
 /// [`shells_from_stop`] decides from the payload's live list whether the row is
-/// `Task` / `Server` / `Review` rather than `Idle`. A `Stop` that names no list
+/// `Task` rather than `Idle`. A `Stop` that names no list
 /// (`None`) while the row already holds a background tier keeps that tier —
 /// absent evidence is not evidence the work ended, and the previous `Stop`
 /// already named it. An empty list is a turn end saying nothing is in flight.
@@ -500,16 +469,11 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             Some(shells) if !shells.is_empty() => {
                 common::adopt_session_facts(state, &mut msg);
                 state.last_tool = None;
-                state.status = status_from_shells(&shells);
+                state.status = SessionStatus::BackgroundActive;
+                state.background_commands = shells.into_iter().map(|s| s.key).collect();
                 return;
             }
-            None if matches!(
-                state.status,
-                SessionStatus::BackgroundActive
-                    | SessionStatus::BackgroundServer
-                    | SessionStatus::ReviewPending
-            ) =>
-            {
+            None if matches!(state.status, SessionStatus::BackgroundActive) => {
                 // No list at all is not evidence the live work ended — the
                 // previous Stop already named it. Hold the background row
                 // rather than flashing Idle.
@@ -518,7 +482,9 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             }
             // An empty list is a turn end saying nothing is in flight; absent
             // on a non-background row is an ordinary settle.
-            Some(_) | None => {}
+            Some(_) | None => {
+                state.background_commands.clear();
+            }
         }
     }
 
@@ -1002,9 +968,7 @@ mod tests {
         // — `the_source_carries_no_per_session_data` pins that separately.
     }
 
-    /// The Stop list's classification: a bash job's label *is* its command, so
-    /// the shared text heuristic decides the tier; every other kind is busy
-    /// work; and a job is never dropped for a missing label or unknown type —
+    /// A bash job's label is its command; other jobs are named by label or type; and a job is never dropped for a missing label or unknown type —
     /// dropping a running job is the silent failure this exists to prevent.
     #[test]
     fn shells_from_stop_classifies_each_job_and_never_drops_one() {
@@ -1018,19 +982,7 @@ mod tests {
             {"type":"bash"}
         ]}"#;
         let shells = shells_from_stop(Some(raw)).expect("the key is present");
-        let kinds: Vec<BgSeedKind> = shells.iter().map(|s| s.kind).collect();
-        assert_eq!(
-            kinds,
-            [
-                BgSeedKind::ReviewWatch,
-                BgSeedKind::LongRunning,
-                BgSeedKind::Other,
-                BgSeedKind::Other,
-                BgSeedKind::Other,
-                BgSeedKind::Other,
-                BgSeedKind::Other,
-            ]
-        );
+        assert_eq!(shells.len(), 7);
         // A bash job's key is its command text; a label-less bash still yields a
         // non-empty key so the job is named rather than dropped.
         assert_eq!(shells[0].key, "r3 watch review_abc123");
@@ -1054,37 +1006,39 @@ mod tests {
     }
 
     /// **The feature, end to end.** A terminal `Stop` that still has async jobs
-    /// running must land the row on the tier the list implies — `Server` /
-    /// `Review` / `Task` — not `Idle`; an empty list settles; and a `Stop`
+    /// running must land the row on `Task` with its command identities; an empty list settles; and a `Stop`
     /// naming no list holds an already-background row rather than flashing
     /// `Idle`.
     #[test]
-    fn a_stop_with_live_async_jobs_lands_on_the_matching_tier() {
+    fn a_stop_with_live_async_jobs_reports_tasks_and_commands() {
         let server = r#"{"async_jobs":[{"type":"bash","label":"npm run dev"}]}"#;
         let mut state = state_at(SessionStatus::Active);
         feed(&mut state, HookEvent::Stop, server);
-        assert_eq!(state.status, SessionStatus::BackgroundServer);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
+        assert_eq!(state.background_commands, ["npm run dev"]);
 
         let review = r#"{"async_jobs":[{"type":"bash","label":"r3 watch review_abc123"}]}"#;
         let mut state = state_at(SessionStatus::Active);
         feed(&mut state, HookEvent::Stop, review);
-        assert_eq!(state.status, SessionStatus::ReviewPending);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
+        assert_eq!(state.background_commands, ["r3 watch review_abc123"]);
 
         let task = r#"{"async_jobs":[{"type":"task","label":"refactor the parser"}]}"#;
         let mut state = state_at(SessionStatus::Active);
         feed(&mut state, HookEvent::Stop, task);
         assert_eq!(state.status, SessionStatus::BackgroundActive);
+        assert_eq!(state.background_commands, ["refactor the parser"]);
 
         // An empty list is a turn end saying nothing is in flight.
-        let mut state = state_at(SessionStatus::Active);
         feed(&mut state, HookEvent::Stop, r#"{"async_jobs":[]}"#);
         assert_eq!(state.status, SessionStatus::Idle);
+        assert!(state.background_commands.is_empty());
 
         // No list at all while already on a background tier: hold it there — the
         // previous Stop already named the live work.
-        let mut state = state_at(SessionStatus::BackgroundServer);
+        let mut state = state_at(SessionStatus::BackgroundActive);
         feed(&mut state, HookEvent::Stop, r#"{"will_continue":false}"#);
-        assert_eq!(state.status, SessionStatus::BackgroundServer);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
     }
 
     /// A `Stop` carrying `will_continue: true` is still the `PostToolUse`

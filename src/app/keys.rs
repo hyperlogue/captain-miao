@@ -670,6 +670,10 @@ impl App {
                 self.open_dir_edit();
                 None
             }
+            Command::ToggleTaskIdle => {
+                self.toggle_task_idle();
+                None
+            }
             Command::ToggleKeepAwake => {
                 self.toggle_prevent_sleep();
                 None

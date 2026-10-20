@@ -56,6 +56,22 @@ is still restart-labelled.
 
 ---
 
+## Idle task commands
+
+Preferences also manages the user-owned Idle task list. `Space t i` adds the
+selected session's current background commands as exact matches, or removes
+matching entries to return the session to Task. **Idle tasks** supports adding
+(`a`), editing (`Enter`), and deleting (`d`) entries. A `*` matches any text;
+backslash escapes a literal star or backslash. Patterns match whole commands.
+
+The list persists in `dashboard-overrides.json` under `prefs.idle_commands`
+and applies across hosts. Launchers report `background_commands` alongside
+Task status; the dashboard presents Idle only when every reported command
+matches. Foreground turns and approval/decision prompts retain their status.
+This replaces the Server/Review status variants and automatic duration-based
+learning. Old serialized Server/Review values decode as Idle. Older launchers
+without command metadata must be restarted before their tasks can be toggled.
+
 ## Background & Motivation
 
 ### What exists today

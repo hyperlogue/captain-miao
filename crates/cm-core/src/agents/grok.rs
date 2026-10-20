@@ -44,7 +44,7 @@
 //! at turn end only, which is why a compaction (not a turn end) needs
 //! [`last_compaction`] to keep the gauge honest.
 //! A `Stop` with in-flight `backgroundTasks` / `sessionCrons` lands on
-//! Task / Server / Review (an r3 watch is Review) rather than Idle.
+//! Task with command identities for the dashboard's Idle preferences.
 //! Unrecognized event names are still skipped, which is why `StopCancelled` is
 //! free on an older grok.
 //!
@@ -74,7 +74,7 @@ use tokio::process::Command;
 use super::common;
 use super::shell_quote;
 use super::synth_home::write_if_changed;
-use crate::agent::{BgSeedKind, BgShell, ResumeCandidate, TranscriptStats};
+use crate::agent::{BgShell, ResumeCandidate, TranscriptStats};
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -806,16 +806,11 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             Some(shells) if !shells.is_empty() => {
                 common::adopt_session_facts(state, &mut msg);
                 state.last_tool = None;
-                state.status = status_from_shells(&shells);
+                state.status = SessionStatus::BackgroundActive;
+                state.background_commands = shells.into_iter().map(|s| s.key).collect();
                 return;
             }
-            None if matches!(
-                state.status,
-                SessionStatus::BackgroundActive
-                    | SessionStatus::BackgroundServer
-                    | SessionStatus::ReviewPending
-            ) =>
-            {
+            None if matches!(state.status, SessionStatus::BackgroundActive) => {
                 // `idle_prompt` (and any Stop that omitted the list) is not
                 // evidence the live work ended — the previous Stop already
                 // named it. Hold the background row rather than flashing Idle.
@@ -824,6 +819,7 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             }
             Some(_) | None => {
                 // Empty list, or absent on a non-background row: the turn ended.
+                state.background_commands.clear();
             }
         }
     }
@@ -919,9 +915,8 @@ fn child_pre_is_recent(launcher_pid: u32) -> bool {
 /// an unparseable body). `Some` even when empty: that is a real turn end saying
 /// nothing is in flight.
 ///
-/// Classified the same way Claude's process-tree walk is, except the *type* is
-/// Grok's rather than inferred from command text: a `monitor` is at-rest by
-/// construction, a `subagent` is busy work, a `/loop` cron is a parked wakeup.
+/// Commands and non-shell task labels retain their identities for the
+/// dashboard's user-owned Idle preferences.
 fn shells_from_stop(raw: Option<&str>) -> Option<Vec<BgShell>> {
     let raw = raw?;
     let payload: HookPayload = serde_json::from_str(raw).ok()?;
@@ -950,7 +945,9 @@ fn shell_from_task(task: &BackgroundTask) -> Option<BgShell> {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?;
-            Some(classify_command(key))
+            Some(BgShell {
+                key: key.to_string(),
+            })
         }
         "monitor" => Some(BgShell {
             key: task
@@ -960,7 +957,6 @@ fn shell_from_task(task: &BackgroundTask) -> Option<BgShell> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("monitor")
                 .to_string(),
-            kind: BgSeedKind::LongRunning,
         }),
         "subagent" => Some(BgShell {
             key: task
@@ -971,7 +967,6 @@ fn shell_from_task(task: &BackgroundTask) -> Option<BgShell> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("subagent")
                 .to_string(),
-            kind: BgSeedKind::Other,
         }),
         _ => None,
     }
@@ -991,22 +986,7 @@ fn shell_from_cron(cron: &SessionCron) -> Option<BgShell> {
         .unwrap_or("loop");
     Some(BgShell {
         key: key.to_string(),
-        kind: BgSeedKind::LongRunning,
     })
-}
-
-fn classify_command(key: &str) -> BgShell {
-    let kind = if super::claude::is_r3_watch_command(key) {
-        BgSeedKind::ReviewWatch
-    } else if super::claude::is_long_running_command(key) {
-        BgSeedKind::LongRunning
-    } else {
-        BgSeedKind::Other
-    };
-    BgShell {
-        key: key.to_string(),
-        kind,
-    }
 }
 
 /// Grok's docs don't enumerate `status` values; the live payload uses
@@ -1028,21 +1008,6 @@ fn is_live_task_status(status: Option<&str>) -> bool {
                 | "error"
         )
     )
-}
-
-/// Same precedence as the launcher's `classify_and_learn`: any finite task
-/// keeps the row busy (`Task`); else any parked server/monitor/loop is at-rest
-/// (`Server`); else every remaining shell is an r3 review-watch (`Review`).
-fn status_from_shells(shells: &[BgShell]) -> SessionStatus {
-    let any_transient = shells.iter().any(|s| s.kind == BgSeedKind::Other);
-    let any_long = shells.iter().any(|s| s.kind == BgSeedKind::LongRunning);
-    if any_transient {
-        SessionStatus::BackgroundActive
-    } else if any_long {
-        SessionStatus::BackgroundServer
-    } else {
-        SessionStatus::ReviewPending
-    }
 }
 
 // =============================================================================
@@ -1956,13 +1921,9 @@ mod tests {
         );
         assert_eq!(state.status, SessionStatus::Idle);
     }
-    /// The whole tier map in one place, which the cases below refine: a finite
-    /// background command is busy `Task`; a recognized dev server is at-rest
-    /// `Server`; a `monitor` is at-rest by construction; a background subagent
-    /// is busy work; a `/loop` cron is a parked wakeup; an empty array is
-    /// plain `Idle`.
+    /// Every reported background job is Task; an empty array is Idle.
     #[test]
-    fn stop_background_tasks_pick_the_tier_from_type_and_command() {
+    fn stop_background_tasks_report_work_without_implicit_idle_classification() {
         let cases: &[(&str, String, SessionStatus)] = &[
             (
                 "a finite shell is busy work",
@@ -1970,17 +1931,17 @@ mod tests {
                 SessionStatus::BackgroundActive,
             ),
             (
-                "a recognized dev server is parked",
+                "a dev server remains Task until the user marks it Idle",
                 stop_tail("end_turn", &[shell("npm run dev")]),
-                SessionStatus::BackgroundServer,
+                SessionStatus::BackgroundActive,
             ),
             (
-                "a monitor is parked by construction",
+                "a monitor is reported as background work",
                 stop_tail(
                     "end_turn",
                     &[bg_task("monitor", "running", r#""description":"tail -f log""#)],
                 ),
-                SessionStatus::BackgroundServer,
+                SessionStatus::BackgroundActive,
             ),
             (
                 "a background subagent is busy work",
@@ -1995,10 +1956,10 @@ mod tests {
                 SessionStatus::BackgroundActive,
             ),
             (
-                "a /loop cron is a parked wakeup",
+                "a /loop cron retains its task identity",
                 r#","reason":"end_turn","sessionCrons":[{"id":"loop-1","schedule":"every 5 minutes","prompt":"check CI"}]"#
                     .to_string(),
-                SessionStatus::BackgroundServer,
+                SessionStatus::BackgroundActive,
             ),
             (
                 "nothing in flight is plain Idle",
@@ -2012,10 +1973,10 @@ mod tests {
     }
     /// An `r3 watch` run by absolute path, carrying the `id` and `--session`
     /// fields a real `Stop` includes: none of that stops it being named a
-    /// shell task, so the row is `Review` rather than `Idle`, and a review
+    /// shell task, so the row is `Task` rather than `Idle`, and a review
     /// wait is not a tool call.
     #[test]
-    fn a_stop_with_an_r3_watch_is_review() {
+    fn a_stop_with_an_r3_watch_reports_its_command() {
         let mut state = state_at(SessionStatus::Active);
         feed(
             &mut state,
@@ -2035,11 +1996,14 @@ mod tests {
                 ),
             ),
         );
-        assert_eq!(state.status, SessionStatus::ReviewPending);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
         assert_eq!(state.last_tool, None);
+        assert_eq!(
+            state.background_commands,
+            ["/home/miao/bin/r3 watch review_abc --session grok"]
+        );
     }
-    /// Finite work dominates: an r3 watch plus a `cargo test` is `Task`, not
-    /// `Review`, matching the launcher's classify-and-learn precedence.
+    /// A review watcher and a finite command are both background tasks.
     #[test]
     fn a_transient_task_outranks_an_r3_watch() {
         assert_eq!(
@@ -2077,14 +2041,14 @@ mod tests {
     /// review-watch the previous real Stop already named.
     #[test]
     fn an_idle_prompt_does_not_clear_a_background_row() {
-        let mut state = state_at(SessionStatus::ReviewPending);
+        let mut state = state_at(SessionStatus::BackgroundActive);
         state.session_id = Some("s1".to_string());
         feed(
             &mut state,
             HookEvent::Stop,
             r#"{"hookEventName":"notification","sessionId":"s1","notificationType":"idle_prompt"}"#,
         );
-        assert_eq!(state.status, SessionStatus::ReviewPending);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
         assert_eq!(state.session_id.as_deref(), Some("s1"));
     }
 

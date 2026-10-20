@@ -37,14 +37,9 @@ impl Entry {
         let previous = self.observed_status.as_ref();
         let entered_rest = matches!(
             (previous, status),
-            (
-                Some(Active | BackgroundActive | BackgroundServer | ReviewPending),
-                Idle
-            ) | (Some(Compacting), Compacted)
+            (Some(Active | BackgroundActive), Idle) | (Some(Compacting), Compacted)
         );
-        let parked_server =
-            *status == BackgroundServer && previous.is_some_and(|p| *p != BackgroundServer);
-        if entered_rest || parked_server {
+        if entered_rest {
             self.flags.follow_up = true;
         } else if *status == Active {
             self.flags.follow_up = false;
@@ -258,10 +253,7 @@ mod tests {
         for (before, after, wanted) in [
             (Active, Idle, true),
             (BackgroundActive, Idle, true),
-            (BackgroundServer, Idle, true),
-            (ReviewPending, Idle, true),
             (Compacting, Compacted, true),
-            (Active, BackgroundServer, true),
             (Active, BackgroundActive, false),
             (Idle, Idle, false),
         ] {
@@ -323,7 +315,7 @@ mod tests {
     #[test]
     fn old_sidecar_flags_and_first_seen_idle_rows_are_preserved() {
         let f = Fixture::new();
-        let row = f.status(SessionStatus::BackgroundServer);
+        let row = f.status(SessionStatus::Idle);
         assert!(!f.flags().follow_up);
         let flags = SessionFlags {
             pinned: false,

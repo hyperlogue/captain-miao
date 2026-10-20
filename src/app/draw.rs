@@ -1503,6 +1503,7 @@ impl App {
             section("Flags"),
             cmd(Command::TogglePin),
             cmd(Command::ToggleFollowUp),
+            cmd(Command::ToggleTaskIdle),
             Line::from(""),
             section("Version control"),
             cmd(Command::VcsPush),

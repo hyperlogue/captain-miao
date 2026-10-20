@@ -12,8 +12,8 @@ use super::common;
 use super::{collapse_whitespace, shell_quote};
 
 use crate::agent::{
-    AgentActivity, BgSeedKind, BgShell, ResumeCandidate, SessionIndex, SessionIndexCache,
-    SessionIndexEntry, TranscriptScan, TranscriptStats,
+    AgentActivity, BgShell, ResumeCandidate, SessionIndex, SessionIndexCache, SessionIndexEntry,
+    TranscriptScan, TranscriptStats,
 };
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
@@ -451,89 +451,27 @@ impl StatsCursor {
 /// [`classify_bg_shells`] can't treat it as the only way in.
 const SHELL_SNAPSHOT_MARKER: &str = "/shell-snapshots/snapshot-";
 
-/// The agent's currently-running `run_in_background` shells, each reduced to a
-/// normalized command `key` and a static [`BgSeedKind`].
-///
-/// `None` means **the process tree could not be read**, and nothing may be
-/// concluded from it. An empty `Some` means the tree read cleanly and the agent
-/// has no background shell running — a positive fact, and the evidence the
-/// launcher needs to retire a background status that has gone stale. Collapsing
-/// the two (as this once did) makes "no shells" indistinguishable from "no
-/// answer", which is why a row whose review-watch had ended could sit in
-/// `ReviewPending` for the rest of its life. Read from the **live process tree** — the Bash
-/// tool runs each background command in a wrapper shell that stays a direct
-/// child of the agent for the task's lifetime (or that the command `exec`s over,
-/// leaving itself as that same child — see [`classify_bg_shells`]) — so the
-/// answer is present-tense truth and can't go stale: a task that ends with no
-/// transcript marker
-/// (stopped from the UI, a Monitor timeout, agent teardown, or a `--resume`
-/// orphan from a previous process incarnation) simply isn't in the tree
-/// anymore. (An earlier version folded launch/`<task-notification>` pairs from
-/// the transcript instead, and leaked exactly those markerless stops.) Only
-/// consulted while the session is at rest with a background shell
-/// (`BackgroundActive`/`BackgroundServer`/`ReviewPending`), when no foreground
-/// tool shell can be among the children.
+/// Live task commands, read only after the foreground turn ends. A missing
+/// tree is unknown; an empty tree can corroborate stale-status recovery.
 pub fn bg_shells(agent_pid: u32) -> Option<Vec<BgShell>> {
     Some(classify_bg_shells(&child_cmdlines(agent_pid)?))
 }
 
-/// Reduce the agent's child command lines to its `run_in_background` shells,
-/// each normalized to its eval'd command and classified by command text alone.
-/// The wrapper embeds the eval'd command verbatim, so the classifiers match it
-/// unchanged.
-///
-/// A child qualifies two ways. Normally it carries the
-/// [`SHELL_SNAPSHOT_MARKER`] wrapper — the evidence separating a background task
-/// from the agent's other children. But a command that `exec`s (`…; exec r3
-/// watch review_…`, or a launcher script ending in `exec bun "$cli" "$@"`)
-/// replaces that wrapper with itself, and the marker goes with it; the surviving
-/// line is the command verbatim. So a review-watch is admitted **unwrapped**
-/// too: `watch review_<hex>` / an r3 entrypoint is a distinctive enough form to
-/// stand on its own, and it is the one classification whose loss is silent — the
-/// row sits on `BackgroundActive` while a person is actually waiting.
-///
-/// Nothing else is admitted unwrapped, because nothing else can be told apart
-/// from an MCP stdio server or helper by its text. An exec'd dev server is
-/// therefore missed and its row stays busy, which is this module's standing bias
-/// (see [`is_long_running_command`]) — and, more importantly, a child that isn't
-/// a background task at all keeps leaving the **empty** set that
-/// `promote_stale_background` needs to retire a stale row.
-///
-/// Total, since the caller has already read the tree: no background shell among
-/// the children is an empty vec, never `None` (see [`bg_shells`]).
+/// Wrapper markers distinguish tool shells from MCP servers and helpers.
+/// An exec'd review watcher loses its wrapper but remains recognizable.
 fn classify_bg_shells(cmdlines: &[String]) -> Vec<BgShell> {
     cmdlines
         .iter()
-        .filter_map(|c| {
-            // Classify the *normalized* command (the eval'd body), not the raw
-            // wrapper: the wrapper's leading `bash -c source <snapshot> && …`
-            // would shift a `npm run dev` off position 0 and hide it from the
-            // token checks. The same normalized string is the learning key —
-            // and for an exec'd child it is just the trimmed line itself.
-            let key = normalize_bg_command(c);
-            if is_r3_watch_command(&key) {
-                return Some(BgShell {
-                    key,
-                    kind: BgSeedKind::ReviewWatch,
-                });
-            }
-            // Past that form, the wrapper is the only evidence this child is a
-            // background task rather than one of the agent's own helpers.
-            if !c.contains(SHELL_SNAPSHOT_MARKER) {
-                return None;
-            }
-            let kind = if is_long_running_command(&key) {
-                BgSeedKind::LongRunning
-            } else {
-                BgSeedKind::Other
-            };
-            Some(BgShell { key, kind })
+        .filter_map(|command| {
+            let key = normalize_bg_command(command);
+            (command.contains(SHELL_SNAPSHOT_MARKER) || is_r3_watch_command(&key))
+                .then_some(BgShell { key })
         })
         .collect()
 }
 
 /// Extract the agent's actual `run_in_background` command from the Bash-tool
-/// wrapper, to serve as a stable learning key and as the text both classifiers
+/// wrapper, to serve as a stable task identity and as the text the wrapper filter
 /// match on. Everything else in the wrapper (the per-session snapshot path with
 /// its timestamp, the random cwd temp file) is volatile and must not be part of
 /// the key, or "the same command" would never match across sessions.
@@ -546,8 +484,7 @@ fn classify_bg_shells(cmdlines: &[String]) -> Vec<BgShell> {
 /// only the first segment. Slicing there truncated
 /// `nix develop <dir> --command bash -c '…r3 watch review_… '` down to
 /// `nix develop <dir> --command bash -c`, which hid the r3 watch from
-/// [`is_r3_watch_command`] (the row stuck at `BackgroundActive` instead of
-/// `ReviewPending`) and collapsed every such command onto one learning key.
+/// [`is_r3_watch_command`] and collapsed distinct commands onto one key.
 /// Parsing the argument as a whole shell word instead rebuilds the command the
 /// agent asked to run, verbatim.
 ///
@@ -608,147 +545,6 @@ fn unquote_shell_word(s: &str) -> String {
         }
     }
     out.trim().to_string()
-}
-
-/// Seed heuristic: does `cmd` look like a **long-running service** — a dev
-/// server or file watcher that runs indefinitely and that the agent parked and
-/// moved on from — rather than a finite build/test/step it's waiting to finish?
-///
-/// Deliberately conservative: an unrecognized command is *not* long-running, so
-/// the caller keeps it busy (keep-awake). Keeping the machine awake for a
-/// mystery task is safe; parking a real in-progress build is not. The learned
-/// store (`crate::learned`) catches the long-running commands this list misses,
-/// after they've been observed running past the threshold once — so this only
-/// needs to cover the common cases well enough to avoid a cold-start wait, not
-/// be exhaustive.
-pub fn is_long_running_command(cmd: &str) -> bool {
-    let lc = cmd.to_ascii_lowercase();
-    // Trim wrapping quotes so a token like `dev'` (from the eval quoting) still
-    // matches `dev`; take the path basename so `/usr/bin/nodemon` matches
-    // `nodemon` and a dir named `.../myserver` doesn't leak a false `server`.
-    fn base(t: &str) -> &str {
-        t.trim_matches(|c| c == '\'' || c == '"' || c == '`')
-            .rsplit('/')
-            .next()
-            .unwrap_or(t)
-    }
-    let tokens: Vec<&str> = lc.split_whitespace().map(base).collect();
-
-    // A watch loop: a rebuild-/rerun-on-change watcher, almost always long-lived.
-    if tokens.iter().any(|t| *t == "--watch" || *t == "--watchall") {
-        return true;
-    }
-
-    // Explicit two-word server/watch forms that a bare-token check would miss.
-    const LONG_PAIRS: &[(&str, &str)] = &[
-        ("cargo", "watch"),
-        ("next", "dev"),
-        ("next", "start"),
-        ("nuxt", "dev"),
-        ("astro", "dev"),
-        ("gatsby", "develop"),
-        ("remix", "dev"),
-        ("compose", "up"),
-        ("docker-compose", "up"),
-        ("flask", "run"),
-        ("rails", "server"),
-        ("rails", "s"),
-        ("expo", "start"),
-        ("react-native", "start"),
-    ];
-    if tokens
-        .windows(2)
-        .any(|w| LONG_PAIRS.iter().any(|(a, b)| w[0] == *a && w[1] == *b))
-    {
-        return true;
-    }
-
-    // A one-shot build/test/lint step overrides any server-ish tool name it
-    // wraps (`vite build`, `next build`, `npm run build`) → treat as transient.
-    // Checked *after* the watch/pair forms so `cargo watch -x build` stays long.
-    const TRANSIENT_SUBCMDS: &[&str] = &[
-        "build",
-        "test",
-        "check",
-        "lint",
-        "fmt",
-        "format",
-        "bench",
-        "typecheck",
-        "tsc",
-    ];
-    if tokens.iter().any(|t| TRANSIENT_SUBCMDS.contains(t)) {
-        return false;
-    }
-
-    // Package-manager run-scripts whose name denotes a dev loop:
-    //   npm|pnpm|yarn|bun [run] <dev|serve|start|watch|develop|server>
-    const PKG_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
-    const LONG_SCRIPTS: &[&str] = &["dev", "serve", "start", "watch", "develop", "server"];
-    if tokens.first().is_some_and(|t| PKG_MANAGERS.contains(t)) {
-        let script = if tokens.get(1) == Some(&"run") {
-            tokens.get(2)
-        } else {
-            tokens.get(1)
-        };
-        if script.is_some_and(|s| LONG_SCRIPTS.contains(s)) {
-            return true;
-        }
-    }
-
-    // Standalone server/watcher programs (matched on any token's basename).
-    const LONG_PROGRAMS: &[&str] = &[
-        "nodemon",
-        "watchexec",
-        "entr",
-        "watchman",
-        "vite",
-        "nuxt",
-        "gatsby",
-        "astro",
-        "webpack-dev-server",
-        "http-server",
-        "live-server",
-        "json-server",
-        "browser-sync",
-        "livereload",
-        "uvicorn",
-        "gunicorn",
-        "hypercorn",
-        "daphne",
-        "puma",
-        "rackup",
-        "foreman",
-        "overmind",
-        "jekyll",
-        "hugo",
-        "mkdocs",
-        "docusaurus",
-        "storybook",
-        "start-storybook",
-        "wrangler",
-        "netlify",
-        "vercel",
-        "streamlit",
-        "trunk",
-        "bacon",
-        "air",
-        "ts-node-dev",
-        "tsx",
-        "metro",
-        "cargo-watch",
-    ];
-    if tokens.iter().any(|t| LONG_PROGRAMS.contains(t)) {
-        return true;
-    }
-
-    // Generic server tokens: a bare `serve` subcommand (`ng serve`, `webpack
-    // serve`, `php artisan serve`) or a token ending in `server`/`runserver`
-    // (`rails server`, `manage.py runserver`, `python -m http.server`). Reached
-    // only after the transient guard, so these are dev servers.
-    tokens
-        .iter()
-        .any(|t| *t == "serve" || t.ends_with("server"))
 }
 
 /// Command lines (argv joined with spaces) of every direct child of `pid`.
@@ -1353,8 +1149,8 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
             // A manual `/compact` fires no `Stop`, so this hook is also the turn
             // end — and it must answer the same question `Stop` does: did a
             // `run_in_background` shell outlive it? If so the row's real shape
-            // is that shell's (`Task`/`Server`/`Review`, resolved by the
-            // launcher's classifier), not the compaction's.
+            // is that shell's (`Task`, with commands reported by the launcher),
+            // not the compaction's.
             //
             // Paired with the `Compacted` arm of `reconcile_activity`, which
             // covers the opposite interleaving: Claude's status write and this
@@ -1418,7 +1214,7 @@ fn status_after_stop(current: &SessionStatus, activity: Option<AgentActivity>) -
 /// Resolve the status a `PostCompact` hook should settle to (see its arm).
 /// `Compacted` unless Claude reports a `run_in_background` shell still running,
 /// in which case the row belongs to that shell — `BackgroundActive`, which the
-/// launcher's classifier refines to `Server`/`Review` in the same wake.
+/// dashboard can present as Idle using the user's command list.
 ///
 /// Everything else keeps `Compacted`: a rest status the dashboard bells as
 /// "compaction landed, look at me". In particular a mid-turn *auto*-compaction
@@ -2187,7 +1983,7 @@ mod tests {
     /// session at rest — and a `run_in_background` shell that outlived the
     /// compaction owns the row. Without this, compacting a session that is
     /// watching an r3 review reads `Compacted` until the watch ends, instead of
-    /// going back to `Review`.
+    /// reporting the background task.
     #[test]
     fn post_compact_yields_to_a_surviving_background_shell() {
         use AgentActivity as A;
@@ -2237,7 +2033,7 @@ mod tests {
     /// (`…bash -c '"'"'…'"'"'`) in which the first quote closes only the first
     /// segment. Slicing at that quote truncated the key to the wrapper prefix,
     /// which both hid the `r3 watch` from the classifier and collapsed every
-    /// `<runner> --command bash -c '…'` onto one learning key.
+    /// `<runner> --command bash -c '…'` onto one task identity.
     const QUOTED_RUNNER_WATCH: &str = r#"nix develop /home/riteye/projects/app --command bash -c '/home/riteye/.local/bin/r3 watch review_742a2e64ef72 --session "claude:app-prd"'"#;
 
     /// Both sides of `is_r3_watch_command`'s boundary in one table.
@@ -2267,7 +2063,7 @@ mod tests {
             (
                 false,
                 "npm run watch",
-                "ditto — the seed heuristic's territory",
+                "ditto — still a wrapped background task",
             ),
             (false, "watch -n1 ls", "the unrelated watch(1) utility"),
             (
@@ -2303,11 +2099,11 @@ mod tests {
         )
     }
 
-    /// The seed kinds of the classified background shells, for terse assertions.
-    fn kinds(cmds: &[String]) -> Vec<BgSeedKind> {
+    /// Command identities, excluding unrelated agent helpers.
+    fn keys(cmds: &[String]) -> Vec<String> {
         classify_bg_shells(cmds)
             .into_iter()
-            .map(|s| s.kind)
+            .map(|s| s.key)
             .collect()
     }
 
@@ -2339,55 +2135,18 @@ mod tests {
         assert_eq!(normalize_bg_command(&quoted), QUOTED_RUNNER_WATCH);
     }
 
-    /// Classification keys on the command's **form**, never on where the binary
-    /// lives — the property that lets every path in this module be a
-    /// placeholder. One table over the forms that reach us, replacing three
-    /// near-identical single-form tests.
     #[test]
-    fn classify_bg_shells_keys_on_command_form_not_on_paths() {
-        let cases: &[(&str, BgSeedKind, &str)] = &[
-            (R3_WATCH, BgSeedKind::ReviewWatch, "compiled binary"),
-            (R3_WATCH_SRC, BgSeedKind::ReviewWatch, "run-from-source"),
-            (
-                QUOTED_RUNNER_WATCH,
-                BgSeedKind::ReviewWatch,
-                "review-watch behind a quoted runner",
-            ),
-            ("npm run dev", BgSeedKind::LongRunning, "seed heuristic"),
-            (
-                "cargo build 2>&1 | tail -40",
-                BgSeedKind::Other,
-                "transient, so the row stays busy",
-            ),
+    fn background_commands_preserve_all_task_identities() {
+        let commands = [
+            R3_WATCH,
+            R3_WATCH_SRC,
+            QUOTED_RUNNER_WATCH,
+            "npm run dev",
+            "cargo build 2>&1 | tail -40",
+            "uv run --directory carver carver view --port 8011",
         ];
-        for &(cmd, kind, why) in cases {
-            let line = wrapper(cmd);
-            let seeds = classify_bg_shells(&[line]);
-            assert_eq!(seeds.len(), 1, "{why}");
-            // Assert the *pair*: the kind is only meaningful next to the key it
-            // was derived from, and the key is what the learning store records.
-            assert_eq!(seeds[0].kind, kind, "wrong kind for {why}: {cmd}");
-            assert_eq!(seeds[0].key, cmd, "key not recovered for {why}");
-        }
-    }
-
-    #[test]
-    fn classify_bg_shells_mixed() {
-        // A review-watch, a long-running dev server, and a plain build → each
-        // gets its own kind (the launcher aggregates them).
-        let cmds = vec![
-            wrapper("r3 watch review_2b40f7"),
-            wrapper("npm run dev"),
-            wrapper("cargo build 2>&1 | tail -40"),
-        ];
-        assert_eq!(
-            kinds(&cmds),
-            vec![
-                BgSeedKind::ReviewWatch,
-                BgSeedKind::LongRunning,
-                BgSeedKind::Other,
-            ]
-        );
+        let wrapped: Vec<_> = commands.iter().map(|c| wrapper(c)).collect();
+        assert_eq!(keys(&wrapped), commands);
     }
 
     /// A command that `exec`s leaves no wrapper behind, so the snapshot marker
@@ -2403,15 +2162,14 @@ mod tests {
         let execd = format!("{R3_WATCH_SRC} --auto-fetch-timeout 900");
         let seeds = classify_bg_shells(std::slice::from_ref(&execd));
         assert_eq!(seeds.len(), 1, "exec'd review-watch dropped: {execd}");
-        assert_eq!(seeds[0].kind, BgSeedKind::ReviewWatch);
         assert_eq!(seeds[0].key, execd, "an unwrapped line is its own key");
 
         // The admission stays narrow. Past the review-watch form an unwrapped
-        // child is still no shell at all: an exec'd dev server leaves the row
-        // busy rather than parking it, which is the safe direction, and the
+        // child is still no shell at all: an exec'd dev server cannot
+        // be distinguished from a helper by its command text, and the
         // non-task children keep leaving the empty set that
         // `promote_stale_background` recovers on.
-        assert!(kinds(&["npm run dev".to_string()]).is_empty());
+        assert!(keys(&["npm run dev".to_string()]).is_empty());
     }
 
     #[test]
@@ -2420,13 +2178,13 @@ mod tests {
         // background tasks and must not block the refinement…
         let mcp = "node /home/riteye/.local/lib/some-mcp-server/index.js --stdio".to_string();
         let cmds = vec![mcp.clone(), wrapper("r3 watch review_2b40f7")];
-        assert_eq!(kinds(&cmds), vec![BgSeedKind::ReviewWatch]);
+        assert_eq!(keys(&cmds), vec!["r3 watch review_2b40f7"]);
         // …and alone they leave an *empty* set, which is a different fact from
         // "the tree couldn't be read" (`bg_shells`' `None`). The launcher
         // promotes a stale background row on the strength of this emptiness, so
         // collapsing it back into `None` would silently disable that recovery.
-        assert!(kinds(&[mcp]).is_empty());
-        assert!(kinds(&[]).is_empty());
+        assert!(keys(&[mcp]).is_empty());
+        assert!(keys(&[]).is_empty());
     }
 
     #[test]
@@ -2453,61 +2211,6 @@ mod tests {
     }
 
     #[test]
-    fn long_running_command_recognizes_common_dev_servers() {
-        for cmd in [
-            "npm run dev",
-            "yarn dev",
-            "pnpm run start",
-            "vite",
-            "next dev",
-            "nuxt dev",
-            "cargo watch -x run",
-            "cargo watch -x build", // still long: the watch loop, not the build
-            "nodemon server.js",
-            "jest --watch",
-            "tsc --watch",
-            "uvicorn app:main --reload",
-            "python manage.py runserver",
-            "rails server",
-            "flask run",
-            "docker compose up",
-            "docker-compose up -d web",
-            "php artisan serve",
-            "python -m http.server 8000",
-        ] {
-            assert!(
-                is_long_running_command(cmd),
-                "should be long-running: {cmd}"
-            );
-        }
-    }
-
-    #[test]
-    fn long_running_command_rejects_finite_steps() {
-        for cmd in [
-            "npm run build",
-            "npm test",
-            "yarn build",
-            "cargo build",
-            "cargo test",
-            "cargo clippy",
-            "pytest -q",
-            "go build ./...",
-            "make",
-            "tsc",
-            "vite build",
-            "next build",
-            "eslint .",
-            "r3 watch review_2b40f7", // a watch, but classified separately
-        ] {
-            assert!(
-                !is_long_running_command(cmd),
-                "should NOT be long-running: {cmd}"
-            );
-        }
-    }
-
-    #[test]
     fn parse_stat_ppid_survives_hostile_comm() {
         // comm can contain spaces and parens; ppid is 2 fields past the LAST `)`.
         assert_eq!(parse_stat_ppid("123 (a b) c) R 4567 123 123 0"), Some(4567));
@@ -2531,8 +2234,8 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert!(children[0].starts_with("/bin/bash -c source"));
         assert_eq!(
-            kinds(&children),
-            vec![BgSeedKind::LongRunning, BgSeedKind::ReviewWatch]
+            keys(&children),
+            vec!["npm run dev".to_string(), children[1].clone()]
         );
     }
 

@@ -719,7 +719,8 @@ pub enum SessionStatus {
     Active,
     Compacting,
     Compacted,
-    /// The agent's turn has ended and nothing it spawned is still running.
+    /// The turn ended. Launchers emit this when no background work remains;
+    /// dashboards also use it for tasks matching the user's Idle command list.
     ///
     /// The **only** rest status the agent's own session file may promote back to
     /// `Active` on its own word (`launcher::reconcile_activity`). It has to be:
@@ -728,37 +729,11 @@ pub enum SessionStatus {
     /// dequeued, so the turn a flushed queue starts is announced nowhere but
     /// that file. Every other promotion needs corroboration from outside it (see
     /// `launcher::promote_stale_background`).
+    #[serde(alias = "background_server", alias = "review_pending")]
     Idle,
-    /// The agent's turn has ended (it would be `Idle`) but a **short-term**
-    /// `run_in_background` shell it spawned is still running — a build/test/step
-    /// the agent is waiting to finish before it resumes. Treated as **busy**
-    /// (green "Task", keep-awake, active-grouped): finite work is genuinely in
-    /// progress. Detected by the launcher mirroring Claude's own session-status
-    /// file (`status == "shell"`), not from a hook (see
-    /// `claude::session_activity`); a background shell that turns out to be a
-    /// **long-running service** is refined away to `BackgroundServer` by
-    /// classifying its command (see `BackgroundServer`).
+    /// The turn ended with background work still running. The dashboard can
+    /// treat its reported commands as Idle using the user's idle-task list.
     BackgroundActive,
-    /// A refinement of `BackgroundActive`: the turn ended and every running
-    /// `run_in_background` shell is a **long-running service** — a dev server or
-    /// file watcher the agent parked and moved on from, not finite work it's
-    /// waiting on. The agent is at rest, so unlike `BackgroundActive` this is
-    /// **not** `is_busy()` (no keep-awake, idle-grouped), renders yellow, and
-    /// *entering* it arms the row's follow-up bell so the parked session still
-    /// draws a glance. The launcher classifies each background command against a
-    /// seed heuristic (`claude::is_long_running_command`) **and** a self-learning
-    /// store of commands previously observed to run long (`learned`), so a dev
-    /// server is recognized either from a built-in list or from experience.
-    BackgroundServer,
-    /// A refinement of `BackgroundActive`: the turn ended and the *only*
-    /// `run_in_background` shells still running are r3 review-watches
-    /// (`r3 watch <review-id>`), so the agent is blocked waiting for a **human
-    /// review**, not doing work. Surfaced as an attention state (the human is
-    /// being asked to go review) rather than a busy one. The launcher promotes
-    /// `BackgroundActive → ReviewPending` when a live process-tree scan reports
-    /// every running background shell is a review-watch (`AgentControl::bg_shells`),
-    /// and demotes back the moment a non-watch task joins them.
-    ReviewPending,
     WaitingForApproval,
     WaitingForDecision,
     /// The launch never produced an agent: `direnv` blocked on the session's
@@ -781,8 +756,6 @@ impl SessionStatus {
         SessionStatus::Compacted,
         SessionStatus::Idle,
         SessionStatus::BackgroundActive,
-        SessionStatus::BackgroundServer,
-        SessionStatus::ReviewPending,
         SessionStatus::WaitingForApproval,
         SessionStatus::WaitingForDecision,
         SessionStatus::FailedToStart,
@@ -796,8 +769,6 @@ impl SessionStatus {
             Self::Compacted => "Compacted",
             Self::Idle => "Idle",
             Self::BackgroundActive => "Task",
-            Self::BackgroundServer => "Server",
-            Self::ReviewPending => "Review",
             Self::WaitingForApproval => "Approval",
             Self::WaitingForDecision => "Decision",
             Self::FailedToStart => "Failed",
@@ -815,27 +786,20 @@ impl SessionStatus {
     }
 
     /// Whether this status requires user attention — the agent is actively
-    /// asking (permission request, elicitation), blocked on a human review
-    /// (`ReviewPending`), or the launch failed and the row is waiting to be
+    /// asking (permission request, elicitation), or the launch failed and the row is waiting to be
     /// dealt with — not just post-Stop idle.
     pub fn needs_attention(&self) -> bool {
         matches!(
             self,
-            Self::WaitingForApproval
-                | Self::WaitingForDecision
-                | Self::ReviewPending
-                | Self::FailedToStart
+            Self::WaitingForApproval | Self::WaitingForDecision | Self::FailedToStart
         )
     }
 
     /// Whether the session is doing work: the agent is mid-turn
-    /// (`Active`/`Compacting`) or its turn ended but a **short-term** background
-    /// task it's waiting on is still running (`BackgroundActive`). Drives the
+    /// (`Active`/`Compacting`) or background work still counts as Task
+    /// (`BackgroundActive`). User-idled tasks are presented as `Idle`. Drives the
     /// active-group sort, the keep-awake inhibitor, and the launcher's
     /// `active_since` gate — everywhere a "busy vs at-rest" split is needed.
-    /// `BackgroundServer` (a long-running dev server / watcher the agent parked)
-    /// is deliberately **not** here: the agent isn't working, so it's at-rest —
-    /// no keep-awake, idle-grouped.
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
@@ -852,18 +816,8 @@ impl SessionStatus {
     /// exactly the ones a silent restart ruins — a launch cut off before it
     /// produced a session id, a permission prompt thrown away unanswered.
     ///
-    /// `BackgroundServer` and `ReviewPending` *are* here, though, because in
-    /// both the agent's turn has genuinely ended: what is still running is a
-    /// parked dev server / file watcher or an r3 review-watch, neither of which
-    /// is work the agent is waiting on and neither of which holds state the
-    /// restart would lose. Blocking on them only made a session
-    /// un-restartable until the user hunted down a shell they had already
-    /// walked away from.
     pub fn is_restartable(&self) -> bool {
-        matches!(
-            self,
-            Self::Idle | Self::Compacted | Self::BackgroundServer | Self::ReviewPending
-        )
+        matches!(self, Self::Idle | Self::Compacted)
     }
 }
 
@@ -1094,6 +1048,11 @@ pub struct LauncherState {
     pub tab_id: Option<TabId>,
     pub cwd: String,
     pub status: SessionStatus,
+    /// Commands still running after the turn. Only populated for Task rows;
+    /// dashboards retain them when presenting a user-selected task as Idle.
+    /// Older launchers omit this; an empty list cannot be toggled safely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_commands: Vec<String>,
     pub last_tool: Option<String>,
     pub updated_at: u64,
     /// Timestamp of the most recent non-active → active transition. Reset to
@@ -1273,6 +1232,7 @@ impl LauncherState {
             tab_id: None,
             cwd: String::new(),
             status,
+            background_commands: Vec::new(),
             last_tool: None,
             updated_at: 0,
             active_since: None,
@@ -1716,6 +1676,32 @@ pub(crate) fn read_launcher_states_in(dir: &Path) -> Vec<LauncherState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_commands_round_trip_and_retired_states_decode_as_idle() {
+        let mut row =
+            LauncherState::for_test(AgentControl::Claude, SessionStatus::BackgroundActive);
+        row.background_commands = vec![
+            "carver view --port 8011".into(),
+            "r3 watch review_abc".into(),
+        ];
+        let value = serde_json::to_value(&row).unwrap();
+        let restored: LauncherState = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.background_commands, row.background_commands);
+        for status in ["background_server", "review_pending"] {
+            let mut legacy = value.clone();
+            legacy["status"] = serde_json::json!(status);
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("background_commands");
+            let restored: LauncherState = serde_json::from_value(legacy).unwrap();
+            assert_eq!(restored.status, SessionStatus::Idle);
+            assert!(restored.background_commands.is_empty());
+            assert!(!restored.status.needs_attention());
+            assert_eq!(serde_json::to_value(restored.status).unwrap(), "idle");
+        }
+    }
 
     #[test]
     fn proc_stat_distinguishes_exited_from_stopped_or_unknown() {
@@ -2186,36 +2172,21 @@ mod tests {
     }
 
     #[test]
-    fn review_pending_is_an_attention_state_not_a_busy_one() {
-        // The agent is blocked on a human review — it floats to the attention
-        // sort rank (`s` jumps to it) but must NOT keep the machine awake, so it
-        // is `needs_attention()` yet not `is_busy()` (mirroring the Waiting*
-        // states and its at-rest sibling `BackgroundServer`, unlike the busy
-        // `BackgroundActive`).
-        assert!(SessionStatus::ReviewPending.needs_attention());
-        assert!(!SessionStatus::ReviewPending.is_busy());
-        assert_eq!(SessionStatus::ReviewPending.label(), "Review");
-        // Listed in ALL so the Status column widths itself correctly.
-        assert!(SessionStatus::ALL.contains(&SessionStatus::ReviewPending));
-    }
-
-    #[test]
-    fn background_task_is_busy_but_a_parked_server_is_at_rest() {
+    fn background_task_is_busy_and_idle_is_at_rest() {
         // A short-term background task the agent is waiting on is genuine work:
         // busy (keeps the machine awake), green "Task".
         assert!(SessionStatus::BackgroundActive.is_busy());
         assert!(!SessionStatus::BackgroundActive.needs_attention());
         assert_eq!(SessionStatus::BackgroundActive.label(), "Task");
-        // A parked long-running dev server/watcher is not the agent working:
-        // at-rest (never keeps the machine awake), yellow "Server". It draws
+        // Idle is at rest (never keeps the machine awake). It draws
         // attention via the follow-up bell (armed on entry), not needs_attention.
-        assert!(!SessionStatus::BackgroundServer.is_busy());
-        assert!(!SessionStatus::BackgroundServer.needs_attention());
-        assert_eq!(SessionStatus::BackgroundServer.label(), "Server");
-        assert!(SessionStatus::ALL.contains(&SessionStatus::BackgroundServer));
+        assert!(!SessionStatus::Idle.is_busy());
+        assert!(!SessionStatus::Idle.needs_attention());
+        assert_eq!(SessionStatus::Idle.label(), "Idle");
+        assert!(SessionStatus::ALL.contains(&SessionStatus::Idle));
     }
 
-    /// `is_restartable` is neither `!is_busy()` nor "idle or compacted", and the
+    /// `is_restartable` is deliberately narrower than `!is_busy()`, and the
     /// gap on each side is the point. Both restart commands and the server
     /// upgrade share it, so a variant sliding across this line changes what
     /// those will tear down.
@@ -2225,7 +2196,7 @@ mod tests {
         // The agent has stopped and nothing it is waiting on is in flight —
         // including a parked server / review-watch, whose shells are not work
         // the restart would interrupt.
-        for st in [S::Idle, S::Compacted, S::BackgroundServer, S::ReviewPending] {
+        for st in [S::Idle, S::Compacted] {
             assert!(st.is_restartable(), "{st:?} must be restartable");
         }
         // `Starting` and the Waiting* states pass `!is_busy()` and must still

@@ -39,15 +39,7 @@ pub(super) fn status_color(status: &SessionStatus) -> Color {
     match status {
         // The attention states are all yellow — matching a follow-up Idle
         // (which renders in `attention_fg`, itself yellow by default).
-        // `ReviewPending` (blocked on a human review) reads the same as the
-        // "agent is asking" states rather than getting its own color.
-        // `BackgroundServer` ("Server") joins them: a parked long-running dev
-        // server/watcher isn't the agent working, so it reads as an at-rest
-        // state that wants a glance, not busy green.
-        SessionStatus::WaitingForApproval
-        | SessionStatus::WaitingForDecision
-        | SessionStatus::ReviewPending
-        | SessionStatus::BackgroundServer => Color::Yellow,
+        SessionStatus::WaitingForApproval | SessionStatus::WaitingForDecision => Color::Yellow,
         SessionStatus::FailedToStart => Color::Red,
         // `BackgroundActive` ("Task") is green with Active: a short-term
         // background step the agent is waiting to finish is genuine work.

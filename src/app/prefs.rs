@@ -10,13 +10,16 @@
 //! 2. `~/.config/captain-miao/config.toml`, the declarative file,
 //! 3. `dashboard-overrides.json`'s `prefs`, what this overlay writes.
 //!
-//! Every field of [`PrefsOverrides`] is therefore an `Option`, and `None` means
+//! Config-backed fields of [`PrefsOverrides`] are `Option`s, and `None` means
 //! *inherit* rather than "off" — which is why **resetting a row writes `None`
 //! rather than the default value**. Writing the default would freeze today's
 //! compiled-in number into the user's state file, and a later config.toml edit
 //! would then appear to do nothing. [`apply_prefs_to_config`] is the one place
 //! layer 3 is folded onto 1+2, and [`App::reapply_live_config`] re-runs the
 //! whole stack from disk after any write.
+//!
+//! The Idle tasks list is user state without a TOML default. It is stored
+//! alongside these overrides and applies through `tasks::apply_idle_commands`.
 //!
 //! Two rows are deliberately absent, because they are not single values: the
 //! default agent is the first entry of the ordered agent list in this overlay,
@@ -51,6 +54,7 @@ use super::{Action, App, InputMode};
 pub(super) enum PrefsCategory {
     Agents,
     General,
+    IdleTasks,
     Display,
     Colors,
     Terminal,
@@ -63,12 +67,14 @@ impl PrefsCategory {
         Self::Display,
         Self::Colors,
         Self::Terminal,
+        Self::IdleTasks,
     ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Agents => "Agents",
             Self::General => "General",
+            Self::IdleTasks => "Idle tasks",
             Self::Display => "Display",
             Self::Colors => "Colors",
             Self::Terminal => "Terminal",
@@ -152,6 +158,9 @@ impl PrefsState {
 /// doc on why a reset writes `None` rather than the current default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PrefsOverrides {
+    /// User-owned command patterns; independent of TOML defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub idle_commands: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_window_close: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,7 +203,8 @@ impl PrefsOverrides {
     /// `PartialEq` with the default, so adding a field is a compile error here
     /// rather than a silently-always-written key.
     pub(super) fn is_empty(&self) -> bool {
-        self.on_window_close.is_none()
+        self.idle_commands.is_empty()
+            && self.on_window_close.is_none()
             && self.pooled.is_none()
             && self.kitty_rc_password.is_none()
             && self.agents.is_none()
@@ -430,6 +440,7 @@ impl App {
         match cat {
             PrefsCategory::Agents => self.agent_order.len().max(1),
             PrefsCategory::General => GENERAL_ROWS.len(),
+            PrefsCategory::IdleTasks => self.extra_prefs.idle_commands.len() + 1,
             PrefsCategory::Display => DISPLAY_ROWS.len(),
             PrefsCategory::Colors => COLOR_ROWS.len(),
             PrefsCategory::Terminal => {
@@ -561,6 +572,16 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('a')
+                if self.prefs.as_ref().is_some_and(|p| {
+                    p.category == PrefsCategory::IdleTasks && p.pane == PrefsPane::Items
+                }) =>
+            {
+                if let Some(p) = self.prefs.as_mut() {
+                    p.cursor = self.extra_prefs.idle_commands.len();
+                }
+                self.open_prefs_field(String::new());
+            }
             KeyCode::Char('J') => self.prefs_reorder(1),
             KeyCode::Char('K') => self.prefs_reorder(-1),
             KeyCode::Char('x') | KeyCode::Char('d') => self.prefs_toggle_disable(),
@@ -631,6 +652,14 @@ impl App {
         let Some(st) = self.prefs.as_ref() else {
             return;
         };
+        if st.category == PrefsCategory::IdleTasks && st.pane == PrefsPane::Items {
+            if st.cursor < self.extra_prefs.idle_commands.len() {
+                self.extra_prefs.idle_commands.remove(st.cursor);
+                self.save_overrides();
+                self.refresh_idle_tasks();
+            }
+            return;
+        }
         if st.category != PrefsCategory::Agents || st.pane != PrefsPane::Items {
             return;
         }
@@ -677,6 +706,15 @@ impl App {
             return;
         }
         match st.category {
+            PrefsCategory::IdleTasks => {
+                let seed = self
+                    .extra_prefs
+                    .idle_commands
+                    .get(st.cursor)
+                    .cloned()
+                    .unwrap_or_default();
+                self.open_prefs_field(seed);
+            }
             PrefsCategory::Agents => {}
             PrefsCategory::General => match GENERAL_ROWS.get(st.cursor) {
                 Some(GeneralRow::Layout) => {
@@ -778,6 +816,31 @@ impl App {
     /// instead of pinning a nonsense number.
     fn commit_prefs_field(&mut self, cat: PrefsCategory, cursor: usize, raw: String) {
         match cat {
+            PrefsCategory::IdleTasks => {
+                let command = raw.trim().to_string();
+                if command.is_empty() {
+                    self.set_status(
+                        "Enter a command or pattern; d removes an entry".into(),
+                        true,
+                    );
+                    return;
+                }
+                let commands = &mut self.extra_prefs.idle_commands;
+                if commands
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| i != cursor && c == &command)
+                {
+                    self.set_status("That Idle command is already listed".into(), true);
+                    return;
+                }
+                if cursor < commands.len() {
+                    commands[cursor] = command;
+                } else {
+                    commands.push(command);
+                }
+            }
+
             PrefsCategory::Display => {
                 let Ok(n) = raw.trim().parse::<u64>() else {
                     self.set_status("invalid number".into(), true);
@@ -880,6 +943,11 @@ impl App {
             return;
         };
         match st.category {
+            PrefsCategory::IdleTasks => {
+                self.prefs_toggle_disable();
+                return;
+            }
+
             PrefsCategory::Agents => {
                 self.agent_order = default_agent_list();
                 self.extra_prefs.agents = None;
@@ -955,6 +1023,7 @@ impl App {
         let cfg = config::get();
         self.on_window_close = cfg.remote.on_window_close;
         self.sessions_layout = cfg.terminal.sessions_layout.unwrap_or_default();
+        self.refresh_idle_tasks();
     }
 
     pub(super) fn draw_prefs(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
@@ -1012,21 +1081,55 @@ impl App {
                 ListItem::new(Line::from(vec![Span::raw(prefix), Span::raw(line)]))
             })
             .collect();
-        frame.render_widget(List::new(items), right);
+        let mut rows_state = ListState::default();
+        rows_state.select(Some(st.cursor));
+        frame.render_stateful_widget(List::new(items), right, &mut rows_state);
 
-        let mut help_lines = vec![Line::from(Span::styled(
+        let help_line = Line::from(Span::styled(
             help_text,
             Style::default().add_modifier(Modifier::DIM),
-        ))];
+        ));
         if let Some(field) = st.field.as_ref() {
-            help_lines.push(Line::from(format!("edit: {}", field.text())));
+            use unicode_width::UnicodeWidthChar;
+            let [hint, editor] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(help);
+            frame.render_widget(Paragraph::new(help_line).wrap(Wrap { trim: true }), hint);
+            // Keep the insertion point visible for long command lines.
+            let available = editor.width.saturating_sub(6) as usize;
+            let mut start = field.cursor();
+            let mut width = 0;
+            for (index, ch) in field.text()[..field.cursor()].char_indices().rev() {
+                let next_width = width + ch.width().unwrap_or(0);
+                if next_width >= available {
+                    break;
+                }
+                start = index;
+                width = next_width;
+            }
+            frame.render_widget(
+                Paragraph::new(format!("edit: {}", &field.text()[start..])),
+                editor,
+            );
+            if available > 0 && editor.height > 0 {
+                frame.set_cursor_position((editor.x + 6 + width as u16, editor.y));
+            }
+        } else {
+            frame.render_widget(Paragraph::new(help_line).wrap(Wrap { trim: true }), help);
         }
-        frame.render_widget(Paragraph::new(help_lines).wrap(Wrap { trim: true }), help);
     }
 
     fn prefs_right_lines(&self, st: &PrefsState) -> (Vec<String>, String) {
         let cfg = config::get();
         match st.category {
+            PrefsCategory::IdleTasks => {
+                let mut rows = self.extra_prefs.idle_commands.clone();
+                rows.push("+ Add command…".into());
+                (
+                    rows,
+                    "Enter edits · a adds · d removes · * matches any text · Esc closes".into(),
+                )
+            }
+
             PrefsCategory::Agents => {
                 let rows = self
                     .agent_order

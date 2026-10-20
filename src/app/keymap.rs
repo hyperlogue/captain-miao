@@ -304,6 +304,7 @@ pub(super) enum Command {
     RestartAll,
     EditDir,
     ToggleKeepAwake,
+    ToggleTaskIdle,
     DefaultAgent,
     /// Compatibility command for custom bindings; opens the Hosts panel,
     /// where the first row now owns the default.
@@ -368,6 +369,7 @@ impl Command {
             Command::RestartAll => "restart_all",
             Command::EditDir => "edit_dir",
             Command::ToggleKeepAwake => "keep_awake",
+            Command::ToggleTaskIdle => "task_idle",
             Command::DefaultAgent => "default_agent",
             Command::DefaultHost => "default_host",
             Command::StealAttach => "steal_attach",
@@ -427,6 +429,7 @@ impl Command {
             Command::RestartAll => "restart all (idle only, confirm)",
             Command::EditDir => "edit directory icon + color (^E emoji picker)",
             Command::ToggleKeepAwake => "toggle keep-awake (prevent OS sleep)",
+            Command::ToggleTaskIdle => "toggle background commands between Task and Idle",
             // No parenthetical list of backends. It read as a closed set and so
             // went stale the moment a third arrived — but deriving one from
             // `ALL` only trades a wrong list for an unwieldy one, since this
@@ -480,6 +483,7 @@ impl Command {
             Command::RestartAll => "restart all",
             Command::EditDir => "color",
             Command::ToggleKeepAwake => "keep-awake",
+            Command::ToggleTaskIdle => "task idle",
             Command::DefaultAgent => "agent",
             Command::DefaultHost => "host",
             Command::StealAttach => "steal",
@@ -505,6 +509,7 @@ impl Command {
             Command::TogglePreview
                 | Command::ToggleDetail
                 | Command::ToggleKeepAwake
+                | Command::ToggleTaskIdle
                 | Command::SessionDetail
         )
     }
@@ -552,6 +557,7 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ToggleDetail,       &["space t d"]),
     (Command::SessionDetail,      &["space t s"]),
     (Command::ToggleKeepAwake,    &["space t z"]),
+    (Command::ToggleTaskIdle,     &["space t i"]),
     (Command::VcsPush,            &["space v p"]),
     (Command::VcsPull,            &["space v l"]),
     (Command::RestartSelected,    &["space e"]),

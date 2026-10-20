@@ -883,7 +883,7 @@ fn shows_all_status_variants() {
         session(5, "/home/test/f", SessionStatus::WaitingForApproval),
         session(6, "/home/test/g", SessionStatus::WaitingForDecision),
         session(7, "/home/test/h", SessionStatus::BackgroundActive),
-        session(8, "/home/test/i", SessionStatus::BackgroundServer),
+        session(8, "/home/test/i", SessionStatus::Idle),
         session(9, "/home/test/j", SessionStatus::FailedToStart),
     ]);
     let out = d.render();
@@ -895,7 +895,8 @@ fn shows_all_status_variants() {
     assert!(out.contains("Approval"));
     assert!(out.contains("Decision"));
     assert!(out.contains("Task"));
-    assert!(out.contains("Server"));
+    assert!(!out.contains("Server"));
+    assert!(!out.contains("Review"));
     assert!(out.contains("Failed"));
 }
 
@@ -1631,7 +1632,12 @@ fn update_inbox_scrolls_details_independently_and_uses_active_host_binding() {
         "0.11.0",
     );
     d.app.upgrade_notices = super::upgrade_notices::UpgradeNotices::new(
-        super::announcements::ANNOUNCEMENTS.iter().collect(),
+        super::announcements::pending(
+            super::announcements::ANNOUNCEMENTS,
+            None,
+            &semver::Version::new(0, 11, 0),
+        )
+        .unwrap(),
     );
     let out = d.render();
     assert!(out.contains("1/2"), "{out}");
@@ -2070,6 +2076,121 @@ fn prefs_hides_terminal_unless_this_dashboard_is_kitty() {
         out.contains("Terminal"),
         "a kitty identity must show the password category:\n{out}"
     );
+}
+
+#[test]
+fn task_idle_toggle_and_preferences_persist_across_sessions_and_hosts() {
+    const CHILD: &str = "CM_TEST_IDLE_TASK_PREFS";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::task_idle_toggle_and_preferences_persist_across_sessions_and_hosts",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Idle task preferences failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut d = TestDashboard::new(120, 28);
+    d.app.prevent_sleep_enabled = false;
+    let dir = tempfile::tempdir().unwrap();
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
+        dir.path().join("dashboard-overrides.json"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let command = "uv run carver view --port 8011";
+    let mut task = session(1, "/home/test/project", SessionStatus::BackgroundActive);
+    task.background_commands = vec![command.into()];
+    let mut other = task.clone();
+    other.launcher_pid = 2;
+    other.host = crate::state::HostId("remote".into());
+    let mut mixed = task.clone();
+    mixed.launcher_pid = 3;
+    mixed.background_commands.push("cargo test".into());
+    d.set_sessions(vec![task, other, mixed]);
+    let selected = d.app.selected_session_ref().unwrap().launcher_pid;
+    d.press_toggle('i');
+    assert_eq!(d.app.sessions[0].status, SessionStatus::Idle);
+    assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
+    assert_eq!(d.app.sessions[2].status, SessionStatus::BackgroundActive);
+    assert_eq!(d.app.selected_session_ref().unwrap().launcher_pid, selected);
+    assert_eq!(d.app.extra_prefs.idle_commands, [command]);
+    let saved = d.app.dashboard_state.load().unwrap();
+    assert_eq!(saved.prefs.idle_commands, [command]);
+    d.app.extra_prefs.idle_commands.clear();
+    d.app.load_overrides();
+    assert_eq!(d.app.extra_prefs.idle_commands, [command]);
+
+    // Preferences edit a remembered command into a reusable pattern.
+    d.press(KeyCode::Char(','));
+    for _ in 0..6 {
+        if d.render().contains("+ Add command") {
+            break;
+        }
+        d.press(KeyCode::Char('l'));
+    }
+    assert!(d.render().contains(command));
+    d.press(KeyCode::Enter);
+    d.press_ctrl(KeyCode::Char('u'));
+    for c in "uv run carver view --port *".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(
+        d.app.extra_prefs.idle_commands,
+        ["uv run carver view --port *"]
+    );
+    d.app.sessions[1].background_commands = vec!["uv run carver view --port 8010".into()];
+    d.app.refresh_idle_tasks();
+    assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
+    d.press(KeyCode::Char('a'));
+    for c in "cargo test".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.sessions[2].status, SessionStatus::Idle);
+    d.press(KeyCode::Char('d'));
+    assert_eq!(d.app.sessions[2].status, SessionStatus::BackgroundActive);
+    assert_eq!(d.app.extra_prefs.idle_commands.len(), 1);
+    d.press(KeyCode::Esc);
+
+    // The reverse toggle removes matching patterns and updates every row.
+    d.press_toggle('i');
+    assert!(d.app.extra_prefs.idle_commands.is_empty());
+    assert!(
+        d.app
+            .sessions
+            .iter()
+            .all(|s| s.status == SessionStatus::BackgroundActive)
+    );
+    assert_eq!(d.app.selected_session_ref().unwrap().launcher_pid, selected);
+    assert!(
+        d.app
+            .dashboard_state
+            .load()
+            .unwrap()
+            .prefs
+            .idle_commands
+            .is_empty()
+    );
+    d.app.sessions[0].status = SessionStatus::Active;
+    d.app.mark_dirty(Cursor::FollowSession);
+    d.press_toggle('i');
+    assert_eq!(d.app.sessions[0].status, SessionStatus::Active);
+    assert!(d.app.extra_prefs.idle_commands.is_empty());
 }
 
 #[test]
@@ -3681,10 +3802,7 @@ fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
     // refusing left a host un-upgradeable over a shell the user had already
     // walked away from. Same whitelist the restart commands use
     // (`SessionStatus::is_restartable`).
-    for status in [
-        SessionStatus::BackgroundServer,
-        SessionStatus::ReviewPending,
-    ] {
+    for status in [SessionStatus::Idle, SessionStatus::Idle] {
         let mut d = TestDashboard::new(120, 12);
         d.set_sessions(vec![
             pooled(1, SessionStatus::Idle, Some(false)),
@@ -5070,7 +5188,7 @@ fn failed_to_start_floats_to_attention_rank() {
 }
 
 #[test]
-fn review_pending_ranks_below_follow_up_above_idle() {
+fn follow_up_ranks_above_idle_and_idle_sorts_by_recency() {
     let mut d = TestDashboard::new(120, 15);
     // updated_at descending by pid so a pure recency sort would order the rows
     // 4,3,2,1 — the assertion below proves the rank tiers dominate recency.
@@ -5078,7 +5196,7 @@ fn review_pending_ranks_below_follow_up_above_idle() {
     approval.updated_at = 700;
     let mut follow = session(2, "/home/test/b", SessionStatus::Idle);
     follow.updated_at = 800;
-    let mut review = session(3, "/home/test/c", SessionStatus::ReviewPending);
+    let mut review = session(3, "/home/test/c", SessionStatus::Idle);
     review.updated_at = 900;
     let mut idle = session(4, "/home/test/d", SessionStatus::Idle);
     idle.updated_at = 1000;
@@ -5093,16 +5211,14 @@ fn review_pending_ranks_below_follow_up_above_idle() {
         },
     );
 
-    // Tiers, top to bottom: attention (approval) > follow-up-flagged >
-    // ReviewPending > plain idle. So ReviewPending (pid 3) ranks *below* the
-    // follow-up row (pid 2) but *above* the plain idle row (pid 4).
+    // Approval and follow-up precede both Idle rows, which sort by recency.
     let order: Vec<u32> = d
         .app
         .visible_sessions()
         .iter()
         .map(|s| s.launcher_pid)
         .collect();
-    assert_eq!(order, vec![1, 2, 3, 4]);
+    assert_eq!(order, vec![1, 2, 4, 3]);
 }
 
 #[test]
@@ -7635,9 +7751,9 @@ fn preview_auto_refresh_gates() {
         d.app.wants_preview_auto_refresh(interval),
         "background task is busy"
     );
-    // A parked long-running server (`BackgroundServer`) is at-rest — the agent
+    // A parked long-running server (`Idle`) is at-rest — the agent
     // isn't working, so the timer stays paused like any other at-rest row.
-    d.app.sessions[0].status = SessionStatus::BackgroundServer;
+    d.app.sessions[0].status = SessionStatus::Idle;
     assert!(
         !d.app.wants_preview_auto_refresh(interval),
         "parked server is at rest, not busy"
@@ -10284,40 +10400,33 @@ fn a_busy_remote_session_does_not_keep_this_machine_awake() {
 }
 
 #[test]
-fn review_pending_does_not_inhibit_sleep() {
-    // A session blocked on a human review (`ReviewPending`) is an *attention*
-    // state, not a busy one: there's no point caffeinating through a multi-hour
-    // `r3 watch` that's waiting on a person. The inhibitor gate
-    // (`has_active_session` → `is_busy`) must ignore it, exactly as it ignores
-    // plain Idle / WaitingForApproval. This pins the end-to-end link so adding
-    // `ReviewPending` to `is_busy` (e.g. to re-group the row) can't silently
-    // start keeping the machine awake.
+fn user_idled_tasks_do_not_inhibit_sleep() {
+    // A user-idled background task must release the sleep inhibitor.
     let mut d = TestDashboard::new(120, 10);
-    d.set_sessions(vec![session(
-        1,
-        "/home/test/a",
-        SessionStatus::ReviewPending,
-    )]);
+    let mut task = session(1, "/home/test/a", SessionStatus::BackgroundActive);
+    task.background_commands = vec!["r3 watch review_abc".into()];
+    super::tasks::apply_idle_commands(&mut task, &["r3 watch *".into()]);
+    d.set_sessions(vec![task]);
     assert!(
         !d.app.has_active_session(),
-        "ReviewPending must not count as an active (busy) session"
+        "Idle must not count as an active (busy) session"
     );
 
     if !crate::sleep::supported() {
         return; // Can't exercise the real inhibitor without a backend binary.
     }
 
-    // With the toggle on, reconciling the inhibitor for a ReviewPending-only
+    // With the toggle on, reconciling the inhibitor for a Idle-only
     // set must leave caffeinate stopped.
     d.app.prevent_sleep_enabled = true;
     d.app.update_sleep_inhibitor();
     assert!(
         !d.app.sleep_inhibitor.is_active(),
-        "ReviewPending session must not spin up the sleep inhibitor"
+        "Idle session must not spin up the sleep inhibitor"
     );
 
     // Positive control: a genuinely busy (Active) session *does* inhibit sleep,
-    // so the assertion above is testing the ReviewPending exclusion — not a
+    // so the assertion above is testing the Idle exclusion — not a
     // globally-disabled inhibitor.
     d.set_sessions(vec![session(2, "/home/test/b", SessionStatus::Active)]);
     d.app.update_sleep_inhibitor();
@@ -11133,27 +11242,20 @@ fn space_shift_e_rejects_when_any_session_busy() {
     assert!(d.app.status_is_error);
 }
 
-/// A parked server (`Server`) and a session blocked on a human review
-/// (`Review`) restart like an idle one, singly and in bulk.
-///
-/// Both are at rest — the agent's turn ended and what's left running is a dev
-/// server / watcher it walked away from, or an r3 review-watch waiting on a
-/// human. There is no in-flight work to lose, so the gate
-/// (`SessionStatus::is_restartable`, shared with `upgrade_blocker`) lets them
-/// through; refusing only stranded the row until the user hunted the shell down.
+/// User-idled tasks restart like any other Idle session.
 #[test]
-fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
-    for status in [
-        SessionStatus::BackgroundServer,
-        SessionStatus::ReviewPending,
-    ] {
+fn space_e_and_space_shift_e_treat_user_idled_tasks_as_idle() {
+    for command in ["npm run dev", "r3 watch review_abc"] {
         let mut d = TestDashboard::new(120, 20);
-        d.set_sessions(vec![session(1, "/home/test/proj", status.clone())]);
+        let mut task = session(1, "/home/test/proj", SessionStatus::BackgroundActive);
+        task.background_commands = vec![command.into()];
+        super::tasks::apply_idle_commands(&mut task, &[command.into()]);
+        d.set_sessions(vec![task]);
         d.press(KeyCode::Char(' '));
         d.press(KeyCode::Char('e'));
         assert!(
             d.app.confirmation.is_some(),
-            "{status:?} should confirm, not refuse"
+            "{command} should confirm, not refuse"
         );
         assert!(matches!(
             d.press(KeyCode::Char('y')),
@@ -11166,8 +11268,8 @@ fn space_e_and_space_shift_e_treat_server_and_review_as_idle() {
     let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![
         session(1, "/home/test/a", SessionStatus::Idle),
-        session(2, "/home/test/b", SessionStatus::BackgroundServer),
-        session(3, "/home/test/c", SessionStatus::ReviewPending),
+        session(2, "/home/test/b", SessionStatus::Idle),
+        session(3, "/home/test/c", SessionStatus::Idle),
     ]);
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('E'));

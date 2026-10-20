@@ -1313,7 +1313,7 @@ decides what they mean**.
     a session from whoever is using it rather than hand it back. "Idle" is the
     restart-all whitelist (`Idle | Compacted`), deliberately not
     `SessionStatus::is_busy`: `Starting`, `WaitingForApproval` and
-    `ReviewPending` all read as at-rest by that narrower test and are exactly
+    `WaitingForDecision` all read as at-rest by that narrower test and are exactly
     what you would hate to have restarted. An *unreadable* attached bit is not
     evidence of a second client, matching the detached glyph's rule.
   - **The refusal uses the shared confirmation overlay** above the hosts

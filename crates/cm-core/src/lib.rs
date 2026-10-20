@@ -24,7 +24,6 @@ pub mod clipboard;
 pub mod config;
 pub mod hooks;
 pub mod launcher;
-pub mod learned;
 pub mod logging;
 pub mod paths;
 pub mod protocol;

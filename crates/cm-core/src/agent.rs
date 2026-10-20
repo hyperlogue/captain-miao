@@ -1368,17 +1368,8 @@ impl AgentControl {
         }
     }
 
-    /// The agent's currently-running `run_in_background` shells, read from the
-    /// **live process tree** (see `claude::bg_shells`) and each classified by
-    /// *what* it runs — the launcher's basis for refining a `BackgroundActive`
-    /// row into `ReviewPending` (all review-watches), `BackgroundServer` (all
-    /// long-running services), or a busy transient task.
-    ///
-    /// `None` means the tree could not be read, so nothing may be concluded; an
-    /// empty `Some` is the positive fact that nothing is running, which is what
-    /// lets the launcher retire a stale background status. Always `None` for
-    /// Codex, which has no `run_in_background` concept — and therefore never
-    /// reaches any of the states that reading would refine.
+    /// Live background commands. `None` means unavailable; an empty list is
+    /// positive evidence that no shell remains. Only read after a turn ends.
     pub fn bg_shells(self, agent_pid: u32) -> Option<Vec<BgShell>> {
         match self {
             AgentControl::Claude => claude::bg_shells(agent_pid),
@@ -1395,26 +1386,25 @@ impl AgentControl {
             // process tree we can walk, and no documented payload enumerates
             // them the way Grok's `Stop` does. So a `Stop` while something else
             // is still running means "the foreground turn ended" and the row
-            // reads Idle — never `BackgroundServer` or `ReviewPending`.
+            // reads Idle.
             AgentControl::Kimi => None,
             // The live list is applied at Stop in `grok::dispatch_hook` rather
             // than here: Grok names its background work on the payload itself
             // (`backgroundTasks` / `sessionCrons`), which a pid-only tree walk
             // would miss (monitors, subagents, `/loop` crons) and would disagree
             // with the agent that just decided the turn is over. A `Stop` with
-            // in-flight work therefore lands on `Task` / `Server` / `Review`
+            // in-flight work therefore lands on `Task`
             // without this method ever seeing the pid.
             AgentControl::Grok => None,
             // No background-shell concept in anything design §9 names, so a
             // `session.idle` while something else is still running means "the
             // foreground turn ended" and the row reads `Idle` — never
-            // `BackgroundServer` or `ReviewPending`.
+            // a background-task state.
             AgentControl::OpenCode => None,
             // Pi has no background-shell concept in its event surface at all —
             // no `run_in_background` tool, no background-task list on any
             // payload — so a `Stop` is simply the end of the work, and the row
-            // never reaches `BackgroundActive`, `BackgroundServer` or
-            // `ReviewPending`. An absence, with nothing to wire up later.
+            // never reaches `BackgroundActive`.
             AgentControl::Pi => None,
             // Antigravity *does* background long commands — every `run_command`
             // carries a `WaitMsBeforeAsync` — and `Stop` even reports whether
@@ -1498,35 +1488,11 @@ fn mentions_event(config: &str, kebab: &str) -> bool {
     })
 }
 
-/// One of an agent's running `run_in_background` shells, reduced to what the
-/// launcher's background-status refinement needs: a normalized command `key`
-/// (the learning identity, stable across sessions) and the `kind` a *static*
-/// classifier assigned it. "Static" means from the command text alone — the
-/// launcher then overlays the learned store and per-command durations on top of
-/// an `Other` to decide busy-vs-at-rest (see `launcher::classify_and_learn`).
+/// One live background task, with its command extracted from the agent's
+/// wrapper. The dashboard uses this identity for the user's idle-task list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BgShell {
-    /// The normalized command (the agent's actual `run_in_background` command,
-    /// extracted from the Bash-tool wrapper) — the key both the learning store
-    /// and the duration tracker use to recognize "the same command" again.
     pub key: String,
-    /// What the command text alone says this is.
-    pub kind: BgSeedKind,
-}
-
-/// A background shell's classification from its command text alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BgSeedKind {
-    /// An r3 review-watch (`r3 watch <review-id>`) — the agent is blocked on a
-    /// human review → `ReviewPending`.
-    ReviewWatch,
-    /// A recognized long-running service (dev server / watcher) per the seed
-    /// heuristic → at-rest `BackgroundServer`, no waiting to learn it.
-    LongRunning,
-    /// Anything else — a finite build/test/step by default (busy), unless the
-    /// learned store or a duration threshold later reclassifies it as
-    /// long-running.
-    Other,
 }
 
 /// The agent's own report of what it's doing, read from its status file

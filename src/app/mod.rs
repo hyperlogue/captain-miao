@@ -51,6 +51,7 @@ mod prefs;
 mod render_backend;
 mod restart;
 mod run;
+mod tasks;
 mod upgrade_notices;
 mod vcs_confirm;
 
@@ -1622,15 +1623,7 @@ fn session_sort_key(
     active_since: Option<u64>,
 ) -> (u8, i64) {
     let active = status.is_busy();
-    // Approvals, decisions, and failed-to-start launches float to the
-    // top attention rank. `ReviewPending` is needs-attention too, but
-    // it's a *follow-up*: the human should get to the review, it isn't
-    // the agent blocking on a live prompt. It ranks like a follow-up
-    // idle session but sits in its own tier *below* the actual
-    // follow-up-flagged rows (rank 3) — above plain idle, below
-    // follow-up — sorted by updated_at like the other attention tiers.
-    let review_pending = matches!(status, SessionStatus::ReviewPending);
-    let attention = status.needs_attention() && !review_pending;
+    let attention = status.needs_attention();
     // A pooled session with no window on this screen sinks to the very
     // bottom — it's running somewhere else, so it shouldn't compete for
     // the eye with what's in front of you (§9).
@@ -1646,10 +1639,10 @@ fn session_sort_key(
     // block. The one thing that still wins is `pinned`: that's a
     // deliberate per-row "keep this in front of me", and honouring it
     // is the whole point of the key.
-    // Ranks 1–3 cover what `is_attention_row` unions (a needs-attention
+    // Ranks 1–2 cover what `is_attention_row` unions (a needs-attention
     // or at-rest follow-up row); kept split here because ordering needs
     // the finer tiers, and with the detached tier taking precedence over
-    // all three an attention row that is also detached lands in 6.
+    // both an attention row that is also detached lands in 6.
     // `jump_to_next_attention` skips that same row for the same reason
     // it sinks here — the prompt can't be answered until you attach —
     // so the sort and the jump target stay in agreement. Changing the
@@ -1662,22 +1655,20 @@ fn session_sort_key(
         1
     } else if flags.follow_up && !active {
         2
-    } else if review_pending {
-        3
     } else if !active {
         4
     } else {
         5
     };
     // Pinned: most-recently-pinned first (negate seq so larger sorts before smaller).
-    // Attention groups (approval + follow_up + review-pending): oldest
+    // Attention groups (approval + follow_up): oldest
     // first so the longest-waiting session surfaces at the top of its
     // tier. Active group: sort by when the session entered the active
     // state so the order stays stable during a turn (updated_at churns
     // on every tool event). Everything else: newest updated_at first.
     let time_key: i64 = if rank == 0 {
         -(flags.pin_seq as i64)
-    } else if rank == 1 || rank == 2 || rank == 3 {
+    } else if rank == 1 || rank == 2 {
         updated_at as i64
     } else if active {
         -(active_since.unwrap_or(updated_at) as i64)
@@ -2220,10 +2211,10 @@ impl App {
     }
 
     /// True iff at least one session **on this machine** is currently working —
-    /// `Active`, `Compacting`, or `BackgroundActive` (a short-term background task
-    /// the agent is waiting on, which can itself peg the CPU), via `is_busy`. Used
+    /// `Active`, `Compacting`, or `BackgroundActive`, via `is_busy`. User-idled
+    /// commands have already been presented as Idle. Used
     /// to decide when to actually run caffeinate; sleep during Idle /
-    /// WaitingForApproval / BackgroundServer is fine because the agent isn't
+    /// WaitingForApproval is fine because the agent isn't
     /// working (a parked long-running dev server is deliberately not counted —
     /// see `is_busy`) and macOS just pauses the process either way.
     ///
@@ -3439,6 +3430,7 @@ impl App {
             let host = backend.host_id();
             for mut s in backend.list_sessions() {
                 s.host = host.clone();
+                tasks::apply_idle_commands(&mut s, &self.extra_prefs.idle_commands);
                 // Drop rows this dashboard could only stare at — see
                 // `is_actionable_row`. Filtered here, at the single point every
                 // row enters the dashboard, so nothing downstream has to know.

@@ -45,7 +45,7 @@ focused tool and the rest of your workflow is yours to compose.
   - An image in the local clipboard can be pasted directly into a remote session through Ctrl-V, the same way as if it was a local session ([details](#pasting-a-screenshot-into-a-remote-session)).
 - **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
 - **Keep-awake:** prevents your machine from sleeping while any local session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
-- **[r3](https://github.com/hyperlogue/r3) integration:** when a session's running background task is an `r3 watch` waiting for your review, it flags as **Review** and surfaces as needing your attention.
+- **Background task controls:** use `Space t i` to count the selected session's background commands as **Idle**, including an `r3 watch` waiting for review. Manage remembered commands in **Preferences → Idle tasks**.
 
 ## Requirements
 
@@ -205,7 +205,7 @@ Status, launch, resume and the **title, token and model columns** work. Esc mid-
 
 Status, launch, resume, fork, worktrees, and the **title, token and model columns** all work. An interrupt (Esc / Ctrl+C) settles the row — Grok 1.0.4 fires `StopCancelled` for one.
 
-- **The worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch. A `Stop` with live background work (`backgroundTasks` / `/loop` crons) does land on Task / Server / Review — an `r3 watch` is Review.
+- **The worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch. A `Stop` with live background work (`backgroundTasks` / `/loop` crons) lands on Task. Use the Idle task preferences to mark commands, including `r3 watch`, as Idle.
 - **`~/.grok/hooks/captain-miao.json` is always loaded**, including in grok sessions you start yourself. `miao hook` exits immediately when it has no launcher socket, so those events are discarded.
 - **`Ctrl+V` pastes a screenshot** on a Linux host offered the clipboard. Grok 1.0.5 otherwise never shells out to `wl-paste` in a displayless session, so a pooled launch sets the documented kill switch; a macOS host still needs `clipboard-paste`.
 
@@ -276,15 +276,24 @@ heavily-evolved fork of pi, and is hooked with a generated extension passed as
   `$PI_CODING_AGENT_DIR/sessions`). Sessions in other `--profile` directories
   are not listed; `omp -r` opens omp's own picker for those.
 - **Background-task tiers work** — a turn that settles while async bash jobs or
-  `task` spawns are still running lands on `Task`, on `Server` for a recognised
-  long-running service (`npm run dev`), or on `Review` for an `r3 watch`, rather
-  than reading `Idle`. The generated extension reads omp's
+  `task` spawns are still running lands on `Task`. Commands matching your Idle
+  task preferences appear as `Idle`. The generated extension reads omp's
   `ctx.getAsyncJobSnapshot()` at turn end and forwards the live jobs; `omp ps`
   and its daemon broker are a different tier (daemon-supervised named services)
   and are not what these columns read.
 - **No worktrees** — omp has no launch-time worktree flag.
 
 ### Key bindings
+
+Background work shows **Task** until you mark its commands as **Idle**. Manage
+the remembered commands in **Preferences → Idle tasks**: `Enter` edits, `a`
+adds, and `d` removes. Entries match the whole command; `*` matches any text
+(`\*` matches a literal star). The toggle saves exact commands and applies
+across hosts. All running commands must match before a session appears Idle;
+active turns and approval prompts keep their status. This replaces the Server
+and Review states and automatic one-hour learning. Existing sessions need a
+launcher restart with the updated build to report their commands; update
+`miao-server` first for pooled hosts.
 
 Confirmations accept with `y` or `Enter` and cancel with `Esc`, `Ctrl+C` or
 `n`. Other keys are ignored except navigation: `↑`/`↓`, `j`/`k`,
@@ -320,6 +329,7 @@ Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/D
 | `Space v p` / `Space v l` | Push / pull (fast-forward only)                                                                                                                                       |
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space t z`           | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
+| `Space t i` | Toggle the selected session's background commands between Task and Idle. |
 | `,` (Agents) / `Space h` | Reorder agents / hosts to choose the default for new sessions                                                                                                                    |
 | `,` / `Space p`       | Preferences; **General → Session layout** changes stacked/per-tab layout where supported                                                                                  |
 | `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
@@ -352,7 +362,7 @@ An unknown sequence after `Space` or `g` cancels the prefix and consumes the
 key without running a session action. Existing defaults and command ids are
 kept stable; new actions should use free keys within the related leader menu.
 
-Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
+Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, background task Idle status, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
 Pins and follow-up flags are saved on the session's host and shared across
 dashboards, including direct-local sessions. The daemon tracks completion while

@@ -45,6 +45,31 @@ pub(super) enum Content {
 
 pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
     Announcement {
+        id: "idle-background-commands",
+        introduced: "0.15.0",
+        title: "Choose which background tasks count as Idle",
+        kind: Kind::Update,
+        content: &[
+            Content::Text(
+                "Background work now uses Task or Idle. The separate Server and Review states and automatic one-hour learning have been removed.",
+            ),
+            Content::Binding(
+                Command::ToggleTaskIdle,
+                "Remember the selected session's background commands as Idle, or toggle them back to Task.",
+            ),
+            Content::Binding(
+                Command::Preferences,
+                "Open Preferences → Idle tasks to add, edit, or remove commands. Use * to match changing arguments.",
+            ),
+            Content::Text(
+                "These preferences apply across hosts. Every running background command must match for a session to count as Idle. Active turns and approval prompts keep their status.",
+            ),
+            Content::Text(
+                "Existing launchers need a restart with the updated build to report their background commands. On pooled hosts, update miao-server first.",
+            ),
+        ],
+    },
+    Announcement {
         id: "session-shortcuts-x",
         introduced: "0.11.0",
         title: "Session shortcuts changed",

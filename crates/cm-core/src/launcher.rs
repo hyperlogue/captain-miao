@@ -33,11 +33,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 
 use crate::agent::{
-    AgentActivity, AgentControl, BgSeedKind, BgShell, ResumeMetadata, TranscriptScan,
-    TranscriptStats,
+    AgentActivity, AgentControl, BgShell, ResumeMetadata, TranscriptScan, TranscriptStats,
 };
 use crate::cli::ClipboardShims;
-use crate::learned;
 use crate::state::{self, HookEvent, HookMessage, HostId, LauncherState, SessionStatus};
 
 // =============================================================================
@@ -120,6 +118,7 @@ pub async fn run(
         tab_id: None,
         cwd: cwd.to_string(),
         status: SessionStatus::Starting,
+        background_commands: Vec::new(),
         last_tool: None,
         updated_at: LauncherState::now(),
         active_since: None,
@@ -855,19 +854,6 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 
     let mut throttle = WriteThrottle::default();
 
-    // A background command the seed heuristic didn't recognize is treated as a
-    // busy transient task — but if it keeps running past this threshold it's
-    // clearly a long-running service, so the launcher learns it (persisting to
-    // the shared `learned` store for every future session) and re-classifies
-    // this row to the at-rest `BackgroundServer`. `bg_first_seen` times each
-    // still-unrecognized command since it was first observed running; `learn_at`
-    // is the one-shot wake that lets a *parked* session cross the threshold and
-    // flip without needing some unrelated event to wake the loop.
-    const LEARN_LONG_RUNNING_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
-    let mut bg_first_seen: std::collections::HashMap<String, tokio::time::Instant> =
-        std::collections::HashMap::new();
-    let mut learn_at: Option<tokio::time::Instant> = None;
-
     // Losing the hook socket fires no event and produces no traffic — a session
     // whose hooks have stopped looks exactly like one that is simply quiet — so
     // the only way to notice is to look. One `stat` per tick, and the interval
@@ -1148,11 +1134,6 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             // agent whether the turn it promised is still coming; nothing else
             // would ever wake a row holding Active on a promise that lapsed.
             _ = sleep_until_opt(confirm_hold_at) => {}
-            // Learn-long-running deadline. A parked session with an unrecognized
-            // background command otherwise never wakes; this fires when the
-            // oldest such command crosses the threshold so the classification
-            // block below can learn it and flip the row to `BackgroundServer`.
-            _ = sleep_until_opt(learn_at) => {}
             // Socket health. Nothing else can detect a socket removed out from
             // under us, and a session that has lost its hooks is silent by
             // definition — so this arm is the only thing standing between a
@@ -1206,8 +1187,6 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                     | SessionStatus::Idle
                     | SessionStatus::Compacted
                     | SessionStatus::BackgroundActive
-                    | SessionStatus::BackgroundServer
-                    | SessionStatus::ReviewPending
             )
         {
             // Offload the blocking status-file read off the runtime thread. A
@@ -1248,57 +1227,31 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             }
         }
 
-        // Refine a background-shell status by *what* is running: an r3
-        // review-watch → `ReviewPending`, a long-running server/watcher →
-        // at-rest `BackgroundServer`, anything else → busy `BackgroundActive`.
-        // Classified from the **live process tree** (each background shell stays
-        // a direct child of the agent), not the transcript — a task that ends
-        // with no transcript marker (stopped from the UI, a Monitor timeout, a
-        // `--resume` orphan) is simply gone from the tree, so the classification
-        // can't go stale. Gated to the three at-rest/background states, so a busy
-        // foreground turn never pays for the scan and no foreground tool shell
-        // can be among the children; within those states it runs on every wake
-        // (it's idempotent) so it converges whichever event woke us — e.g. the
-        // session-file wake that produced `BackgroundActive` just above, or the
-        // `learn_at` deadline that fires when an unrecognized command crosses the
-        // long-running threshold.
-        if matches!(
-            state.status,
-            SessionStatus::BackgroundActive
-                | SessionStatus::BackgroundServer
-                | SessionStatus::ReviewPending
-        ) && let Some(cpid) = state.child_pid
+        // Report live commands for the dashboard's explicit idle-task policy.
+        // Hooks report Grok/omp jobs themselves; their process scan is None.
+        if state.status == SessionStatus::BackgroundActive
+            && let Some(cpid) = state.child_pid
         {
-            // Offload the scan (a /proc walk, or one `ps` exec on macOS) off the
-            // runtime thread like the session-file reads above.
             let shells = tokio::task::spawn_blocking(move || agent.bg_shells(cpid))
                 .await
                 .unwrap_or(None);
             if promote_stale_background(state, shells.as_deref(), activity) {
-                // Left the background states entirely; the per-command timers
-                // belong to shells that are gone.
-                bg_first_seen.clear();
-                learn_at = None;
                 state_changed = true;
-            } else {
-                let (class, next_deadline) = classify_and_learn(
-                    shells.as_deref(),
-                    &mut bg_first_seen,
-                    LEARN_LONG_RUNNING_AFTER,
-                    tokio::time::Instant::now(),
-                    learned::is_long_running,
-                    learned::record_long_running,
-                );
-                learn_at = next_deadline;
-                if refine_background_kind(state, class) {
+            }
+            if let Some(shells) = shells {
+                let mut commands: Vec<_> = shells.into_iter().map(|s| s.key).collect();
+                commands.sort();
+                commands.dedup();
+                if state.background_commands != commands {
+                    state.background_commands = commands;
                     state_changed = true;
                 }
             }
-        } else {
-            // Not in a background-shell state: drop the per-command timers so a
-            // later, unrelated background job starts its clock fresh.
-            bg_first_seen.clear();
-            learn_at = None;
+        }
+        if state.status != SessionStatus::BackgroundActive && !state.background_commands.is_empty()
+        {
+            state.background_commands.clear();
+            state_changed = true;
         }
 
         // Settle a held Stop, exactly once. Either the agent still means to
@@ -1621,102 +1574,6 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
     changed
 }
 
-// =============================================================================
-// Background shells: classify, learn, refine
-// =============================================================================
-
-/// The aggregate background-shell classification a session's running shells
-/// reduce to, in precedence order — see [`classify_and_learn`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BgClass {
-    /// At least one shell is a finite/short task (or an as-yet-unlearned
-    /// command): finite work is in progress → busy `BackgroundActive`.
-    Transient,
-    /// No transient shell, and at least one long-running server/watcher (seed
-    /// heuristic or learned) → at-rest `BackgroundServer`.
-    LongRunning,
-    /// Every running shell is an r3 review-watch → `ReviewPending`.
-    ReviewWatch,
-}
-
-/// Fold a session's current background shells into an aggregate [`BgClass`],
-/// learning as a side effect. Each shell is already statically classed by
-/// [`BgSeedKind`]; here we overlay the persistent learned store and per-command
-/// durations onto the `Other` shells:
-///
-/// - A `LongRunning` seed, or an `Other` whose command `is_learned`, counts as
-///   long-running immediately.
-/// - An unrecognized `Other` is a *candidate*: `first_seen` times it, and once
-///   it has been running `threshold` or longer it is `learn`ed (persisted for
-///   every future session) and promoted to long-running. Until then it keeps
-///   the row busy.
-///
-/// Precedence: any transient shell → `Transient` (finite work dominates — keep
-/// the machine awake); else any long-running shell → `LongRunning`; else (≥1
-/// shell, all watches) → `ReviewWatch`. Returns the class (`None` = no shells /
-/// unreadable tree → leave the status to the session-file idle transition, so
-/// we don't flicker on the way out) and the next learn deadline to schedule
-/// (the earliest candidate's `first_seen + threshold`).
-///
-/// `is_learned` / `learn` are injected (the launcher passes the `learned` store;
-/// tests pass an in-memory set) so the pure timing/precedence logic is testable
-/// without touching the filesystem.
-fn classify_and_learn(
-    shells: Option<&[BgShell]>,
-    first_seen: &mut std::collections::HashMap<String, tokio::time::Instant>,
-    threshold: std::time::Duration,
-    now: tokio::time::Instant,
-    is_learned: impl Fn(&str) -> bool,
-    mut learn: impl FnMut(&str),
-) -> (Option<BgClass>, Option<tokio::time::Instant>) {
-    let Some(shells) = shells.filter(|s| !s.is_empty()) else {
-        first_seen.clear();
-        return (None, None);
-    };
-
-    // Forget timers for commands no longer running (prevents a re-run of the
-    // same command from inheriting a stale, already-elapsed clock).
-    first_seen.retain(|k, _| {
-        shells
-            .iter()
-            .any(|s| s.kind == BgSeedKind::Other && s.key == *k)
-    });
-
-    let mut any_transient = false;
-    let mut any_long = false;
-    let mut next_deadline: Option<tokio::time::Instant> = None;
-    for shell in shells {
-        match shell.kind {
-            BgSeedKind::ReviewWatch => {}
-            BgSeedKind::LongRunning => any_long = true,
-            BgSeedKind::Other => {
-                if is_learned(&shell.key) {
-                    any_long = true;
-                    continue;
-                }
-                let started = *first_seen.entry(shell.key.clone()).or_insert(now);
-                if now.duration_since(started) >= threshold {
-                    learn(&shell.key);
-                    any_long = true;
-                } else {
-                    any_transient = true;
-                    let due = started + threshold;
-                    next_deadline = Some(next_deadline.map_or(due, |cur| cur.min(due)));
-                }
-            }
-        }
-    }
-
-    let class = if any_transient {
-        BgClass::Transient
-    } else if any_long {
-        BgClass::LongRunning
-    } else {
-        BgClass::ReviewWatch
-    };
-    (Some(class), next_deadline)
-}
-
 /// The status a fresh session-file read settles `current` to, or `None` to hold
 /// it. The agent's own file is authoritative on the coarse
 /// working/idle/background-shell axis; this is the table that mirrors it (the
@@ -1748,7 +1605,7 @@ fn classify_and_learn(
 /// status, so a `run_in_background` shell that outlives the compaction is the
 /// truer shape of the row — otherwise a session compacted while an r3
 /// review-watch runs reads `Compacted` until the watch ends, rather than the
-/// `Review` its shells say it is. It is never demoted to `Idle`, though: both
+/// `Task` its shells report. It is never demoted to `Idle`, though: both
 /// are at rest, so that trades away the compaction signal (and the follow-up
 /// bell armed on entering it) for nothing.
 /// Whether the `Stop` just dispatched left an *unconfirmed* hold — a busy row
@@ -1786,15 +1643,6 @@ fn reconcile_activity(
             Some(SessionStatus::BackgroundActive)
         }
         (SessionStatus::BackgroundActive, Some(AgentActivity::Idle)) => Some(SessionStatus::Idle),
-        // A long-running server / review-watch is a background shell too — when
-        // it ends (killed, human submitted, timed out) the shell is gone, so
-        // settle to rest just like `BackgroundActive`. Staying-in-shell is left
-        // to the classification refinement (which decides transient-task vs
-        // server vs review).
-        (
-            SessionStatus::BackgroundServer | SessionStatus::ReviewPending,
-            Some(AgentActivity::Idle),
-        ) => Some(SessionStatus::Idle),
         // Working on a background/compacted row, unknown/torn read (None), or
         // already-consistent: hold.
         _ => None,
@@ -1804,7 +1652,7 @@ fn reconcile_activity(
 /// Retire a background-shell status the process tree has disproved, promoting
 /// the row to `Active`. Returns whether the status changed.
 ///
-/// Each of the three background states asserts *"a `run_in_background` shell is
+/// A background status asserts *"a `run_in_background` shell is
 /// running"*. The live process tree is the authority on that — the same
 /// authority that put the row into the state to begin with — so when it reads
 /// cleanly and holds no background shell, the assertion is false and the row is
@@ -1824,22 +1672,16 @@ fn reconcile_activity(
 ///
 /// Without this, a session whose background shell ends *while the agent goes
 /// back to work* has no path back to `Active`: the mirror only exits these
-/// states toward `Idle`, and `refine_background_kind` declines to act on
-/// an empty tree. Hooks normally cover the gap in milliseconds, so the hole is
+/// states toward `Idle`. Hooks normally cover the gap in milliseconds, so the hole is
 /// invisible until hooks are missing — a lost socket, a hook binary that can't
-/// run — at which point the row reads `Review`/`Task`/`Server` for every working
+/// run — at which point the row reads `Task` for every working
 /// turn until the agent next comes to rest.
 fn promote_stale_background(
     state: &mut LauncherState,
     shells: Option<&[BgShell]>,
     activity: Option<AgentActivity>,
 ) -> bool {
-    if !matches!(
-        state.status,
-        SessionStatus::BackgroundActive
-            | SessionStatus::BackgroundServer
-            | SessionStatus::ReviewPending
-    ) {
+    if !matches!(state.status, SessionStatus::BackgroundActive) {
         return false;
     }
     if activity != Some(AgentActivity::Working) {
@@ -1849,33 +1691,6 @@ fn promote_stale_background(
         return false;
     }
     state.status = SessionStatus::Active;
-    true
-}
-
-/// Apply an aggregate [`BgClass`] to a background-shell status. The session file
-/// still owns whether a background shell is running *at all* (it produces
-/// `BackgroundActive` first); this only classifies it into the right sub-state.
-/// A `None` class leaves the status untouched (the way out is the session-file
-/// idle transition). Returns whether the status changed.
-fn refine_background_kind(state: &mut LauncherState, class: Option<BgClass>) -> bool {
-    if !matches!(
-        state.status,
-        SessionStatus::BackgroundActive
-            | SessionStatus::BackgroundServer
-            | SessionStatus::ReviewPending
-    ) {
-        return false;
-    }
-    let Some(class) = class else { return false };
-    let next = match class {
-        BgClass::Transient => SessionStatus::BackgroundActive,
-        BgClass::LongRunning => SessionStatus::BackgroundServer,
-        BgClass::ReviewWatch => SessionStatus::ReviewPending,
-    };
-    if state.status == next {
-        return false;
-    }
-    state.status = next;
     true
 }
 
@@ -2581,10 +2396,9 @@ mod tests {
         LauncherState::for_test(AgentControl::Claude, status)
     }
 
-    fn shell(key: &str, kind: BgSeedKind) -> BgShell {
+    fn shell(key: &str) -> BgShell {
         BgShell {
             key: key.to_string(),
-            kind,
         }
     }
 
@@ -2622,14 +2436,15 @@ mod tests {
             Some(S::BackgroundActive)
         );
         // A background shell appearing on a resting row, and clearing again from
-        // each of the three background states.
+        // the background state.
         assert_eq!(
             reconcile_activity(&S::Idle, Some(A::BackgroundShell)),
             Some(S::BackgroundActive)
         );
-        for st in [S::BackgroundActive, S::BackgroundServer, S::ReviewPending] {
-            assert_eq!(reconcile_activity(&st, Some(A::Idle)), Some(S::Idle));
-        }
+        assert_eq!(
+            reconcile_activity(&S::BackgroundActive, Some(A::Idle)),
+            Some(S::Idle)
+        );
 
         // `Idle` is the one rest status a "busy" read promotes: the turn a
         // queued prompt flushes into announces itself nowhere else.
@@ -2641,21 +2456,10 @@ mod tests {
         // `promote_stale_background`'s corroborating tree, and `Compacted` would
         // lose the compaction signal to a mid-turn auto-compaction's own `busy`.
         // An unknown/torn read holds everything, `Idle` included.
-        for st in [
-            S::Compacted,
-            S::BackgroundActive,
-            S::BackgroundServer,
-            S::ReviewPending,
-        ] {
+        for st in [S::Compacted, S::BackgroundActive] {
             assert_eq!(reconcile_activity(&st, Some(A::Working)), None);
         }
-        for st in [
-            S::Idle,
-            S::Compacted,
-            S::BackgroundActive,
-            S::BackgroundServer,
-            S::ReviewPending,
-        ] {
+        for st in [S::Idle, S::Compacted, S::BackgroundActive] {
             assert_eq!(reconcile_activity(&st, None), None);
         }
         // The fine-grained hook/transcript-backed states are none of the file's
@@ -2670,7 +2474,7 @@ mod tests {
     /// `Compacted` is a **rest** status, so a `run_in_background` shell that
     /// outlived the compaction has to show through it — otherwise a session
     /// compacted while an r3 review-watch runs reads `Compacted` for as long as
-    /// the watch does, instead of the `Review` its shells say it is. It is only
+    /// the watch does, instead of the `Task` its shells report. It is only
     /// ever moved by a shell, never demoted to `Idle`: both are at rest, so that
     /// would drop the compaction signal for nothing.
     #[test]
@@ -2715,55 +2519,18 @@ mod tests {
         assert_eq!(reconcile_activity(&status, Some(A::Idle)), Some(S::Idle));
     }
 
-    #[test]
-    fn refine_background_kind_maps_each_class() {
-        let mut s = state_with(SessionStatus::BackgroundActive);
-        assert!(refine_background_kind(&mut s, Some(BgClass::ReviewWatch)));
-        assert_eq!(s.status, SessionStatus::ReviewPending);
-        assert!(refine_background_kind(&mut s, Some(BgClass::LongRunning)));
-        assert_eq!(s.status, SessionStatus::BackgroundServer);
-        assert!(refine_background_kind(&mut s, Some(BgClass::Transient)));
-        assert_eq!(s.status, SessionStatus::BackgroundActive);
-        // Same class again → no change.
-        assert!(!refine_background_kind(&mut s, Some(BgClass::Transient)));
-        // A `None` class leaves it be — the clean exit is the session-file idle
-        // transition, not a bounce through a background state.
-        assert!(!refine_background_kind(&mut s, None));
-        assert_eq!(s.status, SessionStatus::BackgroundActive);
-    }
-
-    #[test]
-    fn refine_ignores_non_background_statuses() {
-        for st in [
-            SessionStatus::Active,
-            SessionStatus::Idle,
-            SessionStatus::WaitingForApproval,
-        ] {
-            let mut s = state_with(st.clone());
-            assert!(!refine_background_kind(&mut s, Some(BgClass::ReviewWatch)));
-            assert_eq!(s.status, st);
-        }
-    }
-
     /// The recovery path: a background shell ended while the agent went back to
     /// work, so the row's background status is disproved by the tree and the
-    /// session file says which rest-or-work shape replaces it. Every background
-    /// state has to escape, since the bug reproduced from `ReviewPending` but
-    /// the hole is in all three.
+    /// session file says which rest-or-work shape replaces it.
     #[test]
     fn a_disproved_background_status_promotes_to_active() {
-        for st in [
-            SessionStatus::BackgroundActive,
-            SessionStatus::BackgroundServer,
-            SessionStatus::ReviewPending,
-        ] {
-            let mut s = state_with(st.clone());
-            assert!(
-                promote_stale_background(&mut s, Some(&[]), Some(AgentActivity::Working)),
-                "{st:?} survived a clean tree read with no background shells"
-            );
-            assert_eq!(s.status, SessionStatus::Active);
-        }
+        let mut s = state_with(SessionStatus::BackgroundActive);
+        assert!(promote_stale_background(
+            &mut s,
+            Some(&[]),
+            Some(AgentActivity::Working)
+        ));
+        assert_eq!(s.status, SessionStatus::Active);
     }
 
     /// The half that protects the corroboration rule. `bg_shells` returns `None`
@@ -2773,35 +2540,35 @@ mod tests {
     /// the assertion that is easy to leave out and expensive to lose.
     #[test]
     fn an_unreadable_process_tree_never_promotes() {
-        let mut s = state_with(SessionStatus::ReviewPending);
+        let mut s = state_with(SessionStatus::BackgroundActive);
         assert!(!promote_stale_background(
             &mut s,
             None,
             Some(AgentActivity::Working)
         ));
-        assert_eq!(s.status, SessionStatus::ReviewPending);
+        assert_eq!(s.status, SessionStatus::BackgroundActive);
     }
 
     #[test]
     fn promotion_needs_a_working_agent_and_a_background_row() {
         // A shell is still running → the status is not stale; classification,
         // not promotion, owns this row.
-        let mut s = state_with(SessionStatus::ReviewPending);
-        let running = [shell("r3 watch review_abc", BgSeedKind::ReviewWatch)];
+        let mut s = state_with(SessionStatus::BackgroundActive);
+        let running = [shell("r3 watch review_abc")];
         assert!(!promote_stale_background(
             &mut s,
             Some(&running),
             Some(AgentActivity::Working)
         ));
-        assert_eq!(s.status, SessionStatus::ReviewPending);
+        assert_eq!(s.status, SessionStatus::BackgroundActive);
 
         // Tree is empty, but the agent is at rest or the session file wasn't
         // re-read this wake (`None`) — the mirror path owns the exit to
         // `Idle`; promotion must not invent work.
         for activity in [None, Some(AgentActivity::Idle)] {
-            let mut s = state_with(SessionStatus::ReviewPending);
+            let mut s = state_with(SessionStatus::BackgroundActive);
             assert!(!promote_stale_background(&mut s, Some(&[]), activity));
-            assert_eq!(s.status, SessionStatus::ReviewPending);
+            assert_eq!(s.status, SessionStatus::BackgroundActive);
         }
 
         // Not a background row at all: `Active`/`Idle` and the fine-grained
@@ -2819,25 +2586,6 @@ mod tests {
             ));
             assert_eq!(s.status, st);
         }
-    }
-
-    /// An empty-but-readable tree must keep behaving like "nothing to classify"
-    /// everywhere *else*, or teaching `bg_shells` the distinction would change
-    /// the meaning of a parked row. `None` class → `refine_background_kind`
-    /// leaves the status alone.
-    #[test]
-    fn an_empty_tree_still_classifies_as_nothing() {
-        let mut first_seen = std::collections::HashMap::new();
-        let (class, deadline) = classify_and_learn(
-            Some(&[]),
-            &mut first_seen,
-            std::time::Duration::from_secs(3600),
-            tokio::time::Instant::now(),
-            |_| false,
-            |_| panic!("nothing running must never be learned"),
-        );
-        assert_eq!(class, None);
-        assert_eq!(deadline, None);
     }
 
     /// The socket health check keys on inode identity, not mere existence: a
@@ -2932,108 +2680,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn classify_precedence_transient_over_server_over_watch() {
-        let threshold = std::time::Duration::from_secs(3600);
-        let now = tokio::time::Instant::now();
-        let never = |_: &str| false;
-        let noop = |_: &str| {};
-        let mut seen = std::collections::HashMap::new();
-
-        // Every shell a watch → ReviewWatch (no learn deadline).
-        let shells = [shell("r3 watch review_1", BgSeedKind::ReviewWatch)];
-        let (class, due) =
-            classify_and_learn(Some(&shells), &mut seen, threshold, now, never, noop);
-        assert_eq!(class, Some(BgClass::ReviewWatch));
-        assert!(due.is_none());
-
-        // A server alongside a watch → LongRunning (no transient present).
-        let shells = [
-            shell("r3 watch review_1", BgSeedKind::ReviewWatch),
-            shell("npm run dev", BgSeedKind::LongRunning),
-        ];
-        let (class, _) = classify_and_learn(Some(&shells), &mut seen, threshold, now, never, noop);
-        assert_eq!(class, Some(BgClass::LongRunning));
-
-        // A fresh unrecognized command alongside a server → Transient (finite
-        // work dominates; keep the row busy) plus a learn deadline for it.
-        seen.clear();
-        let shells = [
-            shell("npm run dev", BgSeedKind::LongRunning),
-            shell("cargo build", BgSeedKind::Other),
-        ];
-        let (class, due) =
-            classify_and_learn(Some(&shells), &mut seen, threshold, now, never, noop);
-        assert_eq!(class, Some(BgClass::Transient));
-        assert_eq!(due, Some(now + threshold));
-
-        // No shells / unreadable tree → unrefined, and the timers reset.
-        let (class, due) = classify_and_learn(None, &mut seen, threshold, now, never, noop);
-        assert_eq!(class, None);
-        assert!(due.is_none());
-        assert!(seen.is_empty());
-    }
-
-    #[tokio::test]
-    async fn classify_learns_a_command_that_outlives_the_threshold() {
-        let threshold = std::time::Duration::from_secs(3600);
-        let start = tokio::time::Instant::now();
-        let store = std::cell::RefCell::new(std::collections::HashSet::<String>::new());
-        let is_learned = |k: &str| store.borrow().contains(k);
-        let learn = |k: &str| {
-            store.borrow_mut().insert(k.to_string());
-        };
-        let shells = [shell("my-custom-server --port 9", BgSeedKind::Other)];
-        let mut seen = std::collections::HashMap::new();
-
-        // First sighting: unrecognized → busy Transient, deadline scheduled.
-        let (class, due) = classify_and_learn(
-            Some(&shells),
-            &mut seen,
-            threshold,
-            start,
-            is_learned,
-            learn,
-        );
-        assert_eq!(class, Some(BgClass::Transient));
-        assert_eq!(due, Some(start + threshold));
-        assert!(store.borrow().is_empty(), "not learned yet");
-
-        // Halfway: still busy, not yet learned.
-        let mid = start + std::time::Duration::from_secs(1800);
-        let (class, _) =
-            classify_and_learn(Some(&shells), &mut seen, threshold, mid, is_learned, learn);
-        assert_eq!(class, Some(BgClass::Transient));
-        assert!(store.borrow().is_empty());
-
-        // Past the threshold: learn it and flip to at-rest LongRunning; no more
-        // candidate, so no further deadline.
-        let (class, due) = classify_and_learn(
-            Some(&shells),
-            &mut seen,
-            threshold,
-            start + threshold,
-            is_learned,
-            learn,
-        );
-        assert_eq!(class, Some(BgClass::LongRunning));
-        assert!(due.is_none());
-        assert!(store.borrow().contains("my-custom-server --port 9"));
-
-        // A brand-new session (fresh timers) now recognizes it immediately from
-        // the learned store — no waiting.
-        let mut fresh = std::collections::HashMap::new();
-        let (class, due) = classify_and_learn(
-            Some(&shells),
-            &mut fresh,
-            threshold,
-            tokio::time::Instant::now(),
-            is_learned,
-            learn,
-        );
-        assert_eq!(class, Some(BgClass::LongRunning));
-        assert!(due.is_none());
-    }
     /// A fold that produced no token count has learned nothing, not that the
     /// count is zero — so it must leave the row's number alone. This became
     /// load-bearing once a hook could carry the value too

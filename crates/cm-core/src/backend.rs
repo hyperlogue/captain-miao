@@ -275,6 +275,9 @@ impl LocalBackend {
         for s in sessions.iter_mut() {
             s.cwd = paths::collapse_home(&s.cwd, &self.home);
             if self.home.len() > 1 {
+                for command in &mut s.background_commands {
+                    *command = command.replace(&self.home, "~");
+                }
                 if let Some(error) = &mut s.last_error {
                     *error = error.replace(&self.home, "~");
                 }
