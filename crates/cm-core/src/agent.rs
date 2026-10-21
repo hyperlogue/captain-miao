@@ -1258,7 +1258,16 @@ impl AgentControl {
     /// permission wait (for example, a background memory flush). Its hooks
     /// must release the wait. Other backends do not watch a transcript.
     pub(crate) fn transcript_write_clears_approval(self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Kimi)
+        // Kimi reports PermissionResult explicitly; unrelated wire metadata
+        // must not dismiss its approval prompt.
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
+    /// Catch up persisted facts before dispatching a hook. Kimi and Antigravity
+    /// report lifecycle changes themselves, so their metadata needs no timer.
+    /// Codex's macOS poll also catches up here to preserve hook/rollout order.
+    pub(crate) fn refresh_transcript_on_hook(self) -> bool {
+        matches!(self, Self::Kimi | Self::Antigravity) || self.transcript_poll_interval().is_some()
     }
 
     /// `Some(interval)` when the launcher's transcript watch must be a
@@ -1298,16 +1307,8 @@ impl AgentControl {
             // Moot: no hook payload names a transcript, so no watch of either
             // kind is ever started for a Reasonix session.
             AgentControl::Reasonix => None,
-            // **Unverified, and set anyway.** Kimi appends
-            // `agents/*/wire.jsonl` for the life of a session, which is the
-            // long-held-fd shape that defeats macOS FSEvents entirely — so this
-            // matches Codex. And it is live, not precautionary: `agents::kimi`
-            // resolves the wire log from the session id and names it on every
-            // payload, so without this a Kimi session on macOS would inherit an
-            // event-driven watch FSEvents cannot deliver. This machine is Linux
-            // and could not test it; no macOS behaviour is being claimed, only
-            // the same defence Codex needed.
-            AgentControl::Kimi if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
+            // Interrupt and PermissionResult are hooks; metadata catches up
+            // on those hooks even when filesystem events miss a held-open log.
             AgentControl::Kimi => None,
             // Event-driven, and must stay that way: we watch sibling
             // `summary.json` (resolved from `transcriptPath` or the session
@@ -1330,10 +1331,8 @@ impl AgentControl {
             // want of one, so the launcher starts no watch of either kind for a
             // Pi session and there is no poll for this to configure.
             AgentControl::Pi => None,
-            // The CLI appends its log. As with Kimi, conservatively use a
-            // busy-only poll on macOS (not verified there); Linux receives
-            // inotify writes directly.
-            AgentControl::Antigravity if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
+            // Hooks/status snapshots cover lifecycle changes; persisted prompt
+            // facts catch up on hooks without a foreground transcript timer.
             AgentControl::Antigravity => None,
             // Moot, and by the same decision as pi's: `agents::omp` supplies no
             // transcript path, so the launcher starts no watch of either kind
@@ -1406,12 +1405,9 @@ impl AgentControl {
             // payload — so a `Stop` is simply the end of the work, and the row
             // never reaches `BackgroundActive`.
             AgentControl::Pi => None,
-            // Antigravity *does* background long commands — every `run_command`
-            // carries a `WaitMsBeforeAsync` — and `Stop` even reports whether
-            // they have all finished (`fullyIdle`). What is missing is the list:
-            // nothing enumerates the running ones, so there is no shell to name
-            // and no tier to put the row in. Unlike Pi's, this one has something
-            // to wire up if that list ever appears.
+            // Antigravity's launcher-owned task monitor reads commands and
+            // timers from its conversation database, including completion
+            // while the foreground is idle. No process-tree scan is needed.
             AgentControl::Antigravity => None,
             // The live list is applied at Stop in `omp::dispatch_hook` rather
             // than here: the extension reads omp's in-process async jobs

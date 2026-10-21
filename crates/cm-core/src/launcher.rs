@@ -28,7 +28,7 @@
 use anyhow::{Context, Result};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 
@@ -42,7 +42,11 @@ use crate::state::{self, HookEvent, HookMessage, HostId, LauncherState, SessionS
 // Launch, and the loop that supervises it
 // =============================================================================
 
+mod daemon_watch;
 mod watch;
+
+#[cfg(test)]
+mod io_tests;
 
 use watch::{TranscriptWatch, arm_replaced_sidecars, start_file_watcher, start_stat_poll};
 
@@ -465,23 +469,14 @@ async fn wait_for_termination_signal() {
 ///
 /// A non-pooled launcher (or a name we cannot parse) waits forever — those
 /// sessions do not live in the pool, so a daemon restart is not their
-/// concern. Polled rather than watched: `server.pid` is a regular file and
-/// the minting process is not our child.
+/// concern. PID-file notifications and process-exit observation are separate:
+/// a crash need not rewrite the file, and a replacement can reuse its path.
 async fn wait_until_minting_daemon_gone(pool_session: Option<&str>) {
     let Some(minting) = pool_session.and_then(state::pool_session_daemon_pid) else {
         std::future::pending::<()>().await;
         return;
     };
-    loop {
-        if state::minting_pool_daemon_is_gone(
-            minting,
-            state::is_process_alive,
-            state::recorded_daemon_pid(),
-        ) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    daemon_watch::wait(minting, &state::server_pid_path()).await;
 }
 
 // =============================================================================
@@ -768,6 +763,8 @@ fn seed_resumed_session(state: &mut LauncherState, metadata: Option<ResumeMetada
 
 async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mut LauncherState) {
     let agent = state.agent;
+    let mut antigravity_tasks =
+        (agent == AgentControl::Antigravity).then(crate::agents::antigravity::tasks::Monitor::new);
     // Watch the agent's transcript file instead of polling. For Claude,
     // a transcript modification while we're in WaitingForApproval is a
     // near-instant "approval granted" signal (no need to wait for the
@@ -854,22 +851,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 
     let mut throttle = WriteThrottle::default();
 
-    // Losing the hook socket fires no event and produces no traffic — a session
-    // whose hooks have stopped looks exactly like one that is simply quiet — so
-    // the only way to notice is to look. One `stat` per tick, and the interval
-    // bounds how long a session can run blind before it recovers itself.
-    const SOCKET_HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    // Watch the pathname and its parent lifetime: removal/replacement must
+    // recover even while the agent is quiet, without periodic socket stats.
     let mut bound_identity = file_identity(sock_path);
-    // Start one interval out rather than immediately, so the loop's first pass is
-    // always a real event and the `Starting` → `Idle` settle below isn't skipped
-    // by a tick that `continue`s.
-    let mut socket_health = tokio::time::interval_at(
-        tokio::time::Instant::now() + SOCKET_HEALTH_INTERVAL,
-        SOCKET_HEALTH_INTERVAL,
-    );
-    // After a laptop sleep, don't replay every tick that elapsed while suspended
-    // — one check is as good as fifty.
-    socket_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut socket_changes = crate::fs_events::PathChanges::new(sock_path);
 
     loop {
         let was_active = state.status.is_busy();
@@ -925,13 +910,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 
                 // (Re)adopt the transcript when the path changes. Claude mints a
                 // new transcript on `/resume`, so the path can shift mid-session.
-                // The watcher backend is the agent's call: an event-driven watch
-                // (Claude; Linux) starts here, once; a poll-backed watch (Codex
-                // on macOS, whose held-open rollout fd defeats FSEvents — see
-                // `transcript_poll_interval`) is instead lifecycle-managed at the
-                // bottom of the loop, running only while the session is off Idle,
-                // so the path is adopted here without a watcher (any stale
-                // old-path watcher is dropped).
+                // Event-driven watches start here. Kimi/Antigravity read only
+                // on hooks; Codex on macOS uses a poll managed at the bottom of
+                // the loop, running only while the session is off Idle. Those
+                // paths are adopted without a watcher, dropping any old one.
                 //
                 // A child session's hook shares this socket and often names its
                 // own transcript. Adopting that path folds the child's title
@@ -951,7 +933,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                             transcript_path = None;
                             transcript_watcher = None;
                         }
-                        let adopted = if agent.transcript_poll_interval().is_some() {
+                        let adopted = if agent.refresh_transcript_on_hook() {
                             transcript_watcher = None;
                             true
                         } else {
@@ -1002,9 +984,10 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                     }
                 }
 
-                // A poll-watched transcript (Codex on macOS) catches up here,
-                // before the dispatch: Codex writes the rollout lines *before*
-                // firing the matching hook (`token_count` lands ~20ms ahead of
+                // Hook-driven metadata (Kimi/Antigravity), and the poll-watched
+                // Codex rollout on macOS, catch up before dispatch. Codex writes
+                // the rollout lines *before* firing the matching hook
+                // (`token_count` lands ~20ms ahead of
                 // `Stop`), so the bytes behind this state change are already on
                 // disk and deserve to fold now, not a poll tick later. The
                 // ordering is load-bearing — transcript first, hook second: the
@@ -1015,7 +998,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 // Active with Idle and stick the row there for the whole turn).
                 // Event-watched agents (Claude; Codex on Linux) skip this:
                 // their writes already woke the fs arm directly.
-                if agent.transcript_poll_interval().is_some()
+                if agent.refresh_transcript_on_hook()
                     && let Some(path) = &transcript_path
                 {
                     rescan_transcript(
@@ -1038,7 +1021,11 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                 // for Claude a `/model` echoes itself into the transcript, so
                 // "next" is milliseconds away. See `TranscriptStats::adopt_model`.
                 let hook_model = msg.model.clone();
-                agent.dispatch_hook(state, msg);
+                if let Some(tasks) = &mut antigravity_tasks {
+                    tasks.dispatch_hook(state, msg);
+                } else {
+                    agent.dispatch_hook(state, msg);
+                }
                 if let Some(model) = hook_model.filter(|m| !m.trim().is_empty())
                     && let Some(data) = transcript_data.as_mut()
                 {
@@ -1118,6 +1105,16 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
                     state_changed = true;
                 }
             }
+            update = async {
+                match &mut antigravity_tasks {
+                    Some(tasks) => tasks.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(tasks) = &mut antigravity_tasks {
+                    state_changed |= tasks.apply(update, state);
+                }
+            }
             Some(_) = sess_rx.recv() => {
                 // The session-status file changed. Unlike a transcript write this
                 // is NOT an "approval dismissed" signal, so we deliberately skip
@@ -1134,20 +1131,18 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
             // agent whether the turn it promised is still coming; nothing else
             // would ever wake a row holding Active on a promise that lapsed.
             _ = sleep_until_opt(confirm_hold_at) => {}
-            // Socket health. Nothing else can detect a socket removed out from
-            // under us, and a session that has lost its hooks is silent by
-            // definition — so this arm is the only thing standing between a
-            // reaped socket and a row that is stale for the rest of the
-            // session's life.
-            _ = socket_health.tick() => {
+            // Socket-path changes are independent of session activity.
+            _ = socket_changes.changed() => {
                 if hook_socket_lost(sock_path, bound_identity) {
                     bound_identity = restore_hook_socket(listener, sock_path);
+                    if bound_identity.is_none() {
+                        socket_changes.retry();
+                    }
                 }
                 // Deliberately the whole iteration: this wake carries no state
                 // signal, and falling through would run the reconciliation — and
                 // on a background row its process-tree scan, a `ps` exec on
-                // macOS — every 30s for the life of every parked session, purely
-                // as a side effect of watching a socket.
+                // macOS — purely as a side effect of restoring a socket.
                 continue;
             }
         }
@@ -1305,8 +1300,8 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
         // re-drives itself does not weaken that premise, because it never
         // reaches Idle to be parked at: its Stop is held Active by
         // `AgentControl::self_continues` precisely so no watch has to stay
-        // awake waiting for the turn it starts next. Idle is deliberately the
-        // *only* at-rest state: WaitingForApproval/WaitingForDecision need the
+        // awake waiting for the turn it starts next. For Codex, Idle is the
+        // only parked state: WaitingForApproval/WaitingForDecision need the
         // rollout wake (approval-granted fast path; an Esc there writes
         // `turn_aborted` with no hook), and a Compacted row can still take that
         // same hookless Esc. Dropping the watcher on the way to rest fires one
@@ -1356,7 +1351,7 @@ async fn process_hooks(listener: &mut UnixListener, sock_path: &Path, state: &mu
 /// offset and the prior fold are held.
 ///
 /// Shared by the two wakes that can find unread transcript bytes: the fs-watch
-/// arm, and — for a poll-watched transcript — the hook arm's pre-dispatch
+/// arm, and — for hook-driven or poll-watched metadata — the pre-dispatch
 /// catch-up (see the call site there for why it must run *before*
 /// `dispatch_hook`).
 async fn rescan_transcript(
@@ -1710,6 +1705,7 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_cleanup_keeps_the_launcher_and_tui_alive_until_a_successful_retry() {
@@ -2186,11 +2182,7 @@ mod tests {
 
     #[test]
     fn conversation_writes_clear_approval_only_after_the_grace_period() {
-        for agent in [
-            AgentControl::Claude,
-            AgentControl::Codex,
-            AgentControl::Kimi,
-        ] {
+        for agent in [AgentControl::Claude, AgentControl::Codex] {
             let mut state = LauncherState::for_test(agent, SessionStatus::WaitingForApproval);
             let grace = Duration::from_secs(2);
             on_transcript_changed(&mut state, Some(Instant::now()), grace);
@@ -2204,6 +2196,26 @@ mod tests {
             on_transcript_changed(&mut state, entered_at, grace);
             assert_eq!(state.status, SessionStatus::WaitingForDecision, "{agent:?}");
         }
+    }
+
+    #[test]
+    fn kimi_metadata_does_not_override_its_permission_result_hook() {
+        let mut state =
+            LauncherState::for_test(AgentControl::Kimi, SessionStatus::WaitingForApproval);
+        on_transcript_changed(
+            &mut state,
+            Some(Instant::now() - Duration::from_secs(21)),
+            Duration::from_secs(2),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+        AgentControl::Kimi.dispatch_hook(
+            &mut state,
+            serde_json::from_value(serde_json::json!({
+                "event": HookEvent::ElicitationResult
+            }))
+            .unwrap(),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
     }
 
     /// The hookless turn start, end to end through the launcher: a turn opened

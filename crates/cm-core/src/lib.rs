@@ -22,6 +22,7 @@ pub mod backend;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
+mod fs_events;
 pub mod hooks;
 pub mod launcher;
 pub mod logging;

@@ -298,13 +298,13 @@ values remain in Codex's native environment and are not copied into snapshots;
 ordinary shell startup behavior applies to those values.
 
 Each launcher holds a filesystem lease and records the threads using its files.
-Cleanup runs when a relay starts, every minute while it runs, and when its
-launcher exits. It removes an inactive launcher's snapshots only after Codex
-confirms its threads and their descendants are unloaded. A lost creation reply
-retains the files until its owning daemon process has exited: an empty inventory
-alone cannot rule out an in-flight creation. The daemon PID comes from kernel
-credentials on the actual relay socket. Missing credentials or a reused PID
-conservatively delay cleanup. Unreachable daemons,
+Cleanup runs when a relay starts and when its launcher exits, with one collector
+at a time for the shared store. It removes an inactive launcher's snapshots only
+after Codex confirms its threads and their descendants are unloaded. A lost
+creation reply retains the files until its owning daemon process has exited:
+an empty inventory alone cannot rule out an in-flight creation. The daemon PID
+comes from kernel credentials on the actual relay socket. Missing credentials
+or a reused PID conservatively delay cleanup. Unreachable daemons,
 unsupported inventory, and incomplete ancestry information defer collection;
 failed inventory is never treated as proof that a file is unused. Crashed
 launchers release their leases automatically, allowing a later relay to clean

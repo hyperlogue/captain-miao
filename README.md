@@ -244,7 +244,8 @@ missing below is missing from the agent rather than from captain-miao.
   starts, so that is the first moment a session can be identified.
 - **No fork** (`f` hides itself) — conversations fork from inside Antigravity's
   own TUI, and no flag does it at launch.
-- **No token column, no worktrees, no background-task tiers.**
+- **No token column or worktrees.** Background commands and timers are
+  tracked from the conversation database; completion refreshes on hooks.
 - **The resume picker lists a conversation only if a directory was recorded for
   it.** Antigravity stores conversations flat with no project nesting; the cwd
   comes from its prompt history, so a conversation older than that record is

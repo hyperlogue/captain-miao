@@ -19,7 +19,7 @@ pub(crate) struct Relay {
     task: tokio::task::JoinHandle<()>,
     environment: Option<Arc<Mutex<super::Environments>>>,
     upstream: PathBuf,
-    maintenance: tokio::task::JoinHandle<()>,
+    startup_cleanup: tokio::task::JoinHandle<()>,
 }
 
 impl Relay {
@@ -46,19 +46,17 @@ impl Relay {
         let (input_paused, mut pause_rx) = watch::channel(false);
         let (ack_tx, pause_ack) = watch::channel(InputState::Running);
         let ack_tx = GateAck::new(ack_tx);
-        let maintenance = {
+        let startup_cleanup = {
             let environment = environment.clone();
             let upstream = upstream.clone();
             tokio::spawn(async move {
                 let Some(environment) = environment else {
                     return;
                 };
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    let root = environment.lock().await.root();
-                    super::Environments::collect(&root, &upstream).await;
-                }
+                // Collect abandoned snapshots at lifecycle events, not once
+                // per minute in every launcher sharing this store.
+                let root = environment.lock().await.root();
+                super::Environments::collect(&root, &upstream).await;
             })
         };
         let task_environment = environment.clone();
@@ -205,14 +203,14 @@ impl Relay {
             task,
             environment,
             upstream,
-            maintenance,
+            startup_cleanup,
         })
     }
     pub(crate) async fn cleanup_environment(&mut self) {
         self.task.abort();
-        self.maintenance.abort();
+        self.startup_cleanup.abort();
         let _ = (&mut self.task).await;
-        let _ = (&mut self.maintenance).await;
+        let _ = (&mut self.startup_cleanup).await;
         if let Some(environment) = self.environment.take() {
             environment.lock().await.finish(&self.upstream).await;
         }
@@ -767,7 +765,7 @@ fn observable(value: &Value) -> bool {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.task.abort();
-        self.maintenance.abort();
+        self.startup_cleanup.abort();
         let _ = std::fs::remove_file(&self.path);
     }
 }

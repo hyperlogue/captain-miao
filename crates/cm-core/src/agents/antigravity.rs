@@ -24,8 +24,11 @@
 //! `tool_confirmation_pending` identifies a native permission prompt; its
 //! absence on the next busy snapshot releases the approval state. The coarse
 //! `agent_state` alone cannot distinguish approval from ordinary tool use.
-//! PreToolUse is a permission gate, so we leave it alone. Background tasks and
-//! compaction have no verified separate states either. Fork and worktree flags
+//! PreToolUse is a permission gate, so we leave it alone. The launcher's task
+//! monitor reads live commands/timers from the conversation database at rest;
+//! Linux also uses a coalesced DB/WAL watch; macOS refreshes on hooks without
+//! periodic checks. Stop's `fullyIdle: false` retains Task through coarse idle
+//! snapshots. Compaction has no verified separate state. Fork and worktree flags
 //! are absent from 1.3.5's argv interface, although `/fork` exists in the TUI.
 //!
 //! # Configuration and state
@@ -65,6 +68,7 @@
 //! or external inference.
 
 mod metadata;
+pub(crate) mod tasks;
 pub use metadata::{
     PromptCursor, read_titles, read_transcript_stats, title_store_mtimes, title_watch_paths,
 };
@@ -747,6 +751,7 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
                     SessionStatus::Starting
                         | SessionStatus::Idle
                         | SessionStatus::Active
+                        | SessionStatus::BackgroundActive
                         | SessionStatus::WaitingForApproval
                 ) =>
             {

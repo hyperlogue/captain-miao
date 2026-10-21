@@ -103,6 +103,21 @@ pub(super) async fn collect(root: &Path, endpoint: &Path) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Ok(());
     };
+    // Launches/exits can coincide across processes. One collector owns the
+    // shared store at a time; a skipped sweep leaves snapshots for the next
+    // lifecycle event rather than duplicating inventory RPCs and file reads.
+    let collection = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join(".collection.lock"))?;
+    match collection.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry?;
@@ -287,6 +302,34 @@ mod tests {
         })
         .await
         .expect("waiting for two environment inventory sweeps");
+    }
+
+    #[tokio::test]
+    async fn concurrent_collectors_do_not_repeat_inventory() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = root.path().join("missing.sock");
+        let mut store = Store::new(root.path(), &endpoint).unwrap();
+        store
+            .response(&json!({"result":{"thread":{"id":"unloaded"}}}), None)
+            .unwrap();
+        let snapshot = store.dir.clone();
+        drop(store);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(root.path().join(".collection.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        collect(root.path(), &endpoint).await.unwrap();
+        assert!(snapshot.exists());
+        lock.unlock().unwrap();
+        // Once the other collector finishes, inventory is attempted. The
+        // missing endpoint leaves uncertain ownership intact.
+        assert!(collect(root.path(), &endpoint).await.is_err());
+        assert!(snapshot.exists());
     }
 
     #[tokio::test]

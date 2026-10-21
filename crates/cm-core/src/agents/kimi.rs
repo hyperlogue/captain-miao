@@ -64,20 +64,11 @@
 //! `event`, `command`, `timeout` for that reason (and no `matcher`, for a
 //! sharper one documented there).
 //!
-//! Two risks carried over from Codex:
-//!
-//! - **`sessions/` is reached through a symlink**, and on macOS the notify event
-//!   reports the resolved path while Linux echoes the registered one. Kimi's tree
-//!   has the same shape, so it inherits the same handling — live, since the
-//!   launcher watches the wire log named on every payload (below).
-//! - **`sessions/<workDirKey>/<sessionId>/agents/*/wire.jsonl` is almost
-//!   certainly appended through a long-held fd**, the condition that defeats
-//!   macOS FSEvents entirely, so [`crate::agent::AgentControl::transcript_poll_interval`]
-//!   answers `Some(2s)` there, matching Codex. **This machine is Linux and cannot
-//!   test it** — that is unverified, and no macOS support is claimed. And it is
-//!   live, not precautionary: [`parse_hook_payload`] resolves the wire log from
-//!   the session id and names it on every payload, so the launcher does start
-//!   this watch.
+//! **Held-open wire logs can miss macOS filesystem notifications.** The
+//! launcher catches up metadata on each hook instead of polling or watching
+//! the log. Interrupt and PermissionResult report lifecycle transitions
+//! directly. Resolving the wire log through the synthetic home's `sessions/`
+//! symlink works with these reads, independent of platform event paths.
 //!
 //! **The token and model columns come off `wire.jsonl`, and the schema is not
 //! guessed.** `agent-core-v2` ships a *generated* manifest of its whole wire
@@ -211,11 +202,11 @@ impl TokenUsage {
 /// percent. The last record's input side is the size of the prompt that was
 /// actually sent, which is what the column means.
 ///
-/// Recomputed from a whole-file read rather than an incremental one: `prior`'s
-/// cursor is Claude-only, and Kimi's records are small. If that ever costs too
-/// much, a bounded tail is the fix (Codex's approach), not a cursor.
+/// Read the same bounded tail as Codex, so a hook doesn't reread the entire
+/// conversation. If usage has scrolled out of the tail, the launcher preserves
+/// its last known value until a new record arrives.
 pub fn read_transcript_stats(transcript: &Path) -> TranscriptStats {
-    let Ok(body) = std::fs::read_to_string(transcript) else {
+    let Some(body) = common::read_tail(transcript) else {
         return TranscriptStats::default();
     };
     let mut stats = TranscriptStats::default();
@@ -703,10 +694,8 @@ pub fn build_hooks_settings(_sock_path: &str) -> String {
 /// verbatim — which is what `raw` exists for and shows the user the real text
 /// under whatever key it actually has.
 ///
-/// **No transcript path**, which no documented field supplies. That is what
-/// keeps the launcher's entire transcript pipeline (stats fold, signal scan,
-/// stat poll) inert for Kimi by construction: it only ever runs on a path a hook
-/// gave it.
+/// No transcript-path field is supplied. The parser resolves the main wire log
+/// from the session id so the launcher can fold metadata on hooks/file events.
 #[derive(Deserialize)]
 struct HookPayload {
     session_id: Option<String>,

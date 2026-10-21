@@ -3,14 +3,13 @@
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
 pub(super) struct Listener {
     socket: UnixListener,
     path: Option<PathBuf>,
     identity: Option<(u64, u64)>,
-    health: tokio::time::Interval,
+    changes: Option<crate::fs_events::PathChanges>,
 }
 
 fn identity(path: &Path) -> Option<(u64, u64)> {
@@ -24,13 +23,12 @@ impl Listener {
             .ok()
             .and_then(|addr| addr.as_pathname().map(Path::to_owned));
         let identity = path.as_deref().and_then(identity);
-        let mut health = tokio::time::interval(Duration::from_secs(1));
-        health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let changes = path.as_deref().map(crate::fs_events::PathChanges::new);
         Self {
             socket,
             path,
             identity,
-            health,
+            changes,
         }
     }
 
@@ -38,9 +36,17 @@ impl Listener {
         loop {
             tokio::select! {
                 accepted = self.socket.accept() => return accepted.map(|(stream, _)| stream),
-                _ = self.health.tick() => {
+                _ = async {
+                    match &mut self.changes {
+                        Some(changes) => changes.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     if let Err(error) = self.restore() {
                         tracing::warn!("Could not restore Codex launcher socket: {error}");
+                        if let Some(changes) = &mut self.changes {
+                            changes.retry();
+                        }
                     }
                 }
             }

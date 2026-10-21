@@ -120,7 +120,7 @@ pub(super) fn newest_first<T>(
 /// thing, losing every later record.
 ///
 /// This is a *bounded one-shot read*, never a watch: a record older than the
-/// window it reaches reads as absent, and both callers treat that the same way
+/// window it reaches reads as absent, and callers treat that the same way
 /// they treat a file that isn't there yet.
 pub(super) fn read_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
