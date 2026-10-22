@@ -154,6 +154,11 @@ mod tests {
         std::fs::write(&path, "owner").unwrap();
         let mut changes = PathChanges::new(&path);
         changes.changed().await;
+        // FSEvents can deliver the creation of `owner` (and of `root` itself,
+        // seen through the parent watch) after registration. Let it settle so
+        // the assertion below only sees events caused by the loop.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while changes.events.try_recv().is_ok() {}
         for i in 0..20 {
             std::fs::write(root.path().join("other"), i.to_string()).unwrap();
             std::fs::read(&path).unwrap();
