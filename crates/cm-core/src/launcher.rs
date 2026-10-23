@@ -374,6 +374,19 @@ pub async fn run(
 
     tracing::info!("Agent exited with {exit_status}");
 
+    // A failure during startup is otherwise a window that closes before the
+    // agent's own error can be read. Hold it with that output still on screen.
+    if let Some(error) = startup_exit_error(agent, &launcher_state.status, exit_status) {
+        hold_failed_launch(
+            launcher_pid,
+            &sock_path,
+            &settings_path,
+            &mut launcher_state,
+            error,
+        )
+        .await
+    }
+
     // Remove state file (dashboard will see the deletion via notify and reset
     // visuals), socket, and settings file. `into_inner` runs that cleanup once
     // and disarms the guard so the upcoming `process::exit` (which skips Drop)
@@ -618,9 +631,10 @@ fn cleanup_launcher_files(launcher_pid: u32, sock_path: &Path, settings_path: &P
 }
 
 /// Hold a launch that never produced an agent (direnv blocked on the session's
-/// `.envrc`, a missing `claude`/`codex`, a spawn failure) as a visible
+/// `.envrc`, a missing `claude`/`codex`, a spawn failure), or whose agent
+/// failed before reporting any status ([`startup_exit_error`]), as a visible
 /// `FailedToStart` row instead of letting it vanish. We print the error to the
-/// window (the agent never got to), stamp it onto the state file as
+/// window below any agent output, stamp it onto the state file as
 /// `last_error`, and **block** until the user dismisses it — closing the window
 /// (kitty SIGHUP) or killing the row (the dashboard SIGTERMs `launcher_pid`,
 /// since there's no child) — then tear the files down.
@@ -662,6 +676,35 @@ async fn hold_failed_launch(
     }
     cleanup_launcher_files(launcher_pid, sock_path, settings_path);
     std::process::exit(1);
+}
+
+/// The error to hold for an agent that failed before reporting any status. A
+/// row still `Starting` has seen no hook or transcript signal; Codex stays
+/// there until its first prompt, so a startup failure (an unreachable backend)
+/// exits from this state. A clean exit and an exit from a hangup, interrupt or
+/// termination are the user's or terminal's doing, matching the attach
+/// wrapper's refusal test.
+fn startup_exit_error(
+    agent: AgentControl,
+    status: &SessionStatus,
+    exit: std::process::ExitStatus,
+) -> Option<anyhow::Error> {
+    use std::os::unix::process::ExitStatusExt;
+    const USER_ENDED_SIGNALS: [i32; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM];
+    if *status != SessionStatus::Starting || exit.success() {
+        return None;
+    }
+    let user_ended = match (exit.code(), exit.signal()) {
+        (Some(code), _) => USER_ENDED_SIGNALS.iter().any(|sig| code == 128 + sig),
+        (None, Some(sig)) => USER_ENDED_SIGNALS.contains(&sig),
+        (None, None) => false,
+    };
+    (!user_ended).then(|| {
+        anyhow::anyhow!(
+            "{} exited during startup ({exit}); its output, if any, is above",
+            agent.label()
+        )
+    })
 }
 
 /// Scope guard that runs `cleanup_launcher_files` on drop. Installed once the
@@ -1706,6 +1749,32 @@ async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn only_an_unprompted_startup_failure_holds_the_window() {
+        use std::os::unix::process::ExitStatusExt;
+        let code = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        let signal = std::process::ExitStatus::from_raw;
+        let holds = |status, exit| startup_exit_error(AgentControl::Codex, &status, exit).is_some();
+
+        assert!(holds(SessionStatus::Starting, code(1)));
+        assert!(holds(SessionStatus::Starting, signal(libc::SIGABRT)));
+        // The user quit or closed the window, or the agent already reported.
+        assert!(!holds(SessionStatus::Starting, code(0)));
+        for ended in [129, 130, 143] {
+            assert!(!holds(SessionStatus::Starting, code(ended)), "{ended}");
+        }
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+            assert!(!holds(SessionStatus::Starting, signal(sig)), "{sig}");
+        }
+        assert!(!holds(SessionStatus::Idle, code(1)));
+
+        let error = startup_exit_error(AgentControl::Codex, &SessionStatus::Starting, code(1));
+        assert_eq!(
+            format!("{:#}", error.unwrap()),
+            "Codex exited during startup (exit status: 1); its output, if any, is above"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_cleanup_keeps_the_launcher_and_tui_alive_until_a_successful_retry() {
