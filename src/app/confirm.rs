@@ -173,7 +173,6 @@ impl<T> Confirmation<T> {
         clear_overlay(frame, popup);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().dim())
             .padding(Padding::horizontal(1))
             .title(Span::styled(
                 format!(" {} ", self.title),
