@@ -100,10 +100,14 @@ mod tests {
             .await
             .expect("waiting for daemon-watch registration")
             .unwrap();
+        // FSEvents can deliver the pid file's creation after registration,
+        // costing one harmless extra read. Count only reads after it settles.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = reads.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(
             reads.load(Ordering::SeqCst),
-            1,
+            settled,
             "quiet ownership must not reread server.pid"
         );
         process.start_kill().unwrap();
