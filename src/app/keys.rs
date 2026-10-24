@@ -609,6 +609,7 @@ impl App {
             Command::Search => {
                 self.input_mode = InputMode::Search;
                 self.search_input.clear();
+                self.set_search_filter(None);
                 None
             }
             Command::ClearSearch => {
@@ -751,7 +752,10 @@ impl App {
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Backspace
+                if key.code == KeyCode::Esc
+                    || (key.modifiers.is_empty() && self.search_input.is_empty()) =>
+            {
                 self.input_mode = InputMode::Normal;
                 self.set_search_filter(None);
                 self.search_input.clear();

@@ -2100,7 +2100,7 @@ impl App {
     /// Update the search filter. Wrapping this in a setter is important: it
     /// bumps `mutation_version`, invalidating the visible/dir-labels caches —
     /// and, since a filter change makes this a different list, sends the cursor
-    /// back to the top. Owning that here rather than at the four key handlers is
+    /// back to the top. Owning that here rather than in each key handler is
     /// what fixed `ClearSearch`, the one of them that had forgotten to do it.
     pub(super) fn set_search_filter(&mut self, filter: Option<String>) {
         if self.search_filter != filter {
@@ -3400,10 +3400,12 @@ impl App {
                             .as_deref()
                             .is_some_and(|p| contains_ci(last_prompt_text(p), q))
                         || contains_ci(s.status_label(), q)
-                        || self
-                            .index_of(s)
-                            .lookup(s)
-                            .is_some_and(|n| contains_ci(n, q))
+                        // Match the same name the table shows, including
+                        // launcher titles, auto-titles and generated fallbacks.
+                        || contains_ci(
+                            &format::session_display_name(s, self.index_of(s), &self.random_names),
+                            q,
+                        )
                 }
             })
             .map(|(i, _)| i)

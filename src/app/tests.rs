@@ -5613,11 +5613,133 @@ fn search_mode_filters() {
     assert_eq!(d.app.visible_sessions().len(), 3);
 }
 
+#[test]
+fn search_matches_every_displayed_name() {
+    let mut d = TestDashboard::new(160, 20);
+    let mut renamed = session(1, "/work/project", SessionStatus::Idle);
+    renamed.name = Some("Renamed workflow".into());
+    let mut auto_title =
+        session_with_prompt(2, "/work/project", SessionStatus::Idle, "Latest request");
+    auto_title.first_prompt = Some("Original task".into());
+    let generated = session(3, "/work/project", SessionStatus::Idle);
+    d.app
+        .random_names
+        .insert(super::flag_key(&generated), "mellow-koala".into());
+    let indexed = session(5, "/work/project", SessionStatus::Idle);
+    d.app
+        .session_indexes
+        .entry(indexed.host.clone())
+        .or_default()
+        .by_session_id
+        .insert(indexed.session_id.clone().unwrap(), "Indexed title".into());
+    d.set_sessions(vec![
+        renamed,
+        auto_title,
+        generated,
+        session(4, "/work/project", SessionStatus::Idle),
+        indexed,
+    ]);
+
+    let out = d.render();
+    for (pid, name) in [
+        (1, "Renamed workflow"),
+        (2, "Original task"),
+        (3, "mellow-koala"),
+        (4, "session-4"),
+        (5, "Indexed title"),
+    ] {
+        assert!(
+            out.contains(name),
+            "name must be visible before searching: {name}"
+        );
+        d.press(KeyCode::Char('/'));
+        for c in name.to_ascii_uppercase().chars() {
+            d.press(KeyCode::Char(c));
+        }
+        assert_eq!(
+            d.app.visible_len(),
+            1,
+            "search must find visible name: {name}"
+        );
+        assert_eq!(d.app.selected_pid(), Some(pid));
+        d.press(KeyCode::Esc);
+    }
+}
+
+#[test]
+fn search_backspace_on_empty_input_exits() {
+    let mut d = TestDashboard::new(120, 15);
+    d.app.set_status("Keep this notification".into(), true);
+    d.press(KeyCode::Char('/'));
+
+    assert!(d.press(KeyCode::Backspace).is_none());
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+    assert!(d.app.search_input.is_empty());
+    assert!(d.app.search_filter.is_none());
+    assert!(d.render().contains("Keep this notification"));
+}
+
+#[test]
+fn search_backspace_only_exits_when_input_was_already_empty() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![
+        session(1, "/work/café", SessionStatus::Idle),
+        session(2, "/work/project", SessionStatus::Idle),
+    ]);
+    d.press(KeyCode::Char('/'));
+    d.press(KeyCode::Char('é'));
+    assert_eq!(d.app.visible_len(), 1);
+
+    // Backspace at the start of a nonempty query must keep search open.
+    d.press(KeyCode::Home);
+    d.press(KeyCode::Backspace);
+    assert_eq!(d.app.input_mode, InputMode::Search);
+    assert_eq!(d.app.search_input.text(), "é");
+    assert_eq!(d.app.visible_len(), 1);
+
+    // Deleting the final character clears the filter but keeps editing open.
+    d.press(KeyCode::End);
+    d.press(KeyCode::Backspace);
+    assert_eq!(d.app.input_mode, InputMode::Search);
+    assert!(d.app.search_input.is_empty());
+    assert!(d.app.search_filter.is_none());
+    assert_eq!(d.app.visible_len(), 2);
+
+    d.press(KeyCode::Backspace);
+    assert_eq!(d.app.input_mode, InputMode::Normal);
+}
+
+#[test]
+fn search_reopening_clears_the_previous_filter_with_the_input() {
+    let mut d = TestDashboard::new(120, 15);
+    d.set_sessions(vec![
+        session(1, "/work/alpha", SessionStatus::Idle),
+        session(2, "/work/beta", SessionStatus::Idle),
+    ]);
+    d.press(KeyCode::Char('/'));
+    for c in "alpha".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.visible_len(), 1);
+
+    d.press(KeyCode::Char('/'));
+    assert_eq!(d.app.input_mode, InputMode::Search);
+    assert!(d.app.search_input.is_empty());
+    assert!(d.app.search_filter.is_none());
+    assert_eq!(d.app.visible_len(), 2);
+    assert_eq!(d.selected(), Some(0));
+
+    d.press(KeyCode::Char('b'));
+    assert_eq!(d.app.visible_len(), 1);
+    assert_eq!(d.app.selected_pid(), Some(2));
+}
+
 /// Clearing the filter makes the list a different list, so the cursor goes back
 /// to the top. `ClearSearch` used to be the one search path that forgot — its
-/// three siblings each called `reset_selection()` by hand — leaving the cursor
+/// sibling handlers each called `reset_selection()` by hand — leaving the cursor
 /// on an index that now named an unrelated session. `set_search_filter` owns the
-/// policy now (`Cursor::Top`), so all four get it.
+/// policy now (`Cursor::Top`), so every handler gets it.
 #[test]
 fn clearing_the_search_filter_returns_the_cursor_to_the_top() {
     let mut d = TestDashboard::new(120, 15);
