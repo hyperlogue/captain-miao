@@ -144,6 +144,52 @@ async fn native_launcher_survives_ctrl_c_until_its_agent_exits() {
 }
 
 #[tokio::test]
+async fn native_kill_removes_session_when_agent_ignores_sigterm() {
+    let mut host = Host::new();
+    host.start();
+    let launcher = host.launch("native", false);
+    let mut peer = Peer::connect(host.socket()).await;
+    peer.rows_until(|rows| rows.values().any(|s| s.status == SessionStatus::Idle))
+        .await;
+    let row = peer.row("native");
+    let key = row.key();
+    let agent = row.child_pid.unwrap();
+
+    // The agent installed its signal handlers before publishing Idle. A
+    // successful Kill reply must remove the session even if SIGTERM cannot
+    // persuade the agent itself to exit.
+    peer.send(ClientFrame::KillSession {
+        req_id: 1,
+        key: key.clone(),
+        cleanup: CleanupPolicy::ForceIfUnavailable,
+    })
+    .await;
+    assert!(matches!(
+        peer.reply(1).await,
+        ServerFrame::Killed {
+            ok: true,
+            error: None,
+            ..
+        }
+    ));
+    until("native launcher state removal after Kill", || {
+        host.launcher_state(launcher).is_none()
+    })
+    .await;
+    peer.rows_until(|rows| !rows.contains_key(&key)).await;
+    host.wait_exited(launcher).await;
+    assert!(host.launcher_state(launcher).is_none());
+    assert!(host.launcher_sockets_gone());
+    assert!(
+        !cm_core::state::is_process_alive(agent),
+        "Kill left the native agent alive"
+    );
+    // A new snapshot must agree: hiding the old row is not sufficient.
+    let mut fresh = Peer::connect(host.socket()).await;
+    fresh.rows_until(|rows| rows.is_empty()).await;
+}
+
+#[tokio::test]
 async fn sessions_recover_and_remain_controllable_across_connection_and_cleanup_failures() {
     let mut host = Host::new();
     let mut codex = CodexServer::start(host.codex_socket()).await;
@@ -456,6 +502,9 @@ async fn codex_fixture() {
         use std::io::Write;
         use tokio::signal::unix::{SignalKind, signal};
         let mut interrupt = signal(SignalKind::interrupt()).unwrap();
+        // Some native agents catch SIGTERM without exiting. Session teardown
+        // must go through the launcher that owns their lifetime and state.
+        let _terminate = signal(SignalKind::terminate()).unwrap();
         for event in ["session-start", "stop", "prompt-submit"] {
             if event == "prompt-submit" {
                 interrupt.recv().await.unwrap();

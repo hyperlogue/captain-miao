@@ -2822,23 +2822,28 @@ fn resume_picker_names_the_host_it_lists() {
 }
 
 #[test]
-fn resume_picker_rejects_an_already_managed_codex_thread() {
+fn resume_picker_rejects_an_already_managed_conversation() {
     use crate::agent::{AgentControl, ResumeCandidate};
     use crate::state::HostId;
     use cm_core::agents::codex::CodexMode;
 
     for host in [HostId::local(), HostId("test-host".into())] {
-        for mode in [CodexMode::Native, CodexMode::AppServer] {
+        for (agent, mode) in AgentControl::ALL
+            .iter()
+            .map(|&agent| (agent, CodexMode::Native))
+            .chain([(AgentControl::Codex, CodexMode::AppServer)])
+        {
             for status in [
                 SessionStatus::Idle,
                 SessionStatus::Active,
                 SessionStatus::Starting,
+                SessionStatus::BackgroundActive,
             ] {
                 let mut d = TestDashboard::new(140, 20);
                 d.app.open_resume_picker(
                     host.clone(),
                     vec![ResumeCandidate {
-                        agent: AgentControl::Codex,
+                        agent,
                         session_id: "managed-thread".into(),
                         cwd: "/tmp/project".into(),
                         first_prompt: None,
@@ -2849,7 +2854,7 @@ fn resume_picker_rejects_an_already_managed_codex_thread() {
                 );
                 // The owner can appear after the inventory was fetched. Even a
                 // detached or disconnected session still owns its conversation.
-                let mut owner = LauncherState::for_test(AgentControl::Codex, status);
+                let mut owner = LauncherState::for_test(agent, status);
                 owner.host = host.clone();
                 owner.codex_mode = mode;
                 owner.codex_connected = Some(false);
@@ -2858,11 +2863,12 @@ fn resume_picker_rejects_an_already_managed_codex_thread() {
 
                 assert!(
                     d.press(KeyCode::Enter).is_none(),
-                    "Resume must not open a duplicate that waits for its owner"
+                    "Resume must not launch a second {agent:?} for an owned conversation"
                 );
                 assert!(d.app.status_is_error);
                 let message = d.app.status_msg.as_deref().unwrap();
                 assert!(message.contains("already managed"), "{message}");
+                assert!(message.contains(agent.label()), "{message}");
                 assert!(message.contains("attach or restart"), "{message}");
             }
         }
@@ -2870,7 +2876,7 @@ fn resume_picker_rejects_an_already_managed_codex_thread() {
 }
 
 #[test]
-fn resume_picker_scopes_ownership_to_the_codex_thread_and_host() {
+fn resume_picker_scopes_ownership_to_the_agent_conversation_and_host() {
     use crate::agent::{AgentControl, ResumeCandidate};
     use crate::state::HostId;
 
@@ -2896,8 +2902,20 @@ fn resume_picker_scopes_ownership_to_the_codex_thread_and_host() {
         (
             AgentControl::Claude,
             AgentControl::Claude,
+            HostId("test-host".into()),
+            "saved-thread",
+        ),
+        (
+            AgentControl::Claude,
+            AgentControl::Codex,
             HostId::local(),
             "saved-thread",
+        ),
+        (
+            AgentControl::Claude,
+            AgentControl::Claude,
+            HostId::local(),
+            "other-thread",
         ),
     ] {
         let mut d = TestDashboard::new(140, 20);

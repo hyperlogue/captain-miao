@@ -332,8 +332,8 @@ library**.
 
 The pool is why kill/detach have clean semantics: **detach** closes the local
 window and touches nothing on the host — the launcher keeps running in its
-pool pty; **kill** signals the agent and the whole triple tears down, pool
-session included.
+pool pty; **kill** asks the launcher to terminate its agent and clean up the
+session, pool session included.
 
 ## 2. The per-host daemon: `miao-server`
 
@@ -1081,10 +1081,12 @@ through the identical path.
   tier; Enter re-attaches. The reload's `prune_detached_sessions` treats
   externally-closed windows the same way, minus the intent (gated on
   `has_remote()` + an interval floor).
-- **KILL** (`X`): `KillSession{key}` → the host resolves the key to a live pid
-  and SIGTERMs the agent → launcher tears down, removes its state file →
-  `Removed` push → row gone. Later the session shows in that host's resumable
-  list; resuming is OPEN with `resume: Some(…)`.
+- **KILL** (`X`): `KillSession{key}` → the host resolves the key to a live
+  launcher and SIGTERMs it → launcher kills its native agent and removes its
+  state file → `Removed` push → row gone. Later the session shows in that
+  host's resumable list; resuming is OPEN with `resume: Some(…)`. Signalling
+  the native agent directly is insufficient: an agent may catch SIGTERM without exiting.
+  App-server Codex uses its acknowledged cleanup protocol before termination.
 
   **The row leaves at the keystroke, not at the `Removed`.** That whole chain is
   an ssh round trip plus a process teardown, and it used to run on the UI thread

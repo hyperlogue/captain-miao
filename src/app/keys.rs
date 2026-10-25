@@ -881,20 +881,20 @@ impl App {
         })
     }
 
-    /// Resume a picker candidate unless this host already manages its Codex
-    /// thread. Check at selection time: the owner can appear after the list was
-    /// fetched. Restart has its own action and needs the launcher's handoff wait.
+    /// Resume a picker candidate unless this host already manages that agent's
+    /// conversation. Check at selection time: the owner can appear after the
+    /// list was fetched. Restart has its own action and cleanup sequence.
     fn resume_action(&mut self, host: HostId, c: ResumeCandidate) -> Option<Action> {
-        if c.agent == AgentControl::Codex
-            && self.sessions.iter().any(|s| {
-                s.host == host
-                    && s.agent == c.agent
-                    && s.session_id.as_deref() == Some(c.session_id.as_str())
-            })
-        {
+        if self.sessions.iter().any(|s| {
+            s.host == host
+                && s.agent == c.agent
+                && s.session_id.as_deref() == Some(c.session_id.as_str())
+        }) {
             self.set_status(
-                "Codex conversation is already managed on this host; use its existing row to attach or restart"
-                    .into(),
+                format!(
+                    "{} conversation is already managed on this host; use its existing row to attach or restart",
+                    c.agent.label(),
+                ),
                 true,
             );
             return None;

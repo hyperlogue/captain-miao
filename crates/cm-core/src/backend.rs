@@ -471,15 +471,16 @@ impl LocalBackend {
         (all, errors)
     }
 
-    /// Tear a session down, resolving `key` → the **current** agent pid from
+    /// Tear a session down, resolving `key` → the **current** launcher from
     /// the live state file first. That re-resolution is the point: the pid a
     /// caller's mirror holds may name a session that has already exited, and
     /// the OS recycles pids — so signalling the pid off the wire could SIGTERM
     /// an unrelated process. An unknown key is refused rather than guessed at.
     ///
-    /// Falls back to the launcher pid when the row carries no `child_pid` (a
-    /// `FailedToStart` launcher holding its error), matching the client's own
-    /// kill target.
+    /// Native launchers own agent termination and state cleanup. Signalling
+    /// their child directly can leave the whole session alive when an agent
+    /// catches SIGTERM without exiting. App-server Codex instead requires its
+    /// existing acknowledged cleanup before terminating the launcher.
     pub fn kill_session(key: &SessionKey, policy: CleanupPolicy) -> anyhow::Result<SessionRemoval> {
         let Some(state) = state::read_all_launcher_states()
             .into_iter()
@@ -492,7 +493,7 @@ impl LocalBackend {
             return Ok(SessionRemoval::AlreadyGone);
         };
         let pid = if state.codex_mode.is_native() {
-            state.child_pid.unwrap_or(state.launcher_pid)
+            state.launcher_pid
         } else if state.codex_control {
             return crate::agents::codex::app_server::kill(&state, policy);
         } else if state.status == crate::state::SessionStatus::FailedToStart {

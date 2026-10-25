@@ -56,6 +56,8 @@ The scenario verifies:
 - Strict cleanup followed by replacement preserves a saved conversation.
 - Explicit Kill reports missing-thread and unreachable-server removals
   separately and removes the launcher state and sockets.
+- Native Kill terminates an agent that catches SIGTERM without exiting,
+  removes launcher state and sockets, and stays absent on a fresh subscription.
 - A host daemon restart rediscovers a surviving direct launcher. Pool upgrades
   continue to use the existing stop-and-resume workflow.
 
