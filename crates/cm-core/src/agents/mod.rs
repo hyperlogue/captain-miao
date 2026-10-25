@@ -59,9 +59,9 @@ pub(crate) fn binary_available(name: &str) -> bool {
 /// questions: which rc file a login shell reads, whether the pool's shell is
 /// interactive, and why an already-running session keeps a stale `PATH`.
 ///
-/// Caveat worth knowing at the call site: `direnv` is in the spawn path, and an
-/// `.envrc` that sets `PATH` absolutely can drop this dir again. The shim's
-/// delegate rule makes that "paste stops working", not "the session breaks".
+/// For a launch through `direnv`, [`common::agent_command`] prepends the farm
+/// after the project environment loads, so its PATH changes cannot hide the
+/// bridge behind native clipboard tools.
 fn with_shim_path(cmd: &mut Command, shim_dir: Option<&Path>) {
     let Some(dir) = shim_dir else { return };
     if let Some(path) = shim_path(dir, std::env::var_os("PATH").as_deref()) {

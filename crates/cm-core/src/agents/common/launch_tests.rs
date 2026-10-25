@@ -2,6 +2,7 @@
 use super::agent_command;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::process::Command;
 
 fn executable(path: &Path, text: &str) {
@@ -21,7 +22,7 @@ async fn isolated(test: &str, real_direnv: bool) -> Option<PathBuf> {
     if real_direnv {
         for name in ["direnv", "bash"] {
             symlink(
-                super::super::find_in_path(name)
+                crate::agents::find_in_path(name)
                     .unwrap_or_else(|| panic!("{name} must be installed")),
                 bin.join(name),
             )
@@ -124,7 +125,7 @@ fn launch_error(project: &Path) -> String {
 
 #[tokio::test]
 async fn parent_direnv_launch_checks_approval_without_exposing_output() {
-    const TEST: &str = "agents::common::launch_tests::parent_direnv_launch_checks_approval_without_exposing_output";
+    const TEST: &str = "agents::common::launch::tests::parent_direnv_launch_checks_approval_without_exposing_output";
     let Some(root) = isolated(TEST, false).await else {
         return;
     };
@@ -177,6 +178,109 @@ async fn parent_direnv_launch_checks_approval_without_exposing_output() {
     assert_eq!(output.stdout, b"ordinary");
 }
 
+#[tokio::test]
+async fn clipboard_shims_win_after_direnv_changes_path() {
+    const TEST: &str =
+        "agents::common::launch::tests::clipboard_shims_win_after_direnv_changes_path";
+    let Some(root) = isolated(TEST, false).await else {
+        return;
+    };
+    clipboard_launch_cases(&root, false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed direnv and bash; uses isolated HOME and XDG roots"]
+async fn real_direnv_preserves_clipboard_shims_and_agent_process() {
+    const TEST: &str =
+        "agents::common::launch::tests::real_direnv_preserves_clipboard_shims_and_agent_process";
+    let Some(root) = isolated(TEST, true).await else {
+        return;
+    };
+    clipboard_launch_cases(&root, true).await;
+}
+
+async fn clipboard_launch_cases(root: &Path, real_direnv: bool) {
+    let project = project(root);
+    std::fs::write(
+        root.join("status.json"),
+        "{\"state\":{\"foundRC\":{\"allowed\":0}}}\n",
+    )
+    .unwrap();
+    let shims = root.join("clipboard shims ' quoted");
+    std::fs::create_dir(&shims).unwrap();
+    executable(&shims.join("xclip"), "#!/bin/sh\nprintf 'image/png\\n'\n");
+    executable(
+        &root.join("project-bin/xclip"),
+        "#!/bin/sh\nprintf 'text/plain\\n'\n",
+    );
+
+    // A direct launch and each direnv PATH mutation must have the same clipboard
+    // precedence, argv, exit status and process identity.
+    let envrc = root.join("work/.envrc");
+    std::fs::remove_file(&envrc).unwrap();
+    assert_launch(&project, Some(&shims), "image/png", "").await;
+    for path in [
+        "$CM_TEST_PARENT_DIRENV/project-bin:$PATH",
+        "$CM_TEST_PARENT_DIRENV/project-bin",
+        "",
+    ] {
+        std::fs::write(
+            &envrc,
+            format!("export PATH=\"{path}\"\nexport PROJECT_VALUE=loaded\n"),
+        )
+        .unwrap();
+        if real_direnv {
+            direnv("allow", &root.join("work")).await;
+        }
+        assert_launch(&project, Some(&shims), "image/png", "loaded").await;
+        if !path.is_empty() {
+            // Unshimmed sessions must still use the project's native tools.
+            assert_launch(&project, None, "text/plain", "loaded").await;
+        }
+    }
+}
+
+async fn assert_launch(project: &Path, shims: Option<&Path>, target: &str, value: &str) {
+    let child = agent_command("sh", project.to_str().unwrap(), shims)
+        .unwrap()
+        .args([
+            "-c",
+            "xclip -selection clipboard -t TARGETS -o; printf '%s\\n' \"$$\" \"$PROJECT_VALUE\" \"$1\" \"$2\" \"$PWD\"; exit 23",
+            "agent",
+            "argument ' with spaces $PATH",
+            "",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let output = child.wait_with_output().await.unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{target}\n{pid}\n{value}\nargument ' with spaces $PATH\n\n{}\n",
+            project.display()
+        ),
+        "clipboard priority, exec, environment, cwd and arguments must survive launch"
+    );
+}
+
+#[test]
+fn a_missing_binary_says_which_one() {
+    let cwd = tempfile::tempdir().unwrap();
+    let error = agent_command("cm-no-such-agent", cwd.path().to_str().unwrap(), None)
+        .expect_err("the binary does not exist");
+    assert!(error.to_string().contains("cm-no-such-agent"));
+}
+
 async fn direnv(action: &str, path: &Path) {
     let output = Command::new("direnv")
         .arg(action)
@@ -195,7 +299,7 @@ async fn direnv(action: &str, path: &Path) {
 #[ignore = "requires installed direnv and bash; uses isolated HOME and XDG roots"]
 async fn real_direnv_launch_uses_nearest_approved_parent() {
     const TEST: &str =
-        "agents::common::launch_tests::real_direnv_launch_uses_nearest_approved_parent";
+        "agents::common::launch::tests::real_direnv_launch_uses_nearest_approved_parent";
     let Some(root) = isolated(TEST, true).await else {
         return;
     };

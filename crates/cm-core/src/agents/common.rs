@@ -1,82 +1,15 @@
-//! The hook-event mapping every backend starts from.
+//! Shared launch, transcript, and hook helpers for agent implementations.
 //!
-//! Claude's and Codex's dispatchers were near-identical copies, and every
-//! backend since would have been another. A backend now handles only the events
-//! it genuinely treats differently and delegates the rest here, so the arms that
-//! *are* common exist once — which is why five of the seven dispatchers are a
-//! single delegating line.
-//!
-//! [`dispatch_default`]'s match is deliberately exhaustive (no `_` arm): a newly
-//! added [`HookEvent`] variant must force a decision, and this is the one place
-//! that stays true now that the per-agent dispatchers end in a catch-all.
+//! [`launch`] owns command construction. Backends handle their specific hook
+//! events and delegate the rest to [`dispatch_default`], whose exhaustive match
+//! requires an explicit decision for every new [`HookEvent`].
 
-use anyhow::{Context, Result};
 use std::path::Path;
-use tokio::process::Command;
+
+mod launch;
+pub(super) use launch::agent_command;
 
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
-
-/// The shared part of every backend's `build_launch_command`: resolve the
-/// binary, put `direnv` in front of it when the session's directory or an
-/// ancestor has an `.envrc`, enter that directory, and put the clipboard shim
-/// farm on `PATH`.
-/// The caller adds its own environment and argv on top.
-///
-/// This existed seven times before it existed once, and the copies had drifted
-/// in the way copies do: only Claude's checked whether direnv would *accept*
-/// the `.envrc`. On the other six a blocked `.envrc` meant `direnv exec` printed
-/// its refusal to a stderr nobody reads and exited non-zero, so the launch
-/// produced no agent, no state file and no visible reason — the exact failure
-/// [`check_direnv_allowed`] was written to prevent.
-///
-/// Search the real working directory and its ancestors through the filesystem
-/// root, matching direnv even when the session path contains symlinks. This
-/// presence check does not load any files: direnv selects the nearest one and
-/// enforces its approval policy. Never skip a blocked file to try a higher one.
-pub(super) fn agent_command(bin: &str, cwd: &str, shim_dir: Option<&Path>) -> Result<Command> {
-    let exe = super::find_in_path(bin).with_context(|| format!("{bin} not found in PATH"))?;
-    let project = std::fs::canonicalize(cwd).context("resolving session directory for direnv")?;
-    let has_envrc = project.ancestors().any(|dir| dir.join(".envrc").is_file());
-    let mut cmd = if has_envrc {
-        let direnv = super::find_in_path("direnv")
-            .context("project has an .envrc but direnv is not on PATH")?;
-        check_direnv_allowed(&direnv, &project)?;
-        let mut c = Command::new(direnv);
-        c.arg("exec").arg(&project).arg(&exe);
-        c
-    } else {
-        Command::new(&exe)
-    };
-    cmd.current_dir(cwd);
-    super::with_shim_path(&mut cmd, shim_dir);
-    Ok(cmd)
-}
-
-/// Refuse to launch unless direnv confirms approval of the nearest `.envrc`.
-/// `state.foundRC.allowed` is 0 when approved, 1 when unapproved, and 2 when
-/// denied. Failed or unrecognized responses are errors, never permission.
-/// Keep raw status output (including its reported path) out of diagnostics;
-/// values from the external process may contain private information.
-fn check_direnv_allowed(direnv: &Path, cwd: &Path) -> Result<()> {
-    let output = std::process::Command::new(direnv)
-        .args(["status", "--json"])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("could not check direnv approval")?;
-    anyhow::ensure!(output.status.success(), "could not check direnv approval");
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| anyhow::anyhow!("invalid direnv approval response"))?;
-    let reason = match parsed["state"]["foundRC"]["allowed"].as_u64() {
-        Some(0) => return Ok(()),
-        Some(1) => "not allowed",
-        Some(2) => "denied",
-        _ => anyhow::bail!("invalid direnv approval response"),
-    };
-    anyhow::bail!(
-        "direnv: nearest .envrc is {reason}. Review it and run `direnv allow` in the session directory to approve it."
-    );
-}
 
 /// The immediate subdirectories of `dir`, or nothing if it can't be read.
 ///
@@ -278,58 +211,9 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
 }
 
 #[cfg(test)]
-#[path = "common_launch_tests.rs"]
-mod launch_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::AgentControl;
-
-    /// A directory with no `.envrc`, so [`agent_command`] takes its direct
-    /// branch rather than consulting whatever direnv the test machine has.
-    fn plain_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cm-agentcmd-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = std::fs::remove_file(dir.join(".envrc"));
-        dir
-    }
-
-    /// The three things every backend used to do for itself, now done once: the
-    /// agent's directory is entered, the shim farm is on `PATH` ahead of the
-    /// user's own, and the binary is the one resolved from `PATH`.
-    #[test]
-    fn one_call_enters_the_cwd_and_puts_the_shim_farm_on_path() {
-        let cwd = plain_dir("cwd");
-        let shim = plain_dir("shim");
-        let cmd = agent_command("sh", &cwd.to_string_lossy(), Some(&shim))
-            .expect("/bin/sh is on PATH everywhere this runs");
-        let std_cmd = cmd.as_std();
-        assert_eq!(std_cmd.get_current_dir(), Some(cwd.as_path()));
-        let path = std_cmd
-            .get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
-            .and_then(|(_, v)| v)
-            .expect("PATH is set for the shim farm");
-        assert!(
-            std::path::Path::new(path).starts_with(&shim)
-                || path.to_string_lossy().starts_with(&*shim.to_string_lossy()),
-            "the shim dir must come first: {path:?}"
-        );
-    }
-
-    /// A missing agent names itself, because this is the error a user sees when
-    /// they pick a backend they have not installed.
-    #[test]
-    fn a_missing_binary_says_which_one() {
-        let cwd = plain_dir("missing");
-        let err = agent_command("cm-no-such-agent", &cwd.to_string_lossy(), None)
-            .expect_err("the binary does not exist");
-        assert!(
-            err.to_string().contains("cm-no-such-agent"),
-            "{err}, which does not name the agent"
-        );
-    }
 
     fn state() -> LauncherState {
         LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle)
