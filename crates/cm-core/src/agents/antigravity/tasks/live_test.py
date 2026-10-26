@@ -79,8 +79,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             command = shlex.join([sys.executable, '-c',
                 f"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:{server.server_port}/held', timeout=50).read().decode())"])
             parts = [{'functionCall': {'name': 'run_command', 'args': {
-                'CommandLine': command, 'Cwd': str(root), 'WaitMsBeforeAsync': 1000,
-                'toolAction': 'Running command', 'toolSummary': 'Held background fixture',
+                'CommandLine': command, 'WaitMsBeforeAsync': 1000,
+                'toolSummary': 'Held background fixture',
             }}}]
         response = {'candidates': [{'content': {'role': 'model', 'parts': parts},
                                    'finishReason': 'STOP', 'index': 0}],

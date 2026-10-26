@@ -1120,8 +1120,8 @@ impl AgentControl {
             // case that forced Codex to read its rollout cannot arise. Pi's
             // transcript is read only for the resume picker, never live status.
             AgentControl::Pi => TranscriptScan::default(),
-            // The log supplies prompts only; cancellation comes from status
-            // snapshots, so no second read for activity signals is needed.
+            // Status snapshots handle cancellation and consult the log for
+            // compaction, so no separate interrupt scan is needed.
             AgentControl::Antigravity => TranscriptScan::default(),
             // Empty, for pi's reason reached via `agent_end`: omp's turn-end
             // event fires on an abort too (`stopReason === "aborted"` calls the

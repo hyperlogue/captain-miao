@@ -29,6 +29,9 @@ delayed_request = threading.Event()
 release_response = threading.Event()
 tool_started = threading.Event()
 release_tool = threading.Event()
+compact_requested = threading.Event()
+compact_started = threading.Event()
+release_compact = threading.Event()
 
 
 class Model(http.server.BaseHTTPRequestHandler):
@@ -49,6 +52,9 @@ class Model(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         title = 'title generator' in json.dumps(body.get('systemInstruction', {}))
+        if compact_requested.is_set() and not title:
+            compact_started.set()
+            release_compact.wait(45)
         contents = body.get('contents', [])
         prompt_index = next((i for i in range(len(contents) - 1, -1, -1)
                              if contents[i].get('role') == 'user'
@@ -75,8 +81,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                     "pathlib.Path('~/new-top-level.txt').expanduser().write_text('real home'); "
                     f"print(urllib.request.urlopen('http://127.0.0.1:{server.server_port}/held-tool', timeout=50).read().decode())"])
             response_parts = [{'functionCall': {'name': 'run_command', 'args': {
-                'CommandLine': command, 'Cwd': str(work),
-                'WaitMsBeforeAsync': 1000, 'toolAction': 'Running command',
+                'CommandLine': command,
+                'WaitMsBeforeAsync': 1000,
                 'toolSummary': 'Local fixture print',
             }}}]
         response = {
@@ -253,6 +259,15 @@ try:
     release_tool.set()
     terminal.wait('idle after accepted tool finishes', lambda: status('idle'))
     checkpoint('accepted-complete')
+    compact_requested.set()
+    terminal.prompt('/compact')
+    terminal.wait('compaction request in flight', lambda: compact_started.is_set()
+                  and status('working'))
+    checkpoint('compacting')
+    release_compact.set()
+    terminal.wait('idle after compaction', lambda: status('idle'))
+    checkpoint('compacted')
+    compact_requested.clear()
     terminal.prompt('/clear')
     terminal.wait('new conversation after clear', lambda: status('idle') and any(
         e['event'] == 'status-update' and e['body'].get('conversation_id')
@@ -261,6 +276,7 @@ try:
 finally:
     release_response.set()
     release_tool.set()
+    release_compact.set()
     terminal.close()
 
 offset = len(events())
@@ -272,6 +288,10 @@ try:
         and e['body'].get('context_window', {}).get('total_input_tokens', 0) > 0
         for e in current()))
     checkpoint('resume')
+    terminal.prompt('after_compact_fixture')
+    terminal.wait('fresh usage after compaction', lambda: status('idle')
+                  and any(e['event'] == 'stop' for e in current()))
+    checkpoint('after-compact')
 finally:
     terminal.close()
 

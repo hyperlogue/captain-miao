@@ -20,9 +20,22 @@ fn real_agy_tracks_startup_completion_cancellation_and_resume() {
     std::fs::write(
         &recorder,
         r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, tempfile
+from pathlib import Path
 body = json.load(sys.stdin)
-line = json.dumps({'event': sys.argv[-1], 'body': body, 'home': os.environ['HOME']}) + '\n'
+event = {'event': sys.argv[-1], 'body': body, 'home': os.environ['HOME']}
+if sys.argv[-1] == 'status-update' and body.get('conversation_id'):
+    source = Path(os.environ['HOME']) / '.gemini/antigravity-cli/brain' / body['conversation_id'] / '.system_generated/logs/transcript.jsonl'
+    try:
+        transcript = source.read_bytes()
+    except FileNotFoundError:
+        pass
+    else:
+        fd, name = tempfile.mkstemp(prefix='transcript-', dir=Path(os.environ['CM_AGY_TEST_EVENTS']).parent)
+        with os.fdopen(fd, 'wb') as capture:
+            capture.write(transcript)
+        event['transcript'] = name
+line = json.dumps(event) + '\n'
 fd = os.open(os.environ['CM_AGY_TEST_EVENTS'], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.write(fd, line.encode())
 os.close(fd)
@@ -80,6 +93,7 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
     let mut user_hook_ran = false;
     for checkpoint in checkpoints.as_array().unwrap() {
         let phase = checkpoint["phase"].as_str().unwrap();
+        let snapshot = Path::new(checkpoint["snapshot"].as_str().unwrap());
         if phase == "resume" {
             state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
         }
@@ -94,10 +108,21 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 continue;
             }
             let kind = HookEvent::from_kebab(event["event"].as_str().unwrap()).unwrap();
-            dispatch_hook(
-                &mut state,
-                parse_hook_payload(kind, &event["body"].to_string()).unwrap(),
+            let mut message = parse_hook_payload(kind, &event["body"].to_string()).unwrap();
+            // Use the log captured at the status command itself: a later
+            // phase snapshot could hide a race with checkpoint persistence.
+            message.transcript_path = Some(
+                event["transcript"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        root.path()
+                            .join("not-yet-created.jsonl")
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
             );
+            dispatch_hook(&mut state, message);
         }
         // Check against agy's independently reported percentage, not just a
         // second implementation of our input/output sum.
@@ -110,12 +135,17 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 .as_u64()
                 .is_some_and(|size| size > 0)
         {
-            let percentage =
-                state.context_tokens.unwrap() as f64 * 100.0 / state.context_window.unwrap() as f64;
-            assert!(
-                (percentage - window["used_percentage"].as_f64().unwrap()).abs() < 0.01,
-                "context percentage disagrees with agy during {phase}"
-            );
+            if matches!(phase, "compacted" | "resume") {
+                assert!(window["total_input_tokens"].as_u64().unwrap() > 0);
+                assert_eq!(state.context_tokens, None, "stale usage during {phase}");
+            } else {
+                let percentage = state.context_tokens.unwrap() as f64 * 100.0
+                    / state.context_window.unwrap() as f64;
+                assert!(
+                    (percentage - window["used_percentage"].as_f64().unwrap()).abs() < 0.01,
+                    "context percentage disagrees with agy during {phase}"
+                );
+            }
         }
         match phase {
             "startup" => assert_eq!(state.status, SessionStatus::Idle),
@@ -144,6 +174,8 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
             "cancel-approval" => assert_eq!(state.status, SessionStatus::Idle),
             "accepted" => assert_eq!(state.status, SessionStatus::Active),
             "accepted-complete" => assert_eq!(state.status, SessionStatus::Idle),
+            "compacting" => assert_eq!(state.status, SessionStatus::Compacting),
+            "compacted" => assert_eq!(state.status, SessionStatus::Compacted),
             "clear" => {
                 assert_eq!(state.status, SessionStatus::Idle);
                 assert!(state.session_id.is_some());
@@ -151,19 +183,24 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
                 assert_eq!(state.context_tokens, Some(0));
             }
             "resume" => {
-                assert_eq!(state.status, SessionStatus::Idle);
+                assert_eq!(state.status, SessionStatus::Compacted);
                 assert_eq!(state.session_id, conversation);
+                assert_eq!(state.context_tokens, None);
+            }
+            "after-compact" => {
+                assert_eq!(state.status, SessionStatus::Idle);
                 assert!(state.context_tokens.is_some_and(|n| n > 0));
             }
             other => panic!("unexpected phase {other}"),
         }
-        let snapshot = Path::new(checkpoint["snapshot"].as_str().unwrap());
         let stats = read_transcript_stats(&snapshot.join("transcript.jsonl"), None);
         let expected_prompt = match phase {
             "startup" | "clear" => None,
             "complete" | "rename" => Some("completion_fixture"),
             "working" | "cancel" => Some("cancel_fixture"),
             "approval" | "cancel-approval" => Some("approval_fixture"),
+            "compacting" | "compacted" | "resume" => Some("/compact"),
+            "after-compact" => Some("after_compact_fixture"),
             _ => Some("accept_fixture"),
         };
         assert_eq!(stats.last_prompt.as_deref(), expected_prompt, "{phase}");

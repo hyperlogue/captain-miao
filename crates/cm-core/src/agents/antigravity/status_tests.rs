@@ -118,6 +118,123 @@ fn approval_snapshots_distinguish_waiting_from_tool_execution() {
     }
 }
 
+fn append_step(path: &Path, step: serde_json::Value) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{step}").unwrap();
+}
+
+fn append_prompt(path: &Path, prompt: &str) {
+    append_step(
+        path,
+        serde_json::json!({
+            "type": "USER_INPUT", "status": "DONE",
+            "content": format!("<USER_REQUEST>\n{prompt}\n</USER_REQUEST>")
+        }),
+    );
+}
+
+fn snapshot_at(path: &Path, activity: &str, tokens: u64) -> HookMessage {
+    let mut message = snapshot(activity, tokens);
+    message.transcript_path = Some(path.to_string_lossy().into_owned());
+    message
+}
+
+#[test]
+fn compact_snapshots_use_the_transcript_and_withhold_stale_usage_until_inference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("transcript.jsonl");
+    append_prompt(&path, "original task");
+    append_step(
+        &path,
+        serde_json::json!({"type":"PLANNER_RESPONSE", "status":"DONE", "input_tokens":9000}),
+    );
+    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
+    assert_eq!(state.context_tokens, Some(9012));
+
+    // agy 1.4.0's status command says only "working" during /compact.
+    append_prompt(&path, "/compact");
+    dispatch_hook(&mut state, snapshot_at(&path, "working", 9000));
+    assert_eq!(state.status, SessionStatus::Compacting);
+    assert_eq!(state.context_tokens, Some(9012));
+
+    append_step(
+        &path,
+        serde_json::json!({"type":"CHECKPOINT", "status":"DONE", "content":"summary"}),
+    );
+    // Its idle snapshot repeats the old usage, even after a fresh resume.
+    for initial in [
+        SessionStatus::Compacting,
+        SessionStatus::Compacted,
+        SessionStatus::Starting,
+    ] {
+        state.status = initial;
+        dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
+        assert_eq!(state.status, SessionStatus::Compacted);
+        assert_eq!(state.context_tokens, None);
+        assert_eq!(state.context_window, Some(1048576));
+    }
+
+    append_prompt(&path, "continue");
+    dispatch_hook(&mut state, snapshot_at(&path, "working", 9000));
+    assert_eq!(state.status, SessionStatus::Active);
+    assert_eq!(
+        state.context_tokens, None,
+        "a new prompt is not fresh usage"
+    );
+    append_step(
+        &path,
+        serde_json::json!({"type":"PLANNER_RESPONSE", "status":"DONE", "input_tokens":0}),
+    );
+    dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
+    assert_eq!(state.status, SessionStatus::Idle);
+    assert_eq!(
+        state.context_tokens, None,
+        "cancelled inference has no usage"
+    );
+
+    let response = serde_json::json!({
+        "type":"PLANNER_RESPONSE", "status":"DONE", "input_tokens":42
+    })
+    .to_string();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(response.as_bytes()).unwrap();
+    dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
+    assert_eq!(
+        state.context_tokens, None,
+        "partial records are not evidence"
+    );
+    file.write_all(b"\n").unwrap();
+    dispatch_hook(&mut state, snapshot_at(&path, "idle", 42));
+    assert_eq!(state.status, SessionStatus::Idle);
+    assert_eq!(state.context_tokens, Some(54));
+}
+
+#[test]
+fn cancelled_compaction_keeps_usage_and_does_not_reactivate_on_an_ordinary_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("transcript.jsonl");
+    append_prompt(&path, "/compact");
+    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    dispatch_hook(&mut state, snapshot_at(&path, "working", 9000));
+    assert_eq!(state.status, SessionStatus::Compacting);
+    dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
+    assert_eq!(state.status, SessionStatus::Idle);
+    assert_eq!(state.context_tokens, Some(9012));
+    for prompt in ["explain /compact", "/compaction", "continue"] {
+        append_prompt(&path, prompt);
+        dispatch_hook(&mut state, snapshot_at(&path, "working", 9000));
+        assert_eq!(state.status, SessionStatus::Active);
+    }
+}
+
 #[test]
 fn unknown_and_coarse_states_preserve_more_specific_hook_status() {
     let mut state =

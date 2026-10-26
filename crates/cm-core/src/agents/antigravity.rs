@@ -1,4 +1,4 @@
-//! Antigravity CLI integration, verified with `agy` 1.3.5. Only the current
+//! Antigravity CLI integration, verified with `agy` 1.4.5. Only the current
 //! CLI contract is supported; no compatibility layer for older versions.
 //!
 //! # Hooks and status snapshots
@@ -14,8 +14,12 @@
 //! distinguishes idle from working/thinking/tool_use. Unknown states leave
 //! status unchanged; snapshots do not reset prompt facts or failure messages.
 //! The sum of `context_window.total_input_tokens` and `total_output_tokens`,
-//! divided by `context_window_size`, matches its reported usage percentage.
+//! divided by `context_window_size`, tracks its reported usage percentage.
 //! `current_usage` instead describes the last API call.
+//! During manual `/compact`, `agent_state` is still `working`; the transcript's
+//! user request distinguishes it. A completed `CHECKPOINT` marks `Compacted`.
+//! Status snapshots retain pre-compaction usage even on resume, so context is
+//! unknown until a measured `PLANNER_RESPONSE` follows that checkpoint.
 //! The snapshot's transcript_path incorrectly names the GUI's state directory
 //! in 1.3.5, so we resolve the CLI log from the conversation id instead.
 //! The launcher incrementally folds first/last prompts from that log; the host
@@ -27,9 +31,11 @@
 //! PreToolUse is a permission gate, so we leave it alone. The launcher's task
 //! monitor reads live commands/timers from the conversation database at rest;
 //! Linux also uses a coalesced DB/WAL watch; macOS refreshes on hooks without
-//! periodic checks. Stop's `fullyIdle: false` retains Task through coarse idle
-//! snapshots. Compaction has no verified separate state. Fork and worktree flags
-//! are absent from 1.3.5's argv interface, although `/fork` exists in the TUI.
+//! periodic checks. Stop's
+//! `fullyIdle: false` retains Task through coarse idle snapshots. Automatic
+//! compaction starts have no verified separate signals. Fork and
+//! worktree flags are absent from the argv interface, although `/fork` exists
+//! in the TUI.
 //!
 //! # Configuration and state
 //!
@@ -63,9 +69,9 @@
 //! `Ctrl+V` was verified with 1.1.11: agy shells out to xclip for TARGETS and
 //! image/png without requiring DISPLAY, matching the pooled clipboard bridge.
 //! The opt-in live test uses a disposable home, a loopback Gemini fixture and
-//! a PTY to check startup, completion, cancellation, approval, clear, managed
-//! and bare resume, real HOME and global config preservation without credentials
-//! or external inference.
+//! a PTY to check startup, completion, cancellation, approval, compaction,
+//! clear, managed and bare resume, real HOME and global config preservation
+//! without credentials or external inference.
 
 mod metadata;
 pub(crate) mod tasks;
@@ -720,13 +726,24 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 
 /// Apply the observed activity before adopting snapshot facts. Ordinary
 /// lifecycle hooks retain the shared dispatcher's semantics.
-pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
     if msg.event == HookEvent::StatusUpdate
         && let Some(payload) = msg
             .raw
             .as_deref()
             .and_then(|raw| serde_json::from_str::<StatusPayload>(raw).ok())
     {
+        let compaction = msg
+            .transcript_path
+            .as_deref()
+            .and_then(|path| metadata::read_compaction(Path::new(path)))
+            .unwrap_or_default();
+        if compaction.usage_stale {
+            // This snapshot repeats usage from before the checkpoint. None
+            // means unknown, not zero; the next measured response restores it.
+            msg.context_tokens = None;
+            state.context_tokens = None;
+        }
         if let Some(capacity) = payload
             .context_window
             .and_then(|window| window.context_window_size)
@@ -742,8 +759,15 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
         ) {
             (_, true) => state.status = SessionStatus::WaitingForApproval,
             ("idle", false) => {
-                state.status = SessionStatus::Idle;
+                state.status = if compaction.completed {
+                    SessionStatus::Compacted
+                } else {
+                    SessionStatus::Idle
+                };
                 state.last_tool = None;
+            }
+            ("working" | "thinking" | "tool_use", false) if compaction.requested => {
+                state.status = SessionStatus::Compacting;
             }
             ("working" | "thinking" | "tool_use", false)
                 if matches!(
@@ -751,6 +775,8 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
                     SessionStatus::Starting
                         | SessionStatus::Idle
                         | SessionStatus::Active
+                        | SessionStatus::Compacting
+                        | SessionStatus::Compacted
                         | SessionStatus::BackgroundActive
                         | SessionStatus::WaitingForApproval
                 ) =>

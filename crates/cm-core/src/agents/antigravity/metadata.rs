@@ -1,4 +1,4 @@
-//! Prompt logs are append-only; titles live in a separate SQLite store.
+//! Prompt and compaction logs are append-only; titles live in a SQLite store.
 //! The launcher seeds prompts from the log's ends, then reads only new bytes.
 //! The host shares one cached title reader across its sessions, including
 //! remote subscribers.
@@ -81,12 +81,28 @@ fn read_prompt_ends(file: &mut (impl Read + Seek), len: u64) -> io::Result<(Tran
         }
     }
 
+    let (last, offset) = read_backwards(file, head_end, len, user_prompt)?;
+    if let Some(prompt) = last {
+        stats.last_prompt = Some(prompt);
+    }
+    Ok((stats, offset))
+}
+
+/// Visit complete lines from the end until a reader has enough evidence.
+/// Cross block boundaries without a fixed tail cutoff; discard a partial
+/// final write and return the last committed byte offset for prompt cursors.
+fn read_backwards<T>(
+    file: &mut (impl Read + Seek),
+    start: u64,
+    len: u64,
+    mut visit: impl FnMut(&[u8]) -> Option<T>,
+) -> io::Result<(Option<T>, u64)> {
     let mut block = [0; PROMPT_READ_BLOCK];
     let mut position = len;
     let mut committed_end = None;
     let mut reversed_line = Vec::new();
-    while position > head_end {
-        let size = (position - head_end).min(block.len() as u64) as usize;
+    while position > start {
+        let size = (position - start).min(block.len() as u64) as usize;
         position -= size as u64;
         file.seek(SeekFrom::Start(position))?;
         file.read_exact(&mut block[..size])?;
@@ -94,9 +110,8 @@ fn read_prompt_ends(file: &mut (impl Read + Seek), len: u64) -> io::Result<(Tran
             if byte == b'\n' {
                 if let Some(end) = committed_end {
                     reversed_line.reverse();
-                    if let Some(prompt) = user_prompt(&reversed_line) {
-                        stats.last_prompt = Some(prompt);
-                        return Ok((stats, end));
+                    if let Some(value) = visit(&reversed_line) {
+                        return Ok((Some(value), end));
                     }
                     reversed_line.clear();
                 } else {
@@ -108,13 +123,69 @@ fn read_prompt_ends(file: &mut (impl Read + Seek), len: u64) -> io::Result<(Tran
             }
         }
     }
-    // The first line after the opening prompt has no preceding delimiter in
-    // the searched range: head_end is already just past that delimiter.
+    // The first line in the range has no preceding delimiter.
     reversed_line.reverse();
-    if let Some(prompt) = user_prompt(&reversed_line) {
-        stats.last_prompt = Some(prompt);
+    Ok((visit(&reversed_line), committed_end.unwrap_or(start)))
+}
+
+#[derive(Default)]
+pub(super) struct Compaction {
+    pub requested: bool,
+    pub completed: bool,
+    pub usage_stale: bool,
+}
+
+/// agy 1.4.0 reports manual compaction as `working` and keeps pre-checkpoint
+/// usage in later status snapshots, including on resume. Read only as far back
+/// as the latest checkpoint or measured model response. A subsequent prompt
+/// ends the compacted status but cannot make those old usage numbers current.
+pub(super) fn read_compaction(path: &Path) -> Option<Compaction> {
+    #[derive(Deserialize)]
+    struct ContextStep {
+        r#type: String,
+        #[serde(default)]
+        status: String,
+        input_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
     }
-    Ok((stats, committed_end.unwrap_or(head_end)))
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut requested = None;
+    let (observed, _) = read_backwards(&mut file, 0, len, |line| {
+        let step: ContextStep = serde_json::from_slice(line).ok()?;
+        match step.r#type.as_str() {
+            "USER_INPUT" if requested.is_none() => {
+                if let Some(prompt) = user_prompt(line) {
+                    requested = Some(prompt.split_whitespace().next() == Some("/compact"));
+                }
+            }
+            "CHECKPOINT" if step.status == "DONE" => {
+                return Some(Compaction {
+                    requested: requested == Some(true),
+                    completed: requested.is_none(),
+                    usage_stale: true,
+                });
+            }
+            "PLANNER_RESPONSE"
+                if step.status == "DONE"
+                    && (step.input_tokens.is_some_and(|n| n > 0)
+                        || step.cache_read_tokens.is_some_and(|n| n > 0)) =>
+            {
+                return Some(Compaction {
+                    requested: requested == Some(true),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+        None
+    })
+    .ok()?;
+    Some(observed.unwrap_or(Compaction {
+        requested: requested == Some(true),
+        ..Default::default()
+    }))
 }
 
 pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> TranscriptStats {
