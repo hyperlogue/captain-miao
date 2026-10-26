@@ -1,5 +1,7 @@
 {
   inputs = {
+    # Runtime artwork is embedded at build time and stored in Git LFS.
+    self.lfs = true;
     nixpkgs.url = "nixpkgs/nixos-unstable";
     flake-parts = {
       url = "github:hercules-ci/flake-parts";

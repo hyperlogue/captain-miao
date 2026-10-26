@@ -1,11 +1,13 @@
 <p align="center">
-  <img src="assets/logo.jpg" alt="captain-miao logo" width="280">
+  <img src="assets/logo.jpg" alt="captain-miao logo" width="220">
 </p>
 
 <h1 align="center">captain-miao</h1>
 
-<p align="center"><b>Know which coding agent needs you, without checking all
-  terminal windows.</b></p>
+<p align="center"><b>Mission control for AI coding sessions in terminal.</b><br>
+See the status of all sessions and jump right to the terminal tab that needs you.<br>
+Support persistent sessions on remote servers. Close the lid and remote sessions
+will keep working.</p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@hyperlogue/captain-miao"><img src="https://img.shields.io/npm/v/@hyperlogue/captain-miao?color=cb3837&amp;logo=npm&amp;label=%40hyperlogue%2Fcaptain-miao" alt="npm version"></a>
@@ -13,789 +15,136 @@
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platforms: macOS, Linux">
 </p>
 
-Picture a normal afternoon. Six agent sessions open: four still thinking, one that finished ten minutes ago and is waiting on your follow-up, one stopped on a decision it won't make without you. You can't tell which is which without tabbing through all six.
+<a href="assets/captain-miao.mp4"><img src="assets/dashboard.png" alt="captain-miao dashboard in Kitty with 15 active and waiting agent sessions"></a>
 
-**captain-miao is a TUI dashboard for every coding agent you have running**, Claude Code, Codex and others. Each session gets a row that says what it's doing right now.
+[Watch the 60-second demo](assets/captain-miao.mp4)
 
-- **Show key information about your session in a compact format** Every session in one table: status, working directory, model, context usage, git branch, and a live transcript preview. Sessions that need your attention are highlighted.
-- **Integrate with your existing workflow** Sessions stay in native
-  windows/tabs/panes of the terminal you choose. captain-miao is non-intrusive to
-  your existing workflow.
-- **Support sessions on remote servers.** Manage and view sessions on a remote server in the same way as local sessions. One dashboard to drive the whole fleet.
+## Quick start
 
-https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a
+Install captain-miao and at least one [supported agent](#supported-agents):
 
 ```sh
-npx @hyperlogue/captain-miao
+npm install -g @hyperlogue/captain-miao
 ```
 
-Runs in the terminal you already use: [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [iTerm2](https://iterm2.com/), [zellij](https://zellij.dev/) or [tmux](https://github.com/tmux/tmux). See [Installation](#installation) for Cargo, Nix and prebuilt binaries.
+You can also run `npx @hyperlogue/captain-miao` after you configure your terminal.
+[Prebuilt binaries](https://github.com/hyperlogue/captain-miao/releases) are available for macOS and Linux.
 
-## Highlights
+**1. Configure your terminal**
 
-<img src="https://oss-assets.hyperlogue.tech/captain-miao/cm_screenshot.png" alt="captain-miao dashboard">
+| Terminal                                   | Preparation                                                                   |
+| ------------------------------------------ | ----------------------------------------------------------------------------- |
+| [Kitty](https://sw.kovidgoyal.net/kitty/)  | Enable remote control as shown below. Then restart Kitty.                     |
+| [zellij](https://zellij.dev/) ≥ 0.44       | Start inside a zellij session. Requires no extra configuration.               |
+| [tmux](https://github.com/tmux/tmux) ≥ 3.2 | Start inside a tmux session. Requires no extra configuration.                 |
+| [Ghostty](https://ghostty.org/) ≥ 1.3      | macOS: permit AppleScript Automation when prompted. No transcript preview.    |
+| [iTerm2](https://iterm2.com/) ≥ 3.0        | macOS: permit AppleScript Automation when prompted. Plain-text previews only. |
 
-Unlike herdr or cmux, captain-miao embeds no terminal of its own. It drives the
-Kitty, Ghostty, iTerm2, zellij or tmux you already run (every session is a native window
-or pane, controlled through the terminal's own protocol), so it stays one small,
-focused tool and the rest of your workflow is yours to compose.
-
-- **Sessions on remote servers:**
-  - Remote sessions run in a pty pool on the server, powered by [shpool](https://github.com/shell-pool/shpool). These sessions keep running when your laptop lid is closed.
-  - An image in the local clipboard can be pasted directly into a remote session through Ctrl-V, the same way as if it was a local session ([details](#pasting-a-screenshot-into-a-remote-session)).
-- **direnv-aware:** a session started in a directory with an `.envrc` picks up that environment automatically (via `direnv exec`).
-- **Keep-awake:** prevents your machine from sleeping while any local session is still working (`caffeinate` on macOS, `systemd-inhibit` on Linux).
-- **Background task controls:** use `Space t i` to count the selected session's background commands as **Idle**, including an `r3 watch` waiting for review. Manage remembered commands in **Preferences → Idle tasks**.
-
-## Requirements
-
-One supported terminal to drive, and at least one agent CLI on your `PATH`.
-
-### Terminals
-
-| Terminal                                                    | Notes                                                                                                                                     |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Kitty](https://github.com/kovidgoyal/kitty)**            | Needs remote control enabled ([Kitty setup](#kitty-setup)). Most of features in captain-miao are designed around Kitty.                   |
-| **[Ghostty](https://github.com/ghostty-org/ghostty)** ≥ 1.3 | **macOS only**, driven through Ghostty's AppleScript dictionary. Nothing in that API reads a window's screen, so there is **no preview**. |
-| **[iTerm2](https://github.com/gnachman/iTerm2)** ≥ 3.0      | **macOS only**, driven through iTerm2's AppleScript dictionary. Previews are plain text — iTerm2 returns no colour.                       |
-| **[zellij](https://github.com/zellij-org/zellij)** ≥ 0.44   | The stack layout is simulated by full screen floating windows.                                                                            |
-| **[tmux](https://github.com/tmux/tmux)** ≥ 3.2              | One window per session.                                                                                                                   |
-
-Every one of them runs the whole dashboard; the notes above are the deltas. One cosmetic difference isn't among them: the header's paw is a real image only under Kitty, the single backend that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (and not from inside zellij or tmux, even in a Kitty window). Click it to summon an anime kitten walking along the empty lane below the title bar: a ginger tabby, tuxedo, or calico (32% each), or a rare pink kitten (4%). Additional kittens can be summoned once per second, up to twelve at once. Clicks during the cooldown still pulse the paw. Everywhere else it's a `🐾` glyph and clicking it does nothing.
-
-### Agents
-
-| Agent                                                            | Notes                                                                                                                                                                                                                                                                  |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **[Claude Code](https://claude.com/claude-code)**                |                                                                                                                                                                                                                                                                        |
-| **[Codex](https://github.com/openai/codex)**                     | Native mode uses an owned `captain-miao` profile in your real `CODEX_HOME`; `--profile` / `-p` is reserved in that mode. Hosts can instead use a shared [app-server](docs/codex-app-server.md). `Ctrl+V` attaches remote images through the pool's clipboard bridge ([details](#pasting-a-screenshot-into-a-remote-session)). |
-| **[Reasonix](https://github.com/esengine/DeepSeek-Reasonix)**    | Token/model columns and worktrees don't work ([known limits](#reasonix-support)).                                                                                                                                                                                      |
-| **[Kimi Code](https://github.com/MoonshotAI/kimi-code)**         | Hooks can't be injected per-invocation, so a session runs under a synthetic `KIMI_CODE_HOME`. No fork and no worktrees ([known limits](#kimi-code-support)).                                                                                                           |
-| **[Grok Build](https://github.com/xai-org/grok-build)**          | Hooks via `~/.grok/hooks/captain-miao.json` (no-op outside captain-miao). Token and model columns come off `signals.json`. Worktree name isn't shown on the row ([known limits](#grok-build-support)).                                                                 |
-| **[opencode](https://github.com/anomalyco/opencode)**            | Has no hooks at all, so a session runs under a synthetic `OPENCODE_CONFIG_DIR` carrying a generated plugin. No worktrees ([known limits](#opencode-support)).                                                                                                          |
-| **[Pi](https://github.com/earendil-works/pi)**                   | Hooked with a generated extension passed as `pi -e`; nothing of yours is touched. No approval state (Pi has no per-tool gate), no resume-picker entries and no worktrees ([known limits](#pi-support)).                                                                |
-| **[Antigravity](https://antigravity.google/docs/cli/reference)** | Runs under a synthetic `$HOME` that symlinks your real one, since `agy` reads hooks only from `~/.gemini/config/`. No approval state, no fork, no worktrees, no token column, and an interrupted turn keeps reading as working ([known limits](#antigravity-support)). |
-| **[omp](https://github.com/can1357/oh-my-pi)**                   | Hooked with a generated extension passed as `omp -e`; nothing of yours is touched. No worktrees ([known limits](#omp-support)).                                                                                                                                        |
-
-> [!NOTE]
-> The Kitty/zellij + Claude Code/Codex have the best level of support and
-> features. Other terminals and agents are either in experimental stage or
-> feature incomplete due to the lack of API to customize their behavior.
-
-## Installation
-
-### From source with Cargo
-
-```sh
-cargo install --git https://github.com/hyperlogue/captain-miao
-```
-
-This installs the `miao` command (the project is captain-miao; the binary is short because you'll type it a lot).
-
-Building needs a Rust toolchain and a C compiler (for the statically-bundled SQLite that reads Codex session titles).
-
-### From a prebuilt binary (npm)
-
-No Rust toolchain, no build:
-
-```sh
-npx @hyperlogue/captain-miao              # run it once
-npm install -g @hyperlogue/captain-miao   # or install the `miao` command
-bunx @hyperlogue/captain-miao             # same, with bun (no Node needed)
-bun add -g @hyperlogue/captain-miao
-```
-
-The npm package is a small launcher that execs a prebuilt native binary shipped
-as a per-platform optional dependency, so your package manager downloads only
-the one binary matching your machine; nothing is fetched at runtime. Prebuilt
-binaries cover **macOS** (Apple silicon + Intel) and **Linux** (x86-64 + arm64),
-and are also attached to every
-[GitHub Release](https://github.com/hyperlogue/captain-miao/releases) as
-`miao-v<version>-<target>.tar.gz` if you'd rather download one directly.
-
-Every prebuilt binary carries an x86-64 glibc `miao-server`, so it can set up a
-remote host that has nothing installed on it — see [Running sessions on remote
-servers](#running-sessions-on-remote-servers). A host on another architecture, or
-one with no glibc, gets its server downloaded at deploy time instead. If you'd
-rather not depend on that, each release also has a
-`miao-bundled-all-server-v<version>-<target>.tar.gz` carrying every server
-captain-miao publishes — larger, and never needs the network.
-
-### With Nix
-
-A flake is provided; run it straight from GitHub:
-
-```sh
-nix run github:hyperlogue/captain-miao
-```
-
-## Kitty setup
-
-captain-miao drives Kitty over its [remote-control protocol](https://sw.kovidgoyal.net/kitty/remote-control/), so your `kitty.conf` must allow it. Remote control is a real privilege (a program that has it can read your terminal and run commands), so the tightest setup kitty offers pairs a password with an authorization script:
+For Kitty, add these lines to `~/.config/kitty/kitty.conf`:
 
 ```conf
-allow_remote_control password
-remote_control_password "i-am-the-captain-miao" captain_miao_rc.py
-listen_on unix:/tmp/mykitty
+allow_remote_control socket-only
+listen_on unix:/tmp/captain-miao-kitty
 ```
 
-Kitty resolves that filename against your config directory, so put the script at `~/.config/kitty/captain_miao_rc.py`:
+These settings allow programs with socket access to control Kitty windows.
+For more security, Kitty also supports [password authorization](https://sw.kovidgoyal.net/kitty/remote-control/).
 
-```python
-# The only remote-control commands captain-miao issues.
-ALLOWED_COMMANDS = frozenset({
-    "ls", "get-text", "launch", "focus-window",
-    "focus-tab", "close-window", "detach-window", "goto-layout",
-})
-
-def is_cmd_allowed(pcmd, window, from_socket, extra_data):
-    # Reject the in-terminal escape-code channel; only the listen_on socket gets in.
-    return from_socket and pcmd["cmd"] in ALLOWED_COMMANDS
-```
-
-Every request must now clear three checks: arrive over the socket (not the escape-code channel that a shell, even one across `ssh`, could otherwise use), carry the password, and name one of the commands above. `i-am-the-captain-miao` is captain-miao's built-in default, so this works as written; to use your own secret instead, set `remote_control_password` (above) and `[kitty] rc_password` in captain-miao's config to match. Keep the script the _last_ item after the password; command names listed alongside it are allowed without ever calling your function.
-
-Looser alternatives: `allow_remote_control socket-only` (off the escape-code channel, but no password and no allowlist) or `allow_remote_control yes` (no checks at all; avoid it). captain-miao verifies remote control at startup and exits with a diagnostic if it can't connect.
-
-**Keep the `stack` layout enabled.** captain-miao's default **Stacked** session layout puts every session in one kitty tab and shows one at a time via kitty's `stack` layout. The default `enabled_layouts *` already includes it; if you've narrowed that list, add `stack` or sessions tile instead of stacking. (The alternate **Per-tab** layout, toggled with `Space l`, needs no particular layout.)
-
-## Usage
-
-Run the dashboard inside a supported terminal (Kitty, Ghostty, iTerm2, zellij or tmux):
+**2. Start the dashboard**
 
 ```sh
+cd /path/to/your/project
 miao
 ```
 
-From the dashboard, `o` / `O` start new sessions and `r` resumes existing ones. You can also drive captain-miao from the shell:
-
-| Command                             | What it does                                                                                                                                                                                                                                                                                      |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `miao`                              | Run the TUI dashboard (the default).                                                                                                                                                                                                                                                              |
-| `miao launch <agent> [dir] [args…]` | Launch `<agent>` in `dir` (default `.`) with tracking hooks. Args starting with `-` (e.g. `--resume`) are forwarded straight to the agent. `<agent>` is one of `claude`, `codex`, `reasonix`, `kimi`, `grok`, `opencode`, `pi`, `antigravity`, `omp` — see [per-agent limits](#per-agent-limits). |
-| `miao focus [--window-id <id>]`     | Focus the running dashboard window; with `--window-id`, also ring the session running in that Kitty window.                                                                                                                                                                                       |
-| `miao hook <event>`                 | Internal: forwards an agent hook event to the launcher. You won't run this yourself; it's wired up automatically.                                                                                                                                                                                 |
-
-If a Codex conversation is already listed on the selected host, the resume
-picker reports the conflict immediately without opening another session. Use
-the existing row to attach, or restart it with `Space e`.
-
-Sessions launched via `miao launch <agent>` are wrapped by a _launcher_ process that tracks their activity, so they show up in the dashboard automatically. Nothing is written to your global `~/.claude/settings.json` or `~/.codex/hooks.json`. For native Codex, captain-miao writes one owner-only integration file: `~/.codex/captain-miao.config.toml` (or the same file under `$CODEX_HOME`), loaded only for managed sessions through `--profile captain-miao`. Because Codex selects only one named profile, forwarding your own `--profile` / `-p` is unsupported; move settings needed in managed sessions into the base `config.toml`. Codex writes its own answers into whichever profile it was launched with, so a directory you trust inside a managed session is trusted for managed sessions, not for a bare `codex` run. App-server mode observes the Codex protocol and uses no managed hook profile. Launching in a bare Ghostty window is refused — see [Ghostty setup](#ghostty-setup).
-
-### Per-agent limits
-
-Claude Code and Codex are the proven backends. The seven below all ship and track status; Antigravity and omp are the only two of them probed against a released binary, and the other five have **not been run against one** — report anything that looks wrong. A row stuck at `Starting` usually means the agent rejected our hook config.
-
-#### Reasonix support
-
-Status, launch, resume and fork work.
-
-- **No token or model columns** — Reasonix persists usage per day, not per session.
-- **No worktrees, no background-task tiers.**
-- **`reasonix setup` works inside a session** — its `.env` and `config.toml` are written into the synthetic home and moved back to your real `~/.reasonix` on the next launch.
-
-#### Kimi Code support
-
-Status, launch, resume and the **title, token and model columns** work. Esc mid-turn settles the row immediately, because Kimi reports an interrupt as a real hook. Written from Kimi's docs alone, so the least verified here.
-
-- **No fork** (`f` hides itself) — Kimi documents no flag to branch a resume, so the key would silently resume in place.
-- **No worktrees, no background-task tiers.**
-
-#### Grok Build support
-
-Status, launch, resume, fork, worktrees, and the **title, token and model columns** all work. An interrupt (Esc / Ctrl+C) settles the row — Grok 1.0.4 fires `StopCancelled` for one.
-
-- **The worktree name isn't shown on the row** (Grok keeps worktrees in its own registry, not beside the repo). The resume picker does show the branch. A `Stop` with live background work (`backgroundTasks` / `/loop` crons) lands on Task. Use the Idle task preferences to mark commands, including `r3 watch`, as Idle.
-- **`~/.grok/hooks/captain-miao.json` is always loaded**, including in grok sessions you start yourself. `miao hook` exits immediately when it has no launcher socket, so those events are discarded.
-- **`Ctrl+V` pastes a screenshot** on a Linux host offered the clipboard. Grok 1.0.5 otherwise never shells out to `wl-paste` in a displayless session, so a pooled launch sets the documented kill switch; a macOS host still needs `clipboard-paste`.
-
-#### opencode support
-
-Status, launch, resume, fork and the **title, tool, token and model columns** all work. opencode has no shell-command hooks, so captain-miao generates a JavaScript plugin for it.
-
-- **No worktrees, no background-task tiers** — a settled turn reads as `Idle` whatever else is still running.
-- Your global and project settings and plugins keep loading normally. An explicit `OPENCODE_CONFIG_DIR` keeps its override priority.
-- The plugin stays out of `permission.ask`, so nothing it does can delay a decision you're being asked to make.
-
-#### Pi support
-
-Status, launch, resume, fork and the **token, model and title columns** all work.
-
-- **No "waiting for approval" state** — Pi has no per-tool gate, so there is no prompt to reflect. An absence in Pi, not a gap here.
-- **No resume-picker entries** — Pi's sessions are trees rather than logs. `pi -r` opens Pi's own picker meanwhile.
-- **No worktrees, no background-task tiers.**
-- **A row stuck at `Starting` is usually Pi's project-trust prompt** — answer it in the session window.
-
-#### Antigravity support
-
-Status, launch, resume and the **model column** work, verified against `agy`
-1.1.11. Antigravity's whole hook vocabulary is five events and none of them
-fires at startup, on compaction, or while it waits on you, so most of what's
-missing below is missing from the agent rather than from captain-miao.
-
-- **An interrupted turn keeps reading as working** until you send the next
-  prompt — Esc fires no hook and leaves no mark in the transcript. The limit
-  most likely to bite day to day.
-- **No "waiting for approval" state.** Antigravity blocks on its permission
-  prompt without firing a hook. Its one pre-tool hook is a _gate_ rather than an
-  observer — every answer it can give changes what the agent does, and an
-  incomplete one denies the tool call — so captain-miao doesn't register it.
-- **A row sits at `Starting` until your first prompt.** Nothing fires when `agy`
-  starts, so that is the first moment a session can be identified.
-- **No fork** (`f` hides itself) — conversations fork from inside Antigravity's
-  own TUI, and no flag does it at launch.
-- **No token column or worktrees.** Background commands and timers are
-  tracked from the conversation database; completion refreshes on hooks.
-- **The resume picker lists a conversation only if a directory was recorded for
-  it.** Antigravity stores conversations flat with no project nesting; the cwd
-  comes from its prompt history, so a conversation older than that record is
-  skipped rather than offered against the wrong repo.
-- **A session runs under a synthetic `$HOME`** that symlinks your real one, and
-  that applies to the commands the agent runs too. Existing paths resolve
-  through the links as usual; a brand-new top-level dotfile written inside a
-  session lands in the synthetic home and is set aside as `.shadow-…` on the
-  next launch rather than deleted. Your own `~/.gemini/config/hooks.json` is
-  merged, not replaced.
-
-#### omp support
-
-Status, launch, resume, fork and the **approval, title, token and model
-columns** all work. omp is [Oh My Pi](https://github.com/can1357/oh-my-pi), a
-heavily-evolved fork of pi, and is hooked with a generated extension passed as
-`omp -e`; nothing of yours is touched. Verified against omp v18.4.8.
-
-- **A `Waiting for approval` state works** — omp has a per-tool approval gate
-  (`tool_approval_requested` / `tool_approval_resolved`), the one capability
-  pi lacks. `s` jumps to a session blocked on one.
-- **A question reads as a Decision** — when omp's `ask` tool puts a question
-  to you, the row shows `Decision` and rings for attention, separately from
-  the per-tool approval gate above.
-- **Esc mid-turn settles the row immediately** — omp's `agent_end` fires on an
-  aborted run too, so the case that costs Antigravity a stranded `Active` row
-  cannot arise.
-- **Resume-picker entries come from `~/.omp/agent/sessions`** (or
-  `$PI_CODING_AGENT_DIR/sessions`). Sessions in other `--profile` directories
-  are not listed; `omp -r` opens omp's own picker for those.
-- **Background-task tiers work** — a turn that settles while async bash jobs or
-  `task` spawns are still running lands on `Task`. Commands matching your Idle
-  task preferences appear as `Idle`. The generated extension reads omp's
-  `ctx.getAsyncJobSnapshot()` at turn end and forwards the live jobs; `omp ps`
-  and its daemon broker are a different tier (daemon-supervised named services)
-  and are not what these columns read.
-- **No worktrees** — omp has no launch-time worktree flag.
-
-### Key bindings
-
-Background work shows **Task** until you mark its commands as **Idle**. Manage
-the remembered commands in **Preferences → Idle tasks**: `Enter` edits, `a`
-adds, and `d` removes. Entries match the whole command; `*` matches any text
-(`\*` matches a literal star). The toggle saves exact commands and applies
-across hosts. All running commands must match before a session appears Idle;
-active turns and approval prompts keep their status. This replaces the Server
-and Review states and automatic one-hour learning. Existing sessions need a
-launcher restart with the updated build to report their commands; update
-`miao-server` first for pooled hosts.
-
-Confirmations accept with `y` or `Enter` and cancel with `Esc`, `Ctrl+C` or
-`n`. Other keys are ignored except navigation: `↑`/`↓`, `j`/`k`,
-`PageUp`/`PageDown`, `Home`/`End` and the mouse wheel scroll; `Ctrl+U`/`Ctrl+D`
-scroll half a page. Cancelling returns to the underlying screen.
-
-Press `?` in the dashboard for the complete list; scroll with `j`/`k`, Page Up/Down, `g`/`G`, or the mouse wheel. The six you'll reach for most:
-
-| Key                            | Action                                                                                                             |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `j`/`k`, `↑`/`↓`, `Ctrl-n`/`p` | Navigate sessions                                                                                                  |
-| `Enter`                        | Focus the selected session's window, or attach one to a detached session (asking first if another client holds it) |
-| `o` / `O`                      | New session (same cwd / prompt for cwd)                                                                            |
-| `r` / `f`                      | Resume picker (one host; `Ctrl-h` switches) / fork the selected session                                            |
-| `X` / `D`                      | Close the selected session / detach from it, leaving it running                                                    |
-| `s`                            | Jump to the next session needing attention                                                                         |
-
-#### Remaining key bindings
-
-| Key                   | Action                                                                                                                                                                     |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gg` / `G`            | Jump to top / bottom                                                                                                                                                       |
-| `1..9` / `Ctrl-1..9`  | Select Nth session / select and focus its window                                                                                                                           |
-| `p` / `i`             | Pin / toggle needs-input on the selected session                                                                                                                           |
-| `y`                   | Copy the selected session id to the clipboard                                                                                                                              |
-| `t` / `w`             | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab                                                                                                 |
-| `h`/`l`, `←`/`→`      | Scroll the preview horizontally                                                                                                                                            |
-| `Ctrl-u` / `Ctrl-d`   | Scroll the preview up / down                                                                                                                                               |
-| `R`                   | Refresh the preview now                                                                                                                                                    |
-| `Space t v` / `Space t d` | Toggle the preview / detail panel                                                                                                                                          |
-| `Space t s`           | Session record — pid, terminfo, context, updated, and the first prompt (`Esc` closes)                                                                                      |
-| `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
-| `Space v p` / `Space v l` | Push / pull (fast-forward only)                                                                                                                                       |
-| `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
-| `Space t z`           | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
-| `Space t i` | Toggle the selected session's background commands between Task and Idle. |
-| `,` (Agents) / `Space h` | Reorder agents / hosts to choose the default for new sessions                                                                                                                    |
-| `,` / `Space p`       | Preferences; **General → Session layout** changes stacked/per-tab layout where supported                                                                                  |
-| `Space h` / `Space s` | Hosts panel (`J`/`K` reorder; first is default, add, edit, port forwards with `f`, suspend with `c`, upgrade the host's server with `u`, connection log with `l`) / attach to a session, kicking the client holding it |
-| `Space A`             | Attach a window to every detached session that's free to take (rows another client holds are skipped, not stolen)                                                          |
-| `Space m`             | Message log — notification history, newest last (`j`/`k`, `g`/`G` to scroll; in memory only, last 200)                                                             |
-| `x`                   | Dismiss the newest notification (or click its `×`)                                                                                                                     |
-| `Esc`                 | Close a popup or cancel input/a key sequence; clear the search filter; otherwise dismiss the newest notification                                                         |
-| `?`                   | Show the full key list (help overlay)                                                                                                                                      |
-| `/`                   | Search                                                                                                                                                                     |
-| `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
-
-Confirmation prompts marked `[y/N]` require `y` or `Y`; Enter cancels.
-`Ctrl-1..9` needs terminal support for distinct modified digits; `1..9` followed
-by Enter works through the ordinary select/focus bindings.
-
-The Hosts panel shows each host's emoji before its name. A `↑` marks a connected
-host whose server is older than the dashboard; press `Enter` for version details.
-
-Pooled sessions automatically mark needs-input on their host when work finishes,
-even while the dashboard is disconnected. Reconnecting restores that flag;
-focusing the session or pressing `i` clears it, and new work clears it
-automatically. Direct-local sessions track these transitions in the dashboard.
-Upgrade `miao-server` on each pooled host (including pooled localhost) to the
-build matching your dashboard: completion tracking moved to the server, so an
-older server will not arm the yellow dot when a turn finishes. Use the Hosts
-panel's `u` action when offered, or update your own server installation and
-restart its daemon.
-
-An unknown sequence after `Space` or `g` cancels the prefix and consumes the
-key without running a session action. Existing defaults and command ids are
-kept stable; new actions should use free keys within the related leader menu.
-
-Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, background task Idle status, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
-
-Pins and follow-up flags are saved on the session's host and shared across
-dashboards, including direct-local sessions. The daemon tracks completion while
-remote dashboards are disconnected, so the follow-up flag is ready on reconnect.
-Existing local flags migrate automatically from dashboard preferences.
-
-Push and pull start immediately without a confirmation prompt, reading fresh
-checkout status even when the Detail panel is hidden. They keep running when you
-navigate elsewhere. Only one Git operation runs per checkout at a time. A deleted
-tracking branch appears as `upstream gone`; push can recreate it.
-
-Push uses Git's configured push remote and publishes the prepared commit to one
-branch, without force or extra tags. Mirror, wildcard, and multiple-ref pushes
-must be run outside the dashboard. Pull fetches its candidate and fast-forwards
-only to that commit. If the checkout, commit, or destination changes during
-preparation, the operation stops; invoke it again to retry. These checks do not
-lock out other programs using the checkout.
-
-Dashboard notifications float in the bottom-right corner and stack vertically.
-New sessions immediately show a `Starting` row in the usual session styling,
-named `new-session` until the launcher reports the real session. It follows the
-normal idle-session ranking, below pinned and attention rows. You can keep
-navigating while it starts; doing so keeps the new row from moving your cursor.
-If you quit during a launch, the dashboard finishes recording its window first.
-Session launches only show a notification if an error occurs. Successful session
-termination is silent.
-Git progress updates one popup until the operation finishes. Information and
-successful results disappear after five seconds; warnings and errors stay until
-you dismiss them. Click a popup's `×` to close it, or press `x` to dismiss
-the newest notification (`dismiss_notification` in `[keybinds]`). `Esc` handles
-open dialogs, text input, and pending key sequences first, then clears any search
-filter; otherwise it dismisses the newest notification. Its Normal-mode action
-is configurable as `clear` in `[keybinds]`. Dismissing progress does not cancel
-the operation; its result still appears. Notifications briefly fade from dim to
-normal on arrival. `Space m` opens their history,
-including the full text of long messages and notifications hidden above the stack.
-The panel distinguishes info, warnings and errors by color and label. Each entry
-shows local ISO 8601 time to the second, its UTC offset, and a single-unit age
-(for example, `(-2h)`). Scroll with the mouse wheel or the pager keys. Drag across
-message text and release to copy through OSC 52; the terminal must permit
-clipboard writes. Copied text retains its original line breaks and excludes
-timestamps, severity labels and display wrapping.
-
-Commands have a 60-second host-side budget, including queueing and cleanup. On
-timeout, the dashboard stops its Git process group and reports an unknown outcome
-if an update may have started; check the checkout and remote before retrying.
-Commands are never retried automatically. Remote commands require an updated
-server; older dashboards must also update before issuing commands to a new server.
-
-The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead (`↑`) or behind (`↓`), and the working tree (clean, dirty, or mid-operation). That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
-sessions show connection or cleanup information with available recovery keys;
-narrow layouts prioritize those hints. The **Last error** section disappears after
-five minutes; older launchers without an error timestamp use the session's last
-update time. For Codex app-server sessions, a forced
-removal reports whether the thread was missing or the server was unreachable,
-and warns when server-side work could still be running. Results stay in the
-message log (`Space m`). See [Codex lifecycle details](docs/codex-app-server.md).
-
-In Kitty, new work tabs opened with `w` follow the dashboard, `miao:sessions`
-(when present), and earlier work tabs, keeping them together before other tabs.
-Pressing `w` again for the same cwd switches to its existing work tab.
-Opening or switching work tabs only shows a notification if an error occurs.
-
-In the cwd picker, `Ctrl-t` switches the backend for that one launch, `Ctrl-h` the host, and `Ctrl-d` drops the highlighted recent directory.
-It opens pointed at the focused session's own workdir when that host's recent list holds it, so a single `Enter` starts a second session alongside the one you were looking at. That choice then follows `Ctrl-h` from host to host: a host that doesn't have the directory falls back to the top of its own list without losing it, so cycling on to one that does lands back on it. Moving the cursor picks a new one.
-
-**Custom keybindings.** Every Normal-mode command above is remappable via a `[keybinds]` table in `~/.config/captain-miao/config.toml`. Map a command id to a key (or list of keys); an empty list unbinds it:
-
-```toml
-[keybinds]
-close_session = "delete"        # move session closing from X to Delete
-dismiss_notification = "f8"      # move notification dismissal from x to F8
-jump_attention = ["s", "n"]     # bind two keys to one command
-restart = "space r"             # remap a leader sequence
-toggle_detail = []              # unbind a command
-```
-
-Keys parse forms like `"ctrl+u"`, `"O"` (= `"shift+o"`), `"space e"`, `"space v p"` (up to three chords), `"enter"`, `"f5"`, and arrow names. `Ctrl-c` is reserved for quitting. The `g g` and `1..9` / `Ctrl-1..9` shortcuts are built-in fallbacks; an explicit configured binding takes precedence.
-
-Command ids are the string in each `Command::id()`; the authoritative list lives in the `DEFAULTS` table in [`src/app/keymap.rs`](src/app/keymap.rs), and they match the actions in the key-bindings table above.
-The old `kill` name remains an alias for `close_session`. If both are configured,
-`close_session` takes precedence.
-
-**What's new.** Existing dashboard users see a one-time startup inbox for new
-features, changes, and upgrade warnings. The selected item's details sit above
-a bordered list of updates. Warnings appear first, and the first item is
-selected initially. Use arrows or `j`/`k` to select an item, or click its row.
-Tab switches focus between the list and details; arrows or `j`/`k` then scroll
-the focused panel. Page Up/Down always scroll details, and the mouse wheel
-operates on the panel under the pointer.
-
-The shortcut update explains `X` for closing sessions and `x` for dismissing
-notifications, shows your active bindings, and includes a snippet to restore
-the previous default:
-
-```toml
-[keybinds]
-close_session = "x"
-dismiss_notification = []
-```
-
-Click **Copy snippet** on the bottom border or press `c` in the popup to copy
-it, then edit `config.toml` and restart miao. TOML snippets have syntax
-highlighting and extra vertical spacing.
-
-Viewing an item's details marks it read with a checkmark in the list. Press
-Enter or click **Next unread** to visit the next unread item. Once every item
-has been viewed, Enter or **Got it** closes the inbox and acknowledges the
-batch. Read status lasts only while the popup is open; browsing does not save
-acknowledgements. The completed batch stays acknowledged across restarts; your
-configured `close_session` (or `kill`) and `dismiss_notification` bindings remain
-in effect.
-Fresh installs skip existing announcements. Existing use is detected from saved
-dashboard preferences or window bindings before startup writes new state.
-The dashboard stores only `last_dashboard_version` in
-`dashboard-overrides.json` to track announcements. Upgrading from version `x`
-to `y` shows every announcement introduced in `(x, y]`, warnings first and
-oldest first within each kind, with each item's version shown in the list and
-details. This includes all announcements
-from skipped releases. The same version and downgrades show no announcements;
-adding an item to an already-seen version does not reopen the inbox.
-Acknowledging the batch records `y`. Escape postpones the inbox without
-acknowledging it. Postponing or quitting with Ctrl+C first leaves `x`
-unchanged, so the batch appears on the next launch. Ordinary preference saves
-preserve the version. Fresh installs and launches without announcements record
-the current version immediately. Existing dashboards without a recorded version
-see all applicable announcements once.
-
-New announcements are declared in the
-[`ANNOUNCEMENTS` catalog](src/app/announcements.rs) with a stable ID,
-introduction version, title, kind (`Update` or `Warning`), and content.
-Feature promotions and migrations use the same inbox. Text, headings, code
-snippets, and active shortcut bindings share its rendering and persistence;
-keep introduction versions stable and give each new announcement a new ID.
-IDs identify catalog entries; acknowledgement is tracked only by version.
-
-Codex can also run through a shared app-server, selected **per execution host**.
-Open **Space h → host → e** to set **Codex** to `app-server` and configure its Unix
-socket. The permanent **localhost** entry configures this machine. New launches
-and explicit restarts use the setting; existing sessions keep their current mode.
-See [Codex execution modes](docs/codex-app-server.md) for migration, interface
-coverage, daemon lifecycle and environment differences.
-
-## Configuration
-
-captain-miao reads an optional TOML file at `~/.config/captain-miao/config.toml` (or `$XDG_CONFIG_HOME/captain-miao/config.toml`). Every key is optional and falls back to the default shown below; an unparseable file falls back to defaults for the dashboard. Codex launches reject invalid configuration so a broken mode setting cannot silently change execution ownership. The complete set of options:
-
-> **Using remote hosts?** This file is read per-machine, so a host running `miao-server` has its own, independent of your dashboard's. Almost everything below is read only by the dashboard — including all of `[remote]`. The exceptions are `[launcher] max_recent_cwds`, `[launcher] approval_grace_secs`, `[codex]` and `[debug]`, which each host supplies for itself. Worth knowing for `[remote] inherit_env` in particular: the variables it names live on the host, but the setting is read from the **dashboard's** file and threaded over the connection, so putting it in the host's `config.toml` silently does nothing. See [docs/remote-sessions.md](docs/remote-sessions.md#configtoml-is-per-machine-and-the-halves-are-not-interchangeable).
-
-```toml
-[terminal]
-# The terminal itself is auto-detected (zellij, then tmux, then iTerm2/Ghostty,
-# else Kitty); there is no key to pin it.
-sessions_layout = "stacked"  # "stacked" | "per-tab" (the runtime Space l toggle overrides this;
-                             # tmux, Ghostty and iTerm2 are always per-tab)
-
-[kitty]
-rc_password = "i-am-the-captain-miao"   # the built-in default, and a published constant; set your own (see Kitty setup)
-
-[launcher]
-default_agent = "claude"     # backend for new sessions: "claude" | "codex" | "reasonix" |
-                             # "kimi" | "grok" | "opencode" | "pi" | "antigravity" | "omp";
-                             # a name this build can't drive falls back to Claude
-                             # (Space a overrides)
-approval_grace_secs = 2      # grace window after a permission dialog before a transcript change reads as "dismissed"
-max_recent_cwds = 50         # entries kept in the workdir picker's recent list
-resume_list_limit = 50       # max sessions listed in the resume picker (most recent first)
-new_tab_title = "{agent}: {basename}"     # new-session tab title; placeholders: {agent} {basename} {cwd}
-resume_tab_title = "{agent}: {basename}"  # resumed-session tab title
-pooled = false               # run this machine's sessions in a local pty pool, so they
-                             # survive closing the window; needs miao-server on PATH
-
-[codex]
-mode = "native"             # "native" | "app-server", owned by each execution host
-endpoint = "unix://"         # default Codex control socket; also unix:///path/to/socket
-
-[remote]
-on_window_close = "close"    # "close" | "detach": what closing a pooled session's window
-                             # does to the session. Only a window *you* close counts — an
-                             # attach that ends because its link died (a laptop resuming to
-                             # a dropped ssh) always detaches, and the session keeps running.
-inherit_env = []             # host environment variable names to forward into pooled
-                             # sessions, e.g. ["ANTHROPIC_API_KEY"]. Names only, matching
-                             # [A-Za-z_][A-Za-z0-9_]*.
-                             #
-                             # NEW SESSIONS ONLY. The value is read on the host and baked
-                             # in when the session is created; sessions already running
-                             # keep whatever they started with. Editing this list, or
-                             # rotating a key, changes nothing until you kill a session and
-                             # start a fresh one — reattaching an existing one will not do
-                             # it, and nothing in the dashboard flags the mismatch.
-                             #
-                             # Before you list a secret: the pty pool writes each forwarded
-                             # NAME=VALUE to $SHPOOL_SESSION_DIR/forward.env on the host in
-                             # cleartext, mode 0644, and on the ssh path the directory above
-                             # it stays 0755 too — so every local account on that host can
-                             # read it. Nothing cleans it up; it outlives the session and,
-                             # where XDG_RUNTIME_DIR is unset, the reboot.
-                             # See docs/remote-sessions.md.
-
-[thresholds]
-context_warning_tokens = 175000    # context usage turns to the warning color here
-context_critical_tokens = 400000   # …and to the critical color here
-preview_stale_secs = 20            # show "updated Ns ago" once the preview is older than this (0 = always)
-
-[polling]
-fs_reload_debounce_ms = 100        # debounce for filesystem-watch reloads
-preview_debounce_ms = 200          # debounce before re-fetching the preview
-event_poll_ms = 100                # input poll interval (floored at 10)
-preview_auto_refresh_secs = 10     # auto-refresh the preview while focused + busy + unscrolled (0 disables)
-
-[ui.panels]
-preview_auto_min_height = 16       # min body height before the preview auto-shows
-detail_auto_min_width = 70         # min body width before the detail panel auto-shows
-detail_default_width = 36          # detail panel column width
-narrow_max_width = 90              # at/below this body width the layout stacks vertically
-
-[ui.table]
-name_truncate = 35                 # max characters of a session name before truncation
-
-[colors.ui]
-title_fg = "cyan"
-header_fg = "cyan"
-attention_fg = "yellow"
-error_fg = "red"
-highlight_bg = "dark_gray"
-selection_fg = "blue"
-selection_symbol = "❯ "         # display width = cursor gutter width; keep the
-                                # trailing cell unless the glyph paints within one
-
-[colors.picker]
-highlight_bg = "dark_gray"
-chevron_fg = "blue"
-
-[debug]
-enabled = false                    # verbose logging; also enabled by CAPTAIN_MIAO_DEBUG=1
-log_file = "debug.log"
-keybind_log_file = "keybinds.log"
-
-[keybinds]
-# Remap any Normal-mode command: command-id = "key" or ["key", "alt"]; [] unbinds.
-# command-ids are the Command::id() strings in src/app/keymap.rs (DEFAULTS table).
-# e.g. close_session = "delete"  /  jump_attention = ["s", "n"]  /  restart = "space r"
-```
-
-Colors accept named values (`cyan`, `dark_gray`, …) or `#rrggbb` hex. The command ids for `[keybinds]` are the ones in the key-bindings table above (`close_session`, `jump_attention`, `restart`, `toggle_preview`, …).
-
-### Running sessions on remote servers
-
-Add hosts with `Space h`. Each runs a `miao-server` daemon holding its sessions
-in a pty pool, and the dashboard attaches local windows to them over ssh — so a
-dropped connection or a slept laptop detaches windows without touching the
-sessions, and reconnecting brings them back. Full design notes:
-[docs/remote-sessions.md](docs/remote-sessions.md).
-
-The panel lists host, connection state, session count, CPU, memory, disk, and
-latency in aligned columns. Disk measures space used on the host's home
-filesystem. All three percentages use the attention color at 80% and the error
-color at 90% (yellow and red by default). `Enter` opens details, including full
-failure messages, connection settings, and the daemon version, with labeled
-values and two columns when the terminal has room. `e` edits the
-host in one form grouped into Connection, Codex, and Services; Tab or `↑`/`↓`
-walks all fields, and `Alt+1/2/3` jumps to a section without hiding the others.
-The form scrolls to keep the focused field visible on smaller terminals.
-Enter applies edits and Escape cancels the entire draft.
-`J`/`K` reorder hosts; the first usable host is the default for new sessions.
-`?` shows host commands, including `l` for the connection log, `c` to suspend or
-reconnect, `f` for port forwards, and `u` to upgrade the server when available.
-
-- **Detached rows** — running there, no window here — are dimmed and marked 🙈
-  when free or 👀 when another client is holding one. `Enter` attaches, `Space A`
-  attaches every free one, `Space s` steals a held one.
-- **Closing a session's window ends it**, the same as `X`; set `on_window_close =
-"detach"` under `[remote]` for the opposite. A window lost to a dropped link
-  detaches instead, so a flaky network never costs you a session.
-- **Port forwards** — press `f` on an SSH host to add, edit, duplicate (`y`),
-  enable/disable (`Space`), or delete (`d`) individual forwards. Local, remote,
-  and SOCKS forwarding have dedicated fields; `Ctrl-r` opens the raw spec editor
-  for socket forwards. Import (`i`) accepts ports such as `3000 5173 8080` or
-  existing `-L`/`-R`/`-D` arguments. Saved changes apply without reconnecting the
-  host; failures appear in the manager and leave the previous configuration in
-  place. Offline rules wait for the host. Escape cancels an unfinished edit.
-  Existing forwarding options migrate automatically into rows.
-- **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
-  belongs in `~/.ssh/config`. Changing these connection options can reconnect
-  the host. The forwarding list manages ports independently.
-- **SSH agent forwarding** — work tabs and dashboard Git push/pull follow
-  `ForwardAgent` in your SSH configuration and Advanced SSH options; there is
-  no separate captain-miao toggle. For example, set `ForwardAgent yes` in the
-  matching `Host` entry in `~/.ssh/config`. Work tabs use independent SSH
-  connections, with forwarding lasting until that connection closes. The
-  shared server connection, provisioning and pooled-session attachments always
-  disable forwarding.
-
-  Before network Git requests, the dashboard checks the effective SSH setting.
-  When forwarding is off, Git uses the remote host's existing authentication
-  without opening another connection. When on, each request opens a fresh SSH
-  connection, passes its agent socket only to that Git request, and closes it
-  when the request ends. Pull preparation also uses a short connection to check
-  and fetch the branch; forwarding closes while you review the confirmation.
-  If SSH provides no agent, the extra connection closes and Git uses the
-  remote host's existing authentication, as it does when forwarding is off.
-  Start the dashboard with access to your agent, usually through `SSH_AUTH_SOCK`
-  or SSH's `IdentityAgent` setting. Forwarded Git requests require an updated
-  `miao-server`; the daemon's startup environment does not need to change.
-  Changes to SSH configuration apply to new work tabs and subsequent Git
-  requests. Old `forward_agent` values in `hosts.json` are ignored.
-  Existing shells inside a persistent tmux or Zellij session can retain an old
-  `SSH_AUTH_SOCK`; reconnecting SSH does not update those running processes.
-  Only enable forwarding for hosts you trust: the remote account or root can
-  use your agent while the forwarding connection is open.
-- **Work tab command** — edit an SSH host with `Space h` → `e` and set this
-  optional field to a shell command. Pressing `w` on one of that host's sessions
-  opens a work tab in its directory and runs the command in the remote user's
-  interactive login environment. The command receives `$MIAO_WORKDIR`, the
-  absolute directory on that host, and `$MIAO_WORKSPACE`, a stable name such as
-  `miao-project-9d2bf386d45fe429`. Both are set before shell startup scripts run.
-  The name combines a short, sanitized basename with a hash of the full
-  host-canonical directory. It survives dashboard restarts and host renames;
-  directories with the same basename and separate worktrees get distinct names.
-  For a persistent Zellij workspace, use:
-
-  ```sh
-  zellij attach --create "$MIAO_WORKSPACE" options --default-cwd "$MIAO_WORKDIR"
-  ```
-
-  A successful command exit (including Zellij detach) closes the work tab, so
-  pressing `w` again opens a new tab and reattaches to the same workspace.
-  On failure, a login shell opens so errors stay visible. Missing, empty, or
-  whitespace-only `shell_command` opens the default user login shell. Pressing
-  `w` on an existing work tab just focuses it. Changes apply to new tabs without
-  reconnecting the host. The setting lives per host in `hosts.json` on the
-  dashboard machine.
-- **Terminfo** — a host with no entry for your `TERM` is offered yours, so
-  sessions there stop falling back to `xterm-256color`. It asks first.
-- **The daemon** is either your own on `PATH` or one the dashboard deploys.
-  `cargo xtask dist` bundles servers into the binary (`--list` shows the
-  variants); carrying none for a host, it offers to download the published one.
-  `miao --version` reports what a binary carries.
-  Its control and pool sockets live under `~/.local/state/captain-miao/run/`
-  (or `$XDG_STATE_HOME/captain-miao/run/`), so local and SSH connections agree
-  even when their `XDG_RUNTIME_DIR` differs. `daemon ensure` waits briefly for
-  an unavailable daemon and then reports an error, preserving its sessions.
-  Retry after recovery, or explicitly stop it with `miao-server daemon stop`;
-  `--force` is required when that would end live pooled sessions.
-  On upgrade, `daemon ensure` can link the fixed paths to an older daemon's
-  verified live sockets, keeping its sessions running until a planned restart.
-  Update both the server on `PATH` and any deployed copy used by your clients:
-  older `daemon ensure` binaries still contain the destructive recovery logic.
-- **Run `loginctl enable-linger "$USER"`** on any Linux host running the daemon,
-  to protect session runtime directories at logout. Daemon sockets now live in
-  the state tree, but launcher and clipboard sockets still use the runtime
-  directory, and host logout policies can terminate processes.
-
-#### Pasting a screenshot into a remote session
-
-A host's **Clipboard** field (`Space h`, `e`, then `Space` on it) offers that host
-**this machine's clipboard**, so `Ctrl+V` in an agent running there attaches a
-screenshot you just took here. It works by shadowing `xclip`/`wl-paste` on the
-agent's `PATH` with a shim that asks back over an owner-only unix socket,
-ssh-forwarded while the host is connected. Codex uses the same bridge through
-the pool's input handler, because its native clipboard reader bypasses those
-commands. A row that has it on shows 📋.
-
-**Only images are ever served.** Text is not filtered out — it is never requested,
-so a remote can't read your password manager through this. It is off by default
-and per-host, because while a host is connected anything running as you there
-(including the agent, which runs arbitrary code by design) can read your clipboard
-when it holds an image.
-
-Turning the field off, suspending the host, or deleting it closes its local
-clipboard relay and active transfers immediately, even if SSH cleanup fails.
-Re-enabling uses a fresh relay. If multiple rows share the same SSH master and
-remote clipboard socket, access stays enabled until the last of those rows turns
-it off. Images already received by the remote remain there.
-
-Sharp edges worth knowing:
-
-- **Codex's `Ctrl+V` attaches the image and keeps your draft.** The pool fetches
-  the image and delivers its path as a bracketed paste, which Codex recognizes
-  as an attachment. Verified with Codex 0.153.4, including its extended keyboard
-  protocol. Each image gets a separate private file, retained until the session
-  exits so multiple attachments remain intact. Ordinary text paste is unchanged.
-  This needs an updated host daemon; an older daemon still reports the X11
-  timeout. `!clipboard-paste` remains a manual fallback in Codex; from a shell
-  on that host, use `miao-server clipboard paste`.
-- **Claude Code and Antigravity are confirmed to work through the shim.**
-  Grok Build 1.0.5 reads the clipboard
-  in-process (arboard) and only shells out to `wl-paste` when `WAYLAND_DISPLAY`
-  is set, so a pooled launch without a display sets Grok's documented kill
-  switch and a dummy value rather than waiting on arboard. Reasonix, Kimi Code,
-  opencode and Pi are shimmed identically but untested: each works if it shells
-  out to `xclip`/`wl-paste` and silently does nothing if it reads the clipboard
-  in-process the way Codex does. `clipboard-paste` works on all of them
-  regardless, so treat it as the reliable route until one is confirmed.
-- **On a macOS host**, agents using `osascript` bypass the command shims and
-  need `clipboard-paste`. Codex's pool input route does not depend on that tool.
-- **On a Linux dashboard** only what the clipboard actually offers can be served,
-  so a browser-copied JPEG answers "no image" — there is no converter on that side.
-  macOS re-encodes, so anything on the pasteboard works.
-- **Command shims require a session restart** to pick up changes. Codex's pool
-  input route can use the clipboard as soon as its forwarding socket is available.
-- **Two dashboards on different machines against one host** collide: the later one
-  wins the forward and the earlier one's paste stops working until it reconnects.
+Press `o` to start an agent in the directory of the selected session.
+If you do not select a session, `o` opens the directory picker.
+Press `O` to select a directory.
+In the directory picker, press `Ctrl-t` to select an agent.
+Press `r` to resume a previous conversation.
+
+The dashboard highlights sessions that require attention.
+Press `s` to select the next highlighted session.
+Press `Enter` to focus its window.
+In Ghostty, start agents from the dashboard.
+
+## Why captain-miao
+
+- **Keep your terminal environment.** Sessions run in native windows, tabs, or panes.
+  Your fonts, settings, and key bindings do not change.
+- **No changes to global agent settings.** Managed sessions use isolated tracking hooks.
+  The files `~/.claude/settings.json` and `~/.codex/hooks.json` remain unchanged.
+  Integrations use separate files and profiles.
+- **Persistent remote sessions.** `miao-server` runs agents in a [shpool](https://github.com/shell-pool/shpool) pty pool.
+  Sessions continue when your computer sleeps or disconnects.
+  Enable clipboard sharing to paste local images into remote agents with `Ctrl-V`.
+
+## Supported agents
+
+The ✓ mark indicates stable integrations in both support tables.
+Other integrations have API limitations or less testing.
+
+| Agent                                                        | Stable | Support notes                                                                                    |
+| ------------------------------------------------------------ | :----: | ------------------------------------------------------------------------------------------------ |
+| [Claude Code](https://claude.com/claude-code)                |   ✓    | Configures tracking hooks per session.                                                           |
+| [Codex](https://github.com/openai/codex)                     |   ✓    | Uses a managed native profile or shared app-server. Do not use native `--profile`.               |
+| [Grok Build](https://github.com/xai-org/grok-build)          |   ✓    | Uses a dedicated hook file. The session row does not show the worktree name.                     |
+| [Antigravity](https://antigravity.google/docs/cli/reference) |   ✓    | Tracks model, context, approvals, cancellations, and background tasks.                           |
+| [Reasonix](https://github.com/esengine/DeepSeek-Reasonix)    |        | Does not show token or model columns.                                                            |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-code)         |        | Does not support session fork or worktrees.                                                      |
+| [opencode](https://github.com/anomalyco/opencode)            |        | Uses a generated plugin. Does not support worktrees or background-task tiers.                    |
+| [Pi](https://github.com/earendil-works/pi)                   |        | Supports resume picker, fork, and context tracking. Does not track approval states or worktrees. |
+| [omp](https://github.com/can1357/oh-my-pi)                   |        | Tracks approvals, decisions, and background tasks. Does not support worktrees.                   |
+
+Antigravity uses a separate configuration copy for managed sessions.
+captain-miao preserves your custom status-line command.
+Updates to your global configuration apply during the next launch.
+
+## Supported terminals
+
+| Terminal                                   | Stable | Support notes                                                                   |
+| ------------------------------------------ | :----: | ------------------------------------------------------------------------------- |
+| [Kitty](https://sw.kovidgoyal.net/kitty/)  |   ✓    | Full support, including stacked windows and styled previews.                    |
+| [zellij](https://zellij.dev/) ≥ 0.44       |   ✓    | Supports floating panes and styled previews. Cannot move sessions between tabs. |
+| [tmux](https://github.com/tmux/tmux) ≥ 3.2 |        | One window per session with styled previews. No stacked layout.                 |
+| [Ghostty](https://ghostty.org/) ≥ 1.3      |        | macOS only. Start agents from the dashboard. No transcript preview.             |
+| [iTerm2](https://iterm2.com/) ≥ 3.0        |        | macOS only. Shows plain-text previews of the active screen.                     |
+
+## Key bindings
+
+The six most frequent shortcuts:
+
+| Key                  | Action                                                 |
+| -------------------- | ------------------------------------------------------ |
+| `j` / `k`, `↑` / `↓` | Navigate sessions.                                     |
+| `Enter`              | Focus the window of the selected session.              |
+| `o` / `O`            | Start session in current directory / choose directory. |
+| `r` / `f`            | Resume a conversation / fork the selected session.     |
+| `X`                  | Stop the selected session.                             |
+| `s`                  | Select the next session that requires attention.       |
+
+Press `?` to view all key bindings.
+Press `,` to open preferences.
+
+## Remote sessions
+
+Press `Space h` to add an SSH host and configure `miao-server`.
+Remote sessions continue to run when your network disconnects or your computer sleeps.
+Press `Enter` on a detached session to reconnect.
+Closing a window stops the session by default.
+To keep sessions active after window close, set `[remote] on_window_close = "detach"` in `~/.config/captain-miao/config.toml`.
 
 ## How it works
 
-captain-miao is built around a strict unidirectional data flow:
-
-- The **launcher** wraps each agent process and is the single source of truth for that session's state. It receives hook events over a Unix socket and writes a JSON state file.
-- **Hooks** are thin forwarders: they parse the agent's hook payload from stdin and send it to the launcher socket.
-- The **dashboard** is a pure viewer. It watches the session state directory and per-backend transcript dirs with `notify` (FSEvents on macOS, inotify on Linux) and re-reads files when they change. It performs no IPC of its own.
-
-State lives under `~/.local/state/captain-miao/`, with daemon control and pool sockets in its `run/` directory. Launcher and clipboard sockets use `$XDG_RUNTIME_DIR/captain-miao/`, falling back to that state `run/` directory. These directories are owner-only: session state files record your prompt text, so they are written `0600` under a `0700` directory. For implementation rules and architecture references, see [AGENTS.md](AGENTS.md).
-
-## Agent logos
-
-In Kitty, the wide session table shows a two-cell-wide harness logo immediately
-before Context. Logos are enabled by default and hidden in narrow layouts or
-unsupported terminals, including tmux and zellij. Missing artwork uses an initial.
-
-Turn them off with `,` → **Display → Agent logos**, or in
-`~/.config/captain-miao/config.toml`:
-
-```toml
-[ui.table]
-agent_logos = false
-```
-
-Preferences take precedence over the config file. Press `r` on the setting to
-inherit the file again. This setting controls session logos independently of
-the title-bar paw.
+- **Local sessions:** `miao launch <agent>` starts the agent process with a launcher wrapper.
+  The launcher captures hook events, reads agent session data, and writes status files.
+  The dashboard monitors these files and updates the session table.
+  When you select a session, the dashboard uses terminal controls to focus that window or pane.
+- **Remote sessions:** The agent and launcher run on the remote SSH host inside a `miao-server` pty pool.
+  The server transmits session updates across SSH to your local dashboard.
+  Your local terminal connects to the remote session for user input and output.
+  If the network connection drops or your computer sleeps, the agent continues on the host.
+  Select the session and press `Enter` to reconnect.
 
 ## License
 

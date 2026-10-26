@@ -53,7 +53,21 @@ local rationale remains beside the implementation.
 
 - Keep zellij's `list-panes` off focus, spawn, restart and recurring paths:
   it costs about 20ms per pane server-side. tmux's equivalent is cheap.
-- Update the README's remote-control allowlist whenever adding a `kitten @`
-  command; the recommended config denies commands outside that list.
+- Keep the password-authorized Kitty setup allowlist in sync with `kitten @`
+  commands: `ls`, `get-text`, `launch`, `focus-window`, `focus-tab`,
+  `close-window`, `detach-window` and `goto-layout`.
 - Launchers use only `current_window` from their environment. Terminal window
   snapshots and tab lookup belong to presentation; launchers can be headless.
+
+## Keymap and announcements
+
+- Keep existing defaults and command IDs stable; place new actions on free keys
+  in the related leader menu. An unknown sequence after `Space` or `g` cancels
+  the prefix and consumes that key without running a session action.
+- Declare announcements in `src/app/announcements.rs` with a new stable ID,
+  introduction version, title, kind (`Update` or `Warning`), and content.
+  Keep introduction versions stable: acknowledgement is tracked by version,
+  not by catalog ID. Feature promotions and migrations share the same inbox.
+- Render shortcuts through the active keymap in help, menus and announcements
+  so custom bindings appear. `src/app/keymap.rs` owns sequences and command IDs;
+  `run_command` in `src/app/keys.rs` owns their effects.

@@ -23,6 +23,9 @@ in
       cargo-edit
       cargo-watch
 
+      # Fetch and update the repository's image, video and audio assets.
+      git-lfs
+
       # Execute the generated agent forwarders against a controlled hook host.
       nodejs
 

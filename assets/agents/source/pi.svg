@@ -1,6 +1,3 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800">
-  <path fill="#F09082" d="M165.29 165.29H517.36V400H400V282.65H165.29Z"/>
-  <path fill="#4D9ABF" d="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z"/>
-  <path fill="#F1BE58" d="M517.36 400H634.72V634.72H517.36Z"/>
-</svg>
+version https://git-lfs.github.com/spec/v1
+oid sha256:abd66e7868b2d24f0f0895f9237ee8a6dcb22337583b0dc54aeb595acecb4d6b
+size 334

@@ -1,33 +1,3 @@
-<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-  <!-- body outline -->
-  <rect
-    x="3"
-    y="4.5"
-    width="18"
-    height="13"
-    rx="2.2"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="1.6"
-  />
-
-  <!-- left eye (filled) -->
-  <rect
-    x="9.6"
-    y="8.0"
-    width="1.4"
-    height="2.6"
-    rx="0.45"
-    fill="currentColor"
-  />
-
-  <!-- right eye (filled) -->
-  <rect
-    x="15.6"
-    y="8.0"
-    width="1.4"
-    height="2.6"
-    rx="0.45"
-    fill="currentColor"
-  />
-</svg>
+version https://git-lfs.github.com/spec/v1
+oid sha256:60685e25b2db869030290485a35eed8ca77e535d2c6b7731374df49edbfa98c8
+size 537
