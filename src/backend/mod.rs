@@ -851,7 +851,8 @@ pub(crate) struct AttachPlan {
 /// a rejected cleanup must restore the row, even if some work already stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
-    /// The host resolved the key and signalled the session.
+    /// The host resolved the key and signalled the session. `Backend::kill_session`
+    /// also verifies removal before returning this to the dashboard.
     Signalled,
     /// The host had no live session under that key — it had already ended, so
     /// the row leaving was right even though the signal never went out.
@@ -866,6 +867,10 @@ pub(crate) enum KillOutcome {
     Failed(String),
 }
 
+/// Time for a successful cleanup reply to reach the session subscription.
+/// This starts after the host's own cleanup budget, not at request submission.
+pub(crate) const SESSION_REMOVAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A host's account of a launcher binding, before optimistic UI filtering.
 /// Unknown covers a disconnected host or one that has not sent a snapshot.
 #[derive(Debug, Clone, PartialEq)]
@@ -876,6 +881,16 @@ pub(crate) enum BindingPresence {
 }
 
 impl Backend {
+    /// Ownership includes rows hidden by an optimistic Kill. Only the host's
+    /// removal releases a conversation for Resume, not presentation filtering.
+    pub(crate) fn manages_conversation(&self, agent: crate::agent::AgentControl, id: &str) -> bool {
+        let matches = |s: &LauncherState| s.agent == agent && s.session_id.as_deref() == Some(id);
+        match self {
+            Self::Local(host) => host.inner.list_sessions().iter().any(matches),
+            Self::Remote(remote) => remote.mirror.lock().unwrap().values().any(matches),
+        }
+    }
+
     pub(crate) fn binding_presence(&self, token: &str) -> BindingPresence {
         let status = match self {
             Self::Local(host) => host
@@ -1140,22 +1155,72 @@ impl Backend {
         key: SessionKey,
         cleanup: CleanupPolicy,
     ) -> tokio::task::JoinHandle<KillOutcome> {
-        match self {
-            Self::Local(_) => {
-                tokio::task::spawn_blocking(move || {
-                    match LocalBackend::kill_session(&key, cleanup) {
-                        Ok(SessionRemoval::Signalled) => KillOutcome::Signalled,
-                        Ok(SessionRemoval::AlreadyGone) => KillOutcome::AlreadyGone,
-                        Ok(SessionRemoval::Forced(reason)) => KillOutcome::Forced(reason),
-                        Err(error) => KillOutcome::Failed(format!("{error:#}")),
+        let remote = match self {
+            Self::Local(_) => None,
+            Self::Remote(remote) => Some(remote.clone()),
+        };
+        tokio::spawn(async move {
+            let outcome = match &remote {
+                None => {
+                    let key = key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match LocalBackend::kill_session(&key, cleanup) {
+                            Ok(SessionRemoval::Signalled) => KillOutcome::Signalled,
+                            Ok(SessionRemoval::AlreadyGone) => KillOutcome::AlreadyGone,
+                            Ok(SessionRemoval::Forced(reason)) => KillOutcome::Forced(reason),
+                            Err(error) => KillOutcome::Failed(format!("{error:#}")),
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        KillOutcome::Failed(format!("Cleanup worker failed: {error}"))
+                    })
+                }
+                Some(remote) => remote.kill_session(&key, cleanup).await,
+            };
+            if !matches!(
+                outcome,
+                KillOutcome::Signalled | KillOutcome::AlreadyGone | KillOutcome::Forced(_)
+            ) {
+                return outcome;
+            }
+            // A legacy daemon can acknowledge SIGTERM even when its agent
+            // catches the signal and survives. Never use the filtered UI rows
+            // as proof of death; a disconnect's empty mirror is not proof either.
+            let removed = tokio::time::timeout(SESSION_REMOVAL_TIMEOUT, async {
+                loop {
+                    let gone = match &remote {
+                        Some(remote) => {
+                            let mirror = remote.mirror.lock().unwrap();
+                            remote.mirrored.load(Ordering::Relaxed)
+                                && remote.conn_state().is_connected()
+                                && !mirror.contains_key(&key)
+                        }
+                        None => {
+                            let key = key.clone();
+                            tokio::task::spawn_blocking(move || {
+                                !state::read_all_launcher_states()
+                                    .iter()
+                                    .any(|row| row.key() == key)
+                            })
+                            .await
+                            .unwrap_or(false)
+                        }
+                    };
+                    if gone {
+                        return;
                     }
-                })
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if removed {
+                outcome
+            } else {
+                KillOutcome::Failed("Session removal was not confirmed; the agent may still be running. Check the host connection and update its server before retrying".into())
             }
-            Self::Remote(remote) => {
-                let remote = remote.clone();
-                tokio::task::spawn_blocking(move || remote.kill_session(&key, cleanup))
-            }
-        }
+        })
     }
 
     /// Treat `key` as already gone, before the host has been asked — the
@@ -1469,14 +1534,21 @@ pub(crate) mod test_support {
         let (backend, _, requests) =
             RemoteBackend::build(&Transport::LocalSocket(PathBuf::new()), host);
         backend.simulate_link_for_tests(ConnState::Connected, true);
-        (backend, Peer { requests })
+        (backend.clone(), Peer { requests, backend })
     }
 
     pub(crate) struct Peer {
         requests: mpsc::UnboundedReceiver<PendingRequest>,
+        backend: Arc<RemoteBackend>,
     }
 
     impl Peer {
+        pub(crate) fn snapshot(&self, rows: Vec<LauncherState>) {
+            let mut mirror = self.backend.mirror.lock().unwrap();
+            *mirror = rows.into_iter().map(|row| (row.key(), row)).collect();
+            self.backend.mirrored.store(true, Ordering::Relaxed);
+        }
+
         pub(crate) async fn recv(&mut self) -> (ClientFrame, oneshot::Sender<ServerFrame>) {
             let request = self.requests.recv().await.expect("backend dropped");
             (request.frame, request.reply)
@@ -2010,20 +2082,31 @@ impl RemoteBackend {
         }
     }
 
-    /// Blocking: an ssh round trip, so the dashboard makes it from a pool thread
-    /// through an `Arc` clone (hence `pub(crate)`, as for [`list_resumable`]).
+    /// Ask the host to signal/clean up a session. The dashboard-facing backend
+    /// separately waits for its removal from the subscription.
     /// Callers hold the row's [`presume_dead`] over this, so nothing about the
     /// wait is visible in the table.
     ///
     /// [`list_resumable`]: Self::list_resumable
     /// [`presume_dead`]: Self::presume_dead
-    pub(crate) fn kill_session(&self, key: &SessionKey, cleanup: CleanupPolicy) -> KillOutcome {
+    pub(crate) async fn kill_session(
+        &self,
+        key: &SessionKey,
+        cleanup: CleanupPolicy,
+    ) -> KillOutcome {
         let key = key.clone();
-        match self.request(|req_id| ClientFrame::KillSession {
+        let Some((reply, sent_at)) = self.enqueue(|req_id| ClientFrame::KillSession {
             req_id,
             key,
             cleanup,
-        }) {
+        }) else {
+            return KillOutcome::Unreachable;
+        };
+        let reply = reply.await.ok();
+        if reply.is_some() {
+            *self.latency.lock().unwrap() = Some(sent_at.elapsed());
+        }
+        match reply {
             Some(ServerFrame::Killed {
                 error: Some(error), ..
             }) => KillOutcome::Failed(error),
@@ -5457,14 +5540,86 @@ fi
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn acknowledged_kill_requires_authoritative_session_removal() {
+        for scenario in [
+            "delayed removal",
+            "survivor",
+            "disconnect",
+            "reconnect survivor",
+        ] {
+            let (remote, mut peer) = test_support::connected(HostId("test-host".into()));
+            let row = test_state(42);
+            let key = row.key();
+            peer.snapshot(vec![row.clone()]);
+            let backend = Backend::Remote(remote.clone());
+            backend.presume_killed(&key);
+            assert!(backend.list_sessions().is_empty());
+            let mut task = backend.kill_session(key, CleanupPolicy::Required);
+            let (request, reply) = peer.recv().await;
+            let ClientFrame::KillSession { req_id, .. } = request else {
+                panic!("expected KillSession");
+            };
+            // An older daemon reports successful signalling without ending the
+            // launcher. This must never count as a completed kill/restart.
+            reply
+                .send(ServerFrame::Killed {
+                    req_id,
+                    ok: true,
+                    forced: None,
+                    error: None,
+                })
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut task)
+                    .await
+                    .is_err(),
+                "an acknowledgement plus an optimistic hide is not removal"
+            );
+            match scenario {
+                "delayed removal" => peer.snapshot(vec![]),
+                "disconnect" | "reconnect survivor" => {
+                    {
+                        let mut mirror = remote.mirror.lock().unwrap();
+                        remote.mirrored.store(false, Ordering::Relaxed);
+                        mirror.clear();
+                    }
+                    remote.simulate_link_for_tests(ConnState::Disconnected, false);
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), &mut task)
+                            .await
+                            .is_err(),
+                        "disconnect is not confirmation of removal"
+                    );
+                    if scenario == "reconnect survivor" {
+                        peer.snapshot(vec![row]);
+                        remote.simulate_link_for_tests(ConnState::Connected, true);
+                    }
+                }
+                _ => {}
+            }
+            let outcome = task.await.unwrap();
+            if scenario == "delayed removal" {
+                assert_eq!(outcome, KillOutcome::Signalled);
+            } else {
+                assert!(
+                    matches!(outcome, KillOutcome::Failed(_)),
+                    "{scenario}: {outcome:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_cleanup_is_a_failed_kill_not_an_already_gone_session() {
         let (remote, _shared, mut requests) = RemoteBackend::build(
             &Transport::LocalSocket(std::path::PathBuf::from("/unused.sock")),
             HostId("test-host".into()),
         );
-        let task = tokio::task::spawn_blocking(move || {
-            remote.kill_session(&SessionKey::from_launcher_pid(123), CleanupPolicy::Required)
+        let task = tokio::spawn(async move {
+            remote
+                .kill_session(&SessionKey::from_launcher_pid(123), CleanupPolicy::Required)
+                .await
         });
         let request = requests.recv().await.unwrap();
         request.reply.send(serde_json::from_value(serde_json::json!({
@@ -5511,8 +5666,9 @@ fi
         let (cands, errs) = tokio::task::block_in_place(|| backend.list_resumable(5));
         assert!(cands.is_empty() && errs.is_empty());
         assert_eq!(
-            tokio::task::block_in_place(|| backend
-                .kill_session(&SessionKey::from_launcher_pid(999), CleanupPolicy::Required)),
+            backend
+                .kill_session(&SessionKey::from_launcher_pid(999), CleanupPolicy::Required)
+                .await,
             KillOutcome::Signalled
         );
 
@@ -5534,7 +5690,7 @@ fi
         backend.presume_dead(&doomed);
         assert_eq!(backend.list_sessions().len(), 1);
         assert_eq!(
-            tokio::task::block_in_place(|| backend.kill_session(&doomed, CleanupPolicy::Required)),
+            backend.kill_session(&doomed, CleanupPolicy::Required).await,
             KillOutcome::Signalled
         );
         let mut tries = 0;

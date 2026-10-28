@@ -126,6 +126,10 @@ The six most frequent shortcuts:
 Press `?` to view all key bindings.
 Press `,` to open preferences.
 
+Restart waits for the previous session to end before its replacement resumes
+the conversation. If the host cannot confirm removal, the dashboard reports an
+error. Resume also refuses conversations still managed on the selected host.
+
 ## Remote sessions
 
 Press `Space h` to add an SSH host and configure `miao-server`.

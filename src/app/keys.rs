@@ -889,7 +889,10 @@ impl App {
             s.host == host
                 && s.agent == c.agent
                 && s.session_id.as_deref() == Some(c.session_id.as_str())
-        }) {
+        }) || self
+            .backend_for(&host)
+            .is_some_and(|backend| backend.manages_conversation(c.agent, &c.session_id))
+        {
             self.set_status(
                 format!(
                     "{} conversation is already managed on this host; use its existing row to attach or restart",

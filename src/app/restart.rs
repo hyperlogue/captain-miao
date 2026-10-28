@@ -15,15 +15,26 @@ pub(super) struct Job {
     pub(super) launched_at: Option<Instant>,
     replacement_seen: bool,
     pub(super) reuse_replacement: bool,
+    pub(super) cleanup_confirmed: bool,
     pub(super) spec: RestartSpec,
     pub(super) window: Option<KillWindow>,
 }
 impl Job {
+    /// Codex launchers wait for the old owner before acquiring their thread.
+    /// Other agents can resume immediately, so end their owner before opening.
+    pub(super) fn needs_cleanup_before_launch(&self) -> bool {
+        self.spec.kill_old
+            && self.spec.agent != crate::agent::AgentControl::Codex
+            && !self.cleanup_confirmed
+    }
+
     fn has_retry_budget(&self) -> bool {
         self.spec.agent != crate::agent::AgentControl::Codex
-            || self
-                .launched_at
-                .is_some_and(|at| at.elapsed() < cm_core::agents::codex::RESTART_RETRY_WINDOW)
+            || self.launched_at.is_some_and(|at| {
+                at.elapsed()
+                    < cm_core::agents::codex::RESTART_RETRY_WINDOW
+                        .saturating_sub(crate::backend::SESSION_REMOVAL_TIMEOUT)
+            })
     }
 }
 pub(super) struct Completion {
@@ -84,6 +95,7 @@ impl Restarts {
                 launched_at: None,
                 replacement_seen: false,
                 reuse_replacement: false,
+                cleanup_confirmed: false,
             };
             if let Some(previous) = self.failed.get(&key) {
                 let status = presence(&key.0, previous.replacement_token.as_deref().unwrap());
@@ -186,6 +198,24 @@ impl Restarts {
         self.rx.try_recv().ok()
     }
 
+    /// Advance the same job after confirmed teardown, retaining its ownership
+    /// and batch slot until the replacement has been opened on a later frame.
+    pub(super) fn continue_after_cleanup(&mut self, result: &Completion) -> bool {
+        if result.job.needs_cleanup_before_launch()
+            && matches!(
+                result.outcome,
+                KillOutcome::Signalled | KillOutcome::AlreadyGone
+            )
+        {
+            let mut job = result.job.clone();
+            job.cleanup_confirmed = true;
+            self.queued.push_back(job);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn settle(&mut self, result: &Completion) -> (String, bool) {
         self.pending
             .remove(&(result.job.spec.host.clone(), result.job.spec.key.clone()));
@@ -263,6 +293,52 @@ mod tests {
             session_id: format!("thread-{pid}"),
             flags: SessionFlags::default(),
             kill_old: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_restart_keeps_ownership_until_replacement_after_cleanup() {
+        for outcome in [
+            KillOutcome::Signalled,
+            KillOutcome::AlreadyGone,
+            KillOutcome::Failed("still running".into()),
+            KillOutcome::Unreachable,
+        ] {
+            let mut restarts = Restarts::default();
+            let mut original = spec(1);
+            original.agent = AgentControl::Claude;
+            restarts.enqueue(vec![original.clone()], |_, _| BindingPresence::Missing);
+            let mut job = restarts.next().unwrap();
+            assert!(job.needs_cleanup_before_launch());
+            job.window = Some(KillWindow {
+                id: crate::terminal::WindowId::from(7),
+                pid: None,
+                binding_token: Some("old-pool".into()),
+            });
+            restarts.finish(job, outcome.clone());
+            let result = restarts.try_recv().unwrap();
+            let continued = restarts.continue_after_cleanup(&result);
+            assert_eq!(
+                continued,
+                matches!(outcome, KillOutcome::Signalled | KillOutcome::AlreadyGone)
+            );
+            if continued {
+                assert_eq!(
+                    restarts.enqueue(vec![original], |_, _| BindingPresence::Missing),
+                    0
+                );
+                let job = restarts.next().unwrap();
+                assert!(job.cleanup_confirmed);
+                assert!(!job.needs_cleanup_before_launch());
+                assert!(job.replacement_token.is_none());
+                assert_eq!(
+                    job.window.unwrap().binding_token.as_deref(),
+                    Some("old-pool")
+                );
+            } else {
+                restarts.settle(&result);
+                assert!(restarts.next().is_none());
+            }
         }
     }
 

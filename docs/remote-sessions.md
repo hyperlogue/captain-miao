@@ -1106,12 +1106,24 @@ through the identical path.
   about is one the host has no reason to re-send, and an edit to the mirror
   would leave nothing to correct against. An `Unreachable` reply — no answer at
   all — or a `Failed` cleanup reply withdraws it immediately rather than waiting
-  the lapse out. The terminal window is closed only after a successful result.
+  the lapse out. A successful kill reply is not enough: the dashboard waits up
+  to five more seconds for the session to disappear from the host's unfiltered
+  snapshot. An optimistic hide or a cleared mirror during disconnect does not
+  count. If removal cannot be confirmed, the row returns with an error; this
+  also catches older daemons that acknowledge a signal an agent survives.
+  The terminal window is closed only after confirmed removal. Resume checks
+  host ownership even while a row is optimistically hidden.
 - **RESTART / FORK**: kill + reopen **on the row's own host** (fork with
   `fork = true`), landing in that host's pool and auto-attaching like any open.
   Restarts advance through a dashboard queue and account for completions;
   cleanup never holds the dashboard event loop. A pending restart owns its
   host/session pair so repeated commands cannot create competing replacements.
+  Agents without a launcher handoff gate, including Claude, are reopened only
+  after confirmed removal of their old session. Codex can open its replacement
+  window earlier because its launcher waits for the old owner before acquiring
+  the thread. A failed cleanup cannot start another Claude process. If opening
+  the replacement fails after cleanup, the saved conversation can be resumed
+  from the picker.
 
 ## 8. State: what lives where, who writes it
 

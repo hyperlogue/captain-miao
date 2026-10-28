@@ -2822,6 +2822,43 @@ fn resume_picker_names_the_host_it_lists() {
 }
 
 #[test]
+fn resume_picker_rejects_a_session_hidden_during_kill() {
+    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::backend::{Backend, RemoteBackend};
+    use crate::state::HostId;
+    let mut d = TestDashboard::new(140, 20);
+    let host = HostId("test-host".into());
+    let mut owner = LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle);
+    owner.session_id = Some("managed-thread".into());
+    let key = owner.key();
+    let backend = Backend::Remote(RemoteBackend::unconnected_for_tests(
+        host.clone(),
+        vec![owner],
+    ));
+    backend.presume_killed(&key);
+    assert!(backend.list_sessions().is_empty());
+    d.app.backends.push(backend);
+    d.set_sessions(vec![]);
+    d.app.open_resume_picker(
+        host,
+        vec![ResumeCandidate {
+            agent: AgentControl::Claude,
+            session_id: "managed-thread".into(),
+            cwd: "/tmp/project".into(),
+            first_prompt: None,
+            custom_title: None,
+            git_branch: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+        }],
+    );
+    assert!(
+        d.press(KeyCode::Enter).is_none(),
+        "hiding a row does not end its conversation ownership"
+    );
+    assert!(d.app.status_is_error);
+}
+
+#[test]
 fn resume_picker_rejects_an_already_managed_conversation() {
     use crate::agent::{AgentControl, ResumeCandidate};
     use crate::state::HostId;

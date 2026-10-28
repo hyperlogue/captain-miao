@@ -1672,17 +1672,17 @@ fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
 /// switch migrates an existing session. Returns whether one queued restart
 /// advanced; cleanup and its result are handled on later event-loop ticks.
 ///
-/// Order still matters on the reuse path: launch the replacement first, then
-/// close the old window, so a Stacked restart doesn't momentarily empty (and
-/// destroy) the shared `miao:sessions` tab between the close and the respawn.
+/// Non-Codex agents must finish teardown before the replacement opens. Codex's
+/// launcher has its own handoff gate, so its replacement window can open first.
+/// Explicit window closure follows the replacement in either case.
 ///
-/// `spec.kill_old` gates the SIGTERM + close_window post-step. It's true for
+/// `spec.kill_old` gates teardown and the eventual window closure. It's true for
 /// user-initiated restarts (the session is live, so the old child must be torn
 /// down) and false for crash-recovery specs: there the launcher pid is already
 /// dead, so the child pid is gone (and possibly reused by an unrelated process)
 /// and the recorded window id may collide with an innocent live window after a
-/// relaunch — signaling/closing either would hit the wrong target. We also
-/// re-check `child_pid` liveness before signaling even on the kill path.
+/// relaunch — signaling/closing either would hit the wrong target. The backend
+/// resolves the opaque session key on its owning host at signal time.
 ///
 /// After a confirmed kill, the close is best-effort, since closing an
 /// already-gone window is a no-op (zellij) or an ignored error (kitty). It is
@@ -1697,15 +1697,29 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
         return false;
     };
     let spec = job.spec.clone();
-    job.window = spec.window_id.clone().map(|id| KillWindow {
-        id,
-        pid: spec.window_pid,
-        binding_token: app
-            .sessions
-            .iter()
-            .find(|s| s.host == spec.host && s.key() == spec.key)
-            .and_then(|s| s.binding_token().map(str::to_owned)),
-    });
+    if !job.cleanup_confirmed {
+        job.window = spec.window_id.clone().map(|id| KillWindow {
+            id,
+            pid: spec.window_pid,
+            binding_token: app
+                .sessions
+                .iter()
+                .find(|s| s.host == spec.host && s.key() == spec.key)
+                .and_then(|s| s.binding_token().map(str::to_owned)),
+        });
+    }
+    if job.needs_cleanup_before_launch() {
+        match app.backend_for(&spec.host) {
+            Some(backend) => restarts
+                .wait_for_cleanup(job, backend.kill_session(spec.key, CleanupPolicy::Required)),
+            None => restarts.finish(
+                job,
+                KillOutcome::Failed(format!("Unknown host {}", spec.host.0)),
+            ),
+        }
+        app.set_status("Restarting: waiting for cleanup".into(), false);
+        return true;
+    }
     let agent = spec.agent;
     let session_id = spec.session_id;
     let cwd = spec.cwd;
@@ -1734,7 +1748,7 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
             None,
         )
         .await;
-        // Keep the old session if its replacement could not be opened.
+        // A failed open finishes this job; the saved conversation remains resumable.
         let Some(replacement_token) = replacement_token else {
             let error = app
                 .status_msg
@@ -1755,7 +1769,7 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
             app.pending_flag_restores.insert(new_wid, flags);
         }
     }
-    if kill_old {
+    if kill_old && !job.cleanup_confirmed {
         match app.backend_for(&host) {
             Some(backend) => {
                 restarts.wait_for_cleanup(job, backend.kill_session(key, CleanupPolicy::Required))
@@ -1766,7 +1780,9 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
     } else {
         // Crash recovery owns no old process/window. Clear it before completion
         // so a recycled window identifier can never be closed.
-        job.window = None;
+        if !kill_old {
+            job.window = None;
+        }
         restarts.finish(job, KillOutcome::AlreadyGone);
     }
     true
@@ -2182,6 +2198,10 @@ async fn drain_background_results(
     }
     inboxes.restarts.observe_pending(&app.sessions);
     while let Some(result) = inboxes.restarts.try_recv() {
+        if inboxes.restarts.continue_after_cleanup(&result) {
+            redraw = true;
+            continue;
+        }
         let (message, error) = inboxes.restarts.settle(&result);
         if matches!(
             result.outcome,
@@ -3247,6 +3267,63 @@ mod tests {
         app.mark_dirty(super::super::Cursor::HoldIndex);
         app.table_state.select(Some(0));
         app
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claude_restart_does_not_open_a_replacement_before_cleanup() {
+        use cm_core::protocol::{ClientFrame, ServerFrame};
+        let mut app = vcs_app();
+        let host = HostId("restart-host".into());
+        let (remote, mut peer) = crate::backend::test_support::connected(host.clone());
+        app.backends.push(Backend::Remote(remote));
+        let mut restarts = super::super::restart::Restarts::default();
+        restarts.enqueue(
+            vec![RestartSpec {
+                agent: AgentControl::Claude,
+                host,
+                key: state::SessionKey::from_launcher_pid(42),
+                window_id: None,
+                window_pid: None,
+                cwd: "/work/project".into(),
+                session_id: "shared-conversation".into(),
+                flags: super::super::SessionFlags::default(),
+                kill_old: true,
+            }],
+            |_, _| crate::backend::BindingPresence::Missing,
+        );
+        let host_reply = tokio::spawn(async move {
+            let (request, reply) = peer.recv().await;
+            let ClientFrame::KillSession { req_id, .. } = request else {
+                panic!("restart opened a second agent before ending the first: {request:?}");
+            };
+            reply
+                .send(ServerFrame::Killed {
+                    req_id,
+                    ok: false,
+                    forced: None,
+                    error: Some("cleanup refused".into()),
+                })
+                .unwrap();
+            peer
+        });
+        advance_restart(&mut app, &mut restarts).await;
+        let peer = host_reply.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(result) = restarts.try_recv() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting for refused restart cleanup");
+        assert!(matches!(result.outcome, KillOutcome::Failed(_)));
+        assert!(result.job.replacement_token.is_none());
+        assert!(
+            peer.is_empty(),
+            "refused cleanup must never open a replacement"
+        );
     }
 
     #[tokio::test]
