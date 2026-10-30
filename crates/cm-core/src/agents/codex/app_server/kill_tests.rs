@@ -2,12 +2,28 @@ use crate::agent::AgentControl;
 use crate::backend::{CleanupPolicy, LocalBackend};
 use crate::state::{self, LauncherState, SessionStatus};
 use serde_json::{Value, json};
+use std::time::Duration;
 use tokio::net::UnixListener;
+
+/// macOS can drop a dying child from `proc_pidinfo` before `waitpid(WNOHANG)`
+/// can reap it. Kill already waited until the pid looked gone; poll until this
+/// parent observes that exit. A process left in `sleep` still fails the caller.
+async fn parent_observed_exit(child: &mut tokio::process::Child) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 #[tokio::test]
 async fn a_slow_cleanup_rpc_does_not_make_a_responsive_server_unreachable() {
     use futures_util::{SinkExt, StreamExt};
-    use std::time::Duration;
     let root =
         std::path::Path::new("/tmp").join(format!("miao-kill-timeout-{}", std::process::id()));
     state::create_dir_all_private(&root).unwrap();
@@ -77,7 +93,6 @@ async fn a_slow_cleanup_rpc_does_not_make_a_responsive_server_unreachable() {
 async fn kill_qualifies_cleanup_failures_and_reaps_the_tui() {
     use super::super::{CodexConfig, CodexMode};
     use futures_util::{SinkExt, StreamExt};
-    use std::time::Duration;
 
     const TEST: &str =
         "agents::codex::app_server::kill_tests::kill_qualifies_cleanup_failures_and_reaps_the_tui";
@@ -405,7 +420,14 @@ async fn kill_removes_a_missing_thread_with_an_older_launcher() {
             .exists()
             && !control_path.exists()
             && !relay_path.exists();
-        let exited = launcher.try_wait().unwrap().is_some() && tui.try_wait().unwrap().is_some();
+        // Removal has already signalled both processes. A single WNOHANG loses
+        // the macOS exit race, so poll for the parent's reap. Survivors are
+        // checked once, while they are still running.
+        let exited = if remove {
+            parent_observed_exit(&mut launcher).await && parent_observed_exit(&mut tui).await
+        } else {
+            launcher.try_wait().unwrap().is_some() && tui.try_wait().unwrap().is_some()
+        };
         // Always reap the fixtures, including on a failing regression assertion.
         let _ = launcher.kill().await;
         let _ = tui.kill().await;
