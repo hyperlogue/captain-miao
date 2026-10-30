@@ -510,6 +510,90 @@ async fn capture_checks_approval_and_keeps_failed_environment_output_private() {
 }
 
 #[tokio::test]
+async fn capture_resolves_env_after_direnv_changes_path() {
+    const TEST: &str = "agents::codex::app_server::environment::tests::capture_resolves_env_after_direnv_changes_path";
+    if std::env::var_os("CM_TEST_DIRENV_ENV_PATH").is_some() {
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let delta = capture(&root.join("project")).await.unwrap().unwrap();
+        assert_eq!(delta["PATH"].as_deref(), root.join("project-bin").to_str());
+        assert_eq!(
+            delta["LD_LIBRARY_PATH"].as_deref(),
+            root.join("project-libs").to_str()
+        );
+        assert_eq!(delta["PROJECT"].as_deref(), Some("captured"));
+        assert_eq!(delta["REMOVED"], None);
+        return;
+    }
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let bin = root.path().join("bin");
+    let project = root.path().join("project");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join(".envrc"), "synthetic fixture").unwrap();
+    let env = find_in_path("env").unwrap();
+    for name in ["project-bin", "baseline-bin"] {
+        let dir = root.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&env, dir.join("env")).unwrap();
+    }
+    for (name, script) in [
+        (
+            "direnv",
+            r#"#!/bin/sh
+case $1 in
+status) printf '{"state":{"foundRC":{"allowed":0}}}' ;;
+exec)
+    shift 2
+    if [ -f .envrc ]; then
+        export PATH="$HOME/project-bin"
+        export LD_LIBRARY_PATH="$HOME/project-libs"
+        export PROJECT=captured
+        unset REMOVED
+    else
+        export PATH="$HOME/baseline-bin"
+        unset LD_LIBRARY_PATH
+    fi
+    exec "$@"
+    ;;
+esac
+"#,
+        ),
+        // The launcher's env may be incompatible with the libraries selected
+        // by direnv. Neither the project nor the unloaded baseline may use it.
+        ("env", "#!/bin/sh\nexit 1\n"),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = tokio::time::timeout(
+        CAPTURE_TIMEOUT * 3 + Duration::from_secs(30),
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env_clear()
+            .env("PATH", bin)
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("REMOVED", "baseline")
+            .env("CM_TEST_DIRENV_ENV_PATH", "1")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("waiting for project and baseline environment capture child")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires installed direnv; uses isolated HOME and XDG roots"]
 async fn real_direnv_capture_recovers_changes_from_an_already_activated_project() {
     const TEST: &str = "agents::codex::app_server::environment::tests::real_direnv_capture_recovers_changes_from_an_already_activated_project";

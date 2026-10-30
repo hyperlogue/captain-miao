@@ -213,13 +213,13 @@ async fn capture(cwd: &Path) -> Result<Option<Delta>> {
         "direnv .envrc is not approved; run direnv allow in {}",
         cwd.display()
     );
-    let env = find_in_path("env").context("env is not on PATH")?;
+    // Resolve env after direnv changes PATH: a launcher binary can require a
+    // different libc than the one selected by the project's LD_LIBRARY_PATH.
     let captured = output(
         Command::new(&direnv)
             .arg("exec")
             .arg(cwd)
-            .arg(&env)
-            .arg("-0")
+            .args(["env", "-0"])
             .current_dir(cwd),
         "capturing the project environment",
     )
@@ -245,8 +245,7 @@ async fn capture(cwd: &Path) -> Result<Option<Delta>> {
         Command::new(&direnv)
             .arg("exec")
             .arg(empty.path())
-            .arg(&env)
-            .arg("-0")
+            .args(["env", "-0"])
             .current_dir(empty.path()),
         "unloading the inherited project environment",
     )
