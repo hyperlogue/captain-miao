@@ -13,15 +13,17 @@ Match the requested scope:
   with `cargo check --workspace --locked`. Commit under the repository's
   working rules; a version bump alone does not request a tag or publication.
 - **Prepare or cut a release:** use [release preparation](references/release.md#prepare-the-release)
-  and the changelog guidance. Complete the notes, version bump and checks before
-  presenting the release for review.
+  and the changelog guidance. Present the notes as an r3 files artifact for
+  review before changing the working directory, then apply the approved notes,
+  bump versions and complete checks.
 - **Publish or recover a release:** use the applicable
   [publication or recovery section](references/release.md#publish) and establish
   the current tag, workflow and registry state before acting.
 
 Follow [AGENTS.md](../../../AGENTS.md) for checks, concurrent committers and
-path-scoped commits. Reuse authorization already given in the conversation;
-release-note review and pushing are governed by the release reference.
+path-scoped commits. Reuse authorization already given in the conversation.
+The [changelog guidance](references/changelog.md#review-before-editing) governs
+release-note review; the release reference governs pushing.
 
 ## Version sources
 

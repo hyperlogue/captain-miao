@@ -11,32 +11,32 @@ assets and npm packages.
    and local tags so unrelated work or an existing tag is not swept into the
    release. Follow the [distribution rules](../../../../docs/agent-guides/distribution.md)
    when release preparation also changes builds or packaging.
-2. Prepare the changelog and version sources described in [SKILL.md](../SKILL.md).
-   Inspect `Cargo.lock` to confirm the inheriting member versions moved with
-   `Cargo.toml`; leave unrelated dependency updates out of the release.
-3. Complete verification: the tag version must match `[workspace.package]`,
+2. Follow the [changelog review](changelog.md#review-before-editing): publish
+   the proposed notes as an r3 files artifact and obtain sign-off before any
+   working-directory changes. If review is still needed, cite that requirement,
+   share the artifact URL and leave the working directory unchanged.
+3. Apply the approved changelog and update the version sources described in
+   [SKILL.md](../SKILL.md). Inspect `Cargo.lock` to confirm the inheriting member
+   versions moved with `Cargo.toml`; leave unrelated dependency updates out of
+   the release.
+4. Complete verification: the tag version must match `[workspace.package]`,
    the lock must be current, and `CHANGELOG.md` must have a populated section
    for that version. Run the repository's fmt and clippy commands plus
    `cargo test --workspace --locked`. Reuse checks already passed on unchanged
    inputs; fix failures caused by the release preparation and rerun affected
    checks.
-4. Show the completed notes, version diff and check results for release-note
-   sign-off **before committing and tagging**, unless the user has already
-   approved those notes or explicitly asked to proceed without that review.
-   This is the project's review of the public release description. Preparation
-   and verification do not need separate permission. If review is still needed,
-   cite this requirement and leave the prepared files ready for approval.
-5. After sign-off, follow the concurrent-committer check and path-scoped commit
-   procedure in `AGENTS.md`. The usual paths are `CHANGELOG.md`, `Cargo.toml`
-   and `Cargo.lock`; the subject is `Release vX.Y.Z`.
+5. Follow the concurrent-committer check and path-scoped commit procedure in
+   `AGENTS.md`. The usual paths are `CHANGELOG.md`, `Cargo.toml` and `Cargo.lock`;
+   the subject is `Release vX.Y.Z`.
 6. Create an annotated tag on that commit:
    `git tag -a vX.Y.Z -m "captain-miao vX.Y.Z"`. Verify the tag resolves to the
    release commit and read the version and notes from the tagged tree. The tag
    message is only a subject; CI takes release notes from `CHANGELOG.md`.
 
 Preparation is complete with the verified local commit and tag, or the fully
-prepared files awaiting the required review. Report which state was reached.
-A request to prepare a release does not require publishing it.
+drafted r3 artifact awaiting the required review with the working directory
+unchanged. Report which state was reached. A request to prepare a release does
+not require publishing it.
 
 ## Publish
 
