@@ -229,12 +229,12 @@ impl AgentControl {
             AgentControl::Claude => "Claude",
             AgentControl::Codex => "Codex",
             AgentControl::Reasonix => "Reasonix",
-            AgentControl::Kimi => "Kimi",
-            AgentControl::Grok => "Grok",
+            AgentControl::Kimi => "Kimi Code",
+            AgentControl::Grok => "Grok Build",
             // Lowercase on purpose: sst styles the project `opencode`.
             AgentControl::OpenCode => "opencode",
             AgentControl::Pi => "Pi",
-            AgentControl::Omp => "Oh My Pi (OMP)",
+            AgentControl::Omp => "oh-my-pi",
             AgentControl::Antigravity => "Antigravity",
             // Truthful and neutral: the row is an agent session, we just can't
             // say which backend.

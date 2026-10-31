@@ -1072,13 +1072,18 @@ impl App {
         let items: Vec<ListItem> = rows
             .into_iter()
             .enumerate()
-            .map(|(i, line)| {
+            .map(|(i, mut line)| {
                 let prefix = if st.pane == PrefsPane::Items && i == st.cursor {
                     config::get().colors.ui.selection_symbol.clone()
                 } else {
                     "  ".into()
                 };
-                ListItem::new(Line::from(vec![Span::raw(prefix), Span::raw(line)]))
+                // Keep the cursor visible even when its agent is disabled.
+                line.spans.insert(
+                    0,
+                    Span::styled(prefix, Style::default().remove_modifier(Modifier::DIM)),
+                );
+                ListItem::new(line)
             })
             .collect();
         let mut rows_state = ListState::default();
@@ -1118,9 +1123,9 @@ impl App {
         }
     }
 
-    fn prefs_right_lines(&self, st: &PrefsState) -> (Vec<String>, String) {
+    fn prefs_right_lines(&self, st: &PrefsState) -> (Vec<Line<'static>>, String) {
         let cfg = config::get();
-        match st.category {
+        let (rows, help) = match st.category {
             PrefsCategory::IdleTasks => {
                 let mut rows = self.extra_prefs.idle_commands.clone();
                 rows.push("+ Add command…".into());
@@ -1131,25 +1136,34 @@ impl App {
             }
 
             PrefsCategory::Agents => {
+                let default = self.agent_order.iter().position(|(_, on)| *on);
                 let rows = self
                     .agent_order
                     .iter()
                     .enumerate()
                     .map(|(i, (a, on))| {
                         let mark = if !*on {
-                            "disabled"
-                        } else if i == self.agent_order.iter().position(|(_, e)| *e).unwrap_or(0) {
-                            "default"
+                            Span::raw("disabled")
+                        } else if Some(i) == default {
+                            Span::styled(
+                                "default",
+                                Style::default().fg(cfg.colors.ui.attention_fg).bold(),
+                            )
                         } else {
-                            ""
+                            Span::raw("")
                         };
-                        format!("{:<16} {mark}", a.label())
+                        let line = Line::from(vec![Span::raw(format!("{:<16} ", a.label())), mark]);
+                        if *on {
+                            line
+                        } else {
+                            line.style(Style::default().add_modifier(Modifier::DIM))
+                        }
                     })
                     .collect();
-                (
+                return (
                     rows,
                     "First enabled is o/O/r default. J/K reorder. x disable. Ctrl-t cycles this list.".into(),
-                )
+                );
             }
             PrefsCategory::General => {
                 let layout_warn = if !self.capabilities.layout_is_a_choice() {
@@ -1265,7 +1279,8 @@ impl App {
                     "Enter to edit in plaintext. Restart miao after changing.".into(),
                 )
             }
-        }
+        };
+        (rows.into_iter().map(Line::raw).collect(), help)
     }
 }
 
