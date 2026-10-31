@@ -398,7 +398,10 @@ impl TextInput {
 /// picker never interprets these — `keys.rs` does, per `PickerKind`.
 pub(in crate::app) struct PickerItem {
     pub primary: String,
-    pub secondary: Option<String>,
+    pub secondary: Option<Line<'static>>,
+    pub primary_style: Style,
+    /// Excluded by the caller's scope filter, independently of typed search.
+    pub hidden: bool,
     pub filter_text: String,
     /// Opaque payload the caller can stash — for the workdir picker we put
     /// the raw (un-tilde-collapsed) path here so submission yields the exact
@@ -419,6 +422,8 @@ impl PickerItem {
         Self {
             primary: p,
             secondary: None,
+            primary_style: Style::default(),
+            hidden: false,
             filter_text,
             payload: None,
             prefix: None,
@@ -431,8 +436,13 @@ impl PickerItem {
     /// (the `new` default of the lowercased primary, or an explicit
     /// `with_filter_text`), so builder call order can't silently pollute the
     /// filter.
-    pub fn with_secondary(mut self, s: impl Into<String>) -> Self {
+    pub fn with_secondary(mut self, s: impl Into<Line<'static>>) -> Self {
         self.secondary = Some(s.into());
+        self
+    }
+
+    pub fn with_primary_style(mut self, style: Style) -> Self {
+        self.primary_style = style;
         self
     }
 
@@ -526,6 +536,8 @@ pub(in crate::app) struct Picker {
     /// Only changes the empty-list message — the picker is fully interactive
     /// meanwhile, so a slow host can't hold the UI.
     pub loading: bool,
+    /// Blank rows between entries, useful for multi-line session summaries.
+    pub item_spacing: u16,
 }
 
 impl Picker {
@@ -543,6 +555,7 @@ impl Picker {
             error: None,
             status_bar: None,
             loading: false,
+            item_spacing: 0,
         }
     }
 
@@ -580,14 +593,11 @@ impl Picker {
 
     /// Indices (into `self.items`) that pass the current filter, in order.
     pub fn filtered(&self) -> Vec<usize> {
-        if self.input.is_empty() {
-            return (0..self.items.len()).collect();
-        }
         let q = self.input.text().to_lowercase();
         self.items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.filter_text.contains(&q))
+            .filter(|(_, item)| !item.hidden && item.filter_text.contains(&q))
             .map(|(i, _)| i)
             .collect()
     }
@@ -702,7 +712,7 @@ impl Picker {
         clear_overlay(frame, popup);
 
         let filtered = self.filtered();
-        let total = self.items.len();
+        let total = self.items.iter().filter(|item| !item.hidden).count();
         let visible = filtered.len();
         let sel_display = if visible == 0 {
             0
@@ -842,7 +852,7 @@ impl Picker {
         if visible == 0 {
             let msg = if self.loading {
                 "Loading…"
-            } else if total == 0 {
+            } else if total == 0 && !self.items.iter().any(|item| item.hidden) {
                 if self.free_input {
                     "Type a path and press Enter."
                 } else {
@@ -858,7 +868,9 @@ impl Picker {
         // Two-line rows when any item carries secondary meta, otherwise single-line rows.
         let has_secondary = self.items.iter().any(|i| i.secondary.is_some());
         let row_h: u16 = if has_secondary { 2 } else { 1 };
-        let max_rows = ((list_area.height as usize) / row_h as usize).max(1);
+        let max_rows = ((list_area.height + self.item_spacing) as usize
+            / (row_h + self.item_spacing) as usize)
+            .max(1);
         let sel = self.cursor.min(visible - 1);
         let start = if sel >= max_rows {
             sel + 1 - max_rows
@@ -917,21 +929,20 @@ impl Picker {
                     spans.push(Span::raw(" ".repeat(prefix_slot)));
                 }
             }
-            spans.push(Span::raw(title_text));
+            spans.push(Span::styled(title_text, item.primary_style));
             let title_line = Line::from(spans);
 
             let mut lines = vec![title_line];
             if let Some(meta) = &item.secondary {
-                let meta = truncate_str(meta, title_width.saturating_sub(prefix_slot));
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(" ".repeat(prefix_slot)),
-                    Span::styled(meta, dim),
-                ]));
+                let mut meta = meta.clone().style(dim);
+                meta.spans.insert(0, Span::raw(" ".repeat(2 + prefix_slot)));
+                lines.push(meta);
             } else if has_secondary {
                 lines.push(Line::from(""));
             }
-            let row = Row::new(vec![Cell::from(lines)]).height(row_h);
+            let row = Row::new(vec![Cell::from(lines)])
+                .height(row_h)
+                .bottom_margin(self.item_spacing);
             rows.push(if is_sel {
                 row.style(sel_row_style)
             } else {

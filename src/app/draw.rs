@@ -1593,7 +1593,10 @@ impl App {
             _ if self.confirmation.is_some() => self.confirmation.as_ref().unwrap().hints().spans,
             InputMode::Picker if self.launch_options.is_some() => {
                 let mut spans = hint_pair("Enter", "keep & return");
-                spans.extend(hint_pair("Ctrl-o", "launch"));
+                spans.extend(hint_pair(
+                    "Ctrl-o",
+                    self.launch_options.as_ref().unwrap().action_label(),
+                ));
                 spans.extend(hint_pair("Esc", "cancel"));
                 spans.extend(hint_pair("[/]", "host page"));
                 spans
@@ -1721,7 +1724,6 @@ impl App {
                     "Esc",
                     if free_input { "cancel" } else { "clear/cancel" },
                 ));
-                let multi_host = self.backends.len() > 1;
                 match self.picker.as_ref().map(|a| &a.kind) {
                     // Naming a worktree owns the keyboard, so the ribbon shows
                     // only what works there rather than a list of keys the
@@ -1750,8 +1752,11 @@ impl App {
                             spans.extend(hint_pair("Ctrl-g", "worktree"));
                         }
                     }
-                    Some(PickerKind::Resume { .. }) if multi_host => {
-                        spans.extend(hint_pair("Ctrl-h", "host"));
+                    Some(PickerKind::Resume { .. }) => {
+                        spans = hint_pair("Ctrl-o", "agent & host");
+                        spans.extend(hint_pair("Enter", "resume"));
+                        spans.extend(hint_pair("Esc", "clear/cancel"));
+                        spans.extend(hint_pair("↑/↓", "navigate"));
                     }
                     _ => {}
                 }

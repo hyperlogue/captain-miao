@@ -1,10 +1,11 @@
-//! Direct, per-launch agent and host choices over the directory picker.
+//! Direct agent and host choices over the directory and resume pickers.
 //!
-//! The underlying picker stays untouched until Enter keeps the choices or
-//! Ctrl-o successfully launches. Its highlighted directory is captured on open:
-//! neither paging hosts nor a background recent-dir refresh can change the
-//! directory that the launch shortcut names. Key assignments use a snapshot of
-//! preference order, with ten hosts per page and fixed agent keys throughout.
+//! Choices stay in a draft until Enter applies them or Ctrl-o launches. Capture
+//! the highlighted directory or conversation on open so background list updates
+//! cannot change that target. A resume must still match its original host and
+//! agent; otherwise Ctrl-o applies the filters and returns to session selection.
+//! Key assignments snapshot preference order, with ten hosts per page and fixed
+//! agent keys throughout. Only resume offers All (0).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -15,9 +16,13 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
-use crate::{agent::AgentControl, config, state::HostId};
+use crate::{
+    agent::{AgentControl, ResumeCandidate},
+    config,
+    state::HostId,
+};
 
-use super::{Action, App, PickerKind, format::clear_overlay, format::truncate_str};
+use super::{Action, App, InputMode, PickerKind, format::clear_overlay, format::truncate_str};
 
 const AGENT_KEYS: &str = "qwertyuiop";
 const HOST_KEYS: &str = "asdfgzxcvb";
@@ -27,19 +32,44 @@ const PAGE_SIZE: usize = HOST_KEYS.len();
 pub(super) struct LaunchOptions {
     agents: Vec<AgentControl>,
     hosts: Vec<HostId>,
-    agent: AgentControl,
+    agent: Option<AgentControl>,
     host: HostId,
     cwd: String,
     worktree: Option<String>,
+    resume: Option<ResumeSelection>,
     page: usize,
     scroll: usize,
     reveal: Option<usize>,
     error: Option<String>,
 }
 
+#[derive(Debug)]
+struct ResumeSelection {
+    host: HostId,
+    candidate: Option<ResumeCandidate>,
+    title: String,
+}
+
 impl LaunchOptions {
     fn pages(&self) -> usize {
         self.hosts.len().div_ceil(PAGE_SIZE).max(1)
+    }
+
+    fn resumable_selection(&self) -> Option<&ResumeCandidate> {
+        let selected = self.resume.as_ref()?;
+        selected.candidate.as_ref().filter(|candidate| {
+            selected.host == self.host && self.agent.is_none_or(|agent| agent == candidate.agent)
+        })
+    }
+
+    pub(super) fn action_label(&self) -> &'static str {
+        if self.resume.is_none() {
+            "launch"
+        } else if self.resumable_selection().is_some() {
+            "resume"
+        } else {
+            "apply filters"
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -50,8 +80,11 @@ impl LaunchOptions {
         if width < 12 || area.height < 6 {
             return;
         }
-        let controls = Paragraph::new("Enter keep & return   Ctrl-o launch   Esc cancel")
-            .wrap(Wrap { trim: false });
+        let controls = Paragraph::new(format!(
+            "Enter keep & return   Ctrl-o {}   Esc cancel",
+            self.action_label()
+        ))
+        .wrap(Wrap { trim: false });
         let controls_height = controls.line_count(width.saturating_sub(4)) as u16;
         let height = (17
             + controls_height
@@ -98,12 +131,19 @@ impl LaunchOptions {
         };
         let mut lines = vec![
             Line::raw(truncate_str(
-                &format!("Directory: {cwd}"),
+                &self.resume.as_ref().map_or_else(
+                    || format!("Directory: {cwd}"),
+                    |resume| format!("Session: {}", resume.title),
+                ),
                 summary.width as usize,
             )),
             Line::styled(
                 truncate_str(
-                    &format!("Selected: {} · {}", self.agent.label(), self.host.0),
+                    &format!(
+                        "Selected: {} · {}",
+                        self.agent.map_or("All", AgentControl::label),
+                        self.host.0
+                    ),
                     summary.width as usize,
                 ),
                 heading,
@@ -132,7 +172,8 @@ impl LaunchOptions {
         let visible = columns.height.saturating_sub(1) as usize;
         let host_start = self.page * PAGE_SIZE;
         let host_end = (host_start + PAGE_SIZE).min(self.hosts.len());
-        let rows = self.agents.len().max(host_end - host_start);
+        let rows =
+            (self.agents.len() + usize::from(self.resume.is_some())).max(host_end - host_start);
         if let Some(row) = self.reveal.take() {
             if row < self.scroll {
                 self.scroll = row;
@@ -154,11 +195,14 @@ impl LaunchOptions {
                 },
             )
         };
-        let agent_rows: Vec<_> = AGENT_KEYS
+        let mut agent_rows: Vec<_> = AGENT_KEYS
             .chars()
             .zip(&self.agents)
-            .map(|(key, agent)| entry(key, agent.label(), *agent == self.agent, agents.width))
+            .map(|(key, agent)| entry(key, agent.label(), Some(*agent) == self.agent, agents.width))
             .collect();
+        if self.resume.is_some() {
+            agent_rows.insert(0, entry('0', "All", self.agent.is_none(), agents.width));
+        }
         let host_rows: Vec<_> = HOST_KEYS
             .chars()
             .zip(&self.hosts[host_start..host_end])
@@ -209,19 +253,45 @@ impl App {
         let Some(active) = &self.picker else {
             return;
         };
-        let PickerKind::Workdir {
-            agent,
-            host,
-            worktree,
-            ..
-        } = &active.kind
-        else {
-            return;
+        let (agent, host, cwd, worktree, resume) = match &active.kind {
+            PickerKind::Workdir {
+                agent,
+                host,
+                worktree,
+                ..
+            } => (
+                Some(*agent),
+                host.clone(),
+                self.selected_workdir(),
+                worktree.as_ref().map(|arm| arm.requested_name()),
+                None,
+            ),
+            PickerKind::Resume {
+                host, agent_filter, ..
+            } => {
+                let candidate = self.selected_resume().map(|(_, candidate)| candidate);
+                let title = candidate.as_ref().map_or_else(
+                    || "(choose a session)".into(),
+                    |candidate| self.resume_candidate_item(host, candidate).primary,
+                );
+                (
+                    *agent_filter,
+                    host.clone(),
+                    String::new(),
+                    None,
+                    Some(ResumeSelection {
+                        host: host.clone(),
+                        candidate,
+                        title,
+                    }),
+                )
+            }
+            _ => return,
         };
         let hosts = self.ordered_hosts();
         let position = hosts
             .iter()
-            .position(|candidate| candidate == host)
+            .position(|candidate| *candidate == host)
             .unwrap_or(0);
         self.launch_options = Some(LaunchOptions {
             agents: self
@@ -230,10 +300,11 @@ impl App {
                 .filter_map(|(agent, on)| on.then_some(*agent))
                 .collect(),
             hosts,
-            agent: *agent,
-            host: host.clone(),
-            cwd: self.selected_workdir(),
-            worktree: worktree.as_ref().map(|arm| arm.requested_name()),
+            agent,
+            host,
+            cwd,
+            worktree,
+            resume,
             page: position / PAGE_SIZE,
             scroll: 0,
             reveal: Some(position % PAGE_SIZE),
@@ -247,8 +318,21 @@ impl App {
         }
         let mut options = self.launch_options.take()?;
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+            if options.resume.is_some() {
+                if let Some(candidate) = options.resumable_selection().cloned() {
+                    if let Some(action) = self.resume_action(options.host.clone(), candidate) {
+                        self.picker = None;
+                        self.input_mode = InputMode::Normal;
+                        return Some(action);
+                    }
+                    options.error = self.status_msg.clone();
+                    self.launch_options = Some(options);
+                    return None;
+                }
+                return self.apply_resume_options(&options);
+            }
             match self.launch_workdir(
-                options.agent,
+                options.agent?,
                 options.host.clone(),
                 options.cwd.clone(),
                 options.worktree.clone(),
@@ -260,6 +344,9 @@ impl App {
             match key.code {
                 KeyCode::Esc => return None,
                 KeyCode::Enter => {
+                    if options.resume.is_some() {
+                        return self.apply_resume_options(&options);
+                    }
                     if let Some(active) = self.picker.as_mut()
                         && let PickerKind::Workdir {
                             agent,
@@ -269,7 +356,7 @@ impl App {
                         } = &mut active.kind
                     {
                         let host_changed = *host != options.host;
-                        *agent = options.agent;
+                        *agent = options.agent?;
                         *host = options.host;
                         if options.worktree.is_none() {
                             *worktree = None;
@@ -297,15 +384,20 @@ impl App {
                 }
                 KeyCode::Up => options.scroll = options.scroll.saturating_sub(1),
                 KeyCode::Down => options.scroll = (options.scroll + 1).min(PAGE_SIZE - 1),
+                KeyCode::Char('0') if options.resume.is_some() => {
+                    options.agent = None;
+                    options.reveal = Some(0);
+                    options.error = None;
+                }
                 KeyCode::Char(c) => {
                     if let Some(i) = AGENT_KEYS.chars().position(|key| key == c)
                         && let Some(agent) = options.agents.get(i)
                     {
-                        options.agent = *agent;
+                        options.agent = Some(*agent);
                         if !agent.capabilities().worktrees {
                             options.worktree = None;
                         }
-                        options.reveal = Some(i);
+                        options.reveal = Some(i + usize::from(options.resume.is_some()));
                         options.error = None;
                     }
                     if let Some(i) = HOST_KEYS.chars().position(|key| key == c)
@@ -321,6 +413,18 @@ impl App {
         }
         self.launch_options = Some(options);
         None
+    }
+
+    fn apply_resume_options(&mut self, options: &LaunchOptions) -> Option<Action> {
+        let Some(PickerKind::Resume { host, .. }) = self.picker.as_ref().map(|active| &active.kind)
+        else {
+            return None;
+        };
+        let host_changed = *host != options.host;
+        self.set_resume_agent_filter(options.agent);
+        host_changed.then(|| Action::SwitchResumeHost {
+            host: options.host.clone(),
+        })
     }
 
     pub(super) fn draw_launch_options(&mut self, frame: &mut Frame, area: Rect) {

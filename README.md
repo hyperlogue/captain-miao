@@ -70,6 +70,14 @@ shows the launch directory and validates it on the chosen host before launching.
 The existing `Ctrl-t` (cycle agent) and `Ctrl-h` (cycle host) shortcuts also work
 in the directory picker.
 Press `r` to resume a previous conversation.
+Inside the resume picker, `Ctrl-o` opens the same agent and host selector.
+The agent filter starts on **All** (`0`); individual agents use `qwertyuiop`.
+It filters the loaded session list alongside the text search. `Enter` keeps
+the filters and returns to the list, and `Esc` cancels selector changes.
+`Ctrl-o` resumes the previously highlighted session when it still matches
+the chosen host and agent; otherwise it applies the filters and returns to
+the list so you can choose a session. Hosts use `asdfgzxcvb` and `[` / `]`
+for paging, just as in the new-session selector.
 
 The dashboard highlights sessions that require attention.
 Press `s` to select the next highlighted session.

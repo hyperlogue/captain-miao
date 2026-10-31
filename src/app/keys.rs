@@ -905,7 +905,7 @@ impl App {
     /// Resume a picker candidate unless this host already manages that agent's
     /// conversation. Check at selection time: the owner can appear after the
     /// list was fetched. Restart has its own action and cleanup sequence.
-    fn resume_action(&mut self, host: HostId, c: ResumeCandidate) -> Option<Action> {
+    pub(super) fn resume_action(&mut self, host: HostId, c: ResumeCandidate) -> Option<Action> {
         if self.sessions.iter().any(|s| {
             s.host == host
                 && s.agent == c.agent
@@ -1160,6 +1160,7 @@ impl App {
                     PickerKind::Resume {
                         host,
                         mut candidates,
+                        ..
                     } => {
                         if idx >= candidates.len() {
                             return None;

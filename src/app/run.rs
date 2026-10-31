@@ -751,7 +751,8 @@ fn finish_host_upgrade(app: &mut App, report: super::UpgradeReport) {
 /// [`ResumeLoad::reseed`]: a fresh `r` closes the popup and puts the reason on
 /// the status line — the pre-async behaviour, and there is nothing in an empty
 /// popup to act on — while a failed `Ctrl-h` switch keeps it open on the error
-/// so the next host is one keystroke away.
+/// so the next host is one keystroke away. An open agent/host selector also
+/// keeps its parent picker alive, allowing a different host to be chosen.
 fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
     if load.seq != inboxes.resume_seq {
         return;
@@ -788,7 +789,7 @@ fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
         format!("List sessions failed: {}", load.errors.join("; "))
     };
     app.set_picker_loading(false);
-    if load.reseed {
+    if load.reseed || app.launch_options.is_some() {
         if let Some(active) = app.picker.as_mut() {
             active.picker.set_error(msg);
         }
@@ -3253,6 +3254,75 @@ mod tests {
             .decode(&output[7..output.len() - 1])
             .unwrap();
         assert_eq!(decoded, text.as_bytes());
+    }
+
+    #[test]
+    fn resume_reply_preserves_agent_and_text_filters_chosen_while_loading() {
+        let mut app = vcs_app();
+        let mut inboxes = LoopInboxes::new();
+        inboxes.resume_seq = 2;
+        app.open_resume_picker(HostId::local(), Vec::new());
+        app.set_picker_loading(true);
+        app.set_resume_agent_filter(Some(AgentControl::Codex));
+        app.picker.as_mut().unwrap().picker.set_text("target");
+        let reply = |seq| ResumeLoad {
+            seq,
+            reseed: false,
+            host: HostId::local(),
+            errors: Vec::new(),
+            candidates: [AgentControl::Claude, AgentControl::Codex]
+                .into_iter()
+                .map(|agent| crate::agent::ResumeCandidate {
+                    agent,
+                    session_id: agent.cli_subcommand().into(),
+                    cwd: "~/project".into(),
+                    first_prompt: Some("target".into()),
+                    custom_title: None,
+                    git_branch: None,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                })
+                .collect(),
+        };
+        apply_resume_load(&mut app, &inboxes, reply(1));
+        assert!(app.picker.as_ref().unwrap().picker.loading);
+        apply_resume_load(&mut app, &inboxes, reply(2));
+        let picker = &app.picker.as_ref().unwrap().picker;
+        assert!(!picker.loading);
+        assert_eq!(picker.input.text(), "target");
+        assert_eq!(picker.filtered(), [1]);
+        assert_eq!(app.selected_resume().unwrap().1.agent, AgentControl::Codex);
+    }
+
+    #[test]
+    fn empty_resume_reply_does_not_strand_an_open_selector() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = vcs_app();
+        let inboxes = LoopInboxes::new();
+        app.open_resume_picker(HostId::local(), Vec::new());
+        app.set_picker_loading(true);
+        app.open_launch_options();
+        apply_resume_load(
+            &mut app,
+            &inboxes,
+            ResumeLoad {
+                seq: 0,
+                reseed: false,
+                host: HostId::local(),
+                candidates: Vec::new(),
+                errors: vec!["inventory failed".into()],
+            },
+        );
+        assert!(app.launch_options.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.launch_options.is_none());
+        assert_eq!(app.input_mode, InputMode::Picker);
+        let picker = &app.picker.as_ref().unwrap().picker;
+        assert!(!picker.loading);
+        assert_eq!(
+            picker.error.as_deref(),
+            Some("List sessions failed: inventory failed")
+        );
     }
 
     fn vcs_app() -> App {

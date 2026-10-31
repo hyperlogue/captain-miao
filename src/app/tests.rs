@@ -8,6 +8,7 @@ use super::format::{ansi_to_lines, default_dir_emoji_and_color, format_coarse_ag
 use super::{Action, App, Cursor, InputMode};
 
 mod launch_options;
+mod resume_options;
 
 // =============================================================================
 // Test harness

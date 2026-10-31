@@ -378,11 +378,13 @@ pub(super) enum PickerKind {
         window_id: WindowId,
         tabs: Vec<TabInfo>,
     },
-    /// Resume one of `host`'s dormant sessions. One host at a time — `Ctrl-h`
-    /// switches, exactly like `Ctrl-t` switches the agent — so the list's scope
-    /// is always visible in the title instead of being an implicit union (§9).
+    /// Resume one of `host`'s dormant sessions. Ctrl-o selects the agent filter
+    /// and host; Ctrl-h still cycles hosts. Scope stays visible above the list.
     Resume {
         host: HostId,
+        /// None means All. Keep the full inventory so All can restore it and
+        /// picker indices continue to identify the original candidates.
+        agent_filter: Option<AgentControl>,
         candidates: Vec<ResumeCandidate>,
     },
     /// Launch a new session. The picker shows recent cwds and also accepts
@@ -966,7 +968,7 @@ pub(super) struct App {
     /// Active picker popup (directory, move-tab, resume, etc.) — `Some` iff
     /// `input_mode == InputMode::Picker`.
     pub(super) picker: Option<ActivePicker>,
-    /// Draft launch choices over the still-open directory picker.
+    /// Draft agent/host choices over the directory or resume picker.
     pub(in crate::app) launch_options: Option<launch_options::LaunchOptions>,
     /// The active confirmation overlays, and preserves, the current input mode.
     pub(in crate::app) confirmation: Option<confirm::Confirmation<ConfirmAction>>,
@@ -5070,17 +5072,9 @@ impl App {
     // The resume picker
     // =============================================================================
 
-    /// Build one resume/browser picker row from a resumable candidate. Shared by
-    /// the resume picker (`tag = None`) and the cross-host browser's resumable
-    /// rows (`tag = Some("resumable")`), so the title precedence, meta assembly,
-    /// and filter fields stay identical between the two. `tag`, when present,
-    /// leads both the visible meta line and the filter text.
-    fn resume_candidate_item(
-        &self,
-        host: &HostId,
-        c: &ResumeCandidate,
-        tag: Option<&str>,
-    ) -> PickerItem {
+    /// Titles carry the task; metadata leads with the agent and keeps the
+    /// directory readable. The host is already pinned above this scoped list.
+    fn resume_candidate_item(&self, host: &HostId, c: &ResumeCandidate) -> PickerItem {
         // Title precedence:
         // 1. Custom title from the transcript (e.g. user's rename).
         // 2. The session's name in the agent's session manifest.
@@ -5104,35 +5098,23 @@ impl App {
             });
         let ago = format_relative_time(c.mtime);
         let cwd_short = self.shorten_path(&c.cwd).into_owned();
-        let mut meta_parts: Vec<String> = Vec::new();
-        if let Some(t) = tag {
-            meta_parts.push(t.to_string());
-        }
-        meta_parts.push(format!("{ago} ago"));
+        let readable = Style::default().remove_modifier(Modifier::DIM);
+        let mut metadata = vec![
+            Span::styled(
+                c.agent.label(),
+                readable.fg(crate::config::get().colors.ui.title_fg),
+            ),
+            Span::raw(format!("  ·  {ago} ago  ·  ")),
+            Span::styled(cwd_short, readable),
+        ];
         if let Some(b) = c.git_branch.as_deref() {
-            meta_parts.push(b.to_string());
+            metadata.push(Span::raw(format!("  ·  {b}")));
         }
-        meta_parts.push(cwd_short);
-        // Trail with the backend so a mixed Claude/Codex list is
-        // distinguishable — two sessions can share a first prompt, cwd, and
-        // branch but differ only by agent.
-        meta_parts.push(c.agent.label().to_string());
-        // In a cross-host list, lead the meta with the host so remote
-        // candidates are distinguishable; omit it for local rows.
-        if !host.is_local() {
-            meta_parts.insert(0, host.0.clone());
-        }
-        let secondary = meta_parts.join("  ·  ");
-        // Filter against tag + title + saved name + cwd + branch + agent + host
+        // Filter against title + saved name + cwd + branch + agent + host
         // so users can search by any of them — saved names aren't shown for
         // entries that already have a custom title or first prompt, but they're
         // still useful for filtering.
-        let mut filter_text = String::new();
-        if let Some(t) = tag {
-            filter_text.push_str(t);
-            filter_text.push(' ');
-        }
-        filter_text.push_str(&format!(
+        let filter_text = format!(
             "{} {} {} {} {} {} {}",
             primary,
             saved_name.as_deref().unwrap_or(""),
@@ -5141,9 +5123,10 @@ impl App {
             c.git_branch.as_deref().unwrap_or(""),
             c.agent.label(),
             host.0,
-        ));
+        );
         PickerItem::new(primary)
-            .with_secondary(secondary)
+            .with_primary_style(Style::default().bold())
+            .with_secondary(Line::from(metadata))
             .with_filter_text(filter_text)
     }
 
@@ -5153,15 +5136,20 @@ impl App {
     pub(super) fn open_resume_picker(&mut self, host: HostId, candidates: Vec<ResumeCandidate>) {
         let items: Vec<PickerItem> = candidates
             .iter()
-            .map(|c| self.resume_candidate_item(&host, c, None))
+            .map(|c| self.resume_candidate_item(&host, c))
             .collect();
 
-        let picker = Picker::new(resume_picker_title(&host), items)
+        let mut picker = Picker::new(resume_picker_title(&host), items)
             .with_placeholder("Search by title, path, or branch…")
             .with_size(80, 80);
+        picker.item_spacing = 1;
         self.picker = Some(ActivePicker {
             picker,
-            kind: PickerKind::Resume { host, candidates },
+            kind: PickerKind::Resume {
+                host,
+                agent_filter: None,
+                candidates,
+            },
         });
         self.input_mode = InputMode::Picker;
         self.refresh_picker_status_bar();
@@ -5172,17 +5160,67 @@ impl App {
     /// picker. Scoping to one host at a time is what replaced the cross-host
     /// union (§9), so the list's scope is always readable in the title.
     pub(super) fn reseed_resume_picker(&mut self, host: HostId, candidates: Vec<ResumeCandidate>) {
+        let agent_filter = match self.picker.as_ref().map(|active| &active.kind) {
+            Some(PickerKind::Resume { agent_filter, .. }) => *agent_filter,
+            _ => return,
+        };
         let items: Vec<PickerItem> = candidates
             .iter()
-            .map(|c| self.resume_candidate_item(&host, c, None))
+            .map(|c| self.resume_candidate_item(&host, c))
             .collect();
         if let Some(active) = self.picker.as_mut() {
             active.picker.title = resume_picker_title(&host);
             active.picker.items = items;
             active.picker.set_text("");
-            active.kind = PickerKind::Resume { host, candidates };
+            active.kind = PickerKind::Resume {
+                host,
+                agent_filter,
+                candidates,
+            };
         }
+        self.set_resume_agent_filter(agent_filter);
+    }
+
+    /// Scope the loaded inventory without changing its indices: submission
+    /// still resolves the original candidate after either filter is applied.
+    pub(super) fn set_resume_agent_filter(&mut self, filter: Option<AgentControl>) {
+        let Some(active) = self.picker.as_mut() else {
+            return;
+        };
+        let PickerKind::Resume {
+            agent_filter,
+            candidates,
+            ..
+        } = &mut active.kind
+        else {
+            return;
+        };
+        let filtered = active.picker.filtered();
+        let selected = filtered.get(active.picker.cursor).copied();
+        *agent_filter = filter;
+        for (item, candidate) in active.picker.items.iter_mut().zip(candidates) {
+            item.hidden = filter.is_some_and(|agent| agent != candidate.agent);
+        }
+        active.picker.cursor = active
+            .picker
+            .filtered()
+            .iter()
+            .position(|index| Some(*index) == selected)
+            .unwrap_or(0);
         self.refresh_picker_status_bar();
+    }
+
+    pub(super) fn selected_resume(&self) -> Option<(HostId, ResumeCandidate)> {
+        let active = self.picker.as_ref()?;
+        let PickerKind::Resume {
+            host, candidates, ..
+        } = &active.kind
+        else {
+            return None;
+        };
+        let filtered = active.picker.filtered();
+        let index = filtered.get(active.picker.cursor.min(filtered.len().saturating_sub(1)))?;
+        Some((host.clone(), candidates.get(*index)?.clone()))
     }
 
     /// Mark the open picker as still fetching its items (or done). Only affects
@@ -5254,8 +5292,15 @@ impl App {
             // No loading note here: the list area already says so, and while a
             // fetch is in flight the items are always empty, so the two would
             // only ever appear together.
-            PickerKind::Resume { host, .. } => {
-                vec![Span::styled(" Host ", dim), host_span(self, host)]
+            PickerKind::Resume {
+                host, agent_filter, ..
+            } => {
+                vec![
+                    Span::styled(" Agent ", dim),
+                    Span::styled(agent_filter.map_or("All", AgentControl::label), value),
+                    Span::styled("   Host ", dim),
+                    host_span(self, host),
+                ]
             }
             _ => Vec::new(),
         };
