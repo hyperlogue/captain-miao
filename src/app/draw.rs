@@ -1595,7 +1595,7 @@ impl App {
                 let mut spans = hint_pair("Enter", "keep & return");
                 spans.extend(hint_pair("Ctrl-o", "launch"));
                 spans.extend(hint_pair("Esc", "cancel"));
-                spans.extend(hint_pair(",/.", "host page"));
+                spans.extend(hint_pair("[/]", "host page"));
                 spans
             }
             InputMode::Normal if self.session_detail => {

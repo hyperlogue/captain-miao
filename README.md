@@ -62,7 +62,7 @@ If you do not select a session, `o` opens the directory picker.
 Press `O` to select a directory.
 In the directory picker, press `Ctrl-o` to choose an agent and host side by side.
 Use `qwertyuiop` for agents and `asdfgzxcvb` for the ten hosts on each page;
-`,` and `.` turn host pages. The configured defaults start selected.
+`[` and `]` turn host pages. The configured defaults start selected.
 Press `Enter` to keep the choices and return to directory selection, `Ctrl-o`
 to launch immediately in the previously highlighted directory, or `Esc` to
 discard changes and return. Choices apply to this launch only. The selector

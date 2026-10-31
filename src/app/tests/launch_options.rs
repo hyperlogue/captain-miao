@@ -122,7 +122,7 @@ fn launch_options_ctrl_o_launches_the_captured_highlight_not_the_filter() {
 fn launch_options_paging_reaches_thirty_hosts_and_remembers_an_off_page_choice() {
     let mut d = with_hosts(30, 100, 24);
     open(&mut d);
-    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char('['));
     assert!(d.render().contains("Host · 1/3"));
     for page in 0..3 {
         let out = d.render();
@@ -139,11 +139,11 @@ fn launch_options_paging_reaches_thirty_hosts_and_remembers_an_off_page_choice()
             assert!(out.contains(&format!("Selected: Claude · {host}")), "{out}");
             assert!(out.contains(&format!("[{key}] ● {host}")), "{out}");
         }
-        d.press(KeyCode::Char('.'));
+        d.press(KeyCode::Char(']'));
     }
     assert!(d.render().contains("Host · 3/3"), "last page does not wrap");
-    d.press(KeyCode::Char(','));
-    d.press(KeyCode::Char(','));
+    d.press(KeyCode::Char('['));
+    d.press(KeyCode::Char('['));
     let out = d.render();
     assert!(out.contains("Host · 1/3"));
     assert!(out.contains("Selected: Claude · host-29"));
@@ -172,7 +172,7 @@ fn launch_options_partial_page_and_modifier_keys_do_not_change_selection() {
     let mut d = with_hosts(31, 100, 24);
     open(&mut d);
     for _ in 0..3 {
-        d.press(KeyCode::Char('.'));
+        d.press(KeyCode::Char(']'));
     }
     d.press(KeyCode::Char('a'));
     d.press(KeyCode::Char('b')); // No tenth entry on this page.

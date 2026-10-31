@@ -173,7 +173,7 @@ impl LaunchOptions {
                     self.page + 1,
                     self.pages(),
                     if navigation_height == 0 && self.pages() > 1 {
-                        " ,/."
+                        " [/]"
                     } else {
                         ""
                     }
@@ -194,8 +194,8 @@ impl LaunchOptions {
             );
         }
         let navigation_text = match (self.pages() > 1, rows > visible) {
-            (true, true) => ", previous page   . next page   ↑↓ scroll",
-            (true, false) => ", previous page   . next page",
+            (true, true) => "[ previous page   ] next page   ↑↓ scroll",
+            (true, false) => "[ previous page   ] next page",
             (false, true) => "↑↓ scroll",
             (false, false) => "Press a letter to select",
         };
@@ -285,12 +285,12 @@ impl App {
                     }
                     return None;
                 }
-                KeyCode::Char(',') => {
+                KeyCode::Char('[') => {
                     options.page = options.page.saturating_sub(1);
                     options.scroll = 0;
                     options.reveal = None;
                 }
-                KeyCode::Char('.') => {
+                KeyCode::Char(']') => {
                     options.page = (options.page + 1).min(options.pages() - 1);
                     options.scroll = 0;
                     options.reveal = None;
