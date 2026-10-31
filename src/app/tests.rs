@@ -2083,6 +2083,7 @@ fn prefs_hides_terminal_unless_this_dashboard_is_kitty() {
 
 #[test]
 fn task_idle_toggle_and_preferences_persist_across_sessions_and_hosts() {
+    use super::tasks::TaskRule;
     const CHILD: &str = "CM_TEST_IDLE_TASK_PREFS";
     if std::env::var_os(CHILD).is_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -2130,12 +2131,12 @@ fn task_idle_toggle_and_preferences_persist_across_sessions_and_hosts() {
     assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
     assert_eq!(d.app.sessions[2].status, SessionStatus::BackgroundActive);
     assert_eq!(d.app.selected_session_ref().unwrap().launcher_pid, selected);
-    assert_eq!(d.app.extra_prefs.idle_commands, [command]);
+    assert_eq!(d.app.extra_prefs.task_rules, [TaskRule::new(command, true)]);
     let saved = d.app.dashboard_state.load().unwrap();
-    assert_eq!(saved.prefs.idle_commands, [command]);
-    d.app.extra_prefs.idle_commands.clear();
+    assert_eq!(saved.prefs.task_rules, [TaskRule::new(command, true)]);
+    d.app.extra_prefs.task_rules.clear();
     d.app.load_overrides();
-    assert_eq!(d.app.extra_prefs.idle_commands, [command]);
+    assert_eq!(d.app.extra_prefs.task_rules, [TaskRule::new(command, true)]);
 
     // Preferences edit a remembered command into a reusable pattern.
     d.press(KeyCode::Char(','));
@@ -2153,8 +2154,8 @@ fn task_idle_toggle_and_preferences_persist_across_sessions_and_hosts() {
     }
     d.press(KeyCode::Enter);
     assert_eq!(
-        d.app.extra_prefs.idle_commands,
-        ["uv run carver view --port *"]
+        d.app.extra_prefs.task_rules,
+        [TaskRule::new("uv run carver view --port *", true)]
     );
     d.app.sessions[1].background_commands = vec!["uv run carver view --port 8010".into()];
     d.app.refresh_idle_tasks();
@@ -2167,33 +2168,70 @@ fn task_idle_toggle_and_preferences_persist_across_sessions_and_hosts() {
     assert_eq!(d.app.sessions[2].status, SessionStatus::Idle);
     d.press(KeyCode::Char('d'));
     assert_eq!(d.app.sessions[2].status, SessionStatus::BackgroundActive);
-    assert_eq!(d.app.extra_prefs.idle_commands.len(), 1);
+    assert_eq!(d.app.extra_prefs.task_rules.len(), 1);
     d.press(KeyCode::Esc);
 
-    // The reverse toggle removes matching patterns and updates every row.
+    // The reverse toggle saves an exact Task override, retaining the wildcard
+    // for other commands (including the other host's different port).
     d.press_toggle('i');
-    assert!(d.app.extra_prefs.idle_commands.is_empty());
-    assert!(
-        d.app
-            .sessions
-            .iter()
-            .all(|s| s.status == SessionStatus::BackgroundActive)
+    assert_eq!(
+        d.app.extra_prefs.task_rules,
+        [
+            TaskRule::new("uv run carver view --port *", true),
+            TaskRule::new(command, false),
+        ]
     );
+    assert_eq!(d.app.sessions[0].status, SessionStatus::BackgroundActive);
+    assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
+    assert_eq!(d.app.sessions[2].status, SessionStatus::BackgroundActive);
     assert_eq!(d.app.selected_session_ref().unwrap().launcher_pid, selected);
-    assert!(
-        d.app
-            .dashboard_state
-            .load()
-            .unwrap()
-            .prefs
-            .idle_commands
-            .is_empty()
+    assert_eq!(
+        d.app.dashboard_state.load().unwrap().prefs.task_rules,
+        d.app.extra_prefs.task_rules
     );
     d.app.sessions[0].status = SessionStatus::Active;
     d.app.mark_dirty(Cursor::FollowSession);
     d.press_toggle('i');
     assert_eq!(d.app.sessions[0].status, SessionStatus::Active);
-    assert!(d.app.extra_prefs.idle_commands.is_empty());
+    assert_eq!(d.app.extra_prefs.task_rules.len(), 2);
+
+    // Built-in servers and review waits can be forced to Task and inspected,
+    // edited and reset in Preferences. This applies to pooled hosts too.
+    d.app.sessions[0].status = SessionStatus::BackgroundActive;
+    d.app.sessions[0].background_commands =
+        vec!["npm run dev".into(), "r3 watch review_abc".into()];
+    d.app.sessions[1].background_commands = d.app.sessions[0].background_commands.clone();
+    d.app.refresh_idle_tasks();
+    assert_eq!(d.app.sessions[0].status, SessionStatus::Idle);
+    assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
+    d.press_toggle('i');
+    assert_eq!(d.app.sessions[0].status, SessionStatus::BackgroundActive);
+    assert_eq!(d.app.sessions[1].status, SessionStatus::BackgroundActive);
+    d.app.load_overrides();
+    d.app.refresh_idle_tasks();
+    assert_eq!(d.app.sessions[0].status, SessionStatus::BackgroundActive);
+    d.press(KeyCode::Char(','));
+    for _ in 0..6 {
+        if d.render().contains("+ Add command") {
+            break;
+        }
+        d.press(KeyCode::Char('l'));
+    }
+    let out = d.render();
+    assert!(out.contains("Task  npm run dev"), "{out}");
+    assert!(out.contains("Task  r3 watch review_abc"), "{out}");
+    d.press(KeyCode::Char('j'));
+    d.press(KeyCode::Char('j'));
+    d.press(KeyCode::Char('t'));
+    assert_eq!(d.app.sessions[0].status, SessionStatus::BackgroundActive);
+    assert!(d.render().contains("Idle  npm run dev"));
+    d.press(KeyCode::Char('j'));
+    d.press(KeyCode::Char('r'));
+    assert_eq!(d.app.sessions[0].status, SessionStatus::Idle);
+    assert_eq!(d.app.sessions[1].status, SessionStatus::Idle);
+    d.press(KeyCode::Char('k'));
+    d.press(KeyCode::Char('r'));
+    assert_eq!(d.app.sessions[0].status, SessionStatus::Idle);
 }
 
 #[test]
@@ -10586,7 +10624,10 @@ fn user_idled_tasks_do_not_inhibit_sleep() {
     let mut d = TestDashboard::new(120, 10);
     let mut task = session(1, "/home/test/a", SessionStatus::BackgroundActive);
     task.background_commands = vec!["r3 watch review_abc".into()];
-    super::tasks::apply_idle_commands(&mut task, &["r3 watch *".into()]);
+    super::tasks::apply_idle_commands(
+        &mut task,
+        &[super::tasks::TaskRule::new("r3 watch *", true)],
+    );
     d.set_sessions(vec![task]);
     assert!(
         !d.app.has_active_session(),
@@ -11430,7 +11471,7 @@ fn space_e_and_space_shift_e_treat_user_idled_tasks_as_idle() {
         let mut d = TestDashboard::new(120, 20);
         let mut task = session(1, "/home/test/proj", SessionStatus::BackgroundActive);
         task.background_commands = vec![command.into()];
-        super::tasks::apply_idle_commands(&mut task, &[command.into()]);
+        super::tasks::apply_idle_commands(&mut task, &[super::tasks::TaskRule::new(command, true)]);
         d.set_sessions(vec![task]);
         d.press(KeyCode::Char(' '));
         d.press(KeyCode::Char('e'));

@@ -58,19 +58,31 @@ is still restart-labelled.
 
 ## Idle task commands
 
-Preferences also manages the user-owned Idle task list. `Space t i` adds the
-selected session's current background commands as exact matches, or removes
-matching entries to return the session to Task. **Idle tasks** supports adding
-(`a`), editing (`Enter`), and deleting (`d`) entries. A `*` matches any text;
-backslash escapes a literal star or backslash. Patterns match whole commands.
+The dashboard classifies reported background commands using a conservative
+built-in list in `src/app/tasks/heuristics.rs`: common servers, file watchers
+and r3 review waits count as Idle; unknown commands count as Task. Explicit
+user rules take precedence over these defaults. Foreground turns and
+approval/decision prompts retain their status, and every reported background
+command must count as Idle before the session is presented as Idle.
 
-The list persists in `dashboard-overrides.json` under `prefs.idle_commands`
-and applies across hosts. Launchers report `background_commands` alongside
-Task status; the dashboard presents Idle only when every reported command
-matches. Foreground turns and approval/decision prompts retain their status.
-This replaces the Server/Review status variants and automatic duration-based
-learning. Old serialized Server/Review values decode as Idle. Older launchers
-without command metadata must be restarted before their tasks can be toggled.
+`Space t i` records the selected session's commands as exact Task or Idle
+overrides. It preserves wildcard rules for other commands. **Idle tasks**
+shows each override's choice and supports adding (`a`, initially Idle), editing
+(`Enter`), switching Task/Idle (`t`), and deleting (`d` or `r`) entries.
+Deleting restores the remaining rules or automatic detection. A `*` matches
+any text; backslash escapes a literal star or backslash. Patterns match whole
+commands, with the last matching rule winning.
+
+Rules persist in `dashboard-overrides.json` under `prefs.task_rules` as
+`{"pattern":"npm run dev","idle":false}` entries and apply across hosts.
+The former `prefs.idle_commands` string list migrates to explicit Idle rules.
+Launchers only report `background_commands` alongside Task status; all
+Task/Idle classification lives in the dashboard. The old Server/Review status
+variants and automatic duration-based learning remain removed. Old serialized
+Server/Review values decode as Idle for compatibility. Claude's r3 process
+recognizer only discovers surviving background commands; it does not assign
+their Task/Idle preference. Older launchers without command metadata must be
+restarted before their tasks can be classified or toggled.
 
 ## Background & Motivation
 

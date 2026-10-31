@@ -151,6 +151,22 @@ The six most frequent shortcuts:
 Press `?` to view all key bindings.
 Press `,` to open preferences.
 
+Background commands count as **Task** unless built-in heuristics recognize a
+server, watcher, or review wait (such as `npm run dev`, `cargo watch`, or
+`r3 watch`), which counts as **Idle**. Unknown commands remain Task. Every
+reported background command must count as Idle for the session to be Idle;
+foreground turns and approval prompts retain their status.
+
+Press `Space t i` to override the selected session's commands as Task or Idle.
+View these choices in **Preferences → Idle tasks**: `Enter` edits a pattern,
+`t` switches Task/Idle, `a` adds an Idle rule, and `d` or `r` removes an override
+to restore automatic detection. Patterns match whole commands; `*` matches
+any text and backslash escapes a literal star or backslash. User rules override
+built-in heuristics, with the last matching rule taking precedence, across
+all hosts. Compound or unrecognized commands can be classified this way too.
+For older installations, update `miao-server` on pooled hosts and restart
+existing launchers so they report command identities.
+
 Restart waits for the previous session to end before its replacement resumes
 the conversation. If the host cannot confirm removal, the dashboard reports an
 error. Resume also refuses conversations still managed on the selected host.

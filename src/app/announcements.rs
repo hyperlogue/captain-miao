@@ -51,7 +51,7 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
         kind: Kind::Update,
         content: &[
             Content::Text(
-                "Background work now uses Task or Idle. The separate Server and Review states and automatic one-hour learning have been removed.",
+                "Background work uses Task or Idle. Built-in heuristics count common servers, watchers and review waits as Idle; unknown commands stay Task. The separate Server and Review states and automatic one-hour learning have been removed.",
             ),
             Content::Binding(
                 Command::ToggleTaskIdle,
@@ -59,10 +59,10 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
             ),
             Content::Binding(
                 Command::Preferences,
-                "Open Preferences → Idle tasks to add, edit, or remove commands. Use * to match changing arguments.",
+                "Open Preferences → Idle tasks to inspect overrides. Enter edits, t switches Task/Idle, and d or r removes an override. Use * to match changing arguments.",
             ),
             Content::Text(
-                "These preferences apply across hosts. Every running background command must match for a session to count as Idle. Active turns and approval prompts keep their status.",
+                "User rules override built-in heuristics across hosts; the last matching rule wins. Every running background command must count as Idle for the session to be Idle. Active turns and approval prompts keep their status.",
             ),
             Content::Text(
                 "Existing launchers need a restart with the updated build to report their background commands. On pooled hosts, update miao-server first.",

@@ -3451,7 +3451,7 @@ impl App {
             let host = backend.host_id();
             for mut s in backend.list_sessions() {
                 s.host = host.clone();
-                tasks::apply_idle_commands(&mut s, &self.extra_prefs.idle_commands);
+                tasks::apply_idle_commands(&mut s, &self.extra_prefs.task_rules);
                 // Drop rows this dashboard could only stare at — see
                 // `is_actionable_row`. Filtered here, at the single point every
                 // row enters the dashboard, so nothing downstream has to know.

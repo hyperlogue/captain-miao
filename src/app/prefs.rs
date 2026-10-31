@@ -18,8 +18,8 @@
 //! layer 3 is folded onto 1+2, and [`App::reapply_live_config`] re-runs the
 //! whole stack from disk after any write.
 //!
-//! The Idle tasks list is user state without a TOML default. It is stored
-//! alongside these overrides and applies through `tasks::apply_idle_commands`.
+//! Idle task rules are user state without a TOML default. They override the
+//! built-in classifier through `tasks::apply_idle_commands`.
 //!
 //! Two rows are deliberately absent, because they are not single values: the
 //! default agent is the first entry of the ordered agent list in this overlay,
@@ -42,6 +42,7 @@ use crate::terminal::SessionsLayout;
 
 use super::format::{centered_rect, clear_overlay};
 use super::picker::TextInput;
+use super::tasks::TaskRule;
 use super::{Action, App, InputMode};
 
 // =============================================================================
@@ -151,16 +152,21 @@ impl PrefsState {
 /// Layer 3: what this overlay has overridden, stored under
 /// `dashboard-overrides.json`'s `prefs` key.
 ///
-/// Every field is `Option` and skipped when `None`, so the file records only
-/// what the user actually changed — and `DashboardOverrides` skips the whole
+/// Config-backed fields are `Option` and skipped when `None`, so the file
+/// records only what the user changed — and `DashboardOverrides` skips the whole
 /// `prefs` key via [`Self::is_empty`], leaving no trace at all until something
 /// is set. Absence is what makes the layer below show through; see the module
 /// doc on why a reset writes `None` rather than the current default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PrefsOverrides {
-    /// User-owned command patterns; independent of TOML defaults.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub idle_commands: Vec<String>,
+    /// Ordered user overrides; the last match wins over built-in heuristics.
+    #[serde(
+        default,
+        alias = "idle_commands",
+        deserialize_with = "super::tasks::deserialize_rules",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub(super) task_rules: Vec<TaskRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_window_close: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +209,7 @@ impl PrefsOverrides {
     /// `PartialEq` with the default, so adding a field is a compile error here
     /// rather than a silently-always-written key.
     pub(super) fn is_empty(&self) -> bool {
-        self.idle_commands.is_empty()
+        self.task_rules.is_empty()
             && self.on_window_close.is_none()
             && self.pooled.is_none()
             && self.kitty_rc_password.is_none()
@@ -440,7 +446,7 @@ impl App {
         match cat {
             PrefsCategory::Agents => self.agent_order.len().max(1),
             PrefsCategory::General => GENERAL_ROWS.len(),
-            PrefsCategory::IdleTasks => self.extra_prefs.idle_commands.len() + 1,
+            PrefsCategory::IdleTasks => self.extra_prefs.task_rules.len() + 1,
             PrefsCategory::Display => DISPLAY_ROWS.len(),
             PrefsCategory::Colors => COLOR_ROWS.len(),
             PrefsCategory::Terminal => {
@@ -578,12 +584,13 @@ impl App {
                 }) =>
             {
                 if let Some(p) = self.prefs.as_mut() {
-                    p.cursor = self.extra_prefs.idle_commands.len();
+                    p.cursor = self.extra_prefs.task_rules.len();
                 }
                 self.open_prefs_field(String::new());
             }
             KeyCode::Char('J') => self.prefs_reorder(1),
             KeyCode::Char('K') => self.prefs_reorder(-1),
+            KeyCode::Char('t') => self.prefs_toggle_task_rule(),
             KeyCode::Char('x') | KeyCode::Char('d') => self.prefs_toggle_disable(),
             KeyCode::Char('r') => self.prefs_reset_row(),
             KeyCode::Char('-') | KeyCode::Char('[') => self.prefs_step(-1),
@@ -653,8 +660,8 @@ impl App {
             return;
         };
         if st.category == PrefsCategory::IdleTasks && st.pane == PrefsPane::Items {
-            if st.cursor < self.extra_prefs.idle_commands.len() {
-                self.extra_prefs.idle_commands.remove(st.cursor);
+            if st.cursor < self.extra_prefs.task_rules.len() {
+                self.extra_prefs.task_rules.remove(st.cursor);
                 self.save_overrides();
                 self.refresh_idle_tasks();
             }
@@ -674,6 +681,20 @@ impl App {
             return;
         }
         self.persist_agent_order();
+    }
+
+    fn prefs_toggle_task_rule(&mut self) {
+        let Some(st) = self.prefs.as_ref() else {
+            return;
+        };
+        if st.category != PrefsCategory::IdleTasks || st.pane != PrefsPane::Items {
+            return;
+        }
+        if let Some(rule) = self.extra_prefs.task_rules.get_mut(st.cursor) {
+            rule.idle = !rule.idle;
+            self.save_overrides();
+            self.refresh_idle_tasks();
+        }
     }
 
     pub(super) fn persist_agent_order(&mut self) {
@@ -709,9 +730,9 @@ impl App {
             PrefsCategory::IdleTasks => {
                 let seed = self
                     .extra_prefs
-                    .idle_commands
+                    .task_rules
                     .get(st.cursor)
-                    .cloned()
+                    .map(|rule| rule.pattern.clone())
                     .unwrap_or_default();
                 self.open_prefs_field(seed);
             }
@@ -825,19 +846,19 @@ impl App {
                     );
                     return;
                 }
-                let commands = &mut self.extra_prefs.idle_commands;
+                let commands = &mut self.extra_prefs.task_rules;
                 if commands
                     .iter()
                     .enumerate()
-                    .any(|(i, c)| i != cursor && c == &command)
+                    .any(|(i, rule)| i != cursor && rule.pattern == command)
                 {
-                    self.set_status("That Idle command is already listed".into(), true);
+                    self.set_status("That command pattern is already listed".into(), true);
                     return;
                 }
                 if cursor < commands.len() {
-                    commands[cursor] = command;
+                    commands[cursor].pattern = command;
                 } else {
-                    commands.push(command);
+                    commands.push(TaskRule::new(command, true));
                 }
             }
 
@@ -1127,11 +1148,22 @@ impl App {
         let cfg = config::get();
         let (rows, help) = match st.category {
             PrefsCategory::IdleTasks => {
-                let mut rows = self.extra_prefs.idle_commands.clone();
+                let mut rows: Vec<_> = self
+                    .extra_prefs
+                    .task_rules
+                    .iter()
+                    .map(|rule| {
+                        format!(
+                            "{:<4}  {}",
+                            if rule.idle { "Idle" } else { "Task" },
+                            rule.pattern
+                        )
+                    })
+                    .collect();
                 rows.push("+ Add command…".into());
                 (
                     rows,
-                    "Enter edits · a adds · d removes · * matches any text · Esc closes".into(),
+                    "Enter edits · t toggles Task/Idle · a adds · d/r removes override · * wildcard. Overrides win; last match wins. Automatic: common servers, watchers and review waits are Idle.".into(),
                 )
             }
 
@@ -1292,6 +1324,33 @@ impl App {
 mod tests {
     use super::*;
     use crate::agent::AgentControl;
+
+    #[test]
+    fn legacy_idle_commands_migrate_and_both_choices_round_trip() {
+        let mut prefs: PrefsOverrides = serde_json::from_value(serde_json::json!({
+            "idle_commands": ["carver view *", "r3 watch *"]
+        }))
+        .unwrap();
+        assert_eq!(
+            prefs.task_rules,
+            [
+                TaskRule::new("carver view *", true),
+                TaskRule::new("r3 watch *", true)
+            ]
+        );
+        prefs.task_rules.push(TaskRule::new("npm run dev", false));
+        assert!(!prefs.is_empty());
+        let value = serde_json::to_value(&prefs).unwrap();
+        assert!(value.get("idle_commands").is_none());
+        let restored: PrefsOverrides = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.task_rules, prefs.task_rules);
+        assert!(
+            serde_json::from_str::<PrefsOverrides>("{}")
+                .unwrap()
+                .task_rules
+                .is_empty()
+        );
+    }
 
     #[test]
     fn agent_logos_override_round_trips_and_none_inherits_toml() {
