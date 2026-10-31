@@ -79,6 +79,15 @@ the chosen host and agent; otherwise it applies the filters and returns to
 the list so you can choose a session. Hosts use `asdfgzxcvb` and `[` / `]`
 for paging, just as in the new-session selector.
 
+Resume lists are cached in memory. Opening the picker or switching hosts shows
+the last available result immediately and refreshes it in the background,
+preserving your search and selection. A failed refresh keeps the cached sessions.
+The server warms its cache once at startup; there is no timed refresh. Native
+history readers reuse unchanged files, while CLI/API-only sources use their
+normal listing operation. Updated servers keep entries per agent so the agent
+filter applies before the visible session limit. Caches reset when their process
+restarts.
+
 The dashboard highlights sessions that require attention.
 Press `s` to select the next highlighted session.
 Press `Enter` to focus its window.

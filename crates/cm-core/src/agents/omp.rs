@@ -525,15 +525,31 @@ fn sessions_root() -> Option<PathBuf> {
 /// errors come back (see `opencode::list_resumable` for the same argument), so
 /// refusing here would put an error in front of every user who never ran omp.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let Some(root) = sessions_root() else {
         return Ok(Vec::new());
     };
-    Ok(list_resumable_in(&root, limit))
+    Ok(list_resumable_in_cached(&root, limit, cache))
 }
 
 /// The scan itself, split from `$PI_CODING_AGENT_DIR` resolution so a test can
 /// point it at a fixture tree without touching the environment.
+#[cfg(test)]
 fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    list_resumable_in_cached(root, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_in_cached(
+    root: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Vec<ResumeCandidate> {
     if limit == 0 {
         return Vec::new();
     }
@@ -568,19 +584,22 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
         if out.len() >= limit {
             break;
         }
-        let Some(head) = read_session_head(&path) else {
-            continue;
-        };
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Omp,
-            session_id: head.session_id,
-            cwd: head.cwd,
-            first_prompt: head.first_prompt,
-            custom_title: head.title,
-            // omp records no branch anywhere a candidate can read.
-            git_branch: None,
-            mtime,
+        let candidate = cache.candidates.get(&path, &[], || {
+            let head = read_session_head(&path)?;
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Omp,
+                session_id: head.session_id,
+                cwd: head.cwd,
+                first_prompt: head.first_prompt,
+                custom_title: head.title,
+                // omp records no branch anywhere a candidate can read.
+                git_branch: None,
+                mtime,
+            })
         });
+        if let Some(candidate) = candidate {
+            out.push(candidate);
+        }
     }
     out
 }

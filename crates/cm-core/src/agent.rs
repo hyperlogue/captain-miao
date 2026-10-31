@@ -836,21 +836,29 @@ impl AgentControl {
     /// first, capped at `limit`. The returned candidates carry their source
     /// agent so a future picker can mix backends in one list.
     pub fn list_resumable(self, limit: usize) -> Result<Vec<ResumeCandidate>> {
+        self.list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+    }
+
+    pub(crate) fn list_resumable_cached(
+        self,
+        limit: usize,
+        cache: &mut crate::resume::AgentCache,
+    ) -> Result<Vec<ResumeCandidate>> {
         match self {
-            AgentControl::Claude => claude::list_resumable(limit),
-            AgentControl::Codex => codex::list_resumable(limit),
+            AgentControl::Claude => claude::list_resumable_cached(limit, cache),
+            AgentControl::Codex => codex::list_resumable_cached(limit, cache),
             // Read off disk rather than through Reasonix's own
             // `reasonix session list --json`, which is documented as *redacted*:
             // it deliberately exposes no transcript, label, path or host
             // content — none of the cwd, title or first prompt a candidate is
             // made of. The `.jsonl.meta` sidecars carry all three.
-            AgentControl::Reasonix => reasonix::list_resumable(limit),
-            AgentControl::Kimi => kimi::list_resumable(limit),
-            AgentControl::Grok => grok::list_resumable(limit),
+            AgentControl::Reasonix => reasonix::list_resumable_cached(limit, cache),
+            AgentControl::Kimi => kimi::list_resumable_cached(limit, cache),
+            AgentControl::Grok => grok::list_resumable_cached(limit, cache),
             AgentControl::OpenCode => opencode::list_resumable(limit),
             // Picker metadata is session-wide; it needs no active-branch walk.
-            AgentControl::Pi => pi::list_resumable(limit),
-            AgentControl::Antigravity => antigravity::list_resumable(limit),
+            AgentControl::Pi => pi::list_resumable_cached(limit, cache),
+            AgentControl::Antigravity => antigravity::list_resumable_cached(limit, cache),
             // Read off disk the way the other file-backed backends are: every
             // field a candidate needs sits in the head of
             // `~/.omp/agent/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`
@@ -860,7 +868,7 @@ impl AgentControl {
             // message — so no `parentId` walk is needed. That walk stays where
             // it belongs: `read_transcript_stats`, whose fold really does need
             // the active leaf.
-            AgentControl::Omp => omp::list_resumable(limit),
+            AgentControl::Omp => omp::list_resumable_cached(limit, cache),
             AgentControl::Unknown => Ok(vec![]),
         }
     }

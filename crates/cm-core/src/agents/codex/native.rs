@@ -398,15 +398,27 @@ fn parse_user_message(line: &str) -> Option<String> {
 /// to `limit` candidates sorted by mtime (most recent first). Titles come from
 /// the host's Codex store, just like the live-session overlay: rollouts do not
 /// carry renames, and a title must survive even when no prompt is in the header.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+pub(super) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
     let home = codex_home().ok_or_else(|| anyhow::anyhow!("no codex home"))?;
-    list_resumable_at(&home, limit)
+    list_resumable_at_cached(&home, limit, cache)
 }
 
+#[cfg(test)]
 fn list_resumable_at(home: &Path, limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_at_cached(home, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_at_cached(
+    home: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -438,19 +450,24 @@ fn list_resumable_at(home: &Path, limit: usize) -> Result<Vec<ResumeCandidate>> 
 
     let mut out = Vec::with_capacity(limit.min(files.len()));
     for (path, mtime) in files {
-        let header = read_rollout_header(&path);
-        let (Some(session_id), Some(cwd)) = (header.session_id, header.cwd) else {
-            continue;
-        };
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Codex,
-            session_id,
-            cwd,
-            first_prompt: header.first_prompt,
-            custom_title: None,
-            git_branch: header.git_branch,
-            mtime,
+        let candidate = cache.candidates.get(&path, &[], || {
+            let header = read_rollout_header(&path);
+            let (Some(session_id), Some(cwd)) = (header.session_id, header.cwd) else {
+                return None;
+            };
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Codex,
+                session_id,
+                cwd,
+                first_prompt: header.first_prompt,
+                custom_title: None,
+                git_branch: header.git_branch,
+                mtime,
+            })
         });
+        if let Some(candidate) = candidate {
+            out.push(candidate);
+        }
         if out.len() == limit {
             break;
         }
@@ -1173,7 +1190,8 @@ mod tests {
         )
         .unwrap();
 
-        let candidates = list_resumable_at(&home, 10).unwrap();
+        let mut cache = crate::resume::AgentCache::default();
+        let candidates = list_resumable_at_cached(&home, 10, &mut cache).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].first_prompt, None);
         assert_eq!(
@@ -1186,17 +1204,22 @@ mod tests {
         conn.execute("UPDATE threads SET name = 'New session title'", [])
             .unwrap();
         assert_eq!(
-            list_resumable_at(&home, 10).unwrap()[0]
+            list_resumable_at_cached(&home, 10, &mut cache).unwrap()[0]
                 .custom_title
                 .as_deref(),
             Some("New session title")
         );
         conn.execute("UPDATE threads SET name = NULL", []).unwrap();
         assert_eq!(
-            list_resumable_at(&home, 10).unwrap()[0]
+            list_resumable_at_cached(&home, 10, &mut cache).unwrap()[0]
                 .custom_title
                 .as_deref(),
             Some("Auto title")
+        );
+        assert_eq!(
+            cache.candidates.read_count(),
+            1,
+            "renames do not reread the unchanged rollout"
         );
         drop(conn);
         std::fs::remove_dir_all(home).unwrap();

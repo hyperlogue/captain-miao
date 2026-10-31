@@ -26,9 +26,16 @@ pub const RESTART_RETRY_WINDOW: std::time::Duration = app_server::HANDOFF_TIMEOU
     .saturating_sub(std::time::Duration::from_secs(5));
 
 pub fn list_resumable(limit: usize) -> anyhow::Result<Vec<crate::agent::ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> anyhow::Result<Vec<crate::agent::ResumeCandidate>> {
     let config = crate::config::read_codex()?;
     match config.mode {
-        CodexMode::Native => native::list_resumable(limit),
+        CodexMode::Native => native::list_resumable_cached(limit, cache),
         CodexMode::AppServer => app_server::list_resumable(&config, limit),
     }
 }

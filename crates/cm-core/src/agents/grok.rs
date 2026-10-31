@@ -207,13 +207,29 @@ struct SummaryInfo {
 /// `signals.json`, not on a resume candidate. `last_turn_summary` rides
 /// `first_prompt` so a recap is searchable even when the title is already set.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no grok home"))?;
-    Ok(list_resumable_in(&root, limit))
+    Ok(list_resumable_in_cached(&root, limit, cache))
 }
 
 /// The scan itself, split from `$GROK_HOME` resolution so a test can point it
 /// at a fixture tree without touching the environment.
+#[cfg(test)]
 fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    list_resumable_in_cached(root, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_in_cached(
+    root: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Vec<ResumeCandidate> {
     let mut found = Vec::new();
     for cwd_key in common::read_subdirs(root) {
         for session_dir in common::read_subdirs(&cwd_key) {
@@ -227,30 +243,33 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
 
     let mut out = Vec::new();
     for (dir, mtime) in common::newest_first(found, limit) {
-        let Some(session_id) = dir.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Ok(body) = std::fs::read_to_string(dir.join("summary.json")) else {
-            continue;
-        };
-        let Ok(summary) = serde_json::from_str::<SessionSummary>(&body) else {
-            continue;
-        };
-        if summary.info.cwd.trim().is_empty() || summary.is_subagent() {
-            continue;
-        }
-        let custom_title = summary.title();
-        let git_branch = summary.git_branch();
-        let first_prompt = summary.last_turn_summary();
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Grok,
-            session_id: session_id.to_string(),
-            cwd: summary.info.cwd,
-            first_prompt,
-            custom_title,
-            git_branch,
-            mtime,
+        let candidate = cache.candidates.get(&dir.join("summary.json"), &[], || {
+            let session_id = dir.file_name().and_then(|n| n.to_str())?;
+            let Ok(body) = std::fs::read_to_string(dir.join("summary.json")) else {
+                return None;
+            };
+            let Ok(summary) = serde_json::from_str::<SessionSummary>(&body) else {
+                return None;
+            };
+            if summary.info.cwd.trim().is_empty() || summary.is_subagent() {
+                return None;
+            }
+            let custom_title = summary.title();
+            let git_branch = summary.git_branch();
+            let first_prompt = summary.last_turn_summary();
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Grok,
+                session_id: session_id.to_string(),
+                cwd: summary.info.cwd,
+                first_prompt,
+                custom_title,
+                git_branch,
+                mtime,
+            })
         });
+        if let Some(candidate) = candidate {
+            out.push(candidate);
+        }
     }
     out
 }

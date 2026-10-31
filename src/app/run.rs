@@ -591,32 +591,34 @@ pub(super) fn prune_detached_from_tabs(app: &mut App, tabs: &[Tab]) -> bool {
 /// The fetch used to run inline on a `block_in_place`, which for a remote host
 /// is an ssh round trip — pressing `r`, or `Ctrl-h` onto a remote, froze every
 /// frame until it answered. Now the popup appears first, marked loading, and
-/// [`apply_resume_load`] fills it in when the reply arrives. A **local** host
-/// still resolves inline: it's an in-process directory walk, and routing it
-/// through a task would only add a frame of "Loading…" flicker.
+/// [`apply_resume_load`] fills it in when the reply arrives. Both local and
+/// remote inventories run off-thread; cached rows remain usable meanwhile.
 fn start_resume_load(app: &mut App, inboxes: &mut LoopInboxes, host: HostId, reseed: bool) {
     let limit = config::get().launcher.resume_list_limit;
     inboxes.resume_seq += 1;
     let seq = inboxes.resume_seq;
+    let cached = app.resume_cache.get(&host).cloned().unwrap_or_default();
     if reseed {
-        app.reseed_resume_picker(host.clone(), Vec::new());
+        app.reseed_resume_picker(host.clone(), cached);
     } else {
-        app.open_resume_picker(host.clone(), Vec::new());
+        app.open_resume_picker(host.clone(), cached);
     }
     app.set_picker_loading(true);
     // One shape for the reply whichever arm answers, so the seq/reseed/host
     // bookkeeping can't drift between the inline paths and the spawned one.
-    let load = move |host: HostId, (candidates, errors)| ResumeLoad {
+    let load = move |host: HostId, (candidates, errors), cached, source| ResumeLoad {
         seq,
         reseed,
         host,
         candidates,
         errors,
+        cached,
+        source,
     };
     match app.backend_for(&host) {
         None => {
             let errors = vec![format!("unknown host {}", host.0)];
-            let reply = load(host, (Vec::new(), errors));
+            let reply = load(host, (Vec::new(), errors), false, None);
             apply_resume_load(app, inboxes, reply);
         }
         // Remote: hand the blocking round trip to a pool thread. The `Arc` clone
@@ -624,16 +626,46 @@ fn start_resume_load(app: &mut App, inboxes: &mut LoopInboxes, host: HostId, res
         // `App` that owns the backend.
         Some(Backend::Remote(remote)) => {
             let remote = std::sync::Arc::clone(remote);
+            let source = Some(super::ResumeSource::Remote(std::sync::Arc::downgrade(
+                &remote,
+            )));
             let tx = inboxes.resume_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let listed = remote.list_resumable(limit);
-                let _ = tx.send(load(host, listed));
+                let (candidates, errors, cached) =
+                    remote.list_resumable_snapshot(limit, true, true);
+                let _ = tx.send(load(
+                    host.clone(),
+                    (candidates, errors),
+                    cached,
+                    source.clone(),
+                ));
+                // An old server ignored cached_only and already answered fresh.
+                if cached {
+                    let (candidates, errors, _) =
+                        remote.list_resumable_snapshot(limit, false, true);
+                    let _ = tx.send(load(host, (candidates, errors), false, source));
+                }
             });
         }
         Some(backend) => {
-            let listed = tokio::task::block_in_place(|| backend.list_resumable(limit));
-            let reply = load(host, listed);
-            apply_resume_load(app, inboxes, reply);
+            let inventory = backend.resume_inventory().expect("local inventory");
+            let source = Some(super::ResumeSource::Local(std::sync::Arc::downgrade(
+                &inventory,
+            )));
+            let home = app.home_dir.clone();
+            let tx = inboxes.resume_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut result = inventory.refresh(limit, true);
+                for candidate in &mut result.candidates {
+                    candidate.cwd = cm_core::paths::collapse_home(&candidate.cwd, &home);
+                }
+                let _ = tx.send(load(
+                    host,
+                    (result.candidates, result.errors),
+                    false,
+                    source,
+                ));
+            });
         }
     }
 }
@@ -759,9 +791,39 @@ fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
     }
     if !matches!(
         app.picker.as_ref().map(|a| &a.kind),
-        Some(PickerKind::Resume { .. })
+        Some(PickerKind::Resume { host, .. }) if *host == load.host
     ) {
         return;
+    }
+    let same_source = match (&load.source, app.backend_for(&load.host)) {
+        (None, _) => true,
+        (Some(super::ResumeSource::Remote(source)), Some(Backend::Remote(current))) => source
+            .upgrade()
+            .is_some_and(|source| std::sync::Arc::ptr_eq(&source, current)),
+        (Some(super::ResumeSource::Local(source)), Some(current)) => source
+            .upgrade()
+            .zip(current.resume_inventory())
+            .is_some_and(|(source, current)| std::sync::Arc::ptr_eq(&source, &current)),
+        _ => false,
+    };
+    if !same_source {
+        app.resume_cache.remove(&load.host);
+        app.launch_options = None;
+        app.reseed_resume_picker(load.host, Vec::new());
+        app.set_picker_loading(false);
+        if let Some(active) = app.picker.as_mut() {
+            active
+                .picker
+                .set_error("Host connection changed; reopen the resume list");
+        }
+        return;
+    }
+    if load.cached && load.candidates.is_empty() {
+        return; // A cache miss is followed by a refresh, not an empty inventory.
+    }
+    if !load.candidates.is_empty() || (!load.cached && load.errors.is_empty()) {
+        app.resume_cache
+            .insert(load.host.clone(), load.candidates.clone());
     }
     if !load.candidates.is_empty() {
         // The popup was interactive while the fetch ran (that's the point), so
@@ -769,26 +831,60 @@ fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
         // — right for a `Ctrl-h` host switch, where the query was aimed at the
         // host you just left, but wrong for the list you were already waiting
         // for — so carry it back across.
-        let typed = app
-            .picker
-            .as_ref()
-            .map(|a| a.picker.input.text().to_string())
-            .unwrap_or_default();
+        let selected = app.selected_resume();
+        let active = app.picker.as_ref().unwrap();
+        let input = active.picker.input.clone();
+        let cursor = active.picker.cursor;
         app.reseed_resume_picker(load.host, load.candidates);
-        if !typed.is_empty()
-            && let Some(active) = app.picker.as_mut()
-        {
-            active.picker.set_text(typed);
+        if let Some(active) = app.picker.as_mut() {
+            active.picker.input = input;
+            if let PickerKind::Resume { candidates, .. } = &active.kind {
+                let filtered = active.picker.filtered();
+                active.picker.cursor = filtered
+                    .iter()
+                    .position(|index| {
+                        selected.as_ref().is_some_and(|(_, selected)| {
+                            candidates[*index].agent == selected.agent
+                                && candidates[*index].session_id == selected.session_id
+                        })
+                    })
+                    .unwrap_or_else(|| cursor.min(filtered.len().saturating_sub(1)));
+            }
+            if !load.cached && !load.errors.is_empty() {
+                active
+                    .picker
+                    .set_error(format!("Refresh incomplete: {}", load.errors.join("; ")));
+            }
         }
-        app.set_picker_loading(false);
+        app.set_picker_loading(load.cached);
         return;
     }
     let msg = if load.errors.is_empty() {
+        if let Some(active) = app.picker.as_mut()
+            && let PickerKind::Resume { candidates, .. } = &mut active.kind
+        {
+            candidates.clear();
+            active.picker.items.clear();
+            active.picker.cursor = 0;
+        }
         format!("No resumable sessions on {}", load.host.0)
     } else {
         format!("List sessions failed: {}", load.errors.join("; "))
     };
     app.set_picker_loading(false);
+    if !load.errors.is_empty()
+        && app
+            .picker
+            .as_ref()
+            .is_some_and(|active| !active.picker.items.is_empty())
+    {
+        app.picker
+            .as_mut()
+            .unwrap()
+            .picker
+            .set_error(format!("Keeping cached sessions. {msg}"));
+        return;
+    }
     if load.reseed || app.launch_options.is_some() {
         if let Some(active) = app.picker.as_mut() {
             active.picker.set_error(msg);
@@ -3257,6 +3353,218 @@ mod tests {
     }
 
     #[test]
+    fn failed_resume_refresh_keeps_the_last_successful_inventory() {
+        let mut app = vcs_app();
+        let inboxes = LoopInboxes::new();
+        let candidate = crate::agent::ResumeCandidate {
+            agent: AgentControl::Claude,
+            session_id: "cached-session".into(),
+            cwd: "~/project".into(),
+            first_prompt: Some("Cached task".into()),
+            custom_title: None,
+            git_branch: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+        };
+        app.open_resume_picker(HostId::local(), vec![candidate]);
+        app.set_picker_loading(true);
+        apply_resume_load(
+            &mut app,
+            &inboxes,
+            ResumeLoad {
+                seq: 0,
+                reseed: false,
+                host: HostId::local(),
+                candidates: Vec::new(),
+                errors: vec!["inventory unavailable".into()],
+                cached: false,
+                source: None,
+            },
+        );
+        assert!(
+            app.picker.is_some(),
+            "a failed refresh must retain cached rows"
+        );
+        assert_eq!(
+            app.selected_resume().unwrap().1.session_id,
+            "cached-session"
+        );
+    }
+
+    fn cached_candidate(id: &str) -> crate::agent::ResumeCandidate {
+        crate::agent::ResumeCandidate {
+            agent: AgentControl::Claude,
+            session_id: id.into(),
+            cwd: "~/project".into(),
+            first_prompt: Some(format!("cached {id}")),
+            custom_title: None,
+            git_branch: None,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_reopens_immediately_and_refreshes_without_moving_the_selected_session() {
+        use crate::protocol::{ClientFrame, ServerFrame};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for cache_capable in [false, true] {
+            let mut app = vcs_app();
+            let host = HostId("cached-host".into());
+            let (remote, mut peer) = crate::backend::test_support::connected(host.clone());
+            app.backends.push(Backend::Remote(remote));
+            app.resume_cache
+                .insert(host.clone(), vec![cached_candidate("old")]);
+            let mut inboxes = LoopInboxes::new();
+            start_resume_load(&mut app, &mut inboxes, host.clone(), false);
+            // Assert before the request is even answered: rendering the picker
+            // and navigating cached rows cannot depend on remote timing.
+            assert_eq!(app.selected_resume().unwrap().1.session_id, "old");
+            assert!(app.picker.as_ref().unwrap().picker.loading);
+            app.picker.as_mut().unwrap().picker.set_text("cached");
+            app.picker
+                .as_mut()
+                .unwrap()
+                .picker
+                .input
+                .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            let input_cursor = app.picker.as_ref().unwrap().picker.input.cursor();
+            let (request, reply) = tokio::time::timeout(Duration::from_secs(10), peer.recv())
+                .await
+                .expect("cached inventory request");
+            let ClientFrame::ListResumable {
+                req_id,
+                cached_only: true,
+                per_agent: true,
+                ..
+            } = request
+            else {
+                panic!("expected cache request")
+            };
+            let fresh = vec![cached_candidate("new"), cached_candidate("old")];
+            reply
+                .send(ServerFrame::Resumable {
+                    req_id,
+                    candidates: if cache_capable {
+                        Vec::new()
+                    } else {
+                        fresh.clone()
+                    },
+                    errors: Vec::new(),
+                    cached: cache_capable,
+                })
+                .unwrap();
+            let preview = tokio::time::timeout(Duration::from_secs(10), inboxes.resume_rx.recv())
+                .await
+                .expect("cached inventory reply")
+                .unwrap();
+            apply_resume_load(&mut app, &inboxes, preview);
+            if cache_capable {
+                assert_eq!(
+                    app.selected_resume().unwrap().1.session_id,
+                    "old",
+                    "cache miss keeps dashboard's last successful rows"
+                );
+                let (request, reply) = tokio::time::timeout(Duration::from_secs(10), peer.recv())
+                    .await
+                    .expect("fresh inventory request");
+                let ClientFrame::ListResumable {
+                    req_id,
+                    cached_only: false,
+                    per_agent: true,
+                    ..
+                } = request
+                else {
+                    panic!("expected refresh request")
+                };
+                reply
+                    .send(ServerFrame::Resumable {
+                        req_id,
+                        candidates: fresh,
+                        errors: Vec::new(),
+                        cached: false,
+                    })
+                    .unwrap();
+                let refreshed =
+                    tokio::time::timeout(Duration::from_secs(10), inboxes.resume_rx.recv())
+                        .await
+                        .expect("fresh inventory reply")
+                        .unwrap();
+                apply_resume_load(&mut app, &inboxes, refreshed);
+            }
+            assert!(!app.picker.as_ref().unwrap().picker.loading);
+            assert_eq!(app.selected_resume().unwrap().1.session_id, "old");
+            assert_eq!(
+                app.picker.as_ref().unwrap().picker.input.cursor(),
+                input_cursor
+            );
+            assert_eq!(app.resume_cache[&host].len(), 2);
+            assert!(
+                peer.is_empty(),
+                "no extra refresh after a fresh response, including old servers"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_reply_from_a_replaced_backend_cannot_repopulate_its_cache() {
+        let mut app = vcs_app();
+        let host = HostId("replaced-host".into());
+        let previous =
+            crate::backend::RemoteBackend::unconnected_for_tests(host.clone(), Vec::new());
+        let current =
+            crate::backend::RemoteBackend::unconnected_for_tests(host.clone(), Vec::new());
+        app.backends.push(Backend::Remote(current));
+        app.open_resume_picker(host.clone(), vec![cached_candidate("old")]);
+        app.resume_cache
+            .insert(host.clone(), vec![cached_candidate("old")]);
+        let inboxes = LoopInboxes::new();
+        apply_resume_load(
+            &mut app,
+            &inboxes,
+            ResumeLoad {
+                seq: 0,
+                reseed: false,
+                host: host.clone(),
+                candidates: vec![cached_candidate("wrong-host")],
+                errors: Vec::new(),
+                cached: false,
+                source: Some(super::super::ResumeSource::Remote(
+                    std::sync::Arc::downgrade(&previous),
+                )),
+            },
+        );
+        assert!(!app.resume_cache.contains_key(&host));
+        assert!(app.selected_resume().is_none());
+        assert!(!app.picker.as_ref().unwrap().picker.loading);
+    }
+
+    #[test]
+    fn a_successful_empty_resume_refresh_removes_deleted_sessions() {
+        for reseed in [false, true] {
+            let mut app = vcs_app();
+            let host = HostId::local();
+            app.resume_cache
+                .insert(host.clone(), vec![cached_candidate("deleted")]);
+            app.open_resume_picker(host.clone(), vec![cached_candidate("deleted")]);
+            apply_resume_load(
+                &mut app,
+                &LoopInboxes::new(),
+                ResumeLoad {
+                    seq: 0,
+                    reseed,
+                    host: host.clone(),
+                    candidates: Vec::new(),
+                    errors: Vec::new(),
+                    cached: false,
+                    source: None,
+                },
+            );
+            assert!(app.resume_cache[&host].is_empty());
+            assert!(app.selected_resume().is_none());
+            assert_eq!(app.picker.is_some(), reseed);
+        }
+    }
+
+    #[test]
     fn resume_reply_preserves_agent_and_text_filters_chosen_while_loading() {
         let mut app = vcs_app();
         let mut inboxes = LoopInboxes::new();
@@ -3267,6 +3575,8 @@ mod tests {
         app.picker.as_mut().unwrap().picker.set_text("target");
         let reply = |seq| ResumeLoad {
             seq,
+            cached: false,
+            source: None,
             reseed: false,
             host: HostId::local(),
             errors: Vec::new(),
@@ -3311,6 +3621,8 @@ mod tests {
                 host: HostId::local(),
                 candidates: Vec::new(),
                 errors: vec!["inventory failed".into()],
+                cached: false,
+                source: None,
             },
         );
         assert!(app.launch_options.is_some());

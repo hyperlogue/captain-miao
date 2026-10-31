@@ -10,7 +10,10 @@ use std::time::SystemTime;
 use super::super::common;
 use crate::agent::{AgentControl, ResumeCandidate};
 
-pub(super) fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+pub(super) fn list_resumable(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -51,7 +54,11 @@ pub(super) fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
     // displace a usable conversation. Only those candidates' bodies are read.
     Ok(common::newest_first(files, usize::MAX)
         .into_iter()
-        .filter_map(|(path, mtime)| read_candidate(&path, mtime))
+        .filter_map(|(path, mtime)| {
+            cache
+                .candidates
+                .get(&path, &[], || read_candidate(&path, mtime))
+        })
         .take(limit)
         .collect())
 }

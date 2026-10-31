@@ -544,6 +544,10 @@ async fn serve() -> Result<()> {
     // Seed once for the host, never once per client: reconnecting an Idle row
     // must retain the completion the daemon observed while clients were away.
     backend.refresh_session_flags();
+    // Warm once per daemon, without delaying readiness or installing a timer.
+    let inventory = backend.resume_inventory();
+    let resume_limit = cm_core::config::get().launcher.resume_list_limit;
+    tokio::task::spawn_blocking(move || inventory.refresh(resume_limit, true));
     // One probe for the whole daemon; see [`VitalsProbe`]. A tokio mutex because
     // a cold probe holds it across a short sleep.
     let vitals = Arc::new(tokio::sync::Mutex::new(VitalsProbe::new()));
@@ -846,15 +850,15 @@ async fn handle_conn(
                         write_frame(&mut wr, &ServerFrame::Snapshot { sessions }).await?;
                         subscribed = true;
                     }
-                    ClientFrame::ListResumable { req_id, limit } => {
+                    ClientFrame::ListResumable { req_id, limit, cached_only, per_agent } => {
                         let backend = backend.clone();
                         let tx = replies_tx.clone();
                         // Inventory can wait on an agent's daemon or history
                         // store. Keep host control and pushed updates flowing.
                         tokio::spawn(async move {
-                            let (candidates, errors) = tokio::task::spawn_blocking(move || backend.list_resumable(limit))
+                            let (candidates, errors) = tokio::task::spawn_blocking(move || backend.list_resumable_snapshot(limit, cached_only, per_agent))
                                 .await.unwrap_or_else(|error| (Vec::new(), vec![format!("Resume inventory worker failed: {error}")]));
-                            let _ = tx.send(ServerFrame::Resumable { req_id, candidates, errors });
+                            let _ = tx.send(ServerFrame::Resumable { req_id, candidates, errors, cached: cached_only });
                         });
                     }
                     ClientFrame::KillSession { req_id, key, cleanup } => {
@@ -1329,6 +1333,8 @@ mod tests {
             &ClientFrame::ListResumable {
                 req_id: 1,
                 limit: 1,
+                cached_only: false,
+                per_agent: false,
             },
         )
         .await

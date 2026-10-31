@@ -206,6 +206,7 @@ fn stamp_titles(
 pub struct LocalBackend {
     session_index_caches: HashMap<AgentControl, SessionIndexCache>,
     title_caches: Mutex<HashMap<AgentControl, SessionTitles>>,
+    resume: Arc<crate::resume::Inventory>,
     /// The owning host's existing change channel. Deferred title reads and
     /// automatic flag writes wake it so every subscriber can refresh.
     change_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -449,26 +450,44 @@ impl LocalBackend {
     }
 
     pub fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
-        let mut all: Vec<ResumeCandidate> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-        for &agent in AgentControl::ALL {
-            match agent.list_resumable(limit) {
-                Ok(list) => all.extend(list),
-                Err(e) => errors.push(format!("{agent:?}: {e}")),
-            }
-        }
-        all.sort_by_key(|b| std::cmp::Reverse(b.mtime));
-        all.truncate(limit);
+        let snapshot = self.resume.refresh(limit, false);
+        self.canonical_resume(snapshot)
+    }
+
+    /// Clone the host-owned inventory into a blocking worker without borrowing
+    /// the dashboard or holding its local backend on the UI thread.
+    pub fn resume_inventory(&self) -> Arc<crate::resume::Inventory> {
+        Arc::clone(&self.resume)
+    }
+
+    pub fn list_resumable_snapshot(
+        &self,
+        limit: usize,
+        cached_only: bool,
+        per_agent: bool,
+    ) -> (Vec<ResumeCandidate>, Vec<String>) {
+        let snapshot = if cached_only {
+            self.resume.snapshot(limit, per_agent).unwrap_or_default()
+        } else {
+            self.resume.refresh(limit, per_agent)
+        };
+        self.canonical_resume(snapshot)
+    }
+
+    fn canonical_resume(
+        &self,
+        mut snapshot: crate::resume::Snapshot,
+    ) -> (Vec<ResumeCandidate>, Vec<String>) {
         // The cwds come straight off the transcripts, so collapse them like
         // every other path the backend returns (§3). Without this a resume
         // candidate would be the one path the client sees in a *different*
         // spelling from the running rows beside it — and, worse, a remote
         // candidate's absolute path would get collapsed against the *client's*
         // home for display, which is meaningless.
-        for c in all.iter_mut() {
+        for c in &mut snapshot.candidates {
             c.cwd = paths::collapse_home(&c.cwd, &self.home);
         }
-        (all, errors)
+        (snapshot.candidates, snapshot.errors)
     }
 
     /// Tear a session down, resolving `key` → the **current** launcher from

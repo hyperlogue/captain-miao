@@ -512,34 +512,59 @@ struct HistoryLine {
 /// missing from both is skipped rather than guessed at — a resume aimed at the
 /// wrong directory is worse than a resume the picker didn't offer.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let root = cli_dir().ok_or_else(|| anyhow::anyhow!("no antigravity state dir"))?;
-    Ok(list_resumable_in(&root, limit))
+    Ok(list_resumable_in_cached(&root, limit, cache))
 }
 
 /// The scan itself, split from `$HOME` resolution so a test can point it at a
 /// fixture tree without touching the environment.
+#[cfg(test)]
 fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
-    let mut cwd_of: HashMap<String, String> = HashMap::new();
-    // `last_conversations.json` first, so a history line naming the same id wins
-    // — it is the per-prompt record, where this is a per-workspace cache.
-    if let Ok(body) = std::fs::read_to_string(root.join("cache/last_conversations.json"))
-        && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&body)
-    {
-        for (workspace, id) in map {
-            cwd_of.insert(id, workspace);
-        }
-    }
-    if let Ok(body) = std::fs::read_to_string(root.join("history.jsonl")) {
-        for line in body.lines() {
-            let Ok(entry) = serde_json::from_str::<HistoryLine>(line) else {
-                continue;
-            };
-            if entry.conversation_id.is_empty() || entry.workspace.is_empty() {
-                continue;
+    list_resumable_in_cached(root, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_in_cached(
+    root: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Vec<ResumeCandidate> {
+    let history = root.join("history.jsonl");
+    let last = root.join("cache/last_conversations.json");
+    let key = if history.exists() { &history } else { &last };
+    let cwd_of = cache
+        .index
+        .get(key, &[&history, &last], || {
+            let mut cwd_of: HashMap<String, String> = HashMap::new();
+            // `last_conversations.json` first, so a history line naming the same id wins
+            // — it is the per-prompt record, where this is a per-workspace cache.
+            if let Ok(body) = std::fs::read_to_string(root.join("cache/last_conversations.json"))
+                && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&body)
+            {
+                for (workspace, id) in map {
+                    cwd_of.insert(id, workspace);
+                }
             }
-            cwd_of.insert(entry.conversation_id, entry.workspace);
-        }
-    }
+            if let Ok(body) = std::fs::read_to_string(root.join("history.jsonl")) {
+                for line in body.lines() {
+                    let Ok(entry) = serde_json::from_str::<HistoryLine>(line) else {
+                        continue;
+                    };
+                    if entry.conversation_id.is_empty() || entry.workspace.is_empty() {
+                        continue;
+                    }
+                    cwd_of.insert(entry.conversation_id, entry.workspace);
+                }
+            }
+            Some(cwd_of)
+        })
+        .unwrap_or_default();
 
     // Stat before read, so the cost is one stat per known conversation plus
     // `limit` transcript reads rather than a read per conversation that ever
@@ -558,14 +583,21 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
     let titles = metadata::read_titles_at(root, &ids);
     found
         .into_iter()
-        .map(|((session_id, cwd, path), mtime)| ResumeCandidate {
-            agent: crate::agent::AgentControl::Antigravity,
-            custom_title: titles.get(&session_id).cloned(),
-            session_id,
-            cwd,
-            first_prompt: first_prompt(&path),
-            git_branch: None,
-            mtime,
+        .filter_map(|((session_id, cwd, path), mtime)| {
+            let mut candidate = cache.candidates.get(&path, &[], || {
+                Some(ResumeCandidate {
+                    agent: crate::agent::AgentControl::Antigravity,
+                    custom_title: None,
+                    session_id: session_id.clone(),
+                    cwd: cwd.clone(),
+                    first_prompt: first_prompt(&path),
+                    git_branch: None,
+                    mtime,
+                })
+            })?;
+            candidate.custom_title = titles.get(&session_id).cloned();
+            candidate.cwd = cwd;
+            Some(candidate)
         })
         .collect()
 }

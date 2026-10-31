@@ -371,8 +371,15 @@ struct BranchMeta {
 /// directories (`reasonix sessions reindex --dir`), and a session outside the
 /// default root will not appear here.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let root = sessions_root().ok_or_else(|| anyhow::anyhow!("no reasonix state home"))?;
-    Ok(list_resumable_in(&root, limit))
+    Ok(list_resumable_in_cached(&root, limit, cache))
 }
 
 /// Reasonix's own rule for telling a session transcript from the append-only
@@ -386,7 +393,16 @@ fn is_session_transcript_name(name: &str) -> bool {
 
 /// The scan itself, split from `$REASONIX_STATE_HOME` resolution so a test can
 /// point it at a fixture tree without touching the environment.
+#[cfg(test)]
 fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    list_resumable_in_cached(root, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_in_cached(
+    root: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Vec<ResumeCandidate> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -413,32 +429,37 @@ fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
             p.push(".meta");
             PathBuf::from(p)
         };
-        let meta = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|b| serde_json::from_str::<BranchMeta>(&b).ok())
-            .unwrap_or_default();
-        let session_id = if meta.id.trim().is_empty() {
-            // No sidecar, or one without an id: the transcript's own stem is
-            // what `--resume` takes, so a session is still resumable without it.
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            meta.id.clone()
-        };
-        if session_id.is_empty() || meta.workspace_root.trim().is_empty() {
-            continue;
-        }
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Reasonix,
-            session_id,
-            cwd: meta.workspace_root,
-            first_prompt: Some(meta.preview).filter(|p| !p.trim().is_empty()),
-            custom_title: Some(meta.custom_title).filter(|t| !t.trim().is_empty()),
-            git_branch: None,
-            mtime,
+        let candidate = cache.candidates.get(&path, &[&meta_path], || {
+            let meta = std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|b| serde_json::from_str::<BranchMeta>(&b).ok())
+                .unwrap_or_default();
+            let session_id = if meta.id.trim().is_empty() {
+                // No sidecar, or one without an id: the transcript's own stem is
+                // what `--resume` takes, so a session is still resumable without it.
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                meta.id.clone()
+            };
+            if session_id.is_empty() || meta.workspace_root.trim().is_empty() {
+                return None;
+            }
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Reasonix,
+                session_id,
+                cwd: meta.workspace_root,
+                first_prompt: Some(meta.preview).filter(|p| !p.trim().is_empty()),
+                custom_title: Some(meta.custom_title).filter(|t| !t.trim().is_empty()),
+                git_branch: None,
+                mtime,
+            })
         });
+        if let Some(candidate) = candidate {
+            out.push(candidate);
+        }
     }
     out
 }
@@ -584,13 +605,28 @@ mod tests {
                 ),
             ],
         );
-        let out = list_resumable_in(&root, 10);
+        let mut cache = crate::resume::AgentCache::default();
+        let out = list_resumable_in_cached(&root, 10, &mut cache);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session_id, "abc123");
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
         assert_eq!(out[0].agent, AgentControl::Reasonix);
+        list_resumable_in_cached(&root, 10, &mut cache);
+        assert_eq!(cache.candidates.read_count(), 1);
+        std::fs::write(
+            root.join("abc123.jsonl.meta"),
+            r#"{"id":"abc123","workspace_root":"/work/project","custom_title":"Renamed"}"#,
+        )
+        .unwrap();
+        let renamed = list_resumable_in_cached(&root, 10, &mut cache);
+        assert_eq!(renamed[0].custom_title.as_deref(), Some("Renamed"));
+        assert_eq!(
+            cache.candidates.read_count(),
+            2,
+            "sidecar changes invalidate an unchanged transcript"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -63,7 +63,18 @@ pub enum ClientFrame {
     /// `Delta`/`Removed` as sessions change).
     Subscribe,
     /// Resumable (dormant) sessions on this host, capped at `limit`.
-    ListResumable { req_id: u64, limit: usize },
+    ListResumable {
+        req_id: u64,
+        limit: usize,
+        /// Return immediately without scanning. New clients follow this with
+        /// one refresh request; old servers ignore the field and answer fresh.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cached_only: bool,
+        /// Keep up to `limit` per agent so client-side agent filters precede
+        /// the final visible limit. Older clients retain the merged limit.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        per_agent: bool,
+    },
     /// Tear the session down. The server re-resolves `key` → the *current* agent
     /// pid from the live state file before signalling, so a stale mirror can
     /// never make it signal a recycled pid.
@@ -179,6 +190,10 @@ pub enum ServerFrame {
         req_id: u64,
         candidates: Vec<ResumeCandidate>,
         errors: Vec<String>,
+        /// True even for an empty cache. Missing on older servers, whose
+        /// response already performed the refresh and must not be fetched twice.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cached: bool,
     },
     /// Reply to `KillSession`.
     Killed {
@@ -320,6 +335,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resume_cache_fields_preserve_legacy_request_and_reply_behavior() {
+        let request: ClientFrame = serde_json::from_value(serde_json::json!({
+            "frame": "ListResumable", "req_id": 1, "limit": 50
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            ClientFrame::ListResumable {
+                cached_only: false,
+                per_agent: false,
+                ..
+            }
+        ));
+        let reply: ServerFrame = serde_json::from_value(serde_json::json!({
+            "frame": "Resumable", "req_id": 1, "candidates": [], "errors": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            reply,
+            ServerFrame::Resumable { cached: false, .. }
+        ));
+        let request = ClientFrame::ListResumable {
+            req_id: 2,
+            limit: 50,
+            cached_only: true,
+            per_agent: true,
+        };
+        assert!(matches!(
+            serde_json::from_str::<ClientFrame>(&serde_json::to_string(&request).unwrap()).unwrap(),
+            ClientFrame::ListResumable {
+                cached_only: true,
+                per_agent: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn old_git_requests_inherit_host_authentication() {
         for frame in [
             serde_json::json!({"frame": "PrepareVcs", "req_id": 1, "cwd": "~/project", "push": false}),
@@ -357,6 +410,8 @@ mod tests {
             ClientFrame::ListResumable {
                 req_id: 7,
                 limit: 50,
+                cached_only: false,
+                per_agent: false,
             },
             ClientFrame::KillSession {
                 req_id: 8,

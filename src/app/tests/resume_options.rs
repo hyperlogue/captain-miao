@@ -34,6 +34,32 @@ fn dashboard() -> TestDashboard {
 }
 
 #[test]
+fn resume_agent_filter_applies_before_the_visible_inventory_limit() {
+    let mut d = dashboard();
+    let limit = crate::config::get().launcher.resume_list_limit;
+    let mut inventory = Vec::new();
+    for i in 0..limit {
+        let mut candidate = candidates().remove(0);
+        candidate.session_id = format!("claude-{i}");
+        inventory.push(candidate);
+    }
+    inventory.push(candidates().remove(1));
+    d.app.open_resume_picker(HostId::local(), inventory);
+    assert_eq!(
+        d.app.picker.as_ref().unwrap().picker.filtered().len(),
+        limit
+    );
+    d.press_ctrl(KeyCode::Char('o'));
+    d.press(KeyCode::Char('w'));
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered(), [limit]);
+    assert_eq!(
+        d.app.selected_resume().unwrap().1.agent,
+        AgentControl::Codex
+    );
+}
+
+#[test]
 fn resume_options_default_to_all_and_filter_before_resolving_original_indices() {
     let mut d = dashboard();
     d.app.new_session_agent = AgentControl::Codex;

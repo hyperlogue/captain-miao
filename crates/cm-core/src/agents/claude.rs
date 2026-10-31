@@ -728,10 +728,21 @@ fn read_custom_title(path: &Path) -> Option<String> {
 /// Scan `~/.claude/projects/*/*.jsonl` for resumable Claude Code sessions.
 /// Returns up to `limit` candidates sorted by mtime (most recent first).
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let projects_dir = claude_home()
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?
         .join("projects");
-    let proj_entries = std::fs::read_dir(&projects_dir)?;
+    let proj_entries = match std::fs::read_dir(&projects_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for proj in proj_entries.flatten() {
@@ -757,25 +768,30 @@ pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
 
     let mut out = Vec::with_capacity(files.len());
     for (path, mtime) in files {
-        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let header = read_transcript_header(&path);
-        let cwd = match header.cwd {
-            Some(c) => c,
-            None => continue,
-        };
-        let custom_title = read_custom_title(&path);
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Claude,
-            session_id,
-            cwd,
-            first_prompt: header.first_prompt,
-            custom_title,
-            git_branch: header.git_branch,
-            mtime,
+        let candidate = cache.candidates.get(&path, &[], || {
+            let session_id = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => return None,
+            };
+            let header = read_transcript_header(&path);
+            let cwd = match header.cwd {
+                Some(c) => c,
+                None => return None,
+            };
+            let custom_title = read_custom_title(&path);
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Claude,
+                session_id,
+                cwd,
+                first_prompt: header.first_prompt,
+                custom_title,
+                git_branch: header.git_branch,
+                mtime,
+            })
         });
+        if let Some(candidate) = candidate {
+            out.push(candidate);
+        }
     }
     Ok(out)
 }

@@ -300,14 +300,35 @@ fn read_session_index(home: &Path) -> std::collections::HashMap<String, String> 
 /// `read_transcript_stats` rather than to a picker that stats one file per
 /// candidate.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<ResumeCandidate>> {
     let home = kimi_home().ok_or_else(|| anyhow::anyhow!("no kimi home"))?;
-    Ok(list_resumable_in(&home, limit))
+    Ok(list_resumable_in_cached(&home, limit, cache))
 }
 
 /// The scan itself, split from `$KIMI_CODE_HOME` resolution so a test can point
 /// it at a fixture tree without touching the environment.
+#[cfg(test)]
 fn list_resumable_in(home: &Path, limit: usize) -> Vec<ResumeCandidate> {
-    let index = read_session_index(home);
+    list_resumable_in_cached(home, limit, &mut crate::resume::AgentCache::default())
+}
+
+fn list_resumable_in_cached(
+    home: &Path,
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Vec<ResumeCandidate> {
+    let index = cache
+        .index
+        .get(&home.join(SESSION_INDEX), &[], || {
+            Some(read_session_index(home))
+        })
+        .unwrap_or_default();
 
     let mut found = Vec::new();
     for bucket in common::read_subdirs(&home.join(SESSIONS_DIR)) {
@@ -328,19 +349,25 @@ fn list_resumable_in(home: &Path, limit: usize) -> Vec<ResumeCandidate> {
         let Some(cwd) = index.get(session_id).filter(|c| !c.trim().is_empty()) else {
             continue;
         };
-        let state = std::fs::read_to_string(dir.join("state.json"))
-            .ok()
-            .and_then(|b| serde_json::from_str::<SessionState>(&b).ok())
-            .unwrap_or_default();
-        out.push(ResumeCandidate {
-            agent: crate::agent::AgentControl::Kimi,
-            session_id: session_id.to_string(),
-            cwd: cwd.clone(),
-            first_prompt: state.last_prompt.filter(|p| !p.trim().is_empty()),
-            custom_title: state.title.filter(|t| !t.trim().is_empty()),
-            git_branch: None,
-            mtime,
+        let candidate = cache.candidates.get(&dir.join("state.json"), &[], || {
+            let state = std::fs::read_to_string(dir.join("state.json"))
+                .ok()
+                .and_then(|b| serde_json::from_str::<SessionState>(&b).ok())
+                .unwrap_or_default();
+            Some(ResumeCandidate {
+                agent: crate::agent::AgentControl::Kimi,
+                session_id: session_id.to_string(),
+                cwd: cwd.clone(),
+                first_prompt: state.last_prompt.filter(|p| !p.trim().is_empty()),
+                custom_title: state.title.filter(|t| !t.trim().is_empty()),
+                git_branch: None,
+                mtime,
+            })
         });
+        if let Some(mut candidate) = candidate {
+            candidate.cwd = cwd.clone();
+            out.push(candidate);
+        }
     }
     out
 }
@@ -828,7 +855,8 @@ mod tests {
             r#"{"sessionId":"session_abc","sessionDir":"/x","workDir":"/home/miao/p"}
 "#,
         );
-        let out = list_resumable_in(&home, 10);
+        let mut cache = crate::resume::AgentCache::default();
+        let out = list_resumable_in_cached(&home, 10, &mut cache);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session_id, "session_abc");
         // The cwd is the index's, never the bucket name decoded.
@@ -836,6 +864,22 @@ mod tests {
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
         assert_eq!(out[0].agent, AgentControl::Kimi);
+        list_resumable_in_cached(&home, 10, &mut cache);
+        assert_eq!(cache.candidates.read_count(), 1);
+        assert_eq!(cache.index.read_count(), 1);
+        std::fs::write(
+            home.join(SESSION_INDEX),
+            "{\"sessionId\":\"session_abc\",\"workDir\":\"/work/moved-project\"}\n",
+        )
+        .unwrap();
+        let moved = list_resumable_in_cached(&home, 10, &mut cache);
+        assert_eq!(moved[0].cwd, "/work/moved-project");
+        assert_eq!(
+            cache.candidates.read_count(),
+            1,
+            "an index change need not reread unchanged state.json"
+        );
+        assert_eq!(cache.index.read_count(), 2);
         let _ = std::fs::remove_dir_all(&home);
     }
 

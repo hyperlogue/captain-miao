@@ -68,6 +68,9 @@ exec {} --exact codex_fixture --nocapture
         let bin = root.path().join("bin/codex");
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let opencode = root.path().join("bin/opencode");
+        std::fs::write(&opencode, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        std::fs::set_permissions(opencode, std::fs::Permissions::from_mode(0o700)).unwrap();
         let host = Self {
             root,
             launchers: vec![],
@@ -89,11 +92,22 @@ exec {} --exact codex_fixture --nocapture
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("HOME", self.root.path())
             .env("XDG_RUNTIME_DIR", self.root.path().join("run"))
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("XDG_CACHE_HOME", self.root.path().join("cache"))
             .env("XDG_CONFIG_HOME", self.root.path().join("app"))
+            .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("CODEX_HOME", self.root.path().join("codex"))
+            .env("CLAUDE_CONFIG_DIR", self.root.path().join("claude"))
+            .env("KIMI_CODE_HOME", self.root.path().join("kimi"))
+            .env("GROK_HOME", self.root.path().join("grok"))
+            .env("REASONIX_STATE_HOME", self.root.path().join("reasonix"))
+            .env("PI_CODING_AGENT_DIR", self.root.path().join("pi"))
+            .env(
+                "PI_CODING_AGENT_SESSION_DIR",
+                self.root.path().join("pi/sessions"),
+            )
             .env("TERM", "dumb")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
@@ -573,6 +587,7 @@ async fn serve_codex(
                         }
                         json!({})
                     }
+                    "thread/list" => json!({"data":[], "nextCursor":null}),
                     "thread/loaded/list" => {
                         // Emulate older daemons without this optional inventory,
                         // exercising the explicit missing-thread fallback.

@@ -253,7 +253,7 @@ async fn bounded_status(mut cmd: Command, limit: Duration) -> bool {
 /// protocol to a `miao-server` over a (possibly ssh-forwarded) socket.
 ///
 /// `Remote` is behind an `Arc` because the dashboard hands clones to background
-/// tasks (see [`RemoteBackend::list_resumable`]); `Local` is boxed only to keep
+/// tasks (see [`RemoteBackend::list_resumable_snapshot`]); `Local` is boxed only to keep
 /// the two arms the same size, since one `Backend` per host exists for the
 /// process lifetime and the allocation is paid once at startup.
 pub(crate) enum Backend {
@@ -1133,15 +1133,10 @@ impl Backend {
         }
     }
 
-    /// Resumable sessions across every agent backend, most-recent first, capped
-    /// at `limit`. Returns the merged list plus any per-agent errors (the caller
-    /// decides how to surface them). The walk reads file tails synchronously
-    /// (local) or makes a blocking round-trip (remote), so an async caller
-    /// should wrap this in `block_in_place`.
-    pub(crate) fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
+    pub(crate) fn resume_inventory(&self) -> Option<Arc<cm_core::resume::Inventory>> {
         match self {
-            Backend::Local(h) => h.inner.list_resumable(limit),
-            Backend::Remote(b) => b.list_resumable(limit),
+            Backend::Local(host) => Some(host.inner.resume_inventory()),
+            Backend::Remote(_) => None,
         }
     }
 
@@ -2073,12 +2068,35 @@ impl RemoteBackend {
     /// `pub(crate)` because the dashboard calls it *off* the UI thread through
     /// an `Arc<RemoteBackend>` clone, bypassing the `Backend` seam — see
     /// `run::start_resume_load`. Blocking: it is an ssh round trip.
+    #[cfg(test)]
     pub(crate) fn list_resumable(&self, limit: usize) -> (Vec<ResumeCandidate>, Vec<String>) {
-        match self.request(|req_id| ClientFrame::ListResumable { req_id, limit }) {
+        let (candidates, errors, _) = self.list_resumable_snapshot(limit, false, false);
+        (candidates, errors)
+    }
+
+    pub(crate) fn list_resumable_snapshot(
+        &self,
+        limit: usize,
+        cached_only: bool,
+        per_agent: bool,
+    ) -> (Vec<ResumeCandidate>, Vec<String>, bool) {
+        match self.request(|req_id| ClientFrame::ListResumable {
+            req_id,
+            limit,
+            cached_only,
+            per_agent,
+        }) {
             Some(ServerFrame::Resumable {
-                candidates, errors, ..
-            }) => (candidates, errors),
-            _ => (Vec::new(), vec!["remote host unreachable".to_string()]),
+                candidates,
+                errors,
+                cached,
+                ..
+            }) => (candidates, errors, cached),
+            _ => (
+                Vec::new(),
+                vec!["remote host unreachable".to_string()],
+                false,
+            ),
         }
     }
 
@@ -5438,6 +5456,7 @@ fi
                         req_id,
                         candidates: vec![],
                         errors: vec![],
+                        cached: false,
                     },
                 )
                 .await

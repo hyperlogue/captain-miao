@@ -458,6 +458,15 @@ pub(super) struct ResumeLoad {
     pub(super) host: HostId,
     pub(super) candidates: Vec<ResumeCandidate>,
     pub(super) errors: Vec<String>,
+    /// A server cache preview precedes the fresh response for the same request.
+    pub(super) cached: bool,
+    pub(super) source: Option<ResumeSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ResumeSource {
+    Local(std::sync::Weak<cm_core::resume::Inventory>),
+    Remote(std::sync::Weak<crate::backend::RemoteBackend>),
 }
 
 /// Why a session was killed, which is what decides whether its outcome is worth
@@ -1156,6 +1165,8 @@ pub(super) struct App {
     /// picker follows is *never put a round trip between a keystroke and its
     /// echo*.
     pub(super) recent_dirs_cache: HashMap<HostId, Vec<String>>,
+    /// Last usable inventory for each host; refreshed only by explicit opens.
+    pub(super) resume_cache: HashMap<HostId, Vec<ResumeCandidate>>,
     pub(super) last_table_rect: Option<Rect>,
     pub(super) last_preview_rect: Option<Rect>,
     pub(super) last_detail_rect: Option<Rect>,
@@ -1800,6 +1811,7 @@ impl App {
             host_icons: HashMap::new(),
             host_shell_commands: HashMap::new(),
             recent_dirs_cache: HashMap::new(),
+            resume_cache: HashMap::new(),
             last_table_rect: None,
             last_preview_rect: None,
             last_detail_rect: None,
@@ -2745,6 +2757,7 @@ impl App {
             if backend.is_some() {
                 let host = HostId(identity.label.clone());
                 self.recent_dirs_cache.remove(&host);
+                self.resume_cache.remove(&host);
                 self.reconnect_epochs.remove(&host);
             }
         }
@@ -5152,7 +5165,7 @@ impl App {
             },
         });
         self.input_mode = InputMode::Picker;
-        self.refresh_picker_status_bar();
+        self.set_resume_agent_filter(None);
     }
 
     /// Repopulate the open resume picker for a different host — the `Ctrl-h`
@@ -5198,8 +5211,14 @@ impl App {
         let filtered = active.picker.filtered();
         let selected = filtered.get(active.picker.cursor).copied();
         *agent_filter = filter;
+        let limit = crate::config::get().launcher.resume_list_limit;
+        let mut matched = 0;
         for (item, candidate) in active.picker.items.iter_mut().zip(candidates) {
-            item.hidden = filter.is_some_and(|agent| agent != candidate.agent);
+            let matches = filter.is_none_or(|agent| agent == candidate.agent);
+            if matches {
+                matched += 1;
+            }
+            item.hidden = !matches || matched > limit;
         }
         active.picker.cursor = active
             .picker
@@ -5289,18 +5308,19 @@ impl App {
                 }
                 spans
             }
-            // No loading note here: the list area already says so, and while a
-            // fetch is in flight the items are always empty, so the two would
-            // only ever appear together.
             PickerKind::Resume {
                 host, agent_filter, ..
             } => {
-                vec![
+                let mut spans = vec![
                     Span::styled(" Agent ", dim),
                     Span::styled(agent_filter.map_or("All", AgentControl::label), value),
                     Span::styled("   Host ", dim),
                     host_span(self, host),
-                ]
+                ];
+                if active.picker.loading && !active.picker.items.is_empty() {
+                    spans.push(Span::styled("   Refreshing…", dim));
+                }
+                spans
             }
             _ => Vec::new(),
         };

@@ -72,7 +72,14 @@ mod sessions;
 mod live_tests;
 
 pub fn list_resumable(limit: usize) -> Result<Vec<crate::agent::ResumeCandidate>> {
-    sessions::list_resumable(limit)
+    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
+}
+
+pub(crate) fn list_resumable_cached(
+    limit: usize,
+    cache: &mut crate::resume::AgentCache,
+) -> Result<Vec<crate::agent::ResumeCandidate>> {
+    sessions::list_resumable(limit, cache)
 }
 
 // =============================================================================
