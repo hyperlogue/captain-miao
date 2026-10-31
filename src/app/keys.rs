@@ -75,6 +75,9 @@ impl App {
         if self.upgrade_notices.is_some() {
             return self.handle_upgrade_notices_key(key);
         }
+        if self.launch_options.is_some() {
+            return self.handle_launch_options_key(key);
+        }
         match self.input_mode {
             InputMode::Normal if self.session_detail => self.handle_session_detail_key(key),
             InputMode::Normal => self.handle_normal_key(key),
@@ -809,13 +812,26 @@ impl App {
         }
     }
 
-    /// Resolve a workdir-picker submission into a launch. Enter always takes
-    /// the highlighted row — the typed path is itself a ranked item, so there
-    /// is nothing off-list to prefer. `idx` is that row (`Some`, from `Submit`)
-    /// or `None` when the filtered list was empty (`SubmitFree`). A path that
-    /// doesn't resolve to a directory is rejected: the picker stays open with
-    /// an inline error.
-    fn submit_workdir(&mut self, idx: Option<usize>) -> Option<Action> {
+    /// Both launch paths use the highlighted directory, including when the
+    /// input is only a filter fragment. Capture it before changing hosts.
+    pub(super) fn selected_workdir(&self) -> String {
+        let Some(active) = self.picker.as_ref() else {
+            return String::new();
+        };
+        let filtered = active.picker.filtered();
+        let typed = active.picker.input.text().trim();
+        filtered
+            .get(active.picker.cursor.min(filtered.len().saturating_sub(1)))
+            .and_then(|&i| active.picker.items[i].payload.clone())
+            .or_else(|| (!typed.is_empty()).then(|| super::canonicalize_typed_workdir(typed)))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    /// Validate without consuming the picker on failure, so either view can
+    /// show its own inline error and let the user correct the launch.
+    fn submit_workdir(&mut self) -> Option<Action> {
         let active = self.picker.as_ref()?;
         let PickerKind::Workdir {
             agent,
@@ -829,13 +845,28 @@ impl App {
         let agent = *agent;
         let host = host.clone();
         let worktree = worktree.as_ref().map(|a| a.requested_name());
-        // Extract everything from the picker up front so its borrow ends before we
-        // call `&mut self` (set_error) and the blocking host RPCs below.
-        let typed = active.picker.input.text().trim().to_string();
-        let item_path = idx
-            .and_then(|i| active.picker.items.get(i))
-            .and_then(|it| it.payload.clone());
+        let cwd = self.selected_workdir();
+        if cwd.is_empty() {
+            return None;
+        }
+        match self.launch_workdir(agent, host, cwd, worktree) {
+            Ok(action) => Some(action),
+            Err(error) => {
+                if let Some(active) = self.picker.as_mut() {
+                    active.picker.set_error(error);
+                }
+                None
+            }
+        }
+    }
 
+    pub(super) fn launch_workdir(
+        &mut self,
+        agent: AgentControl,
+        host: crate::state::HostId,
+        cwd: String,
+        worktree: Option<String>,
+    ) -> Result<Action, String> {
         // Paths here are **host-canonical** throughout (§3): what the picker
         // shows is the wire string, a typed `~` stays a `~`, and the host itself
         // expands it — both for the existence checks below and for the launch.
@@ -850,30 +881,20 @@ impl App {
             .backend_for(&host)
             .is_some_and(|b| b.conn_state().is_connected())
         {
-            if let Some(active) = self.picker.as_mut() {
-                active.picker.set_error(format!("{} unreachable", host.0));
-            }
-            return None;
+            return Err(format!("{} unreachable", host.0));
         }
-
-        let cwd = item_path
-            .or_else(|| (!typed.is_empty()).then(|| super::canonicalize_typed_workdir(&typed)))
-            .unwrap_or_default();
-        let cwd = cwd.trim().to_string();
         if cwd.is_empty() {
-            return None;
+            return Err("Choose a directory before launching".into());
         }
         if !self.host_dir_exists(&host, &cwd) {
-            if let Some(active) = self.picker.as_mut() {
-                active.picker.set_error(format!("Not a directory: {cwd}"));
-            }
-            return None;
+            return Err(format!("Not a directory: {cwd}"));
         }
 
         self.picker = None;
+        self.launch_options = None;
         self.workdir_completion = None;
         self.input_mode = InputMode::Normal;
-        Some(Action::NewSessionSplit {
+        Ok(Action::NewSessionSplit {
             agent,
             cwd,
             host,
@@ -916,6 +937,14 @@ impl App {
     // =============================================================================
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // A held key must not open the selector and immediately launch, or
+        // keep its choices and then submit the underlying directory picker.
+        if key.kind != KeyEventKind::Press
+            && (key.code == KeyCode::Enter
+                || (key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL))
+        {
+            return None;
+        }
         let host_cycle = (key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('h'))
         .then(|| self.ordered_hosts());
@@ -951,6 +980,10 @@ impl App {
                     self.refresh_picker_status_bar();
                 }
             }
+            return None;
+        }
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+            self.open_launch_options();
             return None;
         }
         // Ctrl-D in the workdir picker forgets the highlighted recent cwd.
@@ -1109,7 +1142,7 @@ impl App {
                     self.picker.as_ref().map(|a| &a.kind),
                     Some(PickerKind::Workdir { .. })
                 ) {
-                    return self.submit_workdir(Some(idx));
+                    return self.submit_workdir();
                 }
                 // Take the picker out before calling `&self` methods below.
                 let active = self.picker.take().expect("picker was Some just above");
@@ -1192,7 +1225,7 @@ impl App {
                     self.picker.as_ref().map(|a| &a.kind),
                     Some(PickerKind::Workdir { .. })
                 ) {
-                    return self.submit_workdir(None);
+                    return self.submit_workdir();
                 }
                 self.picker = None;
                 self.workdir_completion = None;

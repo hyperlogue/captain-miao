@@ -99,6 +99,7 @@ impl App {
         {
             active.picker.draw(frame, body);
         }
+        self.draw_launch_options(frame, body);
         if self.input_mode == InputMode::Help {
             self.draw_help(frame, frame.area());
         }
@@ -1590,6 +1591,13 @@ impl App {
                 spans
             }
             _ if self.confirmation.is_some() => self.confirmation.as_ref().unwrap().hints().spans,
+            InputMode::Picker if self.launch_options.is_some() => {
+                let mut spans = hint_pair("Enter", "keep & return");
+                spans.extend(hint_pair("Ctrl-o", "launch"));
+                spans.extend(hint_pair("Esc", "cancel"));
+                spans.extend(hint_pair(",/.", "host page"));
+                spans
+            }
             InputMode::Normal if self.session_detail => {
                 let mut spans = Vec::new();
                 spans.extend(hint_pair("j/k", "scroll"));
@@ -1727,16 +1735,19 @@ impl App {
                         spans.extend(hint_pair("Esc", "no worktree"));
                     }
                     Some(PickerKind::Workdir { agent, .. }) => {
+                        // Put launch choices before editing hints so the
+                        // selector remains discoverable in narrow terminals.
+                        spans = hint_pair("Ctrl-o", "agent & host");
+                        spans.extend(hint_pair("Enter", "launch"));
+                        spans.extend(hint_pair("Esc", "cancel"));
+                        spans.extend(hint_pair("↑/↓", "navigate"));
+                        spans.extend(hint_pair("Tab", "complete"));
                         spans.extend(hint_pair("Ctrl-d", "drop dir"));
-                        spans.extend(hint_pair("Ctrl-t", "agent"));
                         // Hidden for an agent that has no worktrees, the same
                         // rule as `t` on zellij and the layout toggle on tmux:
                         // don't offer a key that can only report it does nothing.
                         if agent.capabilities().worktrees {
                             spans.extend(hint_pair("Ctrl-g", "worktree"));
-                        }
-                        if multi_host {
-                            spans.extend(hint_pair("Ctrl-h", "host"));
                         }
                     }
                     Some(PickerKind::Resume { .. }) if multi_host => {

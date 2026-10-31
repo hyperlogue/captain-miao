@@ -60,7 +60,15 @@ miao
 Press `o` to start an agent in the directory of the selected session.
 If you do not select a session, `o` opens the directory picker.
 Press `O` to select a directory.
-In the directory picker, press `Ctrl-t` to select an agent.
+In the directory picker, press `Ctrl-o` to choose an agent and host side by side.
+Use `qwertyuiop` for agents and `asdfgzxcvb` for the ten hosts on each page;
+`,` and `.` turn host pages. The configured defaults start selected.
+Press `Enter` to keep the choices and return to directory selection, `Ctrl-o`
+to launch immediately in the previously highlighted directory, or `Esc` to
+discard changes and return. Choices apply to this launch only. The selector
+shows the launch directory and validates it on the chosen host before launching.
+The existing `Ctrl-t` (cycle agent) and `Ctrl-h` (cycle host) shortcuts also work
+in the directory picker.
 Press `r` to resume a previous conversation.
 
 The dashboard highlights sessions that require attention.

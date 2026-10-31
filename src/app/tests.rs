@@ -7,6 +7,8 @@ use crate::terminal::{TabId, TabInfo, TabTarget, WindowId};
 use super::format::{ansi_to_lines, default_dir_emoji_and_color, format_coarse_age};
 use super::{Action, App, Cursor, InputMode};
 
+mod launch_options;
+
 // =============================================================================
 // Test harness
 // =============================================================================
@@ -3008,20 +3010,21 @@ fn the_workdir_picker_carries_its_agent_on_its_own_status_line() {
     );
     // The value moved off the bottom bar; only the key label is left there.
     let bar = out.lines().last().unwrap();
-    assert!(bar.contains("Ctrl-t"), "{bar}");
+    assert!(bar.contains("Ctrl-o"), "{bar}");
     assert!(
         !bar.contains("Claude"),
         "the bar must not carry the value: {bar}"
     );
 
-    // Flipping the backend rewrites that line, not the bar.
-    d.app
-        .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    // Keeping a selection rewrites that line, not the bar.
+    d.press_ctrl(KeyCode::Char('o'));
+    d.press(KeyCode::Char('w'));
+    d.press(KeyCode::Enter);
     let out = d.render();
     assert!(
         out.lines()
             .any(|l| l.contains("Agent") && l.contains("Codex")),
-        "status line should follow Ctrl-t:\n{out}"
+        "status line should follow the selected agent:\n{out}"
     );
 }
 

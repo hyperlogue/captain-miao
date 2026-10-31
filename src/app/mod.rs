@@ -42,6 +42,7 @@ mod keybind_log;
 mod keymap;
 mod keys;
 mod launch;
+mod launch_options;
 mod logo;
 mod messages;
 mod notifications;
@@ -387,12 +388,12 @@ pub(super) enum PickerKind {
     /// Launch a new session. The picker shows recent cwds and also accepts
     /// a free-form path; Tab completes against the filesystem. `agent` is the
     /// backend this launch will use — seeded from the persistent default and
-    /// overridable in-picker with `Ctrl-t` (per-launch only).
+    /// overridable with `Ctrl-o`'s selector or `Ctrl-t` (per-launch only).
     Workdir {
         agent: AgentControl,
-        /// Host this launch will open on — local by default, cycled in-picker
-        /// with `Ctrl-h` (per-launch only). A remote host opens the session in
-        /// that host's pty pool and attaches over ssh (§8).
+        /// Host this launch will open on — seeded from the default, chosen via
+        /// `Ctrl-o` or cycled with `Ctrl-h` (per-launch only). A remote host
+        /// opens the session in that host's pty pool and attaches over ssh (§8).
         host: HostId,
         /// `Some` to launch into a fresh git worktree instead of the cwd
         /// itself, armed in-picker with `Ctrl-g` (per-launch only, never
@@ -962,9 +963,11 @@ pub(super) struct App {
     /// ago" staleness label; tracking success rather than attempt keeps the
     /// label growing when a re-fetch fails instead of lying that it's fresh.
     pub(super) preview_updated_at: Option<Instant>,
-    /// Active picker popup (move-tab or resume) — `Some` iff
+    /// Active picker popup (directory, move-tab, resume, etc.) — `Some` iff
     /// `input_mode == InputMode::Picker`.
     pub(super) picker: Option<ActivePicker>,
+    /// Draft launch choices over the still-open directory picker.
+    pub(in crate::app) launch_options: Option<launch_options::LaunchOptions>,
     /// The active confirmation overlays, and preserves, the current input mode.
     pub(in crate::app) confirmation: Option<confirm::Confirmation<ConfirmAction>>,
     /// Download-consent questions from the hosts' connection tasks.
@@ -1756,6 +1759,7 @@ impl App {
             preview_fetched_at: None,
             preview_updated_at: None,
             picker: None,
+            launch_options: None,
             confirmation: None,
             consent_prompts: consent_rx,
             upgrading: HashSet::new(),

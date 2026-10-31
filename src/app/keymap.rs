@@ -400,7 +400,9 @@ impl Command {
             Command::JumpBottom => "jump to bottom",
             Command::FocusSelected => "focus selected window",
             Command::NewSession => "new session (same cwd)",
-            Command::NewSessionPrompt => "new session (prompt for cwd; Ctrl-g for a worktree)",
+            Command::NewSessionPrompt => {
+                "new session (choose cwd; Ctrl-o for agent & host; Ctrl-g for a worktree)"
+            }
             Command::ResumePicker => "resume picker",
             // Only ever a fork. The "/ resume selected in place" half dates from
             // before the key refused to plain-resume, which it now does rather
