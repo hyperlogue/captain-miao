@@ -46,7 +46,7 @@ pub(super) enum Content {
 pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
     Announcement {
         id: "idle-background-commands",
-        introduced: "0.15.0",
+        introduced: "0.16.0",
         title: "Choose which background tasks count as Idle",
         kind: Kind::Update,
         content: &[

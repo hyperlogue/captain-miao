@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-31
+
+Thanks to @neopot for improving macOS test reliability
+([#7](https://github.com/hyperlogue/captain-miao/pull/7),
+[#8](https://github.com/hyperlogue/captain-miao/pull/8)).
+
+### New
+
+- **Launch and resume pickers** offer direct agent and host selection with
+  `Ctrl-o`, including an agent filter for resumable conversations.
+- **Resume lists** show cached sessions immediately while refreshing in the
+  background, preserving your search and selection.
+- **Idle tasks** let you mark persistent servers and other background commands
+  as Idle via Preferences or `Space t i`, so the dashboard does not show the
+  session as active.
+- **Confirmation dialogs** use consistent keyboard controls and clearer titles.
+- **Git pull notifications** show how many commits were pulled.
+
+### Fixed
+
+- **Antigravity task tracking** now shows sessions as active while background
+  commands or timers are still running after a turn ends.
+- **Kill, Restart and Resume** confirm session cleanup and prevent duplicate
+  agents from reopening the same conversation.
+- **Project environments** load approved parent `.envrc` files, preserve
+  clipboard access and avoid Codex startup failures from mismatched libraries.
+- **Session search** matches displayed names, clears stale filters and exits
+  when Backspace is pressed on an empty query.
+- **Startup failures** keep the agent's error output visible in its terminal.
+- **Antigravity compaction** shows manual compaction status and hides stale
+  context usage until a fresh measurement arrives.
+
+### Removed
+
+- **Server and Review states**, along with automatic idle-task learning, are
+  replaced by explicit Idle task preferences.
+
 ## [0.15.0] - 2026-10-18
 
 Thanks to @neopot for fixing Git push tracking
@@ -857,7 +894,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/hyperlogue/captain-miao/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hyperlogue/captain-miao/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/hyperlogue/captain-miao/compare/v0.12.0...v0.13.0
