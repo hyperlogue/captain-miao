@@ -716,13 +716,27 @@ the full sequence and re-runs it on every reconnect:
    as serving, even if an RPC worker retains a backend reference. Unsent requests
    whose callers have already timed out are discarded before transmission.
 
+   Before an automatic retry, run a bounded remote `true` through the shared
+   SSH connection. A successful command preserves the master: the daemon may
+   be unavailable while attached terminals still work. A failed or timed-out
+   command retires the master with `ssh -O exit` before dialing again. Local
+   `ssh -O check` is insufficient; a stalled master can still return its PID.
+   Checks and resets are serialized per SSH target so concurrent retries do
+   not replace a connection another row just recovered.
+
+   Resuming a host with the panel's `c` explicitly requests a fresh connection,
+   awaiting master retirement before provisioning or forwarding. A failed
+   retirement remains pending on the next retry. Dashboard startup preserves
+   existing masters. Resetting a master disconnects every attached terminal
+   sharing it, but does not stop the remote daemon or its pooled sessions.
+
 Round-trip time is sampled from ordinary request traffic (`RemoteBackend::request`
 times the oneshot) — there is deliberately **no `Ping` frame**: every reply is
 already `req_id`-matched, so timing one is free.
 
 Key decoupling: **the daemon and the tunnel have independent lifetimes.** A
-dashboard disconnect/reconnect kills only the `-N -L` child; the daemon and
-every pooled session in it persist. (This replaced the original
+dashboard disconnect/reconnect may replace the SSH master as described above;
+the daemon and every pooled session in it persist. (This replaced the original
 "server-inside-the-ssh-channel" model, whose lifetime was tied to one client —
 the disconnect bug.)
 

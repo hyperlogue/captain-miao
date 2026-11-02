@@ -12203,6 +12203,63 @@ fn sessions_layout_label_round_trips() {
 // Host reconciliation, and the clipboard server
 // =============================================================================
 
+#[test]
+fn host_panel_reconnect_requests_a_fresh_ssh_connection() {
+    const CHILD: &str = "CM_TEST_HOST_RECONNECT";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::host_panel_reconnect_requests_a_fresh_ssh_connection",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Enter the runtime without driving it: this tests the key's intent,
+    // independently of SSH subprocess speed or any real host.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let mut d = TestDashboard::new(100, 30);
+    d.app.open_host_edit_from(vec![super::hosts::HostConfig {
+        label: "reconnect-test".into(),
+        ssh: Some("example.invalid".into()),
+        ..Default::default()
+    }]);
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    d.press(KeyCode::Char('c'));
+    assert!(d.app.host_edit.as_ref().unwrap().rows[1].disabled);
+    d.press(KeyCode::Char('c'));
+    assert!(!d.app.host_edit.as_ref().unwrap().rows[1].disabled);
+    let backend = d
+        .app
+        .backend_for(&crate::state::HostId("reconnect-test".into()))
+        .unwrap();
+    assert!(
+        backend
+            .conn_log()
+            .iter()
+            .any(|entry| entry.text.contains("fresh SSH connection requested")),
+        "c twice must replace the SSH master, not just the dashboard backend"
+    );
+}
+
 /// Committing a hosts-panel row used to rebuild every backend, so changing one
 /// host's target dropped and re-dialled every *other* host too — and an emoji
 /// edit did the same. What a backend is built from is the label and the

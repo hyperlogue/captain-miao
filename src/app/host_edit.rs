@@ -1729,9 +1729,10 @@ impl App {
                 KeyCode::Char('c') if state.cursor < n && !state.rows[state.cursor].is_local => {
                     let row = &mut state.rows[state.cursor];
                     row.disabled = !row.disabled;
-                    // Persists and rebuilds: `disabled` is part of what a backend
-                    // is built from, so this drops (or dials) the connection now.
-                    self.apply_host_edits();
+                    // A resumed host needs a fresh transport too: dropping the
+                    // backend alone leaves ControlPersist's master alive.
+                    let fresh = (!row.disabled).then(|| row.host());
+                    self.apply_host_edits_with_reconnect(fresh.as_ref());
                 }
                 // Removal is destructive (it drops the host and its mirror), so
                 // it asks first.

@@ -2591,7 +2591,11 @@ impl App {
     /// Start one host's connection task. The mirror fills when its snapshot
     /// arrives; until then the host reads `Connecting` and contributes no rows,
     /// which is what the table's trailing "loading" line stands in for.
-    fn dial(identity: &ConnIdentity, forwards: Vec<crate::ssh_forward::Rule>) -> Backend {
+    fn dial(
+        identity: &ConnIdentity,
+        forwards: Vec<crate::ssh_forward::Rule>,
+        fresh: bool,
+    ) -> Backend {
         let host = HostId(identity.label.clone());
         let transport = match &identity.target {
             HostTarget::Socket(sock) => Transport::LocalSocket(std::path::PathBuf::from(sock)),
@@ -2612,7 +2616,11 @@ impl App {
                 clipboard: *clipboard,
             },
         };
-        Backend::Remote(RemoteBackend::connect(transport, host))
+        Backend::Remote(if fresh {
+            RemoteBackend::connect_fresh(transport, host)
+        } else {
+            RemoteBackend::connect(transport, host)
+        })
     }
 
     /// Whether any host that will actually be dialled wants the clipboard.
@@ -2671,7 +2679,7 @@ impl App {
     /// after the hosts panel mutates and around an upgrade's suspension.
     fn reconcile_backends(&mut self) {
         let hosts = hosts::load_hosts();
-        self.reconcile_backends_from(&hosts);
+        self.reconcile_backends_from(&hosts, None);
     }
 
     /// Bring the live backends in line with `hosts` **one host at a time**: dial
@@ -2694,7 +2702,7 @@ impl App {
     ///
     /// Takes the configs rather than re-reading the file, so the caller that
     /// just wrote them reconciles against exactly what it wrote.
-    fn reconcile_backends_from(&mut self, hosts: &[hosts::HostConfig]) {
+    fn reconcile_backends_from(&mut self, hosts: &[hosts::HostConfig], fresh: Option<&HostId>) {
         // Before the dials, so the server is already listening when the first
         // connect asks ssh to forward onto its socket. Order is not actually
         // load-bearing — ssh binds the remote end whether or not the local socket
@@ -2737,6 +2745,7 @@ impl App {
                         .find(|h| h.label == identity.label)
                         .map(|h| h.forwards.clone())
                         .unwrap_or_default(),
+                    fresh.is_some_and(|host| host.0 == identity.label),
                 )
             });
             if let Backend::Remote(remote) = &backend
@@ -2933,6 +2942,10 @@ impl App {
     /// per-host, in [`Self::reconcile_backends_from`], which is also what keeps
     /// an edit to one host from blanking the rows of the others.
     pub(super) fn apply_host_edits(&mut self) {
+        self.apply_host_edits_with_reconnect(None);
+    }
+
+    pub(super) fn apply_host_edits_with_reconnect(&mut self, fresh: Option<&HostId>) {
         let Some(state) = self.host_edit.as_mut() else {
             return;
         };
@@ -2949,7 +2962,7 @@ impl App {
         self.extra_prefs.host_order = Some(state.host_order());
         self.save_overrides();
         hosts::save_hosts(&configs);
-        self.reconcile_backends_from(&configs);
+        self.reconcile_backends_from(&configs, fresh);
     }
 
     /// The per-host emoji for the icon column. A suspended host keeps its icon —

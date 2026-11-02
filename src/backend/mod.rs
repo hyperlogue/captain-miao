@@ -1731,8 +1731,20 @@ impl RemoteBackend {
     /// sessions); the task then retries with backoff, re-snapshotting on each
     /// reconnect, until the backend is dropped.
     pub(crate) fn connect(transport: Transport, host: HostId) -> Arc<Self> {
+        Self::start(transport, host, false)
+    }
+
+    /// A deliberate reconnect must not inherit the SSH master that just failed.
+    pub(crate) fn connect_fresh(transport: Transport, host: HostId) -> Arc<Self> {
+        Self::start(transport, host, true)
+    }
+
+    fn start(transport: Transport, host: HostId, fresh: bool) -> Arc<Self> {
         let (backend, shared, requests) = Self::build(&transport, host);
-        let task = tokio::spawn(connection_task(transport, shared, requests));
+        if fresh && matches!(transport, Transport::Ssh { .. }) {
+            backend.log.info("fresh SSH connection requested by you");
+        }
+        let task = tokio::spawn(connection_task(transport, shared, requests, fresh));
         let _ = backend.connection_task.set(task.abort_handle());
         backend
     }
@@ -2709,6 +2721,7 @@ async fn connection_task(
     transport: Transport,
     shared: ConnectionShared,
     mut requests: mpsc::UnboundedReceiver<PendingRequest>,
+    fresh: bool,
 ) {
     let ConnectionShared {
         clipboard,
@@ -2762,6 +2775,7 @@ async fn connection_task(
     // already the matching `Failed` — which is why the re-dial can skip its own
     // store rather than re-announce the same sentence.
     let mut standing_failure: Option<String> = None;
+    let mut reconnect = ssh::Reconnect::new(fresh);
     loop {
         if standing_failure.is_none() {
             store(ConnState::Connecting);
@@ -2789,6 +2803,7 @@ async fn connection_task(
                         local_sock,
                         options,
                         clipboard: clipboard.as_deref(),
+                        reconnect: &mut reconnect,
                     },
                     &remote_exe,
                     &upgrade,
@@ -3055,6 +3070,7 @@ struct SshLink<'a> {
     options: &'a [String],
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
     clipboard: Option<&'a clipboard::Access>,
+    reconnect: &'a mut ssh::Reconnect,
 }
 
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
@@ -3079,6 +3095,7 @@ async fn setup_ssh(
         local_sock,
         options,
         clipboard,
+        reconnect,
     } = link;
     let (extra, _) = split_connection_options(options);
     let ctl = crate::state::ssh_control_path(target);
@@ -3096,6 +3113,11 @@ async fn setup_ssh(
     // Every ssh call below carries the host's connection options. Optional
     // forwards are managed separately after the handshake.
     let opts = ssh_common_opts(&ctl, &extra);
+    if let Err(reason) = reconnect.prepare(target, &opts, log).await {
+        log.error(&reason);
+        *failure = Some(reason);
+        return None;
+    }
     if !options.is_empty() {
         log.info(format!("connection options: {}", options.join(" ")));
     }

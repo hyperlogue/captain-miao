@@ -494,7 +494,7 @@ mod tests {
             log: Default::default(),
         });
         shared.forwards = Some(manager.clone());
-        let task = tokio::spawn(connection_task(transport, shared, requests));
+        let task = tokio::spawn(connection_task(transport, shared, requests, false));
         backend.connection_task.set(task.abort_handle()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             let (mut peer, _) = listener.accept().await.unwrap();

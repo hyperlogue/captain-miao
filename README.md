@@ -176,6 +176,9 @@ error. Resume also refuses conversations still managed on the selected host.
 Press `Space h` to add an SSH host and configure `miao-server`.
 Remote sessions continue to run when your network disconnects or your computer sleeps.
 Press `Enter` on a detached session to reconnect.
+In the Hosts panel, press `c` to suspend a host and `c` again to reconnect with
+a fresh SSH connection. This disconnects attached terminals sharing that
+connection; their remote pooled sessions keep running.
 Closing a window stops the session by default.
 To keep sessions active after window close, set `[remote] on_window_close = "detach"` in `~/.config/captain-miao/config.toml`.
 
