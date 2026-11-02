@@ -1,5 +1,6 @@
 //! Short-lived SSH agent access for Git, independent of the host's shared master.
 
+use super::ssh::agent_forwarding_may_be_enabled;
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
@@ -97,7 +98,13 @@ impl RemoteBackend {
         let options = ssh::session_options(&self.ssh_options, false);
         let started = Instant::now();
         let session = tokio::time::timeout(within, async {
-            if !agent_forwarding_may_be_enabled(target, &options).await? {
+            if !agent_forwarding_may_be_enabled(
+                target,
+                &options,
+                &login_shell_safe(AGENT_SESSION_SCRIPT),
+            )
+            .await?
+            {
                 return Ok::<_, String>(None);
             }
             let mut command = detached("ssh");
@@ -184,40 +191,6 @@ fn command_reply(reply: Result<Option<ServerFrame>, String>) -> Result<String, S
         }) => Err(message),
         _ => Err("no answer from the host; outcome unknown — verify before retrying".into()),
     }
-}
-
-/// Ask OpenSSH, rather than parsing ssh_config ourselves: Include, Match,
-/// IdentityAgent and ForwardAgent socket paths must keep SSH's own semantics.
-/// A socket path in `ssh -G` hides the boolean (even with -a), so only "no"
-/// proves forwarding is disabled. The actual session supplies the final answer.
-async fn agent_forwarding_may_be_enabled(target: &str, options: &[String]) -> Result<bool, String> {
-    let child = detached("ssh")
-        .arg("-G")
-        .args(options)
-        .arg(target)
-        .arg(login_shell_safe(AGENT_SESSION_SCRIPT))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("Could not resolve Git's SSH configuration: {error}"))?;
-    let (status, stdout, stderr) =
-        tokio::time::timeout(MUX_CONTROL_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
-            .await
-            .map_err(|_| "Resolving Git's SSH configuration timed out".to_string())?
-            .map_err(|error| format!("Could not resolve Git's SSH configuration: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "Could not resolve Git's SSH configuration: {}",
-            stderr.trim()
-        ));
-    }
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("forwardagent "))
-        .filter(|value| !value.is_empty())
-        .map(|value| value != "no")
-        .ok_or_else(|| "SSH did not report its agent forwarding setting".into())
 }
 
 struct AgentSession {
@@ -354,7 +327,7 @@ mod tests {
         assert!(
             result
                 .unwrap_err()
-                .contains("Could not resolve Git's SSH configuration")
+                .contains("Could not resolve SSH configuration")
         );
         assert!(requests.try_recv().is_err());
     }
@@ -519,7 +492,7 @@ mod tests {
             options.extend(override_flags.into_iter().map(str::to_owned));
             let git = ssh::session_options(&options, false);
             assert_eq!(
-                agent_forwarding_may_be_enabled("example.invalid", &git)
+                agent_forwarding_may_be_enabled("example.invalid", &git, "true")
                     .await
                     .unwrap(),
                 expected != "no"
@@ -530,9 +503,23 @@ mod tests {
             else {
                 panic!("expected SSH work tab")
             };
+            let crate::Commands::SshWorkTab {
+                ssh_options,
+                target,
+                command,
+            } = <crate::Cli as clap::Parser>::try_parse_from(work)
+                .unwrap()
+                .command
+                .unwrap()
+            else {
+                panic!("expected work-tab launcher")
+            };
+            let options: Vec<String> = serde_json::from_str(&ssh_options).unwrap();
+            let mut work = ssh::work_tab_options(&target, &options, &command).await;
+            work.extend([target, command]);
             let master = ssh_common_opts(Path::new("/tmp/cm-master.sock"), &options);
             for (kind, argv, forward) in [
-                ("work tab", work[1..].to_vec(), expected),
+                ("work tab", work, expected),
                 (
                     "Git",
                     [git, vec!["example.invalid".into()]].concat(),
@@ -566,10 +553,20 @@ mod tests {
                     "{kind} ignored forwarding policy {forward}"
                 );
                 if kind != "master" {
-                    assert!(
-                        !config.lines().any(|line| line.starts_with("controlpath ")),
-                        "{kind} can join another master"
-                    );
+                    if kind == "work tab" && expected == "no" {
+                        let path = state::ssh_control_path("example.invalid");
+                        assert!(
+                            config
+                                .lines()
+                                .any(|line| line == format!("controlpath {}", path.display())),
+                            "unforwarded work tab must reuse the dashboard connection"
+                        );
+                    } else {
+                        assert!(
+                            !config.lines().any(|line| line.starts_with("controlpath ")),
+                            "{kind} can join another master"
+                        );
+                    }
                     assert!(config.lines().any(|line| line == "controlmaster false"));
                     assert!(config.lines().any(|line| line == "controlpersist no"));
                     let tty = if kind == "work tab" { "true" } else { "false" };

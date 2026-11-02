@@ -95,6 +95,62 @@ async fn reset_master(target: &str, options: &[String]) -> Result<(), String> {
         .map_err(|_| "Retiring SSH connection timed out; retrying before dialing".to_string())?
 }
 
+/// Resolve SSH policy inside the new terminal, keeping configuration commands
+/// (`Match exec` included) off the dashboard's event loop.
+pub(super) fn work_tab_launcher(argv: Vec<String>, options: &[String]) -> Vec<String> {
+    let Some(exe) = reporter_exe() else {
+        return argv;
+    };
+    let mut launch = vec![exe, "ssh-work-tab".into(), "--ssh-options".into()];
+    launch.push(serde_json::to_string(options).expect("SSH options serialize"));
+    launch.push("--".into());
+    launch.extend_from_slice(&argv[argv.len() - 2..]);
+    launch
+}
+
+pub(crate) async fn run_work_tab(
+    target: &str,
+    options: &[String],
+    command: &str,
+) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let options = work_tab_options(target, options, command).await;
+    Err(std::process::Command::new("ssh")
+        .args(options)
+        .arg(target)
+        .arg(command)
+        .exec()
+        .into())
+}
+
+/// Only unforwarded work tabs can join the dashboard's unforwarded master.
+/// Keep ControlMaster/ControlPersist disabled: if its socket has disappeared,
+/// OpenSSH falls back to the ordinary independent connection. Never create a
+/// replacement master here or keep a work tab's credentials after it closes.
+pub(super) async fn work_tab_options(
+    target: &str,
+    options: &[String],
+    command: &str,
+) -> Vec<String> {
+    let mut session = session_options(options, true);
+    if !matches!(
+        agent_forwarding_may_be_enabled(target, &session, command).await,
+        Ok(false)
+    ) {
+        return session;
+    }
+    let (extra, _) = split_connection_options(options);
+    let shared = ssh_common_opts(&state::ssh_control_path(target), &extra);
+    if let Ok(control) = control_options(target, &shared).await {
+        // Keep the user's routing/authentication configuration for fallback;
+        // control_options' -F /dev/null belongs only to mux control commands.
+        session.extend_from_slice(&control[2..]);
+        session.push("-a".into());
+    }
+    session
+}
+
 /// Fresh Git/work-tab connection, with forwarding decided by OpenSSH config.
 /// Keep it independent of the non-forwarding dashboard master and any external
 /// master, and end it with its owning command instead of persisting it.
@@ -171,6 +227,44 @@ pub(super) fn session_options(options: &[String], tty: bool) -> Vec<String> {
         "ServerAliveCountMax=3".into(),
     ]);
     opts
+}
+
+/// Ask OpenSSH, rather than parsing ssh_config ourselves: Include, Match,
+/// IdentityAgent and ForwardAgent socket paths must keep SSH's own semantics.
+/// A socket path in `ssh -G` hides the boolean (even with -a), so only "no"
+/// proves forwarding is disabled. The actual session supplies the final answer.
+pub(super) async fn agent_forwarding_may_be_enabled(
+    target: &str,
+    options: &[String],
+    command: &str,
+) -> Result<bool, String> {
+    let child = detached("ssh")
+        .arg("-G")
+        .args(options)
+        .arg(target)
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("Could not resolve SSH configuration: {error}"))?;
+    let (status, stdout, stderr) =
+        tokio::time::timeout(MUX_CONTROL_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .map_err(|_| "Resolving SSH configuration timed out".to_string())?
+            .map_err(|error| format!("Could not resolve SSH configuration: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Could not resolve SSH configuration: {}",
+            stderr.trim()
+        ));
+    }
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("forwardagent "))
+        .filter(|value| !value.is_empty())
+        .map(|value| value != "no")
+        .ok_or_else(|| "SSH did not report its agent forwarding setting".into())
 }
 
 pub(super) async fn forward(
@@ -533,6 +627,92 @@ mod tests {
             .expect("awaiting retried SSH retirement")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_tabs_use_the_resolved_master_and_keep_fallback_session_policy() {
+        let options: Vec<String> = [
+            "-F",
+            "/dev/null",
+            "-oForwardAgent=no",
+            "-oControlPath=/tmp/cm-work-%h-%r-%p-%%",
+            "-l",
+            "test-user",
+            "-p2222",
+            "-S/tmp/ignored",
+            "-fNM",
+            "-L3000:localhost:3000",
+            "-oRemoteCommand=unwanted",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let work = work_tab_options("example.invalid", &options, "true").await;
+        // The dashboard's explicit -S overrides ControlPath, just as it does
+        // for the work tab. Check token expansion separately below.
+        assert!(work.windows(2).any(|pair| pair == ["-S", "/tmp/ignored"]));
+        let options: Vec<_> = options
+            .into_iter()
+            .filter(|a| a != "-S/tmp/ignored")
+            .collect();
+        let work = work_tab_options("example.invalid", &options, "true").await;
+        assert!(
+            work.windows(2)
+                .any(|pair| pair == ["-S", "/tmp/cm-work-example.invalid-test-user-2222-%%"])
+        );
+        let output = detached("ssh")
+            .arg("-G")
+            .args(&work)
+            .arg("example.invalid")
+            .stdout(Stdio::piped())
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let config = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "controlpath /tmp/cm-work-example.invalid-test-user-2222-%",
+            "controlmaster false",
+            "controlpersist no",
+            "forwardagent no",
+            "forkafterauthentication no",
+            "stdinnull no",
+            "sessiontype default",
+            "requesttty true",
+            "clearallforwardings yes",
+            "port 2222",
+            "user test-user",
+        ] {
+            assert!(
+                config.lines().any(|line| line == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(
+            !config
+                .lines()
+                .any(|line| line.starts_with("remotecommand "))
+        );
+        assert!(!config.lines().any(|line| line.starts_with("localforward ")));
+    }
+
+    #[tokio::test]
+    async fn work_tabs_fall_back_when_configuration_cannot_prove_reuse_is_safe() {
+        for options in [
+            vec!["-F".into(), "/nonexistent/cm-work-config".into()],
+            vec!["-F".into(), "/dev/null".into(), "-oControlPath=none".into()],
+            vec![
+                "-F".into(),
+                "/dev/null".into(),
+                "-oForwardAgent=/tmp/agent.sock".into(),
+                "-a".into(),
+            ],
+        ] {
+            assert_eq!(
+                work_tab_options("example.invalid", &options, "true").await,
+                session_options(&options, true),
+            );
+        }
     }
 
     #[tokio::test]

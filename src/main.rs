@@ -57,6 +57,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Resolve work-tab SSH policy, then replace this process with SSH.
+    #[command(hide = true)]
+    SshWorkTab {
+        #[arg(long)]
+        ssh_options: String,
+        target: String,
+        command: String,
+    },
+
     /// Launch a coding agent with hooks injected for session tracking.
     ///
     /// The first positional after the backend name is the working directory
@@ -173,6 +182,19 @@ enum ClipboardAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(Commands::SshWorkTab {
+        ssh_options,
+        target,
+        command,
+    }) = &cli.command
+    {
+        let options: Vec<String> = serde_json::from_str(ssh_options)?;
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(backend::run_work_tab(target, &options, command));
+    }
+
     // The clipboard server wants a **current-thread** runtime, so it is
     // dispatched here rather than in `async_main`. On macOS its pasteboard read
     // is a synchronous AppKit call that expects the process's main thread; with
@@ -258,6 +280,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
+        Some(Commands::SshWorkTab { .. }) => unreachable!("dispatched before async_main"),
         Some(Commands::Hook { event, sock, agent }) => {
             cm_core::cli::run_hook(&agent, &event, sock.as_deref()).await
         }

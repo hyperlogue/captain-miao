@@ -63,6 +63,7 @@ mod ssh;
 mod vcs;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
 use provision::{Provisioning, UploadGate, incompatible_daemon_reason, resolve_remote_exe};
+pub(crate) use ssh::run_work_tab;
 
 // =============================================================================
 // ssh plumbing, shared with `provision`
@@ -123,7 +124,7 @@ fn detached(program: &str) -> Command {
 /// forwards), the third lets ssh prompt on a child whose stdin is `/dev/null`.
 /// Documented where the field is edited rather than blocked — an escape hatch
 /// that second-guesses isn't one. Agent forwarding is the exception: it stays
-/// disabled on these calls; work tabs and Git use independent sessions.
+/// disabled on these calls; forwarded work tabs and Git use independent sessions.
 ///
 /// An *edit* to any of these takes effect only because
 /// [`changed_connection_options`] retires the previous master first;
@@ -836,7 +837,8 @@ pub(crate) enum ShellPlan {
     /// Run the user's own shell locally in `cwd` (the terminal backend does it;
     /// there is no argv).
     InProcess { cwd: String },
-    /// Spawn this argv — an `ssh -t <target>` that cds into the host's cwd.
+    /// Spawn this argv — the work-tab entrypoint resolves SSH policy and execs
+    /// `ssh -t <target>` to cd into the host's cwd.
     Spawn { argv: Vec<String> },
 }
 
@@ -1392,7 +1394,10 @@ impl Backend {
             }),
             Backend::Remote(b) => match b.attach_target.as_deref() {
                 Some(target) => Ok(ShellPlan::Spawn {
-                    argv: remote_shell_argv(target, &b.ssh_options, cwd, shell_command),
+                    argv: ssh::work_tab_launcher(
+                        remote_shell_argv(target, &b.ssh_options, cwd, shell_command),
+                        &b.ssh_options,
+                    ),
                 }),
                 // Pooled localhost: the "remote" host is this machine, so the
                 // shell is the ordinary local one. `$HOME` never crosses the

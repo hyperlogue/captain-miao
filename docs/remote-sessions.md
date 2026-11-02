@@ -636,12 +636,25 @@ the full sequence and re-runs it on every reconnect:
    `ForwardAgent=no` and `-a`, even if SSH configuration enables forwarding.
    Work tabs and network Git RPCs follow `ForwardAgent` in SSH configuration
    and Advanced SSH options. There is no per-host application toggle; obsolete
-   `forward_agent` fields in `hosts.json` are ignored. These connections use
-   `ControlPath=none`, `ControlMaster=no`, and `ControlPersist=no`; they never
-   join the shared master or background themselves. Authentication and routing
+   `forward_agent` fields in `hosts.json` are ignored. Forwarded work tabs and
+   Git connections use `ControlPath=none`, `ControlMaster=no`, and
+   `ControlPersist=no`; they never join the shared master or background
+   themselves. Authentication and routing
    options still apply, but session/multiplexing overrides and unrelated port
    forwards do not. Work tabs allocate a pty and retain forwarding for the life
    of that SSH connection, independently of the dashboard.
+
+   Unforwarded work tabs reuse the dashboard's authenticated master to avoid
+   another connection and authentication handshake. The hidden `ssh-work-tab`
+   entrypoint evaluates `ssh -G` inside the new terminal, so configuration
+   commands cannot stall tab creation or the dashboard. Only an explicit
+   `forwardagent no` qualifies; configured agent socket paths stay independent.
+   The master path is resolved with the dashboard's full connection options,
+   including custom paths and tokens. Failed configuration resolution or
+   disabled multiplexing leaves the independent connection unchanged. A missing
+   master socket falls back to a fresh connection, without creating a master
+   or persisting it. A work tab using the shared connection closes if that
+   connection is retired or lost.
 
    For each network Git RPC, the dashboard evaluates the same connection options
    with `ssh -G`. A disabled agent skips opening another connection. A reported
