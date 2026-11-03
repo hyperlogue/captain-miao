@@ -89,3 +89,37 @@ async fn stop_is_a_command_and_cleanup_failure_keeps_the_task_alive() {
     retry.send(SessionCommand::Stop).unwrap();
     assert_eq!(driver.await.unwrap().unwrap().code, 0);
 }
+
+#[test]
+fn persistence_recreates_a_deleted_session_directory() {
+    if std::env::var_os("CM_TEST_STATE_RECOVERY").is_some() {
+        let row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
+        persist(&row).unwrap();
+        std::fs::remove_dir_all(state::sessions_dir()).unwrap();
+        persist(&row).expect("a retry must recreate the parent, not fail forever");
+        assert!(
+            state::sessions_dir()
+                .join(format!("{}.json", row.launcher_pid))
+                .is_file()
+        );
+        return;
+    }
+    // Isolate directory deletion from every other test's session fixtures.
+    let root = std::env::temp_dir().join(format!("miao-state-recovery-{}", std::process::id()));
+    state::create_dir_all_private(&root).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launcher::tests::persistence_recreates_a_deleted_session_directory",
+        ])
+        .env("CM_TEST_STATE_RECOVERY", "1")
+        .env("XDG_STATE_HOME", &root)
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        output.status.success(),
+        "isolated persistence recovery failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

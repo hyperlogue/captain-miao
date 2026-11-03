@@ -1,55 +1,28 @@
 //! Keep server-owned work supervised through cleanup and state-store failures.
 use super::{Monitor, Relay, monitor::Observation};
+use crate::agent::session::SessionPublisher;
 use crate::state::{LauncherState, SessionStatus};
 use anyhow::{Context, Result};
-use std::time::Duration;
-use tokio::time::Instant;
 
-/// Persistence is secondary to control ownership. Retry a failed write without
-/// losing the current facts, terminating the TUI, or suppressing an RPC reply.
-struct StateWriter {
-    updates: crate::agent::session::SessionPublisher,
-    retry_at: Option<Instant>,
-}
-impl StateWriter {
-    fn new(updates: crate::agent::session::SessionPublisher) -> Self {
-        Self {
-            updates,
-            retry_at: None,
-        }
-    }
-    async fn write(&mut self, state: &LauncherState) {
-        if self.retry_at.is_some_and(|at| at > Instant::now()) {
-            return;
-        }
-        self.retry_at = match self.updates.write(state).await {
-            Ok(()) => None,
-            Err(error) => {
-                tracing::warn!(
-                    "Could not persist Codex session; retaining control and retrying: {error:#}"
-                );
-                Some(Instant::now() + Duration::from_secs(1))
-            }
-        };
-    }
-}
-async fn retry_at(at: Option<Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
+/// Persistence is secondary to control ownership: publish without waiting on
+/// the filesystem. The launcher retains the latest row and retries a failed
+/// write, so neither the TUI nor an RPC reply waits on the state store.
+fn publish(updates: &SessionPublisher, state: &LauncherState) {
+    if let Err(error) = updates.publish(state) {
+        tracing::warn!("Could not publish Codex session state: {error:#}");
     }
 }
 async fn observe(
     monitor: &mut Monitor,
     state: &mut LauncherState,
     event: Observation,
-    writer: &mut StateWriter,
+    updates: &SessionPublisher,
 ) {
     let before = state.clone();
     monitor.apply(state, event);
     if *state != before {
         state.updated_at = LauncherState::now();
-        writer.write(state).await;
+        publish(updates, state);
     }
 }
 
@@ -60,7 +33,7 @@ async fn quiesce(
     relay: &mut Relay,
     monitor: &mut Monitor,
     state: &mut LauncherState,
-    writer: &mut StateWriter,
+    updates: &SessionPublisher,
 ) -> Result<()> {
     let pause = relay.pause_input(paused);
     tokio::pin!(pause);
@@ -69,7 +42,7 @@ async fn quiesce(
             result = &mut pause => return result,
             event = relay.events.recv() => {
                 let event = event.context("Codex relay stopped")?;
-                observe(monitor, state, event, writer).await;
+                observe(monitor, state, event, updates).await;
             }
         }
     }
@@ -81,7 +54,7 @@ pub(crate) async fn supervise(
     mut child: tokio::process::Child,
     mut relay: crate::agents::codex::app_server::Relay,
     mut control: crate::agents::codex::app_server::Control,
-    updates: crate::agent::session::SessionPublisher,
+    updates: SessionPublisher,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
     use crate::agents::codex::app_server;
@@ -95,18 +68,13 @@ pub(crate) async fn supervise(
     let mut exit_code = 0;
     let mut stopping: Option<BoxFuture<'static, Result<()>>> = None;
     let mut reply: Option<app_server::StopRequest> = None;
-    let mut persistence = StateWriter::new(updates);
-    persistence.write(state).await;
+    publish(&updates, state);
     loop {
         let begin_stop = tokio::select! {
-            _ = retry_at(persistence.retry_at) => {
-                persistence.write(state).await;
-                false
-            }
             event = relay.events.recv(), if relay_live => {
                 match event {
                     Some(event) => {
-                        observe(&mut monitor, state, event, &mut persistence).await;
+                        observe(&mut monitor, state, event, &updates).await;
                         false
                     }
                     None => {
@@ -181,8 +149,8 @@ pub(crate) async fn supervise(
                             state.active_since = None;
                         }
                         state.updated_at = LauncherState::now();
-                        persistence.write(state).await;
-                        let _ = quiesce(false, &mut relay, &mut monitor, state, &mut persistence).await;
+                        publish(&updates, state);
+                        let _ = quiesce(false, &mut relay, &mut monitor, state, &updates).await;
                         if let Some(reply) = reply.take() {
                             let reason = super::kill::force_removal_reason(config, &error, state.session_id.as_deref()).await;
                             reply.respond(Some(message), Some(reason.unwrap_or(super::control::ForceRemoval::Denied))).await;
@@ -197,13 +165,13 @@ pub(crate) async fn supervise(
         if begin_stop {
             state.cleanup = Some(crate::state::CleanupStatus::InProgress);
             state.updated_at = LauncherState::now();
-            persistence.write(state).await;
-            let pause = quiesce(true, &mut relay, &mut monitor, state, &mut persistence).await;
+            publish(&updates, state);
+            let pause = quiesce(true, &mut relay, &mut monitor, state, &updates).await;
             // A lifecycle reply can already have reached the TUI while its
             // observation is queued here. Adopt it before selecting cleanup's
             // thread; the paused input gate prevents a new turn overtaking us.
             while let Ok(event) = relay.events.try_recv() {
-                observe(&mut monitor, state, event, &mut persistence).await;
+                observe(&mut monitor, state, event, &updates).await;
             }
             let config = config.clone();
             let snapshot = state.clone();
@@ -226,47 +194,5 @@ pub(crate) async fn supervise(
                 .context("Codex cleanup timed out")?
             }));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn persistence_recreates_a_deleted_session_directory() {
-        if std::env::var_os("CM_TEST_CODEX_STATE_RECOVERY").is_some() {
-            let row = LauncherState::for_test(crate::agent::AgentKind::Codex, SessionStatus::Idle);
-            let mut writer =
-                StateWriter::new(crate::agent::session::SessionPublisher::test_writer());
-            writer.write(&row).await;
-            assert!(writer.retry_at.is_none());
-            std::fs::remove_dir_all(crate::state::sessions_dir()).unwrap();
-            writer.write(&row).await;
-            assert!(
-                writer.retry_at.is_none(),
-                "retry must recreate the parent, not fail forever"
-            );
-            assert!(
-                crate::state::sessions_dir()
-                    .join(format!("{}.json", row.launcher_pid))
-                    .is_file()
-            );
-            return;
-        }
-        // Isolate directory deletion from every other test's session fixtures.
-        let root = std::env::temp_dir().join(format!("miao-state-recovery-{}", std::process::id()));
-        crate::state::create_dir_all_private(&root).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "agents::codex::app_server::lifecycle::tests::persistence_recreates_a_deleted_session_directory"])
-            .env("CM_TEST_CODEX_STATE_RECOVERY", "1")
-            .env("XDG_STATE_HOME", &root)
-            .output().unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-        assert!(
-            output.status.success(),
-            "isolated persistence recovery failed: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
     }
 }
