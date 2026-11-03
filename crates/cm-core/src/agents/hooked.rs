@@ -1,9 +1,7 @@
 //! Shared mechanics for hook-driven agents. Agent definitions supply behavior;
 //! each opaque task owns its child and observation state and publishes facts.
 use crate::agent::session::*;
-use crate::agent::{
-    AgentActivity, AgentKind, BgShell, ResumeMetadata, TranscriptScan, TranscriptStats,
-};
+use crate::agent::{AgentActivity, AgentKind, BgShell, ResumeMetadata, TranscriptStats};
 use crate::agents::definition::AgentDefinition;
 use crate::launcher::*;
 use crate::state::{self, HookEvent, HookMessage, LauncherState, SessionStatus};
@@ -12,11 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
-#[path = "../launcher/watch.rs"]
 mod watch;
 use watch::{TranscriptWatch, arm_replaced_sidecars, start_file_watcher, start_stat_poll};
 #[cfg(test)]
-#[path = "../launcher/io_tests.rs"]
 mod io_tests;
 
 pub(crate) async fn run(
@@ -266,7 +262,16 @@ async fn process_hooks(
         let mut session_file_event = false;
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((mut stream, _)) = accepted else { continue };
+                let (mut stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        // A persistent error (EMFILE) leaves the listener
+                        // readable; back off instead of spinning the loop.
+                        tracing::warn!("could not accept a hook connection: {error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 // Read the whole hook payload, but defend the single-threaded
                 // loop against a hung (e.g. SIGSTOP'd) same-user client: bound
                 // the wait with a timeout and the buffer with a size cap so one
@@ -717,33 +722,23 @@ async fn process_hooks(
     }
 }
 
-#[derive(Clone)]
 struct TranscriptRead {
-    reader: std::sync::Arc<std::sync::Mutex<Box<dyn super::transcript::TranscriptReader>>>,
+    reader: Box<dyn super::transcript::TranscriptReader>,
     stats: TranscriptStats,
 }
 impl TranscriptRead {
     fn new(agent: AgentKind) -> Self {
         Self {
-            reader: std::sync::Arc::new(std::sync::Mutex::new(
-                agent.definition().transcript_reader(),
-            )),
+            reader: agent.definition().transcript_reader(),
             stats: TranscriptStats::default(),
         }
     }
     fn read(&mut self, path: &Path) {
-        self.stats = self
-            .reader
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .read(path);
+        self.stats = self.reader.read(path);
     }
     fn adopt_model(&mut self, model: &str) {
         self.stats.adopt_model(model);
-        self.reader
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .adopt_model(model);
+        self.reader.adopt_model(model);
     }
 }
 impl std::ops::Deref for TranscriptRead {
@@ -759,8 +754,9 @@ impl std::ops::Deref for TranscriptRead {
 /// runtime thread that also drives `child.wait()`/`accept()`. Advances
 /// `offset`, replaces `data`, applies both onto `state`, and returns whether
 /// the fold changed anything (a signal-driven status change is visible to the
-/// caller through `state`). A join error is treated like the read failing: the
-/// offset and the prior fold are held.
+/// caller through `state`). A join error holds the offset and `state`, and
+/// drops the reader, whose cursor may have advanced past bytes it never folded;
+/// the next read starts a fresh one.
 ///
 /// Shared by the two wakes that can find unread transcript bytes: the fs-watch
 /// arm, and — for hook-driven or poll-watched metadata — the pre-dispatch
@@ -776,22 +772,16 @@ async fn rescan_transcript(
 ) -> bool {
     let scan_path = path.to_path_buf();
     let scan_offset = *offset;
-    let mut prior = data.clone().unwrap_or_else(|| TranscriptRead::new(agent));
-    let (scan, fresh) = tokio::task::spawn_blocking(move || {
+    let mut reader = data.take().unwrap_or_else(|| TranscriptRead::new(agent));
+    let Ok((scan, fresh)) = tokio::task::spawn_blocking(move || {
         let scan = agent.scan_transcript_signals(&scan_path, scan_offset);
-        prior.read(&scan_path);
-        (scan, prior)
+        reader.read(&scan_path);
+        (scan, reader)
     })
     .await
-    .unwrap_or_else(|_| {
-        (
-            TranscriptScan {
-                new_offset: scan_offset,
-                ..Default::default()
-            },
-            data.clone().unwrap_or_else(|| TranscriptRead::new(agent)),
-        )
-    });
+    else {
+        return false;
+    };
     *offset = scan.new_offset;
     if scan.interrupted {
         // Some agents (Claude) fire no hook on Esc/interrupt — without this,
