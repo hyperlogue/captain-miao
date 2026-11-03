@@ -1,4 +1,4 @@
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::backend::{CleanupPolicy, LocalBackend};
 use crate::state::{self, LauncherState, SessionStatus};
 use serde_json::{Value, json};
@@ -140,7 +140,7 @@ async fn kill_qualifies_cleanup_failures_and_reaps_the_tui() {
             .spawn()
             .unwrap();
         let tui = child.id().unwrap();
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Starting);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Starting);
         row.launcher_pid = pid;
         row.child_pid = Some(tui);
         row.launch_id = Some("supervised-kill-fixture".into());
@@ -154,6 +154,7 @@ async fn kill_qualifies_cleanup_failures_and_reaps_the_tui() {
             child,
             relay,
             control,
+            crate::agent::session::SessionPublisher::test_writer(),
             std::future::pending(),
         )
         .await
@@ -374,7 +375,7 @@ async fn kill_removes_a_missing_thread_with_an_older_launcher() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Starting);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Starting);
         row.launcher_pid = launcher.id().unwrap();
         row.child_pid = tui.id();
         row.launch_id = Some("kill-fixture".into());

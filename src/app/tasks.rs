@@ -166,7 +166,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     #[test]
     fn patterns_are_anchored_and_literal_commands_round_trip() {
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn every_command_must_match_and_foreground_work_is_never_hidden() {
         let mut session =
-            LauncherState::for_test(AgentControl::Claude, SessionStatus::BackgroundActive);
+            LauncherState::for_test(AgentKind::Claude, SessionStatus::BackgroundActive);
         session.background_commands = vec!["carver view --port 8011".into(), "cargo test".into()];
         let patterns = vec![TaskRule::new("carver view *", true)];
         apply_idle_commands(&mut session, &patterns);
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn automatic_idle_requires_every_command_and_preserves_foreground_states() {
         let mut session =
-            LauncherState::for_test(AgentControl::Claude, SessionStatus::BackgroundActive);
+            LauncherState::for_test(AgentKind::Claude, SessionStatus::BackgroundActive);
         session.background_commands = vec!["npm run dev".into(), "r3 watch review_abc".into()];
         apply_idle_commands(&mut session, &[]);
         assert_eq!(session.status, SessionStatus::Idle);

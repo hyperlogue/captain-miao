@@ -2,7 +2,7 @@
 //! loopback model fixture. No account or external inference is used.
 
 use super::*;
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::state::SessionStatus;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -34,7 +34,7 @@ fn real_pi_loads_extension_and_tracks_conversations() {
         String::from_utf8_lossy(&output.stderr)
     );
     let checkpoints: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let mut state = LauncherState::for_test(AgentControl::Pi, SessionStatus::Starting);
+    let mut state = LauncherState::for_test(AgentKind::Pi, SessionStatus::Starting);
     let mut original_id = None;
     for checkpoint in checkpoints.as_array().unwrap() {
         let phase = checkpoint["phase"].as_str().unwrap();

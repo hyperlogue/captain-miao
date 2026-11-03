@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::terminal::{TabId, WindowId};
 
 // =============================================================================
@@ -492,7 +492,7 @@ pub fn pooled_launcher_pids(states: &[LauncherState]) -> Vec<u32> {
 /// [`crate::terminal_modes::AttachTerminalGuard`] handles cleanup even when
 /// libshpool exits the process without returning from its relay.
 ///
-/// The recipes live behind `AgentControl` and are verified against Grok 1.0.5
+/// The recipes live behind `AgentKind` and are verified against Grok 1.0.5
 /// and Codex 0.153.4 startup (probed on scripted ptys):
 ///
 /// * `alt_screen` — Grok's DECSET 1049 plus mouse tracking in both grades and
@@ -956,7 +956,7 @@ pub struct HookMessage {
     ///
     /// The alternative to reading a transcript, and for some backends the *only*
     /// route: an agent whose sessions live in a database or an undocumented
-    /// sidecar has nothing [`crate::agent::AgentControl::read_transcript_stats`]
+    /// sidecar has nothing [`crate::agent::AgentKind::read_transcript_stats`]
     /// could fold, but can still say the number itself. Where both exist the
     /// transcript is usually richer (it is incremental and carries the first
     /// prompt too), so a backend should pick one source and say which — see
@@ -1029,7 +1029,7 @@ pub struct LauncherState {
     /// every backend-shaped operation through this field. Defaulted to
     /// Claude so state files written before the field existed still parse.
     #[serde(default)]
-    pub agent: AgentControl,
+    pub agent: AgentKind,
     /// Resolved at launch, independent of later host setting changes.
     #[serde(
         default,
@@ -1147,7 +1147,7 @@ pub struct LauncherState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminfo: Option<String>,
     /// Whether the agent's TUI occupies the terminal's **alternate screen**,
-    /// resolved once at launch ([`crate::agent::AgentControl::uses_alt_screen`])
+    /// resolved once at launch ([`crate::agent::AgentKind::uses_alt_screen`])
     /// and stamped for pooled sessions only. The attach guards use it as an
     /// older-daemon fallback to prime the alt-screen mode set
     /// ([`ReattachPrime`]). An older pool replays no bytes on reattach, so the
@@ -1167,7 +1167,7 @@ pub struct LauncherState {
     pub alt_screen: bool,
     /// Whether the agent pushed the **kitty keyboard protocol** at startup
     /// (what makes Shift+Enter reach it as more than a bare CR), resolved once
-    /// at launch ([`crate::agent::AgentControl::uses_kitty_keyboard`]) in the
+    /// at launch ([`crate::agent::AgentKind::uses_kitty_keyboard`]) in the
     /// same environment the agent reads. Grok checks `TERM` and is primed only
     /// in fullscreen; Codex pushes on the primary screen too, unless its env
     /// opt-out or VS Code/WSL workaround disables enhancements. The attaching
@@ -1219,7 +1219,7 @@ impl LauncherState {
     /// `cfg(test)` so it survives compilation as a *dependency*: a `cfg(test)`
     /// item is invisible to the dashboard crate, which is where two of those
     /// literals lived precisely because they could not call this.
-    pub fn for_test(agent: AgentControl, status: SessionStatus) -> Self {
+    pub fn for_test(agent: AgentKind, status: SessionStatus) -> Self {
         Self {
             agent,
             codex_mode: Default::default(),
@@ -1315,7 +1315,7 @@ impl LauncherState {
     /// acknowledge cleanup before the replacement resumes the saved thread.
     pub fn is_restartable(&self) -> bool {
         self.status.is_restartable()
-            || (self.agent == AgentControl::Codex
+            || (self.agent == AgentKind::Codex
                 && self.codex_mode == crate::agents::codex::CodexMode::AppServer
                 && self.codex_connected == Some(false)
                 && self.codex_control)
@@ -1323,7 +1323,7 @@ impl LauncherState {
 
     /// The resolved mode stays visible while a host migrates existing sessions.
     pub fn agent_label(&self) -> &'static str {
-        if self.agent == AgentControl::Codex {
+        if self.agent == AgentKind::Codex {
             match self.codex_mode {
                 crate::agents::codex::CodexMode::Native => "Codex (native)",
                 crate::agents::codex::CodexMode::AppServer => "Codex (app-server)",
@@ -1679,8 +1679,7 @@ mod tests {
 
     #[test]
     fn background_commands_round_trip_and_retired_states_decode_as_idle() {
-        let mut row =
-            LauncherState::for_test(AgentControl::Claude, SessionStatus::BackgroundActive);
+        let mut row = LauncherState::for_test(AgentKind::Claude, SessionStatus::BackgroundActive);
         row.background_commands = vec![
             "carver view --port 8011".into(),
             "r3 watch review_abc".into(),
@@ -1746,7 +1745,7 @@ mod tests {
         let path = dir.join(format!("{pid}.json"));
         let row = LauncherState {
             launcher_pid: pid,
-            ..LauncherState::for_test(crate::agent::AgentControl::Codex, SessionStatus::Active)
+            ..LauncherState::for_test(crate::agent::AgentKind::Codex, SessionStatus::Active)
         };
         write_json_atomic(&path, &row).unwrap();
         assert_eq!(read_launcher_states_in(&dir).len(), 1);
@@ -1789,7 +1788,7 @@ mod tests {
             pool_session: Some("cm-codex-7-1".into()),
             terminfo: Some("xterm-kitty".into()),
             kitty_keyboard: true,
-            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
+            ..LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle)
         };
         let prime = ReattachPrime::of(&state);
         let enter = prime.enter_sequence();
@@ -1803,7 +1802,7 @@ mod tests {
 
     #[test]
     fn codex_without_keyboard_enhancement_still_restores_paste_and_focus() {
-        let state = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let state = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         let prime = ReattachPrime::of(&state);
         assert_eq!(prime.enter_sequence(), b"\x1b[?1004h\x1b[?2004h");
         assert_eq!(prime.leave_sequence(), b"\x1b[?2004l\x1b[?1004l\x1b[?25h");
@@ -1814,7 +1813,7 @@ mod tests {
         let state = LauncherState {
             alt_screen: true,
             kitty_keyboard: true,
-            ..LauncherState::for_test(AgentControl::Grok, SessionStatus::Idle)
+            ..LauncherState::for_test(AgentKind::Grok, SessionStatus::Idle)
         };
         let prime = ReattachPrime::of(&state);
         assert_eq!(
@@ -1835,8 +1834,8 @@ mod tests {
         let create = ReattachPrime::default();
         assert!(create.enter_sequence().is_empty());
         assert!(create.leave_sequence().is_empty());
-        for &agent in AgentControl::ALL {
-            if agent == AgentControl::Codex {
+        for &agent in AgentKind::ALL {
+            if agent == AgentKind::Codex {
                 continue;
             }
             let state = LauncherState::for_test(agent, SessionStatus::Idle);
@@ -1852,7 +1851,7 @@ mod tests {
         let mk = |pid: u32, pool: Option<&str>| LauncherState {
             launcher_pid: pid,
             pool_session: pool.map(str::to_string),
-            ..LauncherState::for_test(crate::agent::AgentControl::Claude, SessionStatus::Idle)
+            ..LauncherState::for_test(crate::agent::AgentKind::Claude, SessionStatus::Idle)
         };
         let states = vec![
             mk(10, None),                  // local session, no pool name
@@ -1913,7 +1912,7 @@ mod tests {
         let mk = |pid: u32, pool: Option<&str>| LauncherState {
             launcher_pid: pid,
             pool_session: pool.map(str::to_string),
-            ..LauncherState::for_test(crate::agent::AgentControl::Claude, SessionStatus::Idle)
+            ..LauncherState::for_test(crate::agent::AgentKind::Claude, SessionStatus::Idle)
         };
         let pids = pooled_launcher_pids(&[
             mk(1, None),
@@ -1970,7 +1969,7 @@ mod tests {
     /// `true` survives the round trip.
     #[test]
     fn cleanup_diagnostics_are_optional_tolerant_and_bounded() {
-        let row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         let mut json = serde_json::to_value(&row).unwrap();
         assert!(json.get("cleanup").is_none());
         json["cleanup"] = serde_json::json!({"state":"future_cleanup_phase"});

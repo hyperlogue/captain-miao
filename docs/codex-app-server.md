@@ -31,7 +31,12 @@ launcher started, so migration can proceed incrementally.
 
 ## Ownership and interface
 
-`crates/cm-core/src/agents/codex/` contains two separate adapters:
+`crates/cm-core/src/agents/codex/adapter.rs` owns the injected Codex
+configuration and selects its native or app-server task internally. Both
+execution modules are private; the shared launcher sees only the opaque task,
+state updates and cooperative stop requests.
+
+The two execution modules retain their separate behavior:
 
 | Operation | Native | App-server |
 | --- | --- | --- |

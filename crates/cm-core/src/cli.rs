@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::logging::init_tracing;
 
 /// Split a `claude`/`codex` positional list into `(cwd, passthrough_args)`.
@@ -77,13 +77,13 @@ pub enum ClipboardShims {
 /// Run the launcher for `agent` from a raw positional arg list, **without** the
 /// clipboard shims — the dashboard's own `claude`/`codex` arms, which open a local
 /// window.
-pub async fn run_launch(agent: AgentControl, args: Vec<String>) -> Result<()> {
+pub async fn run_launch(agent: AgentKind, args: Vec<String>) -> Result<()> {
     run_launch_with(agent, args, ClipboardShims::Skip).await
 }
 
 /// Run the launcher for `agent` **with** the clipboard shims — `miao-server`'s
 /// `claude`/`codex` arms, which only ever run inside the pty pool.
-pub async fn run_launch_pooled(agent: AgentControl, args: Vec<String>) -> Result<()> {
+pub async fn run_launch_pooled(agent: AgentKind, args: Vec<String>) -> Result<()> {
     run_launch_with(agent, args, ClipboardShims::Install).await
 }
 
@@ -93,11 +93,7 @@ pub async fn run_launch_pooled(agent: AgentControl, args: Vec<String>) -> Result
 /// Two public wrappers rather than one function with a parameter, so a call site
 /// cannot pass the wrong one by accident and `miao`'s path yields `Skip` by
 /// construction rather than by argument.
-async fn run_launch_with(
-    agent: AgentControl,
-    args: Vec<String>,
-    shims: ClipboardShims,
-) -> Result<()> {
+async fn run_launch_with(agent: AgentKind, args: Vec<String>, shims: ClipboardShims) -> Result<()> {
     init_tracing("launcher");
     // The server injects `--pool-session <name>` when it starts a launcher inside
     // a remote pty pool, and the dashboard injects `--launch-id <token>` for a
@@ -131,7 +127,7 @@ async fn run_launch_with(
 /// forward the event to the launcher socket.
 pub async fn run_hook(agent_cli: &str, event: &str, sock: Option<&str>) -> Result<()> {
     init_tracing("hook");
-    let agent = AgentControl::from_cli(agent_cli)
+    let agent = AgentKind::from_cli(agent_cli)
         .ok_or_else(|| anyhow::anyhow!("unknown --agent: {agent_cli}"))?;
     crate::hooks::handle_event(agent, event, sock).await
 }

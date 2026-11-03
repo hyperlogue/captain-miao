@@ -36,7 +36,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::config::{self, OnWindowClose, parse_color};
 use crate::terminal::SessionsLayout;
 
@@ -244,12 +244,8 @@ pub(crate) struct AgentPref {
 
 /// Every known backend, in declaration order, all enabled — what a dashboard
 /// that has never opened this overlay shows.
-pub(super) fn default_agent_list() -> Vec<(AgentControl, bool)> {
-    AgentControl::ALL
-        .iter()
-        .copied()
-        .map(|a| (a, true))
-        .collect()
+pub(super) fn default_agent_list() -> Vec<(AgentKind, bool)> {
+    AgentKind::ALL.iter().copied().map(|a| (a, true)).collect()
 }
 
 /// Merge the stored agent order with the backends this build knows about.
@@ -259,19 +255,19 @@ pub(super) fn default_agent_list() -> Vec<(AgentControl, bool)> {
 /// dead row; and a backend added since the list was written is appended
 /// **enabled**, so upgrading surfaces new agents instead of hiding them behind
 /// a preference the user never expressed.
-pub(super) fn resolve_agent_list(prefs: Option<&[AgentPref]>) -> Vec<(AgentControl, bool)> {
+pub(super) fn resolve_agent_list(prefs: Option<&[AgentPref]>) -> Vec<(AgentKind, bool)> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if let Some(list) = prefs {
         for p in list {
-            if let Some(a) = AgentControl::from_cli(&p.id)
+            if let Some(a) = AgentKind::from_cli(&p.id)
                 && seen.insert(a)
             {
                 out.push((a, p.enabled));
             }
         }
     }
-    for a in AgentControl::ALL {
+    for a in AgentKind::ALL {
         if seen.insert(*a) {
             out.push((*a, true));
         }
@@ -282,9 +278,9 @@ pub(super) fn resolve_agent_list(prefs: Option<&[AgentPref]>) -> Vec<(AgentContr
 /// When `prefs.agents` was never written, put `preferred` first so a TOML or
 /// typed-override default is not clobbered by compile-order Claude.
 pub(super) fn prefer_agent_first(
-    mut list: Vec<(AgentControl, bool)>,
-    preferred: AgentControl,
-) -> Vec<(AgentControl, bool)> {
+    mut list: Vec<(AgentKind, bool)>,
+    preferred: AgentKind,
+) -> Vec<(AgentKind, bool)> {
     if let Some(i) = list.iter().position(|(a, _)| *a == preferred) {
         let mut item = list.remove(i);
         item.1 = true;
@@ -295,7 +291,7 @@ pub(super) fn prefer_agent_first(
 
 /// The default agent: the first enabled entry of the ordered list. This is why
 /// there is no "default agent" row — reordering *is* the setting.
-pub(super) fn first_enabled_agent(list: &[(AgentControl, bool)]) -> AgentControl {
+pub(super) fn first_enabled_agent(list: &[(AgentKind, bool)]) -> AgentKind {
     list.iter()
         .find(|(_, on)| *on)
         .map(|(a, _)| *a)
@@ -1323,7 +1319,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     #[test]
     fn legacy_idle_commands_migrate_and_both_choices_round_trip() {
@@ -1372,7 +1368,7 @@ mod tests {
 
     #[test]
     fn prefer_agent_first_promotes_and_enables() {
-        let preferred = AgentControl::from_cli("codex").expect("codex");
+        let preferred = AgentKind::from_cli("codex").expect("codex");
         let list = prefer_agent_first(default_agent_list(), preferred);
         assert_eq!(list[0].0, preferred);
         assert!(list[0].1, "typed default must be enabled");
@@ -1386,12 +1382,12 @@ mod tests {
             enabled: false,
         }];
         let list = resolve_agent_list(Some(&prefs));
-        assert_eq!(list[0].0, AgentControl::from_cli("codex").unwrap());
+        assert_eq!(list[0].0, AgentKind::from_cli("codex").unwrap());
         assert!(!list[0].1);
         assert!(
-            list.iter().any(|(a, on)| *a == AgentControl::Claude && *on),
+            list.iter().any(|(a, on)| *a == AgentKind::Claude && *on),
             "agents missing from the persisted list stay enabled"
         );
-        assert_eq!(list.len(), AgentControl::ALL.len());
+        assert_eq!(list.len(), AgentKind::ALL.len());
     }
 }

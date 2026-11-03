@@ -1,15 +1,9 @@
-//! `AgentControl` is the dashboard's interface to a coding-agent CLI. It is
-//! per-session, not per-process: a single dashboard runs sessions from several
-//! backends side by side, dispatching every backend-shaped operation through
-//! the variant stored on each `LauncherState`.
+//! Serialized identity and shared agent facts. Immutable definitions live with
+//! each integration; configured adapters own settings and opaque session tasks.
+//! A single resolver selects an agent's definition, so adding an integration
+//! does not extend every operation in this module.
 //!
-//! The variants carry no instance state — methods are pure functions of
-//! `self` and forward to the matching `agents::<name>` module.
-//!
-//! Adding a new backend is meant to be: add a variant, add a module under
-//! `agents/`, extend each `match` here. No registry, no dyn dispatch.
-//!
-//! [`AgentControl::Unknown`] is the one variant that isn't a backend. `agent`
+//! [`AgentKind::Unknown`] is the one variant that isn't a backend. `agent`
 //! rides `LauncherState`, and `LauncherState` rides the `Snapshot` frame as a
 //! `Vec` — so a single element that refuses to decode fails the *whole* frame,
 //! and one session started under a backend this build predates would blank
@@ -28,16 +22,16 @@
 //! being echoed back, which the launch path refuses rather than guessing. That
 //! last clause is *enforced*, not merely expected: the two places an argv or a
 //! command gets built — [`crate::backend::LocalBackend::open_session`] and
-//! [`AgentControl::build_launch_command`] — both refuse with
+//! [`AgentKind::build_launch_command`] — both refuse with
 //! [`UNKNOWN_AGENT_REFUSAL`], so no path can turn an undecodable name into a
 //! process.
 //!
-//! It deliberately does not preserve the original name. `AgentControl` is
+//! It deliberately does not preserve the original name. `AgentKind` is
 //! `Copy`, is used as a `HashMap` key, and every method takes `self` by value;
 //! carrying a `String` would cost all of that repo-wide to hold a label nothing
 //! is allowed to act on.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -47,19 +41,21 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::agents;
-use crate::agents::{antigravity, claude, codex, grok, kimi, omp, opencode, pi, reasonix};
+
+pub(crate) mod session;
 use crate::state::{HookEvent, HookMessage, LauncherState, ReattachPrime};
+use session::AgentAdapter;
 
 // =============================================================================
 // Which backends exist, and what they can do
 // =============================================================================
 
 /// `Deserialize` is hand-written (see below) so an unrecognized name lands on
-/// [`AgentControl::Unknown`]; `Serialize` stays derived — `rename_all` maps that
+/// [`AgentKind::Unknown`]; `Serialize` stays derived — `rename_all` maps that
 /// variant to `"unknown"`, which decodes back to itself.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AgentControl {
+pub enum AgentKind {
     #[default]
     Claude,
     Codex,
@@ -87,8 +83,8 @@ pub enum AgentControl {
     Unknown,
 }
 
-/// What both write-side guards say when they refuse an [`AgentControl::Unknown`]
-/// — [`AgentControl::build_launch_command`] and
+/// What both write-side guards say when they refuse an [`AgentKind::Unknown`]
+/// — [`AgentKind::build_launch_command`] and
 /// [`crate::backend::LocalBackend::open_session`]. Shared so the two can't drift
 /// into describing the same situation differently, and so a caller that only
 /// ever sees one of them still learns the fix.
@@ -96,9 +92,9 @@ pub const UNKNOWN_AGENT_REFUSAL: &str = "unknown agent backend: this build doesn
                                          request comes from a newer captain-miao); upgrade \
                                          captain-miao to launch it";
 
-impl<'de> Deserialize<'de> for AgentControl {
-    /// Accepts exactly the names [`AgentControl::cli_subcommand`] emits and maps
-    /// everything else to [`AgentControl::Unknown`] — the whole point being that
+impl<'de> Deserialize<'de> for AgentKind {
+    /// Accepts exactly the names [`AgentKind::cli_subcommand`] emits and maps
+    /// everything else to [`AgentKind::Unknown`] — the whole point being that
     /// a value from a newer host must not fail the frame it arrived in. Matching
     /// is exact, as on-disk state has always been; the case-insensitive spelling
     /// belongs to `from_cli`, where a human types the name.
@@ -108,25 +104,22 @@ impl<'de> Deserialize<'de> for AgentControl {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         struct AgentVisitor;
         impl serde::de::Visitor<'_> for AgentVisitor {
-            type Value = AgentControl;
+            type Value = AgentKind;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("an agent backend name")
             }
-            fn visit_str<E: serde::de::Error>(
-                self,
-                v: &str,
-            ) -> std::result::Result<AgentControl, E> {
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<AgentKind, E> {
                 Ok(match v {
-                    "claude" => AgentControl::Claude,
-                    "codex" => AgentControl::Codex,
-                    "reasonix" => AgentControl::Reasonix,
-                    "kimi" => AgentControl::Kimi,
-                    "grok" => AgentControl::Grok,
-                    "opencode" => AgentControl::OpenCode,
-                    "pi" => AgentControl::Pi,
-                    "antigravity" => AgentControl::Antigravity,
-                    "omp" => AgentControl::Omp,
-                    _ => AgentControl::Unknown,
+                    "claude" => AgentKind::Claude,
+                    "codex" => AgentKind::Codex,
+                    "reasonix" => AgentKind::Reasonix,
+                    "kimi" => AgentKind::Kimi,
+                    "grok" => AgentKind::Grok,
+                    "opencode" => AgentKind::OpenCode,
+                    "pi" => AgentKind::Pi,
+                    "antigravity" => AgentKind::Antigravity,
+                    "omp" => AgentKind::Omp,
+                    _ => AgentKind::Unknown,
                 })
             }
         }
@@ -134,40 +127,51 @@ impl<'de> Deserialize<'de> for AgentControl {
     }
 }
 
-impl AgentControl {
+impl AgentKind {
+    pub(crate) fn definition(self) -> &'static dyn agents::definition::AgentDefinition {
+        match self {
+            Self::Claude => &agents::claude::Definition,
+            Self::Codex => &agents::codex::Definition,
+            Self::Reasonix => &agents::reasonix::Definition,
+            Self::Kimi => &agents::kimi::Definition,
+            Self::Grok => &agents::grok::Definition,
+            Self::OpenCode => &agents::opencode::Definition,
+            Self::Pi => &agents::pi::Definition,
+            Self::Antigravity => &agents::antigravity::Definition,
+            Self::Omp => &agents::omp::Definition,
+            Self::Unknown => agents::definition::UNKNOWN,
+        }
+    }
+
+    pub(crate) fn configure(
+        self,
+        config: &crate::config::AgentConfig,
+    ) -> Result<Box<dyn AgentAdapter>> {
+        self.definition().configure(config)
+    }
+
     /// Every backend this build can actually drive — `Unknown` is deliberately
     /// absent, which is what keeps it out of the `Space a` picker and the
     /// `Ctrl-t` cycle.
     ///
     /// **Append, never reorder**: this seeds the default `Ctrl-t` cycle and
     /// agent picker order. Preferences can reorder or disable entries.
-    pub const ALL: &'static [AgentControl] = &[
-        AgentControl::Claude,
-        AgentControl::Codex,
-        AgentControl::Reasonix,
-        AgentControl::Kimi,
-        AgentControl::Grok,
-        AgentControl::OpenCode,
-        AgentControl::Pi,
-        AgentControl::Antigravity,
-        AgentControl::Omp,
+    pub const ALL: &'static [AgentKind] = &[
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Reasonix,
+        AgentKind::Kimi,
+        AgentKind::Grok,
+        AgentKind::OpenCode,
+        AgentKind::Pi,
+        AgentKind::Antigravity,
+        AgentKind::Omp,
     ];
 
     /// CLI subcommand the dashboard launches to wrap this agent
     /// (e.g. `miao claude .`).
     pub fn cli_subcommand(self) -> &'static str {
-        match self {
-            AgentControl::Claude => "claude",
-            AgentControl::Codex => "codex",
-            AgentControl::Reasonix => "reasonix",
-            AgentControl::Kimi => "kimi",
-            AgentControl::Grok => "grok",
-            AgentControl::OpenCode => "opencode",
-            AgentControl::Pi => "pi",
-            AgentControl::Antigravity => "antigravity",
-            AgentControl::Omp => "omp",
-            AgentControl::Unknown => "",
-        }
+        self.definition().cli_subcommand()
     }
 
     /// Parse the `--agent` flag / config value: the inverse of
@@ -178,7 +182,7 @@ impl AgentControl {
     /// Never yields `Unknown`: a name this build can't drive stays `None` so the
     /// caller reports it, rather than launching into an inert backend. That now
     /// falls out of the search space — [`ALL`](Self::ALL) omits `Unknown`.
-    pub fn from_cli(s: &str) -> Option<AgentControl> {
+    pub fn from_cli(s: &str) -> Option<AgentKind> {
         let s = s.to_ascii_lowercase();
         Self::ALL.iter().copied().find(|a| a.cli_subcommand() == s)
     }
@@ -198,10 +202,7 @@ impl AgentControl {
     /// the agent. The encoder is selected before fetching anything, so other
     /// agents never make an extra clipboard request through this route.
     pub fn clipboard_paste_encoder(self) -> Option<fn(&Path) -> Vec<u8>> {
-        match self {
-            Self::Codex => Some(codex::clipboard_paste_input),
-            _ => None,
-        }
+        self.definition().clipboard_paste_encoder()
     }
 
     /// The executable this backend drives, and the one place that mapping is
@@ -209,37 +210,12 @@ impl AgentControl {
     /// backend this build can launch at all — so no binary could make it
     /// available, and it is absent from [`ALL`](Self::ALL) besides.
     pub fn bin(self) -> Option<&'static str> {
-        Some(match self {
-            AgentControl::Claude => claude::BIN,
-            AgentControl::Codex => codex::BIN,
-            AgentControl::Reasonix => reasonix::BIN,
-            AgentControl::Kimi => kimi::BIN,
-            AgentControl::Grok => grok::BIN,
-            AgentControl::OpenCode => opencode::BIN,
-            AgentControl::Pi => pi::BIN,
-            AgentControl::Antigravity => antigravity::BIN,
-            AgentControl::Omp => omp::BIN,
-            AgentControl::Unknown => return None,
-        })
+        self.definition().bin()
     }
 
     /// Human-facing backend name for headers and status lines.
     pub fn label(self) -> &'static str {
-        match self {
-            AgentControl::Claude => "Claude",
-            AgentControl::Codex => "Codex",
-            AgentControl::Reasonix => "Reasonix",
-            AgentControl::Kimi => "Kimi Code",
-            AgentControl::Grok => "Grok Build",
-            // Lowercase on purpose: sst styles the project `opencode`.
-            AgentControl::OpenCode => "opencode",
-            AgentControl::Pi => "Pi",
-            AgentControl::Omp => "oh-my-pi",
-            AgentControl::Antigravity => "Antigravity",
-            // Truthful and neutral: the row is an agent session, we just can't
-            // say which backend.
-            AgentControl::Unknown => "Agent",
-        }
+        self.definition().label()
     }
 
     /// Saved facts for an explicit resume that starts without a prompt, when
@@ -247,10 +223,7 @@ impl AgentControl {
     /// applies these only after spawning the child; ordinary hooks supersede
     /// them. No metadata for fresh sessions, forks or ambiguous launch args.
     pub fn read_resume_metadata(self, args: &[String]) -> Option<ResumeMetadata> {
-        match self {
-            Self::Codex => codex::read_resume_metadata(args),
-            _ => None,
-        }
+        self.definition().read_resume_metadata(args)
     }
 
     /// Extra args appended after the cwd to resume (or fork) `session_id`.
@@ -265,90 +238,7 @@ impl AgentControl {
     /// which is how a backend says it cannot branch: the two argvs come out
     /// equal and [`Self::supports_fork`] reads that off directly.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
-        match self {
-            // Grok's flags are byte-identical to Claude's here (`17-sessions.md`
-            // documents `--resume <id>` and `--fork-session`), which is why the
-            // two share an arm rather than repeating one.
-            AgentControl::Claude | AgentControl::Grok => {
-                let mut v = vec!["--resume".to_string(), session_id.to_string()];
-                if fork {
-                    v.push("--fork-session".to_string());
-                }
-                v
-            }
-            AgentControl::Codex => {
-                let sub = if fork { "fork" } else { "resume" };
-                vec![sub.to_string(), session_id.to_string()]
-            }
-            AgentControl::Reasonix => {
-                // `--resume QUERY` also accepts a path or a unique title; the id
-                // is the exact form. `--copy` is its fork: the original
-                // transcript is left untouched and the copy is writable, which
-                // is also how you resume a session another process holds.
-                let mut v = vec!["-r".to_string(), session_id.to_string()];
-                if fork {
-                    v.push("--copy".to_string());
-                }
-                v
-            }
-            // **`fork` is ignored, deliberately.** Kimi documents no fork flag,
-            // and ignoring the argument is how a backend says so: the two argvs
-            // come out equal, [`Self::supports_fork`] is then false, and the
-            // dashboard hides `f` — no second match to keep in sync, and no
-            // chance of offering a key that silently resumes in place instead.
-            //
-            // `--session <id>` and `--continue` are mutually exclusive, so only
-            // ever one of them goes on an argv. We always name the id, which is
-            // also why the bare `--session` form (which opens Kimi's session
-            // browser) can't be reached from here.
-            AgentControl::Kimi => vec!["--session".to_string(), session_id.to_string()],
-            // `-s <id>` plus `--fork`, both documented flags on the root TUI
-            // command. The id reaches `LauncherState` on `session.created` and
-            // on every direct hook (`agents::opencode`), so unlike the first cut
-            // of that backend this is reachable. (`-c` / `--continue` resumes
-            // the most recent session in a directory without an id, but this
-            // seam is id-shaped and inventing an id-less path for one backend is
-            // not the trade.)
-            AgentControl::OpenCode => {
-                let mut v = vec!["-s".to_string(), session_id.to_string()];
-                if fork {
-                    v.push("--fork".to_string());
-                }
-                v
-            }
-            // Pi's fork **replaces** the resume rather than decorating it:
-            // `--session <path|id>` opens that session, `--fork <path|id>` forks
-            // it into a new one, and they are alternative entry points rather
-            // than a flag and its modifier. So the flag name swaps and the id
-            // stays — the same shape as Codex's `resume`/`fork` subcommands, and
-            // the reason `supports_fork()` needs no special case here.
-            AgentControl::Pi => {
-                let flag = if fork { "--fork" } else { "--session" };
-                vec![flag.to_string(), session_id.to_string()]
-            }
-            // omp's fork **replaces** the resume rather than decorating it, the
-            // Pi/Codex shape: `--resume <id>` opens that session, `--fork <id>`
-            // forks it into a new one, and they are alternative entry points
-            // rather than a flag and its modifier. `--resume` is in the public
-            // flag schema and `--help`; `--fork` is in the argv map and
-            // documented in `omp://session-operations-export-share-fork-resume.md`.
-            // The undocumented `--session` alias is deliberately not used.
-            AgentControl::Omp => {
-                let flag = if fork { "--fork" } else { "--resume" };
-                vec![flag.to_string(), session_id.to_string()]
-            }
-            // **`fork` is ignored**, the Kimi shape: `--conversation <id>`
-            // resumes, and `agy`'s flag list offers nothing that branches one —
-            // Antigravity forks a conversation from inside its own TUI, which is
-            // not an argv this seam can reach. So the two argvs come out equal,
-            // `supports_fork` reads that off, and `f` hides itself rather than
-            // silently resuming in place. Probed against `agy` 1.1.11: the
-            // resumed session reports the id it was given on its next hook.
-            AgentControl::Antigravity => {
-                vec!["--conversation".to_string(), session_id.to_string()]
-            }
-            AgentControl::Unknown => vec![],
-        }
+        self.definition().resume_args(session_id, fork)
     }
 
     /// Extra args that launch this agent into an isolated git **worktree**, or
@@ -367,65 +257,7 @@ impl AgentControl {
     /// it answers `None` and the dashboard hides the affordance — the same shape
     /// as [`Self::session_watch_path`] and [`Self::bg_shells`].
     pub fn worktree_args(self, name: Option<&str>) -> Option<Vec<String>> {
-        match self {
-            AgentControl::Claude => {
-                let mut v = vec!["--worktree".to_string()];
-                // A `#`-prefixed PR number is a legitimate name (`--worktree
-                // "#1234"` branches from that PR), so nothing here inspects it.
-                if let Some(name) = name.filter(|n| !n.is_empty()) {
-                    v.push(name.to_string());
-                }
-                Some(v)
-            }
-            // Grok has `--worktree [NAME]` too (`tutorial/06-worktrees.md`), with
-            // the same ownership story: it creates the worktree, names it, tracks
-            // its age and collects it (`grok worktree gc`), and a resume re-enters
-            // it without the flag.
-            //
-            // **The `=` form, one argv element**, which the tutorial is explicit
-            // about: the value is *optional*, so a bare `--worktree` followed by
-            // any positional swallows it as the name. Nothing captain-miao spawns
-            // passes a trailing positional today — `split_cwd` consumes the cwd
-            // before the agent sees it — so the separated form would work right
-            // up until something appended one, and then fail silently by opening
-            // a worktree named after the argument.
-            AgentControl::Grok => Some(match name.filter(|n| !n.is_empty()) {
-                Some(name) => vec![format!("--worktree={name}")],
-                // Nothing follows it in our argv, so the bare flag is safe here —
-                // and it is the only way to ask Grok to mint the name.
-                None => vec!["--worktree".to_string()],
-            }),
-            AgentControl::Codex => None,
-            // Reasonix has isolated "Delivery" workspaces of its own (they even
-            // have a state dir), but no CLI flag launches into one, so there is
-            // nothing to spend a worktree request on.
-            AgentControl::Reasonix => None,
-            // No documented worktree flag. `supports_worktrees()` is derived from
-            // this, so `Ctrl-g` hides itself with nothing else to change.
-            AgentControl::Kimi => None,
-            // opencode's *plugin context* exposes a `worktree` field, so it has
-            // the concept — but no CLI flag launches into one, and there is
-            // nothing to spend a worktree request on. `Ctrl-g` hides itself.
-            AgentControl::OpenCode => None,
-            // Pi documents no worktree flag — its own isolation story is
-            // `docs/containerization.md`, which is the agent sandboxing the
-            // dashboard deliberately stays out of. `supports_worktrees()` is
-            // derived from this, so `Ctrl-g` hides itself with nothing else to
-            // change.
-            AgentControl::Pi => None,
-            // No `--worktree` launch flag exists (the single `--worktree` string
-            // in the binary is `git restore --worktree`). omp's `omp worktree`
-            // subcommand only lists/clears worktrees the agent made itself, so
-            // there is nothing to pass at launch. `supports_worktrees()` is
-            // derived from this, so `Ctrl-g` hides itself.
-            AgentControl::Omp => None,
-            // `agy` has no worktree flag. Its isolation story is `--sandbox`,
-            // which is the agent sandboxing the dashboard deliberately stays out
-            // of, so there is nothing to spend a worktree request on and
-            // `Ctrl-g` hides itself.
-            AgentControl::Antigravity => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().worktree_args(name)
     }
 
     // =============================================================================
@@ -466,26 +298,7 @@ impl AgentControl {
     /// TUI in a cleared alternate screen and the eventual leave-toggle then
     /// discards everything on it.
     pub fn uses_alt_screen(self, agent_args: &[String]) -> bool {
-        match self {
-            // Verified on 1.0.4: fullscreen Grok enters the alt screen on a
-            // plain terminal unless config or argv opt out. The resolution
-            // rules (pager.toml / config.toml / `--no-alt-screen`) live with
-            // the rest of Grok's config knowledge.
-            AgentControl::Grok => grok::uses_alt_screen(agent_args),
-            // Inline at launch. Codex's later alternate-screen overlays are
-            // tracked by the pool's live mode spool, not this fallback bit.
-            AgentControl::Claude | AgentControl::Codex => false,
-            // Not verified on a pool pty; false per the note above. A backend
-            // that turns out to be an alt-screen TUI moves up, with its own
-            // opt-out rules if it has any.
-            AgentControl::Reasonix
-            | AgentControl::Kimi
-            | AgentControl::OpenCode
-            | AgentControl::Pi
-            | AgentControl::Omp
-            | AgentControl::Antigravity
-            | AgentControl::Unknown => false,
-        }
+        self.definition().uses_alt_screen(agent_args)
     }
 
     /// Whether this launch will push the **kitty keyboard protocol**,
@@ -498,40 +311,17 @@ impl AgentControl {
     /// keeps reattach exactly as it is today while a wrong push feeds
     /// CSI-u key encodings to a parser that never opted into them.
     pub fn uses_kitty_keyboard(self, term: &str, alt_screen: bool) -> bool {
-        match self {
-            // Probed on 1.0.5: the push is gated purely on `TERM` (it goes
-            // out before any terminal query could answer). The gate itself
-            // lives with the rest of Grok's knowledge.
-            AgentControl::Grok => alt_screen && grok::uses_kitty_keyboard(term),
-            // Codex pushes on the primary screen too, without a TERM gate.
-            AgentControl::Codex => codex::uses_kitty_keyboard(),
-            AgentControl::Claude
-            | AgentControl::Reasonix
-            | AgentControl::Kimi
-            | AgentControl::OpenCode
-            | AgentControl::Pi
-            | AgentControl::Omp
-            | AgentControl::Antigravity
-            | AgentControl::Unknown => false,
-        }
+        self.definition().uses_kitty_keyboard(term, alt_screen)
     }
 
     /// Compose the attach-time recipe from the launcher's recorded decisions.
     /// Input protocols are independent of the screen the agent renders on.
     pub(crate) fn reattach_prime(self, alt_screen: bool, kitty_keyboard: bool) -> ReattachPrime {
-        match self {
-            AgentControl::Codex => codex::reattach_prime(kitty_keyboard),
-            _ => ReattachPrime {
-                alt_screen,
-                input_modes: alt_screen,
-                keyboard_flags: if kitty_keyboard { 3 } else { 0 },
-                ..ReattachPrime::default()
-            },
-        }
+        self.definition().reattach_prime(alt_screen, kitty_keyboard)
     }
 
     /// Everything a backend may structurally lack, in one query — the
-    /// `AgentControl` counterpart to [`crate::terminal::Capabilities`], and the
+    /// `AgentKind` counterpart to [`crate::terminal::Capabilities`], and the
     /// same bargain: a limit the UI has to gate on is a *field* here, not a
     /// special case at the call site.
     ///
@@ -550,43 +340,7 @@ impl AgentControl {
     /// that promises the wrong thing. Declaring a capability is cheap; declaring
     /// one that isn't true is not possible.
     pub fn capabilities(self) -> AgentCapabilities {
-        // Each backend's row in full, so the matrix reads down the page rather
-        // than being assembled from four separate matches.
-        let caps = |fork, worktrees, approval_gate, context_tokens| AgentCapabilities {
-            fork,
-            worktrees,
-            approval_gate,
-            context_tokens,
-        };
-        match self {
-            AgentControl::Claude => caps(true, true, true, true),
-            AgentControl::Codex => caps(true, false, true, true),
-            // No context total: Reasonix persists none we can read, and its own
-            // docs warn that its nearest number reads zero on a rebound session
-            // — a limit of the agent, not a fold nobody has written.
-            AgentControl::Reasonix => caps(true, false, true, false),
-            // No fork flag documented, so `f` hides itself.
-            AgentControl::Kimi => caps(false, false, true, true),
-            // Context total is `signals.json`'s `contextTokensUsed` — the
-            // in-memory billing ledgers still aren't serialized, but this
-            // sidecar is, and it is what `/session-info` shows.
-            AgentControl::Grok => caps(true, true, true, true),
-            AgentControl::OpenCode => caps(true, false, true, true),
-            // The one backend with no approval gate — see
-            // [`AgentCapabilities::approval_gate`].
-            AgentControl::Pi => caps(true, false, false, true),
-            // The one capability row that inverts pi's: omp has a per-tool
-            // approval gate (`tool_approval_requested` / `tool_approval_resolved`),
-            // so `approval_gate` is `true`. Fork via `--fork`, no worktree flag,
-            // and tokens/model come off the hook — the opencode row.
-            AgentControl::Omp => caps(true, false, true, true),
-            // The status-line observer supplies context usage and approval.
-            // The CLI still has no fork/worktree flags.
-            AgentControl::Antigravity => caps(false, false, true, true),
-            // Nothing may be claimed for a backend this build can't drive: it
-            // launches nothing, writes no hook config and fills no column.
-            AgentControl::Unknown => caps(false, false, false, false),
-        }
+        self.definition().capabilities()
     }
 
     /// Every [`HookEvent`] this backend actually subscribes to, read back out of
@@ -618,45 +372,7 @@ impl AgentControl {
     /// session-name files, transcript directories, etc. Missing dirs are
     /// silently skipped by the caller; this just enumerates candidates.
     pub fn watch_paths(self) -> Vec<PathBuf> {
-        match self {
-            AgentControl::Claude => claude::watch_paths(),
-            AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
-            // Nothing: the dashboard derives no Reasonix fact from disk — no
-            // session-name manifest, no title store, no transcript read — so
-            // there is no file whose change could make a row stale.
-            AgentControl::Reasonix => vec![],
-            // Nothing, and for the same reason as Reasonix: no manifest, no
-            // title store (the title rides the hook payload), no transcript
-            // read. There is no file whose change could make a Kimi row stale.
-            AgentControl::Kimi => vec![],
-            // Nothing: title, tokens and model are folded onto the state file
-            // by the launcher (which watches `summary.json` and re-arms after
-            // a `/rename` replace), and the host already watches that state
-            // file.
-            AgentControl::Grok => vec![],
-            // Nothing: every fact an opencode row carries rides the plugin's
-            // events. Its sessions do sit on disk — JSON blobs under
-            // `~/.local/share/opencode/storage/session/` — but nothing here
-            // reads them, and `list_resumable` deliberately goes through
-            // `opencode session list` rather than that internal, twice-migrated
-            // schema. So there is no file whose change could make a row stale.
-            AgentControl::OpenCode => vec![],
-            // Nothing, and for the strongest reason of any backend: every fact
-            // a Pi row carries — status, title, tokens, model — rides a hook
-            // payload, and nothing of ours reads a Pi file at all. There is no
-            // file whose change could make a Pi row stale.
-            AgentControl::Pi => vec![],
-            // Auto-titles and renames land in SQLite, independently of hooks.
-            AgentControl::Antigravity => antigravity::title_watch_paths(),
-            // Nothing, and for the strongest reason of any backend, the same as
-            // pi's: every fact an omp row carries — status, title, tokens,
-            // model — rides a hook payload. `list_resumable` does read omp's
-            // session heads, but only when the resume picker opens, and that is
-            // no row's fact and not a watch, so no file here can make a row
-            // stale.
-            AgentControl::Omp => vec![],
-            AgentControl::Unknown => vec![],
-        }
+        self.definition().watch_paths()
     }
 
     /// Paths outside the launcher's own `sessions/` dir whose changes must still
@@ -672,160 +388,25 @@ impl AgentControl {
     /// is folded onto the state file by the launcher first, so watching it
     /// server-side would only wake subscribers with nothing new to push.
     pub fn out_of_band_watch_paths(self) -> Vec<PathBuf> {
-        match self {
-            // Nothing: names arrive via `session_name`/`session_watch_path` and
-            // stats via the transcript, both folded onto the state file by the
-            // launcher — which is a `sessions/` write the host already watches.
-            AgentControl::Claude => vec![],
-            // `state_5.sqlite`'s WAL. A `/rename` or auto-title lands there alone
-            // — no hook, rollout line, or state-file write — so this wake is the
-            // only thing that gets a rename onto the wire.
-            AgentControl::Codex => codex::title_watch_path().into_iter().collect(),
-            // Nothing, and for a stronger reason than Claude's: every fact a
-            // Reasonix row carries arrives over a hook and is written to the
-            // state file, which the host already watches. There is no store we
-            // read out of band, so a wake here could only ever re-diff rows that
-            // hadn't changed. If a rename or a token count is ever read from the
-            // session sidecars, that sidecar dir belongs here.
-            AgentControl::Reasonix => vec![],
-            // Nothing, and this is the arm `session_title` was added for: Kimi's
-            // rename arrives on the *next hook payload*, which the launcher
-            // folds onto the state file — a `sessions/` write the host already
-            // watches. Codex needs an entry here only because its rename lands
-            // in sqlite with no hook at all.
-            AgentControl::Kimi => vec![],
-            // Nothing: a `/rename` rewrites `summary.json` with no hook, but
-            // the launcher watches that file (and re-arms after each replace)
-            // and folds the title onto the state file — a `sessions/` write
-            // the host already watches. Codex needs an entry here only because
-            // its rename lands in sqlite with no launcher fold at all.
-            AgentControl::Grok => vec![],
-            // Nothing, and now for Kimi's reason rather than for want of a
-            // title: `session.updated` carries `info.title`, so a rename arrives
-            // on a hook the launcher folds onto the state file — a `sessions/`
-            // write the host already watches. Codex needs an entry here only
-            // because its rename lands in sqlite with no hook at all.
-            AgentControl::OpenCode => vec![],
-            // Nothing: the title is the only fact that would want an entry
-            // here, and it arrives on the *next hook payload* — a `sessions/`
-            // write the host already watches. Codex needs one only because its
-            // rename lands in sqlite with no hook at all.
-            AgentControl::Pi => vec![],
-            // The host overlays SQLite titles before serving local/remote rows.
-            AgentControl::Antigravity => antigravity::title_watch_paths(),
-            // Nothing, for pi's reason: the title arrives on the *next hook
-            // payload* — a `sessions/` write the host already watches. Codex
-            // needs an entry here only because its rename lands in sqlite with
-            // no hook at all.
-            AgentControl::Omp => vec![],
-            AgentControl::Unknown => vec![],
-        }
+        self.definition().out_of_band_watch_paths()
     }
 
     /// Refresh per-pid name and session-id maps from the agent's on-disk
     /// session-name store. The cache lets repeated reloads skip files whose
     /// mtime is unchanged.
     pub fn read_session_index(self, cache: &mut SessionIndexCache) -> SessionIndex {
-        match self {
-            AgentControl::Claude => claude::read_session_index(cache),
-            // Codex titles come from the host's SQLite overlay, not a per-pid index.
-            AgentControl::Codex => SessionIndex::default(),
-            // No per-pid manifest to scan: a Reasonix session's id arrives on
-            // every hook payload, which is what this index is a fallback for.
-            AgentControl::Reasonix => SessionIndex::default(),
-            // No per-pid manifest: a Kimi session's id (and name) arrive on
-            // every hook payload, which is what this index is a fallback for.
-            AgentControl::Kimi => SessionIndex::default(),
-            // Same as Reasonix: no per-pid manifest exists, and a Grok session's
-            // id arrives on every hook payload — which is what this index is a
-            // fallback for.
-            AgentControl::Grok => SessionIndex::default(),
-            // No per-pid manifest: an opencode session's id arrives on
-            // `session.created` and on every direct hook (`agents::opencode`),
-            // which is what this index is a fallback for.
-            AgentControl::OpenCode => SessionIndex::default(),
-            // No per-pid manifest: a Pi session's id (and name) arrive on every
-            // hook payload, which is what this index is a fallback for.
-            AgentControl::Pi => SessionIndex::default(),
-            // No per-pid manifest. Identity arrives through SessionStart and
-            // status snapshots; a fresh empty TUI has no conversation yet.
-            AgentControl::Antigravity => SessionIndex::default(),
-            // No per-pid manifest, for pi's reason: an omp session's id (and
-            // name) arrive on every hook payload, which is what this index is a
-            // fallback for.
-            AgentControl::Omp => SessionIndex::default(),
-            AgentControl::Unknown => SessionIndex::default(),
-        }
+        self.definition().read_session_index(cache)
     }
 
-    /// Transcript-derived per-session facts in one pass: context-token total,
-    /// model id, custom title (`/rename`), and first-prompt auto-title. `prior`
-    /// is the previously folded value for this session, if any: Claude folds only
-    /// the transcript bytes appended since `prior`'s cursor (so an active session
-    /// isn't rescanned end-to-end), while Codex recomputes stats from a bounded
-    /// tail but reuses `prior`'s first prompt once found. Antigravity seeds its
-    /// prompts from the log's head and tail, then reads appends. The launcher
-    /// stamps the fields onto the session's state file, so the dashboard never
-    /// reads a transcript itself. Fields are None before the first relevant entry
-    /// (no assistant turn → no `context_tokens`/`model`; no rename → no `name`).
+    /// One-shot transcript facts. Stateful tasks use agent-owned readers, which
+    /// retain their cursors privately. `prior` lets stateless readers reuse
+    /// facts such as a previously discovered first prompt.
     pub fn read_transcript_stats(
         self,
         transcript: &Path,
         prior: Option<&TranscriptStats>,
     ) -> TranscriptStats {
-        match self {
-            AgentControl::Claude => claude::read_transcript_stats_incremental(transcript, prior),
-            AgentControl::Codex => codex::read_transcript_stats(transcript, prior),
-            // Unreachable rather than unimplemented: this runs only on a path a
-            // hook payload supplied, and Reasonix's carries none. The sidecar
-            // schema that once blocked this is settled — `list_resumable` reads
-            // `<session>.jsonl.meta` for the title and cwd — but the sidecar
-            // holds no token total, and `AgentCapabilities::context_tokens` is
-            // `false` for this backend because the agent persists none: its own
-            // docs warn that the nearest number reads zero on a rebound session.
-            // So there is nothing here left to fold, not merely nothing folded.
-            AgentControl::Reasonix => TranscriptStats::default(),
-            // Kimi's payload names no transcript, so `agents::kimi` resolves
-            // one from the session id and puts it on the message — which is
-            // what makes this arm reachable at all. `prior` is unused: the
-            // cursor is Claude's, and this is a whole-file read of a log of
-            // small records.
-            AgentControl::Kimi => kimi::read_transcript_stats(transcript),
-            // Reachable because the envelope names `transcriptPath`; the fold
-            // reads sibling `signals.json` / `summary.json` rather than the ACP
-            // stream. `prior` is unused: both files are small whole-JSON
-            // documents, not an appended log a byte cursor could follow.
-            AgentControl::Grok => grok::read_transcript_stats(transcript),
-            // Unreachable **and settled**, which is the difference between this
-            // arm and Reasonix's: opencode reports its tokens and model on the
-            // hook itself. `message.updated` carries an `AssistantMessage` whose
-            // `tokens` and `modelID` the plugin forwards once the message
-            // completes, so `common::adopt_session_facts` stamps both onto the
-            // row and this fold has nothing left to do. Nor could it do it — the
-            // sessions are per-message JSON blobs under `storage/`, not an
-            // appended file a byte cursor could follow — and `adopt_session_facts`
-            // is explicit that one fact gets one source.
-            AgentControl::OpenCode => TranscriptStats::default(),
-            // Unreachable, and the only one of these arms that is a *decision*
-            // rather than a missing schema. Pi's JSONL is fully documented and
-            // its path is exported as `PI_SESSION_FILE`, so this fold could be
-            // written — but the file is a **tree**, not a log (`id`/`parentId`
-            // with an active leaf), so a correct fold has to walk back from the
-            // active leaf rather than tail the last append. The tokens and model
-            // come off the hook instead, and `agents::pi` supplies no transcript
-            // path, which is what makes this consistent rather than merely
-            // unimplemented: one fact, one source.
-            AgentControl::Pi => TranscriptStats::default(),
-            // Only prompts: usage/model still come from status snapshots.
-            AgentControl::Antigravity => antigravity::read_transcript_stats(transcript, prior),
-            // Unreachable, for pi's decision rather than his schema: omp's
-            // session file is a tree, not a log (the same `id`/`parentId` shape
-            // pi's docs describe), so a correct fold would walk back from the
-            // active leaf. The tokens and model come off the hook instead, and
-            // `agents::omp` supplies no transcript path — one fact, one source.
-            AgentControl::Omp => TranscriptStats::default(),
-            AgentControl::Unknown => TranscriptStats::default(),
-        }
+        self.definition().read_transcript_stats(transcript, prior)
     }
 
     // =============================================================================
@@ -844,33 +425,8 @@ impl AgentControl {
         limit: usize,
         cache: &mut crate::resume::AgentCache,
     ) -> Result<Vec<ResumeCandidate>> {
-        match self {
-            AgentControl::Claude => claude::list_resumable_cached(limit, cache),
-            AgentControl::Codex => codex::list_resumable_cached(limit, cache),
-            // Read off disk rather than through Reasonix's own
-            // `reasonix session list --json`, which is documented as *redacted*:
-            // it deliberately exposes no transcript, label, path or host
-            // content — none of the cwd, title or first prompt a candidate is
-            // made of. The `.jsonl.meta` sidecars carry all three.
-            AgentControl::Reasonix => reasonix::list_resumable_cached(limit, cache),
-            AgentControl::Kimi => kimi::list_resumable_cached(limit, cache),
-            AgentControl::Grok => grok::list_resumable_cached(limit, cache),
-            AgentControl::OpenCode => opencode::list_resumable(limit),
-            // Picker metadata is session-wide; it needs no active-branch walk.
-            AgentControl::Pi => pi::list_resumable_cached(limit, cache),
-            AgentControl::Antigravity => antigravity::list_resumable_cached(limit, cache),
-            // Read off disk the way the other file-backed backends are: every
-            // field a candidate needs sits in the head of
-            // `~/.omp/agent/sessions/<sanitized-cwd>/<timestamp>_<uuid>.jsonl`
-            // (overridable by `PI_CODING_AGENT_DIR`, and per-profile under
-            // `~/.omp/profiles/<name>/agent`) — the `session` header's id and
-            // cwd, the pad-rewritten `title` record, and the first `user`
-            // message — so no `parentId` walk is needed. That walk stays where
-            // it belongs: `read_transcript_stats`, whose fold really does need
-            // the active leaf.
-            AgentControl::Omp => omp::list_resumable_cached(limit, cache),
-            AgentControl::Unknown => Ok(vec![]),
-        }
+        self.configure(&crate::config::AgentConfig::load())?
+            .list_resumable(limit, cache)
     }
 
     // -- Launcher-side: process launch, hooks, transcript signals --
@@ -893,131 +449,26 @@ impl AgentControl {
         extra_args: &[String],
         shim_dir: Option<&Path>,
     ) -> Result<Command> {
-        match self {
-            AgentControl::Claude => {
-                claude::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Codex => {
-                codex::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Reasonix => {
-                reasonix::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Kimi => {
-                kimi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Grok => {
-                grok::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::OpenCode => {
-                opencode::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Pi => {
-                pi::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Omp => {
-                omp::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-            }
-            AgentControl::Antigravity => antigravity::build_launch_command(
-                cwd,
-                sock_path,
-                settings_path,
-                extra_args,
-                shim_dir,
-            ),
-            // One of the two places `Unknown` must be loud: there is no argv to
-            // guess, and guessing Claude's would run the wrong agent in the
-            // user's cwd. The other is `LocalBackend::open_session`, which
-            // builds an argv without coming through here.
-            AgentControl::Unknown => Err(anyhow!(UNKNOWN_AGENT_REFUSAL)),
-        }
+        self.definition()
+            .build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
     }
 
     /// JSON contents of the per-session hook-settings file the launcher
     /// drops on disk before spawning the agent. The file location is
     /// agent-specific and chosen by `build_launch_command`.
     pub fn hooks_settings_json(self, sock_path: &str) -> String {
-        match self {
-            AgentControl::Claude => claude::build_hooks_settings(sock_path),
-            AgentControl::Codex => codex::build_hooks_settings(sock_path),
-            AgentControl::Reasonix => reasonix::build_hooks_settings(sock_path),
-            // TOML, not JSON, despite the method name and the `-settings.json`
-            // file the launcher writes it to: Kimi's hooks live in its
-            // `config.toml`. The path is generic transport and the contents are
-            // opaque to the launcher, so each backend puts its own format
-            // through it.
-            AgentControl::Kimi => kimi::build_hooks_settings(sock_path),
-            AgentControl::Grok => grok::build_hooks_settings(sock_path),
-            // **JavaScript**, not JSON — the furthest this method's name has
-            // been stretched, and the seam holds: opencode has no shell-command
-            // hooks at all, so its event surface is a plugin *module*, which
-            // `build_launch_command` drops into a synthetic `plugins/` dir. The
-            // path is generic transport and the contents are opaque to the
-            // launcher, which is what lets each backend put its own format
-            // through it.
-            AgentControl::OpenCode => opencode::build_hooks_settings(sock_path),
-            // **TypeScript**, not JSON — Pi has no shell-command hooks at all,
-            // so what the launcher writes here is the extension module `pi -e`
-            // loads. Same argument as Kimi's TOML: the path is generic
-            // transport, the contents are opaque to the launcher, and each
-            // backend puts its own format through it.
-            AgentControl::Pi => pi::build_hooks_settings(sock_path),
-            // **TypeScript**, not JSON — omp has no shell-command hooks at all,
-            // so what the launcher writes here is the extension module `omp -e`
-            // loads. Same argument as Kimi's TOML and pi's TypeScript: the path
-            // is generic transport, the contents are opaque to the launcher, and
-            // each backend puts its own format through it.
-            AgentControl::Omp => omp::build_hooks_settings(sock_path),
-            AgentControl::Antigravity => antigravity::build_hooks_settings(sock_path),
-            AgentControl::Unknown => String::new(),
-        }
+        self.definition().hooks_settings_json(sock_path)
     }
 
-    /// Apply a hook event to the launcher state. Encapsulates per-agent
-    /// status mapping (`PreToolUse` → `Active`, `PreCompact` → `Compacting`,
-    /// etc.).
-    ///
-    /// **Synchronous, and the seam keeps it that way.** Every backend maps a
-    /// parsed message onto `state` and nothing else; none reads a file or waits
-    /// on a socket. That matters at the call site rather than here — the
-    /// dispatch sits inside `process_hooks`' `select!`, where whether a
-    /// suspension point exists decides whether `state` can change underneath
-    /// the surrounding code. It cannot, and the signature is what says so. A
-    /// backend that genuinely needs to await belongs behind its own async
-    /// method, not by making this one async for the other eight.
-    pub fn dispatch_hook(self, state: &mut LauncherState, msg: HookMessage) {
-        match self {
-            AgentControl::Claude => claude::dispatch_hook(state, msg),
-            AgentControl::Codex => codex::dispatch_hook(state, msg),
-            AgentControl::Reasonix => reasonix::dispatch_hook(state, msg),
-            AgentControl::Kimi => kimi::dispatch_hook(state, msg),
-            AgentControl::Grok => grok::dispatch_hook(state, msg),
-            AgentControl::OpenCode => opencode::dispatch_hook(state, msg),
-            AgentControl::Pi => pi::dispatch_hook(state, msg),
-            AgentControl::Antigravity => antigravity::dispatch_hook(state, msg),
-            AgentControl::Omp => omp::dispatch_hook(state, msg),
-            AgentControl::Unknown => {}
-        }
+    /// Construct independent hook state; observation starts only in the running task.
+    pub(crate) fn hook_session(self) -> Box<dyn crate::agents::hook_session::HookSession> {
+        self.definition().hook_session()
     }
 
     /// Parse the agent's stdin JSON hook payload into a normalized
     /// `HookMessage`. Used by the `miao hook` subcommand.
     pub fn parse_hook_payload(self, event: HookEvent, stdin: &str) -> Result<HookMessage> {
-        match self {
-            AgentControl::Claude => claude::parse_hook_payload(event, stdin),
-            AgentControl::Codex => codex::parse_hook_payload(event, stdin),
-            AgentControl::Reasonix => reasonix::parse_hook_payload(event, stdin),
-            AgentControl::Kimi => kimi::parse_hook_payload(event, stdin),
-            AgentControl::Grok => grok::parse_hook_payload(event, stdin),
-            AgentControl::OpenCode => opencode::parse_hook_payload(event, stdin),
-            AgentControl::Pi => pi::parse_hook_payload(event, stdin),
-            AgentControl::Antigravity => antigravity::parse_hook_payload(event, stdin),
-            AgentControl::Omp => omp::parse_hook_payload(event, stdin),
-            AgentControl::Unknown => Err(anyhow!(
-                "unknown agent backend (this hook came from a newer \
-                 captain-miao); upgrade captain-miao to handle it"
-            )),
-        }
+        self.definition().parse_hook_payload(event, stdin)
     }
 
     // =============================================================================
@@ -1031,32 +482,16 @@ impl AgentControl {
     /// Asked at the moment the launcher would park a row, which is what keeps
     /// this event-driven: nothing is watched, nothing is timed, the one backend
     /// that can answer `true` reads its own store (see
-    /// [`codex::thread_self_continues`]) and every other one answers from the
+    /// [`crate::agents::codex::thread_self_continues`]) and every other one answers from the
     /// shape of its turn model.
     pub fn self_continues(self, session_id: &str) -> bool {
-        match self {
-            AgentControl::Codex => codex::thread_self_continues(session_id),
-            // Everything else: a turn ends at the user's next move. None of
-            // these backends carries a standing objective that re-drives the
-            // thread after its turn ends, so there is no store to ask and no
-            // hookless turn to miss — a Stop here is rest, full stop. A backend
-            // that grows one lands in this match and has to say so.
-            AgentControl::Claude
-            | AgentControl::Reasonix
-            | AgentControl::Kimi
-            | AgentControl::Grok
-            | AgentControl::OpenCode
-            | AgentControl::Pi
-            | AgentControl::Antigravity
-            | AgentControl::Omp
-            | AgentControl::Unknown => false,
-        }
+        self.definition().self_continues(session_id)
     }
 
     /// Whether *any* session of this backend can self-continue — the question
     /// [`Self::self_continues`] answers about one session, asked of the backend.
-    /// The two matches are the same shape on purpose and have to agree: this one
-    /// is `true` exactly where that one has a store to ask.
+    /// The agent declares this alongside its continuation reader: this is true
+    /// exactly where that reader has a store to ask.
     ///
     /// The launcher needs the backend-level answer because a `Stop` that leaves a
     /// row **busy** no longer means one thing. Codex's is a *bet*: its goal store
@@ -1074,71 +509,14 @@ impl AgentControl {
     /// and asking [`Self::self_continues`] that early is exactly the stale read the
     /// confirmation exists to correct.
     pub fn may_self_continue(self) -> bool {
-        match self {
-            AgentControl::Codex => true,
-            AgentControl::Claude
-            | AgentControl::Reasonix
-            | AgentControl::Kimi
-            | AgentControl::Grok
-            | AgentControl::OpenCode
-            | AgentControl::Pi
-            | AgentControl::Antigravity
-            | AgentControl::Omp
-            | AgentControl::Unknown => false,
-        }
+        self.definition().may_self_continue()
     }
 
     /// Scan new bytes of the transcript starting at `offset` for signals the
     /// launcher cares about (interrupt detection). Backends that don't expose
     /// such signals return an empty scan.
     pub fn scan_transcript_signals(self, path: &Path, offset: u64) -> TranscriptScan {
-        match self {
-            AgentControl::Claude => claude::scan_transcript_signals(path, offset),
-            AgentControl::Codex => codex::scan_transcript_signals(path, offset),
-            // Empty because Reasonix needs no sentinel, not because none was
-            // found: an interrupt is a payload field (`isInterrupt`) on a real
-            // hook, so the case that forced Codex to read its rollout — Esc
-            // firing nothing — cannot arise here.
-            AgentControl::Reasonix => TranscriptScan::default(),
-            // Empty for the strongest reason of any backend: `Interrupt` is a
-            // first-class Kimi hook, so the exact case that forced Codex to read
-            // its rollout — Esc firing nothing — cannot arise. Nothing is
-            // missing here, and nothing would be gained by adding it.
-            AgentControl::Kimi => TranscriptScan::default(),
-            // Empty for Kimi's reason: `StopCancelled` is a first-class observe
-            // hook (1.0.4), so the case that forced Codex to read its rollout —
-            // Esc firing nothing — cannot arise. Nothing would be gained by
-            // scanning `updates.jsonl` for a sentinel as well.
-            AgentControl::Grok => TranscriptScan::default(),
-            // Empty because there is no transcript to scan: opencode's sessions
-            // are per-message JSON blobs under `storage/`, and no hook payload
-            // names a path regardless. Whether a sentinel is even *wanted* is
-            // still unsettled — the plugin takes its turn-end from
-            // `session.status`'s `idle` edge, and nothing source-read says
-            // whether an Esc-interrupted turn reaches it. If it doesn't, this
-            // backend inherits a stranded-`Active` row with nothing of the
-            // agent's to read instead; that is on the probe list in
-            // `agents::opencode`.
-            AgentControl::OpenCode => TranscriptScan::default(),
-            // Empty because Pi needs no sentinel, not because none was found —
-            // the same standing as Reasonix's and Kimi's, reached differently.
-            // Neither carries an interrupt *flag*; Pi instead has a turn-end
-            // event that fires once the run will not continue at all
-            // (`agent_settled`), and a cancelled run is exactly that. So the
-            // case that forced Codex to read its rollout cannot arise. Pi's
-            // transcript is read only for the resume picker, never live status.
-            AgentControl::Pi => TranscriptScan::default(),
-            // Status snapshots handle cancellation and consult the log for
-            // compaction, so no separate interrupt scan is needed.
-            AgentControl::Antigravity => TranscriptScan::default(),
-            // Empty, for pi's reason reached via `agent_end`: omp's turn-end
-            // event fires on an abort too (`stopReason === "aborted"` calls the
-            // same emitter), so the case that forced Codex to read its rollout —
-            // Esc firing nothing — cannot arise. No transcript of omp's is read
-            // for any purpose (`agents::omp` names none).
-            AgentControl::Omp => TranscriptScan::default(),
-            AgentControl::Unknown => TranscriptScan::default(),
-        }
+        self.definition().scan_transcript_signals(path, offset)
     }
 
     /// The agent's own report of what process `agent_pid` is doing, read from
@@ -1148,40 +526,7 @@ impl AgentControl {
     /// can't be determined (caller leaves the status unchanged). Backends without
     /// a status file return `None`.
     pub fn agent_activity(self, agent_pid: u32) -> Option<AgentActivity> {
-        match self {
-            AgentControl::Claude => claude::session_activity(agent_pid),
-            // Codex uses hook and turn events rather than a session-status file.
-            AgentControl::Codex => None,
-            // No status file, so no second opinion on the working/idle axis —
-            // Reasonix's transitions ride hooks alone, interrupts included.
-            AgentControl::Reasonix => None,
-            // No status file, and none needed: the interrupt that this exists to
-            // catch for Claude arrives as a hook. Kimi's transitions ride hooks
-            // alone, with no second opinion to reconcile against.
-            AgentControl::Kimi => None,
-            // No status file, so no second opinion on the working/idle axis. It
-            // is the interrupt case above that would have wanted one.
-            AgentControl::Grok => None,
-            // No status file, and none wanted: `session.status` is the second
-            // opinion this would have been, and it drives the row *directly* the
-            // way Claude's session file does. The plugin forwards only its
-            // `idle` edge — `busy` is coarser than our vocabulary and would knock
-            // a row out of `WaitingForApproval` — so the signal arrives as a
-            // `Stop`, not as an activity read.
-            AgentControl::OpenCode => None,
-            // No status file, and none needed: the interrupt this exists to
-            // catch for Claude is covered by `agent_settled`, which fires when
-            // Pi will not continue running — a cancelled run included.
-            AgentControl::Pi => None,
-            // The status-line observer reports idle after cancellation;
-            // there is no separate status file to poll.
-            AgentControl::Antigravity => None,
-            // No status file, and none needed: the interrupt this exists to
-            // catch for Claude is covered by `agent_end`, which fires on an
-            // aborted run too — pi's reason, reached via omp's emitter.
-            AgentControl::Omp => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().agent_activity(agent_pid)
     }
 
     /// The *user-set* display name from the agent's own session file — Claude
@@ -1193,71 +538,14 @@ impl AgentControl {
     /// file (Codex — its sqlite title is overlaid per-host by
     /// [`crate::backend::LocalBackend`]).
     pub fn session_name(self, agent_pid: u32) -> Option<String> {
-        match self {
-            AgentControl::Claude => claude::read_session_name(agent_pid),
-            AgentControl::Codex => None,
-            // Reasonix titles exist and are now read — `list_resumable` takes
-            // `custom_title` off the `.jsonl.meta` sidecar — but they are keyed
-            // by session id, not by pid, so there is no per-pid file for *this*
-            // method to open. The picker is where they surface; a running row
-            // takes its name from the first prompt like every other backend
-            // without a rename hook.
-            AgentControl::Reasonix => None,
-            // `None` because there is nothing left to read, not because Kimi has
-            // no name: `session_title` rides every hook payload and is already
-            // on `LauncherState.name` by the time this would be asked. That is
-            // what makes this the one backend needing neither a session-file
-            // fold (Claude) nor a sqlite overlay (Codex).
-            AgentControl::Kimi => None,
-            // `None` because there is nothing left to read here: `summary.json`'s
-            // `generated_title` is folded onto `LauncherState.name` by the
-            // transcript watch and by the hook's `session_title` (and by
-            // `list_resumable` for the picker). No per-pid file exists for this
-            // method to open.
-            AgentControl::Grok => None,
-            // `None` because there is nothing left to read, not because
-            // opencode has no name: `session.updated` carries `info.title`, the
-            // plugin forwards it, and it is already on `LauncherState.name` by
-            // the time this would be asked. The Kimi standing, reached from a
-            // bus event rather than a documented hook field.
-            AgentControl::OpenCode => None,
-            // `None` because there is nothing left to read, not because Pi has
-            // no name: `pi.getSessionName()` rides every hook payload as
-            // `session_title` and is already on `LauncherState.name` by the time
-            // this would be asked — the Kimi standing, reached from an
-            // extension call rather than a documented payload field.
-            AgentControl::Pi => None,
-            // Titles are keyed by conversation id, overlaid by the host's
-            // shared SQLite cache rather than a per-pid session file.
-            AgentControl::Antigravity => None,
-            // `None` for pi's reason: `pi.getSessionName()` rides every hook
-            // payload as `session_title` and is already on `LauncherState.name`
-            // by the time this would be asked — the Kimi standing, reached from
-            // the same extension call pi uses.
-            AgentControl::Omp => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().session_name(agent_pid)
     }
 
     /// File whose changes the launcher should watch to learn about
     /// working↔idle↔background-shell transitions (these fire no hook). For Claude
     /// this is its session-status file; `None` for backends without one.
     pub fn session_watch_path(self, agent_pid: u32) -> Option<PathBuf> {
-        match self {
-            AgentControl::Claude => claude::session_file_path(agent_pid),
-            AgentControl::Codex => None,
-            AgentControl::Reasonix => None,
-            // No status file to watch — see `agent_activity`.
-            AgentControl::Kimi => None,
-            AgentControl::Grok => None,
-            AgentControl::OpenCode => None,
-            // No status file to watch — see `agent_activity`.
-            AgentControl::Pi => None,
-            AgentControl::Antigravity => None,
-            // No status file to watch — see `agent_activity`.
-            AgentControl::Omp => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().session_watch_path(agent_pid)
     }
 
     /// Whether a watched transcript write can clear a pending approval after
@@ -1266,16 +554,14 @@ impl AgentControl {
     /// permission wait (for example, a background memory flush). Its hooks
     /// must release the wait. Other backends do not watch a transcript.
     pub(crate) fn transcript_write_clears_approval(self) -> bool {
-        // Kimi reports PermissionResult explicitly; unrelated wire metadata
-        // must not dismiss its approval prompt.
-        matches!(self, Self::Claude | Self::Codex)
+        self.definition().transcript_write_clears_approval()
     }
 
     /// Catch up persisted facts before dispatching a hook. Kimi and Antigravity
     /// report lifecycle changes themselves, so their metadata needs no timer.
     /// Codex's macOS poll also catches up here to preserve hook/rollout order.
     pub(crate) fn refresh_transcript_on_hook(self) -> bool {
-        matches!(self, Self::Kimi | Self::Antigravity) || self.transcript_poll_interval().is_some()
+        self.definition().refresh_transcript_on_hook()
     }
 
     /// `Some(interval)` when the launcher's transcript watch must be a
@@ -1308,46 +594,7 @@ impl AgentControl {
     /// bytes — so the assumption is a latency optimization, not a correctness
     /// requirement.
     pub fn transcript_poll_interval(self) -> Option<Duration> {
-        match self {
-            AgentControl::Claude => None,
-            AgentControl::Codex if cfg!(target_os = "macos") => Some(Duration::from_secs(2)),
-            AgentControl::Codex => None,
-            // Moot: no hook payload names a transcript, so no watch of either
-            // kind is ever started for a Reasonix session.
-            AgentControl::Reasonix => None,
-            // Interrupt and PermissionResult are hooks; metadata catches up
-            // on those hooks even when filesystem events miss a held-open log.
-            AgentControl::Kimi => None,
-            // Event-driven, and must stay that way: we watch sibling
-            // `summary.json` (resolved from `transcriptPath` or the session
-            // id) and, once it exists, sibling `signals.json`. Grok replaces
-            // both whole, so the launcher re-arms those file watches after
-            // each wake (`transcript_path_is_replaced`) rather than polling
-            // or watching the session directory — `updates.jsonl` in that
-            // directory is the long-held-fd append stream we deliberately
-            // don't follow. The fold reads a bounded tail of it
-            // (`grok::last_compaction`), which is not a watch: it runs on a
-            // wake one of those two sidecars already delivered.
-            AgentControl::Grok => None,
-            // Moot, and structurally so rather than merely for now: opencode
-            // keeps each message as its own JSON blob under `storage/`, so there
-            // is no appended transcript for either kind of watch to follow,
-            // whatever a payload might one day name.
-            AgentControl::OpenCode => None,
-            // Moot, and permanently so rather than pending like the other three:
-            // `agents::pi` supplies no transcript path *by decision*, not for
-            // want of one, so the launcher starts no watch of either kind for a
-            // Pi session and there is no poll for this to configure.
-            AgentControl::Pi => None,
-            // Hooks/status snapshots cover lifecycle changes; persisted prompt
-            // facts catch up on hooks without a foreground transcript timer.
-            AgentControl::Antigravity => None,
-            // Moot, and by the same decision as pi's: `agents::omp` supplies no
-            // transcript path, so the launcher starts no watch of either kind
-            // for an omp session and there is no poll for this to configure.
-            AgentControl::Omp => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().transcript_poll_interval()
     }
 
     /// True when the watched transcript path is replaced (new inode) rather
@@ -1357,7 +604,7 @@ impl AgentControl {
     /// that one file — never the parent directory, where a chatty sibling
     /// (Grok's `updates.jsonl`) would keep the loop spinning.
     pub fn transcript_path_is_replaced(self) -> bool {
-        matches!(self, AgentControl::Grok)
+        self.definition().transcript_path_is_replaced()
     }
 
     /// Extra files rewritten the same way as the watched transcript path —
@@ -1366,71 +613,18 @@ impl AgentControl {
     /// the session directory (`updates.jsonl` lives there). Empty for every
     /// other backend.
     pub fn replaced_sidecar_paths(self, transcript: &Path) -> Vec<PathBuf> {
-        match self {
-            AgentControl::Grok => {
-                let dir = transcript.parent().unwrap_or(transcript);
-                vec![dir.join("signals.json")]
-            }
-            _ => vec![],
-        }
+        self.definition().replaced_sidecar_paths(transcript)
     }
 
     /// Live background commands. `None` means unavailable; an empty list is
     /// positive evidence that no shell remains. Only read after a turn ends.
     pub fn bg_shells(self, agent_pid: u32) -> Option<Vec<BgShell>> {
-        match self {
-            AgentControl::Claude => claude::bg_shells(agent_pid),
-            AgentControl::Codex => None,
-            // Reasonix *does* have real background tasks — and deliberately
-            // fires no `SubagentStop` for them — but the only view of them is a
-            // subprocess (`reasonix task list --json`) over a cache the docs call
-            // a projection, not a process tree we can walk. Until that is worth a
-            // spawn per refresh, a `Stop` while a background task runs means "the
-            // foreground turn ended" and the row reads Idle.
-            AgentControl::Reasonix => None,
-            // Kimi has subagents (`SubagentStart` / `SubagentStop`) and tasks
-            // (`TaskStarted`), but neither is a `run_in_background` shell in a
-            // process tree we can walk, and no documented payload enumerates
-            // them the way Grok's `Stop` does. So a `Stop` while something else
-            // is still running means "the foreground turn ended" and the row
-            // reads Idle.
-            AgentControl::Kimi => None,
-            // The live list is applied at Stop in `grok::dispatch_hook` rather
-            // than here: Grok names its background work on the payload itself
-            // (`backgroundTasks` / `sessionCrons`), which a pid-only tree walk
-            // would miss (monitors, subagents, `/loop` crons) and would disagree
-            // with the agent that just decided the turn is over. A `Stop` with
-            // in-flight work therefore lands on `Task`
-            // without this method ever seeing the pid.
-            AgentControl::Grok => None,
-            // No background-shell concept in anything design §9 names, so a
-            // `session.idle` while something else is still running means "the
-            // foreground turn ended" and the row reads `Idle` — never
-            // a background-task state.
-            AgentControl::OpenCode => None,
-            // Pi has no background-shell concept in its event surface at all —
-            // no `run_in_background` tool, no background-task list on any
-            // payload — so a `Stop` is simply the end of the work, and the row
-            // never reaches `BackgroundActive`.
-            AgentControl::Pi => None,
-            // Antigravity's launcher-owned task monitor reads commands and
-            // timers from its conversation database, including completion
-            // while the foreground is idle. No process-tree scan is needed.
-            AgentControl::Antigravity => None,
-            // The live list is applied at Stop in `omp::dispatch_hook` rather
-            // than here: the extension reads omp's in-process async jobs
-            // (`ctx.getAsyncJobSnapshot()`) and rides them on the `agent_end`
-            // payload, so the answer already arrives with the turn end. A
-            // pid-only tree walk is not the source and would disagree with the
-            // agent that just decided the turn is over — Grok's reason.
-            AgentControl::Omp => None,
-            AgentControl::Unknown => None,
-        }
+        self.definition().bg_shells(agent_pid)
     }
 }
 
 /// What a backend structurally cannot do, queried in one place via
-/// [`AgentControl::capabilities`]. Constants or derivations per backend — no IO.
+/// [`AgentKind::capabilities`]. Constants or derivations per backend — no IO.
 ///
 /// **Only structural limits belong here.** A field means *the agent has no
 /// mechanism for this at all*, never *we haven't wired it up yet*: the
@@ -1442,16 +636,16 @@ impl AgentControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentCapabilities {
     /// A resume can **branch** rather than continue the session in place, so `f`
-    /// has something to offer. Derived from [`AgentControl::resume_args`] —
+    /// has something to offer. Derived from [`AgentKind::resume_args`] —
     /// Kimi documents no fork flag, so its two argvs come out equal.
     pub fork: bool,
     /// The agent can launch itself into an isolated git worktree, so `Ctrl-g` in
     /// the workdir picker has something to arm. Derived from
-    /// [`AgentControl::worktree_args`]; Claude and Grok are the two that can.
+    /// [`AgentKind::worktree_args`]; Claude and Grok are the two that can.
     pub worktrees: bool,
     /// The agent has a per-tool approval prompt it tells us about, so a row can
     /// reach [`crate::state::SessionStatus::WaitingForApproval`] and `s` can
-    /// stop on it. Derived from [`AgentControl::forwarded_events`].
+    /// stop on it. Derived from [`AgentKind::forwarded_events`].
     ///
     /// **Pi is the one backend that answers `false`**, and it is not for want of
     /// a hook to subscribe to: `security.md` states it ships no sandbox and runs
@@ -1462,7 +656,7 @@ pub struct AgentCapabilities {
     pub approval_gate: bool,
     /// A context-token total reaches the row at all, so an empty Context field
     /// means "not yet" rather than "not ever". Reasonix answers `false`;
-    /// see [`AgentControl::capabilities`] for why that is the agent's limit
+    /// see [`AgentKind::capabilities`] for why that is the agent's limit
     /// rather than ours.
     pub context_tokens: bool,
 }
@@ -1540,7 +734,7 @@ pub struct SessionIndex {
     /// can be gated on the row's own backend — a dead Claude session's pid can
     /// be reused by an unrelated Codex child, and without this the recycled pid
     /// would surface the stale Claude name on the Codex row.
-    pub by_pid_owner: HashMap<u32, AgentControl>,
+    pub by_pid_owner: HashMap<u32, AgentKind>,
     /// Map session id → display name (a Claude `/rename` from its session-file
     /// manifest).
     pub by_session_id: HashMap<String, String>,
@@ -1601,12 +795,12 @@ pub struct SessionIndexEntry {
     pub name: Option<String>,
 }
 
-/// One resumable session surfaced by `AgentControl::list_resumable`.
+/// One resumable session surfaced by `AgentKind::list_resumable`.
 /// `Serialize`/`Deserialize` so a `captain-miao server` can ship it to a remote
 /// dashboard's resume picker over the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCandidate {
-    pub agent: AgentControl,
+    pub agent: AgentKind,
     pub session_id: String,
     pub cwd: String,
     pub first_prompt: Option<String>,
@@ -1661,36 +855,12 @@ pub struct TranscriptStats {
     /// a subdirectory of its project for hours. `None` for backends whose
     /// transcript carries no directory.
     pub cwd: Option<String>,
-    /// Claude-only incremental-parse cursor: the byte offset reached plus the
-    /// running accumulators, so the next reload folds only the lines appended
-    /// since — instead of rescanning a multi-MB transcript on every keystroke
-    /// the agent writes. `None` for Codex (which recomputes from a bounded
-    /// tail) and before the first parse. Opaque to the dashboard, which reads
-    /// only the two fields above.
-    pub cursor: Option<claude::StatsCursor>,
-    /// Antigravity prompt-log cursor; no token/model accumulators.
-    pub antigravity_cursor: Option<antigravity::PromptCursor>,
 }
 
 impl TranscriptStats {
-    /// Adopt a model the agent named on a hook, so the *next* fold agrees with
-    /// it rather than reverting to the last turn's.
-    ///
-    /// A backend can learn the model two ways — folded out of the transcript, or
-    /// stated on a payload — and for Claude both are live at once: the fold
-    /// bootstraps the row, and `PostModelSwitch` covers the window the fold is
-    /// blind to (see [`claude::StatsCursor::adopt_model`]). That would be two
-    /// sources for one fact, which is exactly what
-    /// [`crate::agents::common::adopt_session_facts`] warns against — so this is
-    /// how the hook *feeds* the fold instead of competing with it. A cursor-less
-    /// backend recomputes from scratch every time and so has no memory to
-    /// correct: it keeps the two in step here and is overwritten by its own next
-    /// read, which is the right outcome for a fold that is already authoritative.
+    /// Adopt a hook fact. Stateful readers update their own accumulators too.
     pub fn adopt_model(&mut self, model: &str) {
-        self.model = Some(model.to_string());
-        if let Some(cursor) = self.cursor.as_mut() {
-            cursor.adopt_model(model);
-        }
+        self.model = Some(model.to_owned());
     }
 }
 
@@ -1803,9 +973,9 @@ mod tests {
         // Every backend, by the name it advertises — so a `visit_str` arm that
         // is dropped, misspelled or reordered fails here rather than turning a
         // live session's rows into `Unknown` on the next dashboard.
-        for &agent in AgentControl::ALL {
+        for &agent in AgentKind::ALL {
             let name = agent.cli_subcommand();
-            let decoded: AgentControl = serde_json::from_str(&format!("\"{name}\""))
+            let decoded: AgentKind = serde_json::from_str(&format!("\"{name}\""))
                 .unwrap_or_else(|e| panic!("{name} must decode: {e}"));
             assert_eq!(decoded, agent, "{name} decoded to the wrong backend");
             // …and round-trips, which is what keeps a state file written by one
@@ -1820,7 +990,7 @@ mod tests {
         // derived `rename_all` spelling of `OpenCode` is one lowercase word,
         // which is also how the project spells it. The loop above would catch a
         // divergence, but this names the reason nobody has to re-derive it.
-        assert_eq!(AgentControl::OpenCode.cli_subcommand(), "opencode");
+        assert_eq!(AgentKind::OpenCode.cli_subcommand(), "opencode");
     }
 
     /// A backend added after this build was cut decodes to `Unknown` instead of
@@ -1828,14 +998,14 @@ mod tests {
     /// name is gone, but it never silently becomes Claude).
     #[test]
     fn an_unrecognized_agent_name_decodes_to_unknown() {
-        let a: AgentControl =
+        let a: AgentKind =
             serde_json::from_str(&format!("\"{FUTURE_AGENT}\"")).expect("decodes, not errors");
-        assert_eq!(a, AgentControl::Unknown);
+        assert_eq!(a, AgentKind::Unknown);
 
         let encoded = serde_json::to_string(&a).expect("encodes");
         assert_eq!(encoded, r#""unknown""#);
-        let round: AgentControl = serde_json::from_str(&encoded).expect("round-trips");
-        assert_eq!(round, AgentControl::Unknown);
+        let round: AgentKind = serde_json::from_str(&encoded).expect("round-trips");
+        assert_eq!(round, AgentKind::Unknown);
     }
 
     /// The regression this variant exists for: `ServerFrame::Snapshot` carries a
@@ -1859,11 +1029,7 @@ mod tests {
         );
         assert_eq!(
             sessions.iter().map(|s| s.agent).collect::<Vec<_>>(),
-            [
-                AgentControl::Claude,
-                AgentControl::Unknown,
-                AgentControl::Codex
-            ]
+            [AgentKind::Claude, AgentKind::Unknown, AgentKind::Codex]
         );
         // The rest of the unknown row is intact, so it still renders and can
         // still be killed.
@@ -1875,21 +1041,21 @@ mod tests {
     /// the workdir picker's `Ctrl-t` cycle — both derive their lists from this.
     #[test]
     fn all_excludes_unknown() {
-        assert!(!AgentControl::ALL.contains(&AgentControl::Unknown));
+        assert!(!AgentKind::ALL.contains(&AgentKind::Unknown));
         // Order seeds the `Ctrl-t` cycle and picker defaults, so this pins it:
         // a new backend appends, it never inserts.
         assert_eq!(
-            AgentControl::ALL,
+            AgentKind::ALL,
             &[
-                AgentControl::Claude,
-                AgentControl::Codex,
-                AgentControl::Reasonix,
-                AgentControl::Kimi,
-                AgentControl::Grok,
-                AgentControl::OpenCode,
-                AgentControl::Pi,
-                AgentControl::Antigravity,
-                AgentControl::Omp
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Reasonix,
+                AgentKind::Kimi,
+                AgentKind::Grok,
+                AgentKind::OpenCode,
+                AgentKind::Pi,
+                AgentKind::Antigravity,
+                AgentKind::Omp
             ]
         );
     }
@@ -1898,12 +1064,12 @@ mod tests {
     /// `from_cli` still refuses rather than handing back an inert backend.
     #[test]
     fn from_cli_rejects_an_unrecognized_name_instead_of_unknown() {
-        assert_eq!(AgentControl::from_cli(FUTURE_AGENT), None);
-        assert_eq!(AgentControl::from_cli(""), None);
-        assert_eq!(AgentControl::from_cli("claude"), Some(AgentControl::Claude));
+        assert_eq!(AgentKind::from_cli(FUTURE_AGENT), None);
+        assert_eq!(AgentKind::from_cli(""), None);
+        assert_eq!(AgentKind::from_cli("claude"), Some(AgentKind::Claude));
         assert_eq!(
-            AgentControl::from_cli("Reasonix"),
-            Some(AgentControl::Reasonix),
+            AgentKind::from_cli("Reasonix"),
+            Some(AgentKind::Reasonix),
             "the CLI spelling is case-insensitive, unlike the on-disk one"
         );
     }
@@ -1912,7 +1078,7 @@ mod tests {
     /// would run the wrong agent in the user's cwd.
     #[test]
     fn launching_an_unknown_agent_is_an_error() {
-        let err = AgentControl::Unknown
+        let err = AgentKind::Unknown
             .build_launch_command(
                 "/home/miao/p",
                 Path::new("/run/miao.sock"),
@@ -1931,9 +1097,9 @@ mod tests {
     /// is a broken payload, and reading it as `Unknown` would hide that.
     #[test]
     fn a_non_string_agent_is_still_a_decode_error() {
-        assert!(serde_json::from_str::<AgentControl>("7").is_err());
-        assert!(serde_json::from_str::<AgentControl>("null").is_err());
-        assert!(serde_json::from_str::<AgentControl>(r#"{"name":"claude"}"#).is_err());
+        assert!(serde_json::from_str::<AgentKind>("7").is_err());
+        assert!(serde_json::from_str::<AgentKind>("null").is_err());
+        assert!(serde_json::from_str::<AgentKind>(r#"{"name":"claude"}"#).is_err());
     }
 
     /// The gate is nothing but "the two argvs differ", in both directions.
@@ -1942,7 +1108,7 @@ mod tests {
     /// no separate match, no flag invented to fill the gap.
     #[test]
     fn a_backend_forks_exactly_when_its_fork_argv_differs() {
-        for &agent in AgentControl::ALL {
+        for &agent in AgentKind::ALL {
             let plain = agent.resume_args("id", false);
             let forked = agent.resume_args("id", true);
             assert_eq!(
@@ -1953,23 +1119,20 @@ mod tests {
         }
         // Named rather than only derived, so a backend quietly losing (or
         // growing) its fork flag fails here instead of just hiding a key.
-        assert!(AgentControl::Claude.supports_fork());
-        assert!(AgentControl::Codex.supports_fork());
-        assert!(AgentControl::Reasonix.supports_fork());
+        assert!(AgentKind::Claude.supports_fork());
+        assert!(AgentKind::Codex.supports_fork());
+        assert!(AgentKind::Reasonix.supports_fork());
         assert!(
-            AgentControl::Pi.supports_fork(),
+            AgentKind::Pi.supports_fork(),
             "Pi forks by swapping --session for --fork, which is still a differing argv"
         );
         assert!(
-            !AgentControl::Kimi.supports_fork(),
+            !AgentKind::Kimi.supports_fork(),
             "Kimi has no fork flag, so `f` must hide rather than resume in place"
         );
+        assert!(AgentKind::OpenCode.supports_fork(), "opencode has --fork");
         assert!(
-            AgentControl::OpenCode.supports_fork(),
-            "opencode has --fork"
-        );
-        assert!(
-            AgentControl::Omp.supports_fork(),
+            AgentKind::Omp.supports_fork(),
             "omp forks with --fork where it resumes with --resume"
         );
 
@@ -1977,10 +1140,10 @@ mod tests {
         // the two are equal and it reports no fork — rather than offering `f`
         // and resuming in place.
         assert_eq!(
-            AgentControl::Unknown.resume_args("id", true),
-            AgentControl::Unknown.resume_args("id", false)
+            AgentKind::Unknown.resume_args("id", true),
+            AgentKind::Unknown.resume_args("id", false)
         );
-        assert!(!AgentControl::Unknown.supports_fork());
+        assert!(!AgentKind::Unknown.supports_fork());
     }
 
     /// The whole subscription surface, backend by backend, read back out of the
@@ -1992,9 +1155,9 @@ mod tests {
     #[test]
     fn every_backend_forwards_exactly_the_events_its_config_registers() {
         use HookEvent::*;
-        let expected: &[(AgentControl, &[HookEvent])] = &[
+        let expected: &[(AgentKind, &[HookEvent])] = &[
             (
-                AgentControl::Claude,
+                AgentKind::Claude,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2017,7 +1180,7 @@ mod tests {
             // synthesized — rather than registered with Codex. Reading the
             // config is what tells the two apart.
             (
-                AgentControl::Codex,
+                AgentKind::Codex,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2032,7 +1195,7 @@ mod tests {
             // No `PostCompact`: Reasonix has no such hook, which is why
             // `Compacting` is left by the next event of any kind.
             (
-                AgentControl::Reasonix,
+                AgentKind::Reasonix,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2046,7 +1209,7 @@ mod tests {
                 ],
             ),
             (
-                AgentControl::Kimi,
+                AgentKind::Kimi,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2068,7 +1231,7 @@ mod tests {
             // `permission_prompt` matcher. `StopCancelled` forwards as `Stop`,
             // so it does not appear as its own variant.
             (
-                AgentControl::Grok,
+                AgentKind::Grok,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2083,7 +1246,7 @@ mod tests {
                 ],
             ),
             (
-                AgentControl::OpenCode,
+                AgentKind::OpenCode,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2102,7 +1265,7 @@ mod tests {
             // **no `PermissionRequest` and no `Elicitation`**, because Pi has no
             // per-tool gate to subscribe to at all.
             (
-                AgentControl::Pi,
+                AgentKind::Pi,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2118,7 +1281,7 @@ mod tests {
             // Lifecycle hooks plus the status-line observer. Failures are
             // synthesized from each lifecycle payload's error field.
             (
-                AgentControl::Antigravity,
+                AgentKind::Antigravity,
                 &[SessionStart, PromptSubmit, PostToolUse, Stop, StatusUpdate],
             ),
             // No `Elicitation`: omp's `tool_approval_requested` is the gate and
@@ -2127,7 +1290,7 @@ mod tests {
             // absent (derived in Rust from `is_error`, never registered) — the
             // same shape opencode already has.
             (
-                AgentControl::Omp,
+                AgentKind::Omp,
                 &[
                     SessionStart,
                     PromptSubmit,
@@ -2143,7 +1306,7 @@ mod tests {
         ];
         assert_eq!(
             expected.len(),
-            AgentControl::ALL.len(),
+            AgentKind::ALL.len(),
             "a backend without a row here would be pinned by nothing at all"
         );
         for (agent, events) in expected {
@@ -2156,7 +1319,7 @@ mod tests {
         // The read-side-only variant writes no config, so it subscribes to
         // nothing — which is also what makes every one of its capabilities
         // false without a special case.
-        assert!(AgentControl::Unknown.forwarded_events().is_empty());
+        assert!(AgentKind::Unknown.forwarded_events().is_empty());
     }
 
     /// The three prefix pairs that make the boundary rule load-bearing. Without
@@ -2207,8 +1370,8 @@ mod tests {
     /// this guards the *default* for everyone else.
     #[test]
     fn no_backend_claims_the_alt_screen_without_verification() {
-        for &agent in AgentControl::ALL {
-            if agent == AgentControl::Grok {
+        for &agent in AgentKind::ALL {
+            if agent == AgentKind::Grok {
                 continue;
             }
             assert!(
@@ -2218,7 +1381,7 @@ mod tests {
             );
             // Same guard for the keyboard push, and for the same reason —
             // even under the TERM that makes Grok push.
-            if agent != AgentControl::Codex {
+            if agent != AgentKind::Codex {
                 assert!(
                     !agent.uses_kitty_keyboard("xterm-kitty", true),
                     "{agent:?} claims the kitty keyboard push; probe its startup \
@@ -2226,9 +1389,9 @@ mod tests {
                 );
             }
         }
-        assert!(!AgentControl::Unknown.uses_alt_screen(&[]));
-        assert!(!AgentControl::Unknown.uses_kitty_keyboard("xterm-kitty", true));
-        assert!(!AgentControl::Grok.uses_kitty_keyboard("xterm-kitty", false));
+        assert!(!AgentKind::Unknown.uses_alt_screen(&[]));
+        assert!(!AgentKind::Unknown.uses_kitty_keyboard("xterm-kitty", true));
+        assert!(!AgentKind::Grok.uses_kitty_keyboard("xterm-kitty", false));
     }
 
     /// **The test the declared matrix is worth having.** `capabilities()` is a
@@ -2246,7 +1409,7 @@ mod tests {
     fn the_capability_matrix_agrees_with_the_implementations() {
         use crate::state::SessionStatus;
 
-        for &agent in AgentControl::ALL {
+        for &agent in AgentKind::ALL {
             let c = agent.capabilities();
             assert_eq!(
                 c.fork,
@@ -2270,7 +1433,7 @@ mod tests {
                         r#"{"agent_state":"tool_use","tool_confirmation_pending":true}"#,
                     )
                     .unwrap();
-                agent.dispatch_hook(&mut state, msg);
+                agent.hook_session().dispatch_hook(&mut state, msg);
                 state.status == SessionStatus::WaitingForApproval
             };
             let gates = forwarded.contains(&HookEvent::PermissionRequest)
@@ -2284,7 +1447,7 @@ mod tests {
         }
         // Same three checks for the variant that is not in `ALL`, since it is
         // the one whose row is all-false by policy rather than by behaviour.
-        let c = AgentControl::Unknown.capabilities();
+        let c = AgentKind::Unknown.capabilities();
         assert!(!c.fork && !c.worktrees && !c.approval_gate && !c.context_tokens);
     }
 
@@ -2294,25 +1457,25 @@ mod tests {
     /// agreed to.
     #[test]
     fn the_capability_matrix_is_what_the_readme_promises() {
-        let row = |a: AgentControl| {
+        let row = |a: AgentKind| {
             let c = a.capabilities();
             (c.fork, c.worktrees, c.approval_gate, c.context_tokens)
         };
         //                                       fork   tree   appr   ctx
-        let promised: &[(AgentControl, _)] = &[
-            (AgentControl::Claude, (true, true, true, true)),
-            (AgentControl::Codex, (true, false, true, true)),
-            (AgentControl::Reasonix, (true, false, true, false)),
-            (AgentControl::Kimi, (false, false, true, true)),
-            (AgentControl::Grok, (true, true, true, true)),
-            (AgentControl::OpenCode, (true, false, true, true)),
-            (AgentControl::Pi, (true, false, false, true)),
-            (AgentControl::Antigravity, (false, false, true, true)),
-            (AgentControl::Omp, (true, false, true, true)),
+        let promised: &[(AgentKind, _)] = &[
+            (AgentKind::Claude, (true, true, true, true)),
+            (AgentKind::Codex, (true, false, true, true)),
+            (AgentKind::Reasonix, (true, false, true, false)),
+            (AgentKind::Kimi, (false, false, true, true)),
+            (AgentKind::Grok, (true, true, true, true)),
+            (AgentKind::OpenCode, (true, false, true, true)),
+            (AgentKind::Pi, (true, false, false, true)),
+            (AgentKind::Antigravity, (false, false, true, true)),
+            (AgentKind::Omp, (true, false, true, true)),
         ];
         assert_eq!(
             promised.len(),
-            AgentControl::ALL.len(),
+            AgentKind::ALL.len(),
             "a backend missing here is a backend the README never promised anything about"
         );
         for &(agent, want) in promised {
@@ -2328,11 +1491,11 @@ mod tests {
     fn grok_replaced_sidecars_are_signals_json_beside_summary() {
         let summary = PathBuf::from("/tmp/sess/summary.json");
         assert_eq!(
-            AgentControl::Grok.replaced_sidecar_paths(&summary),
+            AgentKind::Grok.replaced_sidecar_paths(&summary),
             vec![PathBuf::from("/tmp/sess/signals.json")]
         );
-        for &agent in AgentControl::ALL {
-            if agent == AgentControl::Grok {
+        for &agent in AgentKind::ALL {
+            if agent == AgentKind::Grok {
                 continue;
             }
             assert!(

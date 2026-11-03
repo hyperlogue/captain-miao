@@ -122,7 +122,7 @@ Normal-mode defaults today (`src/app/keymap.rs` `DEFAULTS`):
 | `ToggleKeepAwake` | `Space z` | unbound; prefs row |
 | `ManageHosts` | `Space h` | stays |
 
-`Ctrl-t` (cwd picker) already cycles `AgentControl::ALL` in compile
+`Ctrl-t` (cwd picker) already cycles `AgentKind::ALL` in compile
 order, skipping unavailable binaries. `Ctrl-h` already cycles
 configured hosts in `hosts.json` order, with localhost implicit and
 unlisted.
@@ -292,7 +292,7 @@ An **override** tag means overrides currently win. `r` clears it.
 
 #### Agents
 
-Not a bool/enum row. A list editor over `AgentControl::ALL`:
+Not a bool/enum row. A list editor over `AgentKind::ALL`:
 
 | Gesture | Effect |
 | --- | --- |

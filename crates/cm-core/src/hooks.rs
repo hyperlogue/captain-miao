@@ -3,7 +3,7 @@
 //! Every agent backend is configured to run `miao hook --agent <a> <event>`
 //! when something happens in a session. This module is what that process does:
 //! read the agent's payload from stdin, hand it to that backend's parser
-//! ([`AgentControl::parse_hook_payload`]) for normalisation into a
+//! ([`AgentKind::parse_hook_payload`]) for normalisation into a
 //! [`crate::state::HookMessage`], and write it down the launcher's Unix socket.
 //! Nothing here
 //! interprets the message — the launcher owns the state transition.
@@ -19,7 +19,7 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::state::HookEvent;
 
 /// Parse hook payload from stdin and forward to the launcher socket. `agent`
@@ -33,7 +33,7 @@ use crate::state::HookEvent;
 /// outside captain-miao; those have no launcher to talk to, and a non-zero
 /// exit would only show up in the agent's hook scrollback. Exit 0 immediately
 /// so the spawn is a no-op rather than a failed turn.
-pub async fn handle_event(agent: AgentControl, event: &str, sock_path: Option<&str>) -> Result<()> {
+pub async fn handle_event(agent: AgentKind, event: &str, sock_path: Option<&str>) -> Result<()> {
     let sock_owned;
     let sock_path = match resolve_sock(sock_path, std::env::var("CAPTAIN_MIAO_SOCK").ok()) {
         Some(s) => {

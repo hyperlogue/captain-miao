@@ -99,13 +99,13 @@ pub(super) fn session_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::config::KeyBinding;
     use std::collections::HashMap;
 
     #[test]
     fn failed_host_outranks_cached_agent_health() {
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         row.codex_mode = cm_core::agents::codex::CodexMode::AppServer;
         row.codex_connected = Some(true);
         let lines = session_diagnostics(
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn cleanup_and_reconnect_hints_follow_remaps_and_unbindings() {
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Starting);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Starting);
         row.codex_mode = cm_core::agents::codex::CodexMode::AppServer;
         row.codex_connected = Some(false);
         row.codex_control = true;
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn quiet_native_session_is_not_reported_as_disconnected() {
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         row.updated_at = 0;
         assert!(session_diagnostics(&row, ConnState::Connected, &Keymap::defaults()).is_empty());
     }

@@ -1,6 +1,6 @@
 //! opencode CLI backend. Owns every opencode-specific path, env var and hook
 //! payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::OpenCode`'s match arms.
+//! `crate::agent::AgentKind::OpenCode`'s agent-local definition.
 //!
 //! **Source-read against opencode itself** — `packages/plugin/src/index.ts`
 //! for the hook interface, and (as of a re-read at 1.18.18) `packages/schema/
@@ -30,7 +30,7 @@
 //! `(input: PluginInput, options?) => Promise<Hooks>`, where `PluginInput` is
 //! `{client, project, directory, worktree, serverUrl, $, …}`. So
 //! [`plugin_source`] emits that module,
-//! [`crate::agent::AgentControl::hooks_settings_json`] returns its **JS
+//! [`crate::agent::AgentKind::hooks_settings_json`] returns its **JS
 //! source** — the seam calls it "the per-session hook-settings file" and
 //! nothing requires it to be JSON; Kimi already puts TOML through it — and
 //! [`build_launch_command`] installs it into a synthetic config overlay behind
@@ -738,7 +738,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 /// only on a tty), so this cannot hang waiting on a pager.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
     // **Not installed is an empty list, not an error.** `LocalBackend` asks
-    // every backend in `AgentControl::ALL` for candidates whenever the resume
+    // every backend in `AgentKind::ALL` for candidates whenever the resume
     // picker opens, and surfaces whatever errors come back — so refusing here
     // would put "opencode not found in PATH" in front of every user who has
     // never installed it. Every other backend answers a missing state directory
@@ -793,7 +793,7 @@ fn parse_session_list(stdout: &str) -> Vec<ResumeCandidate> {
         .into_iter()
         .filter(|s| !s.directory.trim().is_empty())
         .map(|s| ResumeCandidate {
-            agent: crate::agent::AgentControl::OpenCode,
+            agent: crate::agent::AgentKind::OpenCode,
             session_id: s.id,
             cwd: s.directory,
             // opencode titles every session itself, so there is no "untitled,
@@ -877,7 +877,7 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
 
     /// A stdin body in exactly the shape [`plugin_source`]'s `send` writes —
@@ -898,7 +898,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::OpenCode, status)
+        LauncherState::for_test(AgentKind::OpenCode, status)
     }
 
     /// Drive one hook end to end — parse the plugin's stdin JSON, then dispatch
@@ -1637,3 +1637,6 @@ export default CaptainMiao;
         assert!(!launch_args(&["-s".to_string(), "s1".to_string()]).contains(&"--dir".to_string()));
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

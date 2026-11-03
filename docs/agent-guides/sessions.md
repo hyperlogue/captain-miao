@@ -29,10 +29,23 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
 
 ## Agent integration
 
-- `AgentControl` in `crates/cm-core/src/agent.rs` owns CLI differences.
-  Unsupported features return `None` or empty results; structural UI limits
-  belong in its declared `capabilities()` table. Each capability is checked
-  against its owning argv or hook configuration; change those together.
+- `AgentKind` is serialized identity. Its single definition resolver selects
+  behavior declared in each `agents/<name>/adapter.rs`; keep agent differences
+  there rather than adding per-operation matches. Optional features return
+  `None` or empty results. Capability declarations must agree with their argv,
+  hook configuration or status observation; change those together.
+- Configured `AgentAdapter`s own settings and return opaque `SessionTask`s.
+  Load settings at the host operation, inject them when configuring the adapter,
+  and capture them for each task. Hook and RPC execution stay private to the
+  integration. Shared launcher code must not select an agent's execution mode.
+- Tasks publish facts through `SessionPublisher`; only the launcher writes
+  session JSON. Stop is cooperative: keep control alive after a retryable
+  cleanup failure or persistence error. Long-lived Codex environment snapshots
+  retain their lease-based lifetime beyond a launcher exit.
+- Hook instances and transcript readers own mutable session state. Constructing
+  a hook parser must not start observers. The running hook task activates them;
+  do not recreate the hook instance per message or put private cursors in shared
+  transcript facts.
 - Inject Claude hooks per session via `--settings` and tear them down on exit.
   Keep them out of `~/.claude/settings.json`.
 - Keep Claude's `--tmux` out of launch arguments. Its self-created tmux session

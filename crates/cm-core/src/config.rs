@@ -332,6 +332,22 @@ pub fn is_valid_env_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A host-operation configuration snapshot. A bad agent setting stays local to
+/// that adapter: unrelated inventory readers and launches remain available.
+pub(crate) struct AgentConfig {
+    pub approval_grace: std::time::Duration,
+    pub codex: Result<crate::agents::codex::CodexConfig, String>,
+}
+
+impl AgentConfig {
+    pub fn load() -> Self {
+        Self {
+            approval_grace: std::time::Duration::from_secs(get().launcher.approval_grace_secs),
+            codex: read_codex().map_err(|error| format!("{error:#}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -74,7 +74,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::agent::{AgentControl, ResumeCandidate, SessionIndex};
+use crate::agent::{AgentKind, ResumeCandidate, SessionIndex};
 use crate::state::{
     self, HostId, LauncherState, SessionFlags as HostSessionFlags, SessionKey, SessionStatus,
 };
@@ -154,7 +154,7 @@ pub(super) enum SessionFlag {
 pub(super) enum Action {
     FocusWindow(WindowId),
     NewSessionSplit {
-        agent: AgentControl,
+        agent: AgentKind,
         cwd: String,
         /// Host to open on (local unless chosen with `Ctrl-h` in the picker).
         host: HostId,
@@ -178,7 +178,7 @@ pub(super) enum Action {
         host: HostId,
     },
     ResumeSession {
-        agent: AgentControl,
+        agent: AgentKind,
         cwd: String,
         session_id: String,
         fork: bool,
@@ -279,7 +279,7 @@ pub(super) enum Action {
 /// session was originally launched under.
 #[derive(Debug, Clone)]
 pub(super) struct RestartSpec {
-    pub(super) agent: AgentControl,
+    pub(super) agent: AgentKind,
     /// Host the session lives on; the replacement opens there too, so a remote
     /// restart lands in that host's pool rather than silently moving the session
     /// to the laptop.
@@ -384,7 +384,7 @@ pub(super) enum PickerKind {
         host: HostId,
         /// None means All. Keep the full inventory so All can restore it and
         /// picker indices continue to identify the original candidates.
-        agent_filter: Option<AgentControl>,
+        agent_filter: Option<AgentKind>,
         candidates: Vec<ResumeCandidate>,
     },
     /// Launch a new session. The picker shows recent cwds and also accepts
@@ -392,7 +392,7 @@ pub(super) enum PickerKind {
     /// backend this launch will use — seeded from the persistent default and
     /// overridable with `Ctrl-o`'s selector or `Ctrl-t` (per-launch only).
     Workdir {
-        agent: AgentControl,
+        agent: AgentKind,
         /// Host this launch will open on — seeded from the default, chosen via
         /// `Ctrl-o` or cycled with `Ctrl-h` (per-launch only). A remote host
         /// opens the session in that host's pty pool and attaches over ssh (§8).
@@ -403,7 +403,7 @@ pub(super) enum PickerKind {
         /// property of the *task* you're starting, not a standing preference).
         ///
         /// Always `None` for an agent that can't do it
-        /// (`AgentControl::supports_worktrees`); a `Ctrl-t` onto such an agent
+        /// (`AgentKind::supports_worktrees`); a `Ctrl-t` onto such an agent
         /// clears it rather than carrying a request that would be silently
         /// dropped at launch.
         worktree: Option<WorktreeArm>,
@@ -548,7 +548,7 @@ pub(super) struct SessionSnapshotEntry {
     /// Backend the original session ran under. Defaulted to Claude so
     /// snapshots written before this field existed still parse.
     #[serde(default)]
-    pub agent: AgentControl,
+    pub agent: AgentKind,
     pub launcher_pid: u32,
     pub child_pid: u32,
     pub window_id: WindowId,
@@ -641,7 +641,7 @@ pub(super) struct WorkTabEntry {
 /// `session_id` crosses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RestoreSpec {
-    pub(super) agent: AgentControl,
+    pub(super) agent: AgentKind,
     /// Host-canonical (`~`-collapsed), exactly as it arrived and exactly as
     /// [`OpenSpec`](cm_core::backend::OpenSpec) wants it back.
     pub(super) cwd: String,
@@ -937,7 +937,7 @@ pub(super) struct App {
     pub(super) capabilities: Capabilities,
     /// Backend used when starting a new session (`o` / `O`). First enabled
     /// agent in the prefs list.
-    pub(super) new_session_agent: AgentControl,
+    pub(super) new_session_agent: AgentKind,
     /// How new sessions are arranged (`resolve_spawn_target`): the shared
     /// `miao:sessions` tab (Stacked) or one tab per session (Per-tab). Seeded
     /// from `[terminal] sessions_layout`, overridable from Preferences. A
@@ -1006,7 +1006,7 @@ pub(super) struct App {
     /// Overlay fields persisted under `dashboard-overrides.json` `prefs`.
     pub(super) extra_prefs: prefs::PrefsOverrides,
     /// Ordered agent list (enabled flag). First enabled is the launch default.
-    pub(super) agent_order: Vec<(AgentControl, bool)>,
+    pub(super) agent_order: Vec<(AgentKind, bool)>,
     /// Persisted (icon, color) overrides keyed by canonicalized cwd. Loaded
     /// once at startup and saved on every popup confirmation.
     pub(super) directory_marks: HashMap<String, DirectoryMark>,
@@ -1758,8 +1758,7 @@ impl App {
             help_scroll: 0,
             help_rows: 0,
             capabilities: crate::terminal::get().capabilities(),
-            new_session_agent: AgentControl::from_cli(&cfg.launcher.default_agent)
-                .unwrap_or_default(),
+            new_session_agent: AgentKind::from_cli(&cfg.launcher.default_agent).unwrap_or_default(),
             sessions_layout: cfg.terminal.sessions_layout.unwrap_or_default(),
             preview_text: None,
             preview_lines: None,
@@ -2186,11 +2185,9 @@ impl App {
             let preferred = overrides
                 .default_agent
                 .as_deref()
-                .and_then(AgentControl::from_cli)
+                .and_then(AgentKind::from_cli)
                 .or_else(|| {
-                    AgentControl::from_cli(
-                        &crate::config::Config::from_disk().launcher.default_agent,
-                    )
+                    AgentKind::from_cli(&crate::config::Config::from_disk().launcher.default_agent)
                 })
                 .unwrap_or_default();
             self.agent_order =
@@ -2317,7 +2314,7 @@ impl App {
     /// workdir picker still overrides one launch. The cursor starts on the
     /// current default.
     pub(super) fn open_default_agent_picker(&mut self) {
-        let enabled: Vec<AgentControl> = self
+        let enabled: Vec<AgentKind> = self
             .agent_order
             .iter()
             .filter(|(_, on)| *on)
@@ -4912,7 +4909,7 @@ impl App {
                 // either, but that is ignorance rather than the agent's limit,
                 // and naming it would state the opposite of what we know.
                 .filter(|s| {
-                    AgentControl::ALL.contains(&s.agent) && !s.agent.capabilities().approval_gate
+                    AgentKind::ALL.contains(&s.agent) && !s.agent.capabilities().approval_gate
                 })
                 .map(|s| s.agent.label())
                 .collect();
@@ -5209,7 +5206,7 @@ impl App {
 
     /// Scope the loaded inventory without changing its indices: submission
     /// still resolves the original candidate after either filter is applied.
-    pub(super) fn set_resume_agent_filter(&mut self, filter: Option<AgentControl>) {
+    pub(super) fn set_resume_agent_filter(&mut self, filter: Option<AgentKind>) {
         let Some(active) = self.picker.as_mut() else {
             return;
         };
@@ -5326,7 +5323,7 @@ impl App {
             } => {
                 let mut spans = vec![
                     Span::styled(" Agent ", dim),
-                    Span::styled(agent_filter.map_or("All", AgentControl::label), value),
+                    Span::styled(agent_filter.map_or("All", AgentKind::label), value),
                     Span::styled("   Host ", dim),
                     host_span(self, host),
                 ];

@@ -1,5 +1,5 @@
 //! Pi CLI backend: per-run extension injection, lifecycle events and resume
-//! discovery. The dashboard reaches this through `AgentControl::Pi`.
+//! discovery. The dashboard reaches this through `AgentKind::Pi`.
 //!
 //! Verified with Pi 1.1.0 and upstream `earendil-works/pi` at `7bd01fb`.
 //! The opt-in test in `live_tests` runs the real RPC CLI against a loopback
@@ -315,7 +315,7 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
 
     /// A stand-in for the executable, independent of the test binary location.
@@ -332,7 +332,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::Pi, status)
+        LauncherState::for_test(AgentKind::Pi, status)
     }
 
     /// Drive one hook end to end — parse the extension's stdin JSON, then
@@ -622,3 +622,6 @@ mod tests {
         }
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

@@ -39,7 +39,7 @@ use crate::protocol::{
     write_frame,
 };
 use crate::state::{self, LauncherState, SessionKey};
-use cm_core::agent::AgentControl;
+use cm_core::agent::AgentKind;
 use cm_core::vitals::{HostVitals, VitalsSampler};
 
 fn codex_config_reply(
@@ -1048,7 +1048,7 @@ async fn push_changes(
 
 /// Watch the `sessions/` dir; signal the broadcast on any non-Access change.
 /// Also watches every backend's out-of-band store
-/// ([`AgentControl::out_of_band_watch_paths`]) — today that is Codex's title
+/// ([`AgentKind::out_of_band_watch_paths`]) — today that is Codex's title
 /// sqlite alone: a rename touches only that file, so without this wake a remote
 /// rename wouldn't reach subscribers until some other session event fired. The
 /// wake just triggers the normal re-read + diff; the actual sqlite read is
@@ -1057,7 +1057,7 @@ async fn push_changes(
 /// A deferred read schedules another broadcast at the deadline; an
 /// unchanged diff pushes nothing. Best-effort: a missing store isn't watched.
 fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::RecommendedWatcher> {
-    let paths = AgentControl::ALL
+    let paths = AgentKind::ALL
         .iter()
         .flat_map(|agent| agent.out_of_band_watch_paths());
     cm_core::backend::watch_session_changes(paths, move || {
@@ -1296,7 +1296,7 @@ mod tests {
             release_rx.await.unwrap();
             drop(stream);
         });
-        let mut row = LauncherState::for_test(AgentControl::Codex, state::SessionStatus::Idle);
+        let mut row = LauncherState::for_test(AgentKind::Codex, state::SessionStatus::Idle);
         row.launcher_pid = std::process::id();
         row.write().unwrap();
         let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
@@ -1420,7 +1420,7 @@ mod tests {
             return;
         }
         state::ensure_sessions_dir().unwrap();
-        let mut row = LauncherState::for_test(AgentControl::Codex, state::SessionStatus::Idle);
+        let mut row = LauncherState::for_test(AgentKind::Codex, state::SessionStatus::Idle);
         row.launcher_pid = std::process::id();
         row.codex_mode = CodexMode::AppServer;
         row.codex_control = true;

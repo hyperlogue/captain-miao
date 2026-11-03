@@ -213,10 +213,10 @@ pub(super) fn dispatch_default(state: &mut LauncherState, mut msg: HookMessage) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     fn state() -> LauncherState {
-        LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle)
+        LauncherState::for_test(AgentKind::Claude, SessionStatus::Idle)
     }
 
     fn blank() -> HookMessage {

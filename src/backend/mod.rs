@@ -1,7 +1,7 @@
 //! `Backend` is the dashboard's seam to *where sessions run and where their
 //! files live*. `Local` is in-process (the dashboard and the agents share one
 //! host); `Remote` reaches a `miao-server` over a (possibly
-//! ssh-forwarded) socket. Enum-dispatched to match `AgentControl`'s style: no
+//! ssh-forwarded) socket. Enum-dispatched to match `AgentKind`'s style: no
 //! dyn, no registry, just a `match` per operation.
 //!
 //! A backend owns *session lifecycle + objective facts on one host*: the live
@@ -885,7 +885,7 @@ pub(crate) enum BindingPresence {
 impl Backend {
     /// Ownership includes rows hidden by an optimistic Kill. Only the host's
     /// removal releases a conversation for Resume, not presentation filtering.
-    pub(crate) fn manages_conversation(&self, agent: crate::agent::AgentControl, id: &str) -> bool {
+    pub(crate) fn manages_conversation(&self, agent: crate::agent::AgentKind, id: &str) -> bool {
         let matches = |s: &LauncherState| s.agent == agent && s.session_id.as_deref() == Some(id);
         match self {
             Self::Local(host) => host.inner.list_sessions().iter().any(matches),
@@ -1473,7 +1473,7 @@ impl Backend {
 /// that can't be created at all leaves the dashboard on its reload cadence
 /// rather than failing to start.
 fn start_local_watcher(changed: Arc<AtomicBool>) -> Option<notify::RecommendedWatcher> {
-    let paths = crate::agent::AgentControl::ALL
+    let paths = crate::agent::AgentKind::ALL
         .iter()
         .flat_map(|agent| agent.watch_paths());
     match cm_core::backend::watch_session_changes(paths, move || {
@@ -3660,7 +3660,7 @@ fn scratch_home(tag: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
@@ -3844,7 +3844,7 @@ mod tests {
             session_id: Some(format!("sess-{pid}")),
             cwd: "/tmp".to_string(),
             child_pid: Some(pid + 1),
-            ..LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle)
+            ..LauncherState::for_test(AgentKind::Claude, SessionStatus::Idle)
         }
     }
 
@@ -5175,7 +5175,7 @@ fi
             HostId::local(),
         );
         let spec = OpenSpec {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             cwd: "/work".to_string(),
             resume: None,
             worktree: None,
@@ -5194,7 +5194,7 @@ fi
             RemoteBackend::connect(Transport::LocalSocket(sock.clone()), HostId("mock".into()));
 
         let spec = OpenSpec {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             cwd: "/work".to_string(),
             resume: None,
             worktree: None,
@@ -5229,7 +5229,7 @@ fi
         );
         let backend = Backend::Remote(remote);
         let spec = OpenSpec {
-            agent: AgentControl::Codex,
+            agent: AgentKind::Codex,
             cwd: "/work/project".into(),
             resume: None,
             worktree: Some("topic".into()),

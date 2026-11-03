@@ -1,6 +1,6 @@
 //! Oh My Pi (`omp`) CLI backend. Owns every omp-specific path, argv flag and
 //! hook payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Omp`'s match arms.
+//! `crate::agent::AgentKind::Omp`'s agent-local definition.
 //!
 //! **Source-verified against the installed binary**, `omp` v18.4.8 at
 //! `/opt/homebrew/bin/omp` — a Bun-compiled single executable whose JS source
@@ -115,7 +115,7 @@
 //!
 //! omp's argv handler map registers `"--resume": R2w`, `"-r": R2w`,
 //! `"--session": R2w` (an undocumented alias) and `"--fork": (w, u) => { w.fork
-//! = u; }`. [`AgentControl::resume_args`] uses `--resume` / `--fork` —
+//! = u; }`. [`AgentKind::resume_args`] uses `--resume` / `--fork` —
 //! `--resume` is in the public flag schema and `--help`, `--fork` is in the
 //! argv map and documented in `omp://session-operations-export-share-fork-
 //! resume.md`. `--session` is deliberately not used: it is absent from both
@@ -124,7 +124,7 @@
 //! No `--worktree` launch flag exists (the single `--worktree` string in the
 //! binary is `git restore --worktree`). omp's `omp worktree` subcommand only
 //! lists/clears worktrees the agent made itself, so there is nothing to pass
-//! at launch and [`AgentControl::worktree_args`] answers `None`.
+//! at launch and [`AgentKind::worktree_args`] answers `None`.
 //!
 //! # Loaded with Bun, not jiti
 //!
@@ -517,11 +517,11 @@ fn sessions_root() -> Option<PathBuf> {
 /// header's `id` and `cwd`, the pad-rewritten `title` record omp keeps at line
 /// 1, and the first `message` whose role is `user` — so the `parentId` tree walk
 /// the old comment feared is not needed. That walk belongs to
-/// [`crate::agent::AgentControl::read_transcript_stats`], whose fold really does
+/// [`crate::agent::AgentKind::read_transcript_stats`], whose fold really does
 /// need the active leaf; a head read does not.
 ///
 /// **A missing store is an empty list, not an error.** `LocalBackend` asks every
-/// backend in `AgentControl::ALL` whenever the picker opens and surfaces whatever
+/// backend in `AgentKind::ALL` whenever the picker opens and surfaces whatever
 /// errors come back (see `opencode::list_resumable` for the same argument), so
 /// refusing here would put an error in front of every user who never ran omp.
 pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
@@ -587,7 +587,7 @@ fn list_resumable_in_cached(
         let candidate = cache.candidates.get(&path, &[], || {
             let head = read_session_head(&path)?;
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Omp,
+                agent: crate::agent::AgentKind::Omp,
                 session_id: head.session_id,
                 cwd: head.cwd,
                 first_prompt: head.first_prompt,
@@ -720,7 +720,7 @@ fn user_prompt(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
 
     /// A stand-in for the executable, independent of the test binary location.
@@ -738,7 +738,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::Omp, status)
+        LauncherState::for_test(AgentKind::Omp, status)
     }
 
     /// Drive one hook end to end — parse the extension's stdin JSON, then
@@ -1257,7 +1257,7 @@ mod tests {
             Some("add a test for the parser")
         );
         assert_eq!(out[0].git_branch, None);
-        assert_eq!(out[0].agent, AgentControl::Omp);
+        assert_eq!(out[0].agent, AgentKind::Omp);
     }
 
     /// The `title` record is optional — a brand-new session has none — and the
@@ -1407,3 +1407,6 @@ mod tests {
         assert!(list_resumable_in(&root, 0).is_empty());
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

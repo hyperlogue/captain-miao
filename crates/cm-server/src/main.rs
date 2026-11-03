@@ -14,7 +14,7 @@ mod server_pool;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use cm_core::agent::AgentControl;
+use cm_core::agent::AgentKind;
 // Re-exported at the crate root so the server modules' `crate::backend` /
 // `crate::protocol` / `crate::state` / `crate::init_tracing` paths resolve.
 pub use cm_core::logging::init_tracing;
@@ -60,7 +60,7 @@ enum Commands {
     /// Launch a coding agent with hooks injected, inside the pty pool
     /// (headless). Argument handling matches the dashboard's `miao launch`.
     Launch {
-        /// Which backend to run — resolved by `AgentControl::from_cli`, the one
+        /// Which backend to run — resolved by `AgentKind::from_cli`, the one
         /// authority on the names.
         agent: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -162,16 +162,16 @@ enum Commands {
 
 impl Commands {
     /// `Some((agent, args))` for the launcher subcommands, `None` for everything
-    /// else — the single place a clap variant maps to an [`AgentControl`], so a
+    /// else — the single place a clap variant maps to an [`AgentKind`], so a
     /// new backend is a new variant plus one arm below.
     ///
     /// The dashboard's `Commands` (`src/main.rs`) carries a twin. They are
     /// separate clap enums over different subcommand sets — the server has no
     /// `focus`, the dashboard no `daemon` — so this is duplicated on purpose
     /// rather than hoisted into `cm-core`.
-    fn launcher(&self) -> Option<(AgentControl, &[String])> {
+    fn launcher(&self) -> Option<(AgentKind, &[String])> {
         match self {
-            Commands::Launch { agent, args } => Some((AgentControl::from_cli(agent)?, args)),
+            Commands::Launch { agent, args } => Some((AgentKind::from_cli(agent)?, args)),
             _ => None,
         }
     }
@@ -328,7 +328,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             unreachable!("pty-pool commands are dispatched in main() before the runtime")
         }
         // The one launcher subcommand, dispatched through `Commands::launcher` so
-        // the variant→`AgentControl` mapping stays in that one place. Named here
+        // the variant→`AgentKind` mapping stays in that one place. Named here
         // rather than swept up by a catch-all so the match stays exhaustive —
         // see the twin in the dashboard's `main.rs`.
         Commands::Clipboard {
@@ -393,7 +393,7 @@ mod tests {
     /// watching.
     #[test]
     fn every_backend_launches_under_the_name_it_advertises() {
-        for &want in AgentControl::ALL {
+        for &want in AgentKind::ALL {
             let name = want.cli_subcommand();
             let plan = cm_core::backend::LocalBackend::default()
                 .open_session(&cm_core::backend::OpenSpec {

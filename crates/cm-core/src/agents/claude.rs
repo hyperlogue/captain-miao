@@ -1,6 +1,6 @@
 //! Claude Code backend. Owns every Claude-specific path, JSON shape, and
 //! hook event mapping. The dashboard reaches everything in here only via
-//! `crate::agent::AgentControl::Claude`'s match arms.
+//! `crate::agent::AgentKind::Claude`'s agent-local definition.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -202,7 +202,40 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
         let Ok(line) = line else { continue };
         cursor.fold_line(&line);
     }
-    cursor.into_stats()
+    cursor.into_stats().stats
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct TranscriptFold {
+    pub(super) stats: TranscriptStats,
+    cursor: Option<StatsCursor>,
+}
+impl std::ops::Deref for TranscriptFold {
+    type Target = TranscriptStats;
+    fn deref(&self) -> &TranscriptStats {
+        &self.stats
+    }
+}
+impl TranscriptFold {
+    fn adopt_model(&mut self, model: &str) {
+        self.stats.adopt_model(model);
+        if let Some(cursor) = &mut self.cursor {
+            cursor.adopt_model(model);
+        }
+    }
+}
+#[derive(Default)]
+pub(super) struct Reader {
+    prior: TranscriptFold,
+}
+impl super::transcript::TranscriptReader for Reader {
+    fn read(&mut self, path: &Path) -> TranscriptStats {
+        self.prior = read_transcript_stats_incremental(path, Some(&self.prior));
+        self.prior.stats.clone()
+    }
+    fn adopt_model(&mut self, model: &str) {
+        self.prior.adopt_model(model);
+    }
 }
 
 /// Incremental sibling of [`read_transcript_stats`]: folds only the transcript
@@ -211,19 +244,19 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
 /// newline-terminated) line is held back and re-read once complete, so a
 /// half-written JSON line is never parsed and never skipped. Falls back to a
 /// full reparse if the file shrank/rotated below the cursor or a seek fails.
-pub fn read_transcript_stats_incremental(
+pub(crate) fn read_transcript_stats_incremental(
     path: &Path,
-    prior: Option<&TranscriptStats>,
-) -> TranscriptStats {
+    prior: Option<&TranscriptFold>,
+) -> TranscriptFold {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut cursor = prior.and_then(|p| p.cursor.clone()).unwrap_or_default();
 
     let Ok(mut file) = std::fs::File::open(path) else {
-        return TranscriptStats::default();
+        return TranscriptFold::default();
     };
     let Ok(meta) = file.metadata() else {
-        return TranscriptStats::default();
+        return TranscriptFold::default();
     };
     let len = meta.len();
     // Truncated / rotated below where we'd parsed: the offset is meaningless,
@@ -239,7 +272,7 @@ pub fn read_transcript_stats_incremental(
         // Seek failed: reparse from the start rather than risk a torn offset.
         cursor = StatsCursor::default();
         if file.seek(SeekFrom::Start(0)).is_err() {
-            return TranscriptStats::default();
+            return TranscriptFold::default();
         }
     }
     let mut bytes: Vec<u8> = Vec::new();
@@ -295,7 +328,7 @@ struct StatsEntry {
 /// Running accumulators for the transcript-stats parse, persisted across reloads
 /// so the dashboard can fold only newly-appended lines instead of rescanning the
 /// whole file. `offset` is the byte position up to which lines have been folded.
-/// Fields are private — the dashboard carries the whole cursor as opaque state.
+/// Private parsing state retained by this session’s reader. Callers receive facts.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StatsCursor {
     offset: u64,
@@ -423,20 +456,21 @@ impl StatsCursor {
         }
     }
 
-    fn into_stats(self) -> TranscriptStats {
+    fn into_stats(self) -> TranscriptFold {
         let context_tokens = self.context_tokens();
         let model = self.last_model.clone();
         let first_prompt = self.first_prompt.clone();
-        TranscriptStats {
-            context_tokens,
-            model,
-            first_prompt,
-            name: None,
-            last_prompt: None,
-            context_window: None,
-            cwd: self.cwd.clone(),
+        TranscriptFold {
+            stats: TranscriptStats {
+                context_tokens,
+                model,
+                first_prompt,
+                name: None,
+                last_prompt: None,
+                context_window: None,
+                cwd: self.cwd.clone(),
+            },
             cursor: Some(self),
-            antigravity_cursor: None,
         }
     }
 }
@@ -780,7 +814,7 @@ pub(crate) fn list_resumable_cached(
             };
             let custom_title = read_custom_title(&path);
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Claude,
+                agent: crate::agent::AgentKind::Claude,
                 session_id,
                 cwd,
                 first_prompt: header.first_prompt,
@@ -1751,7 +1785,7 @@ mod tests {
     }
 
     fn active_state() -> LauncherState {
-        LauncherState::for_test(crate::agent::AgentControl::Claude, SessionStatus::Active)
+        LauncherState::for_test(crate::agent::AgentKind::Claude, SessionStatus::Active)
     }
 
     fn permission_request(tool: &str) -> HookMessage {
@@ -1834,7 +1868,7 @@ mod tests {
             SessionStatus::WaitingForApproval,
         ] {
             let mut state =
-                LauncherState::for_test(crate::agent::AgentControl::Claude, status.clone());
+                LauncherState::for_test(crate::agent::AgentKind::Claude, status.clone());
             let msg = parse_hook_payload(HookEvent::ModelSwitch, MODEL_SWITCH).expect("parses");
             dispatch_hook(&mut state, msg);
             assert_eq!(state.status, status);
@@ -2306,3 +2340,6 @@ mod tests {
         }
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

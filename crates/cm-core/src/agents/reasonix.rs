@@ -1,6 +1,6 @@
 //! Reasonix CLI backend. Owns every Reasonix-specific path, env var and hook
 //! payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Reasonix`'s match arms.
+//! `crate::agent::AgentKind::Reasonix`'s agent-local definition.
 //!
 //! **Source-verified.** No `reasonix` binary was available when this was
 //! written, so every claim below comes from reading
@@ -448,7 +448,7 @@ fn list_resumable_in_cached(
                 return None;
             }
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Reasonix,
+                agent: crate::agent::AgentKind::Reasonix,
                 session_id,
                 cwd: meta.workspace_root,
                 first_prompt: Some(meta.preview).filter(|p| !p.trim().is_empty()),
@@ -577,7 +577,7 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     /// A `<state>/sessions/` directory: transcripts and whichever sidecars the
     /// case needs.
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
-        assert_eq!(out[0].agent, AgentControl::Reasonix);
+        assert_eq!(out[0].agent, AgentKind::Reasonix);
         list_resumable_in_cached(&root, 10, &mut cache);
         assert_eq!(cache.candidates.read_count(), 1);
         std::fs::write(
@@ -700,7 +700,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::Reasonix, status)
+        LauncherState::for_test(AgentKind::Reasonix, status)
     }
 
     /// Drive one hook end to end — parse the agent's stdin JSON, then dispatch it
@@ -933,3 +933,6 @@ mod tests {
         );
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

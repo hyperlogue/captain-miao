@@ -32,8 +32,9 @@ outside the named directories:
   `src/app/keymap.rs`; `run_command` in `src/app/keys.rs` owns command effects.
 - **Agent CLIs, hooks, session status, persistence, hosts or transports:**
   [session rules](docs/agent-guides/sessions.md).
-  `AgentControl` is in `crates/cm-core/src/agent.rs`; `Backend` is in
-  `src/backend/mod.rs`, sharing `LocalBackend` with the server.
+  `AgentKind` is in `crates/cm-core/src/agent.rs`; configured execution lives
+  behind `AgentAdapter` in `crates/cm-core/src/agent/session.rs`. `Backend`
+  is in `src/backend/mod.rs`, sharing `LocalBackend` with the server.
 - **Build scripts, packaging, CI or releases:**
   [distribution rules](docs/agent-guides/distribution.md).
 - **Remote architecture or wire protocol design:**

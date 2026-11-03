@@ -24,12 +24,12 @@ impl Job {
     /// Other agents can resume immediately, so end their owner before opening.
     pub(super) fn needs_cleanup_before_launch(&self) -> bool {
         self.spec.kill_old
-            && self.spec.agent != crate::agent::AgentControl::Codex
+            && self.spec.agent != crate::agent::AgentKind::Codex
             && !self.cleanup_confirmed
     }
 
     fn has_retry_budget(&self) -> bool {
-        self.spec.agent != crate::agent::AgentControl::Codex
+        self.spec.agent != crate::agent::AgentKind::Codex
             || self.launched_at.is_some_and(|at| {
                 at.elapsed()
                     < cm_core::agents::codex::RESTART_RETRY_WINDOW
@@ -280,11 +280,11 @@ impl Restarts {
 mod tests {
     use super::super::SessionFlags;
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     fn spec(pid: u32) -> RestartSpec {
         RestartSpec {
-            agent: AgentControl::Codex,
+            agent: AgentKind::Codex,
             host: HostId("test-host".into()),
             key: SessionKey::from_launcher_pid(pid),
             window_id: None,
@@ -306,7 +306,7 @@ mod tests {
         ] {
             let mut restarts = Restarts::default();
             let mut original = spec(1);
-            original.agent = AgentControl::Claude;
+            original.agent = AgentKind::Claude;
             restarts.enqueue(vec![original.clone()], |_, _| BindingPresence::Missing);
             let mut job = restarts.next().unwrap();
             assert!(job.needs_cleanup_before_launch());
@@ -412,7 +412,7 @@ mod tests {
             "an unseen replacement might still attach"
         );
         let mut replacement = crate::state::LauncherState::for_test(
-            AgentControl::Codex,
+            AgentKind::Codex,
             crate::state::SessionStatus::Starting,
         );
         replacement.host = HostId("test-host".into());
@@ -528,7 +528,7 @@ mod tests {
             }),
         );
         let mut row = crate::state::LauncherState::for_test(
-            AgentControl::Codex,
+            AgentKind::Codex,
             crate::state::SessionStatus::Starting,
         );
         row.host = HostId("test-host".into());

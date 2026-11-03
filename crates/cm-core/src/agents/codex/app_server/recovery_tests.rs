@@ -35,8 +35,7 @@ impl Drop for Scratch {
 }
 
 fn disconnected_row() -> LauncherState {
-    let mut row =
-        LauncherState::for_test(AgentControl::Codex, crate::state::SessionStatus::Starting);
+    let mut row = LauncherState::for_test(AgentKind::Codex, crate::state::SessionStatus::Starting);
     row.codex_mode = super::super::CodexMode::AppServer;
     row.codex_connected = Some(false);
     row.session_id = Some("saved-thread".into());
@@ -332,6 +331,7 @@ async fn disconnected_launcher_requires_ordered_absence_for_lost_requests() {
                 child,
                 relay,
                 control,
+                crate::agent::session::SessionPublisher::test_writer(),
                 std::future::pending(),
             )
             .await
@@ -516,6 +516,7 @@ async fn kill_and_restart_verify_cleanup_after_a_lost_reply() {
                 child,
                 relay,
                 control,
+                crate::agent::session::SessionPublisher::test_writer(),
                 std::future::pending(),
             )
             .await

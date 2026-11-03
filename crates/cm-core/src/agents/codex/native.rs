@@ -1,6 +1,6 @@
 //! Codex CLI backend. Owns every Codex-specific path, rollout JSON shape, and
 //! hook event mapping. The dashboard reaches everything in here only via
-//! `crate::agent::AgentControl::Codex`'s match arms.
+//! `crate::agent::AgentKind::Codex`'s agent-local definition.
 //!
 //! Codex's hook system is a near-clone of Claude Code's: the same event names
 //! (minus a few) and an identical snake_case stdin payload, so the launcher
@@ -352,8 +352,6 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
         cwd: None,
         // Codex recomputes from a bounded tail each refresh — no incremental
         // cursor to carry.
-        cursor: None,
-        antigravity_cursor: None,
     }
 }
 
@@ -456,7 +454,7 @@ fn list_resumable_at_cached(
                 return None;
             };
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Codex,
+                agent: crate::agent::AgentKind::Codex,
                 session_id,
                 cwd,
                 first_prompt: header.first_prompt,
@@ -1289,7 +1287,7 @@ mod tests {
             let args: Vec<_> = args.into_iter().map(str::to_string).collect();
             assert!(read_resume_metadata_at(&home, &args).is_none(), "{args:?}");
         }
-        let args = crate::agent::AgentControl::Codex.resume_args("saved-id", false);
+        let args = crate::agent::AgentKind::Codex.resume_args("saved-id", false);
         assert_eq!(
             read_resume_metadata_at(&home, &args).unwrap().session_id,
             "saved-id"
@@ -1865,7 +1863,7 @@ mod tests {
     }
 
     fn active_state() -> LauncherState {
-        LauncherState::for_test(crate::agent::AgentControl::Codex, SessionStatus::Active)
+        LauncherState::for_test(crate::agent::AgentKind::Codex, SessionStatus::Active)
     }
 
     fn pre_tool_use(tool: &str) -> HookMessage {

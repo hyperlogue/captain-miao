@@ -1,8 +1,9 @@
 //! Opt-in compatibility test using the real agy, a PTY and a loopback model.
 //! Run with `CM_TEST_AGY_BIN=/path/to/agy nix develop -c cargo test -p cm-core
 //! real_agy_tracks_startup_completion_cancellation_and_resume -- --ignored`.
+use super::metadata::read_transcript_stats;
 use super::*;
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -88,14 +89,14 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
         String::from_utf8_lossy(&output.stderr)
     );
     let checkpoints: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Starting);
     let mut conversation = None;
     let mut user_hook_ran = false;
     for checkpoint in checkpoints.as_array().unwrap() {
         let phase = checkpoint["phase"].as_str().unwrap();
         let snapshot = Path::new(checkpoint["snapshot"].as_str().unwrap());
         if phase == "resume" {
-            state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
+            state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Starting);
         }
         let events = checkpoint["events"].as_array().unwrap();
         for event in events {
@@ -169,7 +170,7 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
             }
             "approval" | "accept-approval" => {
                 assert_eq!(state.status, SessionStatus::WaitingForApproval);
-                assert!(AgentControl::Antigravity.capabilities().approval_gate);
+                assert!(AgentKind::Antigravity.capabilities().approval_gate);
             }
             "cancel-approval" => assert_eq!(state.status, SessionStatus::Idle),
             "accepted" => assert_eq!(state.status, SessionStatus::Active),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    agent::AgentControl,
+    agent::AgentKind,
     backend::{Backend, RemoteBackend},
     state::HostId,
 };
@@ -33,11 +33,11 @@ fn open(d: &mut TestDashboard) {
 fn launch_options_start_with_defaults_and_follow_enabled_preference_order() {
     let mut d = with_hosts(3, 100, 24);
     d.app.agent_order = vec![
-        (AgentControl::Kimi, false),
-        (AgentControl::Codex, true),
-        (AgentControl::Claude, true),
+        (AgentKind::Kimi, false),
+        (AgentKind::Codex, true),
+        (AgentKind::Claude, true),
     ];
-    d.app.new_session_agent = AgentControl::Codex;
+    d.app.new_session_agent = AgentKind::Codex;
     d.app.extra_prefs.host_order = Some(vec!["host-02".into(), "local".into(), "host-01".into()]);
     open(&mut d);
     let out = d.render();
@@ -53,8 +53,8 @@ fn launch_options_start_with_defaults_and_follow_enabled_preference_order() {
     assert!(d.app.launch_options.is_none());
     assert_eq!(d.app.input_mode, InputMode::Picker);
     assert!(matches!(&d.app.picker.as_ref().unwrap().kind,
-        super::super::PickerKind::Workdir { agent: AgentControl::Claude, host, .. } if host.is_local()));
-    assert_eq!(d.app.new_session_agent, AgentControl::Codex);
+        super::super::PickerKind::Workdir { agent: AgentKind::Claude, host, .. } if host.is_local()));
+    assert_eq!(d.app.new_session_agent, AgentKind::Codex);
     assert_eq!(d.app.default_host_or_local(), HostId("host-02".into()));
 }
 
@@ -106,7 +106,7 @@ fn launch_options_ctrl_o_launches_the_captured_highlight_not_the_filter() {
             cwd,
             worktree,
         }) => {
-            assert_eq!(agent, AgentControl::Codex);
+            assert_eq!(agent, AgentKind::Codex);
             assert!(host.is_local());
             assert_eq!(cwd, "~/project-two");
             assert!(worktree.is_none());
@@ -234,7 +234,7 @@ fn launch_options_keep_preserves_input_and_disarms_unsupported_worktrees() {
     assert!(matches!(
         d.app.picker.as_ref().unwrap().kind,
         super::super::PickerKind::Workdir {
-            agent: AgentControl::OpenCode,
+            agent: AgentKind::OpenCode,
             worktree: None,
             ..
         }

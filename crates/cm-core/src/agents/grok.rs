@@ -1,6 +1,6 @@
 //! Grok Build CLI backend. Owns every Grok-specific path, env var and hook
 //! payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Grok`'s match arms.
+//! `crate::agent::AgentKind::Grok`'s agent-local definition.
 //!
 //! Written from `xai-org/grok-build` (`10-hooks.md`, `17-sessions.md`,
 //! `crates/codegen/xai-grok-hooks/src/{event,matcher}.rs`) and checked against a
@@ -24,7 +24,7 @@
 //! parent's TUI), so it still reaches Approval. What 1.0.5 *also* fires on
 //! the parent session id is the echo ~20ms after a subagent's auto-allowed
 //! `run_terminal_command` has already started (`wait_ms` 10–40, no UI).
-//! Those are dropped — see [`permission_prompt_already_resolved`].
+//! Those are dropped — see [`Hooks`].
 //!
 //! **What this module still does not do**, and why:
 //!
@@ -64,10 +64,8 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
@@ -258,7 +256,7 @@ fn list_resumable_in_cached(
             let git_branch = summary.git_branch();
             let first_prompt = summary.last_turn_summary();
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Grok,
+                agent: crate::agent::AgentKind::Grok,
                 session_id: session_id.to_string(),
                 cwd: summary.info.cwd,
                 first_prompt,
@@ -447,7 +445,7 @@ fn install_hooks_file(contents: &str) -> Result<()> {
 /// - **`Notification` / `permission_prompt` → `PermissionRequest`.** The
 ///   lifecycle hook that fires while a permission UI is waiting. 1.0.5 also
 ///   fires it on the parent session after a subagent bash auto-allow; those
-///   are not a waiting UI ([`permission_prompt_already_resolved`]).
+///   are not a waiting UI ([`Hooks`]).
 /// - **`Notification` / `idle_prompt` → `Stop`.** Grok's documented backstop
 ///   for turns that report none of Stop / StopFailure / StopCancelled (bash
 ///   mode, rewind, a superseded report). Delayed ~1 minute; cancelled if the
@@ -784,150 +782,126 @@ fn is_session_end_stop(raw: Option<&str>) -> bool {
 /// choice card, not work), and a `permission_prompt` that is a subagent
 /// auto-allow echo rather than a waiting UI. Everything else maps the way
 /// every backend maps it.
-pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
-    // A subagent's hooks share this process's socket. Adopting their session
-    // id would rename the parent row, their Stop/StopCancelled would Idle a
-    // session that is still working, and their `generated_title` would wear
-    // the parent's name. `10-hooks.md` is explicit: exit early when
-    // `subagentType` is present. Parse also drops `transcript_path` on these
-    // so the launcher cannot switch its watch before we get here.
-    //
-    // Child Pre/PostToolUse is still evidence: 1.0.5's `permission_prompt`
-    // Notification is parent-attributed and arrives *after* an auto-allowed
-    // child bash has started, so the child's tool event is what releases a
-    // stuck Approval (and [`note_child_pre`] so a Notification in the echo
-    // window never enters it).
-    if msg.session_is_child == Some(true) {
-        if msg.event == HookEvent::PreToolUse {
-            note_child_pre(state.launcher_pid);
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(crate) struct Hooks {
+    last_child_pre: Option<Instant>,
+}
+
+impl crate::agents::hook_session::HookSession for Hooks {
+    fn dispatch_hook(&mut self, state: &mut LauncherState, mut msg: HookMessage) {
+        // A subagent's hooks share this process's socket. Adopting their session
+        // id would rename the parent row, their Stop/StopCancelled would Idle a
+        // session that is still working, and their `generated_title` would wear
+        // the parent's name. `10-hooks.md` is explicit: exit early when
+        // `subagentType` is present. Parse also drops `transcript_path` on these
+        // so the launcher cannot switch its watch before we get here.
+        //
+        // Child Pre/PostToolUse is still evidence: 1.0.5's `permission_prompt`
+        // Notification is parent-attributed and arrives *after* an auto-allowed
+        // child bash has started, so the child's tool event is what releases a
+        // stuck Approval (and [`Hooks`] so a Notification in the echo
+        // window never enters it).
+        if msg.session_is_child == Some(true) {
+            if msg.event == HookEvent::PreToolUse {
+                self.last_child_pre = Some(Instant::now());
+            }
+            if matches!(
+                msg.event,
+                HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            ) && state.status == SessionStatus::WaitingForApproval
+            {
+                state.status = SessionStatus::Active;
+            }
+            return;
         }
-        if matches!(
-            msg.event,
+
+        // A session-end `Stop` is not a turn end. Harmless for status either way
+        // (the row is on its way out), but it is also the payload that carries
+        // `backgroundTasks`, and reading *that* list from a shutdown is how a
+        // session ends up looking like it has live background work.
+        if msg.event == HookEvent::Stop && is_session_end_stop(msg.raw.as_deref()) {
+            common::adopt_session_facts(state, &mut msg);
+            return;
+        }
+
+        if msg.event == HookEvent::Stop {
+            match shells_from_stop(msg.raw.as_deref()) {
+                Some(shells) if !shells.is_empty() => {
+                    common::adopt_session_facts(state, &mut msg);
+                    state.last_tool = None;
+                    state.status = SessionStatus::BackgroundActive;
+                    state.background_commands = shells.into_iter().map(|s| s.key).collect();
+                    return;
+                }
+                None if matches!(state.status, SessionStatus::BackgroundActive) => {
+                    // `idle_prompt` (and any Stop that omitted the list) is not
+                    // evidence the live work ended — the previous Stop already
+                    // named it. Hold the background row rather than flashing Idle.
+                    common::adopt_session_facts(state, &mut msg);
+                    return;
+                }
+                Some(_) | None => {
+                    // Empty list, or absent on a non-background row: the turn ended.
+                    state.background_commands.clear();
+                }
+            }
+        }
+
+        match msg.event {
+            // Events no hook of ours registers, so they never reach this
+            // dispatcher (see `build_hooks_settings`). Ignored explicitly rather
+            // than mapped defensively — the exhaustive match that forces a
+            // decision on a newly-added `HookEvent` variant is
+            // `common::dispatch_default`'s.
+            HookEvent::Elicitation | HookEvent::ElicitationResult | HookEvent::CwdChanged => {}
+            // `ask_user_question` is Grok's AskUserQuestion analog — a tool that
+            // renders a multiple-choice card and blocks until the user picks. It
+            // is auto-allowed (the permission_prompt Notification, when it fires
+            // at all, resolves in 0ms), so this `PreToolUse` is the only signal
+            // the session is waiting. Without an arm here the row sits at plain
+            // `Active` for as long as the card is up. Surface it as
+            // `WaitingForDecision` ("Decision"), the same bucket as Claude's
+            // `AskUserQuestion`, Codex's `request_user_input` and Reasonix's
+            // `ask`. A gated `ask_user_question` that does fire
+            // `PermissionRequest` lands here too, so it reads as a question
+            // rather than a tool-approval gate.
+            HookEvent::PreToolUse | HookEvent::PermissionRequest
+                if msg.tool_name.as_deref() == Some("ask_user_question") =>
+            {
+                common::adopt_session_facts(state, &mut msg);
+                state.status = SessionStatus::WaitingForDecision;
+                state.last_tool = msg.tool_name;
+            }
+            // A `permission_prompt` that is not a waiting UI: 1.0.5 forwards
+            // subagent bash auto-allows on the parent session id *after* the
+            // child's PreToolUse. A subagent that is actually waiting has no
+            // child Pre yet, so it still takes the shared mapping to Approval.
+            HookEvent::PermissionRequest
+                if self
+                    .last_child_pre
+                    .is_some_and(|t| t.elapsed() <= PERMISSION_ECHO_AFTER_CHILD_PRE) =>
+            {
+                common::adopt_session_facts(state, &mut msg);
+            }
+            // Grok issues tools in parallel. A `search_replace` PostToolUse 35ms
+            // after `ask_user_question`'s PreToolUse is the shared mapping
+            // snapping Decision back to Active while the card is still up. Hold
+            // the row until the question tool itself completes — that
+            // PostToolUse takes the shared mapping through the catch-all.
             HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
-        ) && state.status == SessionStatus::WaitingForApproval
-        {
-            state.status = SessionStatus::Active;
-        }
-        return;
-    }
-
-    // A session-end `Stop` is not a turn end. Harmless for status either way
-    // (the row is on its way out), but it is also the payload that carries
-    // `backgroundTasks`, and reading *that* list from a shutdown is how a
-    // session ends up looking like it has live background work.
-    if msg.event == HookEvent::Stop && is_session_end_stop(msg.raw.as_deref()) {
-        common::adopt_session_facts(state, &mut msg);
-        return;
-    }
-
-    if msg.event == HookEvent::Stop {
-        match shells_from_stop(msg.raw.as_deref()) {
-            Some(shells) if !shells.is_empty() => {
+                if state.status == SessionStatus::WaitingForDecision
+                    && msg.tool_name.as_deref() != Some("ask_user_question") =>
+            {
                 common::adopt_session_facts(state, &mut msg);
-                state.last_tool = None;
-                state.status = SessionStatus::BackgroundActive;
-                state.background_commands = shells.into_iter().map(|s| s.key).collect();
-                return;
             }
-            None if matches!(state.status, SessionStatus::BackgroundActive) => {
-                // `idle_prompt` (and any Stop that omitted the list) is not
-                // evidence the live work ended — the previous Stop already
-                // named it. Hold the background row rather than flashing Idle.
-                common::adopt_session_facts(state, &mut msg);
-                return;
-            }
-            Some(_) | None => {
-                // Empty list, or absent on a non-background row: the turn ended.
-                state.background_commands.clear();
-            }
+            _ => common::dispatch_default(state, msg),
         }
-    }
-
-    match msg.event {
-        // Events no hook of ours registers, so they never reach this
-        // dispatcher (see `build_hooks_settings`). Ignored explicitly rather
-        // than mapped defensively — the exhaustive match that forces a
-        // decision on a newly-added `HookEvent` variant is
-        // `common::dispatch_default`'s.
-        HookEvent::Elicitation | HookEvent::ElicitationResult | HookEvent::CwdChanged => {}
-        // `ask_user_question` is Grok's AskUserQuestion analog — a tool that
-        // renders a multiple-choice card and blocks until the user picks. It
-        // is auto-allowed (the permission_prompt Notification, when it fires
-        // at all, resolves in 0ms), so this `PreToolUse` is the only signal
-        // the session is waiting. Without an arm here the row sits at plain
-        // `Active` for as long as the card is up. Surface it as
-        // `WaitingForDecision` ("Decision"), the same bucket as Claude's
-        // `AskUserQuestion`, Codex's `request_user_input` and Reasonix's
-        // `ask`. A gated `ask_user_question` that does fire
-        // `PermissionRequest` lands here too, so it reads as a question
-        // rather than a tool-approval gate.
-        HookEvent::PreToolUse | HookEvent::PermissionRequest
-            if msg.tool_name.as_deref() == Some("ask_user_question") =>
-        {
-            common::adopt_session_facts(state, &mut msg);
-            state.status = SessionStatus::WaitingForDecision;
-            state.last_tool = msg.tool_name;
-        }
-        // A `permission_prompt` that is not a waiting UI: 1.0.5 forwards
-        // subagent bash auto-allows on the parent session id *after* the
-        // child's PreToolUse. A subagent that is actually waiting has no
-        // child Pre yet, so it still takes the shared mapping to Approval.
-        HookEvent::PermissionRequest if permission_prompt_already_resolved(state) => {
-            common::adopt_session_facts(state, &mut msg);
-        }
-        // Grok issues tools in parallel. A `search_replace` PostToolUse 35ms
-        // after `ask_user_question`'s PreToolUse is the shared mapping
-        // snapping Decision back to Active while the card is still up. Hold
-        // the row until the question tool itself completes — that
-        // PostToolUse takes the shared mapping through the catch-all.
-        HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure
-            if state.status == SessionStatus::WaitingForDecision
-                && msg.tool_name.as_deref() != Some("ask_user_question") =>
-        {
-            common::adopt_session_facts(state, &mut msg);
-        }
-        _ => common::dispatch_default(state, msg),
     }
 }
 
-/// 1.0.5 fires `permission_prompt` on the **parent** session id after a
-/// subagent's auto-allowed `run_terminal_command` has already started
-/// (`wait_ms` 10–40; the Notification lands ~20ms after that child's
-/// PreToolUse). Timings measured off a launcher log, not documented.
-///
-/// The tell is the child's own PreToolUse: auto-allow runs the tool first,
-/// then the Notification; a waiting prompt has no child PreToolUse yet (the
-/// tool cannot start). `last_tool` on the parent is *not* that tell — the
-/// parent is routinely in `get_command_or_subagent_output` while a child
-/// actually waits, and Grok queues that prompt on the parent TUI.
-///
-/// The timestamp is **not** on [`LauncherState`]: it is Grok-only scratch
-/// and a launcher is one process per session, so a pid-keyed map here is
-/// enough. Other backends never see it.
-fn permission_prompt_already_resolved(state: &LauncherState) -> bool {
-    child_pre_is_recent(state.launcher_pid)
-}
-
-/// Observed echo is ~20ms. Wide enough for a slow hook spawn, tight enough
-/// that a later real wait is not eaten by an earlier child's PreToolUse.
+/// Parent-attributed permission echoes follow an auto-allowed child tool by
+/// about 20ms. Keep that evidence on this session only, for at most 500ms.
 const PERMISSION_ECHO_AFTER_CHILD_PRE: Duration = Duration::from_millis(500);
-
-static LAST_CHILD_PRE: LazyLock<Mutex<HashMap<u32, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn note_child_pre(launcher_pid: u32) {
-    if let Ok(mut m) = LAST_CHILD_PRE.lock() {
-        m.insert(launcher_pid, Instant::now());
-    }
-}
-
-fn child_pre_is_recent(launcher_pid: u32) -> bool {
-    LAST_CHILD_PRE
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&launcher_pid).copied())
-        .is_some_and(|t| t.elapsed() <= PERMISSION_ECHO_AFTER_CHILD_PRE)
-}
 
 /// Live background work named on a `Stop` payload, or `None` when the payload
 /// did not carry the arrays (a Notification forwarded as Stop, an older grok,
@@ -1205,7 +1179,7 @@ fn modified_secs(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     /// A `$GROK_HOME/sessions/` tree: one directory per cwd-key, one per session
     /// inside it, `summary.json` inside that.
@@ -1243,7 +1217,7 @@ mod tests {
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].git_branch.as_deref(), Some("main"));
         assert_eq!(out[0].first_prompt, None);
-        assert_eq!(out[0].agent, AgentControl::Grok);
+        assert_eq!(out[0].agent, AgentKind::Grok);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1494,16 +1468,39 @@ mod tests {
         )
     }
 
-    fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::Grok, status)
+    #[derive(Clone, Debug, PartialEq)]
+    struct TestSession {
+        row: LauncherState,
+        hooks: Hooks,
+    }
+    impl std::ops::Deref for TestSession {
+        type Target = LauncherState;
+        fn deref(&self) -> &LauncherState {
+            &self.row
+        }
+    }
+    impl std::ops::DerefMut for TestSession {
+        fn deref_mut(&mut self) -> &mut LauncherState {
+            &mut self.row
+        }
+    }
+    fn state_at(status: SessionStatus) -> TestSession {
+        TestSession {
+            row: LauncherState::for_test(AgentKind::Grok, status),
+            hooks: Hooks::default(),
+        }
     }
 
     /// Drive one hook end to end — parse the agent's stdin JSON, then dispatch it
     /// — so the tests exercise the same path a live hook takes, including the
     /// `Stop`-reason branch that only reads the raw payload.
-    fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
+    fn feed(state: &mut TestSession, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        dispatch_hook(state, msg);
+        crate::agents::hook_session::HookSession::dispatch_hook(
+            &mut state.hooks,
+            &mut state.row,
+            msg,
+        );
     }
 
     /// One `backgroundTasks` entry: the task `type`, its `status`, and the
@@ -1531,7 +1528,33 @@ mod tests {
     fn stop_status(extra: &str) -> SessionStatus {
         let mut state = state_at(SessionStatus::Active);
         feed(&mut state, HookEvent::Stop, &payload("stop", extra));
-        state.status
+        state.row.status
+    }
+
+    #[test]
+    fn two_hook_instances_with_the_same_pid_do_not_share_permission_evidence() {
+        let mut first = state_at(SessionStatus::Active);
+        let mut second = state_at(SessionStatus::Active);
+        first.session_id = Some("parent".into());
+        second.session_id = Some("parent".into());
+        assert_eq!(first.launcher_pid, second.launcher_pid);
+        feed(
+            &mut first,
+            HookEvent::PreToolUse,
+            &payload("pre_tool_use", &child_tool("run_terminal_command")),
+        );
+        feed(
+            &mut second,
+            HookEvent::PermissionRequest,
+            &permission_prompt("parent"),
+        );
+        assert_eq!(second.status, SessionStatus::WaitingForApproval);
+        feed(
+            &mut first,
+            HookEvent::PermissionRequest,
+            &permission_prompt("parent"),
+        );
+        assert_eq!(first.status, SessionStatus::Active);
     }
 
     /// A parent-attributed permission Notification — the shape Grok fires for
@@ -1685,9 +1708,6 @@ mod tests {
     #[test]
     fn a_subagent_auto_allow_does_not_stick_the_parent_at_approval() {
         let mut state = state_at(SessionStatus::Active);
-        // Distinct from `for_test`'s pid 0 so a parallel test's PermissionRequest
-        // cannot see this child's PreToolUse in the process-wide echo map.
-        state.launcher_pid = 11;
         state.session_id = Some("parent".to_string());
         state.last_tool = Some("get_command_or_subagent_output".to_string());
         feed(
@@ -2473,3 +2493,6 @@ mod tests {
         assert!(clipboard_bridge_env(Some(farm), None, Some(OsStr::new(":0"))).is_none());
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

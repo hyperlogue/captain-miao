@@ -15,7 +15,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::backend::{LaunchPlan, RemoteBackend};
 use crate::state::{DetachReport, HostId, LauncherState};
 use crate::terminal::{SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget};
@@ -79,7 +79,7 @@ impl WindowLaunch {
 }
 
 pub(super) struct Request {
-    pub agent: AgentControl,
+    pub agent: AgentKind,
     pub window: WindowLaunch,
     /// A removed/replaced backend must not open a window from its stale reply.
     /// `None` denotes the direct-local backend, including in isolated tests.
@@ -477,7 +477,7 @@ mod tests {
 
     fn request(host: &str, local_token: &str) -> Request {
         Request {
-            agent: AgentControl::Codex,
+            agent: AgentKind::Codex,
             window: WindowLaunch {
                 local_token: local_token.into(),
                 host: HostId(host.into()),
@@ -498,7 +498,7 @@ mod tests {
     }
 
     fn row(host: &str, token: &str, pid: u32) -> LauncherState {
-        let mut row = LauncherState::for_test(AgentControl::Codex, SessionStatus::Starting);
+        let mut row = LauncherState::for_test(AgentKind::Codex, SessionStatus::Starting);
         row.host = HostId(host.into());
         row.launcher_pid = pid;
         row.pool_session = Some(token.into());

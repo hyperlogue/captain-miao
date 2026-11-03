@@ -21,8 +21,8 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::CodexConfig;
-use crate::agent::{AgentControl, ResumeCandidate};
-use crate::state::LauncherState;
+use crate::agent::{AgentKind, ResumeCandidate};
+use crate::state::{self, LauncherState};
 pub(crate) use control::{Control, StopRequest};
 pub(crate) use environment::Environments;
 pub(crate) use kill::kill;
@@ -67,7 +67,7 @@ pub fn list_resumable(config: &CodexConfig, limit: usize) -> Result<Vec<ResumeCa
                     continue;
                 };
                 candidates.push(ResumeCandidate {
-                    agent: AgentControl::Codex,
+                    agent: AgentKind::Codex,
                     session_id: id.into(),
                     cwd: cwd.into(),
                     first_prompt: thread["preview"]
@@ -455,3 +455,63 @@ mod kill_tests;
 
 #[cfg(test)]
 mod startup_tests;
+
+#[cfg(test)]
+mod launcher_tests;
+
+pub(crate) async fn run(
+    config: super::CodexConfig,
+    session: crate::agent::session::SessionContext,
+) -> Result<crate::agent::session::SessionExit> {
+    let crate::agent::session::SessionContext {
+        request,
+        mut state,
+        listener,
+        updates,
+        mut commands,
+    } = session;
+    let state = &mut state;
+    let config = &config;
+    let cwd = request.cwd.as_str();
+    let args = &request.args;
+    let shim = request.shim.as_deref();
+    use crate::agents::codex::app_server;
+    let socket = state::runtime_dir()
+        .join("launchers")
+        .join(format!("{}-codex.sock", state.launcher_pid));
+    let mut control = app_server::Control::start(listener);
+    state.codex_control = true;
+    let shutdown = commands.stop();
+    tokio::pin!(shutdown);
+    // Control precedes both handoff and preflight. Acknowledging Stop here is
+    // safe: the TUI has not started and cannot have created server-owned work.
+    let (relay, mut command) = tokio::select! {
+        biased;
+        request = control.requests.recv() => {
+            if let Some(request) = request {
+                request.reply(None).await;
+                return Ok(crate::agent::session::SessionExit { code: 0 });
+            }
+            Err(anyhow::anyhow!("Codex launcher control stopped during startup"))
+        }
+        _ = &mut shutdown => return Ok(crate::agent::session::SessionExit { code: 143 }),
+        prepared = async {
+            updates.write(state).await?;
+            crate::agents::codex::wait_for_handoff(args, state.launcher_pid).await?;
+            let environment = app_server::Environments::for_project(cwd);
+            let relay = app_server::Relay::start_with_environment(config, &socket, Some(environment)).await?;
+            let command = app_server::command(cwd, args, &socket, shim)?;
+            Ok((relay, command))
+        } => prepared,
+    }?;
+    // The caller's FailedToStart handler clears control ownership on any
+    // preparation/spawn error and retains its ordinary signal removal path.
+    let child = command
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting attached Codex TUI")?;
+    state.child_pid = child.id();
+    app_server::supervise(config, state, child, relay, control, updates, shutdown)
+        .await
+        .map(|code| crate::agent::session::SessionExit { code })
+}

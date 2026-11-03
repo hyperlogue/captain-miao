@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCache};
+use crate::agent::{AgentKind, ResumeCandidate, SessionIndex, SessionIndexCache};
 
 // =============================================================================
 // What to open, and how
@@ -30,11 +30,10 @@ use crate::agent::{AgentControl, ResumeCandidate, SessionIndex, SessionIndexCach
 /// The subcommand every launcher argv goes through: `miao launch <agent> <cwd>`.
 ///
 /// One verb rather than one subcommand per backend, so the top-level CLI doesn't
-/// grow with the agent list and `AgentControl::from_cli` stays the single
+/// grow with the agent list and `AgentKind::from_cli` stays the single
 /// authority on the names. Both binaries' clap enums must spell it the same way;
 /// each has a test that parses an argv built here to make sure they do.
 pub const LAUNCH_VERB: &str = "launch";
-use crate::agents::{antigravity, codex};
 use crate::paths;
 use crate::session_flags::SessionFlagsStore;
 use crate::state::{self, LauncherState, SessionFlags, SessionKey, SessionStatus};
@@ -80,7 +79,7 @@ pub enum SessionRemoval {
 /// because it rides the wire to a remote server (`ClientFrame::OpenSession`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenSpec {
-    pub agent: AgentControl,
+    pub agent: AgentKind,
     pub cwd: String,
     /// `Some((session_id, fork))` to resume an existing session (`fork` continues
     /// it on a branch instead of in place); `None` for a brand-new session.
@@ -174,14 +173,17 @@ impl Drop for TitleRetry {
 /// every other row and untitled sessions untouched so the display falls
 /// through to the folded first prompt. Split from the cache upkeep for tests.
 fn stamp_titles(
-    agent: AgentControl,
+    agent: AgentKind,
     sessions: &mut [LauncherState],
     titles: &HashMap<String, Option<String>>,
 ) {
-    for s in sessions
-        .iter_mut()
-        .filter(|s| s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native()))
-    {
+    for s in sessions.iter_mut().filter(|s| {
+        s.agent == agent
+            && agent
+                .definition()
+                .title_source()
+                .is_some_and(|source| (source.accepts)(s))
+    }) {
         if let Some(title) = s
             .session_id
             .as_ref()
@@ -204,8 +206,8 @@ fn stamp_titles(
 /// calls the same operations.
 #[derive(Default)]
 pub struct LocalBackend {
-    session_index_caches: HashMap<AgentControl, SessionIndexCache>,
-    title_caches: Mutex<HashMap<AgentControl, SessionTitles>>,
+    session_index_caches: HashMap<AgentKind, SessionIndexCache>,
+    title_caches: Mutex<HashMap<AgentKind, SessionTitles>>,
     resume: Arc<crate::resume::Inventory>,
     /// The owning host's existing change channel. Deferred title reads and
     /// automatic flag writes wake it so every subscriber can refresh.
@@ -340,23 +342,16 @@ impl LocalBackend {
     /// deadline stays fixed during a burst, so an idle rename arrives without
     /// another event and a busy store cannot keep postponing the refresh.
     fn overlay_titles(&self, sessions: &mut [LauncherState]) {
-        self.overlay_titles_with(
-            AgentControl::Codex,
-            sessions,
-            codex::title_store_mtimes,
-            codex::read_thread_titles,
-        );
-        self.overlay_titles_with(
-            AgentControl::Antigravity,
-            sessions,
-            antigravity::title_store_mtimes,
-            antigravity::read_titles,
-        );
+        for &agent in AgentKind::ALL {
+            if let Some(source) = agent.definition().title_source() {
+                self.overlay_titles_with(agent, sessions, source.stamp, source.read);
+            }
+        }
     }
 
     fn overlay_titles_with(
         &self,
-        agent: AgentControl,
+        agent: AgentKind,
         sessions: &mut [LauncherState],
         store_stamp: impl FnOnce() -> (Option<SystemTime>, Option<SystemTime>),
         read_titles: impl FnOnce(&[String]) -> HashMap<String, String>,
@@ -364,7 +359,11 @@ impl LocalBackend {
         let ids: Vec<String> = sessions
             .iter()
             .filter(|s| {
-                s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native())
+                s.agent == agent
+                    && agent
+                        .definition()
+                        .title_source()
+                        .is_some_and(|source| (source.accepts)(s))
             })
             .filter_map(|s| s.session_id.clone())
             .collect();
@@ -386,7 +385,11 @@ impl LocalBackend {
         let live: HashMap<_, _> = sessions
             .iter()
             .filter(|s| {
-                s.agent == agent && (agent != AgentControl::Codex || s.codex_mode.is_native())
+                s.agent == agent
+                    && agent
+                        .definition()
+                        .title_source()
+                        .is_some_and(|source| (source.accepts)(s))
             })
             .filter_map(|s| Some(((s.launcher_pid, s.session_id.clone()?), s.status.clone())))
             .collect();
@@ -433,7 +436,7 @@ impl LocalBackend {
 
     pub fn session_index(&mut self) -> SessionIndex {
         let mut merged = SessionIndex::default();
-        for &agent in AgentControl::ALL {
+        for &agent in AgentKind::ALL {
             let cache = self.session_index_caches.entry(agent).or_default();
             let shard = agent.read_session_index(cache);
             // Tag every pid this shard contributes with its owning backend so
@@ -511,25 +514,7 @@ impl LocalBackend {
             );
             return Ok(SessionRemoval::AlreadyGone);
         };
-        let pid = if state.codex_mode.is_native() {
-            state.launcher_pid
-        } else if state.codex_control {
-            return crate::agents::codex::app_server::kill(&state, policy);
-        } else if state.status == crate::state::SessionStatus::FailedToStart {
-            state.launcher_pid
-        } else {
-            anyhow::bail!("This Codex launcher cannot confirm cleanup yet; use an updated launcher")
-        };
-        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
-            Ok(SessionRemoval::Signalled)
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(SessionRemoval::AlreadyGone)
-            } else {
-                Err(error.into())
-            }
-        }
+        state.agent.definition().stop_session(&state, policy)
     }
 
     /// Build the argv for a local launcher window:
@@ -540,7 +525,7 @@ impl LocalBackend {
     /// dashboard (falls back to a bare `miao` on PATH if unresolvable — the
     /// dashboard binary's name, since that is what a local install puts there).
     ///
-    /// Fails only on [`AgentControl::Unknown`], and that is the whole reason it
+    /// Fails only on [`AgentKind::Unknown`], and that is the whole reason it
     /// returns a `Result`: the spec crosses the wire, so a **newer dashboard**
     /// can hand an older server a backend this build has never heard of. The
     /// tolerant decode (see [`crate::agent`]) makes that a live `Unknown`
@@ -548,10 +533,10 @@ impl LocalBackend {
     /// without the guard the argv would be `miao "" <cwd>`, a window that opens
     /// and dies on a clap error. Refusing here rather than at each caller keeps
     /// the check somewhere a future caller cannot forget it, and says the same
-    /// thing [`AgentControl::build_launch_command`] does for the launcher's own
+    /// thing [`AgentKind::build_launch_command`] does for the launcher's own
     /// side of the same problem.
     pub fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
-        if spec.agent == AgentControl::Unknown {
+        if spec.agent == AgentKind::Unknown {
             anyhow::bail!(crate::agent::UNKNOWN_AGENT_REFUSAL);
         }
         let exe = std::env::current_exe()
@@ -731,6 +716,20 @@ fn split_for_completion(path: &str) -> (String, String) {
 // Tests
 // =============================================================================
 
+/// Native sessions are terminated through their launcher, which owns the child.
+pub(crate) fn signal_launcher(pid: u32) -> anyhow::Result<SessionRemoval> {
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
+        Ok(SessionRemoval::Signalled)
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(SessionRemoval::AlreadyGone)
+        } else {
+            Err(error.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -740,10 +739,10 @@ mod tests {
             session_id: Some("rpc-thread".into()),
             codex_mode: crate::agents::codex::CodexMode::AppServer,
             name: Some("RPC title".into()),
-            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
+            ..LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle)
         }];
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || panic!("app-server mode must not stat native SQLite"),
             |_| panic!("app-server mode must not query native SQLite"),
@@ -762,30 +761,30 @@ mod tests {
         });
         let mut sessions: Vec<_> = (0..16)
             .map(|pid| {
-                let mut s = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+                let mut s = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Idle);
                 s.launcher_pid = pid;
                 s.session_id = Some(format!("session-{pid}"));
                 s
             })
             .collect();
-        let mut codex = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut codex = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         codex.session_id = Some("session-0".into());
         codex.name = Some("Codex title".into());
         sessions.push(codex);
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, stamp, |ids| {
+        backend.overlay_titles_with(AgentKind::Antigravity, &mut sessions, stamp, |ids| {
             assert_eq!(ids.len(), 16);
             ids.iter()
                 .map(|id| (id.clone(), format!("Title {id}")))
                 .collect()
         });
         for _ in 0..20 {
-            backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, stamp, |_| {
+            backend.overlay_titles_with(AgentKind::Antigravity, &mut sessions, stamp, |_| {
                 panic!("unchanged store/subscriber must reuse the shared cache")
             });
         }
         let changed = || (None, Some(SystemTime::UNIX_EPOCH));
-        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, changed, |_| {
+        backend.overlay_titles_with(AgentKind::Antigravity, &mut sessions, changed, |_| {
             panic!("busy store must defer its read")
         });
         tokio::time::advance(TITLE_REFRESH_FLOOR).await;
@@ -794,7 +793,7 @@ mod tests {
             wakes.load(Ordering::Relaxed),
             "idle rename must schedule its own refresh"
         );
-        backend.overlay_titles_with(AgentControl::Antigravity, &mut sessions, changed, |_| {
+        backend.overlay_titles_with(AgentKind::Antigravity, &mut sessions, changed, |_| {
             HashMap::from([("session-0".into(), "Renamed".into())])
         });
         assert_eq!(sessions[0].name.as_deref(), Some("Renamed"));
@@ -831,7 +830,7 @@ mod tests {
             launcher_pid: 1,
             session_id: session_id.map(str::to_string),
             first_prompt: Some("first prompt".into()),
-            ..LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle)
+            ..LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle)
         }
     }
 
@@ -854,9 +853,7 @@ mod tests {
             })
             .collect();
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
-            HashMap::new()
-        });
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| HashMap::new());
 
         // Restart resumes the same Codex threads under new launchers. A
         // missing cached title must not survive this lifecycle boundary just
@@ -866,7 +863,7 @@ mod tests {
         }
         let reads = std::cell::Cell::new(0);
         for _subscriber in 0..2 {
-            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
+            backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |ids| {
                 reads.set(reads.get() + 1);
                 assert_eq!(ids.len(), 8, "restart all shares one batch");
                 ids.iter()
@@ -892,9 +889,7 @@ mod tests {
         let mut sessions = [codex_state(Some("starting-session"))];
         sessions[0].status = SessionStatus::Starting;
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
-            HashMap::new()
-        });
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| HashMap::new());
 
         // Startup, a new turn, an approval prompt, and completion are useful
         // chances to recover a stale title even if its watcher missed a write.
@@ -906,7 +901,7 @@ mod tests {
         ] {
             sessions[0].status = status.clone();
             let title = format!("Title at {status:?}");
-            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+            backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| {
                 HashMap::from([("starting-session".into(), title.clone())])
             });
             assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
@@ -915,7 +910,7 @@ mod tests {
             // ordinary cache hits, as is another dashboard's same snapshot.
             sessions[0].name = None;
             sessions[0].updated_at += 1;
-            backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+            backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| {
                 panic!("an unchanged lifecycle must reuse the eager read")
             });
             assert_eq!(sessions[0].name.as_deref(), Some(title.as_str()));
@@ -933,13 +928,13 @@ mod tests {
             )
         };
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(0),
             |_| HashMap::new(),
         );
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(1),
             |_| panic!("an ordinary store write must be throttled"),
@@ -947,7 +942,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(500)).await;
         sessions[0].status = SessionStatus::Active;
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(1),
             |_| HashMap::from([("session".into(), "Eager title".into())]),
@@ -958,7 +953,7 @@ mod tests {
             .expect("other subscribers still need their original wake")
             .unwrap();
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(2),
             |_| panic!("the eager read starts a new throttle window"),
@@ -968,7 +963,7 @@ mod tests {
             .expect("a later store change still needs its own wake")
             .unwrap();
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(2),
             |_| HashMap::from([("session".into(), "Later title".into())]),
@@ -988,7 +983,7 @@ mod tests {
                 tokio::time::advance(Duration::from_millis(100)).await;
             }
             backend.overlay_titles_with(
-                AgentControl::Codex,
+                AgentKind::Codex,
                 &mut sessions,
                 || {
                     (
@@ -1015,7 +1010,7 @@ mod tests {
         other_changes.try_recv().expect("wake every subscriber");
         for _subscriber in 0..2 {
             backend.overlay_titles_with(
-                AgentControl::Codex,
+                AgentKind::Codex,
                 &mut sessions,
                 || (None, Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(9))),
                 |_| {
@@ -1039,7 +1034,7 @@ mod tests {
         let mut sessions = [codex_state(Some("renamed-session"))];
         let stamp = SystemTime::UNIX_EPOCH;
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || (Some(stamp), Some(stamp)),
             |_| HashMap::from([("renamed-session".into(), "Original title".into())]),
@@ -1049,7 +1044,7 @@ mod tests {
         // A rename is the only event: the agent stays idle and writes no
         // launcher state. Defer the read, but schedule a wake to finish it.
         let renamed_stamp = || (Some(stamp), Some(stamp + Duration::from_nanos(1)));
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("a rename inside the throttle window must defer its read")
         });
         assert_eq!(sessions[0].name.as_deref(), Some("Original title"));
@@ -1057,7 +1052,7 @@ mod tests {
             .await
             .expect("an idle rename needs a retry without any more file events")
             .unwrap();
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, renamed_stamp, |_| {
             HashMap::from([("renamed-session".into(), "Renamed title".into())])
         });
         assert_eq!(sessions[0].name.as_deref(), Some("Renamed title"));
@@ -1068,13 +1063,13 @@ mod tests {
         let (backend, mut changes) = title_backend_with_notifications();
         let mut sessions = vec![codex_state(Some("first-session"))];
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || (None, Some(SystemTime::UNIX_EPOCH)),
             |_| HashMap::from([("first-session".into(), "Original title".into())]),
         );
         let renamed_stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("the rename should be deferred")
         });
 
@@ -1082,10 +1077,10 @@ mod tests {
         // Existing subscribers still hold the original title, so their pending
         // notification must survive both this read and an unchanged-store pass.
         sessions.push(codex_state(Some("new-session")));
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, renamed_stamp, |_| {
             HashMap::from([("first-session".into(), "Renamed title".into())])
         });
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, renamed_stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, renamed_stamp, |_| {
             panic!("the title store is already cached")
         });
         tokio::time::timeout(Duration::from_millis(1100), changes.recv())
@@ -1114,13 +1109,13 @@ mod tests {
                     let backend = weak.upgrade().unwrap();
                     let mut sessions = [codex_state(Some("busy-session"))];
                     backend.overlay_titles_with(
-                        AgentControl::Codex,
+                        AgentKind::Codex,
                         &mut sessions,
                         || stamp(1),
                         |_| HashMap::new(),
                     );
                     backend.overlay_titles_with(
-                        AgentControl::Codex,
+                        AgentKind::Codex,
                         &mut sessions,
                         || stamp(2),
                         |_| panic!("the next change must be throttled too"),
@@ -1131,13 +1126,13 @@ mod tests {
         });
         let mut sessions = [codex_state(Some("busy-session"))];
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(0),
             |_| HashMap::new(),
         );
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut sessions,
             || stamp(1),
             |_| panic!("the first change should be deferred"),
@@ -1156,13 +1151,13 @@ mod tests {
             let (backend, mut changes) = title_backend_with_notifications();
             let mut sessions = [codex_state(Some("ending-session"))];
             backend.overlay_titles_with(
-                AgentControl::Codex,
+                AgentKind::Codex,
                 &mut sessions,
                 || (None, Some(SystemTime::UNIX_EPOCH)),
                 |_| HashMap::new(),
             );
             backend.overlay_titles_with(
-                AgentControl::Codex,
+                AgentKind::Codex,
                 &mut sessions,
                 || (Some(SystemTime::UNIX_EPOCH), None),
                 |_| panic!("a changed store should be throttled"),
@@ -1171,7 +1166,7 @@ mod tests {
                 drop(backend);
             } else {
                 backend.overlay_titles_with(
-                    AgentControl::Codex,
+                    AgentKind::Codex,
                     &mut [],
                     || panic!("no sessions should mean no store IO"),
                     |_| panic!("no sessions should mean no read"),
@@ -1190,14 +1185,14 @@ mod tests {
         let backend = LocalBackend::default();
         let mut sessions = vec![codex_state(Some("first-session"))];
         let stamp = || (Some(SystemTime::UNIX_EPOCH), None);
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |ids| {
             assert_eq!(ids, ["first-session"]);
             HashMap::from([("first-session".into(), "First title".into())])
         });
 
         // A state-file event does not query the unchanged title store.
         sessions[0].name = None;
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| {
             panic!("unchanged store should use cached titles")
         });
         assert_eq!(sessions[0].name.as_deref(), Some("First title"));
@@ -1205,21 +1200,21 @@ mod tests {
         // A new session must be queried even if the database has not changed.
         // An absent title is cached too, so that id will not trigger more reads.
         sessions.push(codex_state(Some("untitled-session")));
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |ids| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |ids| {
             assert_eq!(ids, ["first-session", "untitled-session"]);
             HashMap::from([("first-session".into(), "First title".into())])
         });
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| {
             panic!("untitled sessions should also be cached")
         });
         assert_eq!(sessions[1].name, None);
 
         sessions.remove(0);
-        backend.overlay_titles_with(AgentControl::Codex, &mut sessions, stamp, |_| {
+        backend.overlay_titles_with(AgentKind::Codex, &mut sessions, stamp, |_| {
             panic!("removing a session does not need another read")
         });
         assert_eq!(
-            backend.title_caches.lock().unwrap()[&AgentControl::Codex]
+            backend.title_caches.lock().unwrap()[&AgentKind::Codex]
                 .titles
                 .len(),
             1
@@ -1227,13 +1222,13 @@ mod tests {
 
         // Hosts without Codex sessions do not even stat the title store.
         backend.overlay_titles_with(
-            AgentControl::Codex,
+            AgentKind::Codex,
             &mut [],
             || panic!("no Codex sessions should mean no store IO"),
             |_| panic!("no Codex sessions should mean no title reads"),
         );
         assert!(
-            backend.title_caches.lock().unwrap()[&AgentControl::Codex]
+            backend.title_caches.lock().unwrap()[&AgentKind::Codex]
                 .titles
                 .is_empty()
         );
@@ -1246,14 +1241,14 @@ mod tests {
         titles.insert("sid-untitled".into(), None); // known but no title row yet
 
         let mut claude = codex_state(Some("sid-titled"));
-        claude.agent = AgentControl::Claude;
+        claude.agent = AgentKind::Claude;
         let mut sessions = vec![
             codex_state(Some("sid-titled")),
             codex_state(Some("sid-untitled")),
             codex_state(None),
             claude,
         ];
-        stamp_titles(AgentControl::Codex, &mut sessions, &titles);
+        stamp_titles(AgentKind::Codex, &mut sessions, &titles);
         // Titled Codex row gets the sqlite title on `name`.
         assert_eq!(sessions[0].name.as_deref(), Some("My Rename"));
         // Untitled / id-less Codex rows keep `name` empty → first-prompt shows.
@@ -1268,12 +1263,12 @@ mod tests {
     /// The launcher argv **after** the exe and the `launch` verb, so each case
     /// below reads as the agent name and its arguments. The verb itself is
     /// pinned once, in `the_launcher_argv_goes_through_the_launch_verb`.
-    fn open_argv(agent: AgentControl, resume: Option<(&str, bool)>) -> Vec<String> {
+    fn open_argv(agent: AgentKind, resume: Option<(&str, bool)>) -> Vec<String> {
         open_argv_worktree(agent, resume, None)
     }
 
     fn open_argv_worktree(
-        agent: AgentControl,
+        agent: AgentKind,
         resume: Option<(&str, bool)>,
         worktree: Option<&str>,
     ) -> Vec<String> {
@@ -1294,7 +1289,7 @@ mod tests {
     /// and on a remote host nobody would be watching.
     #[test]
     fn the_launcher_argv_goes_through_the_launch_verb() {
-        for &agent in AgentControl::ALL {
+        for &agent in AgentKind::ALL {
             let plan = LocalBackend::default()
                 .open_session(&OpenSpec {
                     agent,
@@ -1312,41 +1307,35 @@ mod tests {
     /// still plan its exact argv, not merely "not fail".
     #[test]
     fn open_session_new_session_argv() {
-        assert_eq!(open_argv(AgentControl::Claude, None), ["claude", "/work"]);
-        assert_eq!(open_argv(AgentControl::Codex, None), ["codex", "/work"]);
+        assert_eq!(open_argv(AgentKind::Claude, None), ["claude", "/work"]);
+        assert_eq!(open_argv(AgentKind::Codex, None), ["codex", "/work"]);
         // The cwd is *our* positional in every case — `miao <agent> <cwd>` — and
         // stays one for Reasonix even though the agent itself takes `--dir`,
         // because translating it is `build_launch_command`'s job (and must be:
         // `reasonix`'s own positional is a prompt).
-        assert_eq!(
-            open_argv(AgentControl::Reasonix, None),
-            ["reasonix", "/work"]
-        );
+        assert_eq!(open_argv(AgentKind::Reasonix, None), ["reasonix", "/work"]);
         // Kimi takes no directory argument at all (`build_launch_command` sets
         // the process cwd instead), so ours is the only positional here too.
-        assert_eq!(open_argv(AgentControl::Kimi, None), ["kimi", "/work"]);
+        assert_eq!(open_argv(AgentKind::Kimi, None), ["kimi", "/work"]);
         // Grok takes no directory argument of its own either — `build_launch_command`
         // sets the process cwd and passes nothing positional, because a bare
         // `--worktree` would otherwise swallow it.
-        assert_eq!(open_argv(AgentControl::Grok, None), ["grok", "/work"]);
+        assert_eq!(open_argv(AgentKind::Grok, None), ["grok", "/work"]);
         // opencode takes no directory argument either: `build_launch_command`
         // sets the process cwd and passes nothing positional. Its documented
         // `[project]` positional is unverified against a real binary, and a
         // flag guessed here is how the first cut died on `--dir`. Ours is the
         // only positional here too.
-        assert_eq!(
-            open_argv(AgentControl::OpenCode, None),
-            ["opencode", "/work"]
-        );
+        assert_eq!(open_argv(AgentKind::OpenCode, None), ["opencode", "/work"]);
         // Pi takes no directory argument either — its trailing positionals are
         // *prompts*, so `build_launch_command` sets the process cwd and passes
         // nothing positional. Ours is the only positional here too.
-        assert_eq!(open_argv(AgentControl::Pi, None), ["pi", "/work"]);
+        assert_eq!(open_argv(AgentKind::Pi, None), ["pi", "/work"]);
         // Antigravity takes no directory argument either — `agy` reads its
         // workspace from the process cwd, and its `--add-dir` *adds* one rather
         // than choosing it. Ours is the only positional here too.
         assert_eq!(
-            open_argv(AgentControl::Antigravity, None),
+            open_argv(AgentKind::Antigravity, None),
             ["antigravity", "/work"]
         );
     }
@@ -1359,7 +1348,7 @@ mod tests {
     #[test]
     fn open_session_refuses_an_unknown_agent() {
         let plan = LocalBackend::default().open_session(&OpenSpec {
-            agent: AgentControl::Unknown,
+            agent: AgentKind::Unknown,
             cwd: "/work".to_string(),
             resume: None,
             worktree: None,
@@ -1381,55 +1370,55 @@ mod tests {
     fn open_session_worktree_argv() {
         // An empty name asks the agent to generate one, so no name is passed.
         assert_eq!(
-            open_argv_worktree(AgentControl::Claude, None, Some("")),
+            open_argv_worktree(AgentKind::Claude, None, Some("")),
             ["claude", "/work", "--worktree"]
         );
         assert_eq!(
-            open_argv_worktree(AgentControl::Claude, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Claude, None, Some("feature-auth")),
             ["claude", "/work", "--worktree", "feature-auth"]
         );
         // A `#N` name is a PR to branch from, and must reach the agent intact.
         assert_eq!(
-            open_argv_worktree(AgentControl::Claude, None, Some("#1234")),
+            open_argv_worktree(AgentKind::Claude, None, Some("#1234")),
             ["claude", "/work", "--worktree", "#1234"]
         );
         // Codex has no worktree flag: the request is dropped, not turned into
         // an argument it would reject (which would fail the whole launch).
         assert_eq!(
-            open_argv_worktree(AgentControl::Codex, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Codex, None, Some("feature-auth")),
             ["codex", "/work"]
         );
         assert_eq!(
-            open_argv_worktree(AgentControl::Reasonix, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Reasonix, None, Some("feature-auth")),
             ["reasonix", "/work"]
         );
         assert_eq!(
-            open_argv_worktree(AgentControl::Kimi, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Kimi, None, Some("feature-auth")),
             ["kimi", "/work"]
         );
         // Grok's flag takes its value with `=`, in **one** argv element: its
         // worktree name is optional, so the separated form would let any later
         // positional be read as the name.
         assert_eq!(
-            open_argv_worktree(AgentControl::Grok, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Grok, None, Some("feature-auth")),
             ["grok", "/work", "--worktree=feature-auth"]
         );
         // With no name to pass there is no value to attach, and nothing follows
         // the flag in our argv, so the bare form is both safe and the only way to
         // ask Grok to mint the name.
         assert_eq!(
-            open_argv_worktree(AgentControl::Grok, None, Some("")),
+            open_argv_worktree(AgentKind::Grok, None, Some("")),
             ["grok", "/work", "--worktree"]
         );
         // opencode's plugin context has a `worktree` field, but no flag
         // launches into one, so the request is dropped like Codex's.
         assert_eq!(
-            open_argv_worktree(AgentControl::OpenCode, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::OpenCode, None, Some("feature-auth")),
             ["opencode", "/work"]
         );
         // Pi has no worktree flag either.
         assert_eq!(
-            open_argv_worktree(AgentControl::Pi, None, Some("feature-auth")),
+            open_argv_worktree(AgentKind::Pi, None, Some("feature-auth")),
             ["pi", "/work"]
         );
     }
@@ -1438,63 +1427,63 @@ mod tests {
     fn open_session_resume_and_fork_argv() {
         // Claude resumes/forks with flags on the same subcommand.
         assert_eq!(
-            open_argv(AgentControl::Claude, Some(("s1", false))),
+            open_argv(AgentKind::Claude, Some(("s1", false))),
             ["claude", "/work", "--resume", "s1"]
         );
         assert_eq!(
-            open_argv(AgentControl::Claude, Some(("s1", true))),
+            open_argv(AgentKind::Claude, Some(("s1", true))),
             ["claude", "/work", "--resume", "s1", "--fork-session"]
         );
         // Codex uses a `resume` / `fork` subcommand instead.
         assert_eq!(
-            open_argv(AgentControl::Codex, Some(("s2", false))),
+            open_argv(AgentKind::Codex, Some(("s2", false))),
             ["codex", "/work", "resume", "s2"]
         );
         assert_eq!(
-            open_argv(AgentControl::Codex, Some(("s2", true))),
+            open_argv(AgentKind::Codex, Some(("s2", true))),
             ["codex", "/work", "fork", "s2"]
         );
         // Reasonix resumes with a short flag and forks with `--copy`, which
         // continues in a writable copy rather than reopening the original.
         assert_eq!(
-            open_argv(AgentControl::Reasonix, Some(("s3", false))),
+            open_argv(AgentKind::Reasonix, Some(("s3", false))),
             ["reasonix", "/work", "-r", "s3"]
         );
         assert_eq!(
-            open_argv(AgentControl::Reasonix, Some(("s3", true))),
+            open_argv(AgentKind::Reasonix, Some(("s3", true))),
             ["reasonix", "/work", "-r", "s3", "--copy"]
         );
         // Kimi names the session it resumes. `--session <id>` and `--continue`
         // are mutually exclusive, so only ever one of them is emitted — and
         // never the bare `--session`, which opens its session browser.
         assert_eq!(
-            open_argv(AgentControl::Kimi, Some(("s4", false))),
+            open_argv(AgentKind::Kimi, Some(("s4", false))),
             ["kimi", "/work", "--session", "s4"]
         );
         // opencode resumes with `-s <id>` and branches with `--fork`. The id
         // arrives on `session.created` and on every direct hook
         // (`agents::opencode`), so both paths are reachable from the dashboard.
         assert_eq!(
-            open_argv(AgentControl::OpenCode, Some(("s5", false))),
+            open_argv(AgentKind::OpenCode, Some(("s5", false))),
             ["opencode", "/work", "-s", "s5"]
         );
         assert_eq!(
-            open_argv(AgentControl::OpenCode, Some(("s5", true))),
+            open_argv(AgentKind::OpenCode, Some(("s5", true))),
             ["opencode", "/work", "-s", "s5", "--fork"]
         );
         // Pi swaps the *flag* rather than adding one: `--session` opens that
         // session, `--fork` forks it into a new one, and the two are
         // alternatives — so a fork must never carry both.
         assert_eq!(
-            open_argv(AgentControl::Pi, Some(("s5", false))),
+            open_argv(AgentKind::Pi, Some(("s5", false))),
             ["pi", "/work", "--session", "s5"]
         );
         assert_eq!(
-            open_argv(AgentControl::Pi, Some(("s5", true))),
+            open_argv(AgentKind::Pi, Some(("s5", true))),
             ["pi", "/work", "--fork", "s5"]
         );
         assert!(
-            !open_argv(AgentControl::Pi, Some(("s5", true))).contains(&"--session".to_string()),
+            !open_argv(AgentKind::Pi, Some(("s5", true))).contains(&"--session".to_string()),
             "a Pi fork resumes through --fork alone"
         );
         // Antigravity resumes with `--conversation <id>` and cannot branch, so
@@ -1502,12 +1491,12 @@ mod tests {
         // the Kimi mechanism, pinned here because a silently-ignored argument
         // is exactly the kind that grows one by accident.
         assert_eq!(
-            open_argv(AgentControl::Antigravity, Some(("s5", false))),
+            open_argv(AgentKind::Antigravity, Some(("s5", false))),
             ["antigravity", "/work", "--conversation", "s5"]
         );
         assert_eq!(
-            open_argv(AgentControl::Antigravity, Some(("s5", true))),
-            open_argv(AgentControl::Antigravity, Some(("s5", false))),
+            open_argv(AgentKind::Antigravity, Some(("s5", true))),
+            open_argv(AgentKind::Antigravity, Some(("s5", false))),
             "a fork request must leave an Antigravity argv unchanged"
         );
     }
@@ -1520,17 +1509,17 @@ mod tests {
     /// silently turn a hidden key back into one that resumes in place.
     #[test]
     fn kimi_forks_and_resumes_identically() {
-        let plain = open_argv(AgentControl::Kimi, Some(("s4", false)));
-        let forked = open_argv(AgentControl::Kimi, Some(("s4", true)));
+        let plain = open_argv(AgentKind::Kimi, Some(("s4", false)));
+        let forked = open_argv(AgentKind::Kimi, Some(("s4", true)));
         assert_eq!(plain, forked, "a fork request must add nothing for Kimi");
-        assert!(!AgentControl::Kimi.supports_fork());
+        assert!(!AgentKind::Kimi.supports_fork());
         // The other three still differ, so this test can't pass by the argv
         // having stopped carrying the flag for everyone.
         for agent in [
-            AgentControl::Claude,
-            AgentControl::Codex,
-            AgentControl::Reasonix,
-            AgentControl::Pi,
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Reasonix,
+            AgentKind::Pi,
         ] {
             assert_ne!(
                 open_argv(agent, Some(("s4", false))),
@@ -1541,11 +1530,11 @@ mod tests {
         // Grok's resume flags are Claude's exactly, which is why the two share an
         // arm — this pins that they may only share it while that stays true.
         assert_eq!(
-            open_argv(AgentControl::Grok, Some(("s4", false))),
+            open_argv(AgentKind::Grok, Some(("s4", false))),
             ["grok", "/work", "--resume", "s4"]
         );
         assert_eq!(
-            open_argv(AgentControl::Grok, Some(("s4", true))),
+            open_argv(AgentKind::Grok, Some(("s4", true))),
             ["grok", "/work", "--resume", "s4", "--fork-session"]
         );
     }
@@ -1574,7 +1563,7 @@ mod tests {
         // shell word, so a `~` there would be a literal directory name.
         let plan = backend
             .open_session(&OpenSpec {
-                agent: AgentControl::Claude,
+                agent: AgentKind::Claude,
                 cwd: "~/proj".to_string(),
                 resume: None,
                 worktree: None,
@@ -1654,7 +1643,7 @@ mod tests {
             return;
         }
         state::ensure_sessions_dir().unwrap();
-        let mut row = LauncherState::for_test(AgentControl::Claude, SessionStatus::Active);
+        let mut row = LauncherState::for_test(AgentKind::Claude, SessionStatus::Active);
         row.launcher_pid = std::process::id();
         row.write().unwrap();
         let (notifier, changes) = std::sync::mpsc::channel();

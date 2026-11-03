@@ -8,7 +8,7 @@
 //!
 //! Two watchers, because one does not cover the ground: the platform's
 //! event-driven one (FSEvents/inotify) wherever it fires, and a stat poll where
-//! it cannot (Codex on macOS — see [`AgentControl::transcript_poll_interval`]).
+//! it cannot (Codex on macOS — see [`AgentKind::transcript_poll_interval`]).
 //! [`TranscriptWatch`] is what makes them interchangeable to the caller, and
 //! dropping either is what stops it.
 
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use notify::Watcher as _;
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 
 /// A live transcript watch. Dropping either variant stops it — the binding's
 /// lifetime is the watch's lifetime, which is how the poll's engaged-only
@@ -27,7 +27,7 @@ pub(super) enum TranscriptWatch {
     #[allow(dead_code)] // held for its Drop; never read
     Event(notify::RecommendedWatcher),
     /// The stat poll standing in where the platform events can't fire (Codex
-    /// on macOS — see [`AgentControl::transcript_poll_interval`]).
+    /// on macOS — see [`AgentKind::transcript_poll_interval`]).
     #[allow(dead_code)]
     Poll(StatPoll),
 }
@@ -85,7 +85,7 @@ pub(super) fn start_stat_poll(
 /// file already exists. [`start_file_watcher`] would otherwise fall back to the
 /// session directory, which also holds `updates.jsonl`.
 pub(super) fn arm_replaced_sidecars(
-    agent: AgentControl,
+    agent: AgentKind,
     transcript: &Path,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
     dest: &mut Vec<TranscriptWatch>,

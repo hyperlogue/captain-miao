@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 
 fn message(event: HookEvent, extra: serde_json::Value) -> HookMessage {
     let mut body = serde_json::json!({"conversationId":"fixture","conversation_id":"fixture"});
@@ -51,7 +51,7 @@ fn insert(conn: &Connection, idx: i64, status: i32, command: Option<&str>) {
 #[tokio::test]
 async fn background_stop_survives_idle_snapshot() {
     let mut monitor = Monitor::at(None);
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
     monitor.dispatch_hook(&mut state, stop(false));
     assert_eq!(state.status, SessionStatus::BackgroundActive);
     monitor.dispatch_hook(&mut state, snapshot("idle"));
@@ -177,7 +177,7 @@ fn descriptions_skip_unrelated_fields_and_reject_partial_records() {
 async fn stale_observations_do_not_erase_new_turns_or_follow_session_switches() {
     let root = tempfile::tempdir().unwrap();
     let mut monitor = Monitor::at(Some(root.path().to_path_buf()));
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
     monitor.dispatch_hook(&mut state, stop(false));
     let revision = monitor.request.as_ref().unwrap().revision;
     assert!(monitor.apply(
@@ -260,7 +260,7 @@ async fn exercise_completion(mode: WatchMode) {
         .unwrap();
     insert(&conn, 1, 2, Some("r3 watch review"));
     let mut monitor = Monitor::with_watch(Some(root.path().to_path_buf()), mode);
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
     monitor.dispatch_hook(&mut state, stop(false));
     observe_update(&mut monitor, &mut state, "initial background task").await;
     assert_eq!(state.background_commands, ["r3 watch review"]);
@@ -350,7 +350,7 @@ async fn real_agy_background_task_lifecycle() {
     let database = observed.join("conversations/fixture.db");
     std::fs::copy(root.path().join("running.db"), &database).unwrap();
     let mut monitor = Monitor::with_watch(Some(observed), WatchMode::Hooks);
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Starting);
     for event in events["background"].as_array().unwrap() {
         let kind = HookEvent::from_kebab(event["event"].as_str().unwrap()).unwrap();
         let mut message =

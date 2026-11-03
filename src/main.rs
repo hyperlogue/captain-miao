@@ -76,7 +76,7 @@ enum Commands {
         /// Which backend to run: `claude`, `codex`, `reasonix`, `kimi`, `grok`,
         /// `opencode`, `pi`, `antigravity` or `omp`.
         ///
-        /// A free-form string resolved by `AgentControl::from_cli` rather than a
+        /// A free-form string resolved by `AgentKind::from_cli` rather than a
         /// clap subcommand per backend: that keeps one authority over the names,
         /// and a new backend then costs nothing here at all.
         agent: String,
@@ -364,10 +364,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         // rather than becoming a clap error about a subcommand that never
         // existed.
         Some(Commands::Launch { agent, args }) => {
-            let backend = agent::AgentControl::from_cli(&agent).ok_or_else(|| {
+            let backend = agent::AgentKind::from_cli(&agent).ok_or_else(|| {
                 anyhow::anyhow!(
                     "unknown agent backend `{agent}`; this build launches: {}",
-                    agent::AgentControl::ALL
+                    agent::AgentKind::ALL
                         .iter()
                         .map(|a| a.cli_subcommand())
                         .collect::<Vec<_>>()
@@ -434,7 +434,7 @@ mod tests {
     /// that dies on a clap error.
     #[test]
     fn every_backend_launches_under_the_name_it_advertises() {
-        for &want in agent::AgentControl::ALL {
+        for &want in agent::AgentKind::ALL {
             let name = want.cli_subcommand();
             let plan = cm_core::backend::LocalBackend::default()
                 .open_session(&cm_core::backend::OpenSpec {
@@ -451,7 +451,7 @@ mod tests {
                 panic!("`miao launch {name}` must be a launch");
             };
             assert_eq!(
-                agent::AgentControl::from_cli(agent),
+                agent::AgentKind::from_cli(agent),
                 Some(want),
                 "`miao launch {name}` resolved to the wrong backend"
             );
@@ -470,7 +470,7 @@ mod tests {
             .expect("clap validates the verb, not the backend name");
         let cmd = cli.command.expect("a subcommand");
         assert!(cmd.launch_args().is_some());
-        assert!(agent::AgentControl::from_cli("nosuchagent").is_none());
+        assert!(agent::AgentKind::from_cli("nosuchagent").is_none());
     }
 
     #[test]

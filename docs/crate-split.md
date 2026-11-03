@@ -65,7 +65,7 @@ each is a small, deliberate cut:
 - **Bundled SQLite stays in core.** `agents/codex.rs` keeps the
   `read_thread_titles` SQLite read (the per-host title overlay in
   `backend::LocalBackend`) — fragmenting the Codex backend across crates to dodge
-  a ~1 MB static amalgamation would break the `AgentControl` abstraction, and
+  a ~1 MB static amalgamation would break the `AgentKind` abstraction, and
   portable-C SQLite cross-compiles fine (unlike libshpool's platform linking).
 
 Mechanically, each binary re-exports the core modules it uses at its crate root

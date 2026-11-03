@@ -324,7 +324,7 @@ mod tests {
         let row = state::LauncherState {
             launcher_pid: pid,
             ..state::LauncherState::for_test(
-                crate::agent::AgentControl::Claude,
+                crate::agent::AgentKind::Claude,
                 state::SessionStatus::Idle,
             )
         };

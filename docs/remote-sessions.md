@@ -260,7 +260,7 @@ library**.
 - **Codex image paste uses the existing input thread.** `PoolHooks::session_input`
   recognizes Ctrl+V (legacy, CSI-u and modifyOtherKeys), excluding bracketed text
   and terminal control strings. It resolves the pool's live launcher on that key
-  and asks `AgentControl::clipboard_paste_encoder` whether input bridging applies.
+  and asks `AgentKind::clipboard_paste_encoder` whether input bridging applies.
   Codex receives a bracketed file URL, which its composer converts to an image
   attachment without submitting or replacing the draft. Other agents keep their
   key bytes. The same forwarded image-only clipboard socket supplies the bytes;

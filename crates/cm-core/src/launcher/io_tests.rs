@@ -14,7 +14,7 @@ async fn hook_only_transcripts_refresh_only_when_hooks_arrive() {
         let output = tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "launcher::io_tests::hook_only_transcripts_refresh_only_when_hooks_arrive",
+                "agents::hooked::io_tests::hook_only_transcripts_refresh_only_when_hooks_arrive",
                 "--nocapture",
             ])
             .env("CM_TEST_HOOK_METADATA", "1")
@@ -36,7 +36,7 @@ async fn hook_only_transcripts_refresh_only_when_hooks_arrive() {
     state::ensure_sessions_dir().unwrap();
     let root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let state_path = state::sessions_dir().join(format!("{}.json", std::process::id()));
-    for agent in [AgentControl::Kimi, AgentControl::Antigravity] {
+    for agent in [AgentKind::Kimi, AgentKind::Antigravity] {
         let path = root.join(format!("{}.jsonl", agent.cli_subcommand()));
         let socket = root.join(format!("{}.sock", agent.cli_subcommand()));
         let mut listener = UnixListener::bind(&socket).unwrap();
@@ -45,9 +45,16 @@ async fn hook_only_transcripts_refresh_only_when_hooks_arrive() {
         let task = tokio::spawn(async move {
             let mut state = LauncherState::for_test(agent, SessionStatus::Starting);
             state.launcher_pid = std::process::id();
-            process_hooks(&mut listener, &watched_socket, &mut state).await;
+            process_hooks(
+                &mut listener,
+                &watched_socket,
+                &mut state,
+                &SessionPublisher::test_writer(),
+                Duration::from_secs(2),
+            )
+            .await;
         });
-        let first = if agent == AgentControl::Kimi {
+        let first = if agent == AgentKind::Kimi {
             HookEvent::PermissionRequest
         } else {
             HookEvent::PromptSubmit
@@ -64,7 +71,7 @@ async fn hook_only_transcripts_refresh_only_when_hooks_arrive() {
             before,
             "{agent:?}: metadata changed without a hook"
         );
-        let next = if agent == AgentControl::Kimi {
+        let next = if agent == AgentKind::Kimi {
             HookEvent::ElicitationResult
         } else {
             HookEvent::PromptSubmit
@@ -77,8 +84,8 @@ async fn hook_only_transcripts_refresh_only_when_hooks_arrive() {
     }
 }
 
-fn append(path: &Path, agent: AgentControl, value: u64) {
-    let line = if agent == AgentControl::Kimi {
+fn append(path: &Path, agent: AgentKind, value: u64) {
+    let line = if agent == AgentKind::Kimi {
         serde_json::json!({"type":"usage.record","model":"fixture-model","usage":{"inputOther":value}})
     } else {
         serde_json::json!({"type":"USER_INPUT","content":format!("<USER_REQUEST>prompt-{value}</USER_REQUEST>")})
@@ -104,19 +111,14 @@ async fn send(socket: &Path, transcript: &Path, event: HookEvent) {
     stream.shutdown().await.unwrap();
 }
 
-async fn wait_for_value(
-    path: &Path,
-    agent: AgentControl,
-    value: u64,
-    phase: &str,
-) -> LauncherState {
+async fn wait_for_value(path: &Path, agent: AgentKind, value: u64, phase: &str) -> LauncherState {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(state) = std::fs::read(path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<LauncherState>(&bytes).ok())
                 && state.agent == agent
-                && if agent == AgentControl::Kimi {
+                && if agent == AgentKind::Kimi {
                     state.context_tokens == Some(value)
                 } else {
                     state.last_prompt.as_deref() == Some(format!("prompt-{value}").as_str())

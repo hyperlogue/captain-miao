@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::super::common;
-use crate::agent::{AgentControl, ResumeCandidate};
+use crate::agent::{AgentKind, ResumeCandidate};
 
 pub(super) fn list_resumable(
     limit: usize,
@@ -104,7 +104,7 @@ fn read_candidate(path: &Path, mtime: SystemTime) -> Option<ResumeCandidate> {
         .as_str()
         .filter(|cwd| !cwd.trim().is_empty())?;
     let mut candidate = ResumeCandidate {
-        agent: AgentControl::Pi,
+        agent: AgentKind::Pi,
         session_id: session_id.into(),
         cwd: cwd.into(),
         first_prompt: None,
@@ -150,7 +150,7 @@ fn read_candidate(path: &Path, mtime: SystemTime) -> Option<ResumeCandidate> {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use std::path::Path;
     use std::time::{Duration, SystemTime};
 
@@ -195,7 +195,7 @@ mod tests {
             return;
         };
 
-        let agent = AgentControl::Pi;
+        let agent = AgentKind::Pi;
         assert!(agent.list_resumable(10).unwrap().is_empty());
         let base = std::path::PathBuf::from(std::env::var_os("PI_CODING_AGENT_DIR").unwrap());
         let root = if case == "flat" {

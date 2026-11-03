@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use super::notifications::Level;
 use super::render_backend::DashboardTerminal;
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::backend::{Backend, CleanupPolicy, KillOutcome, OpenSpec, ShellPlan};
 use crate::config;
 use crate::state::{self, HostId, SessionKey};
@@ -1336,7 +1336,7 @@ pub(super) fn resolve_spawn_target(caps: Capabilities, layout: SessionsLayout) -
 /// `{basename}` → the cwd's last path component (`<repo>@<worktree>` inside a
 /// worktree, so per-tab layout distinguishes two sessions on one repo),
 /// `{cwd}` → the full path.
-pub(super) fn expand_tab_title(template: &str, agent: AgentControl, cwd: &str) -> String {
+pub(super) fn expand_tab_title(template: &str, agent: AgentKind, cwd: &str) -> String {
     let basename = super::display_basename(cwd);
     template
         .replace("{agent}", agent.label())
@@ -1346,7 +1346,7 @@ pub(super) fn expand_tab_title(template: &str, agent: AgentControl, cwd: &str) -
 
 async fn launch_agent(
     app: &mut App,
-    agent: AgentControl,
+    agent: AgentKind,
     cwd: &str,
     resume: Option<(&str, bool)>,
     copy: &LaunchCopy,
@@ -1414,7 +1414,7 @@ async fn launch_agent(
 
 fn launch_window(
     app: &mut App,
-    agent: AgentControl,
+    agent: AgentKind,
     cwd: &str,
     host: &HostId,
     copy: &LaunchCopy,
@@ -1458,7 +1458,7 @@ fn record_launch_window(app: &mut App, host: HostId, token: String, result: term
 
 fn start_new_session(
     app: &mut App,
-    agent: AgentControl,
+    agent: AgentKind,
     cwd: String,
     host: HostId,
     worktree: Option<String>,
@@ -3357,7 +3357,7 @@ mod tests {
         let mut app = vcs_app();
         let inboxes = LoopInboxes::new();
         let candidate = crate::agent::ResumeCandidate {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             session_id: "cached-session".into(),
             cwd: "~/project".into(),
             first_prompt: Some("Cached task".into()),
@@ -3392,7 +3392,7 @@ mod tests {
 
     fn cached_candidate(id: &str) -> crate::agent::ResumeCandidate {
         crate::agent::ResumeCandidate {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             session_id: id.into(),
             cwd: "~/project".into(),
             first_prompt: Some(format!("cached {id}")),
@@ -3571,7 +3571,7 @@ mod tests {
         inboxes.resume_seq = 2;
         app.open_resume_picker(HostId::local(), Vec::new());
         app.set_picker_loading(true);
-        app.set_resume_agent_filter(Some(AgentControl::Codex));
+        app.set_resume_agent_filter(Some(AgentKind::Codex));
         app.picker.as_mut().unwrap().picker.set_text("target");
         let reply = |seq| ResumeLoad {
             seq,
@@ -3580,7 +3580,7 @@ mod tests {
             reseed: false,
             host: HostId::local(),
             errors: Vec::new(),
-            candidates: [AgentControl::Claude, AgentControl::Codex]
+            candidates: [AgentKind::Claude, AgentKind::Codex]
                 .into_iter()
                 .map(|agent| crate::agent::ResumeCandidate {
                     agent,
@@ -3600,7 +3600,7 @@ mod tests {
         assert!(!picker.loading);
         assert_eq!(picker.input.text(), "target");
         assert_eq!(picker.filtered(), [1]);
-        assert_eq!(app.selected_resume().unwrap().1.agent, AgentControl::Codex);
+        assert_eq!(app.selected_resume().unwrap().1.agent, AgentKind::Codex);
     }
 
     #[test]
@@ -3641,7 +3641,7 @@ mod tests {
         let mut app = App::new();
         app.detail_visible = false;
         let mut session = crate::state::LauncherState::for_test(
-            AgentControl::Claude,
+            AgentKind::Claude,
             crate::state::SessionStatus::Idle,
         );
         session.cwd = "/tmp/checkout".to_string();
@@ -3661,7 +3661,7 @@ mod tests {
         let mut restarts = super::super::restart::Restarts::default();
         restarts.enqueue(
             vec![RestartSpec {
-                agent: AgentControl::Claude,
+                agent: AgentKind::Claude,
                 host,
                 key: state::SessionKey::from_launcher_pid(42),
                 window_id: None,
@@ -3721,7 +3721,7 @@ mod tests {
             app.backends.push(Backend::Remote(remote));
             start_new_session(
                 &mut app,
-                AgentControl::Codex,
+                AgentKind::Codex,
                 "/work/project".into(),
                 host,
                 None,

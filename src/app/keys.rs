@@ -23,7 +23,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::agent::{AgentControl, ResumeCandidate};
+use crate::agent::{AgentKind, ResumeCandidate};
 use crate::state::{HostId, SessionStatus};
 use crate::terminal::TabTarget;
 
@@ -42,7 +42,7 @@ const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 ///
 /// A default outside the list lands on the first enabled agent. An empty list
 /// leaves it unchanged rather than offering a disabled agent.
-pub(super) fn cycle_agent(current: AgentControl, enabled: &[AgentControl]) -> AgentControl {
+pub(super) fn cycle_agent(current: AgentKind, enabled: &[AgentKind]) -> AgentKind {
     match enabled.iter().position(|a| *a == current) {
         Some(cur) => enabled[(cur + 1) % enabled.len()],
         None => enabled.first().copied().unwrap_or(current),
@@ -433,7 +433,7 @@ impl App {
             Command::ForkSession => {
                 let s = self.selected_session()?;
                 // Not every backend can branch a resume
-                // (`AgentControl::supports_fork`). Drop the key on one that
+                // (`AgentKind::supports_fork`). Drop the key on one that
                 // can't, rather than run a plain resume under the name "fork" —
                 // continuing the session in place is the single outcome someone
                 // pressing `f` is trying to avoid, and it would look like it
@@ -862,7 +862,7 @@ impl App {
 
     pub(super) fn launch_workdir(
         &mut self,
-        agent: AgentControl,
+        agent: AgentKind,
         host: crate::state::HostId,
         cwd: String,
         worktree: Option<String>,
@@ -1008,7 +1008,7 @@ impl App {
         {
             // Preferences own both inclusion and order. Local PATH detection
             // can miss enabled agents, especially when launching on a remote host.
-            let enabled: Vec<AgentControl> = self
+            let enabled: Vec<AgentKind> = self
                 .agent_order
                 .iter()
                 .filter(|(_, on)| *on)
@@ -1028,7 +1028,7 @@ impl App {
             return None;
         }
         // Ctrl-G in the workdir picker arms an isolated **g**it worktree for
-        // this launch — the agent creates it (see `AgentControl::worktree_args`),
+        // this launch — the agent creates it (see `AgentKind::worktree_args`),
         // so the key is offered only for an agent that has the concept and is
         // otherwise reported rather than silently ignored. Per-launch only:
         // nothing about it is persisted.
@@ -1176,7 +1176,7 @@ impl App {
                             .items
                             .get(idx)
                             .and_then(|it| it.payload.as_deref())
-                            .and_then(AgentControl::from_cli);
+                            .and_then(AgentKind::from_cli);
                         if let Some(a) = chosen {
                             if let Some(i) = self.agent_order.iter().position(|(x, _)| *x == a) {
                                 self.agent_order[i].1 = true;

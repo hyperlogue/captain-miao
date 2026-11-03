@@ -7,16 +7,22 @@ use tokio::time::Instant;
 
 /// Persistence is secondary to control ownership. Retry a failed write without
 /// losing the current facts, terminating the TUI, or suppressing an RPC reply.
-#[derive(Default)]
 struct StateWriter {
+    updates: crate::agent::session::SessionPublisher,
     retry_at: Option<Instant>,
 }
 impl StateWriter {
-    fn write(&mut self, state: &LauncherState) {
+    fn new(updates: crate::agent::session::SessionPublisher) -> Self {
+        Self {
+            updates,
+            retry_at: None,
+        }
+    }
+    async fn write(&mut self, state: &LauncherState) {
         if self.retry_at.is_some_and(|at| at > Instant::now()) {
             return;
         }
-        self.retry_at = match crate::state::ensure_sessions_dir().and_then(|_| state.write()) {
+        self.retry_at = match self.updates.write(state).await {
             Ok(()) => None,
             Err(error) => {
                 tracing::warn!(
@@ -33,7 +39,7 @@ async fn retry_at(at: Option<Instant>) {
         None => std::future::pending().await,
     }
 }
-fn observe(
+async fn observe(
     monitor: &mut Monitor,
     state: &mut LauncherState,
     event: Observation,
@@ -43,7 +49,7 @@ fn observe(
     monitor.apply(state, event);
     if *state != before {
         state.updated_at = LauncherState::now();
-        writer.write(state);
+        writer.write(state).await;
     }
 }
 
@@ -63,7 +69,7 @@ async fn quiesce(
             result = &mut pause => return result,
             event = relay.events.recv() => {
                 let event = event.context("Codex relay stopped")?;
-                observe(monitor, state, event, writer);
+                observe(monitor, state, event, writer).await;
             }
         }
     }
@@ -75,6 +81,7 @@ pub(crate) async fn supervise(
     mut child: tokio::process::Child,
     mut relay: crate::agents::codex::app_server::Relay,
     mut control: crate::agents::codex::app_server::Control,
+    updates: crate::agent::session::SessionPublisher,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<i32> {
     use crate::agents::codex::app_server;
@@ -88,18 +95,18 @@ pub(crate) async fn supervise(
     let mut exit_code = 0;
     let mut stopping: Option<BoxFuture<'static, Result<()>>> = None;
     let mut reply: Option<app_server::StopRequest> = None;
-    let mut persistence = StateWriter::default();
-    persistence.write(state);
+    let mut persistence = StateWriter::new(updates);
+    persistence.write(state).await;
     loop {
         let begin_stop = tokio::select! {
             _ = retry_at(persistence.retry_at) => {
-                persistence.write(state);
+                persistence.write(state).await;
                 false
             }
             event = relay.events.recv(), if relay_live => {
                 match event {
                     Some(event) => {
-                        observe(&mut monitor, state, event, &mut persistence);
+                        observe(&mut monitor, state, event, &mut persistence).await;
                         false
                     }
                     None => {
@@ -174,7 +181,7 @@ pub(crate) async fn supervise(
                             state.active_since = None;
                         }
                         state.updated_at = LauncherState::now();
-                        persistence.write(state);
+                        persistence.write(state).await;
                         let _ = quiesce(false, &mut relay, &mut monitor, state, &mut persistence).await;
                         if let Some(reply) = reply.take() {
                             let reason = super::kill::force_removal_reason(config, &error, state.session_id.as_deref()).await;
@@ -190,13 +197,13 @@ pub(crate) async fn supervise(
         if begin_stop {
             state.cleanup = Some(crate::state::CleanupStatus::InProgress);
             state.updated_at = LauncherState::now();
-            persistence.write(state);
+            persistence.write(state).await;
             let pause = quiesce(true, &mut relay, &mut monitor, state, &mut persistence).await;
             // A lifecycle reply can already have reached the TUI while its
             // observation is queued here. Adopt it before selecting cleanup's
             // thread; the paused input gate prevents a new turn overtaking us.
             while let Ok(event) = relay.events.try_recv() {
-                observe(&mut monitor, state, event, &mut persistence);
+                observe(&mut monitor, state, event, &mut persistence).await;
             }
             let config = config.clone();
             let snapshot = state.clone();
@@ -226,16 +233,16 @@ pub(crate) async fn supervise(
 mod tests {
     use super::*;
 
-    #[test]
-    fn persistence_recreates_a_deleted_session_directory() {
+    #[tokio::test]
+    async fn persistence_recreates_a_deleted_session_directory() {
         if std::env::var_os("CM_TEST_CODEX_STATE_RECOVERY").is_some() {
-            let row =
-                LauncherState::for_test(crate::agent::AgentControl::Codex, SessionStatus::Idle);
-            let mut writer = StateWriter::default();
-            writer.write(&row);
+            let row = LauncherState::for_test(crate::agent::AgentKind::Codex, SessionStatus::Idle);
+            let mut writer =
+                StateWriter::new(crate::agent::session::SessionPublisher::test_writer());
+            writer.write(&row).await;
             assert!(writer.retry_at.is_none());
             std::fs::remove_dir_all(crate::state::sessions_dir()).unwrap();
-            writer.write(&row);
+            writer.write(&row).await;
             assert!(
                 writer.retry_at.is_none(),
                 "retry must recreate the parent, not fail forever"

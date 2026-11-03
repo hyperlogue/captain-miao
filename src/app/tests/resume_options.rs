@@ -1,16 +1,16 @@
 use super::*;
 use crate::{
-    agent::{AgentControl, ResumeCandidate},
+    agent::{AgentKind, ResumeCandidate},
     state::HostId,
 };
 use ratatui::style::Modifier;
 
 fn candidates() -> Vec<ResumeCandidate> {
     [
-        AgentControl::Claude,
-        AgentControl::Codex,
-        AgentControl::Claude,
-        AgentControl::Pi,
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Pi,
     ]
     .into_iter()
     .enumerate()
@@ -53,16 +53,13 @@ fn resume_agent_filter_applies_before_the_visible_inventory_limit() {
     d.press(KeyCode::Char('w'));
     d.press(KeyCode::Enter);
     assert_eq!(d.app.picker.as_ref().unwrap().picker.filtered(), [limit]);
-    assert_eq!(
-        d.app.selected_resume().unwrap().1.agent,
-        AgentControl::Codex
-    );
+    assert_eq!(d.app.selected_resume().unwrap().1.agent, AgentKind::Codex);
 }
 
 #[test]
 fn resume_options_default_to_all_and_filter_before_resolving_original_indices() {
     let mut d = dashboard();
-    d.app.new_session_agent = AgentControl::Codex;
+    d.app.new_session_agent = AgentKind::Codex;
     assert!(d.render().contains("Agent All"));
     for c in "Task".chars() {
         d.press(KeyCode::Char(c));
@@ -80,7 +77,7 @@ fn resume_options_default_to_all_and_filter_before_resolving_original_indices() 
     assert!(!out.contains("Task 0"), "{out}");
     assert!(
         matches!(d.press(KeyCode::Enter), Some(Action::ResumeSession {
-        agent: AgentControl::Codex, session_id, host, ..
+        agent: AgentKind::Codex, session_id, host, ..
     }) if session_id == "session-1" && host.is_local())
     );
 }
@@ -122,7 +119,7 @@ fn resume_options_ctrl_o_resumes_only_when_the_captured_session_matches() {
     assert!(d.render().contains("Ctrl-o resume"));
     assert!(
         matches!(d.press_ctrl(KeyCode::Char('o')), Some(Action::ResumeSession {
-        agent: AgentControl::Codex, session_id, host, ..
+        agent: AgentKind::Codex, session_id, host, ..
     }) if session_id == "session-1" && host.is_local())
     );
     assert!(d.app.picker.is_none());
@@ -160,7 +157,7 @@ fn resume_options_switch_host_without_resuming_another_hosts_session() {
     assert!(out.contains("Agent Codex"), "{out}");
     assert!(
         matches!(d.press(KeyCode::Enter), Some(Action::ResumeSession {
-        agent: AgentControl::Codex, session_id, host, ..
+        agent: AgentKind::Codex, session_id, host, ..
     }) if session_id == "session-1" && host.0 == "box")
     );
 }
@@ -185,7 +182,7 @@ fn resume_options_rechecks_managed_conversations_before_immediate_resume() {
     let mut d = dashboard();
     d.press_ctrl(KeyCode::Char('o'));
     let mut owner = session(1, "~/project", SessionStatus::Idle);
-    owner.agent = AgentControl::Claude;
+    owner.agent = AgentKind::Claude;
     owner.session_id = Some("session-0".into());
     d.set_sessions(vec![owner]);
     assert!(d.press_ctrl(KeyCode::Char('o')).is_none());

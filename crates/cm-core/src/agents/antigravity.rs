@@ -75,9 +75,7 @@
 
 mod metadata;
 pub(crate) mod tasks;
-pub use metadata::{
-    PromptCursor, read_titles, read_transcript_stats, title_store_mtimes, title_watch_paths,
-};
+pub use metadata::{read_titles, title_store_mtimes, title_watch_paths};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -586,7 +584,7 @@ fn list_resumable_in_cached(
         .filter_map(|((session_id, cwd, path), mtime)| {
             let mut candidate = cache.candidates.get(&path, &[], || {
                 Some(ResumeCandidate {
-                    agent: crate::agent::AgentControl::Antigravity,
+                    agent: crate::agent::AgentKind::Antigravity,
                     custom_title: None,
                     session_id: session_id.clone(),
                     cwd: cwd.clone(),
@@ -834,7 +832,7 @@ mod live_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
 
     /// An `antigravity-cli/` state tree: whichever of the two cwd records and
@@ -1004,7 +1002,7 @@ mod tests {
             "the per-prompt record outranks the per-workspace cache"
         );
         assert_eq!(aaa.first_prompt.as_deref(), Some("first thing"));
-        assert!(got.iter().all(|c| c.agent == AgentControl::Antigravity));
+        assert!(got.iter().all(|c| c.agent == AgentKind::Antigravity));
     }
 
     /// A conversation nothing ties to a directory is skipped, not guessed at:
@@ -1104,7 +1102,7 @@ mod tests {
     /// it: an empty `error` is a clean end however the turn was described.
     #[test]
     fn a_clean_stop_settles_the_row_whatever_it_calls_its_reason() {
-        let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+        let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
         let msg = payload(
             HookEvent::Stop,
             r#"{"conversationId":"65a4b172","error":"","executionNum":0,"fullyIdle":true,
@@ -1155,3 +1153,6 @@ mod tests {
         assert!(msg.tool_name.is_none());
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

@@ -199,7 +199,7 @@ fn overlay(sessions: &mut [LauncherState], entries: &HashMap<SessionKey, Entry>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Fixture(SessionFlagsStore);
@@ -219,7 +219,7 @@ mod tests {
         fn status(&self, status: SessionStatus) -> LauncherState {
             let row = LauncherState {
                 launcher_pid: std::process::id(),
-                ..LauncherState::for_test(AgentControl::Claude, status)
+                ..LauncherState::for_test(AgentKind::Claude, status)
             };
             self.write(&row);
             row

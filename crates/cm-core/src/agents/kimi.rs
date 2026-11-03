@@ -1,6 +1,6 @@
 //! Kimi Code CLI backend. Owns every Kimi-specific path, env var and hook
 //! payload shape; the dashboard reaches all of it only via
-//! `crate::agent::AgentControl::Kimi`'s match arms.
+//! `crate::agent::AgentKind::Kimi`'s agent-local definition.
 //!
 //! **Source-read, never run.** First written from MoonshotAI/kimi-code's
 //! published documentation alone (design note §7); since re-read against the
@@ -20,7 +20,7 @@
 //! has to defer `Stop` to its session file, both because pressing Esc fires no
 //! hook. Kimi reports the interrupt directly, so it is registered like any other
 //! event and normalized to [`HookEvent::Stop`] *in the config* — which is why
-//! [`crate::agent::AgentControl::scan_transcript_signals`] is the empty default
+//! [`crate::agent::AgentKind::scan_transcript_signals`] is the empty default
 //! and `agent_activity` is `None` with no loss at all, rather than as an
 //! unimplemented gap. It is the single biggest simplification available to any
 //! backend here.
@@ -355,7 +355,7 @@ fn list_resumable_in_cached(
                 .and_then(|b| serde_json::from_str::<SessionState>(&b).ok())
                 .unwrap_or_default();
             Some(ResumeCandidate {
-                agent: crate::agent::AgentControl::Kimi,
+                agent: crate::agent::AgentKind::Kimi,
                 session_id: session_id.to_string(),
                 cwd: cwd.clone(),
                 first_prompt: state.last_prompt.filter(|p| !p.trim().is_empty()),
@@ -823,7 +823,7 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::SessionStatus;
 
     /// A `$KIMI_CODE_HOME` tree: `sessions/<bucket>/<id>/state.json`, plus the
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(out[0].cwd, "/home/miao/p");
         assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
         assert_eq!(out[0].first_prompt.as_deref(), Some("add a test"));
-        assert_eq!(out[0].agent, AgentControl::Kimi);
+        assert_eq!(out[0].agent, AgentKind::Kimi);
         list_resumable_in_cached(&home, 10, &mut cache);
         assert_eq!(cache.candidates.read_count(), 1);
         assert_eq!(cache.index.read_count(), 1);
@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     fn state_at(status: SessionStatus) -> LauncherState {
-        LauncherState::for_test(AgentControl::Kimi, status)
+        LauncherState::for_test(AgentKind::Kimi, status)
     }
 
     /// Drive one hook end to end — parse the agent's stdin JSON, then dispatch
@@ -1401,3 +1401,6 @@ mod tests {
         );
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

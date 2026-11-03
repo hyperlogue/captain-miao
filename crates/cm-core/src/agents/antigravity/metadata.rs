@@ -188,7 +188,34 @@ pub(super) fn read_compaction(path: &Path) -> Option<Compaction> {
     }))
 }
 
-pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> TranscriptStats {
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct TranscriptFold {
+    pub(super) stats: TranscriptStats,
+    antigravity_cursor: Option<PromptCursor>,
+}
+impl std::ops::Deref for TranscriptFold {
+    type Target = TranscriptStats;
+    fn deref(&self) -> &TranscriptStats {
+        &self.stats
+    }
+}
+impl std::ops::DerefMut for TranscriptFold {
+    fn deref_mut(&mut self) -> &mut TranscriptStats {
+        &mut self.stats
+    }
+}
+#[derive(Default)]
+pub(super) struct Reader {
+    prior: TranscriptFold,
+}
+impl crate::agents::transcript::TranscriptReader for Reader {
+    fn read(&mut self, path: &Path) -> TranscriptStats {
+        self.prior = read_transcript_stats(path, Some(&self.prior));
+        self.prior.stats.clone()
+    }
+}
+
+pub(crate) fn read_transcript_stats(path: &Path, prior: Option<&TranscriptFold>) -> TranscriptFold {
     let mut stats = prior.cloned().unwrap_or_default();
     let Ok(mut file) = std::fs::File::open(path) else {
         return stats;
@@ -205,9 +232,12 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
     });
     let offset = if reset {
         let Ok((seed, offset)) = read_prompt_ends(&mut file, meta.len()) else {
-            return TranscriptStats::default();
+            return TranscriptFold::default();
         };
-        stats = seed;
+        stats = TranscriptFold {
+            stats: seed,
+            ..TranscriptFold::default()
+        };
         offset
     } else {
         let mut offset = stats.antigravity_cursor.as_ref().unwrap().offset;
@@ -460,7 +490,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
         assert_eq!(
-            read_transcript_stats(&path, None),
+            read_transcript_stats(&path, None).stats,
             TranscriptStats::default()
         );
         std::fs::write(&path, prompt("a long original prompt")).unwrap();

@@ -190,7 +190,7 @@ rl.on('close', () => process.exit(0));
             "startup must still be blocked"
         );
         let mut row =
-            LauncherState::for_test(AgentControl::Codex, crate::state::SessionStatus::Starting);
+            LauncherState::for_test(AgentKind::Codex, crate::state::SessionStatus::Starting);
         row.session_id = Some(thread.clone());
         let cleanup = stop_after_quiescence(&config, &row, None, paused, true);
         tokio::pin!(cleanup);

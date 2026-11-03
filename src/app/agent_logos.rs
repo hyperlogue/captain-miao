@@ -18,7 +18,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::widgets::Cell;
 
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use crate::terminal::graphics::{self, CellSize, Placement};
 
 const SIZE: u32 = 32;
@@ -49,18 +49,18 @@ const MARKERS: [&str; 9] = [
 ];
 
 /// Both image cells are blank by the time ratatui flushes its frame.
-pub(super) fn cell(agent: AgentControl) -> Cell<'static> {
+pub(super) fn cell(agent: AgentKind) -> Cell<'static> {
     let marker = match agent {
-        AgentControl::Claude => MARKERS[0],
-        AgentControl::Codex => MARKERS[1],
-        AgentControl::Reasonix => MARKERS[2],
-        AgentControl::Kimi => MARKERS[3],
-        AgentControl::OpenCode => MARKERS[4],
-        AgentControl::Pi => MARKERS[5],
-        AgentControl::Antigravity => MARKERS[6],
-        AgentControl::Omp => MARKERS[7],
-        AgentControl::Grok => MARKERS[8],
-        AgentControl::Unknown => return Cell::from("?"),
+        AgentKind::Claude => MARKERS[0],
+        AgentKind::Codex => MARKERS[1],
+        AgentKind::Reasonix => MARKERS[2],
+        AgentKind::Kimi => MARKERS[3],
+        AgentKind::OpenCode => MARKERS[4],
+        AgentKind::Pi => MARKERS[5],
+        AgentKind::Antigravity => MARKERS[6],
+        AgentKind::Omp => MARKERS[7],
+        AgentKind::Grok => MARKERS[8],
+        AgentKind::Unknown => return Cell::from("?"),
     };
     // The tag prevents a matching private-use character in a user title from
     // being interpreted as one of our placeholders.

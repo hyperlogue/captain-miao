@@ -36,7 +36,7 @@ async fn kill_cancels_handoff_and_connection_before_starting_codex() {
             vec![]
         };
         crate::launcher::run(
-            AgentControl::Codex,
+            AgentKind::Codex,
             "/tmp",
             &args,
             None,
@@ -58,7 +58,7 @@ async fn kill_cancels_handoff_and_connection_before_starting_codex() {
     // Retain a live owner for handoff, or a socket that never finishes the
     // WebSocket handshake for preflight. Neither may prevent cancellation.
     let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
-    let mut owner = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+    let mut owner = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
     owner.launcher_pid = std::process::id();
     owner.session_id = Some("saved-thread".into());
     owner.write().unwrap();

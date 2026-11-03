@@ -144,13 +144,13 @@ function send(forwarded, body) {{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::{LauncherState, SessionStatus};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn unawaited_hooks_keep_order_and_capture_the_original_payload() {
-        for agent in [AgentControl::Pi, AgentControl::Omp] {
+        for agent in [AgentKind::Pi, AgentKind::Omp] {
             let delivered = super::super::forwarder_test::run(
                 &agent.hooks_settings_json("/unused.sock"),
                 &format!("{}_concurrent", agent.cli_subcommand()),
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn hook_delivery_failures_cannot_block_the_agent() {
-        for agent in [AgentControl::Pi, AgentControl::Omp] {
+        for agent in [AgentKind::Pi, AgentKind::Omp] {
             for failure in ["timeout", "spawn_throw", "spawn_error", "stdin_error"] {
                 let delivered = super::super::forwarder_test::run(
                     &agent.hooks_settings_json("/unused.sock"),
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn generated_extensions_preserve_metadata_and_distinct_turn_outcomes() {
-        for agent in [AgentControl::Pi, AgentControl::Omp] {
+        for agent in [AgentKind::Pi, AgentKind::Omp] {
             let source = agent.hooks_settings_json("/unused.sock");
             let messages = super::super::forwarder_test::run(
                 &source,
@@ -199,7 +199,7 @@ mod tests {
                 if expected == HookEvent::PostToolUseFailure {
                     assert_eq!(msg.tool_name.as_deref(), Some("bash"));
                 }
-                agent.dispatch_hook(&mut state, msg);
+                agent.hook_session().dispatch_hook(&mut state, msg);
                 assert_eq!(
                     state.status,
                     if expected == HookEvent::Stop {

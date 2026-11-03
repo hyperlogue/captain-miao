@@ -30,7 +30,7 @@ impl Drop for Scratch {
 fn state() -> LauncherState {
     LauncherState {
         codex_mode: super::super::CodexMode::AppServer,
-        ..LauncherState::for_test(AgentControl::Codex, S::Starting)
+        ..LauncherState::for_test(AgentKind::Codex, S::Starting)
     }
 }
 fn request(m: &mut Monitor, s: &mut LauncherState, id: u64, method: &str) {
@@ -1181,7 +1181,7 @@ async fn inventory_uses_paginated_rpc_without_loading_threads() {
     let candidates = list_resumable(&config, 2).unwrap();
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0].custom_title.as_deref(), Some("Title"));
-    assert_eq!(candidates[0].agent, AgentControl::Codex);
+    assert_eq!(candidates[0].agent, AgentKind::Codex);
     server.await.unwrap();
 }
 
@@ -1198,7 +1198,7 @@ fn live_app_server_supports_read_only_inventory() {
     assert!(
         candidates
             .iter()
-            .all(|c| c.agent == AgentControl::Codex && !c.session_id.is_empty())
+            .all(|c| c.agent == AgentKind::Codex && !c.session_id.is_empty())
     );
 }
 
@@ -1523,6 +1523,7 @@ async fn lost_internal_creation_allows_kill_only_after_main_thread_cleanup() {
                 child,
                 relay,
                 control,
+                crate::agent::session::SessionPublisher::test_writer(),
                 std::future::pending(),
             )
             .await
@@ -1678,6 +1679,7 @@ async fn cleanup_waits_for_resume_identity_while_draining_a_full_observation_que
             child,
             relay,
             control,
+            crate::agent::session::SessionPublisher::test_writer(),
             std::future::pending(),
         )
         .await

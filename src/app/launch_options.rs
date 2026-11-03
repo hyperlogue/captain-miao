@@ -17,7 +17,7 @@ use ratatui::{
 };
 
 use crate::{
-    agent::{AgentControl, ResumeCandidate},
+    agent::{AgentKind, ResumeCandidate},
     config,
     state::HostId,
 };
@@ -30,9 +30,9 @@ const PAGE_SIZE: usize = HOST_KEYS.len();
 
 #[derive(Debug)]
 pub(super) struct LaunchOptions {
-    agents: Vec<AgentControl>,
+    agents: Vec<AgentKind>,
     hosts: Vec<HostId>,
-    agent: Option<AgentControl>,
+    agent: Option<AgentKind>,
     host: HostId,
     cwd: String,
     worktree: Option<String>,
@@ -141,7 +141,7 @@ impl LaunchOptions {
                 truncate_str(
                     &format!(
                         "Selected: {} · {}",
-                        self.agent.map_or("All", AgentControl::label),
+                        self.agent.map_or("All", AgentKind::label),
                         self.host.0
                     ),
                     summary.width as usize,
@@ -440,6 +440,6 @@ mod tests {
 
     #[test]
     fn every_supported_agent_has_a_direct_key() {
-        assert!(AgentControl::ALL.len() <= AGENT_KEYS.len());
+        assert!(AgentKind::ALL.len() <= AGENT_KEYS.len());
     }
 }

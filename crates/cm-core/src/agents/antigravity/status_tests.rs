@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::AgentControl;
+use crate::agent::AgentKind;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -23,7 +23,7 @@ fn snapshot(activity: &str, tokens: u64) -> HookMessage {
 
 #[test]
 fn startup_and_cancelled_turns_settle_without_a_stop_hook() {
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Starting);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Starting);
     dispatch_hook(
         &mut state,
         parse_status_payload(r#"{"agent_state":"idle","conversation_id":""}"#).unwrap(),
@@ -62,7 +62,7 @@ fn startup_and_cancelled_turns_settle_without_a_stop_hook() {
 
 #[test]
 fn context_usage_includes_outputs_to_match_agys_reported_percentage() {
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Idle);
     let payload = r#"{"agent_state":"idle","context_window":{"total_input_tokens":88244,"total_output_tokens":61074,"context_window_size":1048576,"used_percentage":14.24}}"#;
     dispatch_hook(&mut state, parse_status_payload(payload).unwrap());
     assert_eq!(state.context_tokens, Some(149_318));
@@ -79,7 +79,7 @@ fn context_usage_includes_outputs_to_match_agys_reported_percentage() {
 
 #[test]
 fn context_capacity_tracks_the_model_and_ignores_uninitialized_snapshots() {
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Idle);
     for (reported, expected) in [(1_048_576, 1_048_576), (200_000, 200_000), (0, 200_000)] {
         dispatch_hook(
             &mut state,
@@ -98,7 +98,7 @@ fn context_capacity_tracks_the_model_and_ignores_uninitialized_snapshots() {
 
 #[test]
 fn approval_snapshots_distinguish_waiting_from_tool_execution() {
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
     for after in ["working", "tool_use", "idle"] {
         dispatch_hook(
             &mut state,
@@ -152,7 +152,7 @@ fn compact_snapshots_use_the_transcript_and_withhold_stale_usage_until_inference
         &path,
         serde_json::json!({"type":"PLANNER_RESPONSE", "status":"DONE", "input_tokens":9000}),
     );
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Idle);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Idle);
     dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
     assert_eq!(state.context_tokens, Some(9012));
 
@@ -222,7 +222,7 @@ fn cancelled_compaction_keeps_usage_and_does_not_reactivate_on_an_ordinary_promp
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("transcript.jsonl");
     append_prompt(&path, "/compact");
-    let mut state = LauncherState::for_test(AgentControl::Antigravity, SessionStatus::Active);
+    let mut state = LauncherState::for_test(AgentKind::Antigravity, SessionStatus::Active);
     dispatch_hook(&mut state, snapshot_at(&path, "working", 9000));
     assert_eq!(state.status, SessionStatus::Compacting);
     dispatch_hook(&mut state, snapshot_at(&path, "idle", 9000));
@@ -238,7 +238,7 @@ fn cancelled_compaction_keeps_usage_and_does_not_reactivate_on_an_ordinary_promp
 #[test]
 fn unknown_and_coarse_states_preserve_more_specific_hook_status() {
     let mut state =
-        LauncherState::for_test(AgentControl::Antigravity, SessionStatus::WaitingForDecision);
+        LauncherState::for_test(AgentKind::Antigravity, SessionStatus::WaitingForDecision);
     for activity in [
         "authenticating",
         "initializing",

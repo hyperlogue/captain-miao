@@ -1,4 +1,4 @@
-//! Per-backend implementations dispatched to from `crate::agent::AgentControl`.
+//! Per-backend implementations dispatched to from `crate::agent::AgentKind`.
 
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -17,6 +17,7 @@ pub mod reasonix;
 // start from, and the synthetic-home builder an agent needs when its hooks can
 // only be discovered from its home directory.
 mod common;
+pub(crate) mod definition;
 mod pi_extension;
 mod synth_home;
 
@@ -45,7 +46,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Whether `name` resolves to an executable on `$PATH`. Backs
-/// [`crate::agent::AgentControl::is_available`]; the `find_in_path` it wraps is
+/// [`crate::agent::AgentKind::is_available`]; the `find_in_path` it wraps is
 /// module-private because callers outside want the yes/no, not the path.
 pub(crate) fn binary_available(name: &str) -> bool {
     find_in_path(name).is_some()
@@ -144,3 +145,9 @@ mod tests {
         );
     }
 }
+
+pub(crate) mod hooked;
+
+pub(crate) mod hook_session;
+
+pub(crate) mod transcript;

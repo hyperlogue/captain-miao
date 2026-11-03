@@ -213,7 +213,7 @@ fn session(pid: u32, cwd: &str, status: SessionStatus) -> LauncherState {
         // in tests exactly as it does live. A few tests clear this to exercise the
         // hand-launched fallback (no launch_id, self-reported window_id).
         launch_id: Some(format!("launch-{pid}")),
-        ..LauncherState::for_test(crate::agent::AgentControl::Claude, status)
+        ..LauncherState::for_test(crate::agent::AgentKind::Claude, status)
     }
 }
 
@@ -248,7 +248,7 @@ fn host_row(label: &str, target: &str) -> super::HostRow {
 fn pending_launch(app: &mut App, token: &str) {
     app.launches.start(
         super::launch::Request {
-            agent: crate::agent::AgentControl::Codex,
+            agent: crate::agent::AgentKind::Codex,
             window: super::launch::WindowLaunch {
                 local_token: token.into(),
                 host: crate::state::HostId::local(),
@@ -480,7 +480,7 @@ async fn pending_enter_waits_for_confirmation_and_respects_later_input() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         d.app.launches.start(
             Request {
-                agent: crate::agent::AgentControl::Codex,
+                agent: crate::agent::AgentKind::Codex,
                 window: WindowLaunch {
                     local_token: "new-launch".into(),
                     host: host.clone(),
@@ -654,7 +654,7 @@ async fn pending_enter_waits_for_confirmation_and_respects_later_input() {
 
 #[tokio::test]
 async fn pending_and_confirmed_rows_use_identical_session_styling() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::HostId;
 
     for width in [78, 120] {
@@ -671,7 +671,7 @@ async fn pending_and_confirmed_rows_use_identical_session_styling() {
                 let cwd = "/work/new-project";
                 d.app.launches.start(
                     super::launch::Request {
-                        agent: AgentControl::Codex,
+                        agent: AgentKind::Codex,
                         window: super::launch::WindowLaunch {
                             local_token: "pending".into(),
                             host: host.clone(),
@@ -694,7 +694,7 @@ async fn pending_and_confirmed_rows_use_identical_session_styling() {
 
                 d.app.launches = Default::default();
                 let mut confirmed = session(42, cwd, SessionStatus::Starting);
-                confirmed.agent = AgentControl::Codex;
+                confirmed.agent = AgentKind::Codex;
                 confirmed.host = host.clone();
                 confirmed.name = Some("new-session".into());
                 d.app
@@ -735,7 +735,7 @@ async fn enter_on_an_early_session_waits_for_its_window_without_attaching_twice(
 
     let mut d = TestDashboard::new(120, 24);
     let request = super::launch::Request {
-        agent: crate::agent::AgentControl::Codex,
+        agent: crate::agent::AgentKind::Codex,
         window: super::launch::WindowLaunch {
             local_token: "new-launch".into(),
             host: HostId::local(),
@@ -2034,15 +2034,15 @@ fn message_wheel_scroll_can_extend_selection_across_entries() {
 
 #[test]
 fn space_a_picker_sets_default_new_session_backend() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     let mut d = TestDashboard::new(120, 10);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
     // Default backend is Claude: header cluster shows it and `o` launches it.
-    assert_eq!(d.app.new_session_agent, AgentControl::Claude);
+    assert_eq!(d.app.new_session_agent, AgentKind::Claude);
     assert!(d.render().contains("Default agent: Claude"));
     match d.press(KeyCode::Char('o')) {
-        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentControl::Claude),
+        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentKind::Claude),
         _ => panic!("expected NewSessionSplit"),
     }
 
@@ -2053,10 +2053,10 @@ fn space_a_picker_sets_default_new_session_backend() {
     d.press(KeyCode::Char('x'));
     d.press(KeyCode::Esc);
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert_eq!(d.app.new_session_agent, AgentControl::Codex);
+    assert_eq!(d.app.new_session_agent, AgentKind::Codex);
     assert!(d.render().contains("Default agent: Codex"));
     match d.press(KeyCode::Char('o')) {
-        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentControl::Codex),
+        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentKind::Codex),
         _ => panic!("expected NewSessionSplit"),
     }
 }
@@ -2358,7 +2358,7 @@ fn agent_logos_preferences_persist_and_reset_to_the_config_file() {
 
 #[test]
 fn agent_logos_occupy_two_cells_before_context_and_obey_display_gates() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
     let mut d = TestDashboard::new(140, 24);
     d.app.logo.caps = Some(crate::terminal::graphics::CellSize { w: 8, h: 16 });
@@ -2388,7 +2388,7 @@ fn agent_logos_occupy_two_cells_before_context_and_obey_display_gates() {
     assert!(wire.contains("c=2,r=1"));
 
     // Grok uses the xAI image in the same two-cell slot.
-    s.agent = AgentControl::Grok;
+    s.agent = AgentKind::Grok;
     d.set_sessions(vec![s.clone()]);
     d.render();
     let mut wire = Vec::new();
@@ -2404,7 +2404,7 @@ fn agent_logos_occupy_two_cells_before_context_and_obey_display_gates() {
     );
 
     // Unknown kinds remain identifiable without confusing them with a logo.
-    s.agent = AgentControl::Unknown;
+    s.agent = AgentKind::Unknown;
     d.set_sessions(vec![s]);
     d.render();
     assert_eq!(d.terminal.backend().buffer()[(icon_x, row)].symbol(), "?");
@@ -2456,7 +2456,7 @@ fn agent_logos_occupy_two_cells_before_context_and_obey_display_gates() {
 
 #[test]
 fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
@@ -2471,21 +2471,21 @@ fn workdir_picker_ctrl_t_overrides_backend_for_this_launch() {
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert!(d.render().contains("Agent Codex"));
-    assert_eq!(d.app.new_session_agent, AgentControl::Claude);
+    assert_eq!(d.app.new_session_agent, AgentKind::Claude);
 
     // Submitting a free-form path launches with the overridden backend.
     for c in "/tmp/x".chars() {
         d.press(KeyCode::Char(c));
     }
     match d.press(KeyCode::Enter) {
-        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentControl::Codex),
+        Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentKind::Codex),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
 }
 
 #[test]
 fn workdir_picker_ctrl_t_cycles_every_enabled_agent_in_order() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     // A private PATH makes availability deterministic without changing the
     // environment of other tests. Only Claude is installed, but every enabled
@@ -2524,14 +2524,14 @@ fn workdir_picker_ctrl_t_cycles_every_enabled_agent_in_order() {
     }
 
     let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
-    for agent in AgentControl::ALL {
-        assert_eq!(agent.is_available(), *agent == AgentControl::Claude);
+    for agent in AgentKind::ALL {
+        assert_eq!(agent.is_available(), *agent == AgentKind::Claude);
     }
-    let all: Vec<_> = AgentControl::ALL.iter().map(|a| (*a, true)).collect();
-    let reordered: Vec<_> = AgentControl::ALL
+    let all: Vec<_> = AgentKind::ALL.iter().map(|a| (*a, true)).collect();
+    let reordered: Vec<_> = AgentKind::ALL
         .iter()
         .rev()
-        .map(|a| (*a, *a != AgentControl::Codex))
+        .map(|a| (*a, *a != AgentKind::Codex))
         .collect();
     for order in [all, reordered] {
         let enabled: Vec<_> = order
@@ -2822,12 +2822,12 @@ fn the_workdir_picker_wears_a_bare_border() {
 
 #[test]
 fn resume_picker_names_the_host_it_lists() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::agent::{AgentKind, ResumeCandidate};
     use crate::state::HostId;
     use std::time::SystemTime;
 
     let cand = |id: &str, cwd: &str| ResumeCandidate {
-        agent: AgentControl::Claude,
+        agent: AgentKind::Claude,
         session_id: id.to_string(),
         cwd: cwd.to_string(),
         first_prompt: Some(format!("prompt for {id}")),
@@ -2864,12 +2864,12 @@ fn resume_picker_names_the_host_it_lists() {
 
 #[test]
 fn resume_picker_rejects_a_session_hidden_during_kill() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::agent::{AgentKind, ResumeCandidate};
     use crate::backend::{Backend, RemoteBackend};
     use crate::state::HostId;
     let mut d = TestDashboard::new(140, 20);
     let host = HostId("test-host".into());
-    let mut owner = LauncherState::for_test(AgentControl::Claude, SessionStatus::Idle);
+    let mut owner = LauncherState::for_test(AgentKind::Claude, SessionStatus::Idle);
     owner.session_id = Some("managed-thread".into());
     let key = owner.key();
     let backend = Backend::Remote(RemoteBackend::unconnected_for_tests(
@@ -2883,7 +2883,7 @@ fn resume_picker_rejects_a_session_hidden_during_kill() {
     d.app.open_resume_picker(
         host,
         vec![ResumeCandidate {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             session_id: "managed-thread".into(),
             cwd: "/tmp/project".into(),
             first_prompt: None,
@@ -2901,15 +2901,15 @@ fn resume_picker_rejects_a_session_hidden_during_kill() {
 
 #[test]
 fn resume_picker_rejects_an_already_managed_conversation() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::agent::{AgentKind, ResumeCandidate};
     use crate::state::HostId;
     use cm_core::agents::codex::CodexMode;
 
     for host in [HostId::local(), HostId("test-host".into())] {
-        for (agent, mode) in AgentControl::ALL
+        for (agent, mode) in AgentKind::ALL
             .iter()
             .map(|&agent| (agent, CodexMode::Native))
-            .chain([(AgentControl::Codex, CodexMode::AppServer)])
+            .chain([(AgentKind::Codex, CodexMode::AppServer)])
         {
             for status in [
                 SessionStatus::Idle,
@@ -2955,43 +2955,43 @@ fn resume_picker_rejects_an_already_managed_conversation() {
 
 #[test]
 fn resume_picker_scopes_ownership_to_the_agent_conversation_and_host() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::agent::{AgentKind, ResumeCandidate};
     use crate::state::HostId;
 
     for (candidate_agent, owner_agent, owner_host, owner_id) in [
         (
-            AgentControl::Codex,
-            AgentControl::Codex,
+            AgentKind::Codex,
+            AgentKind::Codex,
             HostId("test-host".into()),
             "saved-thread",
         ),
         (
-            AgentControl::Codex,
-            AgentControl::Claude,
+            AgentKind::Codex,
+            AgentKind::Claude,
             HostId::local(),
             "saved-thread",
         ),
         (
-            AgentControl::Codex,
-            AgentControl::Codex,
+            AgentKind::Codex,
+            AgentKind::Codex,
             HostId::local(),
             "other-thread",
         ),
         (
-            AgentControl::Claude,
-            AgentControl::Claude,
+            AgentKind::Claude,
+            AgentKind::Claude,
             HostId("test-host".into()),
             "saved-thread",
         ),
         (
-            AgentControl::Claude,
-            AgentControl::Codex,
+            AgentKind::Claude,
+            AgentKind::Codex,
             HostId::local(),
             "saved-thread",
         ),
         (
-            AgentControl::Claude,
-            AgentControl::Claude,
+            AgentKind::Claude,
+            AgentKind::Claude,
             HostId::local(),
             "other-thread",
         ),
@@ -3098,7 +3098,7 @@ fn a_rule_divides_the_pickers_settings_from_its_input() {
 /// the `Ctrl-h` host switch, which read as a hang.
 #[test]
 fn the_resume_picker_opens_before_its_list_arrives() {
-    use crate::agent::{AgentControl, ResumeCandidate};
+    use crate::agent::{AgentKind, ResumeCandidate};
     use crate::state::HostId;
     use std::time::SystemTime;
 
@@ -3119,7 +3119,7 @@ fn the_resume_picker_opens_before_its_list_arrives() {
     d.app.reseed_resume_picker(
         HostId("buildbox".into()),
         vec![ResumeCandidate {
-            agent: AgentControl::Claude,
+            agent: AgentKind::Claude,
             session_id: "bbbb2222".into(),
             cwd: "/srv/remote-proj".into(),
             first_prompt: Some("fix the thing".into()),
@@ -3952,7 +3952,7 @@ fn a_restore_waits_for_the_hosts_account_and_skips_what_survived() {
     use crate::state::HostId;
     let host = HostId("box".into());
     let spec = |sid: &str| RestoreSpec {
-        agent: crate::agent::AgentControl::Claude,
+        agent: crate::agent::AgentKind::Claude,
         cwd: "~/work".to_string(),
         session_id: sid.to_string(),
     };
@@ -4158,7 +4158,7 @@ fn the_attention_sweep_says_when_a_backend_could_not_have_told_it() {
 
     // Add a Pi row and the same keypress stops promising as much.
     let mut pi = session(2, "/home/test/two", SessionStatus::Active);
-    pi.agent = crate::agent::AgentControl::Pi;
+    pi.agent = crate::agent::AgentKind::Pi;
     d.set_sessions(vec![claude, pi]);
     d.app.table_state.select(Some(0));
     d.press(KeyCode::Char('s'));
@@ -7429,7 +7429,7 @@ fn narrow_layout_stacks_panels_and_trims_columns() {
 /// stalled before its first reply.
 #[test]
 fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
-    let render = |agent: crate::agent::AgentControl, cols: u16| {
+    let render = |agent: crate::agent::AgentKind, cols: u16| {
         let mut d = TestDashboard::new(cols, 20);
         let mut s = session(1, "/home/test/proj", SessionStatus::Active);
         s.agent = agent;
@@ -7438,13 +7438,13 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
         d.render()
     };
     // The wide table's `Ctx` column: blank while Claude has yet to report…
-    let claude = render(crate::agent::AgentControl::Claude, 120);
+    let claude = render(crate::agent::AgentKind::Claude, 120);
     assert!(
         !claude.contains("n/a"),
         "a pending total leaves the column blank: {claude}"
     );
     // …and marked on the backend that will never report one.
-    let reasonix = render(crate::agent::AgentControl::Reasonix, 120);
+    let reasonix = render(crate::agent::AgentKind::Reasonix, 120);
     assert!(
         reasonix.contains("n/a"),
         "a backend with no context total to give must not read as pending: {reasonix}"
@@ -7452,7 +7452,7 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
 
     // The narrow layout drops that column. The same distinction lives in the
     // session record: an em dash pends, `n/a` doesn't.
-    let record = |agent: crate::agent::AgentControl| {
+    let record = |agent: crate::agent::AgentKind| {
         let mut d = TestDashboard::new(80, 24);
         let mut s = session(1, "/home/test/proj", SessionStatus::Active);
         s.agent = agent;
@@ -7461,12 +7461,12 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
         d.press_toggle('s');
         d.render()
     };
-    let claude_record = record(crate::agent::AgentControl::Claude);
+    let claude_record = record(crate::agent::AgentKind::Claude);
     assert!(
         claude_record.contains("Context") && !claude_record.contains("n/a"),
         "the session record pends with an em dash: {claude_record}"
     );
-    let reasonix_record = record(crate::agent::AgentControl::Reasonix);
+    let reasonix_record = record(crate::agent::AgentKind::Reasonix);
     assert!(
         reasonix_record.contains("Context") && reasonix_record.contains("n/a"),
         "…and says so when nothing is coming: {reasonix_record}"
@@ -7480,7 +7480,7 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
 fn a_known_context_window_stays_an_absolute_count_in_the_table() {
     let grok = || {
         let mut s = session(1, "/home/test/proj", SessionStatus::Active);
-        s.agent = crate::agent::AgentControl::Grok;
+        s.agent = crate::agent::AgentKind::Grok;
         s.context_tokens = Some(350_960);
         s.context_window = Some(500_000);
         s
@@ -11240,7 +11240,7 @@ fn disconnected_codex_sessions_can_restart_selected_and_all() {
     for key in ['e', 'E'] {
         let mut d = TestDashboard::new(120, 20);
         let mut row = session(1, "/path/to/project", SessionStatus::Starting);
-        row.agent = crate::agent::AgentControl::Codex;
+        row.agent = crate::agent::AgentKind::Codex;
         row.codex_mode = CodexMode::AppServer;
         row.codex_connected = Some(false);
         row.codex_control = true;
@@ -11274,7 +11274,7 @@ fn codex_restarts_still_require_disconnection_identity_and_cleanup_control() {
         for missing in ["disconnection", "identity", "control", "app-server mode"] {
             let mut d = TestDashboard::new(120, 20);
             let mut row = session(1, "/path/to/project", SessionStatus::Starting);
-            row.agent = crate::agent::AgentControl::Codex;
+            row.agent = crate::agent::AgentKind::Codex;
             row.codex_mode = CodexMode::AppServer;
             row.codex_connected = Some(false);
             row.codex_control = true;
@@ -11648,7 +11648,7 @@ fn restart_restore_waits_until_session_reappears() {
 fn snapshot_entry_flags_roundtrip_and_back_compat() {
     use super::{SessionFlags, SessionSnapshotEntry};
     let entry = SessionSnapshotEntry {
-        agent: crate::agent::AgentControl::Claude,
+        agent: crate::agent::AgentKind::Claude,
         launcher_pid: 1,
         child_pid: 2,
         window_id: WindowId::from(100),
@@ -12107,29 +12107,26 @@ fn work_tabs_persist_across_restart() {
 #[test]
 fn launch_tab_title_expands_template() {
     use super::run::expand_tab_title;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
 
     // The default template names the session's project and backend.
     assert_eq!(
-        expand_tab_title("{agent}: {basename}", AgentControl::Claude, "/home/test/r3"),
+        expand_tab_title("{agent}: {basename}", AgentKind::Claude, "/home/test/r3"),
         "Claude: r3"
     );
     assert_eq!(
-        expand_tab_title("{agent}: {basename}", AgentControl::Codex, "/home/test/r3"),
+        expand_tab_title("{agent}: {basename}", AgentKind::Codex, "/home/test/r3"),
         "Codex: r3"
     );
     // {cwd} carries the full path; a pathless cwd falls back to itself.
     assert_eq!(
-        expand_tab_title("[{cwd}]", AgentControl::Claude, "/a/b"),
+        expand_tab_title("[{cwd}]", AgentKind::Claude, "/a/b"),
         "[/a/b]"
     );
-    assert_eq!(
-        expand_tab_title("{basename}", AgentControl::Claude, "/"),
-        "/"
-    );
+    assert_eq!(expand_tab_title("{basename}", AgentKind::Claude, "/"), "/");
     // A literal title (no placeholders) passes through untouched.
     assert_eq!(
-        expand_tab_title("Claude (new)", AgentControl::Claude, "/x"),
+        expand_tab_title("Claude (new)", AgentKind::Claude, "/x"),
         "Claude (new)"
     );
 }
@@ -12609,7 +12606,7 @@ fn resize_invalidation_forces_a_logo_re_upload() {
 #[test]
 fn the_backend_cycle_walks_only_what_is_enabled() {
     use super::keys::cycle_agent;
-    use crate::agent::AgentControl::{Claude, Codex, Reasonix};
+    use crate::agent::AgentKind::{Claude, Codex, Reasonix};
 
     let enabled = [Claude, Reasonix];
     assert_eq!(cycle_agent(Claude, &enabled), Reasonix);
@@ -12625,7 +12622,7 @@ fn the_backend_cycle_walks_only_what_is_enabled() {
 #[test]
 fn the_backend_cycle_handles_a_default_outside_the_enabled_list() {
     use super::keys::cycle_agent;
-    use crate::agent::AgentControl::{Claude, Codex, Reasonix};
+    use crate::agent::AgentKind::{Claude, Codex, Reasonix};
 
     // The first press must reach the first stop, not skip past it.
     assert_eq!(cycle_agent(Codex, &[Claude, Reasonix]), Claude);
@@ -12640,14 +12637,14 @@ fn the_backend_cycle_handles_a_default_outside_the_enabled_list() {
 
 #[test]
 fn detail_explains_disconnection_and_advertises_the_remapped_full_id_copy() {
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::config::KeyBinding;
     let mut d = TestDashboard::new(160, 30);
     d.app.detail_visible = true;
     d.app.detail_width = 75;
     let id = "12345678-abcd-4321-abcd-123456789abc";
     let mut row = session(543, "~/project", SessionStatus::Starting);
-    row.agent = AgentControl::Codex;
+    row.agent = AgentKind::Codex;
     row.session_id = Some(id.into());
     row.codex_mode = cm_core::agents::codex::CodexMode::AppServer;
     row.codex_connected = Some(false);

@@ -25,7 +25,7 @@ local rationale remains beside the implementation.
   `primary_key` so remaps appear. Gate recurring reads at the call site too:
   the preview loop interprets failed `capture_text` as a stale binding, so
   `capture: false` must prevent the fetch.
-- Gate absent data on `AgentControl::capabilities()`. An unsupported Context
+- Gate absent data on `AgentKind::capabilities()`. An unsupported Context
   cell reads `n/a`; empty means a value has yet to arrive. Attention summaries
   must identify an agent that cannot report approval prompts instead of implying
   every session was checked.

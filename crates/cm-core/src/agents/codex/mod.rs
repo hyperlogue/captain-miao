@@ -3,14 +3,14 @@
 //! Running launchers keep their selected mode, even when the host changes its
 //! setting. The dashboard continues to consume launcher state in either mode.
 
-pub mod app_server;
+mod app_server;
 mod native;
 mod settings;
 mod tui;
 
 #[cfg(test)]
 pub(crate) use native::read_resume_metadata_at;
-pub use native::{
+pub(crate) use native::{
     build_hooks_settings, build_launch_command, dispatch_hook, parse_hook_payload,
     read_resume_metadata, read_thread_titles, read_transcript_stats, scan_transcript_signals,
     thread_self_continues, title_store_mtimes, title_watch_path,
@@ -24,21 +24,6 @@ pub(crate) use tui::{BIN, clipboard_paste_input, reattach_prime, uses_kitty_keyb
 pub const RESTART_RETRY_WINDOW: std::time::Duration = app_server::HANDOFF_TIMEOUT
     .saturating_sub(app_server::CONTROL_TIMEOUT)
     .saturating_sub(std::time::Duration::from_secs(5));
-
-pub fn list_resumable(limit: usize) -> anyhow::Result<Vec<crate::agent::ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
-pub(crate) fn list_resumable_cached(
-    limit: usize,
-    cache: &mut crate::resume::AgentCache,
-) -> anyhow::Result<Vec<crate::agent::ResumeCandidate>> {
-    let config = crate::config::read_codex()?;
-    match config.mode {
-        CodexMode::Native => native::list_resumable_cached(limit, cache),
-        CodexMode::AppServer => app_server::list_resumable(&config, limit),
-    }
-}
 
 /// Restart opens the replacement window before ending the old launcher, to
 /// preserve its terminal tab. Delay acquiring the thread until the old owner
@@ -63,7 +48,7 @@ async fn wait_for_handoff_with(
     tokio::time::timeout(app_server::HANDOFF_TIMEOUT, async {
         loop {
             let owned = states().iter().any(|state|
-                state.launcher_pid != launcher_pid && state.agent == crate::agent::AgentControl::Codex
+                state.launcher_pid != launcher_pid && state.agent == crate::agent::AgentKind::Codex
                     && state.session_id.as_deref() == Some(id));
             if !owned { break; }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -74,13 +59,13 @@ async fn wait_for_handoff_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AgentControl;
+    use crate::agent::AgentKind;
     use crate::state::{LauncherState, SessionStatus};
     use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
     async fn resume_handoff_outlasts_a_slow_successful_cleanup() {
-        let mut owner = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut owner = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         owner.launcher_pid = 11;
         owner.session_id = Some("resumed-thread".into());
         let args = vec!["resume".into(), "resumed-thread".into()];
@@ -98,7 +83,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn resume_waits_for_old_owner_but_ignores_self_and_other_threads() {
-        let mut owner = LauncherState::for_test(AgentControl::Codex, SessionStatus::Idle);
+        let mut owner = LauncherState::for_test(AgentKind::Codex, SessionStatus::Idle);
         owner.launcher_pid = 11;
         owner.session_id = Some("resumed-thread".into());
         let args = vec!["resume".into(), "resumed-thread".into()];
@@ -131,3 +116,6 @@ mod tests {
         assert_eq!(now.elapsed(), app_server::HANDOFF_TIMEOUT);
     }
 }
+
+mod adapter;
+pub(crate) use adapter::Definition;

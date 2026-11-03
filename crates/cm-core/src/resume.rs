@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
-use crate::agent::{AgentControl, ResumeCandidate};
+use crate::agent::{AgentKind, ResumeCandidate};
 
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -22,7 +22,7 @@ pub struct Snapshot {
 struct State {
     generation: u64,
     limit: usize,
-    agents: HashMap<AgentControl, Vec<ResumeCandidate>>,
+    agents: HashMap<AgentKind, Vec<ResumeCandidate>>,
     errors: Vec<String>,
 }
 
@@ -37,7 +37,7 @@ impl Default for Inventory {
         Self {
             state: Mutex::default(),
             refresh: Mutex::default(),
-            parsers: AgentControl::ALL.iter().map(|_| Mutex::default()).collect(),
+            parsers: AgentKind::ALL.iter().map(|_| Mutex::default()).collect(),
         }
     }
 }
@@ -53,8 +53,9 @@ impl Inventory {
     }
 
     pub fn refresh(&self, limit: usize, per_agent: bool) -> Snapshot {
+        let config = crate::config::AgentConfig::load();
         self.refresh_with(limit, per_agent, |agent, limit, cache| {
-            agent.list_resumable_cached(limit, cache)
+            agent.configure(&config)?.list_resumable(limit, cache)
         })
     }
 
@@ -62,7 +63,7 @@ impl Inventory {
         &self,
         limit: usize,
         per_agent: bool,
-        lookup: impl Fn(AgentControl, usize, &mut AgentCache) -> anyhow::Result<Vec<ResumeCandidate>>
+        lookup: impl Fn(AgentKind, usize, &mut AgentCache) -> anyhow::Result<Vec<ResumeCandidate>>
         + Sync,
     ) -> Snapshot {
         if limit == 0 {
@@ -77,7 +78,7 @@ impl Inventory {
         before: u64,
         limit: usize,
         per_agent: bool,
-        lookup: impl Fn(AgentControl, usize, &mut AgentCache) -> anyhow::Result<Vec<ResumeCandidate>>
+        lookup: impl Fn(AgentKind, usize, &mut AgentCache) -> anyhow::Result<Vec<ResumeCandidate>>
         + Sync,
     ) -> Snapshot {
         let _refresh = lock(&self.refresh);
@@ -90,7 +91,7 @@ impl Inventory {
         // Bound parallel CLI/filesystem work; neither one slow agent nor a
         // second dashboard should turn a refresh into unbounded fan-out.
         let mut results = Vec::new();
-        for group in AgentControl::ALL
+        for group in AgentKind::ALL
             .iter()
             .zip(&self.parsers)
             .collect::<Vec<_>>()
@@ -134,7 +135,7 @@ impl Inventory {
 }
 
 fn snapshot(state: &State, limit: usize, per_agent: bool) -> Snapshot {
-    let mut candidates: Vec<_> = AgentControl::ALL
+    let mut candidates: Vec<_> = AgentKind::ALL
         .iter()
         .filter_map(|agent| state.agents.get(agent))
         .flat_map(|rows| rows.iter().take(limit).cloned())
@@ -290,7 +291,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn candidate(agent: AgentControl, name: &str) -> ResumeCandidate {
+    fn candidate(agent: AgentKind, name: &str) -> ResumeCandidate {
         ResumeCandidate {
             agent,
             session_id: agent.cli_subcommand().into(),
@@ -308,16 +309,16 @@ mod tests {
         assert!(inventory.snapshot(50, true).is_none());
         inventory.refresh_with(50, true, |agent, _, _| Ok(vec![candidate(agent, "old")]));
         let updated = inventory.refresh_with(50, true, |agent, _, _| match agent {
-            AgentControl::Claude => anyhow::bail!("temporarily unavailable"),
-            AgentControl::Codex => Ok(Vec::new()),
+            AgentKind::Claude => anyhow::bail!("temporarily unavailable"),
+            AgentKind::Codex => Ok(Vec::new()),
             _ => Ok(vec![candidate(agent, "new")]),
         });
-        assert_eq!(updated.candidates.len(), AgentControl::ALL.len() - 1);
+        assert_eq!(updated.candidates.len(), AgentKind::ALL.len() - 1);
         assert_eq!(
             updated
                 .candidates
                 .iter()
-                .find(|c| c.agent == AgentControl::Claude)
+                .find(|c| c.agent == AgentKind::Claude)
                 .unwrap()
                 .first_prompt
                 .as_deref(),
@@ -327,7 +328,7 @@ mod tests {
             !updated
                 .candidates
                 .iter()
-                .any(|c| c.agent == AgentControl::Codex)
+                .any(|c| c.agent == AgentKind::Codex)
         );
         assert!(
             updated
@@ -338,7 +339,7 @@ mod tests {
         assert_eq!(inventory.snapshot(1, false).unwrap().candidates.len(), 1);
         assert_eq!(
             inventory.snapshot(1, true).unwrap().candidates.len(),
-            AgentControl::ALL.len() - 1
+            AgentKind::ALL.len() - 1
         );
     }
 
@@ -355,15 +356,15 @@ mod tests {
         let queued_at = lock(&inventory.state).generation;
         inventory.refresh_from(queued_at, 10, true, lookup);
         inventory.refresh_from(queued_at, 10, true, lookup);
-        assert_eq!(calls.load(Ordering::SeqCst), AgentControl::ALL.len());
+        assert_eq!(calls.load(Ordering::SeqCst), AgentKind::ALL.len());
         inventory.refresh_from(queued_at, 20, true, lookup);
-        assert_eq!(calls.load(Ordering::SeqCst), 2 * AgentControl::ALL.len());
+        assert_eq!(calls.load(Ordering::SeqCst), 2 * AgentKind::ALL.len());
         for _ in 0..100 {
             inventory.snapshot(20, true).unwrap();
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2 * AgentControl::ALL.len(),
+            2 * AgentKind::ALL.len(),
             "snapshot reads never trigger refreshes"
         );
     }
@@ -378,7 +379,7 @@ mod tests {
         std::thread::scope(|scope| {
             let refresh = scope.spawn(|| {
                 inventory.refresh_with(10, true, |agent, _, _| {
-                    if agent == AgentControl::Claude {
+                    if agent == AgentKind::Claude {
                         started_tx.send(()).unwrap();
                         lock(&release_rx).recv().unwrap();
                     }
