@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+pub(super) type Opened = (Job, Result<(String, crate::terminal::SpawnResult), String>);
+
 #[derive(Clone)]
 pub(super) struct Job {
     batch: u64,

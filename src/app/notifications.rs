@@ -18,6 +18,7 @@ use ratatui::{
 use super::{App, InputMode, format::clear_overlay, keymap::Command};
 
 const LIFETIME: Duration = Duration::from_secs(5);
+const PROGRESS_DELAY: Duration = Duration::from_millis(800);
 const FADE_IN: Duration = Duration::from_millis(180);
 const SPINNER_STEP: Duration = Duration::from_millis(100);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -63,7 +64,27 @@ pub(super) struct Notifications {
     spinner_phase: Option<usize>,
 }
 
+impl Notification {
+    fn visible_at(&self) -> Instant {
+        self.created
+            + if self.level == Level::Progress {
+                PROGRESS_DELAY
+            } else {
+                Duration::ZERO
+            }
+    }
+
+    fn visible(&self, now: Instant) -> bool {
+        now >= self.visible_at()
+    }
+}
+
 impl Notifications {
+    pub(super) fn remove(&mut self, id: NotificationId) {
+        self.entries.retain(|entry| entry.id != id);
+        self.hitboxes.retain(|(entry, _)| *entry != id);
+    }
+
     pub(super) fn push(&mut self, level: Level, text: String, now: Instant) -> NotificationId {
         // Repeated failures stay visible without filling the entire viewport.
         if level != Level::Progress
@@ -83,6 +104,9 @@ impl Notifications {
 
     pub(super) fn update(&mut self, id: NotificationId, level: Level, text: String, now: Instant) {
         if let Some(entry) = self.entries.iter_mut().find(|n| n.id == id) {
+            if entry.level != Level::Progress && level == Level::Progress {
+                entry.created = now;
+            }
             entry.level = level;
             entry.text = text;
             entry.updated = now;
@@ -105,7 +129,19 @@ impl Notifications {
     }
 
     pub(super) fn dismiss_latest(&mut self) {
-        self.entries.pop();
+        self.dismiss_latest_at(Instant::now());
+    }
+
+    fn dismiss_latest_at(&mut self, now: Instant) {
+        if let Some(id) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|n| n.visible(now))
+            .map(|n| n.id)
+        {
+            self.remove(id);
+        }
         self.hitboxes
             .retain(|(id, _)| self.entries.iter().any(|n| n.id == *id));
     }
@@ -140,11 +176,11 @@ impl Notifications {
         let fading = self
             .entries
             .iter()
-            .any(|n| now.duration_since(n.created) < FADE_IN);
+            .any(|n| n.visible(now) && now.duration_since(n.visible_at()) < FADE_IN);
         let phase = self
             .entries
             .iter()
-            .find(|n| n.level == Level::Progress)
+            .find(|n| n.level == Level::Progress && n.visible(now))
             .map(|n| {
                 (now.duration_since(n.created).as_millis() / SPINNER_STEP.as_millis()) as usize
                     % SPINNER.len()
@@ -160,13 +196,14 @@ impl Notifications {
         self.entries
             .iter()
             .flat_map(|n| {
-                let fade = n.created + FADE_IN;
+                let fade = n.visible_at() + FADE_IN;
                 [
+                    (n.visible_at() > now).then(|| n.visible_at().saturating_duration_since(now)),
                     (fade > now).then(|| fade.saturating_duration_since(now)),
                     n.level
                         .expires()
                         .then(|| (n.updated + LIFETIME).saturating_duration_since(now)),
-                    (n.level == Level::Progress).then_some(SPINNER_STEP),
+                    (n.level == Level::Progress && n.visible(now)).then_some(SPINNER_STEP),
                 ]
             })
             .flatten()
@@ -184,7 +221,7 @@ impl Notifications {
         let x = area.right() - width - 1;
         // Leave one blank row between the stack and the footer.
         let mut bottom = area.bottom().saturating_sub(1);
-        for entry in self.entries.iter().rev() {
+        for entry in self.entries.iter().rev().filter(|n| n.visible(now)) {
             // Reserve a row above the stack for its overflow count.
             let available = bottom.saturating_sub(area.y + 1);
             if available < 3 {
@@ -230,7 +267,7 @@ impl Notifications {
             frame.render_widget(paragraph, inner);
             // Native terminal dimming gives a brief fade-in without assuming
             // RGB values for the user's palette or adding an animation crate.
-            if now.duration_since(entry.created) < FADE_IN {
+            if now.duration_since(entry.visible_at()) < FADE_IN {
                 frame
                     .buffer_mut()
                     .set_style(rect, Style::default().add_modifier(Modifier::DIM));
@@ -238,7 +275,12 @@ impl Notifications {
             self.hitboxes.push((entry.id, rect));
             bottom = rect.y.saturating_sub(1);
         }
-        let hidden = self.entries.len().saturating_sub(self.hitboxes.len());
+        let hidden = self
+            .entries
+            .iter()
+            .filter(|n| n.visible(now))
+            .count()
+            .saturating_sub(self.hitboxes.len());
         if hidden > 0 {
             let hint = history
                 .map(|key| format!(" · {key} history"))
@@ -295,6 +337,58 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
+    fn progress_appears_at_800ms_and_fast_visible_results_leave_no_popup() {
+        let now = Instant::now();
+        let mut notices = Notifications::default();
+        let id = notices.push(Level::Progress, "Opening session".into(), now);
+        assert!(!notices.entries[0].visible(now + Duration::from_millis(799)));
+        assert_eq!(notices.next_wakeup(now), Some(PROGRESS_DELAY));
+        assert!(!notices.tick(now + Duration::from_millis(799)));
+        assert!(notices.tick(now + PROGRESS_DELAY));
+        assert!(notices.entries[0].visible(now + PROGRESS_DELAY));
+        notices.remove(id);
+        assert!(notices.entries.is_empty());
+        assert_eq!(notices.next_wakeup(now + PROGRESS_DELAY), None);
+        let id = notices.push(Level::Progress, "Fast open".into(), now);
+        notices.remove(id);
+        notices.tick(now + PROGRESS_DELAY + FADE_IN);
+        assert!(!notices.tick(now + PROGRESS_DELAY + FADE_IN));
+    }
+
+    #[test]
+    fn fast_failures_and_explicit_success_are_visible_without_waiting() {
+        let now = Instant::now();
+        let mut notices = Notifications::default();
+        for level in [Level::Error, Level::Success] {
+            let id = notices.push(Level::Progress, "Working".into(), now);
+            notices.update(id, level, "Finished".into(), now);
+            assert!(notices.entries.last().unwrap().visible(now));
+            notices.remove(id);
+        }
+    }
+
+    #[test]
+    fn confirmation_time_does_not_count_towards_execution_progress() {
+        let now = Instant::now();
+        let mut notices = Notifications::default();
+        let id = notices.push(Level::Progress, "Preparing".into(), now);
+        notices.update(
+            id,
+            Level::Info,
+            "Awaiting confirmation".into(),
+            now + PROGRESS_DELAY,
+        );
+        notices.update(
+            id,
+            Level::Progress,
+            "Pushing".into(),
+            now + Duration::from_secs(60),
+        );
+        assert!(!notices.entries[0].visible(now + Duration::from_secs(60)));
+        assert!(notices.entries[0].visible(now + Duration::from_secs(60) + PROGRESS_DELAY));
+    }
+
+    #[test]
     fn transient_results_expire_but_progress_and_attention_require_resolution() {
         let now = Instant::now();
         let mut notices = Notifications::default();
@@ -313,7 +407,7 @@ mod tests {
             vec![Level::Progress, Level::Warning, Level::Error]
         );
         for _ in 0..3 {
-            notices.dismiss_latest();
+            notices.dismiss_latest_at(now + LIFETIME);
         }
         assert!(notices.entries.is_empty());
     }
@@ -342,7 +436,8 @@ mod tests {
         let now = Instant::now();
         let mut notices = Notifications::default();
         let id = notices.push(Level::Progress, "Pushing".into(), now);
-        notices.dismiss_latest();
+        notices.dismiss_latest_at(now + PROGRESS_DELAY);
+        assert!(notices.entries.is_empty());
         notices.update(id, Level::Error, "Push failed".into(), now);
         assert_eq!(notices.entries.len(), 1);
         assert_eq!(notices.push(Level::Error, "Push failed".into(), now), id);

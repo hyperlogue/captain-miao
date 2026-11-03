@@ -412,17 +412,22 @@ pub fn list_tabs(tabs: &[Tab]) -> Vec<TabInfo> {
 /// shows up in the debug log whichever emulator you are on. What that costs
 /// differs per backend and is noted at each call site -- zellij's `list-panes`
 /// is the one that bites.
-async fn run_capture(
+async fn run_capture(label: &str, cmd: tokio::process::Command, args: &[&str]) -> Result<String> {
+    run_capture_with_limit(label, cmd, args, std::time::Duration::from_secs(30)).await
+}
+
+async fn run_capture_with_limit(
     label: &str,
     mut cmd: tokio::process::Command,
     args: &[&str],
+    limit: std::time::Duration,
 ) -> Result<String> {
     use anyhow::Context as _;
     let started = std::time::Instant::now();
-    let output = cmd
-        .args(args)
-        .output()
+    cmd.kill_on_drop(true);
+    let output = tokio::time::timeout(limit, cmd.args(args).output())
         .await
+        .with_context(|| format!("{label} timed out; its outcome may be unknown"))?
         .with_context(|| format!("Failed to run {label}"))?;
     tracing::debug!("{label} {} took {:?}", args.join(" "), started.elapsed());
 

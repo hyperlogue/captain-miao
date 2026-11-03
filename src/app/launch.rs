@@ -137,6 +137,7 @@ impl Pending {
 }
 
 pub(super) struct Finished {
+    pub launch_id: String,
     pub host: HostId,
     pub token: Option<String>,
     pub result: anyhow::Result<SpawnResult>,
@@ -221,6 +222,7 @@ impl Launches {
             };
             progress.changed = true;
             progress.finished.push(Finished {
+                launch_id: pending.request.window.local_token.clone(),
                 host: pending.request.window.host.clone(),
                 token: pending.token.clone(),
                 result,

@@ -58,6 +58,7 @@ mod codex_config;
 #[cfg(test)]
 mod connection_tests;
 pub(crate) mod forwards;
+mod local_snapshot;
 mod provision;
 mod ssh;
 mod vcs;
@@ -433,6 +434,7 @@ impl ConnLog {
 /// pooled-localhost free: that backend is a `Remote` over a local socket, and
 /// it simply has no watcher to own.)
 pub(crate) struct LocalHost {
+    snapshot: Option<local_snapshot::LocalSnapshot>,
     inner: LocalBackend,
     /// Bumped by the notify callback; the run loop reads it through
     /// [`BackendEvents`]. Held here so the watcher outlives `subscribe`.
@@ -456,7 +458,10 @@ impl LocalHost {
     /// *unknown*, which the UI resolves to "free to take": every pooled row on
     /// this machine looked available whether or not someone was working in it.
     fn list_sessions(&self) -> Vec<LauncherState> {
-        let mut rows = self.inner.list_sessions();
+        let mut rows = self
+            .snapshot
+            .as_ref()
+            .map_or_else(|| self.inner.list_sessions(), |snapshot| snapshot.rows());
         // Nothing on this machine is pooled → nothing to ask the daemon, and no
         // reason to have opened a socket to it. This is the gate that keeps the
         // watch off a laptop entirely (§10.1): the default population never has
@@ -917,6 +922,7 @@ impl Backend {
         let changed = Arc::new(AtomicBool::new(false));
         let sink = changed.clone();
         Backend::Local(Box::new(LocalHost {
+            snapshot: None,
             inner: LocalBackend::new().with_change_notifier(move || {
                 sink.store(true, Ordering::Relaxed);
             }),
@@ -1128,7 +1134,10 @@ impl Backend {
     /// `LauncherState.name` via the per-host overlay).
     pub(crate) fn session_index(&mut self) -> SessionIndex {
         match self {
-            Backend::Local(h) => h.inner.session_index(),
+            Backend::Local(h) => h
+                .snapshot
+                .as_ref()
+                .map_or_else(|| h.inner.session_index(), |snapshot| snapshot.index()),
             Backend::Remote(b) => b.session_index(),
         }
     }
@@ -1285,16 +1294,11 @@ impl Backend {
         }
     }
 
-    /// Plan how to open a session on this host (a fresh launch or a resume/fork).
-    /// Local returns the argv for a Kitty window directly — pure metadata, no
-    /// process starts until the client spawns the window. Remote RPCs the server
-    /// to start the launcher inside its pty pool and returns an `AttachRemote`
-    /// plan (an `ssh … attach` window). May block on the round-trip, so an async
-    /// caller of the remote path should wrap this in `block_in_place`.
+    #[cfg(test)]
     pub(crate) fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         match self {
-            Backend::Local(h) => h.inner.open_session(spec),
-            Backend::Remote(b) => b.open_session(spec),
+            Backend::Local(host) => host.inner.open_session(spec),
+            Backend::Remote(remote) => remote.open_session(spec),
         }
     }
 
@@ -1445,15 +1449,6 @@ impl Backend {
         match self {
             Backend::Local(h) => h.inner.complete_path(prefix),
             Backend::Remote(b) => b.complete_path(prefix),
-        }
-    }
-
-    /// Whether `path` is a directory on this host. Remote blocks — wrap in
-    /// `block_in_place`.
-    pub(crate) fn dir_exists(&self, path: &str) -> bool {
-        match self {
-            Backend::Local(h) => h.inner.dir_exists(path),
-            Backend::Remote(b) => b.dir_exists(path),
         }
     }
 }
@@ -1970,7 +1965,12 @@ impl RemoteBackend {
     /// the way through — the hosts panel's latency, with no dedicated frame.
     fn request(&self, make: impl FnOnce(u64) -> ClientFrame) -> Option<ServerFrame> {
         let (rx, sent_at) = self.enqueue(make)?;
-        let reply = rx.blocking_recv().ok();
+        let reply = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), rx)
+                .await
+                .ok()?
+                .ok()
+        });
         if reply.is_some() {
             *self.latency.lock().unwrap() = Some(sent_at.elapsed());
         }
@@ -2132,7 +2132,10 @@ impl RemoteBackend {
         }) else {
             return KillOutcome::Unreachable;
         };
-        let reply = reply.await.ok();
+        let reply = tokio::time::timeout(Duration::from_secs(120), reply)
+            .await
+            .ok()
+            .and_then(Result::ok);
         if reply.is_some() {
             *self.latency.lock().unwrap() = Some(sent_at.elapsed());
         }
@@ -2165,6 +2168,7 @@ impl RemoteBackend {
     /// Ask the server to start a launcher inside its pty pool, then build the
     /// plan for a *local* window that attaches to it. Blocks on the round-trip,
     /// so an async caller should wrap this in `block_in_place`.
+    #[cfg(test)]
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         let spec = spec.clone();
         let inherit_env = crate::config::get().remote.inherit_env.clone();
@@ -2249,6 +2253,7 @@ impl RemoteBackend {
 
     /// Whether `path` is a directory on the remote fs. Blocks; `false` if
     /// unreachable (the picker surfaces the disconnect separately).
+    #[cfg(test)]
     fn dir_exists(&self, path: &str) -> bool {
         let path = path.to_string();
         matches!(

@@ -2,17 +2,15 @@
 //!
 //! [`run`] owns the terminal (raw mode, alt screen, the keyboard-enhancement
 //! and mouse modes) and the single-instance check; [`run_app`] is the loop
-//! inside it. Everything asynchronous the dashboard does is a branch of that
-//! loop's `select!`: key and mouse input, each backend's change signal, the
-//! reload tick, background resume/kill/upgrade replies, detach reports, the
-//! preview debounce, and the redraw timers.
+//! inside it. Each pass consumes input and completed background operations,
+//! applies backend changes, and advances redraw and notification timers.
 //!
 //! **This is where an [`Action`] becomes a side effect.** `keys.rs` decides
 //! *what* the user asked for and returns a description; the free functions here
-//! (`launch_agent`, `attach_pool_session`, `start_kill`, `advance_restart`, …) are
+//! (`start_new_session`, `attach_pool_session`, `start_kill`, `advance_restart`, …) are
 //! what actually spawn a window, reach a host, or move a session. Anything that
-//! can block a host round-trip runs off the UI path or under
-//! `block_in_place`, because the loop is also what repaints.
+//! can wait on a host or terminal runs in an owned background operation.
+//! `block_in_place` would still suspend this loop and prevent repainting.
 //!
 //! Almost every constant in this file is a **floor or a debounce**, and each
 //! exists because something below it is expensive or flappy — a `snapshot()` of
@@ -106,6 +104,7 @@ struct LoopInboxes {
     resume_rx: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
     resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
     resume_seq: u64,
+    resume_notice: Option<super::notifications::NotificationId>,
     upgrade_rx: tokio::sync::mpsc::UnboundedReceiver<super::UpgradeReport>,
     upgrade_tx: tokio::sync::mpsc::UnboundedSender<super::UpgradeReport>,
     /// Kills coming back from the round trip that carried them, for the same
@@ -159,6 +158,7 @@ impl LoopInboxes {
             resume_rx,
             resume_tx,
             resume_seq: 0,
+            resume_notice: None,
             upgrade_rx,
             upgrade_tx,
             kill_rx,
@@ -595,6 +595,11 @@ pub(super) fn prune_detached_from_tabs(app: &mut App, tabs: &[Tab]) -> bool {
 /// remote inventories run off-thread; cached rows remain usable meanwhile.
 fn start_resume_load(app: &mut App, inboxes: &mut LoopInboxes, host: HostId, reseed: bool) {
     let limit = config::get().launcher.resume_list_limit;
+    if let Some(id) = inboxes.resume_notice.take() {
+        app.notifications.remove(id);
+    }
+    inboxes.resume_notice =
+        Some(app.notify(Level::Progress, format!("Loading sessions…\n{}", host.0)));
     inboxes.resume_seq += 1;
     let seq = inboxes.resume_seq;
     let cached = app.resume_cache.get(&host).cloned().unwrap_or_default();
@@ -682,6 +687,16 @@ fn start_resume_load(app: &mut App, inboxes: &mut LoopInboxes, host: HostId, res
 /// go from idle to working while the confirm sits on screen, and that is exactly
 /// the session this must not take down.
 fn start_host_upgrade(app: &mut App, inboxes: &LoopInboxes, host: HostId) {
+    if app.operations.contains(&format!("upgrade:{}", host.0)) {
+        return;
+    }
+    if !app.operations.has_capacity() {
+        app.notify(
+            Level::Warning,
+            "Too many operations running; try upgrading again shortly".into(),
+        );
+        return;
+    }
     let Some(offer) = app
         .backend_for(&host)
         .and_then(crate::backend::Backend::upgrade_offer)
@@ -723,15 +738,22 @@ fn start_host_upgrade(app: &mut App, inboxes: &LoopInboxes, host: HostId) {
     let options = config.options.clone();
     let reported = host.clone();
     let version = offer.version.clone();
-    tokio::spawn(async move {
-        let error = crate::backend::upgrade_host_server(&target, &options, &offer)
-            .await
-            .err();
-        let _ = tx.send(super::UpgradeReport {
-            host: reported,
-            error,
-        });
-    });
+    app.start_operation(
+        format!("upgrade:{}", host.0),
+        format!("Upgrading {} to {version}…", host.0),
+        None,
+        async move {
+            let error = crate::backend::upgrade_host_server(&target, &options, &offer)
+                .await
+                .err();
+            let _ = tx.send(super::UpgradeReport {
+                host: reported,
+                error,
+            });
+            Ok(())
+        },
+        |_, ()| {},
+    );
     app.set_status(
         match n {
             0 => format!("Upgrading {} to {version}\u{2026}", host.0),
@@ -788,6 +810,23 @@ fn finish_host_upgrade(app: &mut App, report: super::UpgradeReport) {
 fn apply_resume_load(app: &mut App, inboxes: &LoopInboxes, load: ResumeLoad) {
     if load.seq != inboxes.resume_seq {
         return;
+    }
+    if !load.cached
+        && let Some(id) = inboxes.resume_notice
+    {
+        if load.errors.is_empty() {
+            app.notifications.remove(id);
+        } else {
+            app.update_notification(
+                id,
+                Level::Error,
+                format!(
+                    "Could not load sessions on {}: {}",
+                    load.host.0,
+                    load.errors.join("; ")
+                ),
+            );
+        }
     }
     if !matches!(
         app.picker.as_ref().map(|a| &a.kind),
@@ -973,6 +1012,16 @@ fn start_kill(
     origin: KillOrigin,
     window: Option<(WindowId, Option<u32>)>,
 ) -> bool {
+    if app.operations.contains(&format!("kill:{}:{key}", host.0)) {
+        return false;
+    }
+    if !app.operations.has_capacity() {
+        app.notify(
+            Level::Warning,
+            "Too many operations running; try closing this session again shortly".into(),
+        );
+        return false;
+    }
     let Some(backend) = app.backend_for(&host) else {
         app.set_status(format!("Unknown host {}", host.0), true);
         return false;
@@ -989,18 +1038,32 @@ fn start_kill(
     backend.presume_killed(&key);
     let task = backend.kill_session(key.clone(), CleanupPolicy::ForceIfUnavailable);
     let tx = inboxes.kill_tx.clone();
-    tokio::spawn(async move {
-        let outcome = task.await.unwrap_or_else(|error| {
-            KillOutcome::Failed(format!("Close session worker failed: {error}"))
-        });
-        let _ = tx.send(KillResult {
-            host,
-            key,
-            outcome,
-            origin,
-            window,
-        });
-    });
+    let operation = format!("kill:{}:{key}", host.0);
+    let description = if origin == KillOrigin::WindowClosed {
+        String::new()
+    } else {
+        format!("Closing session…\n{}: {key}", host.0)
+    };
+    app.start_operation(
+        operation,
+        description,
+        None,
+        async move {
+            let outcome = task.await.unwrap_or_else(|error| {
+                KillOutcome::Failed(format!("Close session worker failed: {error}"))
+            });
+            let _ = tx.send(KillResult {
+                host,
+                key,
+                outcome,
+                origin,
+                window,
+            });
+            Ok(())
+        },
+        |_, ()| {},
+    );
+
     true
 }
 
@@ -1288,24 +1351,14 @@ fn write_osc52(stdout: &mut impl std::io::Write, text: &str) -> std::io::Result<
 }
 
 struct LaunchCopy {
-    failed: &'static str, // "Launch" / "Resume" / "Restart"
-    is_resume: bool,      // selects new_tab_title vs resume_tab_title from config
+    is_resume: bool, // selects new_tab_title vs resume_tab_title from config
 }
 
-const LAUNCH_COPY_NEW: LaunchCopy = LaunchCopy {
-    failed: "Launch",
-    is_resume: false,
-};
+const LAUNCH_COPY_NEW: LaunchCopy = LaunchCopy { is_resume: false };
 
-const LAUNCH_COPY_RESUME: LaunchCopy = LaunchCopy {
-    failed: "Resume",
-    is_resume: true,
-};
+const LAUNCH_COPY_RESUME: LaunchCopy = LaunchCopy { is_resume: true };
 
-const LAUNCH_COPY_RESTART: LaunchCopy = LaunchCopy {
-    failed: "Restart",
-    is_resume: true,
-};
+const LAUNCH_COPY_RESTART: LaunchCopy = LaunchCopy { is_resume: true };
 
 /// Where a session spawn lands, from the current [`SessionsLayout`] and the
 /// backend's capabilities. This is a **spawn-time policy over the mode**, not the
@@ -1342,74 +1395,6 @@ pub(super) fn expand_tab_title(template: &str, agent: AgentKind, cwd: &str) -> S
         .replace("{agent}", agent.label())
         .replace("{basename}", basename.as_ref())
         .replace("{cwd}", cwd)
-}
-
-async fn launch_agent(
-    app: &mut App,
-    agent: AgentKind,
-    cwd: &str,
-    resume: Option<(&str, bool)>,
-    copy: &LaunchCopy,
-    host: &HostId,
-    // `worktree`: `Some(name)` launches into a fresh agent-created worktree
-    // rather than `cwd` itself; an empty name lets the agent generate one. Only
-    // ever set on a brand-new session — a resume returns the session to the
-    // worktree it was already in (the agent tracks that binding), so asking for
-    // one here would be a second, conflicting request.
-    worktree: Option<String>,
-) -> Option<String> {
-    // The cwd goes into the recent list of the host it lands on — never another
-    // one's, so a mac path can't pollute a Linux box's picker.
-    app.record_launch_cwd(host, cwd);
-
-    // Ask the host how to open the session. A pooled host RPCs its daemon to
-    // start the launcher in the pty pool and returns an `AttachRemote` plan (an
-    // `ssh … attach` window, or a bare `attach` under pooled-localhost); an
-    // unpooled local host returns pure metadata — the argv for a window that
-    // *is* the launcher. The RPC blocks, so run it off the worker; bind the plan
-    // before matching so the backend borrow ends before we touch `app` again.
-    let open_spec = OpenSpec {
-        agent,
-        cwd: cwd.to_string(),
-        resume: resume.map(|(id, fork)| (id.to_string(), fork)),
-        // An empty name is meaningful: the agent generates one (Claude mints
-        // e.g. `bright-running-fox`), which is what `Ctrl-g` + Enter asks for.
-        worktree,
-    };
-    let plan = {
-        let Some(backend) = app.backend_for(host) else {
-            app.set_status(
-                format!("{} failed: unknown host {}", copy.failed, host.0),
-                true,
-            );
-            return None;
-        };
-        tokio::task::block_in_place(|| backend.open_session(&open_spec))
-    };
-    let plan = match plan {
-        Ok(plan) => plan,
-        Err(e) => {
-            app.set_status(format!("{} failed: {e}", copy.failed), true);
-            return None;
-        }
-    };
-    let launch = launch_window(app, agent, cwd, host, copy);
-    let (token, spec) = launch.prepare(plan);
-    match terminal::spawn(spec).await {
-        Ok(result) => {
-            let Some(id) = result.window.clone() else {
-                app.set_status(format!("{} failed: no window id", copy.failed), true);
-                return None;
-            };
-            record_launch_window(app, host.clone(), token.clone(), result);
-            app.pending_focus_window = Some((id, Instant::now()));
-            Some(token)
-        }
-        Err(e) => {
-            app.set_status(format!("{} failed: {e}", copy.failed), true);
-            None
-        }
-    }
 }
 
 fn launch_window(
@@ -1492,6 +1477,12 @@ fn start_new_session(
     let open = backend.open_session_task(spec);
     let window = launch_window(app, agent, &cwd, &host, &LAUNCH_COPY_NEW);
     app.record_launch_cwd(&host, &cwd);
+    let notice = app.notify(
+        Level::Progress,
+        format!("Opening session…\n{}: {cwd}", host.0),
+    );
+    app.launch_notices
+        .insert(window.local_token.clone(), notice);
     app.launches.start(
         super::launch::Request {
             agent,
@@ -1499,6 +1490,48 @@ fn start_new_session(
             owner,
         },
         open,
+    );
+}
+
+fn start_resume_session(
+    app: &mut App,
+    agent: AgentKind,
+    cwd: String,
+    session_id: String,
+    fork: bool,
+    host: HostId,
+) {
+    let spec = OpenSpec {
+        agent,
+        cwd: cwd.clone(),
+        resume: Some((session_id.clone(), fork)),
+        worktree: None,
+    };
+    let Some(backend) = app.backend_for(&host) else {
+        return;
+    };
+    let open = backend.open_session_task(spec);
+    let launch = launch_window(app, agent, &cwd, &host, &LAUNCH_COPY_RESUME);
+    app.start_operation(
+        format!("resume:{}:{session_id}:{fork}", host.0),
+        format!("Resuming session…\n{}: {cwd}", host.0),
+        None,
+        async move {
+            let plan = open.await?;
+            let (token, spec) = launch.prepare(plan);
+            let result = super::operations::within(terminal::spawn(spec)).await?;
+            anyhow::ensure!(
+                result.window.is_some(),
+                "Resume failed: terminal returned no window id"
+            );
+            Ok((token, result))
+        },
+        move |app, (token, result)| {
+            let id = result.window.clone().unwrap();
+            record_launch_window(app, host, token, result);
+            app.pending_focus_window = Some((id.clone(), Instant::now()));
+            start_focus(app, id);
+        },
     );
 }
 
@@ -1516,7 +1549,7 @@ fn poll_launches(app: &mut App, fs_dirty: &mut bool) -> bool {
                     }
             })
         },
-        terminal::spawn,
+        |spec| super::operations::within(terminal::spawn(spec)),
         Instant::now(),
     );
     let mut changed = progress.changed;
@@ -1524,6 +1557,14 @@ fn poll_launches(app: &mut App, fs_dirty: &mut bool) -> bool {
         app.mark_dirty(super::Cursor::FollowSession);
     }
     for finished in progress.finished {
+        if let Some(notice) = app.launch_notices.remove(&finished.launch_id) {
+            match &finished.result {
+                Ok(_) => app.notifications.remove(notice),
+                Err(error) => {
+                    app.update_notification(notice, Level::Error, format!("Launch failed: {error}"))
+                }
+            }
+        }
         match finished.result {
             Ok(result) => {
                 record_launch_window(app, finished.host, finished.token.unwrap(), result);
@@ -1558,6 +1599,60 @@ fn poll_launches(app: &mut App, fs_dirty: &mut bool) -> bool {
 /// Returns whether a window was actually attached and bound, so a caller
 /// attaching a whole batch (`Space A`) can report how much of it landed. The
 /// single-attach callers ignore it: the status line already said what happened.
+fn start_close(app: &mut App, wid: WindowId) {
+    app.start_background(
+        format!("close:{wid}"),
+        super::operations::within(async move { terminal::get().close_window(&wid).await }),
+        |_, ()| {},
+    );
+}
+
+fn start_terminal_snapshot(app: &mut App) {
+    if app.should_quit {
+        return;
+    }
+    let version = app.mutation_version;
+    app.start_background(
+        "terminal-snapshot".into(),
+        super::operations::within(async { terminal::get().snapshot().await }),
+        move |app, tabs| {
+            app.refresh_tab_cache(&tabs);
+            app.fill_tab_ids_from_cache();
+            if app.mutation_version == version {
+                prune_detached_from_tabs(app, &tabs);
+            }
+        },
+    );
+}
+
+fn start_focus(app: &mut App, id: WindowId) {
+    let key = app.selected_key();
+    app.start_operation(
+        format!("focus:{id}"),
+        "Focusing session window…".into(),
+        None,
+        super::operations::within(async move {
+            match terminal::get().focus_window(&id).await {
+                Ok(()) => Ok(None),
+                Err(error) => {
+                    let tabs = terminal::get().snapshot().await?;
+                    Ok(Some((id, error.to_string(), tabs)))
+                }
+            }
+        }),
+        move |app, failed| {
+            if let Some((id, error, tabs)) = failed {
+                prune_detached_from_tabs(app, &tabs);
+                if tabs.iter().any(|tab| tab.windows.contains(&id)) {
+                    app.notify(Level::Error, format!("Focus failed: {error}"));
+                } else if let Some(action) = key.as_ref().and_then(|key| app.refocus_key(key)) {
+                    app.pending_actions.push_back(action);
+                }
+            }
+        },
+    );
+}
+
 async fn attach_pool_session(
     app: &mut App,
     host: HostId,
@@ -1565,6 +1660,13 @@ async fn attach_pool_session(
     force: bool,
     focus: bool,
 ) -> bool {
+    if !app.operations.has_capacity() {
+        app.notify(
+            Level::Warning,
+            "Too many operations running; try attaching again shortly".into(),
+        );
+        return false;
+    }
     // Resolve the plan before the match so the backend borrow ends before `app`
     // is touched again.
     let plan = app
@@ -1604,41 +1706,33 @@ async fn attach_pool_session(
         take_focus: false,
         stack: true,
     };
-    match terminal::spawn(spec).await {
-        // A Floating/NewTab attach spawn always recovers its window; a `None`
-        // can't be bound, so report it rather than proceed.
-        Ok(result) => match result.window {
-            Some(id) => {
-                let verb = if force { "Stole" } else { "Attached to" };
-                app.set_status(format!("{verb} {pool_session} (window {id})"), false);
-                app.record_window_binding(host, pool_session, id.clone());
-                // Same free tab id as a launch spawn — keeps the next reload
-                // off a snapshot.
-                if let Some(tab) = result.tab {
-                    app.window_tab_cache.insert(id.clone(), tab);
-                }
-                // Attach-then-focus *immediately* (§9): the user watches the ssh
-                // handshake and the agent come up in the window, rather than
-                // waiting on a dashboard that can't show either. Best-effort —
-                // a raise that fails leaves the session attached and bound, and
-                // `Enter` on the row retries it.
-                if focus && let Err(e) = terminal::get().focus_window(&id).await {
-                    tracing::debug!("attach window {id:?} raise failed: {e}");
-                }
-                // Selects the row once it comes back carrying this window.
-                app.pending_focus_window = Some((id, Instant::now()));
-                true
+    let selected = app.selected_key();
+    let key = format!("attach:{}:{pool_session}", host.0);
+    app.start_operation(
+        key,
+        format!("Opening attach window…\n{}: {pool_session}", host.0),
+        None,
+        super::operations::within(async move {
+            let result = terminal::spawn(spec).await?;
+            anyhow::ensure!(
+                result.window.is_some(),
+                "Attach failed: terminal returned no window id"
+            );
+            Ok(result)
+        }),
+        move |app, result| {
+            let id = result.window.clone().unwrap();
+            app.record_window_binding(host, pool_session, id.clone());
+            if let Some(tab) = result.tab {
+                app.window_tab_cache.insert(id.clone(), tab);
             }
-            None => {
-                app.set_status("Attach failed: no window id".to_string(), true);
-                false
+            if focus && app.selected_key() == selected {
+                start_focus(app, id.clone());
+                app.pending_focus_window = Some((id, Instant::now()));
             }
         },
-        Err(e) => {
-            app.set_status(format!("Attach failed: {e}"), true);
-            false
-        }
-    }
+    );
+    true
 }
 
 /// Re-open the attach window for a session the dashboard expects to be attached
@@ -1790,7 +1884,32 @@ fn arm_logo_recompose(logo_recompose_at: &mut Option<Instant>) {
 /// was named for. The real guard is `kill_old`, already false on every path
 /// where recycling is possible.
 async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts) -> bool {
-    let Some(mut job) = restarts.next() else {
+    if !app.operations.has_capacity() {
+        return false;
+    }
+    let ready = app.restart_ready.pop_front();
+    let mut job = if let Some((mut job, result)) = ready {
+        match result {
+            Ok((token, result)) => {
+                if let Some(id) = result.window.clone() {
+                    if !job.spec.flags.is_default() {
+                        app.pending_flag_restores.insert(id.clone(), job.spec.flags);
+                    }
+                    app.pending_focus_window = Some((id, Instant::now()));
+                }
+                record_launch_window(app, job.spec.host.clone(), token.clone(), result);
+                job.replacement_token = Some(token);
+                job.reuse_replacement = true;
+                job
+            }
+            Err(error) => {
+                restarts.finish(job, KillOutcome::Failed(error));
+                return true;
+            }
+        }
+    } else if let Some(job) = restarts.next() {
+        job
+    } else {
         return false;
     };
     let spec = job.spec.clone();
@@ -1822,49 +1941,45 @@ async fn advance_restart(app: &mut App, restarts: &mut super::restart::Restarts)
     let cwd = spec.cwd;
     let host = spec.host;
     let key = spec.key;
-    let flags = spec.flags;
     let kill_old = spec.kill_old;
 
     if !job.reuse_replacement {
         job.launched_at = Some(Instant::now());
-        // The replacement opens on the session's **own host** (§9): a remote restart
-        // lands in that host's pool and auto-attaches like any open, rather than
-        // silently relocating the session to the laptop. Its placement comes from
-        // the layout policy, not the old window, so no anchor is threaded.
-        let replacement_token = launch_agent(
-            app,
-            agent,
-            &cwd,
-            Some((session_id.as_str(), false)),
-            &LAUNCH_COPY_RESTART,
-            &host,
-            // A restart resumes, and a resumed session is returned to whatever
-            // worktree it was in by the agent itself — so a restarted worktree
-            // session keeps its isolation without being asked for it again, and
-            // asking would create a *second* worktree beside the one it resumes to.
-            None,
-        )
-        .await;
-        // A failed open finishes this job; the saved conversation remains resumable.
-        let Some(replacement_token) = replacement_token else {
-            let error = app
-                .status_msg
-                .clone()
-                .unwrap_or_else(|| "Replacement launch failed".into());
-            restarts.finish(job, KillOutcome::Failed(error));
+        let Some(backend) = app.backend_for(&host) else {
+            restarts.finish(job, KillOutcome::Failed(format!("Unknown host {}", host.0)));
             return true;
         };
-        job.replacement_token = Some(replacement_token);
-
-        // Carry the old session's status flags onto the relaunched window so the
-        // restart preserves pinned / follow-up. `launch_agent` set
-        // `pending_focus_window` to the new window id on success; the actual flag
-        // copy happens in `reload_sessions` once the new launcher appears.
-        if !flags.is_default()
-            && let Some((new_wid, _)) = app.pending_focus_window.clone()
-        {
-            app.pending_flag_restores.insert(new_wid, flags);
-        }
+        let open = backend.open_session_task(OpenSpec {
+            agent,
+            cwd: cwd.clone(),
+            resume: Some((session_id, false)),
+            worktree: None,
+        });
+        let launch = launch_window(app, agent, &cwd, &host, &LAUNCH_COPY_RESTART);
+        app.start_operation(
+            format!("restart:{}:{key:?}", host.0),
+            format!("Restarting session…\n{}: {cwd}", host.0),
+            None,
+            async move {
+                let result = async {
+                    let plan = open.await?;
+                    let (token, spec) = launch.prepare(plan);
+                    let result = super::operations::within(terminal::spawn(spec)).await?;
+                    anyhow::ensure!(
+                        result.window.is_some(),
+                        "Restart failed: terminal returned no window id"
+                    );
+                    Ok::<_, anyhow::Error>((token, result))
+                }
+                .await
+                .map_err(|e| e.to_string());
+                Ok(result)
+            },
+            move |app, result| {
+                app.restart_ready.push_back((job, result));
+            },
+        );
+        return true;
     }
     if kill_old && !job.cleanup_confirmed {
         match app.backend_for(&host) {
@@ -2064,9 +2179,7 @@ async fn start_dashboard() -> App {
     // dashboard's crashed launcher), and a leaked pane should go regardless of
     // when it leaked. Floating-sessions backend only (the seed gates it).
     for wid in std::mem::take(&mut app.reap_window_queue) {
-        if let Err(e) = terminal::get().close_window(&wid).await {
-            tracing::debug!("startup reap of orphaned pane {wid:?} failed: {e}");
-        }
+        start_close(&mut app, wid);
     }
 
     // Crash recovery: if the previous dashboard left a session snapshot on
@@ -2084,6 +2197,10 @@ async fn start_dashboard() -> App {
         .collect();
     let missing = take_missing_from_snapshot(&alive_pids, app.backends[0].host_id());
     app.prompt_restart_missing(missing);
+    app.persistence = Some(super::persistence::Persistence::new());
+    for backend in &mut app.backends {
+        backend.enable_background_reads();
+    }
     app
 }
 
@@ -2101,13 +2218,12 @@ async fn reload_pass(
     last_detach_prune: &mut Option<Instant>,
     detach_reports_watched: bool,
 ) {
-    // `reload_sessions` walks the sessions dir and reads each backend's
-    // transcripts synchronously. `block_in_place` hands the current
-    // worker thread to those blocking reads while letting the
-    // multi-threaded runtime keep servicing other tasks, so the loop's
-    // own awaits (kitty rc, title pulls) aren't starved during a large
-    // reload.
-    tokio::task::block_in_place(|| app.reload_sessions());
+    // Start or adopt the local scan without waiting for disk. Remote rows and
+    // local scan results are read from their in-memory snapshots.
+    for backend in &mut app.backends {
+        backend.refresh_background_reads();
+    }
+    app.reload_sessions();
     // Drain bell sentinels written by `miao focus --window-id`
     // *after* reload_sessions so we know which pids are alive.
     app.apply_bell_signals(state::drain_bell_flag_pids());
@@ -2124,7 +2240,7 @@ async fn reload_pass(
     // into `FailedToStart`; the launcher can't focus its own window (it
     // may be headless/remote), so the dashboard does it here.
     for wid in std::mem::take(&mut app.failed_launch_focus_queue) {
-        let _ = terminal::get().focus_window(&wid).await;
+        start_focus(app, wid);
     }
     // Close held panes orphaned by rows that just departed without a clean
     // kill (crash / SIGKILL / state-file gone) — and dead remote-attach
@@ -2133,9 +2249,7 @@ async fn reload_pass(
     // invisible leak buried in the shared sessions tab, inflating every
     // `list-panes`. Best-effort — the pane may already be gone.
     for wid in std::mem::take(&mut app.reap_window_queue) {
-        if let Err(e) = terminal::get().close_window(&wid).await {
-            tracing::debug!("reap of departed session pane {wid:?} failed: {e}");
-        }
+        start_close(app, wid);
     }
     // Auto-reattach (§7): a host that just came back gets an attach
     // window respawned for every session the dashboard remembers having
@@ -2157,18 +2271,14 @@ async fn reload_pass(
         let (specs, survived) = app.take_upgrade_restores(&host);
         let n = specs.len();
         for spec in specs {
-            let _ = launch_agent(
+            start_resume_session(
                 app,
                 spec.agent,
-                &spec.cwd,
-                Some((spec.session_id.as_str(), false)),
-                &LAUNCH_COPY_RESUME,
-                &host,
-                // As everywhere else on a resume: the agent re-enters
-                // the session's own worktree.
-                None,
-            )
-            .await;
+                spec.cwd,
+                spec.session_id,
+                false,
+                host.clone(),
+            );
         }
         // A survivor is a session the stop was meant to end and did
         // not, so the line says so: it is the difference between "we
@@ -2183,12 +2293,12 @@ async fn reload_pass(
                 super::plural_sessions(k)
             )),
             (n, 0) => Some(format!(
-                "{} upgraded — resumed {n} {}",
+                "{} upgraded — resuming {n} {}",
                 host.0,
                 super::plural_sessions(n)
             )),
             (n, k) => Some(format!(
-                "{} upgraded — resumed {n} {}; {k} still running, not resumed",
+                "{} upgraded — resuming {n} {}; {k} still running, not resumed",
                 host.0,
                 super::plural_sessions(n)
             )),
@@ -2211,28 +2321,12 @@ async fn reload_pass(
     let need_tab_cache = !app.unresolved_local_tab_windows().is_empty();
     let detach_prune = app.window_bindings.has_remote()
         && (need_tab_cache || detach_prune_due(*last_detach_prune, Instant::now()));
-    let tabs = if need_tab_cache || detach_prune {
-        terminal::get().snapshot().await.ok()
-    } else {
-        None
-    };
-    if need_tab_cache && let Some(tabs) = &tabs {
-        app.refresh_tab_cache(tabs);
+    if need_tab_cache || detach_prune {
+        *last_detach_prune = Some(Instant::now());
+        start_terminal_snapshot(app);
     }
     app.fill_tab_ids_from_cache();
-    // Refresh the snapshot so a crash from this point sees the
-    // current session set, not a stale older one.
     app.save_session_snapshot();
-    // Detach detection (§5): if a remote attach window died (laptop
-    // slept, ssh dropped), drop its binding so the row leaves cleanly.
-    // Only with a snapshot in hand: a failed one means "we don't know",
-    // not "nothing is alive" (see `prune_detached_from_tabs`). The floor
-    // isn't stamped on a failure either — the timer below picks the
-    // retry up in this same iteration and stamps it there.
-    if detach_prune && let Some(tabs) = &tabs {
-        *last_detach_prune = Some(Instant::now());
-        prune_detached_from_tabs(app, tabs);
-    }
 }
 
 /// Drain everything the loop learns about from somewhere other than the
@@ -2255,7 +2349,22 @@ async fn drain_background_results(
     fs_dirty: &mut bool,
     hosts_panel_open: &mut bool,
 ) -> bool {
-    let mut redraw = poll_launches(app, fs_dirty);
+    let mut redraw = app.poll_operations();
+    if redraw {
+        app.write_window_bindings_file();
+        app.save_session_snapshot();
+    }
+    let errors = app
+        .persistence
+        .as_ref()
+        .map(|writer| writer.take_errors())
+        .unwrap_or_default();
+    for error in errors {
+        app.notify(Level::Error, error);
+        redraw = true;
+    }
+
+    redraw |= poll_launches(app, fs_dirty);
     // An attach window reporting that its session ended — the event that
     // makes detachment prompt without polling the window tree (§5). Handled
     // before the reload block so the retired binding is already gone if a
@@ -2267,9 +2376,7 @@ async fn drain_background_results(
         // A report can queue the ended attach's held pane for reaping, and
         // no reload need run this iteration to drain it.
         for wid in std::mem::take(&mut app.reap_window_queue) {
-            if let Err(e) = terminal::get().close_window(&wid).await {
-                tracing::debug!("reap of ended attach pane {wid:?} failed: {e}");
-            }
+            start_close(app, wid);
         }
         redraw = true;
     }
@@ -2318,7 +2425,9 @@ async fn drain_background_results(
             })
     });
     // Advance one replacement per frame; cleanup waits own no App borrow.
-    if !app.should_quit && advance_restart(app, &mut inboxes.restarts).await {
+    if (!app.should_quit || !app.restart_ready.is_empty())
+        && advance_restart(app, &mut inboxes.restarts).await
+    {
         arm_settle_reload(settle_reload_at);
         redraw = true;
     }
@@ -2403,9 +2512,12 @@ async fn drain_background_results(
 /// every keystroke and its echo.
 async fn refresh_preview(
     app: &mut App,
-    last_detach_prune: &mut Option<Instant>,
+    _last_detach_prune: &mut Option<Instant>,
     preview_debounce: Duration,
 ) -> bool {
+    if app.should_quit {
+        return false;
+    }
     let mut redraw = false;
     // Preview debounce: mark dirty when selection differs from cached preview,
     // then fetch after a short settle period so rapid navigation doesn't block.
@@ -2446,33 +2558,21 @@ async fn refresh_preview(
             app.set_preview_text(None);
         } else if let Some(wid) = selected_wid {
             app.preview_fetched_at = Some(Instant::now());
-            match terminal::get()
-                .capture_text(&wid, PREVIEW_CAPTURE_LINES)
-                .await
-            {
-                Ok(text) => {
-                    app.set_preview_text(Some(text));
-                    app.preview_window_id = Some(wid);
-                    app.preview_scroll = 0;
-                    app.preview_h_scroll = 0;
-                }
-                // Record the attempted window id even on failure so the
-                // selection-mismatch check above doesn't re-arm
-                // `preview_dirty_since` every loop iteration — which would
-                // re-spawn a `kitten get-text` subprocess every ~200ms for
-                // as long as a dead window stays selected. Clear any stale
-                // text so nothing outdated is shown for the dead window.
-                Err(_) => {
-                    app.set_preview_text(None);
-                    app.preview_window_id = Some(wid);
-                    // A window that won't answer a `get-text`/`dump-screen`
-                    // is usually a window that no longer exists — the second
-                    // free signal (with a failed focus) that a binding may
-                    // be stale. Not proof on its own, so it only arms the
-                    // snapshot-verified prune.
-                    arm_detach_prune(last_detach_prune, Instant::now());
-                }
-            }
+            app.preview_window_id = Some(wid.clone());
+            let target = wid.clone();
+            app.start_background(
+                format!("preview:{wid}"),
+                super::operations::within(async move {
+                    terminal::get()
+                        .capture_text(&wid, PREVIEW_CAPTURE_LINES)
+                        .await
+                }),
+                move |app, text| {
+                    if app.selected_window_id().as_ref() == Some(&target) {
+                        app.set_preview_text(Some(text));
+                    }
+                },
+            );
         } else {
             app.preview_window_id = None;
             app.set_preview_text(None);
@@ -2767,11 +2867,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             && detach_prune_due(last_detach_prune, Instant::now())
         {
             last_detach_prune = Some(Instant::now());
-            if let Ok(tabs) = terminal::get().snapshot().await
-                && prune_detached_from_tabs(&mut app, &tabs)
-            {
-                needs_redraw = true;
-            }
+            start_terminal_snapshot(&mut app);
         }
 
         needs_redraw |= refresh_preview(&mut app, &mut last_detach_prune, preview_debounce).await;
@@ -2807,22 +2903,35 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         // very first call resolves the dashboard's own tab, which on zellij costs
         // a `list-panes`, and a cosmetic label must not hold up the first frame.
         let tab_title = super::dashboard_tab_title(app.attention_count());
-        if last_tab_title.as_deref() != Some(tab_title.as_str()) {
-            if let Err(e) = terminal::get().set_own_tab_title(&tab_title).await {
-                tracing::debug!("setting the dashboard tab title failed: {e}");
-            }
+        if !app.should_quit
+            && last_tab_title.as_deref() != Some(tab_title.as_str())
+            && !app.operations.contains("tab-title")
+        {
+            let title = tab_title.clone();
+            app.start_background(
+                "tab-title".into(),
+                super::operations::within(async move {
+                    terminal::get().set_own_tab_title(&title).await
+                }),
+                |_, ()| {},
+            );
             last_tab_title = Some(tab_title);
         }
 
         let poll_timeout = next_wakeup(&app, event_poll, settle_reload_at, logo_recompose_at);
         // Prefer buffered input over a deferred Enter, so moving away while
         // a launch completes can still cancel its focus request.
+        let poll_timeout = if app.operations.is_empty() {
+            poll_timeout
+        } else {
+            poll_timeout.min(Duration::from_millis(30))
+        };
         let has_event = event::poll(if app.launches.has_activation() {
             Duration::ZERO
         } else {
             poll_timeout
         })?;
-        if has_event || app.launches.has_activation() {
+        if has_event || app.launches.has_activation() || !app.pending_actions.is_empty() {
             let maybe_action = if has_event {
                 let evt = event::read()?;
                 // Any input event can mutate state (selection, status, input mode,
@@ -2901,18 +3010,11 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                 }
             } else {
                 needs_redraw = true;
-                app.take_launch_focus()
+                app.pending_actions
+                    .pop_front()
+                    .or_else(|| app.take_launch_focus())
             };
             if let Some(action) = maybe_action {
-                // An attach is the slowest action here — it spawns a window and,
-                // on a remote host, waits on the terminal backend — so it gets
-                // an explicit overlay in that pre-action frame rather than
-                // leaving the keypress unacknowledged. Set from the action, the
-                // one place every producer (`Enter`, the `Space s` steal
-                // confirm, a double-click) passes through.
-                if let Action::AttachRemoteRunning { pool_session, .. } = &action {
-                    app.attaching = Some(pool_session.clone());
-                }
                 // Paint the keystroke's own effect (the confirm prompt closing,
                 // the picker dismissing) *before* running the action: an action
                 // handler runs inline in this loop and shells out to the terminal
@@ -2926,60 +3028,55 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     .agent_logos
                     .render(&mut std::io::stdout().lock(), app.logo.caps);
                 match action {
-                    Action::FocusWindow(id) => {
-                        // The row's identity, captured before the call: the
-                        // retry below runs after a prune that re-sorts the list,
-                        // so the selected *index* is no longer a reliable handle
-                        // on the session the user acted on.
-                        let key = app.selected_key();
-                        // The TUI stays up: tearing ratatui down around the
-                        // focus (as an early build did) drops the dashboard
-                        // pane out of the alt screen for the whole call — on
-                        // zellij a visible flash of the underlying shell
-                        // before the client switches tabs.
-                        if let Err(e) = terminal::get().focus_window(&id).await {
-                            // Most likely the window is gone (an attach window
-                            // the user closed). Don't drop the binding on the
-                            // strength of one failed rc call — a transient error
-                            // would then strand a live session as "detached" —
-                            // but *do* settle it now rather than leaving the
-                            // press unanswered: take the snapshot this instant,
-                            // and if the window really is gone, prune and finish
-                            // the job the keypress asked for by re-attaching.
-                            // One `Enter` therefore reaches the session whether
-                            // or not the binding was still good (§9); before
-                            // this, the first press only ever reported an error
-                            // and the user had to press again after the prune
-                            // caught up.
-                            match terminal::get().snapshot().await {
-                                Ok(tabs) => {
-                                    last_detach_prune = Some(Instant::now());
-                                    prune_detached_from_tabs(&mut app, &tabs);
+                    Action::FocusWindow(id) => start_focus(&mut app, id),
+                    Action::ValidateWorkdir {
+                        agent,
+                        host,
+                        cwd,
+                        worktree,
+                    } => {
+                        let remote = match app.backend_for(&host) {
+                            Some(Backend::Remote(remote)) => Some(remote.clone()),
+                            Some(Backend::Local(_)) => None,
+                            None => continue,
+                        };
+                        let path = cwd.clone();
+                        let home = app.home_dir.clone();
+                        let dir_exists = app.dir_exists;
+                        let generation = app.workdir_generation;
+                        let input = app
+                            .picker
+                            .as_ref()
+                            .map(|p| p.picker.input.text().to_string());
+                        app.start_operation(
+                            format!("validate:{}:{cwd}", host.0),
+                            format!("Checking directory…\n{}: {cwd}", host.0), None,
+                            async move {
+                                if let Some(remote) = remote {
+                                    match remote.request_within(Duration::from_secs(30), |req_id|
+                                        crate::protocol::ClientFrame::CheckDir { req_id, path }).await {
+                                        Some(crate::protocol::ServerFrame::DirChecked { exists, .. }) => Ok(exists),
+                                        _ => anyhow::bail!("Could not check directory: host did not respond"),
+                                    }
+                                } else {
+                                    tokio::task::spawn_blocking(move || dir_exists(&cm_core::paths::expand_home(&path, &home)))
+                                        .await.map_err(anyhow::Error::from)
                                 }
-                                Err(_) => arm_detach_prune(&mut last_detach_prune, Instant::now()),
-                            }
-                            match key.and_then(|k| app.refocus_key(&k)) {
-                                Some(Action::AttachRemoteRunning {
-                                    host,
-                                    pool_session,
-                                    force,
-                                }) => {
-                                    app.attaching = Some(pool_session.clone());
-                                    terminal.draw(|frame| app.draw(frame))?;
-                                    let _ = app
-                                        .agent_logos
-                                        .render(&mut std::io::stdout().lock(), app.logo.caps);
-                                    attach_pool_session(&mut app, host, pool_session, force, true)
-                                        .await;
-                                    app.attaching = None;
+                            },
+                            move |app, exists| {
+                                if generation != app.workdir_generation || input != app.picker.as_ref().map(|p| p.picker.input.text().to_string())
+                                    || !matches!(app.picker.as_ref().map(|p| &p.kind), Some(PickerKind::Workdir { host: current, .. }) if current == &host) { return }
+                                if !exists {
+                                    if let Some(picker) = &mut app.picker { picker.picker.set_error(format!("Not a directory: {cwd}")); }
+                                    return;
                                 }
-                                // Still resolves to a window (so the failure was
-                                // transient), or nothing to attach to: report
-                                // the original error rather than silently
-                                // retrying focus on the same id.
-                                _ => app.set_status(format!("Focus failed: {e}"), true),
-                            }
-                        }
+                                app.picker = None;
+                                app.launch_options = None;
+                                app.workdir_completion = None;
+                                app.input_mode = InputMode::Normal;
+                                app.pending_actions.push_back(Action::NewSessionSplit { agent, host, cwd, worktree });
+                            },
+                        );
                     }
                     Action::NewSessionSplit {
                         agent,
@@ -2995,25 +3092,34 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                             .agent_logos
                             .render(&mut std::io::stdout().lock(), app.logo.caps);
                     }
-                    Action::FetchTabsForMove(window_id) => match terminal::get().snapshot().await {
-                        Ok(tabs) => app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs)),
-                        Err(e) => app.set_status(format!("Failed to list tabs: {e}"), true),
-                    },
+                    Action::FetchTabsForMove(window_id) => {
+                        app.start_operation(
+                            "move-tabs".into(),
+                            "Loading tabs…".into(),
+                            None,
+                            super::operations::within(async { terminal::get().snapshot().await }),
+                            move |app, tabs| {
+                                app.open_move_tab_picker(window_id, terminal::list_tabs(&tabs));
+                            },
+                        );
+                    }
                     Action::MoveWindow(wid, target) => {
-                        let result = terminal::get().move_window_to_tab(&wid, target).await;
-                        if let Some(dash_wid) = terminal::get().current_window() {
-                            let _ = terminal::get().focus_window(&dash_wid).await;
-                        }
-                        match result {
-                            Ok(_) => {
-                                // The window's tab changed; drop its cached tab id
-                                // so the next reload re-resolves it from a fresh
-                                // snapshot (instead of showing the old tab).
+                        let window = wid.clone();
+                        app.start_operation(
+                            format!("move:{wid}"),
+                            "Moving window…".into(),
+                            None,
+                            super::operations::within(async move {
+                                terminal::get().move_window_to_tab(&window, target).await?;
+                                if let Some(dash) = terminal::get().current_window() {
+                                    terminal::get().focus_window(&dash).await?;
+                                }
+                                Ok(())
+                            }),
+                            move |app, ()| {
                                 app.window_tab_cache.remove(&wid);
-                                app.set_status("Window moved".to_string(), false);
-                            }
-                            Err(e) => app.set_status(format!("Move failed: {e}"), true),
-                        }
+                            },
+                        );
                     }
                     Action::FetchResumeList { host } => {
                         // One host's list, chosen by the persisted default host
@@ -3058,24 +3164,13 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         // reload's `prune_detached_sessions`, but doing it here makes
                         // the UI update without waiting for the snapshot.
                         app.retire_window_binding(&host, &token);
-                        let _ = terminal::get().close_window(&window_id).await;
+                        start_close(&mut app, window_id);
                         app.set_status("Detached (session still running)".to_string(), false);
                         // Re-render the now window-less row and rewrite the
                         // bindings file with the dropped entry.
                         arm_settle_reload(&mut settle_reload_at);
                     }
-                    Action::OpenShellTab { host, cwd } => 'shell_tab: {
-                        // `w` is a deterministic per-(host, cwd) work tab: switch
-                        // to the one recorded in `App::work_tabs` if its tab is
-                        // still alive, else spawn a fresh shell tab and record it.
-                        // It never scans for an unrelated shell that happens to
-                        // sit in the cwd — only tabs captain-miao created count.
-                        let key = (host.clone(), cwd.clone());
-                        // Ask the host how to open a shell there: in process on
-                        // this machine, an `ssh -t <target>` that cds into the
-                        // cwd for a remote. A `Result`, so the host explains
-                        // itself when it can't (§5) instead of the caller
-                        // inventing a message for a bare `None`.
+                    Action::OpenShellTab { host, cwd } => {
                         let plan = app
                             .backend_for(&host)
                             .ok_or_else(|| anyhow::anyhow!("unknown host {}", host.0))
@@ -3086,84 +3181,60 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                 )
                             });
                         let (command, spawn_cwd) = match plan {
-                            Ok(ShellPlan::InProcess { cwd: real }) => (SpawnCommand::Shell, real),
-                            // The ssh child launches from the dashboard's own
-                            // cwd; the remote cwd is applied by the `cd` in the
-                            // argv.
+                            Ok(ShellPlan::InProcess { cwd }) => (SpawnCommand::Shell, cwd),
                             Ok(ShellPlan::Spawn { argv }) => {
                                 (SpawnCommand::Exec(argv), app.home_dir.clone())
                             }
-                            Err(e) => {
-                                app.set_status(format!("Work tab failed: {e}"), true);
-                                break 'shell_tab;
+                            Err(error) => {
+                                app.notify(Level::Error, format!("Work tab failed: {error}"));
+                                continue;
                             }
                         };
-                        // Only take the validation snapshot when there's an entry
-                        // to validate — a first `w` on this cwd has nothing to
-                        // check, so it skips straight to the spawn. And a failed
-                        // snapshot bails the whole action: `live_work_tab` must
-                        // only ever see a genuinely observed tab list (an empty
-                        // default would spuriously prune a live entry, and the
-                        // prune is persisted now).
-                        let existing = if app.work_tabs.contains_key(&key) {
-                            let tabs = match terminal::get().snapshot().await {
-                                Ok(tabs) => tabs,
-                                Err(e) => {
-                                    app.set_status(format!("Work tab check failed: {e}"), true);
-                                    break 'shell_tab;
+                        let key = (host.clone(), cwd.clone());
+                        let existing = app.work_tabs.get(&key).cloned();
+                        let work_tabs: Vec<_> = app
+                            .work_tabs
+                            .values()
+                            .map(|work| work.tab_id.clone())
+                            .collect();
+                        let title = app.work_tab_title(&host, &cwd);
+                        app.start_operation(
+                            format!("shell:{}:{cwd}", host.0),
+                            format!("Opening work tab…\n{}: {cwd}", host.0),
+                            None,
+                            super::operations::within(async move {
+                                if let Some(existing) = existing {
+                                    let tabs = terminal::get().snapshot().await?;
+                                    if existing.is_live(&tabs, &title) {
+                                        terminal::get().focus_tab(&existing.tab_id).await?;
+                                        return Ok(None);
+                                    }
                                 }
-                            };
-                            app.live_work_tab(&key, &tabs)
-                        } else {
-                            None
-                        };
-                        let outcome: Result<(), anyhow::Error> = if let Some(tab_id) = existing {
-                            terminal::get().focus_tab(&tab_id).await
-                        } else {
-                            let title = app.work_tab_title(&host, &cwd);
-                            let work_tabs: Vec<_> = app
-                                .work_tabs
-                                .values()
-                                .map(|work| work.tab_id.clone())
-                                .collect();
-                            match terminal::spawn_work_tab(
-                                SpawnSpec {
-                                    cwd: spawn_cwd.clone(),
-                                    target: SpawnTarget::NewTab,
-                                    command,
-                                    title: Some(title),
-                                    hold: false,
-                                    take_focus: true,
-                                    stack: false,
-                                },
-                                &work_tabs,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    // Record the tab so the next `w` on this cwd
-                                    // switches back. Prefer the tab id the backend
-                                    // returned (zellij prints it — no second
-                                    // snapshot); else resolve the new window's tab
-                                    // from one snapshot (kitty). Best-effort: an
-                                    // unresolved tab just means the next `w`
-                                    // spawns again.
-                                    let tab_id = match result.tab.clone() {
-                                        Some(tab_id) => Some(tab_id),
-                                        None => match &result.window {
-                                            Some(wid) => {
-                                                let tabs = terminal::get()
-                                                    .snapshot()
-                                                    .await
-                                                    .unwrap_or_default();
-                                                crate::terminal::window_tab_map(&tabs)
-                                                    .get(wid)
-                                                    .cloned()
-                                            }
-                                            None => None,
-                                        },
-                                    };
-                                    if let Some(tab_id) = tab_id {
+                                let mut result = terminal::spawn_work_tab(
+                                    SpawnSpec {
+                                        cwd: spawn_cwd,
+                                        target: SpawnTarget::NewTab,
+                                        command,
+                                        title: Some(title),
+                                        hold: false,
+                                        take_focus: true,
+                                        stack: false,
+                                    },
+                                    &work_tabs,
+                                )
+                                .await?;
+                                if result.tab.is_none()
+                                    && let Some(wid) = &result.window
+                                {
+                                    let tabs = terminal::get().snapshot().await?;
+                                    result.tab = terminal::window_tab_map(&tabs).get(wid).cloned();
+                                }
+                                Ok(Some(result))
+                            }),
+                            move |app, result| {
+                                if let Some(result) = result {
+                                    app.work_tabs.remove(&key);
+                                    if let Some(tab_id) = result.tab {
                                         app.work_tabs.insert(
                                             key,
                                             super::WorkTab {
@@ -3172,18 +3243,10 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                                             },
                                         );
                                     }
-                                    Ok(())
+                                    app.save_work_tabs();
                                 }
-                                Err(e) => Err(e),
-                            }
-                        };
-                        if let Err(e) = outcome {
-                            app.set_status(format!("Work tab failed: {e}"), true);
-                        }
-                        // Persist the map (a fresh insert above, and/or a stale
-                        // entry `live_work_tab` pruned) so a dashboard restart
-                        // returns to these tabs instead of duplicating them.
-                        app.save_work_tabs();
+                            },
+                        );
                     }
                     Action::ResumeSession {
                         agent,
@@ -3192,36 +3255,20 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         fork,
                         host,
                     } => {
-                        let _ = launch_agent(
-                            &mut app,
-                            agent,
-                            &cwd,
-                            Some((session_id.as_str(), fork)),
-                            &LAUNCH_COPY_RESUME,
-                            &host,
-                            // As in `advance_restart`: the agent re-enters the
-                            // session's own worktree on resume. (A `--fork-session`
-                            // deliberately starts in the launch directory, which
-                            // is the agent's call, not ours to override.)
-                            None,
-                        )
-                        .await;
+                        start_resume_session(&mut app, agent, cwd, session_id, fork, host);
                     }
                     Action::ConfigureCodex { host, config } => {
-                        let result = match app.backend_for(&host) {
-                            Some(backend) => backend.set_codex_config(config).await,
-                            None => Err("Host is not connected".into()),
-                        };
-                        if let Some(panel) = app.host_edit.as_mut() {
-                            panel.message = Some(match result {
-                                Ok(config) => format!(
-                                    "Codex: {}. Restart idle sessions to migrate existing ones.",
-                                    config.mode.label()
-                                ),
-                                Err(error) => format!("Could not save Codex settings: {error}"),
-                            });
+                        if let Some(backend) = app.backend_for(&host) {
+                            let task = backend.set_codex_config(config);
+                            app.start_operation(format!("codex-config:{}", host.0), format!("Saving Codex settings…\n{}", host.0), None,
+                                async move { task.await.map_err(anyhow::Error::msg) },
+                                |app, config| {
+                                    if let Some(panel) = &mut app.host_edit {
+                                        panel.message = Some(format!("Codex: {}. Restart idle sessions to migrate existing ones.", config.mode.label()));
+                                    }
+                                    app.refresh_host_codex_settings();
+                                });
                         }
-                        app.refresh_host_codex_settings();
                     }
                     Action::RestartSession(spec) => {
                         queue_restarts(&mut app, &mut inboxes.restarts, vec![spec]);
@@ -3284,9 +3331,9 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::AttachAll { targets } => {
                         let (ok, total) = attach_all(&mut app, targets, terminal).await?;
                         let msg = if ok == total {
-                            format!("Attached to {ok} {}", super::plural_sessions(ok))
+                            format!("Opening {ok} attach {}", super::plural_sessions(ok))
                         } else {
-                            format!("Attached to {ok}/{total} sessions")
+                            format!("Opening {ok}/{total} attach windows")
                         };
                         app.set_status(msg, ok != total);
                     }
@@ -3299,14 +3346,20 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
         }
 
         if app.should_quit {
-            if app.launches.is_empty() {
-                // A row can precede its spawn result. The binding may have been
-                // recorded after this tick's reload (or during its debounce).
-                app.write_window_bindings_file();
+            // Queue bindings created by this tick before checking writer
+            // readiness. Otherwise quitting can discard a just-opened window.
+            app.write_window_bindings_file();
+            if app.launches.is_empty()
+                && app.operations.is_empty()
+                && app.persistence.as_ref().is_none_or(|writer| writer.idle())
+            {
                 break;
             }
             if !waiting_to_quit {
-                app.set_status("Finishing session launch before quitting…".into(), false);
+                app.set_status(
+                    "Finishing pending operations before quitting…".into(),
+                    false,
+                );
                 needs_redraw = true;
                 waiting_to_quit = true;
             }

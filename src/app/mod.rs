@@ -46,6 +46,8 @@ mod launch_options;
 mod logo;
 mod messages;
 mod notifications;
+mod operations;
+mod persistence;
 mod picker;
 mod port_forwards;
 mod prefs;
@@ -78,7 +80,7 @@ use crate::agent::{AgentKind, ResumeCandidate, SessionIndex};
 use crate::state::{
     self, HostId, LauncherState, SessionFlags as HostSessionFlags, SessionKey, SessionStatus,
 };
-use crate::terminal::{Capabilities, SessionsLayout, Tab, TabId, TabInfo, TabTarget, WindowId};
+use crate::terminal::{Capabilities, SessionsLayout, TabId, TabInfo, TabTarget, WindowId};
 
 use self::format::{
     contains_ci, format_coarse_age, format_relative_time, last_prompt_text, random_session_name,
@@ -210,6 +212,12 @@ pub(super) enum Action {
     /// an in-process shell tab; a remote host opens an `ssh -t <target>` tab
     /// that cds into `cwd`. The tab is recorded in [`App::work_tabs`] so the
     /// next `w` on the same cwd switches back instead of spawning another.
+    ValidateWorkdir {
+        agent: AgentKind,
+        host: HostId,
+        cwd: String,
+        worktree: Option<String>,
+    },
     OpenShellTab {
         host: HostId,
         cwd: String,
@@ -317,6 +325,7 @@ impl Action {
     /// clean values that don't change with `Debug` formatting tweaks.
     pub(super) fn name(&self) -> &'static str {
         match self {
+            Action::ValidateWorkdir { .. } => "ValidateWorkdir",
             Action::FocusWindow(_) => "FocusWindow",
             Action::NewSessionSplit { .. } => "NewSessionSplit",
             Action::FetchTabsForMove(_) => "FetchTabsForMove",
@@ -617,6 +626,19 @@ pub(super) struct WorkTab {
     pub window_id: Option<WindowId>,
 }
 
+impl WorkTab {
+    pub(super) fn is_live(&self, tabs: &[crate::terminal::Tab], title: &str) -> bool {
+        tabs.iter().any(|tab| {
+            tab.id == self.tab_id
+                && tab.title == title
+                && self
+                    .window_id
+                    .as_ref()
+                    .is_none_or(|window| tab.windows.contains(window))
+        })
+    }
+}
+
 /// One persisted work-tab binding — the `(host, cwd) → tab` mapping `w` records.
 /// Serialized as a flat list because a `(HostId, String)` map key can't be a
 /// JSON object key. See [`App::work_tabs`] and `work_tabs_path`.
@@ -904,6 +926,12 @@ pub(super) struct App {
     /// Latest outcome, also used by restart recovery. Presentation lives in notifications.
     pub(super) status_msg: Option<String>,
     pub(super) status_is_error: bool,
+    operations: operations::Operations,
+    persistence: Option<persistence::Persistence>,
+    launch_notices: HashMap<String, notifications::NotificationId>,
+    pending_flags: HashMap<FlagKey, HostSessionFlags>,
+    pending_actions: std::collections::VecDeque<Action>,
+    restart_ready: std::collections::VecDeque<restart::Opened>,
     pub(in crate::app) notifications: notifications::Notifications,
     /// Notification history, capped and memory-only.
     pub(super) messages: messages::MessageLog,
@@ -1164,6 +1192,8 @@ pub(super) struct App {
     /// (§9): switching hosts must render instantly, and the rule the whole
     /// picker follows is *never put a round trip between a keystroke and its
     /// echo*.
+    workdir_generation: u64,
+    recent_dirs_generation: HashMap<HostId, u64>,
     pub(super) recent_dirs_cache: HashMap<HostId, Vec<String>>,
     /// Last usable inventory for each host; refreshed only by explicit opens.
     pub(super) resume_cache: HashMap<HostId, Vec<ResumeCandidate>>,
@@ -1809,7 +1839,15 @@ impl App {
             next_launch_id: 0,
             host_icons: HashMap::new(),
             host_shell_commands: HashMap::new(),
+            operations: Default::default(),
+            persistence: None,
+            launch_notices: HashMap::new(),
+            pending_flags: HashMap::new(),
+            pending_actions: Default::default(),
+            restart_ready: Default::default(),
             recent_dirs_cache: HashMap::new(),
+            workdir_generation: 0,
+            recent_dirs_generation: HashMap::new(),
             resume_cache: HashMap::new(),
             last_table_rect: None,
             last_preview_rect: None,
@@ -1997,6 +2035,9 @@ impl App {
             .filter_map(|s| s.flags.map(|f| (flag_key(s), f)))
             .collect();
         for (key, host_flags) in served {
+            if self.pending_flags.contains_key(&key) {
+                continue;
+            }
             let mine = self.flags_of(&key);
             if mine.pinned == host_flags.pinned && mine.follow_up == host_flags.follow_up {
                 continue;
@@ -2020,19 +2061,59 @@ impl App {
     /// Persist explicit UI changes through the owning backend. Both local and
     /// remote backends use the shared host store; the dashboard keeps only a
     /// presentation copy of flags.
-    fn persist_flags(&self, keys: impl IntoIterator<Item = FlagKey>) {
+    fn persist_flags(&mut self, keys: impl IntoIterator<Item = FlagKey>) {
         for key in keys {
             let Some(backend) = self.backend_for(&key.0) else {
                 continue;
             };
             let flags = self.flags_of(&key);
-            if !backend.set_session_flags(
-                &SessionKey::from_launcher_pid(key.1),
-                HostSessionFlags {
-                    pinned: flags.pinned,
-                    follow_up: flags.follow_up,
-                },
-            ) {
+            let wanted = HostSessionFlags {
+                pinned: flags.pinned,
+                follow_up: flags.follow_up,
+            };
+            if let Backend::Remote(remote) = backend {
+                let remote = remote.clone();
+                if !self.operations.has_capacity()
+                    && !self
+                        .operations
+                        .contains(&format!("flags:{}:{}", key.0.0, key.1))
+                {
+                    self.notify(
+                        notifications::Level::Error,
+                        "Session flags were not saved: too many operations are running".into(),
+                    );
+                    continue;
+                }
+                self.pending_flags.insert(key.clone(), wanted);
+                let session = SessionKey::from_launcher_pid(key.1);
+                self.start_operation(
+                    format!("flags:{}:{}", key.0.0, key.1),
+                    format!("Saving session flags…\n{}", key.0.0), None,
+                    async move {
+                        let reply = remote.request_within(Duration::from_secs(30), |req_id|
+                            crate::protocol::ClientFrame::SetSessionFlags { req_id, key: session, flags: wanted }).await;
+                        Ok(matches!(reply, Some(crate::protocol::ServerFrame::FlagsSet { ok: true, .. })))
+                    },
+                    move |app, ok| {
+                        let latest = app.pending_flags.remove(&key);
+                        if !ok {
+                            app.notify(notifications::Level::Error, format!("Could not confirm saved session flags on {}; check the host before retrying", key.0.0));
+                        }
+                        if latest.is_some_and(|latest| latest != wanted) {
+                            app.persist_flags([key]);
+                        }
+                    },
+                );
+            } else if self.persistence.is_some() {
+                let session = SessionKey::from_launcher_pid(key.1);
+                self.persist(format!("flags:{}:{}", key.0.0, key.1), move || {
+                    anyhow::ensure!(
+                        cm_core::backend::LocalBackend::new().set_session_flags(&session, wanted),
+                        "Session flags could not be saved"
+                    );
+                    Ok(())
+                });
+            } else if !backend.set_session_flags(&SessionKey::from_launcher_pid(key.1), wanted) {
                 tracing::warn!("could not persist session flags for {}", key.1);
             }
         }
@@ -2146,7 +2227,8 @@ impl App {
         overrides.sessions_layout = self.extra_prefs.sessions_layout.clone();
         overrides.default_agent = Some(self.new_session_agent.cli_subcommand().to_string());
         overrides.prefs = self.extra_prefs.clone();
-        let _ = self.dashboard_state.save(overrides);
+        let store = self.dashboard_state.clone();
+        self.persist("dashboard preferences", move || store.save(overrides));
     }
 
     pub(super) fn load_overrides(&mut self) {
@@ -2432,7 +2514,7 @@ impl App {
         let payload = DirectoryMarks {
             marks: self.directory_marks.clone(),
         };
-        let _ = state::write_json_atomic(&state::directory_marks_path(), &payload);
+        self.persist_json(state::directory_marks_path(), payload);
     }
 
     /// Seed `work_tabs` from `work-tabs.json` at startup so `w` returns to the
@@ -2470,7 +2552,7 @@ impl App {
                 window_id: work_tab.window_id.clone(),
             })
             .collect();
-        let _ = state::write_json_atomic(&state::work_tabs_path(), &entries);
+        self.persist_json(state::work_tabs_path(), entries.clone());
     }
 
     /// Effective `(icon, color, color_idx)` for `cwd`: the user's override
@@ -3057,7 +3139,7 @@ impl App {
         if self.last_snapshot.borrow().as_ref() == Some(&sessions) {
             return;
         }
-        let _ = state::write_json_atomic(&state::dashboard_sessions_snapshot_path(), &sessions);
+        self.persist_json(state::dashboard_sessions_snapshot_path(), sessions.clone());
         *self.last_snapshot.borrow_mut() = Some(sessions);
     }
 
@@ -3080,7 +3162,7 @@ impl App {
         let recent = state::RecentCwds {
             cwds: self.recent_cwds.clone(),
         };
-        let _ = state::write_json_atomic(&state::recent_cwds_path(), &recent);
+        self.persist_json(state::recent_cwds_path(), recent);
     }
 
     /// Push `cwd` onto the recent-cwds list (most-recent first). Deduplicates
@@ -3179,16 +3261,15 @@ impl App {
     /// from a pre-window-id `work-tabs.json`) falls back to the id + title check.
     /// A failed check prunes the entry and returns `None`, so the caller falls
     /// through to spawning a fresh work tab.
-    pub(super) fn live_work_tab(&mut self, key: &(HostId, String), tabs: &[Tab]) -> Option<TabId> {
+    #[cfg(test)]
+    pub(super) fn live_work_tab(
+        &mut self,
+        key: &(HostId, String),
+        tabs: &[crate::terminal::Tab],
+    ) -> Option<TabId> {
         let expected = self.work_tab_title(&key.0, &key.1);
         let work_tab = self.work_tabs.get(key)?;
-        let matched = tabs
-            .iter()
-            .find(|t| t.id == work_tab.tab_id && t.title == expected);
-        let alive = matched.is_some_and(|t| match &work_tab.window_id {
-            Some(wid) => t.windows.contains(wid),
-            None => true,
-        });
+        let alive = work_tab.is_live(tabs, &expected);
         if alive {
             Some(work_tab.tab_id.clone())
         } else {
@@ -4093,7 +4174,7 @@ impl App {
         if self.last_bindings.borrow().as_ref() == Some(&entries) {
             return;
         }
-        let _ = state::write_json_atomic(&state::window_bindings_path(), &entries);
+        self.persist_json(state::window_bindings_path(), entries.clone());
         *self.last_bindings.borrow_mut() = Some(entries);
     }
 
@@ -5515,6 +5596,7 @@ impl App {
     /// new session lands is decided at spawn time by the current
     /// [`SessionsLayout`] (`resolve_spawn_target`), not by the selected window.
     pub(super) fn open_workdir_picker(&mut self) {
+        self.workdir_generation = self.workdir_generation.wrapping_add(1);
         // New sessions target the persisted default host; `Ctrl-h` cycles
         // per-launch, re-seeding the list from that machine.
         let host = self.default_host_or_local();
@@ -5603,10 +5685,12 @@ impl App {
                 // Cheap local stat only — never an RTT on a keystroke (§9).
                 // Remote: a path-like query ranks as a candidate without
                 // asking the host; a bare name sits last.
-                let known_dir = self.is_direct_local(host)
+                let known_dir = self.persistence.is_none()
+                    && self.is_direct_local(host)
                     && (self.dir_exists)(&cm_core::paths::expand_home(&path, &self.home_dir));
-                let candidate =
-                    known_dir || (!self.is_direct_local(host) && typed_looks_like_path(typed));
+                let candidate = known_dir
+                    || ((self.persistence.is_some() || !self.is_direct_local(host))
+                        && typed_looks_like_path(typed));
                 let score = if candidate {
                     workdir_match_quality(typed, &path) * 1000
                 } else {
@@ -5760,41 +5844,45 @@ impl App {
             .unwrap_or_else(|| self.backends[0].host_id())
     }
 
-    /// A host's recent dirs, **cache-first** (§9). A host switch must render
-    /// instantly, so this never blocks: it returns the cached list (seeded on
-    /// first use and refreshed in the background by `refresh_recent_dirs`) and
-    /// only pays a round-trip when there is nothing cached at all and the host
-    /// is connected. The governing rule is simply *never put an RTT between a
-    /// keystroke and its echo*.
+    /// Return cached rows immediately and fetch a missing remote inventory in
+    /// the background. Even a nominally connected host can stop answering.
     pub(super) fn host_recent_dirs(&mut self, host: &HostId) -> Vec<String> {
-        // A direct-local backend's list is held in memory and is authoritative:
-        // it reflects in-picker deletes (`Ctrl-d`) that haven't been re-read.
         if self.is_direct_local(host) {
             return self.recent_cwds.clone();
         }
         if let Some(cached) = self.recent_dirs_cache.get(host) {
             return cached.clone();
         }
-        let fetched = self.fetch_recent_dirs(host);
-        self.recent_dirs_cache.insert(host.clone(), fetched.clone());
-        fetched
-    }
-
-    /// Read a host's recent dirs straight from its backend. Blocks for a remote,
-    /// so callers go through [`App::host_recent_dirs`] unless they *are* the
-    /// refresh. A not-yet-connected host yields an empty list rather than
-    /// freezing the TUI through the connect attempt (`request()` would queue).
-    fn fetch_recent_dirs(&self, host: &HostId) -> Vec<String> {
-        let Some(backend) = self.backend_for(host) else {
+        let Some(Backend::Remote(remote)) = self.backend_for(host) else {
             return Vec::new();
         };
-        match backend {
-            Backend::Local(_) => backend.recent_dirs(),
-            Backend::Remote(_) if backend.conn_state().is_connected() => {
-                tokio::task::block_in_place(|| backend.recent_dirs())
-            }
-            Backend::Remote(_) => Vec::new(),
+        if !self.backend_for(host).unwrap().conn_state().is_connected() {
+            return Vec::new();
         }
+        let remote = remote.clone();
+        let owner = remote.clone();
+        let generation = self.recent_dirs_generation.get(host).copied().unwrap_or(0);
+        let host = host.clone();
+        self.start_operation(
+            format!("recent-dirs:{}", host.0),
+            format!("Loading directories…\n{}", host.0), None,
+            async move {
+                match remote.request_within(Duration::from_secs(30), |req_id|
+                    crate::protocol::ClientFrame::ListRecentDirs { req_id }).await {
+                    Some(crate::protocol::ServerFrame::RecentDirs { cwds, .. }) => Ok(cwds),
+                    _ => anyhow::bail!("Could not load directories: host did not respond"),
+                }
+            },
+            move |app, cwds| {
+                if !matches!(app.backend_for(&host), Some(Backend::Remote(current)) if std::sync::Arc::ptr_eq(current, &owner)) { return }
+                if app.recent_dirs_generation.get(&host).copied().unwrap_or(0) != generation { return }
+                app.recent_dirs_cache.insert(host.clone(), cwds);
+                if matches!(app.picker.as_ref().map(|p| &p.kind), Some(PickerKind::Workdir { host: current, .. }) if current == &host) {
+                    app.sync_workdir_picker_list();
+                }
+            },
+        );
+        Vec::new()
     }
 
     /// Whether `host` is served by the in-process backend — i.e. this machine,
@@ -5821,14 +5909,12 @@ impl App {
     /// cwd there, which is the only thing that changes the list. The next
     /// picker open re-seeds it.
     pub(super) fn invalidate_recent_dirs(&mut self, host: &HostId) {
+        *self.recent_dirs_generation.entry(host.clone()).or_default() += 1;
         self.recent_dirs_cache.remove(host);
     }
 
-    /// Directory completions for `prefix` on `host`'s filesystem. Local reads the
-    /// fs in-process (no `block_in_place`, so it's usable outside a runtime — e.g.
-    /// unit tests); a *connected* remote makes a blocking RPC off the async worker.
-    /// A not-yet-connected remote returns no completions rather than blocking the
-    /// TUI through the connect attempt (`request()` queues while Connecting).
+    /// Runtime-free local completion for callers before background I/O starts.
+    /// The interactive dashboard schedules local and remote completion workers.
     fn host_complete_path(&self, host: &HostId, prefix: &str) -> Vec<String> {
         let Some(backend) = self.backend_for(host) else {
             return Vec::new();
@@ -5837,9 +5923,6 @@ impl App {
             // In-process: no `block_in_place`, so it works outside a runtime too
             // (the unit tests call this directly).
             Backend::Local(_) => backend.complete_path(prefix),
-            Backend::Remote(_) if backend.conn_state().is_connected() => {
-                tokio::task::block_in_place(|| backend.complete_path(prefix))
-            }
             Backend::Remote(_) => Vec::new(),
         }
     }
@@ -5849,6 +5932,7 @@ impl App {
     /// the input/cursor. Called after `Ctrl-h` changes the host so the picker
     /// always reflects the machine the launch will land on.
     pub(super) fn reseed_workdir_for_host(&mut self) {
+        self.workdir_generation = self.workdir_generation.wrapping_add(1);
         if !matches!(
             self.picker.as_ref().map(|a| &a.kind),
             Some(PickerKind::Workdir { .. })
@@ -5971,7 +6055,52 @@ impl App {
         // matches we get back are in the host-canonical `~` form (§3), so a `~`
         // resolves against the *host's* home with no home ever reaching the
         // client. Completion is inherently a live filesystem read, so this one
-        // does cross the wire — the remote path blocks on a round-trip.
+        // crosses the wire in a background operation.
+        if self.persistence.is_some() && self.is_direct_local(&host) {
+            let prefix = current.clone();
+            self.start_operation(
+                format!("complete:{}:{current}", host.0),
+                format!("Completing directory…\n{current}"),
+                None,
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        cm_core::backend::LocalBackend::new().complete_path(&prefix)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                },
+                move |app, matches| {
+                    app.apply_workdir_completion(&host, &current, matches);
+                },
+            );
+            return;
+        }
+        if let Some(Backend::Remote(remote)) = self.backend_for(&host) {
+            let remote = remote.clone();
+            let prefix = current.clone();
+            self.start_operation(
+                format!("complete:{}:{current}", host.0),
+                format!("Completing directory…\n{}: {current}", host.0),
+                None,
+                async move {
+                    match remote
+                        .request_within(Duration::from_secs(30), |req_id| {
+                            crate::protocol::ClientFrame::CompletePath { req_id, prefix }
+                        })
+                        .await
+                    {
+                        Some(crate::protocol::ServerFrame::PathCompletions { matches, .. }) => {
+                            Ok(matches)
+                        }
+                        _ => anyhow::bail!("Could not complete directory: host did not respond"),
+                    }
+                },
+                move |app, matches: Vec<String>| {
+                    app.apply_workdir_completion(&host, &current, matches);
+                },
+            );
+            return;
+        }
         let matches = self.host_complete_path(&host, &current);
         if matches.is_empty() {
             return;
@@ -5980,6 +6109,19 @@ impl App {
         if let Some(active) = self.picker.as_mut() {
             active.picker.set_text(&matches[0]);
         }
+        self.workdir_completion = Some(WorkdirCompletion { matches, index: 0 });
+        self.sync_workdir_picker_list();
+    }
+
+    fn apply_workdir_completion(&mut self, host: &HostId, current: &str, matches: Vec<String>) {
+        if !matches!(self.picker.as_ref(), Some(active) if matches!(&active.kind, PickerKind::Workdir { host: h, .. } if h == host) && active.picker.input.text() == current)
+        {
+            return;
+        }
+        if matches.is_empty() {
+            return;
+        }
+        self.picker.as_mut().unwrap().picker.set_text(&matches[0]);
         self.workdir_completion = Some(WorkdirCompletion { matches, index: 0 });
         self.sync_workdir_picker_list();
     }

@@ -214,3 +214,20 @@ fn wrap_env_prefixes_env_path() {
     // No PATH to forward → argv unchanged.
     assert_eq!(wrap_env(&argv, None), argv);
 }
+
+#[tokio::test]
+async fn a_stalled_terminal_command_returns_its_deadline_error() {
+    let command = tokio::process::Command::new("sleep");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::run_capture_with_limit(
+            "slow terminal",
+            command,
+            &["10"],
+            std::time::Duration::from_millis(200),
+        ),
+    )
+    .await
+    .expect("terminal command deadline must precede test watchdog");
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+}

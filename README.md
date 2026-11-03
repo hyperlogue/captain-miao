@@ -60,6 +60,14 @@ miao
 Press `o` to start an agent in the directory of the selected session.
 If you do not select a session, `o` opens the directory picker.
 Press `O` to select a directory.
+
+Slow actions run in the background so you can keep navigating. If an action is
+still running after 0.8 seconds, a progress notification appears in the bottom
+right. When the result is visible in the dashboard or a new window, progress
+disappears without a success popup. Actions such as Git push still report
+success explicitly. Errors remain until dismissed; dismissing progress does
+not cancel the action.
+
 In the directory picker, press `Ctrl-o` to choose an agent and host side by side.
 Use `qwertyuiop` for agents and `asdfgzxcvb` for the ten hosts on each page;
 `[` and `]` turn host pages. The configured defaults start selected.

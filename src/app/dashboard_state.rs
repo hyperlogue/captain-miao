@@ -18,6 +18,7 @@ use super::{
 };
 use crate::state;
 
+#[derive(Clone)]
 pub(super) struct DashboardState {
     path: PathBuf,
     version: &'static str,

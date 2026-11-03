@@ -806,9 +806,7 @@ impl App {
             crate::backend::Backend::Local(_) => {
                 (self.dir_exists)(&cm_core::paths::expand_home(path, &self.home_dir))
             }
-            crate::backend::Backend::Remote(_) => {
-                tokio::task::block_in_place(|| backend.dir_exists(path))
-            }
+            crate::backend::Backend::Remote(_) => false,
         }
     }
 
@@ -885,6 +883,19 @@ impl App {
         }
         if cwd.is_empty() {
             return Err("Choose a directory before launching".into());
+        }
+        if self.persistence.is_some()
+            || matches!(
+                self.backend_for(&host),
+                Some(crate::backend::Backend::Remote(_))
+            )
+        {
+            return Ok(Action::ValidateWorkdir {
+                agent,
+                host,
+                cwd,
+                worktree,
+            });
         }
         if !self.host_dir_exists(&host, &cwd) {
             return Err(format!("Not a directory: {cwd}"));

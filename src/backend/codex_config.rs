@@ -56,26 +56,34 @@ impl Backend {
         });
     }
 
-    pub(crate) async fn set_codex_config(
+    pub(crate) fn set_codex_config(
         &self,
         config: CodexConfig,
-    ) -> Result<CodexConfig, String> {
-        match self {
-            Self::Local(_) => {
-                cm_core::config::write_codex(&config).map_err(|e| e.to_string())?;
-                cm_core::config::read_codex().map_err(|e| e.to_string())
-            }
-            Self::Remote(remote) => {
-                remote.codex_config.lock().unwrap().revision += 1;
-                let result = decode(
-                    remote
-                        .request_within(Duration::from_secs(3), |req_id| {
-                            ClientFrame::SetCodexConfig { req_id, config }
-                        })
-                        .await,
-                );
-                remote.codex_config.lock().unwrap().value = Some(result.clone());
-                result
+    ) -> impl std::future::Future<Output = Result<CodexConfig, String>> + Send + 'static {
+        let remote = match self {
+            Self::Remote(remote) => Some(remote.clone()),
+            Self::Local(_) => None,
+        };
+        async move {
+            match remote {
+                None => tokio::task::spawn_blocking(move || {
+                    cm_core::config::write_codex(&config).map_err(|e| e.to_string())?;
+                    cm_core::config::read_codex().map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?,
+                Some(remote) => {
+                    remote.codex_config.lock().unwrap().revision += 1;
+                    let result = decode(
+                        remote
+                            .request_within(Duration::from_secs(3), |req_id| {
+                                ClientFrame::SetCodexConfig { req_id, config }
+                            })
+                            .await,
+                    );
+                    remote.codex_config.lock().unwrap().value = Some(result.clone());
+                    result
+                }
             }
         }
     }
