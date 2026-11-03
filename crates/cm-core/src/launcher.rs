@@ -253,9 +253,23 @@ fn persist(state: &LauncherState) -> Result<()> {
     state.write()
 }
 
+/// The update and retry loop alone, for tests that publish without a task.
 #[cfg(test)]
-pub(crate) fn apply_update(update: SessionUpdate, state: &mut LauncherState) -> bool {
-    apply_update_with(update, state, &mut persist)
+pub(crate) async fn drive_updates(
+    updates: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
+    commands: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    state: &mut LauncherState,
+) -> Result<SessionExit> {
+    let task: SessionTask = Box::pin(std::future::pending());
+    drive(
+        task,
+        updates,
+        commands,
+        state,
+        std::future::pending(),
+        persist,
+    )
+    .await
 }
 
 fn apply_update_with(

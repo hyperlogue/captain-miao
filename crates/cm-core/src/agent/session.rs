@@ -73,12 +73,17 @@ pub(crate) struct SessionPublisher(mpsc::UnboundedSender<SessionUpdate>);
 impl SessionPublisher {
     #[cfg(test)]
     pub fn test_writer() -> Self {
-        let (writer, mut updates) = Self::channel();
+        // Run the launcher's own update loop, retries included. The
+        // placeholder row is never written: drive replaces it with the first
+        // update before any write or retry.
+        let (writer, updates) = Self::channel();
+        let (commands, _) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(update) = updates.recv().await {
-                let mut state = update.state.clone();
-                crate::launcher::apply_update(update, &mut state);
-            }
+            let mut state = LauncherState::for_test(
+                crate::agent::AgentKind::Unknown,
+                crate::state::SessionStatus::Idle,
+            );
+            let _ = crate::launcher::drive_updates(updates, commands, &mut state).await;
         });
         writer
     }
