@@ -65,7 +65,7 @@
 //! **The payload carries no transcript path**, so the launcher's whole
 //! transcript pipeline (stats fold, signal scan, stat-poll) is inert for
 //! Reasonix by construction — it only ever runs on a path a hook supplied.
-//! [`list_resumable`] needs none of it: sessions are discovered by scanning
+//! [`list_resumable_cached`] needs none of it: sessions are discovered by scanning
 //! `<state>/sessions/`, which is how Reasonix's own catalog finds them.
 //!
 //! **The token column is empty, and the reason is more interesting than a
@@ -92,7 +92,7 @@
 //!   id — if they differ, resume is aimed at the wrong namespace);
 //! - that a session's `.jsonl.meta` sidecar is written for **every** session and
 //!   not only for ones the desktop has listed. Its `workspace_root` is the only
-//!   record of a session's working directory that [`list_resumable`] can read,
+//!   record of a session's working directory that [`list_resumable_cached`] can read,
 //!   so a session without one never reaches the picker;
 //! - that the three roots resolve as `paths.go` reads under one launch, with a
 //!   **symlinked `.env` honoured** — under `REASONIX_HOME` every fallback path
@@ -370,10 +370,6 @@ struct BranchMeta {
 /// Only the default sessions root is scanned. Reasonix can index further
 /// directories (`reasonix sessions reindex --dir`), and a session outside the
 /// default root will not appear here.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,

@@ -1,7 +1,7 @@
 //! Codex integration behavior and capability declarations.
 
+use super::{native, tui};
 use crate::agent::*;
-use crate::agents::codex;
 use crate::agents::definition::AgentDefinition;
 use crate::state::{HookEvent, HookMessage, LauncherState, ReattachPrime};
 use anyhow::Result;
@@ -14,8 +14,8 @@ pub(crate) struct Definition;
 impl AgentDefinition for Definition {
     fn title_source(&self) -> Option<crate::agents::definition::TitleSource> {
         Some(crate::agents::definition::TitleSource {
-            stamp: codex::title_store_mtimes,
-            read: codex::read_thread_titles,
+            stamp: native::title_store_mtimes,
+            read: native::read_thread_titles,
             accepts: |row| row.codex_mode.is_native(),
         })
     }
@@ -59,26 +59,23 @@ impl AgentDefinition for Definition {
         "codex"
     }
     fn clipboard_paste_encoder(&self) -> Option<fn(&Path) -> Vec<u8>> {
-        Some(codex::clipboard_paste_input)
-    }
-    fn bin(&self) -> Option<&'static str> {
-        Some(codex::BIN)
+        Some(tui::clipboard_paste_input)
     }
     fn label(&self) -> &'static str {
         "Codex"
     }
     fn read_resume_metadata(&self, args: &[String]) -> Option<ResumeMetadata> {
-        codex::read_resume_metadata(args)
+        native::read_resume_metadata(args)
     }
     fn resume_args(&self, session_id: &str, fork: bool) -> Vec<String> {
         let sub = if fork { "fork" } else { "resume" };
         vec![sub.to_string(), session_id.to_string()]
     }
     fn uses_kitty_keyboard(&self, _term: &str, _alt_screen: bool) -> bool {
-        codex::uses_kitty_keyboard()
+        tui::uses_kitty_keyboard()
     }
     fn reattach_prime(&self, _alt_screen: bool, kitty_keyboard: bool) -> ReattachPrime {
-        codex::reattach_prime(kitty_keyboard)
+        tui::reattach_prime(kitty_keyboard)
     }
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
@@ -89,24 +86,17 @@ impl AgentDefinition for Definition {
         }
     }
     fn watch_paths(&self) -> Vec<PathBuf> {
-        codex::title_watch_path().into_iter().collect()
+        native::title_watch_path().into_iter().collect()
     }
     fn out_of_band_watch_paths(&self) -> Vec<PathBuf> {
-        codex::title_watch_path().into_iter().collect()
+        native::title_watch_path().into_iter().collect()
     }
     fn read_transcript_stats(
         &self,
         transcript: &Path,
         prior: Option<&TranscriptStats>,
     ) -> TranscriptStats {
-        codex::read_transcript_stats(transcript, prior)
-    }
-    fn list_resumable_cached(
-        &self,
-        limit: usize,
-        cache: &mut crate::resume::AgentCache,
-    ) -> Result<Vec<ResumeCandidate>> {
-        super::native::list_resumable_cached(limit, cache)
+        native::read_transcript_stats(transcript, prior)
     }
     fn build_launch_command(
         &self,
@@ -116,25 +106,27 @@ impl AgentDefinition for Definition {
         extra_args: &[String],
         shim_dir: Option<&Path>,
     ) -> Result<Command> {
-        codex::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
+        native::build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
     }
     fn hooks_settings_json(&self, sock_path: &str) -> String {
-        codex::build_hooks_settings(sock_path)
+        native::build_hooks_settings(sock_path)
     }
     fn hook_session(&self) -> Box<dyn crate::agents::hook_session::HookSession> {
-        Box::new(crate::agents::hook_session::Stateless(codex::dispatch_hook))
+        Box::new(crate::agents::hook_session::Stateless(
+            native::dispatch_hook,
+        ))
     }
     fn parse_hook_payload(&self, event: HookEvent, stdin: &str) -> Result<HookMessage> {
-        codex::parse_hook_payload(event, stdin)
+        native::parse_hook_payload(event, stdin)
     }
     fn self_continues(&self, session_id: &str) -> bool {
-        codex::thread_self_continues(session_id)
+        native::thread_self_continues(session_id)
     }
     fn may_self_continue(&self) -> bool {
         true
     }
     fn scan_transcript_signals(&self, path: &Path, offset: u64) -> TranscriptScan {
-        codex::scan_transcript_signals(path, offset)
+        native::scan_transcript_signals(path, offset)
     }
     fn transcript_write_clears_approval(&self) -> bool {
         true

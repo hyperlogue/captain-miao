@@ -20,11 +20,9 @@
 //! it), and no launcher may ever write it into a state file — a host knows its
 //! own backends, so `"agent":"unknown"` on the wire can only be a decoded value
 //! being echoed back, which the launch path refuses rather than guessing. That
-//! last clause is *enforced*, not merely expected: the two places an argv or a
-//! command gets built — [`crate::backend::LocalBackend::open_session`] and
-//! [`AgentKind::build_launch_command`] — both refuse with
-//! [`UNKNOWN_AGENT_REFUSAL`], so no path can turn an undecodable name into a
-//! process.
+//! last clause is enforced by both the host launch plan and adapter
+//! configuration: each refuses with [`UNKNOWN_AGENT_REFUSAL`], so no path can
+//! turn an undecodable name into a process.
 //!
 //! It deliberately does not preserve the original name. `AgentKind` is
 //! `Copy`, is used as a `HashMap` key, and every method takes `self` by value;
@@ -38,7 +36,6 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use tokio::process::Command;
 
 use crate::agents;
 
@@ -83,11 +80,8 @@ pub enum AgentKind {
     Unknown,
 }
 
-/// What both write-side guards say when they refuse an [`AgentKind::Unknown`]
-/// — [`AgentKind::build_launch_command`] and
-/// [`crate::backend::LocalBackend::open_session`]. Shared so the two can't drift
-/// into describing the same situation differently, and so a caller that only
-/// ever sees one of them still learns the fix.
+/// Shared refusal for an unknown agent in host launch plans and adapter
+/// configuration. Either entry point must explain how to resolve the mismatch.
 pub const UNKNOWN_AGENT_REFUSAL: &str = "unknown agent backend: this build doesn't know it (the \
                                          request comes from a newer captain-miao); upgrade \
                                          captain-miao to launch it";
@@ -187,16 +181,6 @@ impl AgentKind {
         Self::ALL.iter().copied().find(|a| a.cli_subcommand() == s)
     }
 
-    /// Whether this agent's binary resolves on `$PATH`.
-    ///
-    /// Advisory for this process's environment only: it cannot determine
-    /// availability on another host or under a different launch environment.
-    /// Picker inclusion follows enabled preferences, not this probe; a missing
-    /// binary is reported by `build_launch_command` when launching.
-    pub fn is_available(self) -> bool {
-        self.bin().is_some_and(agents::binary_available)
-    }
-
     /// Input that attaches an image from this host when the agent's native
     /// clipboard reader cannot use the command shims. `None` leaves Ctrl+V to
     /// the agent. The encoder is selected before fetching anything, so other
@@ -205,30 +189,14 @@ impl AgentKind {
         self.definition().clipboard_paste_encoder()
     }
 
-    /// The executable this backend drives, and the one place that mapping is
-    /// written down. `None` only for [`Unknown`](Self::Unknown), which is not a
-    /// backend this build can launch at all — so no binary could make it
-    /// available, and it is absent from [`ALL`](Self::ALL) besides.
-    pub fn bin(self) -> Option<&'static str> {
-        self.definition().bin()
-    }
-
     /// Human-facing backend name for headers and status lines.
     pub fn label(self) -> &'static str {
         self.definition().label()
     }
 
-    /// Saved facts for an explicit resume that starts without a prompt, when
-    /// the agent defers its startup hook until the first turn. The launcher
-    /// applies these only after spawning the child; ordinary hooks supersede
-    /// them. No metadata for fresh sessions, forks or ambiguous launch args.
-    pub fn read_resume_metadata(self, args: &[String]) -> Option<ResumeMetadata> {
-        self.definition().read_resume_metadata(args)
-    }
-
     /// Extra args appended after the cwd to resume (or fork) `session_id`.
     ///
-    /// The flag shapes differ per backend and each arm states its own; the
+    /// The flag shapes differ per backend and each definition states its own; the
     /// three *kinds* are what matter here. Most decorate a resume with a fork
     /// flag (Claude and Grok share `--resume <id>` / `--fork-session`; Reasonix
     /// takes `-r <id>` / `--copy`; opencode `-s <id>` / `--fork`). Two swap the
@@ -236,7 +204,7 @@ impl AgentKind {
     /// subcommands, and Pi's `--session` / `--fork`, which are alternatives
     /// rather than a flag and its modifier. One ignores `fork` entirely (Kimi),
     /// which is how a backend says it cannot branch: the two argvs come out
-    /// equal and [`Self::supports_fork`] reads that off directly.
+    /// equal and the declared fork capability stays false.
     pub fn resume_args(self, session_id: &str, fork: bool) -> Vec<String> {
         self.definition().resume_args(session_id, fork)
     }
@@ -258,31 +226,6 @@ impl AgentKind {
     /// as [`Self::session_watch_path`] and [`Self::bg_shells`].
     pub fn worktree_args(self, name: Option<&str>) -> Option<Vec<String>> {
         self.definition().worktree_args(name)
-    }
-
-    // =============================================================================
-    // Argv: launch, resume, fork, worktree
-    // =============================================================================
-
-    /// Whether this agent can launch into an isolated worktree. Derived from
-    /// [`Self::worktree_args`] rather than matched separately, so the UI gate
-    /// and the argv can never disagree about which agents support it.
-    pub fn supports_worktrees(self) -> bool {
-        self.worktree_args(None).is_some()
-    }
-
-    /// Whether a resume can **branch** rather than continuing the session in
-    /// place — what `f` offers, and the thing `--fork-session` / Codex's `fork`
-    /// subcommand do.
-    ///
-    /// Derived from [`Self::resume_args`] the same way [`Self::supports_worktrees`]
-    /// derives from `worktree_args`, and for the same reason: a backend with no
-    /// fork flag simply ignores the `fork` argument, which makes the two argvs
-    /// equal and this `false` with no second match to keep in sync. A backend
-    /// that later grows the flag flips this by editing one arm.
-    pub fn supports_fork(self) -> bool {
-        // Any id works — both calls use the same one, so only the flag differs.
-        self.resume_args("id", true) != self.resume_args("id", false)
     }
 
     /// Whether this launch will put the agent's TUI on the terminal's
@@ -321,7 +264,7 @@ impl AgentKind {
     }
 
     /// Everything a backend may structurally lack, in one query — the
-    /// `AgentKind` counterpart to [`crate::terminal::Capabilities`], and the
+    /// `AgentKind` counterpart to the dashboard's terminal capabilities, and the
     /// same bargain: a limit the UI has to gate on is a *field* here, not a
     /// special case at the call site.
     ///
@@ -329,7 +272,7 @@ impl AgentKind {
     /// drawing a frame.** Every field could be computed from the method that
     /// owns it — `fork` from the two argvs, `approval_gate` from the generated
     /// hook config — but three of the four would then allocate per row per
-    /// redraw, and [`crate::terminal::Capabilities`] set the precedent that this
+    /// redraw, and the dashboard's terminal capabilities set the precedent that this
     /// query does no work.
     ///
     /// What keeps a constant honest is that the derivation still runs, in
@@ -398,50 +341,6 @@ impl AgentKind {
         self.definition().read_session_index(cache)
     }
 
-    // =============================================================================
-    // Reading a backend's own files
-    // =============================================================================
-
-    /// Resumable sessions across all of this agent's transcripts. Most-recent
-    /// first, capped at `limit`. The returned candidates carry their source
-    /// agent so a future picker can mix backends in one list.
-    pub fn list_resumable(self, limit: usize) -> Result<Vec<ResumeCandidate>> {
-        self.list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-    }
-
-    pub(crate) fn list_resumable_cached(
-        self,
-        limit: usize,
-        cache: &mut crate::resume::AgentCache,
-    ) -> Result<Vec<ResumeCandidate>> {
-        self.configure(&crate::config::AgentConfig::load())?
-            .list_resumable(limit, cache)
-    }
-
-    // -- Launcher-side: process launch, hooks, transcript signals --
-
-    /// Build the subprocess command that runs this agent in `cwd` with hook
-    /// callbacks pointing at `sock_path`. The launcher writes any per-session
-    /// config files (Claude's `--settings` payload, Codex's owned profile, etc.)
-    /// before spawning.
-    ///
-    /// `shim_dir` is the clipboard shim farm to prepend to the agent's `PATH`, and
-    /// it is `Some` only for a pooled session — see
-    /// [`crate::cli::ClipboardShims`]. An explicit parameter rather than something
-    /// each backend decides for itself, so the two cannot disagree about when a
-    /// session is shimmed.
-    pub fn build_launch_command(
-        self,
-        cwd: &str,
-        sock_path: &Path,
-        settings_path: &Path,
-        extra_args: &[String],
-        shim_dir: Option<&Path>,
-    ) -> Result<Command> {
-        self.definition()
-            .build_launch_command(cwd, sock_path, settings_path, extra_args, shim_dir)
-    }
-
     /// JSON contents of the per-session hook-settings file the launcher
     /// drops on disk before spawning the agent. The file location is
     /// agent-specific and chosen by `build_launch_command`.
@@ -470,9 +369,8 @@ impl AgentKind {
     ///
     /// Asked at the moment the launcher would park a row, which is what keeps
     /// this event-driven: nothing is watched, nothing is timed, the one backend
-    /// that can answer `true` reads its own store (see
-    /// [`crate::agents::codex::thread_self_continues`]) and every other one answers from the
-    /// shape of its turn model.
+    /// that can answer `true` reads its own store and every other one answers
+    /// from the shape of its turn model.
     pub fn self_continues(self, session_id: &str) -> bool {
         self.definition().self_continues(session_id)
     }
@@ -784,7 +682,7 @@ pub struct SessionIndexEntry {
     pub name: Option<String>,
 }
 
-/// One resumable session surfaced by `AgentKind::list_resumable`.
+/// One resumable session surfaced by the host's [`crate::resume::Inventory`].
 /// `Serialize`/`Deserialize` so a `captain-miao server` can ship it to a remote
 /// dashboard's resume picker over the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1067,15 +965,13 @@ mod tests {
     /// would run the wrong agent in the user's cwd.
     #[test]
     fn launching_an_unknown_agent_is_an_error() {
-        let err = AgentKind::Unknown
-            .build_launch_command(
-                "/home/miao/p",
-                Path::new("/run/miao.sock"),
-                Path::new("/run/miao-settings.json"),
-                &[],
-                None,
-            )
-            .expect_err("an unknown backend has no launch command");
+        let config = crate::config::AgentConfig {
+            approval_grace: Duration::from_secs(2),
+            codex: Default::default(),
+        };
+        let Err(err) = AgentKind::Unknown.configure(&config) else {
+            panic!("an unknown backend has no session adapter");
+        };
         assert!(
             err.to_string().contains("upgrade"),
             "the error must name the fix: {err}"
@@ -1093,35 +989,37 @@ mod tests {
 
     /// The gate is nothing but "the two argvs differ", in both directions.
     /// Kimi is the first backend on the false side and the reason the gate
-    /// exists: its arm ignores `fork`, and that alone is what has to be true —
-    /// no separate match, no flag invented to fill the gap.
+    /// exists: its resume argv ignores `fork`, so its capability must be false.
     #[test]
     fn a_backend_forks_exactly_when_its_fork_argv_differs() {
         for &agent in AgentKind::ALL {
             let plain = agent.resume_args("id", false);
             let forked = agent.resume_args("id", true);
             assert_eq!(
-                agent.supports_fork(),
+                agent.capabilities().fork,
                 plain != forked,
                 "{agent:?}'s gate must be its argv, nothing else"
             );
         }
         // Named rather than only derived, so a backend quietly losing (or
         // growing) its fork flag fails here instead of just hiding a key.
-        assert!(AgentKind::Claude.supports_fork());
-        assert!(AgentKind::Codex.supports_fork());
-        assert!(AgentKind::Reasonix.supports_fork());
+        assert!(AgentKind::Claude.capabilities().fork);
+        assert!(AgentKind::Codex.capabilities().fork);
+        assert!(AgentKind::Reasonix.capabilities().fork);
         assert!(
-            AgentKind::Pi.supports_fork(),
+            AgentKind::Pi.capabilities().fork,
             "Pi forks by swapping --session for --fork, which is still a differing argv"
         );
         assert!(
-            !AgentKind::Kimi.supports_fork(),
+            !AgentKind::Kimi.capabilities().fork,
             "Kimi has no fork flag, so `f` must hide rather than resume in place"
         );
-        assert!(AgentKind::OpenCode.supports_fork(), "opencode has --fork");
         assert!(
-            AgentKind::Omp.supports_fork(),
+            AgentKind::OpenCode.capabilities().fork,
+            "opencode has --fork"
+        );
+        assert!(
+            AgentKind::Omp.capabilities().fork,
             "omp forks with --fork where it resumes with --resume"
         );
 
@@ -1132,7 +1030,7 @@ mod tests {
             AgentKind::Unknown.resume_args("id", true),
             AgentKind::Unknown.resume_args("id", false)
         );
-        assert!(!AgentKind::Unknown.supports_fork());
+        assert!(!AgentKind::Unknown.capabilities().fork);
     }
 
     /// The whole subscription surface, backend by backend, read back out of the
@@ -1402,12 +1300,12 @@ mod tests {
             let c = agent.capabilities();
             assert_eq!(
                 c.fork,
-                agent.supports_fork(),
+                agent.resume_args("id", true) != agent.resume_args("id", false),
                 "{agent:?}: the declared fork capability is not what its resume argv does"
             );
             assert_eq!(
                 c.worktrees,
-                agent.supports_worktrees(),
+                agent.worktree_args(None).is_some(),
                 "{agent:?}: the declared worktree capability is not what its worktree argv does"
             );
             let forwarded = agent.forwarded_events();

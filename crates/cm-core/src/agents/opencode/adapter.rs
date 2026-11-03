@@ -17,9 +17,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "opencode"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(opencode::BIN)
-    }
     fn label(&self) -> &'static str {
         "opencode"
     }

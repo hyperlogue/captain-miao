@@ -2524,9 +2524,6 @@ fn workdir_picker_ctrl_t_cycles_every_enabled_agent_in_order() {
     }
 
     let _guard = crate::config::ConfigSlotGuard::install(crate::config::Config::default());
-    for agent in AgentKind::ALL {
-        assert_eq!(agent.is_available(), *agent == AgentKind::Claude);
-    }
     let all: Vec<_> = AgentKind::ALL.iter().map(|a| (*a, true)).collect();
     let reordered: Vec<_> = AgentKind::ALL
         .iter()

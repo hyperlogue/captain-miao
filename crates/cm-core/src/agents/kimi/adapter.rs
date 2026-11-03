@@ -17,9 +17,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "kimi"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(kimi::BIN)
-    }
     fn label(&self) -> &'static str {
         "Kimi Code"
     }

@@ -196,7 +196,13 @@ mod tests {
         };
 
         let agent = AgentKind::Pi;
-        assert!(agent.list_resumable(10).unwrap().is_empty());
+        let config = crate::config::AgentConfig {
+            approval_grace: Duration::from_secs(2),
+            codex: Default::default(),
+        };
+        let adapter = agent.configure(&config).unwrap();
+        let mut cache = crate::resume::AgentCache::default();
+        assert!(adapter.list_resumable(10, &mut cache).unwrap().is_empty());
         let base = std::path::PathBuf::from(std::env::var_os("PI_CODING_AGENT_DIR").unwrap());
         let root = if case == "flat" {
             base.join("custom")
@@ -249,7 +255,7 @@ mod tests {
                 6,
             );
         }
-        let found = agent.list_resumable(10).unwrap();
+        let found = adapter.list_resumable(10, &mut cache).unwrap();
         assert_eq!(
             found.len(),
             2,
@@ -263,7 +269,10 @@ mod tests {
         assert_eq!(found[1].session_id, "older");
         assert_eq!(found[1].first_prompt.as_deref(), Some("First draft please"));
         assert_eq!(found[1].custom_title.as_deref(), Some("Final essay"));
-        assert_eq!(agent.list_resumable(1).unwrap()[0].session_id, "newer");
-        assert!(agent.list_resumable(0).unwrap().is_empty());
+        assert_eq!(
+            adapter.list_resumable(1, &mut cache).unwrap()[0].session_id,
+            "newer"
+        );
+        assert!(adapter.list_resumable(0, &mut cache).unwrap().is_empty());
     }
 }

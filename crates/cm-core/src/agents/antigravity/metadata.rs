@@ -17,7 +17,7 @@ use crate::agent::TranscriptStats;
 /// Committed log position. Partial JSON lines are retried on the next write;
 /// inode changes and truncation discard the old conversation's accumulators.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PromptCursor {
+struct PromptCursor {
     offset: u64,
     device: u64,
     inode: u64,
@@ -189,8 +189,8 @@ pub(super) fn read_compaction(path: &Path) -> Option<Compaction> {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct TranscriptFold {
-    pub(super) stats: TranscriptStats,
+struct TranscriptFold {
+    stats: TranscriptStats,
     antigravity_cursor: Option<PromptCursor>,
 }
 impl std::ops::Deref for TranscriptFold {
@@ -215,7 +215,7 @@ impl crate::agents::transcript::TranscriptReader for Reader {
     }
 }
 
-pub(crate) fn read_transcript_stats(path: &Path, prior: Option<&TranscriptFold>) -> TranscriptFold {
+fn read_transcript_stats(path: &Path, prior: Option<&TranscriptFold>) -> TranscriptFold {
     let mut stats = prior.cloned().unwrap_or_default();
     let Ok(mut file) = std::fs::File::open(path) else {
         return stats;

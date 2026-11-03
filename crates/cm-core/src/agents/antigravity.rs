@@ -509,10 +509,6 @@ struct HistoryLine {
 /// (which holds the most recent conversation per workspace). A conversation
 /// missing from both is skipped rather than guessed at — a resume aimed at the
 /// wrong directory is worse than a resume the picker didn't offer.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,

@@ -433,7 +433,7 @@ impl App {
             Command::ForkSession => {
                 let s = self.selected_session()?;
                 // Not every backend can branch a resume
-                // (`AgentKind::supports_fork`). Drop the key on one that
+                // (`AgentCapabilities::fork`). Drop the key on one that
                 // can't, rather than run a plain resume under the name "fork" —
                 // continuing the session in place is the single outcome someone
                 // pressing `f` is trying to avoid, and it would look like it

@@ -426,7 +426,8 @@ pub(crate) fn command(
     );
     // Project commands execute in the daemon. Wrapping this client in direnv
     // evaluates .envrc a second time and can block opening the resume picker.
-    let executable = crate::agents::find_in_path(super::BIN).context("codex not found in PATH")?;
+    let executable =
+        crate::agents::find_in_path(super::tui::BIN).context("codex not found in PATH")?;
     let mut command = tokio::process::Command::new(executable);
     command.current_dir(cwd);
     crate::agents::with_shim_path(&mut command, shim);

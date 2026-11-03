@@ -49,12 +49,11 @@ pub(crate) trait AgentDefinition: Send + Sync {
     fn clipboard_paste_encoder(&self) -> Option<fn(&Path) -> Vec<u8>> {
         None
     }
-    fn bin(&self) -> Option<&'static str> {
-        None
-    }
     fn label(&self) -> &'static str {
         "Agent"
     }
+    /// Seed an explicit resume after spawning, until ordinary hooks arrive.
+    /// Fresh sessions, forks and ambiguous launch args return no metadata.
     fn read_resume_metadata(&self, _args: &[String]) -> Option<ResumeMetadata> {
         None
     }
@@ -109,6 +108,8 @@ pub(crate) trait AgentDefinition: Send + Sync {
     ) -> Result<Vec<ResumeCandidate>> {
         Ok(vec![])
     }
+    /// Prepare the child and its per-session hook settings. The host supplies
+    /// the clipboard shim directory only when launching a pooled session.
     fn build_launch_command(
         &self,
         _cwd: &str,

@@ -17,9 +17,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "grok"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(grok::BIN)
-    }
     fn label(&self) -> &'static str {
         "Grok Build"
     }

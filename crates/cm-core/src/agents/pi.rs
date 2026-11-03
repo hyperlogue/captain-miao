@@ -71,10 +71,6 @@ mod sessions;
 #[cfg(test)]
 mod live_tests;
 
-pub fn list_resumable(limit: usize) -> Result<Vec<crate::agent::ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,

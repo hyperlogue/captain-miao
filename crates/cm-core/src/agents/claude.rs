@@ -206,8 +206,8 @@ pub fn read_transcript_stats(path: &Path) -> TranscriptStats {
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct TranscriptFold {
-    pub(super) stats: TranscriptStats,
+struct TranscriptFold {
+    stats: TranscriptStats,
     cursor: Option<StatsCursor>,
 }
 impl std::ops::Deref for TranscriptFold {
@@ -225,7 +225,7 @@ impl TranscriptFold {
     }
 }
 #[derive(Default)]
-pub(super) struct Reader {
+struct Reader {
     prior: TranscriptFold,
 }
 impl super::transcript::TranscriptReader for Reader {
@@ -238,13 +238,12 @@ impl super::transcript::TranscriptReader for Reader {
     }
 }
 
-/// Incremental sibling of [`read_transcript_stats`]: folds only the transcript
-/// bytes appended since `prior`'s cursor offset, so an actively-growing session
+/// Folds only the transcript bytes appended since `prior`'s cursor offset, so an actively-growing session
 /// isn't rescanned end-to-end on every reload. A trailing partial (not yet
 /// newline-terminated) line is held back and re-read once complete, so a
 /// half-written JSON line is never parsed and never skipped. Falls back to a
 /// full reparse if the file shrank/rotated below the cursor or a seek fails.
-pub(crate) fn read_transcript_stats_incremental(
+fn read_transcript_stats_incremental(
     path: &Path,
     prior: Option<&TranscriptFold>,
 ) -> TranscriptFold {
@@ -325,12 +324,10 @@ struct StatsEntry {
     cwd: Option<String>,
 }
 
-/// Running accumulators for the transcript-stats parse, persisted across reloads
-/// so the dashboard can fold only newly-appended lines instead of rescanning the
-/// whole file. `offset` is the byte position up to which lines have been folded.
-/// Private parsing state retained by this session’s reader. Callers receive facts.
+/// Parsing state retained by this session's reader. `offset` marks the bytes
+/// already folded, so the next read processes only newly appended lines.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct StatsCursor {
+struct StatsCursor {
     offset: u64,
     last_total: Option<u64>,
     first_total: Option<u64>,
@@ -438,7 +435,7 @@ impl StatsCursor {
     /// cursor keeps the fold the single source of the model and simply advances
     /// what it knows, instead of standing a second source beside it that the
     /// two would then have to be arbitrated between.
-    pub(crate) fn adopt_model(&mut self, model: &str) {
+    fn adopt_model(&mut self, model: &str) {
         self.last_model = Some(model.to_string());
     }
 
@@ -761,10 +758,6 @@ fn read_custom_title(path: &Path) -> Option<String> {
 
 /// Scan `~/.claude/projects/*/*.jsonl` for resumable Claude Code sessions.
 /// Returns up to `limit` candidates sorted by mtime (most recent first).
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,

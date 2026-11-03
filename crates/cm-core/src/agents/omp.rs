@@ -115,7 +115,7 @@
 //!
 //! omp's argv handler map registers `"--resume": R2w`, `"-r": R2w`,
 //! `"--session": R2w` (an undocumented alias) and `"--fork": (w, u) => { w.fork
-//! = u; }`. [`AgentKind::resume_args`] uses `--resume` / `--fork` —
+//! = u; }`. [`crate::agent::AgentKind::resume_args`] uses `--resume` / `--fork` —
 //! `--resume` is in the public flag schema and `--help`, `--fork` is in the
 //! argv map and documented in `omp://session-operations-export-share-fork-
 //! resume.md`. `--session` is deliberately not used: it is absent from both
@@ -124,7 +124,7 @@
 //! No `--worktree` launch flag exists (the single `--worktree` string in the
 //! binary is `git restore --worktree`). omp's `omp worktree` subcommand only
 //! lists/clears worktrees the agent made itself, so there is nothing to pass
-//! at launch and [`AgentKind::worktree_args`] answers `None`.
+//! at launch and [`crate::agent::AgentKind::worktree_args`] answers `None`.
 //!
 //! # Loaded with Bun, not jiti
 //!
@@ -498,7 +498,7 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
 /// The sessions directory: `$PI_CODING_AGENT_DIR/sessions` when omp's documented
 /// override is set (omp calls it the "Session storage directory"; `--profile`
 /// rewrites it too), else `~/.omp/agent/sessions`. `None` means there is nowhere
-/// to look, which [`list_resumable`] answers as an empty list rather than an
+/// to look, which [`list_resumable_cached`] answers as an empty list rather than an
 /// error.
 fn sessions_root() -> Option<PathBuf> {
     let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
@@ -517,17 +517,13 @@ fn sessions_root() -> Option<PathBuf> {
 /// header's `id` and `cwd`, the pad-rewritten `title` record omp keeps at line
 /// 1, and the first `message` whose role is `user` — so the `parentId` tree walk
 /// the old comment feared is not needed. That walk belongs to
-/// [`crate::agent::AgentKind::read_transcript_stats`], whose fold really does
-/// need the active leaf; a head read does not.
+/// the session's transcript reader, whose fold really does need the active
+/// leaf; a head read does not.
 ///
 /// **A missing store is an empty list, not an error.** `LocalBackend` asks every
 /// backend in `AgentKind::ALL` whenever the picker opens and surfaces whatever
 /// errors come back (see `opencode::list_resumable` for the same argument), so
 /// refusing here would put an error in front of every user who never ran omp.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,

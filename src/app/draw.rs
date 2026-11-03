@@ -1466,7 +1466,7 @@ impl App {
         ]);
         // `f` is the one action that turns on the *selected row's* backend
         // rather than on a global capability: a resume with no way to branch
-        // has no fork to offer (`AgentKind::supports_fork`). Hide it there
+        // has no fork to offer (`AgentCapabilities::fork`). Hide it there
         // instead of listing a key that does nothing, as the unsupported `t`
         // and the pool-only detach keys already do. With no row selected the
         // list is generic, so the key stays.

@@ -516,8 +516,8 @@ impl LocalBackend {
 
     /// Build the argv for a local launcher window:
     /// `miao <agent> <cwd> [resume args]`. Pure metadata — the client spawns it
-    /// into a Kitty window; nothing runs here. argv[1] is [`LAUNCH_VERB`] and
-    /// argv[0] is the running
+    /// into a Kitty window; nothing runs here. `argv[1]` is [`LAUNCH_VERB`] and
+    /// `argv[0]` is the running
     /// captain-miao exe so the launched launcher is the same build as the
     /// dashboard (falls back to a bare `miao` on PATH if unresolvable — the
     /// dashboard binary's name, since that is what a local install puts there).
@@ -530,8 +530,8 @@ impl LocalBackend {
     /// without the guard the argv would be `miao "" <cwd>`, a window that opens
     /// and dies on a clap error. Refusing here rather than at each caller keeps
     /// the check somewhere a future caller cannot forget it, and says the same
-    /// thing [`AgentKind::build_launch_command`] does for the launcher's own
-    /// side of the same problem.
+    /// thing adapter configuration does for the launcher's side of the same
+    /// problem.
     pub fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         if spec.agent == AgentKind::Unknown {
             anyhow::bail!(crate::agent::UNKNOWN_AGENT_REFUSAL);
@@ -1255,7 +1255,7 @@ mod tests {
         assert_eq!(sessions[3].name, None);
     }
 
-    /// `open_session` argv[0] is the resolved exe path (varies by environment),
+    /// `open_session` `argv[0]` is the resolved exe path (varies by environment),
     /// so the tests assert on the agent-facing tail.
     /// The launcher argv **after** the exe and the `launch` verb, so each case
     /// below reads as the agent name and its arguments. The verb itself is
@@ -1499,7 +1499,7 @@ mod tests {
     }
 
     /// Kimi has no fork flag, so the two argvs are **identical** — which is the
-    /// whole mechanism behind `supports_fork()` and therefore behind `f` hiding
+    /// reason its fork capability is false and `f` hides
     /// itself on a Kimi row. Asserted end to end (through `open_session`, where
     /// the argv is actually built) rather than left implied by the equality in
     /// `resume_args`, because a stray `if fork` anywhere on this path would
@@ -1509,7 +1509,7 @@ mod tests {
         let plain = open_argv(AgentKind::Kimi, Some(("s4", false)));
         let forked = open_argv(AgentKind::Kimi, Some(("s4", true)));
         assert_eq!(plain, forked, "a fork request must add nothing for Kimi");
-        assert!(!AgentKind::Kimi.supports_fork());
+        assert!(!AgentKind::Kimi.capabilities().fork);
         // The other three still differ, so this test can't pass by the argv
         // having stopped carrying the flag for everyone.
         for agent in [

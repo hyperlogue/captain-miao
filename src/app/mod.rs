@@ -403,7 +403,7 @@ pub(super) enum PickerKind {
         /// property of the *task* you're starting, not a standing preference).
         ///
         /// Always `None` for an agent that can't do it
-        /// (`AgentKind::supports_worktrees`); a `Ctrl-t` onto such an agent
+        /// (`AgentCapabilities::worktrees`); a `Ctrl-t` onto such an agent
         /// clears it rather than carrying a request that would be silently
         /// dropped at launch.
         worktree: Option<WorktreeArm>,

@@ -17,9 +17,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "pi"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(pi::BIN)
-    }
     fn label(&self) -> &'static str {
         "Pi"
     }

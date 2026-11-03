@@ -17,9 +17,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "reasonix"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(reasonix::BIN)
-    }
     fn label(&self) -> &'static str {
         "Reasonix"
     }

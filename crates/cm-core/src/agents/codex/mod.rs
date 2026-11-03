@@ -10,13 +10,7 @@ mod tui;
 
 #[cfg(test)]
 pub(crate) use native::read_resume_metadata_at;
-pub(crate) use native::{
-    build_hooks_settings, build_launch_command, dispatch_hook, parse_hook_payload,
-    read_resume_metadata, read_thread_titles, read_transcript_stats, scan_transcript_signals,
-    thread_self_continues, title_store_mtimes, title_watch_path,
-};
 pub use settings::{CodexConfig, CodexMode};
-pub(crate) use tui::{BIN, clipboard_paste_input, reattach_prime, uses_kitty_keyboard};
 
 /// A dashboard may retry cleanup against an already waiting replacement only
 /// during this initial window. Measured before opening it; never reset on retry.

@@ -425,7 +425,7 @@ async fn process_hooks(
                     state.status,
                 );
                 // A Stop that did *not* land on a rest state may be a session
-                // that re-drives itself (`codex::dispatch_hook`, under a goal).
+                // that re-drives itself (Codex under a goal).
                 // Note it, and arm the one confirmation the bet needs — see
                 // `confirm_hold_at` and `stop_holds_for_goal`.
                 if dispatched_event == HookEvent::Stop {

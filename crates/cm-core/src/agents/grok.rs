@@ -204,10 +204,6 @@ struct SummaryInfo {
 /// The picker does not fold a token count: that lives on the running row via
 /// `signals.json`, not on a resume candidate. `last_turn_summary` rides
 /// `first_prompt` so a recap is searchable even when the title is already set.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,
@@ -722,7 +718,7 @@ fn summary_is_subagent(path: &Path) -> bool {
 }
 
 /// `$GROK_HOME/sessions/<cwd-key>/<session_id>/summary.json`, or `None` if
-/// that directory isn't a persisted session. Same walk as [`list_resumable`]:
+/// that directory isn't a persisted session. Same walk as [`list_resumable_cached`]:
 /// the cwd-key is an encoding we never decode, and Grok's own id resolver
 /// walks every key when it has only an id.
 fn summary_for(session_id: &str) -> Option<PathBuf> {

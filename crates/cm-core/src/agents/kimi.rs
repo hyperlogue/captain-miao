@@ -299,10 +299,6 @@ fn read_session_index(home: &Path) -> std::collections::HashMap<String, String> 
 /// over an append-only log rather than a field, and belongs to
 /// `read_transcript_stats` rather than to a picker that stats one file per
 /// candidate.
-pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
-    list_resumable_cached(limit, &mut crate::resume::AgentCache::default())
-}
-
 pub(crate) fn list_resumable_cached(
     limit: usize,
     cache: &mut crate::resume::AgentCache,
@@ -770,7 +766,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
 ///
 /// **Kimi's payload names no transcript**, so the path is resolved from the
 /// session id instead: `sessions/*/<session_id>/agents/main/wire.jsonl`. The
-/// bucket is walked rather than derived — the same reason [`list_resumable`]
+/// bucket is walked rather than derived — the same reason [`list_resumable_cached`]
 /// walks it, and Kimi's own readers do too.
 ///
 /// `main` specifically, out of the several agents a session can hold

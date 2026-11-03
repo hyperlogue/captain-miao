@@ -31,9 +31,6 @@ impl AgentDefinition for Definition {
     fn cli_subcommand(&self) -> &'static str {
         "antigravity"
     }
-    fn bin(&self) -> Option<&'static str> {
-        Some(antigravity::BIN)
-    }
     fn label(&self) -> &'static str {
         "Antigravity"
     }

@@ -406,7 +406,7 @@ const BIN_FALLBACK: &str = "miao";
 /// callback order; it cannot recover an event lost to a failed hook process.
 ///
 /// The export is emitted **twice**, named and default, because §9 states that a
-/// plugin "export[s] a function" without saying under which convention. Both
+/// plugin exports a function without saying under which convention. Both
 /// point at the same function; the unused one costs a line.
 fn plugin_source(miao: &str) -> String {
     let bus: String = BUS_EVENTS

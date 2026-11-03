@@ -1,9 +1,10 @@
 //! Opt-in compatibility test using the real agy, a PTY and a loopback model.
 //! Run with `CM_TEST_AGY_BIN=/path/to/agy nix develop -c cargo test -p cm-core
 //! real_agy_tracks_startup_completion_cancellation_and_resume -- --ignored`.
-use super::metadata::read_transcript_stats;
+use super::metadata::Reader;
 use super::*;
 use crate::agent::AgentKind;
+use crate::agents::transcript::TranscriptReader;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -194,7 +195,7 @@ print('custom-status-visible' if sys.argv[-1] == 'user-status' else '{}')
             }
             other => panic!("unexpected phase {other}"),
         }
-        let stats = read_transcript_stats(&snapshot.join("transcript.jsonl"), None);
+        let stats = Reader::default().read(&snapshot.join("transcript.jsonl"));
         let expected_prompt = match phase {
             "startup" | "clear" => None,
             "complete" | "rename" => Some("completion_fixture"),
