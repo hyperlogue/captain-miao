@@ -609,7 +609,12 @@ mod tests {
             host: HostId("example".into()),
             generation,
             retiring: Arc::new(AtomicBool::new(false)),
-            options: ssh_common_opts(&state::ssh_control_path(&target), &[]),
+            // The peer is entirely local to this fixture. User and system SSH
+            // configuration must not change its route or reject its setup.
+            options: ssh_common_opts(
+                &state::ssh_control_path(&target),
+                &["-F".into(), "/dev/null".into()],
+            ),
             endpoint: Default::default(),
         };
         let old = control(generation);
