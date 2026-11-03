@@ -398,17 +398,6 @@ impl AgentKind {
         self.definition().read_session_index(cache)
     }
 
-    /// One-shot transcript facts. Stateful tasks use agent-owned readers, which
-    /// retain their cursors privately. `prior` lets stateless readers reuse
-    /// facts such as a previously discovered first prompt.
-    pub fn read_transcript_stats(
-        self,
-        transcript: &Path,
-        prior: Option<&TranscriptStats>,
-    ) -> TranscriptStats {
-        self.definition().read_transcript_stats(transcript, prior)
-    }
-
     // =============================================================================
     // Reading a backend's own files
     // =============================================================================

@@ -142,10 +142,22 @@ impl AgentDefinition for Definition {
     fn refresh_transcript_on_hook(&self) -> bool {
         self.transcript_poll_interval().is_some()
     }
-    fn transcript_poll_interval(&self) -> Option<Duration> {
+    fn transcript_poll_interval(&self) -> Option<std::time::Duration> {
         if cfg!(target_os = "macos") {
             return Some(Duration::from_secs(2));
         }
+        None
+    }
+    fn last_prompt_is_live(&self) -> bool {
+        false
+    }
+    fn agent_activity(&self, _agent_pid: u32) -> Option<AgentActivity> {
+        None
+    }
+    fn transcript_path_is_replaced(&self) -> bool {
+        false
+    }
+    fn bg_shells(&self, _agent_pid: u32) -> Option<Vec<BgShell>> {
         None
     }
 }

@@ -37,9 +37,6 @@ pub(crate) trait AgentDefinition: Send + Sync {
         &self,
         config: &crate::config::AgentConfig,
     ) -> Result<Box<dyn crate::agent::session::AgentAdapter>> {
-        if self.kind() == AgentKind::Unknown {
-            return crate::agent::session::refuse_unknown();
-        }
         Ok(Box::new(crate::agent::session::NativeAdapter {
             definition: self.kind().definition(),
             approval_grace: config.approval_grace,
@@ -128,15 +125,47 @@ pub(crate) trait AgentDefinition: Send + Sync {
     fn hook_session(&self) -> Box<dyn crate::agents::hook_session::HookSession> {
         Box::new(crate::agents::hook_session::Stateless(|_, _| {}))
     }
-    fn last_prompt_is_live(&self) -> bool {
-        false
-    }
+    fn last_prompt_is_live(&self) -> bool;
 
     fn parse_hook_payload(&self, _event: HookEvent, _stdin: &str) -> Result<HookMessage> {
         Err(anyhow::anyhow!(
             "unknown agent backend (this hook came from a newer \
                  captain-miao); upgrade captain-miao to handle it"
         ))
+    }
+    fn self_continues(&self, _session_id: &str) -> bool;
+    fn may_self_continue(&self) -> bool;
+    fn scan_transcript_signals(&self, _path: &Path, _offset: u64) -> TranscriptScan;
+    fn agent_activity(&self, _agent_pid: u32) -> Option<AgentActivity>;
+    fn session_name(&self, _agent_pid: u32) -> Option<String> {
+        None
+    }
+    fn session_watch_path(&self, _agent_pid: u32) -> Option<PathBuf> {
+        None
+    }
+    fn transcript_write_clears_approval(&self) -> bool;
+    fn refresh_transcript_on_hook(&self) -> bool;
+    fn transcript_poll_interval(&self) -> Option<Duration>;
+    fn transcript_path_is_replaced(&self) -> bool;
+    fn replaced_sidecar_paths(&self, _transcript: &Path) -> Vec<PathBuf> {
+        vec![]
+    }
+    fn bg_shells(&self, _agent_pid: u32) -> Option<Vec<BgShell>>;
+}
+
+struct Unknown;
+impl AgentDefinition for Unknown {
+    fn kind(&self) -> AgentKind {
+        AgentKind::Unknown
+    }
+    fn configure(
+        &self,
+        _config: &crate::config::AgentConfig,
+    ) -> Result<Box<dyn crate::agent::session::AgentAdapter>> {
+        crate::agent::session::refuse_unknown()
+    }
+    fn last_prompt_is_live(&self) -> bool {
+        false
     }
     fn self_continues(&self, _session_id: &str) -> bool {
         false
@@ -148,12 +177,6 @@ pub(crate) trait AgentDefinition: Send + Sync {
         TranscriptScan::default()
     }
     fn agent_activity(&self, _agent_pid: u32) -> Option<AgentActivity> {
-        None
-    }
-    fn session_name(&self, _agent_pid: u32) -> Option<String> {
-        None
-    }
-    fn session_watch_path(&self, _agent_pid: u32) -> Option<PathBuf> {
         None
     }
     fn transcript_write_clears_approval(&self) -> bool {
@@ -168,18 +191,8 @@ pub(crate) trait AgentDefinition: Send + Sync {
     fn transcript_path_is_replaced(&self) -> bool {
         false
     }
-    fn replaced_sidecar_paths(&self, _transcript: &Path) -> Vec<PathBuf> {
-        vec![]
-    }
     fn bg_shells(&self, _agent_pid: u32) -> Option<Vec<BgShell>> {
         None
-    }
-}
-
-struct Unknown;
-impl AgentDefinition for Unknown {
-    fn kind(&self) -> AgentKind {
-        AgentKind::Unknown
     }
 }
 

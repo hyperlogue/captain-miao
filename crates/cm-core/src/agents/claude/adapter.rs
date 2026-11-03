@@ -56,13 +56,6 @@ impl AgentDefinition for Definition {
     fn read_session_index(&self, cache: &mut SessionIndexCache) -> SessionIndex {
         claude::read_session_index(cache)
     }
-    fn read_transcript_stats(
-        &self,
-        transcript: &Path,
-        _prior: Option<&TranscriptStats>,
-    ) -> TranscriptStats {
-        claude::read_transcript_stats_incremental(transcript, None).stats
-    }
     fn list_resumable_cached(
         &self,
         limit: usize,
@@ -108,5 +101,23 @@ impl AgentDefinition for Definition {
     }
     fn bg_shells(&self, agent_pid: u32) -> Option<Vec<BgShell>> {
         claude::bg_shells(agent_pid)
+    }
+    fn last_prompt_is_live(&self) -> bool {
+        false
+    }
+    fn self_continues(&self, _session_id: &str) -> bool {
+        false
+    }
+    fn may_self_continue(&self) -> bool {
+        false
+    }
+    fn refresh_transcript_on_hook(&self) -> bool {
+        false
+    }
+    fn transcript_poll_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+    fn transcript_path_is_replaced(&self) -> bool {
+        false
     }
 }

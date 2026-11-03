@@ -54,13 +54,6 @@ impl AgentDefinition for Definition {
     fn out_of_band_watch_paths(&self) -> Vec<PathBuf> {
         antigravity::title_watch_paths()
     }
-    fn read_transcript_stats(
-        &self,
-        transcript: &Path,
-        _prior: Option<&TranscriptStats>,
-    ) -> TranscriptStats {
-        super::metadata::read_transcript_stats(transcript, None).stats
-    }
     fn list_resumable_cached(
         &self,
         limit: usize,
@@ -89,6 +82,30 @@ impl AgentDefinition for Definition {
     }
     fn refresh_transcript_on_hook(&self) -> bool {
         true
+    }
+    fn self_continues(&self, _session_id: &str) -> bool {
+        false
+    }
+    fn may_self_continue(&self) -> bool {
+        false
+    }
+    fn scan_transcript_signals(&self, _path: &Path, _offset: u64) -> TranscriptScan {
+        TranscriptScan::default()
+    }
+    fn agent_activity(&self, _agent_pid: u32) -> Option<AgentActivity> {
+        None
+    }
+    fn transcript_write_clears_approval(&self) -> bool {
+        false
+    }
+    fn transcript_poll_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+    fn transcript_path_is_replaced(&self) -> bool {
+        false
+    }
+    fn bg_shells(&self, _agent_pid: u32) -> Option<Vec<BgShell>> {
+        None
     }
 }
 
