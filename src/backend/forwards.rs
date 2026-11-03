@@ -541,6 +541,36 @@ mod tests {
     #[tokio::test]
     async fn real_ssh_mux_acknowledgements_and_replacement_ownership() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The control socket lives under the runtime dir: bind it in a child
+        // with private XDG roots, never in a running dashboard's directory.
+        // Keep socket paths short even with macOS's long default TMPDIR.
+        const CHILD: &str = "CM_TEST_REAL_SSH_MUX";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("cm-mux-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::forwards::tests::real_ssh_mux_acknowledgements_and_replacement_ownership",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated SSH mux fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let generation = GENERATION.fetch_add(2, Ordering::Relaxed);
         let target = format!("forward-test-{}-{generation}", std::process::id());
         let socket = state::ssh_control_path(&target);
