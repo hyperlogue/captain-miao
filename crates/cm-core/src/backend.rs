@@ -169,6 +169,15 @@ impl Drop for TitleRetry {
     }
 }
 
+/// Whether `agent`'s title store covers a row, resolving its source once.
+fn title_tracked(agent: AgentKind) -> impl Fn(&LauncherState) -> bool {
+    let accepts = agent
+        .definition()
+        .title_source()
+        .map(|source| source.accepts);
+    move |s| s.agent == agent && accepts.is_some_and(|accepts| accepts(s))
+}
+
 /// Stamp cached titles onto matching agent/session rows, leaving
 /// every other row and untitled sessions untouched so the display falls
 /// through to the folded first prompt. Split from the cache upkeep for tests.
@@ -177,13 +186,8 @@ fn stamp_titles(
     sessions: &mut [LauncherState],
     titles: &HashMap<String, Option<String>>,
 ) {
-    for s in sessions.iter_mut().filter(|s| {
-        s.agent == agent
-            && agent
-                .definition()
-                .title_source()
-                .is_some_and(|source| (source.accepts)(s))
-    }) {
+    let tracked = title_tracked(agent);
+    for s in sessions.iter_mut().filter(|s| tracked(s)) {
         if let Some(title) = s
             .session_id
             .as_ref()
@@ -356,15 +360,14 @@ impl LocalBackend {
         store_stamp: impl FnOnce() -> (Option<SystemTime>, Option<SystemTime>),
         read_titles: impl FnOnce(&[String]) -> HashMap<String, String>,
     ) {
+        let accepts = agent
+            .definition()
+            .title_source()
+            .map(|source| source.accepts);
+        let tracked = |s: &LauncherState| s.agent == agent && accepts.is_some_and(|f| f(s));
         let ids: Vec<String> = sessions
             .iter()
-            .filter(|s| {
-                s.agent == agent
-                    && agent
-                        .definition()
-                        .title_source()
-                        .is_some_and(|source| (source.accepts)(s))
-            })
+            .filter(|s| tracked(s))
             .filter_map(|s| s.session_id.clone())
             .collect();
         let mut caches = self.title_caches.lock().unwrap();
@@ -384,13 +387,7 @@ impl LocalBackend {
         }
         let live: HashMap<_, _> = sessions
             .iter()
-            .filter(|s| {
-                s.agent == agent
-                    && agent
-                        .definition()
-                        .title_source()
-                        .is_some_and(|source| (source.accepts)(s))
-            })
+            .filter(|s| tracked(s))
             .filter_map(|s| Some(((s.launcher_pid, s.session_id.clone()?), s.status.clone())))
             .collect();
         let eager = live
