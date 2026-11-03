@@ -42,7 +42,7 @@ impl AgentDefinition for Definition {
     ) -> Result<Box<dyn crate::agent::session::AgentAdapter>> {
         let approval_grace = config.approval_grace;
         let config = config
-            .codex
+            .codex()
             .as_ref()
             .map_err(|error| anyhow::anyhow!(error.clone()))?
             .clone();
@@ -248,11 +248,11 @@ mod tests {
     #[tokio::test]
     async fn configured_adapter_and_its_task_keep_their_configuration_snapshot() {
         let mut host = crate::config::AgentConfig {
-            codex: Ok(super::super::CodexConfig::default()),
+            codex: Ok(super::super::CodexConfig::default()).into(),
             approval_grace: Duration::from_secs(2),
         };
         let original = Definition.configure(&host).unwrap();
-        host.codex.as_mut().unwrap().mode = super::super::CodexMode::AppServer;
+        host.codex.get_mut().unwrap().as_mut().unwrap().mode = super::super::CodexMode::AppServer;
         let replacement = Definition.configure(&host).unwrap();
         assert_eq!(
             captured_mode(original).await,
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn malformed_codex_configuration_does_not_disable_unrelated_adapters() {
         let host = crate::config::AgentConfig {
-            codex: Err("invalid Codex setting".into()),
+            codex: Err("invalid Codex setting".to_string()).into(),
             approval_grace: Duration::from_secs(2),
         };
         for &kind in AgentKind::ALL {
