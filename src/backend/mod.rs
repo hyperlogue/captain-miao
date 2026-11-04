@@ -60,6 +60,7 @@ mod connection_tests;
 pub(crate) mod forwards;
 mod local_snapshot;
 mod provision;
+mod recovery;
 mod ssh;
 mod vcs;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
@@ -1544,6 +1545,12 @@ pub(crate) mod test_support {
             (request.frame, request.reply)
         }
 
+        pub(crate) fn set_recovery_active(&self, active: bool) {
+            self.backend
+                .recovery_active
+                .store(active, Ordering::Relaxed);
+        }
+
         pub(crate) fn is_empty(&self) -> bool {
             self.requests.is_empty()
         }
@@ -1621,7 +1628,7 @@ pub(crate) struct RemoteBackend {
     presumed_attached: Arc<Mutex<HashMap<SessionKey, bool>>>,
     /// Requests to the connection task; `None` once the task has exited.
     requests: mpsc::UnboundedSender<PendingRequest>,
-    next_req_id: AtomicU64,
+    next_req_id: Arc<AtomicU64>,
     /// The command to invoke the remote daemon, resolved at connect by
     /// `setup_ssh` (PATH `miao-server`, or a deployed cache path — see
     /// `docs/crate-split.md`). Defaults to `miao-server`, so before the task
@@ -1665,6 +1672,7 @@ pub(crate) struct RemoteBackend {
     /// compares it against what it last saw to fire the auto-reattach sweep
     /// (§7) exactly once per reconnect.
     reconnect_epoch: Arc<AtomicU64>,
+    recovery_active: Arc<AtomicBool>,
     /// Everything the connection task did and what came back, for the hosts
     /// panel's `l` view. See [`ConnLog`].
     log: Arc<ConnLog>,
@@ -1854,6 +1862,7 @@ impl RemoteBackend {
         let latency = Arc::new(Mutex::new(None));
         let vitals = Arc::new(VitalsCell::default());
         let reconnect_epoch = Arc::new(AtomicU64::new(0));
+        let recovery_active = Arc::new(AtomicBool::new(false));
         let log = Arc::new(ConnLog::default());
         let forwards = match transport {
             Transport::Ssh {
@@ -1869,7 +1878,10 @@ impl RemoteBackend {
             Transport::LocalSocket(_) => None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
+        let next_req_id = Arc::new(AtomicU64::new(1));
         let shared = ConnectionShared {
+            health_requests: tx.downgrade(),
+            next_req_id: next_req_id.clone(),
             clipboard: clipboard.clone(),
             host: host.clone(),
             forwards: forwards.clone(),
@@ -1885,6 +1897,7 @@ impl RemoteBackend {
             latency: latency.clone(),
             vitals: vitals.clone(),
             reconnect_epoch: reconnect_epoch.clone(),
+            recovery_active: recovery_active.clone(),
             log: log.clone(),
         };
         // `Arc` because the dashboard hands clones to background tasks: a
@@ -1902,7 +1915,7 @@ impl RemoteBackend {
             presumed_dead,
             presumed_attached,
             requests: tx,
-            next_req_id: AtomicU64::new(1),
+            next_req_id,
             remote_exe,
             conn,
             server_version,
@@ -1913,6 +1926,7 @@ impl RemoteBackend {
             dirty,
             mirrored,
             reconnect_epoch,
+            recovery_active,
             log,
         });
         (backend, shared, rx)
@@ -1996,6 +2010,11 @@ impl RemoteBackend {
             *self.latency.lock().unwrap() = Some(sent_at.elapsed());
         }
         reply
+    }
+
+    /// A wake/network check or the recovery it initiated is still running.
+    pub(crate) fn recovering_after_wake(&self) -> bool {
+        self.recovery_active.load(Ordering::Relaxed)
     }
 
     /// The reconnect counter behind the auto-reattach sweep (§7).
@@ -2695,6 +2714,8 @@ enum ServeOutcome {
 /// into a struct rather than passed as seven positional `Arc`s, where the two
 /// `Arc<Mutex<Option<String>>>`s would be swappable at a call site.
 struct ConnectionShared {
+    health_requests: mpsc::WeakUnboundedSender<PendingRequest>,
+    next_req_id: Arc<AtomicU64>,
     clipboard: Option<Arc<clipboard::Access>>,
     forwards: Option<Arc<forwards::Manager>>,
     /// Which host this task serves. Needed so a download prompt can name it —
@@ -2713,6 +2734,7 @@ struct ConnectionShared {
     latency: Arc<Mutex<Option<Duration>>>,
     vitals: Arc<VitalsCell>,
     reconnect_epoch: Arc<AtomicU64>,
+    recovery_active: Arc<AtomicBool>,
     log: Arc<ConnLog>,
 }
 
@@ -2729,6 +2751,8 @@ async fn connection_task(
     fresh: bool,
 ) {
     let ConnectionShared {
+        health_requests,
+        next_req_id,
         clipboard,
         forwards,
         host,
@@ -2744,6 +2768,7 @@ async fn connection_task(
         latency,
         vitals,
         reconnect_epoch,
+        recovery_active,
         log,
     } = shared;
     let _forward_lifetime = forwards::Lifetime(forwards.clone());
@@ -2781,6 +2806,7 @@ async fn connection_task(
     // store rather than re-announce the same sentence.
     let mut standing_failure: Option<String> = None;
     let mut reconnect = ssh::Reconnect::new(fresh);
+    let mut recovery_events = recovery::subscribe(matches!(&transport, Transport::Ssh { .. }));
     loop {
         if standing_failure.is_none() {
             store(ConnState::Connecting);
@@ -2849,7 +2875,15 @@ async fn connection_task(
                 None => ConnState::Disconnected,
             });
             log.info(format!("retrying in {}s", backoff.as_secs_f32().round()));
-            if !wait_before_retry(&mut requests, &mut backoff).await {
+            if !wait_before_retry(
+                &mut requests,
+                &mut backoff,
+                &mut recovery_events,
+                &mut reconnect,
+                &recovery_active,
+            )
+            .await
+            {
                 return;
             }
             continue;
@@ -2868,7 +2902,15 @@ async fn connection_task(
             ));
             store(ConnState::Disconnected);
             log.info(format!("retrying in {}s", backoff.as_secs_f32().round()));
-            if !wait_before_retry(&mut requests, &mut backoff).await {
+            if !wait_before_retry(
+                &mut requests,
+                &mut backoff,
+                &mut recovery_events,
+                &mut reconnect,
+                &recovery_active,
+            )
+            .await
+            {
                 return;
             }
             continue;
@@ -2882,36 +2924,59 @@ async fn connection_task(
         // Optional user forwards must not delay the daemon protocol. Abort any
         // unfinished reconciliation before recording a disconnect/reconnecting.
         let mut forward_setup = tokio::task::JoinSet::new();
-        let outcome = serve_connected(
-            stream,
-            ssh_child,
-            MirrorCells {
-                mirror: &mirror,
-                presumed_dead: &presumed_dead,
-                presumed_attached: &presumed_attached,
-                dirty: &dirty,
-                mirrored: &mirrored,
-                server_version: &server_version,
-            },
-            &mut requests,
-            || {
-                if was_connected {
-                    reconnect_epoch.fetch_add(1, Ordering::Relaxed);
+        let (outcome, wake_retry) = {
+            let serving = serve_connected(
+                stream,
+                ssh_child,
+                MirrorCells {
+                    mirror: &mirror,
+                    presumed_dead: &presumed_dead,
+                    presumed_attached: &presumed_attached,
+                    dirty: &dirty,
+                    mirrored: &mirrored,
+                    server_version: &server_version,
+                },
+                &mut requests,
+                || {
+                    if was_connected {
+                        reconnect_epoch.fetch_add(1, Ordering::Relaxed);
+                    }
+                    was_connected = true;
+                    connected_at = Instant::now();
+                    recovery_active.store(false, Ordering::Relaxed);
+                    log.info("connected");
+                    store(ConnState::Connected);
+                    if let Some(clipboard) = clipboard.clone() {
+                        let log = log.clone();
+                        forward_setup.spawn(async move { clipboard.connect(&log).await });
+                    }
+                    if let Some(manager) = forwards.clone() {
+                        forward_setup.spawn(async move { manager.connected().await });
+                    }
+                },
+            );
+            let result = match &transport {
+                Transport::Ssh { .. } => {
+                    recovery::watch_connection(
+                        serving,
+                        &mut recovery_events,
+                        &recovery_active,
+                        || recovery::daemon_responsive(&health_requests, &next_req_id),
+                    )
+                    .await
                 }
-                was_connected = true;
-                connected_at = Instant::now();
-                log.info("connected");
-                store(ConnState::Connected);
-                if let Some(clipboard) = clipboard.clone() {
-                    let log = log.clone();
-                    forward_setup.spawn(async move { clipboard.connect(&log).await });
+                Transport::LocalSocket(_) => recovery::Outcome::Finished(serving.await),
+            };
+            match result {
+                recovery::Outcome::Finished(outcome) => (outcome, false),
+                recovery::Outcome::EndedDuringProbe(outcome) => (outcome, true),
+                recovery::Outcome::Stalled => {
+                    log.info("wake/network check failed; reconnecting promptly");
+                    reconnect.after_wake();
+                    (ServeOutcome::ConnectionLost, true)
                 }
-                if let Some(manager) = forwards.clone() {
-                    forward_setup.spawn(async move { manager.connected().await });
-                }
-            },
-        )
-        .await;
+            }
+        };
         forward_setup.shutdown().await;
         // Forget remembered deploy failures and refusals only once the host has
         // *demonstrably* worked — which means the handshake and subscribe both
@@ -2978,7 +3043,20 @@ async fn connection_task(
             }
             ServeOutcome::ConnectionLost | ServeOutcome::HandshakeFailed(_) => {}
         }
-        if !wait_before_retry(&mut requests, &mut backoff).await {
+        if wake_retry {
+            reconnect.after_wake();
+            backoff = RECONNECT_INITIAL;
+            continue;
+        }
+        if !wait_before_retry(
+            &mut requests,
+            &mut backoff,
+            &mut recovery_events,
+            &mut reconnect,
+            &recovery_active,
+        )
+        .await
+        {
             return;
         }
     }
@@ -2993,14 +3071,24 @@ async fn connection_task(
 async fn wait_before_retry(
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
     backoff: &mut Duration,
+    recovery_events: &mut tokio::sync::watch::Receiver<recovery::Event>,
+    reconnect: &mut ssh::Reconnect,
+    recovery_active: &AtomicBool,
 ) -> bool {
     let this = *backoff;
     *backoff = (*backoff * 2).min(RECONNECT_MAX);
-    let sleep = tokio::time::sleep(this);
+    let sleep = recovery::retry_delay(this, recovery_events);
     tokio::pin!(sleep);
     loop {
         tokio::select! {
-            _ = &mut sleep => return true,
+            woke = &mut sleep => {
+                if woke {
+                    *backoff = RECONNECT_INITIAL;
+                    reconnect.after_wake();
+                    recovery_active.store(true, Ordering::Relaxed);
+                }
+                return true;
+            },
             req = requests.recv() => {
                 // A request racing in while we're down is failed immediately:
                 // taking it here (`req` then drops) closes its reply sender, so
@@ -3664,6 +3752,47 @@ mod tests {
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_resets_backoff_without_replaying_queued_requests() {
+        let (events, mut wake) = tokio::sync::watch::channel(recovery::Event::Network);
+        let (tx, mut requests) = mpsc::unbounded_channel();
+        let before = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            let mut backoff = RECONNECT_MAX;
+            let mut reconnect = ssh::Reconnect::new(false);
+            let active = AtomicBool::new(false);
+            let retry = wait_before_retry(
+                &mut requests,
+                &mut backoff,
+                &mut wake,
+                &mut reconnect,
+                &active,
+            )
+            .await;
+            (retry, backoff, active.load(Ordering::Relaxed))
+        });
+        let (reply, received) = oneshot::channel();
+        tx.send(PendingRequest {
+            req_id: 1,
+            frame: ClientFrame::ListRecentDirs { req_id: 1 },
+            reply,
+        })
+        .unwrap();
+        assert!(
+            received.await.is_err(),
+            "disconnected requests must fail, never replay"
+        );
+        events.send_replace(recovery::Event::Wake);
+        let (retry, backoff, active) = task.await.unwrap();
+        assert!(retry && active);
+        assert_eq!(backoff, RECONNECT_INITIAL);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "no retry delay after wake"
+        );
+    }
 
     #[tokio::test]
     async fn outgoing_requests_preserve_fragmented_responses() {

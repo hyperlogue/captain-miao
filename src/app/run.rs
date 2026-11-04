@@ -103,6 +103,7 @@ struct LoopInboxes {
     /// the *second* answer, not whichever host replied last.
     resume_rx: tokio::sync::mpsc::UnboundedReceiver<ResumeLoad>,
     resume_tx: tokio::sync::mpsc::UnboundedSender<ResumeLoad>,
+    recovery_notices: std::collections::HashMap<HostId, super::notifications::NotificationId>,
     resume_seq: u64,
     resume_notice: Option<super::notifications::NotificationId>,
     upgrade_rx: tokio::sync::mpsc::UnboundedReceiver<super::UpgradeReport>,
@@ -157,6 +158,7 @@ impl LoopInboxes {
         Self {
             resume_rx,
             resume_tx,
+            recovery_notices: Default::default(),
             resume_seq: 0,
             resume_notice: None,
             upgrade_rx,
@@ -2329,6 +2331,45 @@ async fn reload_pass(
     app.save_session_snapshot();
 }
 
+fn sync_recovery_notices(
+    app: &mut App,
+    notices: &mut std::collections::HashMap<HostId, super::notifications::NotificationId>,
+) -> bool {
+    let mut redraw = false;
+    let recovering: HashSet<_> = app
+        .backends
+        .iter()
+        .filter_map(|backend| match backend {
+            Backend::Remote(remote) if remote.recovering_after_wake() => Some(backend.host_id()),
+            _ => None,
+        })
+        .collect();
+    for host in &recovering {
+        if !notices.contains_key(host) {
+            let id = app.notify(
+                Level::Progress,
+                format!("Reconnecting after wake or network change…\n{}", host.0),
+            );
+            notices.insert(host.clone(), id);
+            redraw = true;
+        }
+    }
+    notices.retain(|host, id| {
+        if recovering.contains(host) {
+            return true;
+        }
+        app.notifications.remove(*id);
+        let message = format!("Reconnecting after wake or network change…\n{}", host.0);
+        if app.status_msg.as_ref() == Some(&message) {
+            app.status_msg = None;
+        }
+        redraw = true;
+        false
+    });
+
+    redraw
+}
+
 /// Drain everything the loop learns about from somewhere other than the
 /// keyboard, and say whether the frame has to be redrawn.
 ///
@@ -2350,6 +2391,7 @@ async fn drain_background_results(
     hosts_panel_open: &mut bool,
 ) -> bool {
     let mut redraw = app.poll_operations();
+    redraw |= sync_recovery_notices(app, &mut inboxes.recovery_notices);
     if redraw {
         app.write_window_bindings_file();
         app.save_session_snapshot();
@@ -3390,6 +3432,24 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_recovery_has_one_notice_and_finishes_without_success_popup() {
+        let mut app = App::new();
+        let host = HostId("wake-host".into());
+        let (remote, peer) = crate::backend::test_support::connected(host.clone());
+        app.backends.push(Backend::Remote(remote));
+        let mut notices = std::collections::HashMap::new();
+        peer.set_recovery_active(true);
+        assert!(sync_recovery_notices(&mut app, &mut notices));
+        let notice = notices[&host];
+        assert!(!sync_recovery_notices(&mut app, &mut notices));
+        assert_eq!(notices[&host], notice);
+        peer.set_recovery_active(false);
+        assert!(sync_recovery_notices(&mut app, &mut notices));
+        assert!(notices.is_empty());
+        assert!(app.status_msg.is_none());
+    }
 
     #[test]
     fn clipboard_escape_preserves_multiline_unicode_text() {

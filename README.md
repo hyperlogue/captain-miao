@@ -68,6 +68,11 @@ disappears without a success popup. Actions such as Git push still report
 success explicitly. Errors remain until dismissed; dismissing progress does
 not cancel the action.
 
+On macOS, waking the laptop or changing networks prompts an immediate connection
+check. Healthy SSH connections stay open; stalled connections reconnect without
+waiting through the normal retry backoff. Recovery shows a delayed progress
+notification and still depends on Wi-Fi and the VPN becoming reachable.
+
 In the directory picker, press `Ctrl-o` to choose an agent and host side by side.
 Use `qwertyuiop` for agents and `asdfgzxcvb` for the ten hosts on each page;
 `[` and `]` turn host pages. The configured defaults start selected.

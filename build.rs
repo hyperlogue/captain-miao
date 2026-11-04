@@ -1,17 +1,16 @@
-//! Embeds the `miao-server` payloads this dashboard carries, and nothing
-//! else.
+//! Embeds server payloads and builds the small native macOS recovery monitor.
 //!
 //! `CM_SERVER_PAYLOAD_MANIFEST` names a TSV that `cargo xtask` writes —
 //! `<target>\t<sha256>\t<path to .xz>` per line — and each archive is
 //! `include_bytes!`d into `src/server_payload.rs`'s table. **Unset is the normal
-//! case**: an ordinary `cargo build` embeds nothing, links nothing extra, and
-//! honestly reports carrying no server.
+//! case**: an ordinary `cargo build` embeds no server payloads and honestly
+//! reports carrying no server. The macOS recovery monitor is always native.
 //!
 //! That environment variable *is* the switch, which is why there is no cargo
 //! feature beside it. One switch, and it carries the payload with it.
 //!
-//! Note what this script does **not** do: it does not build, download, or decide
-//! anything. Obtaining a server — cross-compiling it, fetching a released one,
+//! This script does not build or download server payloads. Obtaining a server —
+//! cross-compiling it, fetching a released one,
 //! taking a path — happens in `xtask`, which then hands the finished archives
 //! over. Keeping that out of here is what lets a bundled build need no cross
 //! toolchain and keeps `cargo build` / `clippy` / `check` identical either way.
@@ -23,6 +22,17 @@ use std::path::{Path, PathBuf};
 const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 
 fn main() {
+    println!("cargo::rerun-if-changed=src/backend/recovery_macos.c");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/backend/recovery_macos.c")
+            .warnings(true)
+            .warnings_into_errors(true)
+            .compile("cm_recovery");
+        for framework in ["CoreFoundation", "IOKit", "SystemConfiguration"] {
+            println!("cargo::rustc-link-lib=framework={framework}");
+        }
+    }
     println!("cargo::rerun-if-changed=build.rs");
     // The variable itself, so a build re-runs when it appears, vanishes, or names
     // a different manifest. The manifest's *contents* — and each archive it names

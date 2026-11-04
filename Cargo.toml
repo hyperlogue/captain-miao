@@ -38,6 +38,9 @@ path = "src/main.rs"
 # (no libshpool) — the per-host daemon that does is the separate
 # `miao-server` binary (crates/cm-server), which cross-compiles to Linux.
 # Shared logic (state, protocol, agents, launcher, hooks) lives in `cm-core`.
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 cm-core = { path = "crates/cm-core" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

@@ -1,6 +1,8 @@
 //! SSH connection policies, private socket directories and consistent master paths.
 use super::*;
 
+pub(super) const WAKE_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+
 const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Rows sharing a target must not race a failed health check against another
@@ -13,6 +15,7 @@ static MASTER_CHECKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>
 pub(super) struct Reconnect {
     check: bool,
     reset: bool,
+    check_timeout: Duration,
 }
 
 impl Reconnect {
@@ -20,7 +23,13 @@ impl Reconnect {
         Self {
             check: false,
             reset: fresh,
+            check_timeout: CONNECTION_CHECK_TIMEOUT,
         }
+    }
+
+    pub(super) fn after_wake(&mut self) {
+        self.check = true;
+        self.check_timeout = WAKE_CHECK_TIMEOUT;
     }
 
     pub(super) async fn prepare(
@@ -40,9 +49,8 @@ impl Reconnect {
             // `-O check` only asks the local master for its PID. A wedged
             // connection can answer that while every remote channel stalls.
             log.info("checking SSH responsiveness before retrying");
-            let mut command = detached("ssh");
-            command.args(options).arg(target).arg("true");
-            if !bounded_status(command, CONNECTION_CHECK_TIMEOUT).await {
+            let timeout = std::mem::replace(&mut self.check_timeout, CONNECTION_CHECK_TIMEOUT);
+            if !responsive(target, options, timeout).await {
                 log.error("SSH did not answer; replacing the shared connection");
                 self.reset = true;
             }
@@ -55,8 +63,15 @@ impl Reconnect {
             log.info("previous SSH connection retired; dialing a fresh connection");
         }
         self.check = true;
+        self.check_timeout = CONNECTION_CHECK_TIMEOUT;
         Ok(())
     }
+}
+
+pub(super) async fn responsive(target: &str, options: &[String], within: Duration) -> bool {
+    let mut command = detached("ssh");
+    command.args(options).arg(target).arg("true");
+    bounded_status(command, within).await
 }
 
 async fn reset_master(target: &str, options: &[String]) -> Result<(), String> {
@@ -463,6 +478,34 @@ mod tests {
             master.requests.try_recv().is_err(),
             "manual reconnect must not check/reuse the old connection"
         );
+    }
+
+    #[tokio::test]
+    async fn wake_replaces_a_stalled_master_without_the_normal_five_second_check() {
+        let mut master = Master::new();
+        let options = master.options.clone();
+        let task = tokio::spawn(async move {
+            let mut reconnect = Reconnect::new(false);
+            reconnect.after_wake();
+            reconnect
+                .prepare("wake-test.invalid", &options, &ConnLog::default())
+                .await
+        });
+        let _held_reply = master.next(SESSION).await;
+        // Real subprocess I/O: watchdog is longer than the production deadline,
+        // but shorter than the ordinary five-second stale-master check.
+        let exit = tokio::time::timeout(
+            WAKE_CHECK_TIMEOUT + Duration::from_secs(3),
+            master.next(EXIT),
+        )
+        .await
+        .expect("waiting for wake-time SSH retirement");
+        exit.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("waiting for retired master")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

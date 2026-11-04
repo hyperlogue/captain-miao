@@ -734,6 +734,16 @@ Round-trip time is sampled from ordinary request traffic (`RemoteBackend::reques
 times the oneshot) — there is deliberately **no `Ping` frame**: every reply is
 already `req_id`-matched, so timing one is free.
 
+On macOS, IOKit wake notifications and SystemConfiguration network changes
+wake the reconnect task. A one-second daemon RPC checks the existing transport
+while the subscription keeps serving frames. Success preserves the connection;
+silence prompts an immediate reconnect with a one-second SSH master check.
+The master check stays serialized per target and rechecks before retiring a
+master another host entry may have replaced. A wake event also interrupts retry
+backoff and resets it to 500ms. Later failures resume exponential backoff.
+The dashboard shows delayed recovery progress and removes it silently on
+success. Direct local sockets ignore these network events.
+
 Key decoupling: **the daemon and the tunnel have independent lifetimes.** A
 dashboard disconnect/reconnect may replace the SSH master as described above;
 the daemon and every pooled session in it persist. (This replaced the original
