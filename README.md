@@ -66,7 +66,8 @@ still running after 0.8 seconds, a progress notification appears in the bottom
 right. When the result is visible in the dashboard or a new window, progress
 disappears without a success popup. Actions such as Git push still report
 success explicitly. Errors remain until dismissed; dismissing progress does
-not cancel the action.
+not cancel the action. Press `x` to dismiss notifications oldest first. `Esc`
+does the same after closing panels and clearing pending shortcuts or search.
 
 On macOS, waking the laptop or changing networks prompts an immediate connection
 check. Healthy SSH connections stay open; stalled connections reconnect without

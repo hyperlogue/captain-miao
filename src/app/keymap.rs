@@ -320,7 +320,7 @@ pub(super) enum Command {
     /// skipped rather than stolen: a steal is a per-session decision (§10.2),
     /// and one keypress must not kick a roomful of terminals.
     AttachAll,
-    /// Dismiss the newest notification.
+    /// Dismiss the oldest notification.
     DismissNotification,
     /// Open the notification history.
     MessageLog,
@@ -422,7 +422,7 @@ impl Command {
             Command::TogglePin => "pin",
             Command::ToggleFollowUp => "toggle needs-input (idle only)",
             Command::Search => "search",
-            Command::ClearSearch => "clear search, otherwise dismiss newest notification",
+            Command::ClearSearch => "clear search, otherwise dismiss oldest notification",
             Command::Help => "help",
             Command::Quit => "quit",
             Command::TogglePreview => "toggle preview panel",
@@ -442,7 +442,7 @@ impl Command {
             Command::AttachAll => "attach every free detached session",
             Command::SessionsLayout => "toggle session layout (stacked / per-tab)",
             Command::ManageHosts => "manage remote hosts",
-            Command::DismissNotification => "dismiss the newest notification",
+            Command::DismissNotification => "dismiss the oldest notification",
             Command::MessageLog => "message log (notification history)",
             Command::Preferences => "open preferences",
             Command::SessionDetail => "session record (pid, terminfo, context, first prompt)",

@@ -619,7 +619,7 @@ impl App {
                 if self.search_filter.is_some() {
                     self.set_search_filter(None);
                 } else {
-                    self.notifications.dismiss_latest();
+                    self.notifications.dismiss_oldest();
                 }
                 self.status_msg = None;
                 None
@@ -630,7 +630,7 @@ impl App {
                 None
             }
             Command::DismissNotification => {
-                self.notifications.dismiss_latest();
+                self.notifications.dismiss_oldest();
                 None
             }
             Command::MessageLog => {

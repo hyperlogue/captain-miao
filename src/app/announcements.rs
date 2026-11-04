@@ -81,7 +81,7 @@ pub(super) const ANNOUNCEMENTS: &[Announcement] = &[
             Content::Text(""),
             Content::Heading("Your active shortcuts"),
             Content::Binding(Command::CloseSession, "Close selected session"),
-            Content::Binding(Command::DismissNotification, "Dismiss newest notification"),
+            Content::Binding(Command::DismissNotification, "Dismiss oldest notification"),
             Content::Text(""),
             Content::Text(
                 "If you want to override and restore the previous default, edit these keys in config.toml.",

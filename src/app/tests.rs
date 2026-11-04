@@ -1103,17 +1103,17 @@ fn notification_close_button_does_not_select_the_obscured_session() {
 }
 
 #[test]
-fn x_dismisses_the_newest_notification_and_shift_x_closes_the_session() {
+fn x_dismisses_the_oldest_notification_and_shift_x_closes_the_session() {
     let mut d = TestDashboard::new(100, 24);
     d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
     d.app.set_status("Older failure".into(), true);
     d.app.set_status("Newest failure".into(), true);
     let out = d.render();
-    assert!(!out.contains("dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss oldest"), "{out}");
     assert!(d.press(KeyCode::Char('x')).is_none());
     let out = d.render();
-    assert!(!out.contains("Newest failure"), "{out}");
-    assert!(out.contains("Older failure"), "{out}");
+    assert!(!out.contains("Older failure"), "{out}");
+    assert!(out.contains("Newest failure"), "{out}");
 
     // Uppercase X still closes the selected session while a popup is visible.
     assert!(matches!(
@@ -1121,9 +1121,9 @@ fn x_dismisses_the_newest_notification_and_shift_x_closes_the_session() {
             .handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
         Some(Action::KillSession { .. })
     ));
-    assert!(d.render().contains("Older failure"));
+    assert!(d.render().contains("Newest failure"));
     assert!(d.press(KeyCode::Char('x')).is_none());
-    assert!(!d.render().contains("Older failure"));
+    assert!(!d.render().contains("Newest failure"));
     assert!(
         d.press(KeyCode::Char('x')).is_none(),
         "no popup must mean no action"
@@ -1817,7 +1817,7 @@ fn close_session_and_notification_dismissal_config_drive_the_notice_and_actions(
     assert!(d.press(KeyCode::Char('X')).is_none());
     let out = d.render();
     assert!(out.contains("Visible error"), "{out}");
-    assert!(!out.contains("dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss oldest"), "{out}");
     assert!(d.press(KeyCode::F(8)).is_none());
     assert!(!d.render().contains("Visible error"));
     d.app.set_status("Second error".into(), true);
@@ -1850,7 +1850,7 @@ fn shortcut_notice_handles_unbound_actions_and_small_terminals() {
         if width == 100 {
             assert!(out.contains("Unbound  Close selected session"), "{out}");
             assert!(
-                out.contains("Unbound  Dismiss newest notification"),
+                out.contains("Unbound  Dismiss oldest notification"),
                 "{out}"
             );
         }
@@ -10496,7 +10496,7 @@ fn remapped_key_dispatches_and_frees_old_default() {
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Active)]);
 
     d.app.set_status("Test notification".into(), true);
-    assert!(!d.render().contains("dismiss newest"));
+    assert!(!d.render().contains("dismiss oldest"));
     assert!(d.press(KeyCode::Char('x')).is_none());
     assert!(d.render().contains("Test notification"));
     assert!(d.press(KeyCode::Char('n')).is_none());
@@ -10764,7 +10764,7 @@ fn help_can_reach_every_shortcut_on_an_ordinary_terminal() {
     d.press(KeyCode::Char('G'));
     let out = d.render();
     assert!(out.contains("Rebind via [keybinds]"), "{out}");
-    assert!(out.contains("dismiss the newest notification"), "{out}");
+    assert!(out.contains("dismiss the oldest notification"), "{out}");
     assert_eq!(d.app.input_mode, InputMode::Help);
     assert!(d.app.help_scroll > 0);
     d.press(KeyCode::Home);
@@ -12797,14 +12797,14 @@ fn escape_cancels_prefixes_and_clears_search_before_dismissing_notifications() {
     d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
     d.app.set_status("Older notification".into(), true);
     d.app.set_status("Newest notification".into(), true);
-    assert!(!d.render().contains("dismiss newest"));
+    assert!(!d.render().contains("dismiss oldest"));
     d.app.set_search_filter(Some("project".into()));
     let out = d.render();
-    assert!(!out.contains("dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss oldest"), "{out}");
 
     for prefix in [' ', 'g'] {
         d.press(KeyCode::Char(prefix));
-        assert!(!d.render().contains("dismiss newest"));
+        assert!(!d.render().contains("dismiss oldest"));
         assert!(d.press(KeyCode::Esc).is_none());
         assert!(!d.app.pending_g);
         assert!(d.app.pending_prefix.is_empty());
@@ -12816,14 +12816,14 @@ fn escape_cancels_prefixes_and_clears_search_before_dismissing_notifications() {
     let out = d.render();
     assert!(out.contains("Newest notification"), "{out}");
     assert!(out.contains("Older notification"), "{out}");
-    assert!(!out.contains("dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss oldest"), "{out}");
 
     assert!(d.press(KeyCode::Esc).is_none());
     let out = d.render();
-    assert!(!out.contains("Newest notification"), "{out}");
-    assert!(out.contains("Older notification"), "{out}");
+    assert!(!out.contains("Older notification"), "{out}");
+    assert!(out.contains("Newest notification"), "{out}");
     assert!(d.press(KeyCode::Esc).is_none());
-    assert!(!d.render().contains("Older notification"));
+    assert!(!d.render().contains("Newest notification"));
     assert!(d.press(KeyCode::Esc).is_none());
     assert!(matches!(
         d.press(KeyCode::Char('X')),
@@ -12868,14 +12868,14 @@ fn contextual_and_direct_notification_dismissal_follow_configured_bindings() {
     assert!(warnings.is_empty(), "{warnings:?}");
     d.app.keymap = keymap;
     d.app.set_status("First notification".into(), true);
-    assert!(!d.render().contains("dismiss newest"));
+    assert!(!d.render().contains("dismiss oldest"));
     d.app.set_search_filter(Some("project".into()));
     d.press(KeyCode::Esc);
     d.press(KeyCode::Char('x'));
     assert_eq!(d.app.search_filter.as_deref(), Some("project"));
     let out = d.render();
     assert!(out.contains("First notification"), "{out}");
-    assert!(!out.contains("dismiss newest"), "{out}");
+    assert!(!out.contains("dismiss oldest"), "{out}");
     d.press(KeyCode::F(8));
     assert!(!d.render().contains("First notification"));
     assert_eq!(d.app.search_filter.as_deref(), Some("project"));

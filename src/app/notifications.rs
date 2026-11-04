@@ -128,18 +128,12 @@ impl Notifications {
         }
     }
 
-    pub(super) fn dismiss_latest(&mut self) {
-        self.dismiss_latest_at(Instant::now());
+    pub(super) fn dismiss_oldest(&mut self) {
+        self.dismiss_oldest_at(Instant::now());
     }
 
-    fn dismiss_latest_at(&mut self, now: Instant) {
-        if let Some(id) = self
-            .entries
-            .iter()
-            .rev()
-            .find(|n| n.visible(now))
-            .map(|n| n.id)
-        {
+    fn dismiss_oldest_at(&mut self, now: Instant) {
+        if let Some(id) = self.entries.iter().find(|n| n.visible(now)).map(|n| n.id) {
             self.remove(id);
         }
         self.hitboxes
@@ -407,9 +401,56 @@ mod tests {
             vec![Level::Progress, Level::Warning, Level::Error]
         );
         for _ in 0..3 {
-            notices.dismiss_latest_at(now + LIFETIME);
+            notices.dismiss_oldest_at(now + LIFETIME);
         }
         assert!(notices.entries.is_empty());
+    }
+
+    #[test]
+    fn dismissal_removes_notifications_oldest_first_across_levels() {
+        let now = Instant::now();
+        let mut notices = Notifications::default();
+        let ids: Vec<_> = [
+            Level::Progress,
+            Level::Info,
+            Level::Success,
+            Level::Warning,
+            Level::Error,
+        ]
+        .into_iter()
+        .map(|level| notices.push(level, format!("{level:?}"), now))
+        .collect();
+        // Updating an existing notification does not move it behind newer ones.
+        notices.update(
+            ids[0],
+            Level::Progress,
+            "Still working".into(),
+            now + PROGRESS_DELAY,
+        );
+        for dismissed in 1..=ids.len() {
+            notices.dismiss_oldest_at(now + PROGRESS_DELAY);
+            assert_eq!(
+                notices.entries.iter().map(|n| n.id).collect::<Vec<_>>(),
+                ids[dismissed..],
+            );
+        }
+    }
+
+    #[test]
+    fn dismissal_skips_progress_until_it_is_visible() {
+        let now = Instant::now();
+        let mut notices = Notifications::default();
+        let progress = notices.push(Level::Progress, "Working".into(), now);
+        notices.push(Level::Warning, "Warning".into(), now);
+        let error = notices.push(Level::Error, "Error".into(), now);
+        notices.dismiss_oldest_at(now);
+        assert_eq!(
+            notices.entries.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![progress, error],
+        );
+        notices.dismiss_oldest_at(now + PROGRESS_DELAY);
+        assert_eq!(notices.entries.len(), 1);
+        assert_eq!(notices.entries[0].id, error);
     }
 
     #[test]
@@ -436,7 +477,7 @@ mod tests {
         let now = Instant::now();
         let mut notices = Notifications::default();
         let id = notices.push(Level::Progress, "Pushing".into(), now);
-        notices.dismiss_latest_at(now + PROGRESS_DELAY);
+        notices.dismiss_oldest_at(now + PROGRESS_DELAY);
         assert!(notices.entries.is_empty());
         notices.update(id, Level::Error, "Push failed".into(), now);
         assert_eq!(notices.entries.len(), 1);
@@ -490,8 +531,9 @@ mod tests {
         }
         notices.tick(now + LIFETIME * 10);
         assert_eq!(notices.entries.len(), 8, "hidden errors cannot expire");
-        notices.dismiss_latest();
-        assert_eq!(notices.entries.last().unwrap().id, 6);
+        notices.dismiss_oldest();
+        assert_eq!(notices.entries.first().unwrap().id, 1);
+        assert_eq!(notices.entries.last().unwrap().id, 7);
     }
 
     #[test]
