@@ -601,6 +601,53 @@ fn live_metadata_updates_and_unloading_are_reflected_without_input() {
 }
 
 #[test]
+fn effort_tracks_root_thread_settings_and_clears_when_unset_or_switched() {
+    let (mut monitor, mut row) = (Monitor::default(), state());
+    request(&mut monitor, &mut row, 1, "thread/resume");
+    monitor.apply(
+        &mut row,
+        Observation::Server(json!({"id":1,"result":{
+            "model":"test-model","reasoningEffort":"high",
+            "thread":{"id":"thread-root","status":{"type":"idle"}}
+        }})),
+    );
+    assert_eq!(row.effort.as_deref(), Some("high"));
+
+    for (thread, settings, expected) in [
+        ("child", json!({"effort":"low"}), Some("high")),
+        ("thread-root", json!({"model":"new-model"}), Some("high")),
+        ("thread-root", json!({"effort":"xhigh"}), Some("xhigh")),
+        ("thread-root", json!({"effort":null}), None),
+    ] {
+        notify(
+            &mut monitor,
+            &mut row,
+            "thread/settings/updated",
+            json!({"threadId":thread,"threadSettings":settings}),
+        );
+        assert_eq!(row.effort.as_deref(), expected);
+    }
+
+    request(&mut monitor, &mut row, 2, "thread/read");
+    monitor.apply(
+        &mut row,
+        Observation::Server(json!({"id":2,"result":{
+            "thread":{"id":"thread-root","reasoningEffort":"medium","status":{"type":"idle"}}
+        }})),
+    );
+    assert_eq!(row.effort.as_deref(), Some("medium"));
+
+    request(&mut monitor, &mut row, 3, "thread/start");
+    monitor.apply(
+        &mut row,
+        Observation::Server(json!({"id":3,"result":{
+            "thread":{"id":"new-root","status":{"type":"idle"}}
+        }})),
+    );
+    assert_eq!(row.effort, None);
+}
+
+#[test]
 fn parallel_tools_and_resolving_one_request_do_not_hide_another_approval() {
     let (mut m, mut s) = (Monitor::default(), state());
     resume(&mut m, &mut s);

@@ -125,6 +125,9 @@ impl Monitor {
                 if let Some(model) = result["model"].as_str() {
                     state.model = Some(model.into());
                 }
+                if let Some(effort) = result.get("reasoningEffort") {
+                    state.effort = effort.as_str().map(str::to_owned);
+                }
                 if let Some(turns) = result["initialTurnsPage"]["data"].as_array() {
                     for turn in turns.iter().rev() {
                         self.replay_turn(state, turn);
@@ -168,6 +171,9 @@ impl Monitor {
             "thread/settings/updated" => {
                 if let Some(model) = params["threadSettings"]["model"].as_str() {
                     state.model = Some(model.into());
+                }
+                if let Some(effort) = params["threadSettings"].get("effort") {
+                    state.effort = effort.as_str().map(str::to_owned);
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -262,6 +268,7 @@ impl Monitor {
             self.idle_between_goal_turns = false;
             state.context_tokens = None;
             state.context_window = None;
+            state.effort = None;
             state.last_prompt = None;
             state.last_tool = None;
         }
@@ -277,6 +284,9 @@ impl Monitor {
         }
         if let Some(model) = thread["model"].as_str() {
             state.model = Some(model.into());
+        }
+        if let Some(effort) = thread.get("reasoningEffort") {
+            state.effort = effort.as_str().map(str::to_owned);
         }
         if let Some(turns) = thread["turns"].as_array() {
             for turn in turns {

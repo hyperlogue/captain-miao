@@ -703,7 +703,7 @@ pub struct ResumeMetadata {
     pub stats: TranscriptStats,
 }
 
-/// Per-session facts pulled from one pass over the transcript. Both fields come
+/// Per-session facts pulled from one pass over the transcript. Fields come
 /// from the same assistant entries (Claude) / the same rollout tail (Codex), so
 /// reading them together avoids a second stat + file read per reload.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -717,6 +717,8 @@ pub struct TranscriptStats {
     pub context_window: Option<u64>,
     /// Model id backing the latest turn (e.g. `claude-opus-4-8`, `gpt-5.5`).
     pub model: Option<String>,
+    /// Reasoning effort reported for the latest turn, when available.
+    pub effort: Option<String>,
     /// First real user prompt — the auto-title fallback shown before a rename
     /// (first-wins).
     pub first_prompt: Option<String>,

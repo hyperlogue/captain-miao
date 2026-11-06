@@ -95,6 +95,7 @@ function capture(pi, event, ctx) {{
     body = JSON.stringify({{
       session_id: ctx?.sessionManager?.getSessionId?.(),
       session_title: pi?.getSessionName?.(),
+      effort: pi?.getThinkingLevel?.(),
       cwd: ctx?.cwd,
       tool_name: event?.toolName,
       prompt: event?.prompt,
@@ -196,6 +197,7 @@ mod tests {
                 assert_eq!(msg.session_title.as_deref(), Some("Current title"));
                 assert_eq!(msg.context_tokens, Some(1235));
                 assert_eq!(msg.model.as_deref(), Some("test-model"));
+                assert_eq!(msg.effort.as_deref(), Some("high"));
                 if expected == HookEvent::PostToolUseFailure {
                     assert_eq!(msg.tool_name.as_deref(), Some("bash"));
                 }
@@ -210,6 +212,7 @@ mod tests {
                 );
             }
             assert_eq!(state.last_prompt.as_deref(), Some("Do the work"));
+            assert_eq!(state.effort.as_deref(), Some("high"));
         }
     }
 

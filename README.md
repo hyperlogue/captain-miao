@@ -139,6 +139,10 @@ Antigravity uses a separate configuration copy for managed sessions.
 captain-miao preserves your custom status-line command.
 Updates to your global configuration apply during the next launch.
 
+The detail panel appends the reported effort level to the model, for example
+`Opus 4.8 (high)`. Claude Code, Codex, Pi, and omp supply it when available;
+sessions without a reported effort keep the model alone.
+
 ## Supported terminals
 
 | Terminal                                   | Stable | Support notes                                                                   |

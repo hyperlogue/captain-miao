@@ -7368,6 +7368,37 @@ fn wide_layout_name_column_is_fixed_max_width_with_aligned_truncation() {
 }
 
 #[test]
+fn detail_model_appends_effort_only_when_reported() {
+    for width in [60, 140] {
+        let mut d = TestDashboard::new(width, 30);
+        for effort in [None, Some("high"), Some(""), Some("  "), Some("low")] {
+            let mut s = session(1, "/project", SessionStatus::Active);
+            s.model = Some("claude-opus-4-8".into());
+            s.effort = effort.map(str::to_owned);
+            // The same serialized state reaches local and remote dashboards;
+            // absent effort remains compatible with older launchers.
+            let wire = serde_json::to_value(&s).unwrap();
+            if effort.is_none() {
+                assert!(wire.get("effort").is_none());
+            }
+            d.set_sessions(vec![serde_json::from_value(wire).unwrap()]);
+            let out = d.render();
+            let model_line = out.lines().find(|line| line.contains("Model")).unwrap();
+            let suffix = effort.filter(|e| !e.trim().is_empty());
+            if let Some(effort) = suffix {
+                assert!(
+                    model_line.contains(&format!("Opus 4.8 ({effort})")),
+                    "{out}"
+                );
+            } else {
+                assert!(model_line.contains("Opus 4.8"), "{out}");
+                assert!(!model_line.contains('('), "{out}");
+            }
+        }
+    }
+}
+
+#[test]
 fn narrow_layout_stacks_panels_and_trims_columns() {
     // A body at or below `narrow_max_width` (90) drops the side-by-side layout
     // for the vertical stack, trims the table to status / icon / name, and shows

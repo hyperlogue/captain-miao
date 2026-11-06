@@ -684,6 +684,7 @@ fn parse_hook_payload_inner(event: HookEvent, payload: &HookPayload) -> HookMess
         session_title,
         context_tokens,
         model,
+        effort: None,
         // No transcript path, and this is the field the launcher gates its
         // entire transcript watch on — so nothing reads an opencode transcript.
         // Nothing needs to: tokens, model and title all arrive here by push,

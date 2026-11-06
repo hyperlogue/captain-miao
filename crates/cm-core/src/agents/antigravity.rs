@@ -683,6 +683,7 @@ fn parse_status_payload(stdin: &str) -> Result<HookMessage> {
         transcript_path: live_transcript_path(payload.conversation_id.as_deref()),
         session_id: payload.conversation_id.filter(|s| !s.trim().is_empty()),
         model: payload.model.and_then(|m| m.id),
+        effort: None,
         context_tokens: payload
             .context_window
             .filter(|ctx| ctx.context_window_size.is_some_and(|size| size > 0))
@@ -726,6 +727,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // Usage arrives through the status-line command, not lifecycle hooks.
         context_tokens: None,
         model: payload.model_name,
+        effort: None,
         raw: Some(stdin.to_string()),
         session_is_child: None,
     })

@@ -207,7 +207,7 @@ const ASK_TOOL: &str = "ask";
 /// `session_before_switch` / `session_before_fork` / `session_before_tree` /
 /// `session_branch` / `session_tree` (a replacement session re-emits
 /// `session_start`, which we do register), `model_select` and
-/// `thinking_level_select` (the model rides every payload already),
+/// `thinking_level_select` (model and effort ride every payload already),
 /// `project_trust` / `resources_discover` (never invoked by any session
 /// callsite), `user_bash` / `user_python`, `todo_reminder`,
 /// `ttsr_triggered`, `credential_disabled`, `mcp_notification`, and omp's
@@ -307,6 +307,7 @@ struct HookPayload {
     prompt: Option<String>,
     context_tokens: Option<u64>,
     model: Option<String>,
+    effort: Option<String>,
     /// Set on a `tool_execution_end` whose tool failed.
     #[serde(default)]
     is_error: bool,
@@ -344,11 +345,12 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         message: None,
         cwd: payload.cwd,
         prompt: payload.prompt,
-        // All three ride every payload — see the module doc for why they come
+        // These facts ride every payload — see the module doc for why they come
         // from the hook rather than from a transcript fold.
         session_title: payload.session_title,
         context_tokens: payload.context_tokens,
         model: payload.model,
+        effort: payload.effort,
         // The only omp event carrying a transcript path is `session_stop`'s
         // `session_file`, and we do not subscribe to it — so no path reaches
         // the launcher and its whole transcript pipeline (stats fold, signal

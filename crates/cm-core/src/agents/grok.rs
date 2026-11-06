@@ -669,6 +669,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         session_title,
         context_tokens: None,
         model: payload.model_id.filter(|s| !s.trim().is_empty()),
+        effort: None,
         transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child,

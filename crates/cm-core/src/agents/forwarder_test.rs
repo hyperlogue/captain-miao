@@ -200,6 +200,7 @@ if (scenario.startsWith('opencode_')) {
   const pi = {
     on(name, fn) { handlers.set(name, fn); },
     getSessionName: () => 'Current title',
+    getThinkingLevel: () => 'high',
   };
   module.namespace.default(pi);
   const ctx = {

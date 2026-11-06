@@ -39,7 +39,7 @@ use super::format::{
     ELAPSED_MAX_WIDTH, ICON_COL_WIDTH, ICON_SLOT_WIDTH, OVERRIDE_COL_WIDTH, ansi_to_lines,
     bar_segments, bar_style, centered_rect, clear_overlay, context_pressure_style, dir_icon_width,
     elapsed_line, fade_style, format_context_detail, format_elapsed, format_tokens, hint_badge,
-    hint_pair, last_prompt_text, model_color, model_label, override_indicator_spans, pill,
+    hint_pair, last_prompt_text, model_color, model_detail_label, override_indicator_spans, pill,
     session_display_name, truncate_str,
 };
 use super::keymap::Command;
@@ -611,11 +611,7 @@ impl App {
             return;
         }
 
-        let model = s
-            .model
-            .as_deref()
-            .map(model_label)
-            .unwrap_or_else(|| "—".to_string());
+        let model = model_detail_label(s.model.as_deref(), s.effort.as_deref());
         let model_style = s
             .model
             .as_deref()
@@ -739,11 +735,7 @@ impl App {
                 Style::default().add_modifier(Modifier::DIM),
             )
         };
-        let model = s
-            .model
-            .as_deref()
-            .map(model_label)
-            .unwrap_or_else(|| "—".to_string());
+        let model = model_detail_label(s.model.as_deref(), s.effort.as_deref());
         let model_style = s
             .model
             .as_deref()

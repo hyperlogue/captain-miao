@@ -916,6 +916,10 @@ fn apply_transcript_data(state: &mut LauncherState, data: &TranscriptStats) -> b
         state.model = data.model.clone();
         changed = true;
     }
+    if data.effort.is_some() && state.effort != data.effort {
+        state.effort = data.effort.clone();
+        changed = true;
+    }
     if data.first_prompt.is_some() && state.first_prompt != data.first_prompt {
         state.first_prompt = data.first_prompt.clone();
         changed = true;
@@ -1942,26 +1946,31 @@ mod tests {
     /// It also fixes a pre-existing case — a Codex tail that has scrolled past
     /// its last `token_count` used to drop the number.
     #[test]
-    fn a_silent_transcript_fold_never_clears_tokens_or_model() {
+    fn a_silent_transcript_fold_never_clears_tokens_model_or_effort() {
         let mut state = state_with(SessionStatus::Idle);
         state.context_tokens = Some(64_000);
         state.model = Some("some-model-1".to_string());
+        state.effort = Some("high".to_string());
 
         let changed = apply_transcript_data(&mut state, &TranscriptStats::default());
         assert!(!changed, "a fold with nothing in it changes nothing");
         assert_eq!(state.context_tokens, Some(64_000));
         assert_eq!(state.model.as_deref(), Some("some-model-1"));
+        assert_eq!(state.effort.as_deref(), Some("high"));
 
         // A fold that *does* have an opinion still wins, including a lower
         // count — that is what a compaction looks like.
         let folded = TranscriptStats {
             context_tokens: Some(12_000),
             model: Some("some-model-2".to_string()),
+            effort: Some("low".to_string()),
             ..TranscriptStats::default()
         };
         assert!(apply_transcript_data(&mut state, &folded));
         assert_eq!(state.context_tokens, Some(12_000));
         assert_eq!(state.model.as_deref(), Some("some-model-2"));
+        assert_eq!(state.effort.as_deref(), Some("low"));
+        assert!(!apply_transcript_data(&mut state, &folded));
 
         let windowed = TranscriptStats {
             context_window: Some(500_000),

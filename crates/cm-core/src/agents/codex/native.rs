@@ -301,6 +301,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
     };
     let mut last_tokens: Option<u64> = None;
     let mut last_model: Option<String> = None;
+    let mut last_effort: Option<String> = None;
     for line in tail.split('\n') {
         let is_token_count = line.contains("\"token_count\"");
         let is_turn_context = line.contains("\"turn_context\"");
@@ -338,6 +339,11 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
                 {
                     last_model = Some(model.to_string());
                 }
+                if let Some(effort) = val.pointer("/payload/effort").and_then(|e| e.as_str())
+                    && !effort.trim().is_empty()
+                {
+                    last_effort = Some(effort.to_string());
+                }
             }
             _ => {}
         }
@@ -345,6 +351,7 @@ pub fn read_transcript_stats(path: &Path, prior: Option<&TranscriptStats>) -> Tr
     TranscriptStats {
         context_tokens: last_tokens,
         model: last_model,
+        effort: last_effort,
         first_prompt,
         name: None,
         last_prompt: None,
@@ -942,6 +949,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // events — strictly more than a payload field would give.
         context_tokens: None,
         model: None,
+        effort: None,
         transcript_path: payload.transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child: None,
@@ -1118,20 +1126,27 @@ mod tests {
     }
 
     #[test]
-    fn read_model_takes_last_turn_context() {
+    fn read_model_and_effort_take_last_turn_context() {
         let body = concat!(
-            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5"}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5","effort":"low"}}"#,
             "\n",
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
             "\n",
-            r#"{"type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5"}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5","effort":"high"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"effort":" "}}"#,
             "\n",
         );
         let path = write_tmp("codex_model", body);
-        assert_eq!(
-            read_transcript_stats(&path, None).model,
-            Some("gpt-5.5".to_string())
-        );
+        let stats = read_transcript_stats(&path, None);
+        assert_eq!(stats.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(stats.effort.as_deref(), Some("high"));
+        std::fs::write(
+            &path,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_transcript_stats(&path, None).effort, None);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1877,6 +1892,7 @@ mod tests {
             session_title: None,
             context_tokens: None,
             model: None,
+            effort: None,
             transcript_path: None,
             raw: None,
             session_is_child: None,

@@ -461,6 +461,7 @@ impl StatsCursor {
             stats: TranscriptStats {
                 context_tokens,
                 model,
+                effort: None,
                 first_prompt,
                 name: None,
                 last_prompt: None,
@@ -1113,6 +1114,13 @@ struct HookPayload {
     /// the switch. Absent from every other payload, which is what lets it be
     /// read unconditionally below.
     to_model: Option<String>,
+    effort: Option<HookEffort>,
+    agent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HookEffort {
+    level: Option<String>,
 }
 
 /// Normalize one Claude Code hook payload.
@@ -1143,6 +1151,12 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // fold cannot see; `launcher::run` hands it straight back to the fold so
         // the two never disagree afterwards.
         model: payload.to_model,
+        // Subagent hooks can carry their own effort under the parent's session
+        // id. Only a root hook describes the model shown on this row.
+        effort: payload
+            .effort
+            .filter(|_| payload.agent_id.is_none())
+            .and_then(|e| e.level),
         transcript_path: payload.transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child: None,
@@ -1792,6 +1806,7 @@ mod tests {
             session_title: None,
             context_tokens: None,
             model: None,
+            effort: None,
             transcript_path: None,
             raw: None,
             session_is_child: None,
@@ -1829,6 +1844,26 @@ mod tests {
         r#""from_model":"claude-opus-4-8","to_model":"claude-sonnet-5","#,
         r#""requested_model":"sonnet","source":"command","context_tokens":42000}"#,
     );
+
+    #[test]
+    fn hooks_report_root_effort_without_adopting_subagent_effort() {
+        let mut state =
+            LauncherState::for_test(crate::agent::AgentKind::Claude, SessionStatus::Active);
+        for (payload, expected) in [
+            (r#"{"effort":{"level":"high"}}"#, Some("high")),
+            (
+                r#"{"effort":{"level":"low"},"agent_id":"child"}"#,
+                Some("high"),
+            ),
+            (r#"{}"#, Some("high")),
+            (r#"{"effort":{"level":"  "}}"#, Some("high")),
+            (r#"{"effort":{"level":"max"}}"#, Some("max")),
+        ] {
+            let msg = parse_hook_payload(HookEvent::PostToolUse, payload).unwrap();
+            dispatch_hook(&mut state, msg);
+            assert_eq!(state.effort.as_deref(), expected, "{payload}");
+        }
+    }
 
     #[test]
     fn a_model_switch_reports_the_model_it_switched_to() {

@@ -126,6 +126,9 @@ pub(super) fn adopt_session_facts(state: &mut LauncherState, msg: &mut HookMessa
     if let Some(model) = msg.model.take().filter(|m| !m.trim().is_empty()) {
         state.model = Some(model);
     }
+    if let Some(effort) = msg.effort.take().filter(|e| !e.trim().is_empty()) {
+        state.effort = Some(effort);
+    }
 }
 
 /// Map one hook event onto the launcher state the way every backend agrees on.
@@ -230,6 +233,7 @@ mod tests {
             session_title: None,
             context_tokens: None,
             model: None,
+            effort: None,
             transcript_path: None,
             raw: None,
             session_is_child: None,

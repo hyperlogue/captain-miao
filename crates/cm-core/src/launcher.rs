@@ -90,6 +90,7 @@ pub async fn run(
         context_tokens: None,
         context_window: None,
         model: None,
+        effort: None,
         name: None,
         first_prompt: None,
         pool_session,

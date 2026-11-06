@@ -834,6 +834,15 @@ pub(super) fn model_label(id: &str) -> String {
     out
 }
 
+/// Detail panels keep the reported effort beside the model without adding a row.
+pub(super) fn model_detail_label(model: Option<&str>, effort: Option<&str>) -> String {
+    let mut label = model.map(model_label).unwrap_or_else(|| "—".into());
+    if let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) {
+        label.push_str(&format!(" ({effort})"));
+    }
+    label
+}
+
 /// Color for a raw model id: GPT-6 Astra → magenta; Claude families Sonnet → blue,
 /// Fable → purple (magenta), Opus → white. Anything else stays the default
 /// `Reset`. Standard terminal colors only.

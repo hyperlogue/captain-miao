@@ -968,6 +968,9 @@ pub struct HookMessage {
     /// every agent that reports one reports the other.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reasoning effort reported by the agent, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Path to the current session's transcript on disk, if the agent
     /// exposes one in its hook payload. The launcher watches it to detect
     /// out-of-band signals (approval dismissed, assistant message appended,
@@ -1095,6 +1098,9 @@ pub struct LauncherState {
     /// Model id backing the latest turn (e.g. `claude-opus-4-8`, `gpt-5.5`).
     #[serde(default)]
     pub model: Option<String>,
+    /// Latest reasoning effort reported by the agent. Older hosts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Display name. Claude: the `/rename`, folded from its session file by the
     /// launcher (so it's persisted in the state file). Codex: the sqlite title,
     /// stamped in-memory by the per-host `LocalBackend` overlay as sessions are
@@ -1244,6 +1250,7 @@ impl LauncherState {
             context_tokens: None,
             context_window: None,
             model: None,
+            effort: None,
             name: None,
             first_prompt: None,
             pool_session: None,

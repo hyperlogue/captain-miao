@@ -755,6 +755,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // source (`common::adopt_session_facts`).
         context_tokens: None,
         model: None,
+        effort: None,
         transcript_path,
         raw: Some(stdin.to_string()),
         session_is_child: None,

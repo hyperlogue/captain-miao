@@ -123,7 +123,7 @@ pub(crate) fn list_resumable_cached(
 /// payload), `session_shutdown` (the launcher owns exit), `session_before_switch`
 /// / `session_before_fork` / `session_before_tree` (a
 /// replacement session re-emits `session_start`, which we do register),
-/// `user_bash` and `thinking_level_select` (no corresponding dashboard field),
+/// `user_bash` and `thinking_level_select` (effort rides every forwarded payload),
 /// and `project_trust` / `resources_discover` (see the
 /// module doc).
 const FORWARDED: &[(&str, HookEvent)] = &[
@@ -219,6 +219,7 @@ struct HookPayload {
     prompt: Option<String>,
     context_tokens: Option<u64>,
     model: Option<String>,
+    effort: Option<String>,
     /// Set on a `tool_execution_end` whose tool failed.
     #[serde(default)]
     is_error: bool,
@@ -241,11 +242,12 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         message: payload.error_message,
         cwd: payload.cwd,
         prompt: payload.prompt,
-        // All three ride every payload — see the module doc for why they come
+        // These facts ride every payload — see the module doc for why they come
         // from the hook rather than from a transcript fold.
         session_title: payload.session_title,
         context_tokens: payload.context_tokens,
         model: payload.model,
+        effort: payload.effort,
         // Pi *does* export `PI_SESSION_FILE` and its JSONL schema is documented,
         // so this is a decision rather than a gap: one fact, one source, and the
         // tokens and model above are already that source. Leaving it `None` also
@@ -298,6 +300,7 @@ pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
         state.last_tool = None;
         state.context_tokens = None;
         state.model = None;
+        state.effort = None;
         state.set_last_error(None);
         state.status = crate::state::SessionStatus::Idle;
     }

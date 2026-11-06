@@ -509,6 +509,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // schema (module doc).
         context_tokens: None,
         model: None,
+        effort: None,
         // Reasonix's payload has no transcript path, and this is the field the
         // launcher gates its entire transcript watch on — so nothing reads a
         // Reasonix transcript, which is what makes the empty `read_transcript_stats`
