@@ -1,7 +1,7 @@
 //! SSH connection policies, private socket directories and consistent master paths.
 use super::*;
 
-const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Rows sharing a target must not race a failed health check against another
 // row's replacement master. Check again after the preceding reset finishes.

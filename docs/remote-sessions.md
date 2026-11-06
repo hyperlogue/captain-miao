@@ -738,8 +738,8 @@ On macOS, IOKit wake notifications and SystemConfiguration network changes
 wake the reconnect task. A read-only `ListRecentDirs` RPC checks the existing
 transport while the subscription keeps serving frames. This request is supported
 by every compatible daemon; optional vitals support is not a health requirement.
-The probe allows five seconds for Wi-Fi/VPN recovery. Success preserves the
-connection; silence prompts a reconnect with the normal five-second SSH master
+The probe allows three seconds for Wi-Fi/VPN recovery. Success preserves the
+connection; silence prompts a reconnect with the normal three-second SSH master
 check, preserving attached terminals if that master still answers.
 The master check stays serialized per target and rechecks before retiring a
 master another host entry may have replaced. A wake event also interrupts retry

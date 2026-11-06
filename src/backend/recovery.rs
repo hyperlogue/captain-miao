@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 // Wake can precede Wi-Fi/VPN readiness. Keep serving the existing connection
 // while it gets a chance to answer instead of discarding it after one second.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Event {

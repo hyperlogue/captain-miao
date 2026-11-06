@@ -70,7 +70,7 @@ not cancel the action. Press `x` to dismiss notifications oldest first. `Esc`
 does the same after closing panels and clearing pending shortcuts or search.
 
 On macOS, waking the laptop or changing networks prompts an immediate connection
-check. Checks allow five seconds for a reply so a briefly slow connection can
+check. Checks allow three seconds for a reply so a briefly slow connection can
 stay open; stalled connections reconnect without waiting through the normal
 retry backoff. Recovery shows a delayed progress notification and still depends
 on Wi-Fi and the VPN becoming reachable.
