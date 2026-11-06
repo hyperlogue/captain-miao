@@ -11,6 +11,10 @@ use std::{
 };
 use tokio::sync::watch;
 
+// Wake can precede Wi-Fi/VPN readiness. Keep serving the existing connection
+// while it gets a chance to answer instead of discarding it after one second.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Event {
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -66,7 +70,9 @@ pub(super) async fn changed(events: &mut watch::Receiver<Event>) -> Event {
 
 /// Probe the actual daemon channel, including the forwarded socket, rather
 /// than merely proving that a new SSH channel can reach the host. Share request
-/// IDs with normal RPCs and never keep the owning backend alive.
+/// IDs with normal RPCs and never keep the owning backend alive. Use a read-only
+/// request from before the protocol floor: older compatible daemons can ignore
+/// GetVitals, and even current ones may wait on slow system metrics.
 pub(super) async fn daemon_responsive(
     requests: &tokio::sync::mpsc::WeakUnboundedSender<super::PendingRequest>,
     ids: &std::sync::atomic::AtomicU64,
@@ -79,7 +85,7 @@ pub(super) async fn daemon_responsive(
     if requests
         .send(super::PendingRequest {
             req_id,
-            frame: super::ClientFrame::GetVitals { req_id },
+            frame: super::ClientFrame::ListRecentDirs { req_id },
             reply,
         })
         .is_err()
@@ -87,10 +93,7 @@ pub(super) async fn daemon_responsive(
         return false;
     }
     drop(requests);
-    matches!(
-        tokio::time::timeout(super::ssh::WAKE_CHECK_TIMEOUT, rx).await,
-        Ok(Ok(_))
-    )
+    matches!(tokio::time::timeout(PROBE_TIMEOUT, rx).await, Ok(Ok(_)))
 }
 
 pub(super) enum Outcome<T> {
@@ -195,38 +198,58 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unanswered_wake_probe_requests_reconnect_after_one_second() {
-        use std::sync::Arc;
+    async fn unanswered_wake_probe_requests_reconnect_after_its_deadline() {
+        use std::sync::{Arc, atomic::AtomicU64};
         let (tx, mut events) = watch::channel(Event::Network);
         let active = Arc::new(AtomicBool::new(false));
         let observed = active.clone();
-        let (started, ready) = tokio::sync::oneshot::channel();
+        let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        let weak = requests.downgrade();
         let task = tokio::spawn(async move {
-            let mut started = Some(started);
-            watch_connection(
-                std::future::pending::<()>(),
-                &mut events,
-                &active,
-                move || {
-                    started.take().unwrap().send(()).unwrap();
-                    async {
-                        tokio::time::sleep(super::super::ssh::WAKE_CHECK_TIMEOUT).await;
-                        false
-                    }
-                },
-            )
+            let ids = AtomicU64::new(0);
+            watch_connection(std::future::pending::<()>(), &mut events, &active, || {
+                daemon_responsive(&weak, &ids)
+            })
             .await
         });
         tx.send_replace(Event::Wake);
-        ready.await.unwrap();
-        tokio::time::advance(Duration::from_millis(999)).await;
+        let request = incoming.recv().await.unwrap();
+        tokio::time::advance(PROBE_TIMEOUT - Duration::from_millis(1)).await;
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(task.await.unwrap(), Outcome::Stalled));
+        assert!(request.reply.is_closed());
         assert!(
             observed.load(Ordering::Relaxed),
             "progress continues until reconnect succeeds"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_loss_during_wake_retries_without_waiting_for_the_probe() {
+        use std::sync::atomic::AtomicU64;
+        let (tx, mut events) = watch::channel(Event::Network);
+        let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        let weak = requests.downgrade();
+        let (disconnect, closed) = tokio::sync::oneshot::channel();
+        let before = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            let active = AtomicBool::new(false);
+            let ids = AtomicU64::new(0);
+            watch_connection(closed, &mut events, &active, || {
+                daemon_responsive(&weak, &ids)
+            })
+            .await
+        });
+        tx.send_replace(Event::Wake);
+        let request = incoming.recv().await.unwrap();
+        disconnect.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Outcome::EndedDuringProbe(Ok(()))
+        ));
+        assert_eq!(tokio::time::Instant::now(), before);
+        assert!(request.reply.is_closed());
     }
 
     #[tokio::test(start_paused = true)]
@@ -268,10 +291,10 @@ mod tests {
         assert_eq!(request.req_id, 41);
         assert!(matches!(
             request.frame,
-            super::super::ClientFrame::GetVitals { req_id: 41 }
+            super::super::ClientFrame::ListRecentDirs { req_id: 41 }
         ));
         assert_eq!(ids.fetch_add(1, Ordering::Relaxed), 42);
-        tokio::time::advance(super::super::ssh::WAKE_CHECK_TIMEOUT).await;
+        tokio::time::advance(PROBE_TIMEOUT).await;
         assert!(!task.await.unwrap());
         assert!(request.reply.is_closed());
     }

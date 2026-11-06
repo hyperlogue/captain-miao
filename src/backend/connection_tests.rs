@@ -1,6 +1,97 @@
 use super::*;
 use tokio::io::AsyncReadExt;
 
+async fn wake_preserves_responsive_daemon(reply_delay: Duration, supports_vitals: bool) {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let (_backend, shared, mut requests) = RemoteBackend::build(
+        &Transport::LocalSocket(PathBuf::new()),
+        HostId("wake-test".into()),
+    );
+    let (events, mut wake) = tokio::sync::watch::channel(recovery::Event::Network);
+    let serving = serve(
+        client,
+        None,
+        MirrorCells {
+            mirror: &shared.mirror,
+            presumed_dead: &shared.presumed_dead,
+            presumed_attached: &shared.presumed_attached,
+            dirty: &shared.dirty,
+            mirrored: &shared.mirrored,
+            server_version: &shared.server_version,
+        },
+        &mut requests,
+    );
+    let connection =
+        recovery::watch_connection(serving, &mut wake, &shared.recovery_active, || {
+            recovery::daemon_responsive(&shared.health_requests, &shared.next_req_id)
+        });
+    let conversation = async {
+        assert!(matches!(
+            read_frame::<_, ClientFrame>(&mut peer).await.unwrap(),
+            Some(ClientFrame::Hello { .. })
+        ));
+        write_frame(
+            &mut peer,
+            &ServerFrame::Welcome {
+                server_version: "test".into(),
+                protocol: PROTOCOL_VERSION,
+                host: "wake-test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ClientFrame>(&mut peer).await.unwrap(),
+            Some(ClientFrame::Subscribe)
+        ));
+        events.send_replace(recovery::Event::Wake);
+        loop {
+            let request = read_frame::<_, ClientFrame>(&mut peer)
+                .await
+                .unwrap()
+                .expect("wake must preserve the existing daemon channel");
+            assert!(shared.recovery_active.load(Ordering::Relaxed));
+            let response = match request {
+                ClientFrame::GetVitals { req_id } if supports_vitals => ServerFrame::Vitals {
+                    req_id,
+                    vitals: HostVitals::default(),
+                },
+                // Compatible older daemons ignore GetVitals but answer v4 RPCs.
+                ClientFrame::GetVitals { .. } => continue,
+                ClientFrame::ListRecentDirs { req_id } => ServerFrame::RecentDirs {
+                    req_id,
+                    cwds: Vec::new(),
+                },
+                other => panic!("unexpected wake check: {other:?}"),
+            };
+            tokio::time::sleep(reply_delay).await;
+            // Network notifications can follow wake while Wi-Fi/VPN resumes.
+            events.send_replace(recovery::Event::Network);
+            write_frame(&mut peer, &response).await.unwrap();
+            break;
+        }
+        while shared.recovery_active.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        _ = connection => panic!("wake discarded a responsive daemon connection"),
+        result = tokio::time::timeout(Duration::from_secs(20), conversation) => {
+            result.expect("waiting for wake probe reply and recovery completion");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wake_preserves_a_connection_that_answers_after_one_second() {
+    wake_preserves_responsive_daemon(Duration::from_millis(1500), true).await;
+}
+
+#[tokio::test]
+async fn wake_preserves_a_compatible_daemon_without_vitals() {
+    wake_preserves_responsive_daemon(Duration::ZERO, false).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_silent_handshake_has_a_deadline() {
     let (client, _peer) = UnixStream::pair().unwrap();
