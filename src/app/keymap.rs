@@ -399,7 +399,7 @@ impl Command {
             Command::SelectPrev => "previous session",
             Command::JumpBottom => "jump to bottom",
             Command::FocusSelected => "focus selected window",
-            Command::NewSession => "new session (same cwd)",
+            Command::NewSession => "new session (same host, cwd & agent)",
             Command::NewSessionPrompt => {
                 "new session (choose cwd; Ctrl-o for agent & host; Ctrl-g for a worktree)"
             }

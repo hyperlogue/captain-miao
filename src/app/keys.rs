@@ -403,7 +403,12 @@ impl App {
             Command::NewSession => {
                 match self.selected_cwd() {
                     Some(cwd) => Some(Action::NewSessionSplit {
-                        agent: self.new_session_agent,
+                        agent: self
+                            .launches
+                            .selected()
+                            .map(|p| p.request.agent)
+                            .or_else(|| self.selected_session_ref().map(|s| s.agent))
+                            .unwrap_or(self.new_session_agent),
                         cwd,
                         // Quick same-cwd new session opens on the *selected
                         // session's* host, so `o` on a remote row starts another

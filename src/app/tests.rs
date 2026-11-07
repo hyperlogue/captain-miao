@@ -533,10 +533,10 @@ async fn pending_enter_waits_for_confirmation_and_respects_later_input() {
                 .unwrap()
                 .to_string()
         );
-        // Repeating o while the row is pending retains its host and directory.
+        // Repeating o while pending retains its host, directory, and agent.
         assert!(
-            matches!(d.press(KeyCode::Char('o')), Some(Action::NewSessionSplit { host: h, cwd, .. })
-            if h == host && cwd == "/work/project")
+            matches!(d.press(KeyCode::Char('o')), Some(Action::NewSessionSplit { host: h, cwd, agent, .. })
+            if h == host && cwd == "/work/project" && agent == crate::agent::AgentKind::Codex)
         );
         match next {
             "no-enter" => {}
@@ -1020,16 +1020,38 @@ fn double_click_attaches_running_remote_like_enter() {
 }
 
 #[test]
-fn o_targets_focused_session_tab() {
-    let mut d = TestDashboard::new(120, 15);
-    d.set_sessions(vec![session(1, "/home/test/myproj", SessionStatus::Active)]);
+fn o_inherits_focused_session_host_directory_and_agent() {
+    use crate::agent::AgentKind;
+    use crate::state::HostId;
 
-    let action = d.press(KeyCode::Char('o'));
-    match action {
-        Some(Action::NewSessionSplit { cwd, .. }) => {
-            assert_eq!(cwd, "/home/test/myproj");
+    for host in [HostId::local(), HostId("box".into())] {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let mut d = TestDashboard::new(120, 15);
+            d.app.new_session_agent = if agent == AgentKind::Claude {
+                AgentKind::Codex
+            } else {
+                AgentKind::Claude
+            };
+            let mut focused = session(1, "/work/myproj", SessionStatus::Active);
+            focused.host = host.clone();
+            focused.agent = agent;
+            d.set_sessions(vec![focused]);
+
+            match d.press(KeyCode::Char('o')) {
+                Some(Action::NewSessionSplit {
+                    host: actual_host,
+                    cwd,
+                    agent: actual_agent,
+                    worktree,
+                }) => {
+                    assert_eq!(actual_host, host);
+                    assert_eq!(cwd, "/work/myproj");
+                    assert_eq!(actual_agent, agent);
+                    assert_eq!(worktree, None);
+                }
+                other => panic!("expected NewSessionSplit, got {other:?}"),
+            }
         }
-        _ => panic!("expected NewSessionSplit"),
     }
 }
 
@@ -2038,10 +2060,14 @@ fn space_a_picker_sets_default_new_session_backend() {
     let mut d = TestDashboard::new(120, 10);
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
-    // Default backend is Claude: header cluster shows it and `o` launches it.
+    // Default backend is Claude: header cluster and directory picker use it.
     assert_eq!(d.app.new_session_agent, AgentKind::Claude);
     assert!(d.render().contains("Default agent: Claude"));
-    match d.press(KeyCode::Char('o')) {
+    d.press(KeyCode::Char('O'));
+    for c in "/work/project".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    match d.press(KeyCode::Enter) {
         Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentKind::Claude),
         _ => panic!("expected NewSessionSplit"),
     }
@@ -2055,7 +2081,11 @@ fn space_a_picker_sets_default_new_session_backend() {
     assert_eq!(d.app.input_mode, InputMode::Normal);
     assert_eq!(d.app.new_session_agent, AgentKind::Codex);
     assert!(d.render().contains("Default agent: Codex"));
-    match d.press(KeyCode::Char('o')) {
+    d.press(KeyCode::Char('O'));
+    for c in "/work/project".chars() {
+        d.press(KeyCode::Char(c));
+    }
+    match d.press(KeyCode::Enter) {
         Some(Action::NewSessionSplit { agent, .. }) => assert_eq!(agent, AgentKind::Codex),
         _ => panic!("expected NewSessionSplit"),
     }

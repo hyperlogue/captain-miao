@@ -57,7 +57,8 @@ cd /path/to/your/project
 miao
 ```
 
-Press `o` to start an agent in the directory of the selected session.
+Press `o` to start a new session with the same host, directory, and agent harness
+as the selected session.
 If you do not select a session, `o` opens the directory picker.
 Press `O` to select a directory.
 
@@ -162,7 +163,7 @@ The six most frequent shortcuts:
 | -------------------- | ------------------------------------------------------ |
 | `j` / `k`, `↑` / `↓` | Navigate sessions.                                     |
 | `Enter`              | Focus the window of the selected session.              |
-| `o` / `O`            | Start session in current directory / choose directory. |
+| `o` / `O`            | Start session with selected host, directory, and agent / choose directory. |
 | `r` / `f`            | Resume a conversation / fork the selected session.     |
 | `X`                  | Stop the selected session.                             |
 | `s`                  | Select the next session that requires attention.       |
