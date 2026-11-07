@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-07
+
+### New
+
+- **Dashboard actions** run in the background so navigation stays responsive,
+  with progress notifications for operations that take longer than 0.8 seconds.
+- **Session details** show reported effort beside the model for Claude Code,
+  Codex, Pi, and omp when available.
+- **Quick launch** with `o` starts a session using the selected session's agent,
+  host, and directory. Previously, `o` reused the host and directory but launched
+  the default agent instead of the selected session's agent.
+- **Notifications** dismiss oldest first with `x` or `Esc` after closing panels
+  and clearing pending shortcuts or search.
+
+### Fixed
+
+- **SSH recovery** replaces stalled connections when reconnecting a host and
+  promptly checks connections after macOS wake or network changes.
+
 ## [0.16.0] - 2026-10-31
 
 Thanks to @neopot for improving macOS test reliability
@@ -894,7 +913,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/hyperlogue/captain-miao/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hyperlogue/captain-miao/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/hyperlogue/captain-miao/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/hyperlogue/captain-miao/compare/v0.13.0...v0.14.0
