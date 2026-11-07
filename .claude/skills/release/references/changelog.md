@@ -14,22 +14,45 @@ subjects rather than copying commit messages.
 
 Draft the complete proposed release section and compare link as
 `release-notes.md` in a temporary directory outside the repository; set
-`release_notes_dir` to that directory's path. Keep the working directory
-unchanged while drafting and reviewing, including generated files and
-formatting or lockfile updates. Read `r3 guide` and `r3 guide files`, then publish
-the draft:
+`release_notes_dir` to that directory's path. Keep release files unchanged while
+drafting and reviewing, including generated files and formatting or lockfile
+updates. Separately requested work, such as release-skill maintenance, can
+proceed independently.
+
+Run `r3 guide` and `r3 guide files` with the available CLI, and follow that
+executable's current publication and feedback workflow. Use `r3 --help` for
+command details. When using a local checkout, check its executable version:
+source changes do not establish that its compiled binary is current. Follow
+the guide's version-mismatch instructions; a warning does not invalidate a
+successful publication. Publish the draft:
 
 ```sh
 r3 create --kind files --dir "$release_notes_dir" --file release-notes.md \
   --title 'Release notes'
 ```
 
-Share the returned artifact URL and obtain release-note sign-off before making
-any working-directory changes. Publish revisions to the same artifact with
-`r3 publish <artifact-id> --dir "$release_notes_dir" --file release-notes.md`.
-Reuse approval already given for those exact notes, or an explicit instruction
-to skip review. If r3 publication is unavailable, report the blocker and keep
-the working directory unchanged until the user chooses an alternative.
+Share the returned stable artifact URL and retain its ID and version sequence.
+Obtain release-note sign-off before applying the release. Reuse approval already
+given for those exact notes, or an explicit instruction to skip review.
+
+Supported harnesses subscribe automatically on publication. Follow the guide
+for subscription failures; while subscribed, continue independent work or end
+the turn rather than polling or blocking on review. When feedback arrives,
+fetch and claim its threads, inspect their recorded targets, and revise the
+draft. Publish the complete file set under the same artifact ID:
+
+```sh
+r3 publish <artifact-id> --dir "$release_notes_dir" --file release-notes.md \
+  --expected <latest-version-sequence>
+```
+
+On a sequence conflict, inspect the newer publication before retrying. Follow
+the guide to reply to each thread and re-anchor verified locations after
+publication; the human controls thread resolution. Thread resolution or
+comment delivery alone is not release-note sign-off.
+
+If r3 publication is unavailable, report the blocker and keep release files
+unchanged until the user chooses an alternative.
 
 After sign-off, apply the approved entry to `CHANGELOG.md`. Changelog-only work
 ends under the normal repository commit rules. For a full release, continue

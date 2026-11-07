@@ -14,7 +14,7 @@ Match the requested scope:
   working rules; a version bump alone does not request a tag or publication.
 - **Prepare or cut a release:** use [release preparation](references/release.md#prepare-the-release)
   and the changelog guidance. Present the notes as an r3 files artifact for
-  review before changing the working directory, then apply the approved notes,
+  review before changing release files, then apply the approved notes,
   bump versions and complete checks.
 - **Publish or recover a release:** use the applicable
   [publication or recovery section](references/release.md#publish) and establish

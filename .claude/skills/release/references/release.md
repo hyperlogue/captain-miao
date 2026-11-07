@@ -12,9 +12,9 @@ assets and npm packages.
    release. Follow the [distribution rules](../../../../docs/agent-guides/distribution.md)
    when release preparation also changes builds or packaging.
 2. Follow the [changelog review](changelog.md#review-before-editing): publish
-   the proposed notes as an r3 files artifact and obtain sign-off before any
-   working-directory changes. If review is still needed, cite that requirement,
-   share the artifact URL and leave the working directory unchanged.
+   the proposed notes as an r3 files artifact and obtain sign-off before changing
+   release files. If review is still needed, cite that requirement and share
+   the artifact URL. Complete independent work while the review is pending.
 3. Apply the approved changelog and update the version sources described in
    [SKILL.md](../SKILL.md). Inspect `Cargo.lock` to confirm the inheriting member
    versions moved with `Cargo.toml`; leave unrelated dependency updates out of
@@ -34,8 +34,8 @@ assets and npm packages.
    message is only a subject; CI takes release notes from `CHANGELOG.md`.
 
 Preparation is complete with the verified local commit and tag, or the fully
-drafted r3 artifact awaiting the required review with the working directory
-unchanged. Report which state was reached. A request to prepare a release does
+drafted r3 artifact awaiting the required review with release files unchanged.
+Report which state was reached. A request to prepare a release does
 not require publishing it.
 
 ## Publish
