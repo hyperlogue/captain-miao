@@ -1,6 +1,9 @@
 //! Shared transport for Pi and omp's generated extensions. Each adapter owns
 //! its event table, extra payload fields and Rust-side status interpretation.
-//! The extension only captures facts and forwards them to the launcher.
+//! The shared generator captures facts and forwards them to the launcher; an
+//! adapter's [`Fragments`] may add prompt tracking of its own, which decides
+//! how that adapter's own prompts read but never what the launcher does with
+//! them.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,6 +16,26 @@ pub(super) struct Extension {
     pub agent: &'static str,
     pub events: &'static [(&'static str, HookEvent)],
     pub extra_fields: &'static [(&'static str, &'static str)],
+    /// The adapter's own prompt instrumentation, if it has any. Pi emits no
+    /// prompt code at all: without fragments its source carries only the
+    /// shared template (the `field()` guards and the one queue), so the
+    /// launcher sees a payload with no prompt snapshot.
+    pub fragments: Option<Fragments>,
+}
+
+/// An adapter's prompt-tracking JavaScript, spliced into the shared template at
+/// the three points a tracker needs: after the queue in the default-export
+/// closure, inside a handler after `capture`, and at module scope after
+/// `send`. All three are empty (and no `tracker` argument is threaded) when an
+/// adapter supplies none.
+pub(super) struct Fragments {
+    /// Injected after the queue helper in the default-export closure, so each
+    /// extension instance owns its tracker.
+    pub setup: &'static str,
+    /// Appended at module scope after `send`, beside the helpers it defines.
+    pub functions: &'static str,
+    /// Injected inside a handler after `capture`: the per-event install hook.
+    pub install: &'static str,
 }
 
 impl Extension {
@@ -61,12 +84,25 @@ impl Extension {
         let extra = self
             .extra_fields
             .iter()
-            .map(|(name, value)| format!("      {name}: {value},\n"))
+            .map(|(name, value)| format!("      {name}: field(() => {value}),\n"))
             .collect::<String>();
+        // The adapter's fragments. Absent for pi, so its source holds nothing
+        // prompt-related: no tracker, no install hook, no helper functions.
+        let fragments = self.fragments.as_ref();
+        let tracker_arg = if fragments.is_some() { ", tracker" } else { "" };
+        let note_event = if fragments.is_some() {
+            "    if (tracker) trackPrompts(tracker, event);\n"
+        } else {
+            ""
+        };
+        let setup = fragments.map_or("", |f| f.setup);
+        let functions = fragments.map_or("", |f| f.functions);
+        let install = fragments.map_or("", |f| f.install);
         format!(
             r#"// captain-miao's {agent} session forwarder — GENERATED. Edits are overwritten.
 // Loaded with `{agent} -e`. The launcher socket arrives as $CAPTAIN_MIAO_SOCK.
-// Event interpretation belongs to captain-miao; this extension only forwards facts.
+// Event interpretation belongs to captain-miao; this extension forwards facts,
+// plus the prompt state an adapter's fragments track.
 import {{ spawn }} from "node:child_process";
 
 const MIAO = {exe};
@@ -75,38 +111,51 @@ const FORWARD = [
 
 export default function (pi) {{
   let pending = Promise.resolve();
-  for (const [name, forwarded] of FORWARD) {{
+  // One queue for every payload: a handler and a fragment's `notify` both
+  // append here, so deliveries keep invocation order and a failed send
+  // resolves rather than breaking the chain for the next one.
+  const enqueue = (forwarded, body) => {{
+    const deliver = () => send(forwarded, body);
+    pending = pending.then(deliver, deliver);
+    return pending;
+  }};
+{setup}  for (const [name, forwarded] of FORWARD) {{
     // An unavailable event must not prevent the others from being registered.
     try {{
       pi.on(name, (event, ctx) => {{
-        const body = capture(pi, event, ctx);
-        const deliver = () => send(forwarded, body);
-        pending = pending.then(deliver, deliver);
-        return pending;
+        const body = capture(pi, event, ctx{tracker_arg});
+{install}        return enqueue(forwarded, body);
       }});
     }} catch {{}}
   }}
 }}
 
-function capture(pi, event, ctx) {{
+// Each field is read through its own guard: one throwing getter (an extension
+// context that lost its session, say) must not cost the whole payload.
+function field(read) {{
+  try {{ return read(); }} catch {{ return undefined; }}
+}}
+
+function capture(pi, event, ctx{tracker_arg}) {{
   let body = "{{}}";
   try {{
-    const tokens = ctx?.getContextUsage?.()?.tokens;
+{note_event}    const tokens = field(() => ctx?.getContextUsage?.()?.tokens);
     body = JSON.stringify({{
-      session_id: ctx?.sessionManager?.getSessionId?.(),
-      session_title: pi?.getSessionName?.(),
-      effort: pi?.getThinkingLevel?.(),
-      cwd: ctx?.cwd,
-      tool_name: event?.toolName,
-      prompt: event?.prompt,
-      is_error: event?.isError,
+      session_id: field(() => ctx?.sessionManager?.getSessionId?.()),
+      session_title: field(() => pi?.getSessionName?.()),
+      effort: field(() => pi?.getThinkingLevel?.()),
+      cwd: field(() => ctx?.cwd),
+      tool_name: field(() => event?.toolName),
+      prompt: field(() => event?.prompt),
+      is_error: field(() => event?.isError),
 {extra}      // Pi may report null after compaction; that is unknown, not zero.
       context_tokens: Number.isFinite(tokens) && tokens >= 0 ? Math.round(tokens) : undefined,
-      model: ctx?.model?.provider && ctx?.model?.id
-        ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id,
+      model: field(() => ctx?.model?.provider && ctx?.model?.id
+        ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id),
     }});
   }} catch {{
-    // A throwing getter must not cost the event, which is carried in argv.
+    // A payload that still cannot be built must not cost the event: the event
+    // name is carried in argv.
   }}
   return body;
 }}
@@ -137,7 +186,7 @@ function send(forwarded, body) {{
     try {{ child.stdin.end(body); }} catch {{ abort(); }}
   }});
 }}
-"#
+{functions}"#
         )
     }
 }
@@ -216,6 +265,29 @@ mod tests {
         }
     }
 
+    /// Pi supplies no fragments, so its emitted source carries no prompt code:
+    /// no tracker, no `ctx.ui` wrapper, no snapshot field. The shared template
+    /// still gives it the `field()` guards and the one delivery queue.
+    #[test]
+    fn an_extension_without_fragments_emits_no_prompt_code() {
+        let source = crate::agents::pi::build_hooks_settings("/unused.sock");
+        for fragment in [
+            "tracker",
+            "installUI",
+            "promptSnapshot",
+            "trackPrompts",
+            "blocking_prompt",
+            "isSub",
+        ] {
+            assert!(
+                !source.contains(fragment),
+                "pi's source must contain no `{fragment}`"
+            );
+        }
+        assert!(source.contains("function field(read)"));
+        assert!(source.contains("const enqueue = (forwarded, body)"));
+    }
+
     #[test]
     fn launch_installs_extension_and_preserves_arguments() {
         const TEST: &str =
@@ -245,6 +317,7 @@ mod tests {
             agent: "sh",
             events: &[],
             extra_fields: &[],
+            fragments: None,
         };
         let root = crate::state::state_dir();
         crate::state::create_dir_all_private(&root).unwrap();

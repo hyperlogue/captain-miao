@@ -247,6 +247,114 @@ if (scenario.startsWith('opencode_')) {
     complete(pending.at(-1));
     await sent;
   }
+} else if (scenario === 'omp_prompts') {
+  const handlers = new Map();
+  const pi = {
+    on(name, fn) { handlers.set(name, fn); },
+    getSessionName: () => 'Current title',
+    getThinkingLevel: () => 'high',
+  };
+  module.namespace.default(pi);
+  let resolveDialog;
+  const calls = { select: 0, askDialog: 0 };
+  // omp's extension `ui` is a proxy over the interactive UI. Its blocking
+  // methods are adapters served from the proxy's own table; each adapter
+  // re-reads `target[name]` when called, and the proxy has no set trap, so a
+  // write lands on the target. Wrapping the method the proxy shows made the
+  // adapter call the wrapper back until the stack overflowed, so the fake host
+  // models that shape: only a call to the target's original method succeeds.
+  const target = {
+    select: () => { calls.select += 1; return new Promise((resolve) => { resolveDialog = resolve; }); },
+    askDialog: () => { calls.askDialog += 1; return new Promise((resolve) => { resolveDialog = resolve; }); },
+  };
+  const adapters = {
+    select: (...args) => target.select(...args),
+    askDialog: (...args) => target.askDialog(...args),
+  };
+  const ui = new Proxy(target, {
+    get(object, key) {
+      return Object.hasOwn(adapters, key) ? adapters[key] : Reflect.get(object, key, object);
+    },
+  });
+  const ctx = {
+    sessionManager: { getSessionId: () => 'root' },
+    cwd: '/project',
+    agent: { kind: 'main' },
+    ui,
+    getContextUsage: () => ({ tokens: 10 }),
+    model: { id: 'test-model' },
+  };
+  const send = async (type, event, onCtx = ctx) => {
+    const sent = handlers.get(type)({ type, ...event }, onCtx);
+    await tick();
+    complete(pending.at(-1));
+    await sent;
+    return delivered.at(-1).body;
+  };
+  const openDialog = async (name) => {
+    const dialog = ctx.ui[name]('question');
+    await tick();
+    complete(pending.at(-1));
+    await tick();
+    return { dialog, body: delivered.at(-1).body };
+  };
+  const closeDialog = async (dialog, value) => {
+    resolveDialog(value);
+    await dialog;
+    await tick();
+    complete(pending.at(-1));
+    await tick();
+    return delivered.at(-1).body;
+  };
+
+  const start = await send('session_start', {});
+  assert.equal(start.blocking_prompt, 'none');
+
+  let dialog = await openDialog('select');
+  assert.equal(dialog.body.blocking_prompt, 'decision');
+  assert.equal(dialog.body.tool_name, undefined, 'a dialog carries no tool name');
+  assert.equal((await closeDialog(dialog.dialog, 'answer')).blocking_prompt, 'none');
+  assert.equal(calls.select, 1, 'the wrapping must call omp\'s method once, not itself');
+
+  const approval = await send('tool_approval_requested', { toolCallId: 't1', toolName: 'bash' });
+  assert.equal(approval.blocking_prompt, 'approval');
+  dialog = await openDialog('askDialog');
+  assert.equal(dialog.body.blocking_prompt, 'approval', 'an open approval outranks a dialog');
+  assert.equal(
+    (await closeDialog(dialog.dialog, { kind: 'chat' })).blocking_prompt,
+    'approval',
+    'closing the dialog leaves the approval open',
+  );
+  assert.equal(calls.askDialog, 1, 'the wrapping must call omp\'s method once, not itself');
+  const resolved = await send('tool_approval_resolved', { toolCallId: 't1' });
+  assert.equal(resolved.blocking_prompt, 'none');
+
+  assert.equal((await send('plan_review_requested', { reviewId: 'r1' })).blocking_prompt, 'decision');
+  assert.equal((await send('plan_review_resolved', { reviewId: 'r1' })).blocking_prompt, 'none');
+
+  // omp hands each session its own context over the same `ui`; a dialog opened
+  // after a switch must report the new session, not the one it was wrapped in.
+  const nextCtx = { ...ctx, sessionManager: { getSessionId: () => 'next' } };
+  assert.equal((await send('session_switch', {}, nextCtx)).session_id, 'next');
+  dialog = await openDialog('select');
+  assert.equal(dialog.body.session_id, 'next', 'a dialog reports the current session');
+  assert.equal((await closeDialog(dialog.dialog, 'answer')).session_id, 'next');
+
+  // A subagent reports its own snapshot: its approval events still feed the
+  // tracker, so the parent row can show a card the user answers in the same
+  // terminal. Its other facts stay marked as the child's.
+  const subCtx = { ...ctx, agent: { kind: 'sub' }, ui: {} };
+  const subBody = await send('tool_execution_start', { toolName: 'read' }, subCtx);
+  assert.equal(subBody.session_is_child, true);
+  assert.equal(subBody.blocking_prompt, 'none', 'a child reports its own empty snapshot');
+  const subApproval = await send(
+    'tool_approval_requested', { toolCallId: 'c1', toolName: 'bash' }, subCtx,
+  );
+  assert.equal(subApproval.blocking_prompt, 'approval');
+  assert.equal(
+    (await send('tool_approval_resolved', { toolCallId: 'c1' }, subCtx)).blocking_prompt,
+    'none',
+  );
 } else throw new Error('unknown scenario');
 clearTimeout(watchdog);
 process.stdout.write(JSON.stringify(delivered));

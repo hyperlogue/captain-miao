@@ -154,6 +154,7 @@ const EXTENSION: Extension = Extension {
         ("will_retry", "event?.willRetry"),
         ("error_message", "event?.errorMessage"),
     ],
+    fragments: None,
 };
 
 /// The "hook settings" the launcher writes to its per-session file — for Pi,

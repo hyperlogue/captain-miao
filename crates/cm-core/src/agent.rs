@@ -1177,7 +1177,9 @@ mod tests {
             // `tool_approval_resolved` releases it, so the approval pair carries
             // what a separate decision prompt would. `PostToolUseFailure` is
             // absent (derived in Rust from `is_error`, never registered) — the
-            // same shape opencode already has.
+            // same shape opencode already has. `StatusUpdate` carries the
+            // extension's prompt snapshot: plan reviews and blocking `ctx.ui`
+            // dialogs, which have no lifecycle event of their own.
             (
                 AgentKind::Omp,
                 &[
@@ -1190,6 +1192,7 @@ mod tests {
                     Stop,
                     PreCompact,
                     PostCompact,
+                    StatusUpdate,
                 ],
             ),
         ];
