@@ -601,6 +601,34 @@ fn live_metadata_updates_and_unloading_are_reflected_without_input() {
 }
 
 #[test]
+fn reloaded_thread_clears_disconnected_after_rewind() {
+    for unloaded in ["thread/closed", "thread/status/changed"] {
+        for loaded in ["idle", "active"] {
+            let (mut m, mut s) = (Monitor::default(), state());
+            resume(&mut m, &mut s);
+            notify(
+                &mut m,
+                &mut s,
+                unloaded,
+                json!({"threadId":"thread-root","status":{"type":"notLoaded"}}),
+            );
+            assert_eq!(s.status_label(), "Disconnected");
+            notify(
+                &mut m,
+                &mut s,
+                "thread/status/changed",
+                json!({"threadId":"thread-root","status":{"type":loaded,"activeFlags":[]}}),
+            );
+            assert_eq!(s.codex_connected, Some(true));
+            assert_eq!(
+                s.status_label(),
+                if loaded == "idle" { "Idle" } else { "Active" }
+            );
+        }
+    }
+}
+
+#[test]
 fn effort_tracks_root_thread_settings_and_clears_when_unset_or_switched() {
     let (mut monitor, mut row) = (Monitor::default(), state());
     request(&mut monitor, &mut row, 1, "thread/resume");

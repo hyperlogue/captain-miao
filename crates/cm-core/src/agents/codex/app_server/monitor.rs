@@ -382,8 +382,15 @@ fn record_item_error(state: &mut LauncherState, item: &Value) {
 
 fn status(state: &mut LauncherState, value: &Value) {
     let next = match value["type"].as_str() {
-        Some("idle") => SessionStatus::Idle,
+        Some("idle") => {
+            // Rewind unloads and reloads the selected thread on the same
+            // connection, without a new resume response. Its loaded status
+            // restores connectivity as well as the activity label.
+            state.codex_connected = Some(true);
+            SessionStatus::Idle
+        }
         Some("active") => {
+            state.codex_connected = Some(true);
             let flags = value["activeFlags"].as_array();
             if flags.is_some_and(|f| f.iter().any(|v| v == "waitingOnUserInput")) {
                 SessionStatus::WaitingForDecision
