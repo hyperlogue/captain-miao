@@ -53,7 +53,7 @@ impl AgentDefinition for Definition {
         omp::build_hooks_settings(sock_path)
     }
     fn hook_session(&self) -> Box<dyn crate::agents::hook_session::HookSession> {
-        Box::new(crate::agents::hook_session::Stateless(omp::dispatch_hook))
+        Box::new(omp::Hooks::default())
     }
     fn parse_hook_payload(&self, event: HookEvent, stdin: &str) -> Result<HookMessage> {
         omp::parse_hook_payload(event, stdin)

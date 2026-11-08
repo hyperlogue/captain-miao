@@ -135,7 +135,7 @@ Other integrations have API limitations or less testing.
 | [Kimi Code](https://github.com/MoonshotAI/kimi-code)         |        | Does not support session fork or worktrees.                                                      |
 | [opencode](https://github.com/anomalyco/opencode)            |        | Uses a generated plugin. Does not support worktrees or background-task tiers.                    |
 | [Pi](https://github.com/earendil-works/pi)                   |        | Supports resume picker, fork, and context tracking. Does not track approval states or worktrees. |
-| [omp](https://github.com/can1357/oh-my-pi)                   |        | Tracks approvals, decisions, and background tasks. Does not support worktrees.                   |
+| [omp](https://github.com/can1357/oh-my-pi)                   |        | Tracks approvals, decisions (including any extension's dialog), plan reviews, and background tasks. Does not support worktrees. |
 
 Antigravity uses a separate configuration copy for managed sessions.
 captain-miao preserves your custom status-line command.

@@ -11,7 +11,7 @@
 //! dirs (`~/.omp` vs `~/.pi`), so nothing about the pi backend changes. This
 //! module is built on the same `-e <extension.ts>` injection pi uses — **not**
 //! a parameterization of `pi.rs`: omp's event surface has diverged from pi's
-//! in five load-bearing ways (below), so the two modules share only what
+//! in six load-bearing ways (below), so the two modules share only what
 //! already lives in `agents::common`.
 //!
 //! omp is, like pi, **neither a synthetic home nor a shell hook**, and for
@@ -20,7 +20,7 @@
 //! `-e` extension is trusted by virtue of being on the command line, so there
 //! is no seeding step. omp needs no [`super::synth_home::SynthHome`] at all.
 //!
-//! # The four divergences from pi
+//! # The six divergences from pi
 //!
 //! ## 1. `agent_end` + `willContinue`, not `agent_settled`
 //!
@@ -61,14 +61,59 @@
 //! `{ sessionId, toolName, toolCallId, reason?, approvalMode }`, and
 //! `tool_approval_resolved` fires "after approve, deny, or approval prompt
 //! failure". Both are emitted whenever a handler is registered
-//! (`const K = this.runner.hasHandlers("tool_approval_requested") ||
+//! (`const f = this.runner.hasHandlers("tool_approval_requested") ||
 //! this.runner.hasHandlers("tool_approval_resolved")`). So `Omp` gets
 //! `approval_gate: true` — pi's `false` is the one capability row that
 //! inverts. The pair maps to [`HookEvent::PermissionRequest`] and
 //! [`HookEvent::ElicitationResult`], the same shape opencode already has, and
 //! neither return value can alter the turn.
 //!
-//! ## 4. `session_switch`, not `session_info_changed`
+//! An approval is **not the only way omp waits on the user**, though, and
+//! this is the difference the row used to miss:
+//!
+//! - **Plan review** emits `plan_review_requested` / `plan_review_resolved`
+//!   (`{ reviewId, sessionId, … }`); it has no status vocabulary of its own, so
+//!   the pair rides `status-update` and the overlay below supplies the status.
+//! - **Every `ctx.ui` dialog** blocks, and omp emits no event for one. But the
+//!   TUI builds a single writable `uiContext` and hands the same instance to
+//!   the extension runner and the tool context, each consumer wrapping it in a
+//!   `trackUserWaits` Proxy with only a `get` trap. The extension therefore
+//!   replaces the blocking methods (`select`, `confirm`, `input`, `editor`,
+//!   `custom`, `askDialog`, `approve`) on that object, which observes omp's own
+//!   ask card and approval prompt *and* a dialog another extension opens
+//!   through `ctx.ui` — without knowing a tool name.
+//!
+//! The extension counts the three sources in one tracker per instance and
+//! rides the result on every payload as `blocking_prompt`
+//! (`"approval"`, `"decision"` or `"none"`), sending a synthesized
+//! `status-update` when a dialog opens or closes with no omp event behind it.
+//! [`Hooks`] applies it as an overlay: the visible row is
+//! `WaitingForApproval`/`WaitingForDecision` while the prompt is up, but every
+//! event still moves the status underneath, so a sibling tool's events and a
+//! terminal `Stop` are not lost. Only an explicit `"none"` releases the
+//! overlay; a payload without the field is unknown.
+//!
+//! One card escapes the tracker: omp's built-in `ask` tool, if its card is
+//! built without the methods we wrap, leaves the snapshot at `"none"` while the
+//! user is still blocked. [`Hooks`] therefore also reads the tool event itself
+//! ([`ASK_TOOL`]) — narrow to that one built-in tool, never a tool-name
+//! heuristic over other agents' questions.
+//!
+//! ## 4. Subagents preload this extension in the parent's process
+//!
+//! `task` runners load the parent's extensions and share
+//! `CAPTAIN_MIAO_SOCK`, so their events reach the parent row. They must not:
+//! a child `agent_end` would settle the parent and its `session_start` would
+//! rename the parent's id. The runner's extension context carries a frozen
+//! agent object built as `{ kind: un ? "sub" : "main", … }`, so the extension
+//! marks subagent payloads (`ctx.agent.kind === "sub"`) and never installs the
+//! `ctx.ui` wrapper there — the child's own tracker counts only the approval
+//! and plan-review events its payloads carry. [`Hooks`] drops every other child
+//! fact, status and session id; the child's own prompt snapshot still moves the
+//! overlay, because the user answers that card on the same TUI the row
+//! describes.
+//!
+//! ## 5. `session_switch`, not `session_info_changed`
 //!
 //! `session_info_changed` does not exist in omp (grep → 0). Its role (deliver
 //! a fact with no status move) is taken by **`session_switch`**, which omp
@@ -78,7 +123,7 @@
 //! that touches status only to settle a row out of `Starting` — so it adopts
 //! the new session id and moves nothing, which is precisely what is wanted.
 //!
-//! ## 5. `ctx.getAsyncJobSnapshot()` is the only enumerator of live async work
+//! ## 6. `ctx.getAsyncJobSnapshot()` is the only enumerator of live async work
 //!
 //! omp tracks async jobs **in-process**: `getAsyncJobSnapshot()` returns
 //! `{ running, recent, delivery }`, and `running` is already filtered to the
@@ -153,7 +198,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use super::common;
-use super::pi_extension::Extension;
+use super::pi_extension::{Extension, Fragments};
 use crate::agent::{BgShell, ResumeCandidate};
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
@@ -167,8 +212,8 @@ pub(crate) const BIN: &str = "omp";
 /// `tool_name = "ask"`. That `"exclusive"` concurrency makes it a barrier in
 /// omp's tool loop (`Tgn`'s `V`/`ee` promise chains): every prior tool settles
 /// before `ask` starts and every later one waits on it, so no other tool can
-/// run while the question is up — this arm needs no Grok-style hold against a
-/// concurrent tool's `PostToolUse`.
+/// run while the question is up — the ask arm in [`Hooks::dispatch_hook`] needs
+/// no hold against a concurrent tool's `PostToolUse`.
 const ASK_TOOL: &str = "ask";
 
 // =============================================================================
@@ -223,6 +268,11 @@ const FORWARDED: &[(&str, HookEvent)] = &[
     ("tool_execution_end", HookEvent::PostToolUse),
     ("tool_approval_requested", HookEvent::PermissionRequest),
     ("tool_approval_resolved", HookEvent::ElicitationResult),
+    // Plan review is a prompt like an approval gate, but it has no status
+    // vocabulary of its own: it rides `status-update`, whose launcher arm only
+    // adopts facts, and the extension's snapshot supplies the overlay.
+    ("plan_review_requested", HookEvent::StatusUpdate),
+    ("plan_review_resolved", HookEvent::StatusUpdate),
     ("agent_end", HookEvent::Stop),
     ("session_before_compact", HookEvent::PreCompact),
     ("session_compact", HookEvent::PostCompact),
@@ -231,6 +281,111 @@ const FORWARDED: &[(&str, HookEvent)] = &[
 // =============================================================================
 // The generated extension
 // =============================================================================
+
+/// omp's prompt tracker, injected after the shared queue inside the
+/// default-export closure. Each extension instance (a subagent runner loads its
+/// own copy in the same process) owns its tracker, so two instances cannot
+/// double-count one dialog. `notify` reads the snapshot after a dialog opens or
+/// closes with no omp event behind it and enqueues it as a `status-update`, the
+/// event whose launcher arm changes nothing but the prompt overlay.
+const PROMPT_SETUP: &str = r#"  // A prompt is a modal: while one is open omp is waiting on the user. The
+  // approval gate and plan reviews have events; a plain ctx.ui dialog does not,
+  // so the blocking methods themselves feed the tracker.
+  // `ctx` is the latest main-session context: a dialog's status-update must
+  // carry the session that is current when it opens, not the one at install.
+  const tracker = { approvals: new Set(), reviews: new Set(), dialogs: 0, ctx: undefined };
+  const notify = () => {
+    enqueue("status-update", capture(pi, { type: "status_update" }, tracker.ctx, tracker));
+  };
+"#;
+
+/// The per-event install hook, injected in a handler right after `capture`.
+/// Both events that hand the extension a fresh main context are covered, so the
+/// tracker's `ctx` follows a `/new` or `/resume`. A wrap failure must not cost
+/// the event, hence the empty catch.
+const PROMPT_INSTALL: &str = "        if (name === \"session_start\" || name === \"session_switch\") {\n          try { installUI(ctx, tracker, notify); } catch {}\n        }\n";
+
+/// The omp prompt helpers, appended at module scope after `send`. `ctx.ui` is
+/// one writable object shared by the TUI, the extension runner and the tool
+/// context, and every consumer wraps the same instance, so replacing these
+/// methods observes omp's own ask card and approval prompt as well as any other
+/// extension's dialog.
+const PROMPT_FUNCTIONS: &str = r#"
+const PROMPT_METHODS = ["select", "confirm", "input", "editor", "custom", "askDialog", "approve"];
+
+// A subagent runner gets its own extension runner but shares the parent's
+// process and socket. Wrapping `ctx.ui` there would count a dialog the parent's
+// own instance already saw, so the child's tracker counts only the approval and
+// plan-review events its payloads carry. The snapshot still travels on those
+// payloads: a child prompt is on the parent row's screen.
+function isSub(ctx) {
+  return ctx?.agent?.kind === "sub";
+}
+
+function trackPrompts(tracker, event) {
+  const type = event?.type;
+  if (type === "tool_approval_requested") tracker.approvals.add(event?.toolCallId ?? "?");
+  else if (type === "tool_approval_resolved") tracker.approvals.delete(event?.toolCallId ?? "?");
+  else if (type === "plan_review_requested") tracker.reviews.add(event?.reviewId ?? "?");
+  else if (type === "plan_review_resolved") tracker.reviews.delete(event?.reviewId ?? "?");
+}
+
+// Approval outranks a plain question when both are open: it is the narrower
+// gate, and the row should not lose it to a dialog opened by another extension.
+function promptSnapshot(tracker) {
+  if (tracker.approvals.size > 0) return "approval";
+  if (tracker.dialogs > 0 || tracker.reviews.size > 0) return "decision";
+  return "none";
+}
+
+function installUI(ctx, tracker, notify) {
+  const ui = ctx?.ui;
+  if (!ui || isSub(ctx)) return;
+  tracker.ctx = ctx;
+  for (const name of PROMPT_METHODS) {
+    const adapter = field(() => ui[name]);
+    if (typeof adapter !== "function") continue;
+    // omp serves ctx.ui as a proxy whose blocking methods come from its own
+    // adapter table, and each adapter re-reads the *target's* property when it
+    // runs (`select: (o, d, h) => wait(() => target.select(o, d, ...))`). The
+    // proxy has no set trap, so `ui.select = wrapped` lands on the target and
+    // that late lookup calls the wrapper right back: wrapper, adapter,
+    // target.select (now the wrapper), ... until the stack overflows. The
+    // method behind the adapter is only visible through the property
+    // descriptor, so call exactly that and never the adapter.
+    const descriptor = field(() => Object.getOwnPropertyDescriptor(ui, name));
+    const original = typeof descriptor?.value === "function" ? descriptor.value : adapter;
+    // Already ours: a second session_start must not double-count. The marker
+    // lives on the target's own function, since the proxy hands out the same
+    // adapter for every read and drops tags added to it.
+    if (original.__miaoTracked) continue;
+    const wrapped = function (...args) {
+      tracker.dialogs += 1;
+      notify();
+      let result;
+      try {
+        result = original.apply(this, args);
+      } catch (error) {
+        tracker.dialogs -= 1;
+        notify();
+        throw error;
+      }
+      const close = () => { tracker.dialogs -= 1; notify(); };
+      // A timed dialog still blocks; settlement is the only close signal.
+      if (result && typeof result.then === "function") {
+        return result.then(
+          (value) => { close(); return value; },
+          (error) => { close(); throw error; },
+        );
+      }
+      close();
+      return result;
+    };
+    wrapped.__miaoTracked = true;
+    ui[name] = wrapped;
+  }
+}
+"#;
 
 // The shared transport owns installation and delivery; this adapter keeps its
 // event vocabulary and payload differences beside its normalization rules.
@@ -242,7 +397,24 @@ const EXTENSION: Extension = Extension {
         // The session's live async-job list, read from the extension context.
         // `running` is already the live-only set (see `shells_from_stop`).
         ("async_jobs", "ctx?.getAsyncJobSnapshot?.()?.running"),
+        // What the payload proves about lineage: a subagent runner preloads
+        // this extension and shares the parent's socket, so its events must be
+        // marked or they settle the parent row (see `Hooks`).
+        ("session_is_child", "isSub(ctx) || undefined"),
+        // The prompt overlay snapshot: "approval", "decision" or "none". Only
+        // an explicit "none" releases the overlay in the launcher. A child
+        // reports the same field from its own tracker: the prompt is on the
+        // parent row's screen even though the rest of the child's event is not.
+        (
+            "blocking_prompt",
+            "tracker ? promptSnapshot(tracker) : undefined",
+        ),
     ],
+    fragments: Some(Fragments {
+        setup: PROMPT_SETUP,
+        functions: PROMPT_FUNCTIONS,
+        install: PROMPT_INSTALL,
+    }),
 };
 
 /// The "hook settings" the launcher writes to its per-session file — for omp,
@@ -318,6 +490,11 @@ struct HookPayload {
     /// could read them — absent on an omp that predates `getAsyncJobSnapshot`.
     #[serde(default)]
     async_jobs: Option<Vec<AsyncJob>>,
+    /// `true` when the runner that emitted the event is a subagent: it shares
+    /// this process's extension instance and socket, but its events are not
+    /// the parent row's. Absent on a main runner.
+    #[serde(default)]
+    session_is_child: Option<bool>,
 }
 
 /// One entry of the extension's `async_jobs` array — omp's
@@ -358,7 +535,7 @@ pub fn parse_hook_payload(event: HookEvent, stdin: &str) -> Result<HookMessage> 
         // coming off the hook as their single source.
         transcript_path: None,
         raw: Some(stdin.to_string()),
-        session_is_child: None,
+        session_is_child: payload.session_is_child,
     })
 }
 
@@ -427,12 +604,186 @@ fn shell_from_job(job: &AsyncJob) -> BgShell {
 // Hook event → status mapping
 // =============================================================================
 
-/// omp departs from [`common::dispatch_default`] in two places: the `Stop` arm
-/// and [`ASK_TOOL`]. The native → normalized renaming is done in the generated
-/// table ([`FORWARDED`]) rather than here, and the two payload-driven
-/// corrections are done in [`normalize_event`]. `agent_end` with a falsy
-/// `willContinue` means the shared `Stop` arm needs no help from a session file
-/// or a rollout scan, and the abort path settles too.
+/// The prompt overlay a payload reported. The generated extension counts open
+/// approvals, plan reviews and blocking `ctx.ui` dialogs, and rides the result
+/// on every payload as `blocking_prompt`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptSignal {
+    Approval,
+    Decision,
+    Released,
+}
+
+/// Only the snapshot field; the rest of the payload is not this parser's
+/// business and `raw` also carries the Stop job list.
+#[derive(Deserialize)]
+struct PromptPayload {
+    blocking_prompt: Option<String>,
+}
+
+/// The overlay the payload named, or `None` when it named none at all. A
+/// missing field is **unknown** and must leave any overlay in place; only an
+/// explicit `"none"` releases it.
+fn prompt_signal(raw: Option<&str>) -> Option<PromptSignal> {
+    let payload: PromptPayload = serde_json::from_str(raw?).ok()?;
+    match payload.blocking_prompt.as_deref()? {
+        "approval" => Some(PromptSignal::Approval),
+        "decision" => Some(PromptSignal::Decision),
+        "none" => Some(PromptSignal::Released),
+        _ => None,
+    }
+}
+
+/// omp's hook interpretation. Everything shared with pi goes through
+/// [`common::dispatch_default`]; this type adds the omp-only layers:
+///
+/// - **Subagent gating.** A subagent runner preloads this process's extensions
+///   and shares its socket, and its extension context marks itself
+///   `ctx.agent.kind === "sub"` (the runner is built with that frozen agent
+///   object). Its events are not the parent session's: a child `agent_end`
+///   would settle the parent row and its `session_start` would rename the
+///   parent's id, so no child fact, status or session id reaches the row. Its
+///   prompt does, and only its prompt — see [`Hooks::apply_child_prompt`].
+/// - **The ask card fallback.** omp's built-in `ask` tool blocks on a
+///   multiple-choice card. The `ctx.ui` wrapper usually sees the card, but one
+///   that bypasses it leaves the tracker at `"none"`, and omp's own tool event
+///   is still a question rather than work — see [`ASK_TOOL`].
+/// - **The prompt overlay.** omp can block on the user in three ways that are
+///   not tool work: the per-tool approval gate, a plan review, and any
+///   blocking `ctx.ui` method (`select`, `confirm`, `input`, `editor`,
+///   `custom`, `askDialog`, `approve`). The extension replaces those methods
+///   on the one shared `uiContext` object, so it sees omp's own ask card and
+///   approval prompt as well as another extension's dialog, without knowing a
+///   tool name. While a prompt is open the visible status is
+///   `WaitingForApproval` or `WaitingForDecision`; the real status keeps
+///   moving underneath so a sibling tool's events, or a terminal `Stop` that
+///   lands while a dialog is still up, are not lost.
+///
+/// The overlay is stateful: [`HookSession`] instances own session state (see
+/// `docs/agent-guides/sessions.md`), and the underlying status must outlive the
+/// event that produced it.
+#[derive(Default)]
+pub(crate) struct Hooks {
+    /// The status the row would show with no prompt overlay.
+    underlying: Option<SessionStatus>,
+    /// The prompt currently blocking the user, if any.
+    overlay: Option<SessionStatus>,
+    /// Whether that overlay came from a child's prompt. A child may open and
+    /// close its own card, but its `Released` must not drop a parent prompt
+    /// that is up: the two run in one TUI, yet their snapshots are separate.
+    child_overlay: bool,
+}
+
+impl Hooks {
+    /// Apply a child payload's prompt snapshot to the overlay and the visible
+    /// row, leaving the underlying status and every session fact alone.
+    ///
+    /// A child's card is a modal on the same TUI the parent row describes, and
+    /// the user answers it there, so hiding it would say `Active` while the
+    /// user is blocked. The rest of the child's event stays dropped because it
+    /// describes the child: its `session_id` would rename the row, its title
+    /// and tokens are not the row's facts, and its `Stop` would settle a turn
+    /// the parent may still be running.
+    fn apply_child_prompt(&mut self, state: &mut LauncherState, raw: Option<&str>) {
+        let Some(signal) = prompt_signal(raw) else {
+            return;
+        };
+        // The child's tracker knows only its own prompt. When a parent prompt
+        // is the one on the row, the child's empty snapshot says nothing about
+        // it, so only a child that covered the row can uncover it.
+        if signal == PromptSignal::Released && !self.child_overlay {
+            return;
+        }
+        // The first child prompt covers a row whose real status this instance
+        // may not have recorded yet (the child's event is the first thing it
+        // sees), so remember what was on the row: that is what its release
+        // restores. A later child prompt over an overlay keeps the first value.
+        if self.overlay.is_none() && self.underlying.is_none() {
+            self.underlying = Some(state.status.clone());
+        }
+        self.overlay = overlay_for(signal);
+        self.child_overlay = self.overlay.is_some();
+        match &self.overlay {
+            Some(overlay) => state.status = overlay.clone(),
+            None => {
+                if let Some(underlying) = &self.underlying {
+                    state.status = underlying.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Whether this payload is omp's built-in `ask` card asking the user a
+/// question rather than doing work. Its `PreToolUse` is the only signal, and a
+/// gated `ask` also fires `tool_approval_requested` for the same tool.
+fn is_ask_card(msg: &HookMessage) -> bool {
+    matches!(
+        msg.event,
+        HookEvent::PreToolUse | HookEvent::PermissionRequest
+    ) && msg.tool_name.as_deref() == Some(ASK_TOOL)
+}
+
+/// The overlay a signal asks for; `Released` is the absence of one.
+fn overlay_for(signal: PromptSignal) -> Option<SessionStatus> {
+    match signal {
+        PromptSignal::Approval => Some(SessionStatus::WaitingForApproval),
+        PromptSignal::Decision => Some(SessionStatus::WaitingForDecision),
+        PromptSignal::Released => None,
+    }
+}
+
+impl crate::agents::hook_session::HookSession for Hooks {
+    fn dispatch_hook(&mut self, state: &mut LauncherState, mut msg: HookMessage) {
+        // See the type doc: a subagent shares this process and socket. Only
+        // its prompt may touch the row, and only the overlay.
+        if msg.session_is_child == Some(true) {
+            self.apply_child_prompt(state, msg.raw.as_deref());
+            return;
+        }
+
+        // Map this event against the real status, not the overlay on screen.
+        // A sibling tool's Pre/PostToolUse and a terminal Stop have to move
+        // the underlying status even while a prompt is up.
+        if let Some(underlying) = self.underlying.take() {
+            state.status = underlying;
+        }
+
+        // The ask fallback: the card is a question, not work, and a gated ask
+        // arrives as `tool_approval_requested`. `ask` is exclusive (see
+        // [`ASK_TOOL`]), so nothing else is in flight and the row must read
+        // Decision rather than Approval.
+        if is_ask_card(&msg) {
+            common::adopt_session_facts(state, &mut msg);
+            state.status = SessionStatus::WaitingForDecision;
+            state.last_tool = msg.tool_name;
+            self.underlying = Some(state.status.clone());
+            self.overlay = None;
+            self.child_overlay = false;
+            return;
+        }
+
+        if let Some(signal) = prompt_signal(msg.raw.as_deref()) {
+            self.overlay = overlay_for(signal);
+            self.child_overlay = false;
+        }
+
+        dispatch_event(state, msg);
+        self.underlying = Some(state.status.clone());
+        if let Some(overlay) = self.overlay.clone() {
+            state.status = overlay;
+        }
+    }
+}
+
+/// omp's departures from [`common::dispatch_default`]: the `Stop` arm only. The
+/// native → normalized renaming is done in the generated table ([`FORWARDED`])
+/// rather than here, and the two payload-driven corrections are done in
+/// [`normalize_event`]. The ask card is the other departure, and it lives one
+/// level up in [`Hooks::dispatch_hook`] beside the overlay it must win over.
+/// `agent_end` with a falsy `willContinue` means the shared
+/// `Stop` arm needs no help from a session file or a rollout scan, and the
+/// abort path settles too.
 ///
 /// The `Stop` arm is omp's background tier, the shape Grok's `Stop` arm takes.
 /// A genuine terminal turn end can arrive with async jobs still running, and
@@ -441,31 +792,7 @@ fn shell_from_job(job: &AsyncJob) -> BgShell {
 /// (`None`) while the row already holds a background tier keeps that tier —
 /// absent evidence is not evidence the work ended, and the previous `Stop`
 /// already named it. An empty list is a turn end saying nothing is in flight.
-///
-/// The other departure is `ask` — a blocking multiple-choice card, not work.
-/// Like Grok's `ask_user_question` and Reasonix's `ask` it is surfaced as
-/// [`SessionStatus::WaitingForDecision`] ("Decision"), the same bucket as
-/// Claude's `AskUserQuestion` and Codex's `request_user_input`; without an arm
-/// the row sits at plain `Active` for as long as the card is up. Its
-/// `PreToolUse` is the only signal — omp blocks on the answer — and a gated
-/// `ask` that also fires `tool_approval_requested` lands here too, so it reads
-/// as a question rather than a tool-approval gate. The question's own
-/// `PostToolUse` settles the row back to `Active` through the shared mapping,
-/// and [`ASK_TOOL`] explains why no hold is needed for another tool's events.
-pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
-    // `ask` is a question, not a tool call — see the doc comment. Both the
-    // tool-execution event and an approval gate on it read as a decision.
-    if matches!(
-        msg.event,
-        HookEvent::PreToolUse | HookEvent::PermissionRequest
-    ) && msg.tool_name.as_deref() == Some(ASK_TOOL)
-    {
-        common::adopt_session_facts(state, &mut msg);
-        state.status = SessionStatus::WaitingForDecision;
-        state.last_tool = msg.tool_name;
-        return;
-    }
-
+fn dispatch_event(state: &mut LauncherState, mut msg: HookMessage) {
     if msg.event == HookEvent::Stop {
         match shells_from_stop(msg.raw.as_deref()) {
             Some(shells) if !shells.is_empty() => {
@@ -719,6 +1046,7 @@ fn user_prompt(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
+    use crate::agents::hook_session::HookSession;
     use crate::state::SessionStatus;
 
     /// A stand-in for the executable, independent of the test binary location.
@@ -739,12 +1067,18 @@ mod tests {
         LauncherState::for_test(AgentKind::Omp, status)
     }
 
-    /// Drive one hook end to end — parse the extension's stdin JSON, then
-    /// dispatch it — so the tests exercise the same path a live hook takes,
-    /// including the event normalization that only happens in the parser.
-    fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
+    /// Drive one hook through one [`Hooks`] instance — parse the extension's
+    /// stdin JSON, then dispatch it — so a sequence exercises the same state a
+    /// live session accumulates.
+    fn drive(hooks: &mut Hooks, state: &mut LauncherState, event: HookEvent, stdin: &str) {
         let msg = parse_hook_payload(event, stdin).expect("payload parses");
-        dispatch_hook(state, msg);
+        hooks.dispatch_hook(state, msg);
+    }
+
+    /// One event through a fresh instance, for tests whose subject is the
+    /// event mapping rather than the overlay's lifetime.
+    fn feed(state: &mut LauncherState, event: HookEvent, stdin: &str) {
+        drive(&mut Hooks::default(), state, event, stdin);
     }
 
     /// The generated table must be the module's [`FORWARDED`] claim rendered,
@@ -764,6 +1098,8 @@ mod tests {
                 "tool_execution_end",
                 "tool_approval_requested",
                 "tool_approval_resolved",
+                "plan_review_requested",
+                "plan_review_resolved",
                 "agent_end",
                 "session_before_compact",
                 "session_compact",
@@ -971,20 +1307,6 @@ mod tests {
         );
     }
 
-    /// The extension reads omp's live async-job list from the context — the
-    /// only enumerator (divergence 5) — as a plain `ctx` expression, so no
-    /// per-session data is spliced into the shared file.
-    #[test]
-    fn the_source_reads_the_async_jobs_from_the_context() {
-        let source = EXTENSION.source(EXE);
-        assert!(
-            source.contains("async_jobs: ctx?.getAsyncJobSnapshot?.()?.running,"),
-            "{source}"
-        );
-        // Same file for every session, so this too is context, not spliced data
-        // — `the_source_carries_no_per_session_data` pins that separately.
-    }
-
     /// A bash job's label is its command; other jobs are named by label or type; and a job is never dropped for a missing label or unknown type —
     /// dropping a running job is the silent failure this exists to prevent.
     #[test]
@@ -1093,10 +1415,61 @@ mod tests {
         assert_eq!(state.status, SessionStatus::Active);
     }
 
+    /// A sibling tool runs concurrently with an approval gate. Its
+    /// `PreToolUse`/`PostToolUse` set the shared mapping to `Active`, which must
+    /// land on the underlying status instead of the visible row: the prompt is
+    /// still up, and only its resolution releases the row.
+    #[test]
+    fn a_sibling_tool_cannot_clear_an_open_approval() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PermissionRequest,
+            &payload(r#","tool_name":"bash","blocking_prompt":"approval""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(r#","tool_name":"read","blocking_prompt":"approval""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForApproval,
+            "a sibling tool starting must not hide the approval"
+        );
+        assert_eq!(state.last_tool.as_deref(), Some("read"));
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload(r#","tool_name":"read","blocking_prompt":"approval""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::ElicitationResult,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::Active,
+            "closing the approval restores the underlying turn status"
+        );
+    }
+
     /// omp's `ask` tool renders a blocking multiple-choice card and blocks
     /// until the user answers; its `tool_execution_start` is the only signal
-    /// the session is waiting. Without the dispatch arm the row sits at plain
-    /// `Active` for as long as the card is up.
+    /// the session is waiting. A card built without the wrapped `ctx.ui`
+    /// methods leaves the tracker at `"none"`, so without this arm the row
+    /// sits at plain `Active` for as long as the card is up.
     #[test]
     fn an_ask_question_holds_the_row_until_answered() {
         let mut state = state_at(SessionStatus::Active);
@@ -1120,11 +1493,12 @@ mod tests {
             &payload(r#","tool_name":"ask""#),
         );
         assert_eq!(state.status, SessionStatus::Active);
-        assert_eq!(state.last_tool, None);
     }
 
     /// A gated `ask` — one that fires `tool_approval_requested` before its
-    /// card — must still read as a question, not as a tool-approval gate.
+    /// card — must still read as a question, not as a tool-approval gate. That
+    /// gate is the question's own, so even its `"approval"` snapshot leaves the
+    /// row on Decision.
     #[test]
     fn a_gated_ask_reads_as_a_question_not_an_approval() {
         let mut state = state_at(SessionStatus::Active);
@@ -1139,27 +1513,294 @@ mod tests {
             "an approval gate on `ask` is the question, not WaitingForApproval"
         );
         assert_eq!(state.last_tool.as_deref(), Some("ask"));
-    }
 
-    /// An interrupted question — the user aborts while the card is up — must
-    /// still settle the row; `agent_end` on the abort path arrives as `Stop`
-    /// and the shared arm takes it to `Idle`, never stranding Decision.
-    #[test]
-    fn an_interrupted_question_still_settles() {
         let mut state = state_at(SessionStatus::Active);
         feed(
             &mut state,
-            HookEvent::PreToolUse,
-            &payload(r#","tool_name":"ask""#),
+            HookEvent::PermissionRequest,
+            &payload(r#","tool_name":"ask","blocking_prompt":"approval""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForDecision,
+            "the gate belongs to the question, so the question wins the row"
+        );
+        assert_eq!(state.last_tool.as_deref(), Some("ask"));
+    }
+
+    /// A `ctx.ui` dialog announces itself through a synthesized `status-update`
+    /// with no tool name. Mid-turn it must read as Decision; opened while the
+    /// row is Idle it must return to Idle, not to a guessed Active.
+    #[test]
+    fn a_ui_dialog_reads_as_a_decision_and_returns_to_the_underlying_status() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"decision""#),
         );
         assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.last_tool, None, "a dialog is not a tool call");
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
 
-        feed(&mut state, HookEvent::Stop, &payload(""));
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Idle);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"decision""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"none""#),
+        );
         assert_eq!(
             state.status,
             SessionStatus::Idle,
-            "an aborted question must not strand the row in Decision"
+            "a dialog opened at rest returns to rest"
         );
+    }
+
+    /// A terminal `Stop` can arrive while a dialog is still up (an extension
+    /// opened one from a command, or omp settled the turn before the modal
+    /// closed). The row keeps waiting; when the dialog closes it lands on the
+    /// turn end's real status, including the background tier its live jobs name.
+    #[test]
+    fn a_terminal_stop_under_a_prompt_keeps_waiting_and_releases_to_the_turn_end() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"decision""#),
+        );
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::Stop,
+            &payload(r#","blocking_prompt":"decision","async_jobs":[]"#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForDecision,
+            "the settle must not hide the open dialog"
+        );
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"decision""#),
+        );
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::Stop,
+            &payload(
+                r#","blocking_prompt":"decision","async_jobs":[{"type":"bash","label":"npm run dev"}]"#,
+            ),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(state.background_commands, ["npm run dev"]);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
+    }
+
+    /// The snapshot precedence itself lives in the generated extension, so the
+    /// forwarder harness drives it: an approval open beside a dialog reads
+    /// `approval`, and closing the dialog leaves it `approval` until the
+    /// approval resolves to `none`. The same run pins the plain-dialog sequence,
+    /// plan reviews, a dialog after a session switch (whose payloads the driver
+    /// asserts carry the new session id), and the subagent's own snapshot.
+    #[test]
+    fn an_open_approval_outranks_a_dialog_and_each_close_reports_its_own_snapshot() {
+        let source = EXTENSION.source(EXE);
+        let messages = super::super::forwarder_test::run(&source, "omp_prompts");
+        let snapshots: Vec<(HookEvent, Option<String>)> = messages
+            .into_iter()
+            .map(|(event, body)| {
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let snapshot = value["blocking_prompt"].as_str().map(str::to_string);
+                (event, snapshot)
+            })
+            .collect();
+        // Session start, dialog open, dialog close, approval, dialog open
+        // under the approval, dialog close, approval resolved, plan review
+        // request, plan review resolved, session switch, dialog open, dialog
+        // close, subagent tool, subagent approval, subagent approval resolved.
+        assert_eq!(
+            snapshots,
+            [
+                (HookEvent::SessionStart, Some("none".into())),
+                (HookEvent::StatusUpdate, Some("decision".into())),
+                (HookEvent::StatusUpdate, Some("none".into())),
+                (HookEvent::PermissionRequest, Some("approval".into())),
+                (HookEvent::StatusUpdate, Some("approval".into())),
+                (HookEvent::StatusUpdate, Some("approval".into())),
+                (HookEvent::ElicitationResult, Some("none".into())),
+                (HookEvent::StatusUpdate, Some("decision".into())),
+                (HookEvent::StatusUpdate, Some("none".into())),
+                (HookEvent::SessionStart, Some("none".into())),
+                (HookEvent::StatusUpdate, Some("decision".into())),
+                (HookEvent::StatusUpdate, Some("none".into())),
+                (HookEvent::PreToolUse, Some("none".into())),
+                (HookEvent::PermissionRequest, Some("approval".into())),
+                (HookEvent::ElicitationResult, Some("none".into())),
+            ]
+        );
+    }
+
+    /// A payload with no snapshot field is unknown, not "nothing is open": an
+    /// overlay already on screen survives it. Only an explicit `none` releases.
+    #[test]
+    fn an_unknown_snapshot_leaves_the_overlay_alone_until_an_explicit_none() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"decision""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload(r#","tool_name":"bash""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForDecision,
+            "an event that says nothing about the prompt must not release it"
+        );
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+    }
+
+    /// A subagent runner shares this process's extension instance and socket.
+    /// Its own card is a modal on the same TUI the parent row describes, so the
+    /// snapshot moves the overlay; every other thing its payload carries — the
+    /// session id, a title, a `Stop` — stays off the parent row.
+    #[test]
+    fn a_child_prompt_moves_the_overlay_but_no_fact_of_the_row() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        state.session_id = Some("parent".into());
+        state.name = Some("parent title".into());
+
+        // The child's card is open: the row must say so.
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            r#"{"session_id":"child","session_title":"child title","session_is_child":true,"blocking_prompt":"decision"}"#,
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("parent"),
+            "a child session_start must not rename the row"
+        );
+        assert_eq!(state.name.as_deref(), Some("parent title"));
+
+        // The child's `Stop` says its card closed; it must neither settle the
+        // parent nor deliver the child's session id.
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::Stop,
+            r#"{"session_id":"child","session_is_child":true,"blocking_prompt":"none"}"#,
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::Active,
+            "a child Stop must not settle the parent row"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("parent"));
+        assert_eq!(state.name.as_deref(), Some("parent title"));
+    }
+
+    /// The child's tracker knows only its own card. A `"none"` from the child
+    /// while the parent's prompt is the one on the row says nothing about that
+    /// prompt, so only the parent's own release may uncover it. A sibling tool
+    /// moving the status underneath is what makes the mistake visible: the
+    /// overlay is the only thing still saying the prompt is up.
+    #[test]
+    fn a_child_release_cannot_drop_a_parent_prompt() {
+        let mut hooks = Hooks::default();
+        let mut state = state_at(SessionStatus::Active);
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PermissionRequest,
+            &payload(r#","tool_name":"bash","blocking_prompt":"approval""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+
+        // A sibling tool runs while the prompt is up: the real status moves to
+        // Active, and only the overlay keeps the row honest.
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(r#","tool_name":"read","blocking_prompt":"approval""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForApproval);
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::StatusUpdate,
+            r#"{"session_is_child":true,"blocking_prompt":"none"}"#,
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForApproval,
+            "a child with no prompt of its own must not release the parent's"
+        );
+
+        drive(
+            &mut hooks,
+            &mut state,
+            HookEvent::ElicitationResult,
+            &payload(r#","blocking_prompt":"none""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
     }
 
     /// **The point of registering `session_switch`.** omp emits it on `/new`,
