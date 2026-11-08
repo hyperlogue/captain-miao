@@ -55,10 +55,14 @@ use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 /// The one named-profile slot captain-miao reserves on managed Codex launches.
 const PROFILE_NAME: &str = "captain-miao";
 const PROFILE_FILE: &str = "captain-miao.config.toml";
-/// First line of the file and the whole ownership probe, so it has to stay
+/// First line we write and the whole ownership probe, so it has to stay
 /// byte-stable: every profile already on disk would read as someone else's the
-/// moment this string changes, and a launch refuses those.
-const PROFILE_MARKER: &str = "# Managed by captain-miao; changes are overwritten.\n";
+/// moment this string changes, and a launch refuses those. [`is_owned_profile`]
+/// matches it as a line anywhere in the file, not as a prefix: Codex edits the
+/// profile with a format-preserving TOML editor that keeps a leading comment
+/// as the first table's decor, so a top-level key it adds (persisting a
+/// `/model` choice, say) lands above the marker.
+const PROFILE_MARKER: &str = "# Managed by captain-miao; changes are overwritten.";
 /// What a refresh actually writes. The second line is the honest version of
 /// the first: [`build_profile`] regenerates only the `hooks` tables.
 const PROFILE_HEADER: &str = concat!(
@@ -673,7 +677,7 @@ fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
             }
             let current = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading Codex profile {}", path.display()))?;
-            if !current.starts_with(PROFILE_MARKER) {
+            if !is_owned_profile(&current) {
                 anyhow::bail!(
                     "Codex profile {} already exists and is not owned by captain-miao",
                     path.display()
@@ -696,6 +700,15 @@ fn ensure_profile_at(home: &Path, hooks_json: &str) -> Result<PathBuf> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing Codex profile {}", path.display()))?;
     Ok(path)
+}
+
+/// Whether a profile on disk carries [`PROFILE_MARKER`] on a line of its own.
+/// A refresh rewrites the header at the top, so a marker that Codex pushed
+/// down is moved back on the next launch.
+fn is_owned_profile(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim_end() == PROFILE_MARKER)
 }
 
 /// PascalCase Codex event key (as it appears in hook config) → the snake_case
@@ -1643,7 +1656,8 @@ mod tests {
     fn profile_contains_only_inline_hooks_and_own_trust() {
         let path = PathBuf::from("/users/me/.codex/captain-miao.config.toml");
         let profile = build_profile(&path, &build_hooks_settings("/run/x.sock"), None).unwrap();
-        assert!(profile.starts_with(PROFILE_MARKER));
+        assert!(profile.starts_with(PROFILE_HEADER));
+        assert!(is_owned_profile(&profile));
         let doc: toml::Table = profile.parse().unwrap();
         assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
 
@@ -1825,6 +1839,24 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "model = \"user-choice\"\n"
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn profile_refresh_accepts_keys_codex_wrote_above_the_marker() {
+        let home = scratch_home("codex-write");
+        let hooks = build_hooks_settings("/run/x.sock");
+        let path = ensure_profile_at(&home, &hooks).unwrap();
+        // Codex's TOML editor keeps the header as the first table's decor and
+        // inserts a new top-level key before that table.
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("model = \"codex-choice\"\n{written}")).unwrap();
+
+        ensure_profile_at(&home, &hooks).unwrap();
+        let refreshed = std::fs::read_to_string(&path).unwrap();
+        assert!(refreshed.starts_with(PROFILE_HEADER));
+        let doc: toml::Table = refreshed.parse().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("codex-choice"));
         let _ = std::fs::remove_dir_all(home);
     }
 
