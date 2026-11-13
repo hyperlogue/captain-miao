@@ -16,7 +16,7 @@ Remote sessions persist across disconnects and system sleep.</p>
 
 <img src="assets/dashboard.png" alt="captain-miao dashboard in Kitty with 15 active and waiting agent sessions">
 
-<video src="https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/49709d95-c30a-4390-be64-d52f6b95a751" controls width="100%"></video>
 
 ## Quick start
 
