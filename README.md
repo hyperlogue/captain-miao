@@ -16,7 +16,7 @@ Remote sessions persist across disconnects and system sleep.</p>
 
 <img src="assets/dashboard.png" alt="captain-miao dashboard in Kitty with 15 active and waiting agent sessions">
 
-<video src="https://github.com/user-attachments/assets/49709d95-c30a-4390-be64-d52f6b95a751" controls width="100%"></video>
+https://github.com/user-attachments/assets/49709d95-c30a-4390-be64-d52f6b95a751
 
 ## Quick start
 
@@ -137,14 +137,14 @@ The detail panel appends reported effort levels to model names (for example,
 
 The six most frequent shortcuts:
 
-| Key                  | Action                                                 |
-| -------------------- | ------------------------------------------------------ |
-| `j` / `k`, `↑` / `↓` | Navigate sessions.                                     |
-| `Enter`              | Focus the window of the selected session.              |
+| Key                  | Action                                                                     |
+| -------------------- | -------------------------------------------------------------------------- |
+| `j` / `k`, `↑` / `↓` | Navigate sessions.                                                         |
+| `Enter`              | Focus the window of the selected session.                                  |
 | `o` / `O`            | Start session with selected host, directory, and agent / choose directory. |
-| `r` / `f`            | Resume a conversation / fork the selected session.     |
-| `X`                  | Stop the selected session.                             |
-| `s`                  | Select the next session that requires attention.       |
+| `r` / `f`            | Resume a conversation / fork the selected session.                         |
+| `X`                  | Stop the selected session.                                                 |
+| `s`                  | Select the next session that requires attention.                           |
 
 Press `?` to view all key bindings.
 Press `,` to open preferences.
@@ -156,6 +156,7 @@ Foreground turns and approval prompts keep their own status.
 
 Press `Space t i` to override command classifications.
 Configure rules in **Preferences → Idle tasks**:
+
 - `Enter`: Edit pattern.
 - `t`: Toggle Task/Idle.
 - `a`: Add rule.
