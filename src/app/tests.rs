@@ -7661,6 +7661,24 @@ fn the_detail_panel_names_the_worktree_a_session_sits_in() {
 }
 
 #[test]
+fn the_detail_panel_shows_the_agent_pid() {
+    let mut d = TestDashboard::new(160, 40);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.preview_visible = false;
+    let mut s = session(1, "/work", SessionStatus::Idle);
+    s.child_pid = Some(4242);
+    d.set_sessions(vec![s]);
+    let out = d.render();
+    assert!(out.contains("PID      4242"), "{out}");
+
+    // Before the launcher reports its child, the field holds a placeholder.
+    d.app.sessions[0].child_pid = None;
+    let out = d.render();
+    assert!(out.contains("PID      —"), "{out}");
+}
+
+#[test]
 fn the_detail_panel_hides_old_errors_without_erasing_them() {
     let mut d = TestDashboard::new(160, 40);
     d.app.panels_initialized = true;

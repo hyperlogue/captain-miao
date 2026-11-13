@@ -691,6 +691,13 @@ impl App {
                 Span::styled(status_text, Style::default().fg(status_fg)),
             ]),
             Line::from(vec![label("Session"), Span::raw(sid)]),
+            Line::from(vec![
+                label("PID"),
+                Span::raw(
+                    s.child_pid
+                        .map_or_else(|| "—".to_string(), |p| p.to_string()),
+                ),
+            ]),
         ];
         lines.extend(diagnostic_lines());
         lines.push(Line::from(vec![label("Dir"), Span::raw(cwd)]));
@@ -771,8 +778,8 @@ impl App {
         lines
     }
 
-    /// Pid, terminfo, context, updated, and the first prompt. These left the
-    /// side panel; `Space t s` opens them here.
+    /// Pid with window and tab, terminfo, context, updated, and the first
+    /// prompt. The side panel shows only the pid; `Space t s` opens the rest.
     fn session_record_lines(&self, width: usize) -> Vec<Line<'static>> {
         let Some(s) = self.selected_session_ref() else {
             return vec![Line::from(Span::styled(
