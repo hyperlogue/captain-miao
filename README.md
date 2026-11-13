@@ -4,20 +4,19 @@
 
 <h1 align="center">captain-miao</h1>
 
-<p align="center"><b>Mission control for AI coding sessions in terminal.</b><br>
-See the status of all sessions and jump right to the terminal tab that needs you.<br>
-Support persistent sessions on remote servers. Close the lid and remote sessions
-will keep working.</p>
+<p align="center"><b>Mission control for AI coding sessions in your terminal.</b><br>
+Monitor all agent sessions and jump to the window that needs attention.<br>
+Remote sessions persist across disconnects and system sleep.</p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@hyperlogue/captain-miao"><img src="https://img.shields.io/npm/v/@hyperlogue/captain-miao?color=cb3837&amp;logo=npm&amp;label=%40hyperlogue%2Fcaptain-miao" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/@hyperlogue/captain-miao"><img src="https://img.shields.io/npm/v/@hyperlogue/captain-miao?color=orange&amp;logo=npm&amp;label=%40hyperlogue%2Fcaptain-miao" alt="npm version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platforms: macOS, Linux">
 </p>
 
-<a href="assets/captain-miao.mp4"><img src="assets/dashboard.png" alt="captain-miao dashboard in Kitty with 15 active and waiting agent sessions"></a>
+<img src="assets/dashboard.png" alt="captain-miao dashboard in Kitty with 15 active and waiting agent sessions">
 
-[Watch the 60-second demo](assets/captain-miao.mp4)
+<video src="https://github.com/user-attachments/assets/e51ffc2f-0d6c-41c1-a825-0de32f2bed3a" controls width="100%"></video>
 
 ## Quick start
 
@@ -27,7 +26,7 @@ Install captain-miao and at least one [supported agent](#supported-agents):
 npm install -g @hyperlogue/captain-miao
 ```
 
-You can also run `npx @hyperlogue/captain-miao` after you configure your terminal.
+You can also run `npx @hyperlogue/captain-miao` after terminal configuration.
 [Prebuilt binaries](https://github.com/hyperlogue/captain-miao/releases) are available for macOS and Linux.
 
 **1. Configure your terminal**
@@ -47,8 +46,8 @@ allow_remote_control socket-only
 listen_on unix:/tmp/captain-miao-kitty
 ```
 
-These settings allow programs with socket access to control Kitty windows.
-For more security, Kitty also supports [password authorization](https://sw.kovidgoyal.net/kitty/remote-control/).
+These settings allow socket access to control Kitty windows.
+For higher security, use [password authorization](https://sw.kovidgoyal.net/kitty/remote-control/).
 
 **2. Start the dashboard**
 
@@ -57,54 +56,36 @@ cd /path/to/your/project
 miao
 ```
 
-Press `o` to start a new session with the same host, directory, and agent harness
-as the selected session.
-If you do not select a session, `o` opens the directory picker.
-Press `O` to select a directory.
+Press `o` to start a session with the selected host, directory, and agent.
+If no session is selected, `o` opens the directory picker.
+Press `O` to open the directory picker directly.
 
-Slow actions run in the background so you can keep navigating. If an action is
-still running after 0.8 seconds, a progress notification appears in the bottom
-right. When the result is visible in the dashboard or a new window, progress
-disappears without a success popup. Actions such as Git push still report
-success explicitly. Errors remain until dismissed; dismissing progress does
-not cancel the action. Press `x` to dismiss notifications oldest first. `Esc`
-does the same after closing panels and clearing pending shortcuts or search.
+Slow actions run in the background. If an action exceeds 0.8 seconds,
+a bottom-right progress notification appears. The notification clears
+when results appear. Actions like Git push report success explicitly.
+Errors remain until dismissed. Dismissing progress does not cancel the action.
+Press `x` to dismiss notifications, oldest first. Press `Esc` to close panels,
+clear input, and dismiss notifications.
 
-On macOS, waking the laptop or changing networks prompts an immediate connection
-check. Checks allow three seconds for a reply so a briefly slow connection can
-stay open; stalled connections reconnect without waiting through the normal
-retry backoff. Recovery shows a delayed progress notification and still depends
-on Wi-Fi and the VPN becoming reachable.
+On macOS, system wake or network changes trigger an immediate connection check.
+The check waits three seconds before reconnecting stalled links.
+Recovery requires active Wi-Fi or VPN.
 
-In the directory picker, press `Ctrl-o` to choose an agent and host side by side.
-Use `qwertyuiop` for agents and `asdfgzxcvb` for the ten hosts on each page;
-`[` and `]` turn host pages. The configured defaults start selected.
-Press `Enter` to keep the choices and return to directory selection, `Ctrl-o`
-to launch immediately in the previously highlighted directory, or `Esc` to
-discard changes and return. Choices apply to this launch only. The selector
-shows the launch directory and validates it on the chosen host before launching.
-The existing `Ctrl-t` (cycle agent) and `Ctrl-h` (cycle host) shortcuts also work
-in the directory picker.
-Press `r` to resume a previous conversation.
-Inside the resume picker, `Ctrl-o` opens the same agent and host selector.
-The agent filter starts on **All** (`0`); individual agents use `qwertyuiop`.
-It filters the loaded session list alongside the text search. `Enter` keeps
-the filters and returns to the list, and `Esc` cancels selector changes.
-`Ctrl-o` resumes the previously highlighted session when it still matches
-the chosen host and agent; otherwise it applies the filters and returns to
-the list so you can choose a session. Hosts use `asdfgzxcvb` and `[` / `]`
-for paging, just as in the new-session selector.
+In the directory picker, press `Ctrl-o` to select an agent and host.
+Press `qwertyuiop` for agents and `asdfgzxcvb` for hosts (`[` and `]` turn pages).
+Press `Enter` to confirm choices, `Ctrl-o` to launch immediately, or `Esc` to cancel.
+Shortcuts `Ctrl-t` and `Ctrl-h` cycle agents and hosts.
 
-Resume lists are cached in memory. Opening the picker or switching hosts shows
-the last available result immediately and refreshes it in the background,
-preserving your search and selection. A failed refresh keeps the cached sessions.
-The server warms its cache once at startup; there is no timed refresh. Native
-history readers reuse unchanged files, while CLI/API-only sources use their
-normal listing operation. Updated servers keep entries per agent so the agent
-filter applies before the visible session limit. Caches reset when their process
-restarts.
+Press `r` to resume a conversation. In the picker, press `Ctrl-o` to filter
+by agent and host (`0` for all, `qwertyuiop` per agent). Press `Enter` to apply
+filters, or `Ctrl-o` to resume the selected session.
 
-The dashboard highlights sessions that require attention.
+The resume picker caches results in memory. It displays cached sessions
+immediately and refreshes them in the background. Search filters and selections
+persist during refresh. If refresh fails, cached sessions remain visible.
+Process restarts clear the cache.
+
+The dashboard highlights sessions that need attention.
 Press `s` to select the next highlighted session.
 Press `Enter` to focus its window.
 In Ghostty, start agents from the dashboard.
@@ -112,13 +93,12 @@ In Ghostty, start agents from the dashboard.
 ## Why captain-miao
 
 - **Keep your terminal environment.** Sessions run in native windows, tabs, or panes.
-  Your fonts, settings, and key bindings do not change.
-- **No changes to global agent settings.** Managed sessions use isolated tracking hooks.
-  The files `~/.claude/settings.json` and `~/.codex/hooks.json` remain unchanged.
-  Integrations use separate files and profiles.
-- **Persistent remote sessions.** `miao-server` runs agents in a [shpool](https://github.com/shell-pool/shpool) pty pool.
-  Sessions continue when your computer sleeps or disconnects.
-  Enable clipboard sharing to paste local images into remote agents with `Ctrl-V`.
+  Fonts, themes, and key bindings remain unchanged.
+- **Keep global settings clean.** Managed sessions use isolated tracking hooks.
+  Configuration files like `~/.claude/settings.json` and `~/.codex/hooks.json` remain untouched.
+- **Persistent remote sessions.** `miao-server` runs agents in a [shpool](https://github.com/shell-pool/shpool) PTY pool.
+  Sessions survive network drops and client sleep.
+  Enable clipboard sharing to paste local images with `Ctrl-V`.
 
 ## Supported agents
 
@@ -135,15 +115,13 @@ Other integrations have API limitations or less testing.
 | [Kimi Code](https://github.com/MoonshotAI/kimi-code)         |        | Does not support session fork or worktrees.                                                      |
 | [opencode](https://github.com/anomalyco/opencode)            |        | Uses a generated plugin. Does not support worktrees or background-task tiers.                    |
 | [Pi](https://github.com/earendil-works/pi)                   |        | Supports resume picker, fork, and context tracking. Does not track approval states or worktrees. |
-| [omp](https://github.com/can1357/oh-my-pi)                   |        | Tracks approvals, decisions (including any extension's dialog), plan reviews, and background tasks. Does not support worktrees. |
+| [omp](https://github.com/can1357/oh-my-pi)                   |        | Tracks approvals, decisions, plan reviews, and background tasks. Does not support worktrees.     |
 
-Antigravity uses a separate configuration copy for managed sessions.
-captain-miao preserves your custom status-line command.
-Updates to your global configuration apply during the next launch.
+Antigravity uses isolated configuration copies for managed sessions, preserving
+custom status lines. Global configuration changes apply on the next launch.
 
-The detail panel appends the reported effort level to the model, for example
-`Opus 4.8 (high)`. Claude Code, Codex, Pi, and omp supply it when available;
-sessions without a reported effort keep the model alone.
+The detail panel appends reported effort levels to model names (for example,
+`Opus 4.8 (high)`). Claude Code, Codex, Pi, and omp supply effort data.
 
 ## Supported terminals
 
@@ -171,48 +149,42 @@ The six most frequent shortcuts:
 Press `?` to view all key bindings.
 Press `,` to open preferences.
 
-Background commands count as **Task** unless built-in heuristics recognize a
-server, watcher, or review wait (such as `npm run dev`, `cargo watch`, or
-`r3 watch`), which counts as **Idle**. Unknown commands remain Task. Every
-reported background command must count as Idle for the session to be Idle;
-foreground turns and approval prompts retain their status.
+Background commands count as **Task** by default. Dev servers and watchers
+(such as `npm run dev` or `cargo watch`) count as **Idle**.
+A session becomes Idle only when all background commands are Idle.
+Foreground turns and approval prompts keep their own status.
 
-Press `Space t i` to override the selected session's commands as Task or Idle.
-View these choices in **Preferences → Idle tasks**: `Enter` edits a pattern,
-`t` switches Task/Idle, `a` adds an Idle rule, and `d` or `r` removes an override
-to restore automatic detection. Patterns match whole commands; `*` matches
-any text and backslash escapes a literal star or backslash. User rules override
-built-in heuristics, with the last matching rule taking precedence, across
-all hosts. Compound or unrecognized commands can be classified this way too.
-For older installations, update `miao-server` on pooled hosts and restart
-existing launchers so they report command identities.
+Press `Space t i` to override command classifications.
+Configure rules in **Preferences → Idle tasks**:
+- `Enter`: Edit pattern.
+- `t`: Toggle Task/Idle.
+- `a`: Add rule.
+- `d` or `r`: Remove override.
 
-Restart waits for the previous session to end before its replacement resumes
-the conversation. If the host cannot confirm removal, the dashboard reports an
-error. Resume also refuses conversations still managed on the selected host.
+Patterns match complete command strings. Use `*` as a wildcard and `\\` to escape
+literal characters. Custom rules override defaults across all hosts.
+
+Restart waits for the previous session to stop before resuming.
+If removal cannot be confirmed, the dashboard displays an error.
+Resume rejects sessions that remain active on the host.
 
 ## Remote sessions
 
 Press `Space h` to add an SSH host and configure `miao-server`.
-Remote sessions continue to run when your network disconnects or your computer sleeps.
+Remote sessions continue running when your network drops or your computer sleeps.
 Press `Enter` on a detached session to reconnect.
-In the Hosts panel, press `c` to suspend a host and `c` again to reconnect with
-a fresh SSH connection. This disconnects attached terminals sharing that
-connection; their remote pooled sessions keep running.
-Closing a window stops the session by default.
-To keep sessions active after window close, set `[remote] on_window_close = "detach"` in `~/.config/captain-miao/config.toml`.
+In the Hosts panel, press `c` to disconnect an SSH connection, and `c` again to reconnect.
+Remote pooled sessions continue running while disconnected.
+Closing a window terminates the session by default.
+To detach instead, set `[remote] on_window_close = "detach"` in `~/.config/captain-miao/config.toml`.
 
 ## How it works
 
-- **Local sessions:** `miao launch <agent>` starts the agent process with a launcher wrapper.
-  The launcher captures hook events, reads agent session data, and writes status files.
-  The dashboard monitors these files and updates the session table.
-  When you select a session, the dashboard uses terminal controls to focus that window or pane.
-- **Remote sessions:** The agent and launcher run on the remote SSH host inside a `miao-server` pty pool.
-  The server transmits session updates across SSH to your local dashboard.
-  Your local terminal connects to the remote session for user input and output.
-  If the network connection drops or your computer sleeps, the agent continues on the host.
-  Select the session and press `Enter` to reconnect.
+- **Local sessions:** `miao launch <agent>` wraps the agent process and records
+  hook events to status files. The dashboard reads these files and controls terminal focus.
+- **Remote sessions:** The agent runs inside a `miao-server` PTY pool on the SSH host.
+  The server streams status updates over SSH. If the network drops, the agent
+  continues running. Press `Enter` on the session to reconnect.
 
 ## License
 
