@@ -6251,6 +6251,49 @@ fn workdir_picker_starts_on_the_focused_sessions_cwd() {
     }
 }
 
+/// The first open waits for the host inventory; later opens use the cache.
+#[tokio::test(start_paused = true)]
+async fn workdir_picker_first_open_selects_cwd_after_delayed_reply() {
+    use crate::backend::{Backend, test_support};
+    use crate::protocol::{ClientFrame, ServerFrame};
+    use crate::state::HostId;
+    use std::time::Duration;
+
+    let mut d = TestDashboard::new(120, 15);
+    let host = HostId("box".into());
+    let (remote, mut peer) = test_support::connected(host.clone());
+    d.app.backends.push(Backend::Remote(remote));
+    d.app.extra_prefs.host_order = Some(vec![host.0.clone()]);
+    let mut selected = session(1, "~/beta", SessionStatus::Active);
+    selected.host = host;
+    selected.pool_session = Some("cm-1".into());
+    d.set_sessions(vec![selected]);
+
+    d.press(KeyCode::Char('O'));
+    let (request, reply) = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("picker must request the host's recent directories");
+    let ClientFrame::ListRecentDirs { req_id } = request else {
+        panic!("expected directory request")
+    };
+    assert!(d.app.picker.as_ref().unwrap().picker.items.is_empty());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    reply
+        .send(ServerFrame::RecentDirs {
+            req_id,
+            cwds: vec!["~/alpha".into(), "~/beta".into()],
+        })
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(d.app.poll_operations());
+    assert_eq!(workdir_highlighted(&d.app), "~/beta");
+
+    d.press(KeyCode::Esc);
+    d.press(KeyCode::Char('O'));
+    assert_eq!(workdir_highlighted(&d.app), "~/beta");
+    assert!(peer.is_empty(), "reopening should use the cached inventory");
+}
+
 /// A session launched by hand (`miao launch claude .`) recorded an absolute cwd
 /// on its state file, while the picker's rows are host-canonical (§3). Both
 /// sides collapse before the match, or the preselect would work only for rows

@@ -5731,8 +5731,8 @@ impl App {
 
     /// Settle the workdir picker's cursor on its pinned dir, seeding the pin
     /// from the **focused row's** cwd the first time there is nothing pinned.
-    /// Run on open and after every `Ctrl-h` re-seed — the two moments the list
-    /// is rebuilt from scratch.
+    /// Run on open, after every `Ctrl-h` re-seed, and when a host's directory
+    /// inventory arrives in the background.
     ///
     /// Opening the picker while looking at a session is nearly always "another
     /// one of these", so the cursor starts on that row's cwd and a bare Enter
@@ -5879,6 +5879,9 @@ impl App {
                 app.recent_dirs_cache.insert(host.clone(), cwds);
                 if matches!(app.picker.as_ref().map(|p| &p.kind), Some(PickerKind::Workdir { host: current, .. }) if current == &host) {
                     app.sync_workdir_picker_list();
+                    // On the first open the inventory was empty when the pin
+                    // was seeded. Resolve it now that the host's rows arrived.
+                    app.preselect_workdir();
                 }
             },
         );
