@@ -201,9 +201,11 @@ needed. `miao-server` still serves the rest of the host (resume list, directory
 picker, vitals, VCS), and its sessions show `↻`. A remote Tower session's window
 runs `tower-cli attach`.
 
-Unset the variable to return to the built-in launcher. Local sessions still on
-Tower are then the ones marked; remote Tower sessions keep running but are not
-listed until the variable is set again.
+Trying Tower changes nothing about sessions already running: they are only
+marked, never stopped or restarted unless you ask. Unset the variable to return
+to the built-in launcher and `miao-server`. Those sessions are then unmarked and
+work as before; sessions still on Tower, local or remote, stay listed, marked
+and controllable. Without the variable, Miao never starts a Tower daemon.
 
 ## License
 

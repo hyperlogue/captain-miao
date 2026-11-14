@@ -1,7 +1,9 @@
 //! Sessions on an ssh host's Tower daemon, behind [`crate::tower::FLAG`].
 //!
 //! With the flag set, a remote host's new sessions run under the Tower
-//! installed there. The dashboard drives that host's `tower-cli` over the
+//! installed there. With it unset, sessions an earlier run started there
+//! stay listed and operable, but no daemon is started and nothing new runs
+//! on Tower. The dashboard drives that host's `tower-cli` over the
 //! host's shared ssh connection: `tower-cli events` streams the daemon's
 //! session records, `tower-cli rpc` opens, stops and tags sessions, and an
 //! attach window runs `tower-cli attach`. The CLI starts the daemon when it
@@ -39,6 +41,9 @@ const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// A stream that lasted this long was healthy, so its loss retries promptly.
 const HEALTHY: Duration = Duration::from_secs(30);
+/// How often a host is asked again, with the flag unset, after its Tower
+/// was found absent or idle.
+const RETRY_DORMANT: Duration = Duration::from_secs(600);
 
 /// One host's Tower: its live sessions, and how to reach its CLI.
 pub(crate) struct TowerLink {
@@ -252,7 +257,7 @@ impl TowerLink {
             .args(&self.opts)
             .arg("-T")
             .arg(&self.target)
-            .arg(remote_command(args))
+            .arg(remote_command(&cli_args(crate::tower::enabled(), args)))
             .stdin(Stdio::null())
             .kill_on_drop(true);
         command
@@ -335,6 +340,17 @@ fn launcher_key(id: &str) -> u32 {
     0x8000_0000 | hash
 }
 
+/// The CLI's arguments. With the flag unset the dashboard only follows
+/// sessions Tower already runs, so it must never start a daemon.
+fn cli_args<'a>(enabled: bool, args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = Vec::with_capacity(args.len() + 1);
+    if !enabled {
+        all.push("--no-start");
+    }
+    all.extend_from_slice(args);
+    all
+}
+
 /// The remote command running `tower-cli args` in the account's login shell,
 /// which is where a user's `PATH` is complete.
 fn remote_command(args: &[&str]) -> String {
@@ -404,18 +420,32 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
     loop {
         let Some(this) = link.upgrade() else { return };
         let started = Instant::now();
-        this.log
-            .info(format!("following Tower sessions with `{CLI} events`"));
-        match follow_once(&this).await {
-            Ok(()) => this.log.error("the Tower event stream ended"),
-            Err(reason) => this.log.error(format!("Tower: {reason}")),
+        // With the flag unset, a host without Tower or without a running
+        // daemon is the normal case, not worth a line in the log.
+        let enabled = crate::tower::enabled();
+        if enabled {
+            this.log
+                .info(format!("following Tower sessions with `{CLI} events`"));
+        }
+        let outcome = follow_once(&this).await;
+        let was_up = this.reported();
+        if enabled || was_up {
+            match outcome {
+                Ok(()) => this.log.error("the Tower event stream ended"),
+                Err(reason) => this.log.error(format!("Tower: {reason}")),
+            }
         }
         this.lost();
         drop(this);
         if started.elapsed() >= HEALTHY {
             backoff = RETRY_INITIAL;
         }
-        tokio::time::sleep(backoff).await;
+        let wait = if enabled || was_up {
+            backoff
+        } else {
+            RETRY_DORMANT
+        };
+        tokio::time::sleep(wait).await;
         backoff = (backoff * 2).min(RETRY_MAX);
     }
 }
@@ -557,6 +587,12 @@ mod tests {
         ));
         assert!(link.rows().is_empty());
         assert!(event(b"Welcome to the host\n").is_none());
+    }
+
+    #[test]
+    fn without_the_flag_the_cli_never_starts_a_daemon() {
+        assert_eq!(cli_args(false, &["events"]), ["--no-start", "events"]);
+        assert_eq!(cli_args(true, &["events"]), ["events"]);
     }
 
     #[test]

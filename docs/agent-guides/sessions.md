@@ -102,6 +102,12 @@ owns the local side and the record-to-row mapping both sides use;
   set, clear of any real launcher pid; its `pool_session` is the Tower id,
   which is the binding token and decides the attach argv. Only owned, live
   records are listed. Kill confirmation for such a key waits on Tower alone.
+- Trying the flag must not harm sessions on the other backend: marking is
+  display only, every restart is the user's, and neither launcher removes the
+  other's hooks (Grok's live in separate files; each hook routes only through
+  its own launcher's environment). With the flag unset the link still
+  follows each host's Tower, passing `--no-start`, so its sessions stay
+  operable without starting a daemon; new sessions go to `miao-server`.
 - `tower-cli` treats a caller with `CLAUDE_CODE_SESSION_ID` or
   `CODEX_THREAD_ID` set as an agent and refuses admin calls; ssh does not
   forward them by default.

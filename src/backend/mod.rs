@@ -1372,7 +1372,7 @@ impl Backend {
             Backend::Remote(remote) => {
                 let remote = Arc::clone(remote);
                 Box::pin(async move {
-                    if let Some(tower) = &remote.tower {
+                    if let Some(tower) = remote.tower.as_ref().filter(|_| crate::tower::enabled()) {
                         return tower.open(spec).await;
                     }
                     let inherit_env = crate::config::get().remote.inherit_env.clone();
@@ -1737,8 +1737,8 @@ pub(crate) struct RemoteBackend {
     /// panel's `l` view. See [`ConnLog`].
     log: Arc<ConnLog>,
     /// The host's Tower, which runs its new sessions while
-    /// [`crate::tower::FLAG`] is set. `None` otherwise, and for a socket
-    /// transport.
+    /// [`crate::tower::FLAG`] is set and keeps the ones it runs operable
+    /// when it is not. `None` for a socket transport.
     tower: Option<Arc<tower_remote::TowerLink>>,
 }
 
@@ -1947,16 +1947,16 @@ impl RemoteBackend {
             )),
             Transport::LocalSocket(_) => None,
         };
+        // Kept with the flag unset too, so sessions it once started stay
+        // listed and operable; the link then never starts a daemon.
         let tower = match transport {
-            Transport::Ssh { target, .. } if crate::tower::enabled() => {
-                Some(tower_remote::TowerLink::new(
-                    host.clone(),
-                    target,
-                    &ssh_options,
-                    dirty.clone(),
-                    log.clone(),
-                ))
-            }
+            Transport::Ssh { target, .. } => Some(tower_remote::TowerLink::new(
+                host.clone(),
+                target,
+                &ssh_options,
+                dirty.clone(),
+                log.clone(),
+            )),
             _ => None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2105,15 +2105,18 @@ impl RemoteBackend {
         self.reconnect_epoch.load(Ordering::Relaxed)
     }
 
-    /// The host's sessions from `miao-server` and, while the flag is on,
-    /// from its Tower. The former are then marked for a restart.
+    /// The host's sessions from `miao-server` and from its Tower. Those on
+    /// the backend new sessions do not use are marked for a restart; nothing
+    /// is done to them.
     fn list_sessions(&self) -> Vec<LauncherState> {
         let mut rows = self.all_rows();
-        if crate::tower::enabled() {
-            let tower = self.tower.as_ref();
-            for row in &mut rows {
-                row.needs_restart = tower.is_none_or(|tower| tower.id(&row.key()).is_none());
-            }
+        let enabled = crate::tower::enabled();
+        for row in &mut rows {
+            let on_tower = self
+                .tower
+                .as_ref()
+                .is_some_and(|tower| tower.id(&row.key()).is_some());
+            row.needs_restart = on_tower != enabled;
         }
         live_rows(
             &rows.into_iter().map(|row| (row.key(), row)).collect(),
@@ -2315,7 +2318,7 @@ impl RemoteBackend {
 
     #[cfg(test)]
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
-        if let Some(tower) = &self.tower {
+        if let Some(tower) = self.tower.as_ref().filter(|_| crate::tower::enabled()) {
             return tokio::runtime::Handle::current().block_on(tower.open(spec.clone()));
         }
         let spec = spec.clone();
