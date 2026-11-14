@@ -72,7 +72,9 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
 ## Tower backend
 
 `CAPTAIN_MIAO_TOWER` selects Tower's embedded launcher for this machine's
-sessions. `src/tower.rs` is the only module that names Tower.
+sessions and each SSH host's Tower daemon for its sessions. `src/tower.rs`
+owns the local side and the record-to-row mapping both sides use;
+`src/backend/tower_remote.rs` owns the remote side.
 
 - The older launcher, its hooks and `miao-server` stay in place and unchanged.
   Both launchers' sessions are always listed, stopped and flagged; the flag
@@ -89,7 +91,20 @@ sessions. `src/tower.rs` is the only module that names Tower.
   below `tower/` in the state root; the launcher removes its own on exit.
 - Pin and follow-up are Tower tags on those sessions, not `session-flags.json`
   entries. Tower sessions get no automatic flag transitions yet.
-- Remote hosts still use `miao-server`; only their rows are marked.
+- On an SSH host, `RemoteBackend` holds a `TowerLink` beside its
+  `miao-server` connection. It runs the host's `tower-cli` over the shared
+  ssh master in the login shell: `events --topics agents` for records, `rpc`
+  for `session.open` (deferred until the first attach), `session.kill` and
+  `session.tags.patch`, and `attach` in the window. Nothing is provisioned.
+- `miao-server` still serves resume candidates, directory queries, vitals,
+  Codex config and VCS. Its rows are merged with Tower's and marked.
+- A remote Tower row is keyed by a hash of its Tower id with the high bit
+  set, clear of any real launcher pid; its `pool_session` is the Tower id,
+  which is the binding token and decides the attach argv. Only owned, live
+  records are listed. Kill confirmation for such a key waits on Tower alone.
+- `tower-cli` treats a caller with `CLAUDE_CODE_SESSION_ID` or
+  `CODEX_THREAD_ID` set as an agent and refuses admin calls; ssh does not
+  forward them by default.
 
 ## Backend and transport boundaries
 

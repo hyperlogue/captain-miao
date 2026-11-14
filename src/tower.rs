@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
 use tower_agents::Harness;
-use tower_agents::runtime::{AgentSpec, Embedding, NativeSession};
+use tower_agents::runtime::{AgentDetail, AgentSpec, Embedding, NativeSession};
 use tower_launcher::local::{self, Local, Session};
+use tower_protocol::AgentRecord;
 
 use crate::agent::AgentKind;
 use crate::backend::{LaunchPlan, OpenSpec};
@@ -38,8 +39,9 @@ const RESUME: &str = "--tower-resume";
 /// Continue [`RESUME`] as a new conversation.
 const FORK: &str = "--tower-fork";
 
-const PINNED: &str = "pinned";
-const FOLLOW_UP: &str = "follow-up";
+/// The tags that hold a session's dashboard flags.
+pub(crate) const PINNED: &str = "pinned";
+pub(crate) const FOLLOW_UP: &str = "follow-up";
 
 pub(crate) fn enabled() -> bool {
     std::env::var(FLAG).is_ok_and(|value| !value.is_empty() && value != "0")
@@ -89,7 +91,7 @@ pub(crate) fn helper(args: &[String]) -> Option<io::Result<()>> {
     local::helper(args)
 }
 
-fn harness(agent: AgentKind) -> Option<Harness> {
+pub(crate) fn harness(agent: AgentKind) -> Option<Harness> {
     Harness::parse(agent.cli_subcommand())
 }
 
@@ -327,43 +329,45 @@ pub(crate) fn rows(home: &str) -> Vec<LauncherState> {
     };
     let mut since = WORKING_SINCE.lock().unwrap();
     since.retain(|id, _| sessions.iter().any(|session| &session.plan.id == id));
-    sessions
+    records
         .into_iter()
-        .map(|session| {
-            let id = &session.plan.id;
-            let tags = records
-                .iter()
-                .find(|record| &record.id == id)
-                .map(|record| &record.tags);
-            let flags = SessionFlags {
-                pinned: tags.is_some_and(|tags| tags.contains(PINNED)),
-                follow_up: tags.is_some_and(|tags| tags.contains(FOLLOW_UP)),
-            };
-            let window = std::fs::read(window_path(id))
+        .filter_map(|record| {
+            let session = sessions.iter().find(|s| s.plan.id == record.id)?;
+            let window: Window = std::fs::read(window_path(&record.id))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
-            row(session, window, flags, home, &mut since)
+            let mut row = row(record, home, &mut since);
+            row.launcher_pid = session.state.launcher_pid;
+            // The id the dashboard minted for the launch, which binds the row
+            // to the window it opened.
+            row.launch_id = Some(session.plan.id.clone());
+            (row.window_id, row.terminal, row.terminfo) =
+                (window.window_id, window.terminal, window.terminfo);
+            Some(row)
         })
         .collect()
 }
 
-/// One Tower session as a dashboard row. `since` remembers when each session
-/// began the turn it is working on.
-fn row(
-    Session { plan, state, .. }: Session,
-    window: Window,
-    flags: SessionFlags,
+/// A Tower session record as a dashboard row, apart from what only its
+/// launcher or window knows. `since` remembers when each session began the
+/// turn it is working on; `home` is the session host's home directory.
+pub(crate) fn row(
+    record: AgentRecord,
     home: &str,
     since: &mut HashMap<String, u64>,
 ) -> LauncherState {
-    let status = status(&state.status, state.detail.phase.as_deref());
+    let detail: AgentDetail = record
+        .status_detail
+        .and_then(|detail| serde_json::from_value(serde_json::to_value(detail).ok()?).ok())
+        .unwrap_or_default();
+    let status = status(&record.status, detail.phase.as_deref());
     // Tower counts milliseconds; the dashboard counts seconds.
-    let updated_at = state.updated_at / 1000;
+    let updated_at = record.updated_at / 1000;
     let active_since = if status == SessionStatus::Active {
-        Some(*since.entry(plan.id.clone()).or_insert(updated_at))
+        Some(*since.entry(record.id.clone()).or_insert(updated_at))
     } else {
-        since.remove(&plan.id);
+        since.remove(&record.id);
         None
     };
     // Every path leaving a backend is host-canonical.
@@ -371,48 +375,45 @@ fn row(
         0 | 1 => text,
         _ => text.replace(home, "~"),
     };
+    let flags = SessionFlags {
+        pinned: record.tags.contains(PINNED),
+        follow_up: record.tags.contains(FOLLOW_UP),
+    };
     LauncherState {
-        agent: agent(state.harness),
-        codex_mode: if plan.spec.uses_app_server() {
+        agent: Harness::parse(&record.harness).map_or(AgentKind::Unknown, agent),
+        codex_mode: if record.mode.as_deref() == Some("app-server") {
             CodexMode::AppServer
         } else {
             CodexMode::Native
         },
         codex_connected: None,
         codex_control: false,
-        launcher_pid: state.launcher_pid,
-        session_id: state.native.map(|native| native.id),
+        launcher_pid: 0,
+        session_id: record.native_session_id,
         child_session_ids: Vec::new(),
-        window_id: window.window_id,
+        window_id: None,
         tab_id: None,
-        cwd: cm_core::paths::collapse_home(&state.cwd, home),
+        cwd: cm_core::paths::collapse_home(&record.cwd, home),
         status,
-        background_commands: state
-            .detail
-            .background_commands
-            .into_iter()
-            .map(tidy)
-            .collect(),
-        last_tool: state.detail.last_tool,
+        background_commands: detail.background_commands.into_iter().map(tidy).collect(),
+        last_tool: detail.last_tool,
         updated_at,
         active_since,
-        last_prompt: state.detail.last_prompt,
-        child_pid: state.agent_pid,
-        last_error_at: state.detail.error.as_ref().map(|_| updated_at),
-        last_error: state.detail.error.map(tidy),
+        last_prompt: detail.last_prompt,
+        child_pid: record.pid,
+        last_error_at: detail.error.as_ref().map(|_| updated_at),
+        last_error: detail.error.map(tidy),
         cleanup: None,
-        context_tokens: state.detail.context_tokens,
+        context_tokens: detail.context_tokens,
         context_window: None,
-        model: state.detail.model,
-        effort: state.detail.effort,
-        name: state.display_name,
+        model: detail.model,
+        effort: detail.effort,
+        name: record.display_name,
         first_prompt: None,
         pool_session: None,
-        // The id the dashboard minted for the launch, which binds the row to
-        // the window it opened.
-        launch_id: Some(plan.id),
-        terminal: window.terminal,
-        terminfo: window.terminfo,
+        launch_id: None,
+        terminal: None,
+        terminfo: None,
         alt_screen: false,
         kitty_keyboard: false,
         flags: Some(flags),
@@ -535,54 +536,31 @@ mod tests {
         assert_eq!(request.id, None);
     }
 
-    fn session(status: &str, updated_at: u64) -> Session {
-        let spec = serde_json::json!({
-            "harness": "codex", "cwd": "/home/miao/work", "args": [], "mode": "app-server",
-        });
-        Session {
-            plan: serde_json::from_value(serde_json::json!({
-                "id": "L7-1", "generation": "g1", "state_dir": "/s", "tower_socket": "",
-                "control_socket": "/s/control.sock", "spec": spec,
-            }))
-            .unwrap(),
-            state: serde_json::from_value(serde_json::json!({
-                "id": "L7-1", "generation": "g1", "harness": "codex", "status": status,
-                "cwd": "/home/miao/work", "native": {"id": "thread-1"},
-                "display_name": "Fix the build",
-                "detail": {
-                    "last_tool": "Bash", "model": "m", "context_tokens": 1200,
-                    "error": "failed in /home/miao/work", "last_prompt": "fix it",
-                    "background_commands": ["/home/miao/bin/serve"],
-                },
-                "launcher_pid": 4242, "launcher_start_time": 1, "boot_id": "b",
-                "agent_pid": 4243, "agent_start_time": 2, "seq": 9,
-                "updated_at": updated_at, "stop_requested": false, "exit_code": null,
-            }))
-            .unwrap(),
-            live: true,
-        }
+    fn record(status: &str, updated_at: u64) -> AgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "L7-1", "display_name": "Fix the build", "node": "local",
+            "harness": "codex", "mode": "app-server", "ownership": "owned",
+            "trust": "strong", "native_session_id": "thread-1", "pid": 4243,
+            "pid_start_time": 2, "cwd": "/home/miao/work", "status": status,
+            "status_detail": {
+                "last_tool": "Bash", "model": "m", "context_tokens": 1200,
+                "error": "failed in /home/miao/work", "last_prompt": "fix it",
+                "background_commands": ["/home/miao/bin/serve"],
+            },
+            "caps": {"attach": false, "kill": true, "message": "none",
+                     "message_reason": null, "wake_when_idle": false,
+                     "reply_path": false, "steer": false},
+            "pool_session": null, "attach_count": 0, "sources": [],
+            "registered_at": 1, "updated_at": updated_at, "last_seen": 1,
+            "revision": 9, "tags": ["pinned"], "sync_state": "synced",
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn a_tower_session_becomes_a_row_keyed_by_its_launcher() {
+    fn a_tower_record_becomes_a_row() {
         let mut since = HashMap::new();
-        let flags = SessionFlags {
-            pinned: true,
-            follow_up: false,
-        };
-        let window = Window {
-            terminal: Some("kitty:1".into()),
-            ..Window::default()
-        };
-        let row = row(
-            session("working", 5_000_999),
-            window,
-            flags,
-            "/home/miao",
-            &mut since,
-        );
-        assert_eq!(row.key(), SessionKey::from_launcher_pid(4242));
-        assert_eq!(row.binding_token(), Some("L7-1"));
+        let row = row(record("working", 5_000_999), "/home/miao", &mut since);
         assert_eq!(
             (row.agent, row.codex_mode),
             (AgentKind::Codex, CodexMode::AppServer)
@@ -594,28 +572,22 @@ mod tests {
         );
         assert_eq!(row.background_commands, ["~/bin/serve"]);
         assert_eq!(row.last_error.as_deref(), Some("failed in ~/work"));
+        assert_eq!(row.last_prompt.as_deref(), Some("fix it"));
         assert_eq!((row.updated_at, row.active_since), (5_000, Some(5_000)));
         assert_eq!(row.child_pid, Some(4243));
-        assert_eq!(row.flags, Some(flags));
-        assert_eq!(row.terminal.as_deref(), Some("kitty:1"));
+        assert_eq!(
+            row.flags,
+            Some(SessionFlags {
+                pinned: true,
+                follow_up: false
+            })
+        );
         assert!(!row.needs_restart);
 
         // A later event in the same turn keeps the turn's start.
-        let later = super::row(
-            session("working", 9_000_000),
-            Window::default(),
-            flags,
-            "/home/miao",
-            &mut since,
-        );
+        let later = super::row(record("working", 9_000_000), "/home/miao", &mut since);
         assert_eq!((later.updated_at, later.active_since), (9_000, Some(5_000)));
-        let idle = super::row(
-            session("idle", 9_500_000),
-            Window::default(),
-            flags,
-            "/home/miao",
-            &mut since,
-        );
+        let idle = super::row(record("idle", 9_500_000), "/home/miao", &mut since);
         assert_eq!(
             (idle.status, idle.active_since),
             (SessionStatus::Idle, None)

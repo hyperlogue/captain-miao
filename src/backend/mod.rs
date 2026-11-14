@@ -62,6 +62,7 @@ mod local_snapshot;
 mod provision;
 mod recovery;
 mod ssh;
+mod tower_remote;
 mod vcs;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
 use provision::{Provisioning, UploadGate, incompatible_daemon_reason, resolve_remote_exe};
@@ -919,7 +920,7 @@ impl Backend {
         let matches = |s: &LauncherState| s.agent == agent && s.session_id.as_deref() == Some(id);
         match self {
             Self::Local(host) => host.list_sessions().iter().any(matches),
-            Self::Remote(remote) => remote.mirror.lock().unwrap().values().any(matches),
+            Self::Remote(remote) => remote.all_rows().iter().any(matches),
         }
     }
 
@@ -931,14 +932,26 @@ impl Backend {
                 .find(|row| row.binding_token() == Some(token))
                 .map(|row| row.status),
             Self::Remote(remote) => {
-                let mirror = remote.mirror.lock().unwrap();
-                if !remote.mirrored.load(Ordering::Relaxed) {
+                // Only a source that is reporting counts, either way.
+                let legacy = remote.mirrored.load(Ordering::Relaxed);
+                let mut rows = Vec::new();
+                if legacy {
+                    rows.extend(remote.mirror.lock().unwrap().values().cloned());
+                }
+                let tower = remote.tower.as_ref().is_none_or(|tower| {
+                    if tower.reported() {
+                        rows.extend(tower.rows());
+                    }
+                    tower.reported()
+                });
+                let found = rows
+                    .into_iter()
+                    .find(|row| row.binding_token() == Some(token))
+                    .map(|row| row.status);
+                if found.is_none() && !(legacy && tower) {
                     return BindingPresence::Unknown;
                 }
-                mirror
-                    .values()
-                    .find(|row| row.binding_token() == Some(token))
-                    .map(|row| row.status.clone())
+                found
             }
         };
         status.map_or(BindingPresence::Missing, BindingPresence::Present)
@@ -1160,16 +1173,7 @@ impl Backend {
     pub(crate) fn list_sessions(&self) -> Vec<LauncherState> {
         match self {
             Backend::Local(h) => h.list_sessions(),
-            Backend::Remote(b) => {
-                let mut rows = b.list_sessions();
-                // A `miao-server` is one of the backends Tower replaces.
-                if crate::tower::enabled() {
-                    for row in &mut rows {
-                        row.needs_restart = true;
-                    }
-                }
-                rows
-            }
+            Backend::Remote(b) => b.list_sessions(),
         }
     }
 
@@ -1248,12 +1252,7 @@ impl Backend {
             let removed = tokio::time::timeout(SESSION_REMOVAL_TIMEOUT, async {
                 loop {
                     let gone = match &remote {
-                        Some(remote) => {
-                            let mirror = remote.mirror.lock().unwrap();
-                            remote.mirrored.load(Ordering::Relaxed)
-                                && remote.conn_state().is_connected()
-                                && !mirror.contains_key(&key)
-                        }
+                        Some(remote) => remote.reports_gone(&key),
                         None => {
                             let key = key.clone();
                             tokio::task::spawn_blocking(move || {
@@ -1373,6 +1372,9 @@ impl Backend {
             Backend::Remote(remote) => {
                 let remote = Arc::clone(remote);
                 Box::pin(async move {
+                    if let Some(tower) = &remote.tower {
+                        return tower.open(spec).await;
+                    }
                     let inherit_env = crate::config::get().remote.inherit_env.clone();
                     let reply = remote
                         .request_within(Duration::from_secs(30), |req_id| {
@@ -1412,26 +1414,29 @@ impl Backend {
                 argv: local_attach_argv(session_name, force)?,
             }),
             Backend::Remote(b) => Ok(AttachPlan {
-                argv: attach_argv(
-                    b.attach_target.as_deref(),
-                    &b.ssh_options,
-                    &b.remote_exe.lock().unwrap(),
-                    session_name,
-                    force,
-                    // No `[remote] inherit_env` here, and not an oversight:
-                    // this is the *reattach* path. libshpool injects a
-                    // forwarded value into the shell's environment only where
-                    // it spawns that shell (`build_shell_env`, reached from
-                    // `spawn_subshell`), which happens once, when the session
-                    // is created — so a name passed here changes nothing about
-                    // the session. What it *would* still do is make the daemon
-                    // re-serialize every forwarded name and value to
-                    // `$SHPOOL_SESSION_DIR/forward.env` in cleartext, which it
-                    // does on every attach: pure exposure, zero effect. The
-                    // create path ([`RemoteBackend::open_session`]) is the only
-                    // one that passes them.
-                    &[],
-                ),
+                argv: match b.tower.as_ref().filter(|tower| tower.owns(session_name)) {
+                    Some(tower) => tower.attach_argv(session_name),
+                    None => attach_argv(
+                        b.attach_target.as_deref(),
+                        &b.ssh_options,
+                        &b.remote_exe.lock().unwrap(),
+                        session_name,
+                        force,
+                        // No `[remote] inherit_env` here, and not an oversight:
+                        // this is the *reattach* path. libshpool injects a
+                        // forwarded value into the shell's environment only where
+                        // it spawns that shell (`build_shell_env`, reached from
+                        // `spawn_subshell`), which happens once, when the session
+                        // is created — so a name passed here changes nothing about
+                        // the session. What it *would* still do is make the daemon
+                        // re-serialize every forwarded name and value to
+                        // `$SHPOOL_SESSION_DIR/forward.env` in cleartext, which it
+                        // does on every attach: pure exposure, zero effect. The
+                        // create path ([`RemoteBackend::open_session`]) is the only
+                        // one that passes them.
+                        &[],
+                    ),
+                },
             }),
         }
     }
@@ -1731,6 +1736,10 @@ pub(crate) struct RemoteBackend {
     /// Everything the connection task did and what came back, for the hosts
     /// panel's `l` view. See [`ConnLog`].
     log: Arc<ConnLog>,
+    /// The host's Tower, which runs its new sessions while
+    /// [`crate::tower::FLAG`] is set. `None` otherwise, and for a socket
+    /// transport.
+    tower: Option<Arc<tower_remote::TowerLink>>,
 }
 
 /// How long a session stays presumed dead on the strength of the dashboard's own
@@ -1804,6 +1813,9 @@ impl RemoteBackend {
         }
         let task = tokio::spawn(connection_task(transport, shared, requests, fresh));
         let _ = backend.connection_task.set(task.abort_handle());
+        if let Some(tower) = &backend.tower {
+            tower.start();
+        }
         backend
     }
 
@@ -1818,6 +1830,9 @@ impl RemoteBackend {
         }
         if let Some(manager) = &self.forwards {
             manager.retire();
+        }
+        if let Some(tower) = &self.tower {
+            tower.stop();
         }
         *self.conn.lock().unwrap() = ConnState::Disconnected;
         self.dirty.store(true, Ordering::Relaxed);
@@ -1932,6 +1947,18 @@ impl RemoteBackend {
             )),
             Transport::LocalSocket(_) => None,
         };
+        let tower = match transport {
+            Transport::Ssh { target, .. } if crate::tower::enabled() => {
+                Some(tower_remote::TowerLink::new(
+                    host.clone(),
+                    target,
+                    &ssh_options,
+                    dirty.clone(),
+                    log.clone(),
+                ))
+            }
+            _ => None,
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let next_req_id = Arc::new(AtomicU64::new(1));
         let shared = ConnectionShared {
@@ -1983,6 +2010,7 @@ impl RemoteBackend {
             reconnect_epoch,
             recovery_active,
             log,
+            tower,
         });
         (backend, shared, rx)
     }
@@ -2077,13 +2105,44 @@ impl RemoteBackend {
         self.reconnect_epoch.load(Ordering::Relaxed)
     }
 
+    /// The host's sessions from `miao-server` and, while the flag is on,
+    /// from its Tower. The former are then marked for a restart.
     fn list_sessions(&self) -> Vec<LauncherState> {
+        let mut rows = self.all_rows();
+        if crate::tower::enabled() {
+            let tower = self.tower.as_ref();
+            for row in &mut rows {
+                row.needs_restart = tower.is_none_or(|tower| tower.id(&row.key()).is_none());
+            }
+        }
         live_rows(
-            &self.mirror.lock().unwrap(),
+            &rows.into_iter().map(|row| (row.key(), row)).collect(),
             &mut self.presumed_dead.lock().unwrap(),
             &self.presumed_attached.lock().unwrap(),
             Instant::now(),
         )
+    }
+
+    /// Every session the host reports, before the dashboard's presumptions.
+    fn all_rows(&self) -> Vec<LauncherState> {
+        let mut rows: Vec<_> = self.mirror.lock().unwrap().values().cloned().collect();
+        if let Some(tower) = &self.tower {
+            rows.extend(tower.rows());
+        }
+        rows
+    }
+
+    /// Whether every account the host gives of its sessions is known and
+    /// lacks `key`. A disconnect is not proof that a session ended.
+    fn reports_gone(&self, key: &SessionKey) -> bool {
+        let tower_lacks = self
+            .tower
+            .as_ref()
+            .is_none_or(|tower| tower.reported() && tower.id(key).is_none());
+        // Only Tower can say one of its own sessions ended.
+        let legacy_lacks = tower_remote::is_tower_key(key)
+            || (self.mirrored.load(Ordering::Relaxed) && self.conn_state().is_connected());
+        tower_lacks && legacy_lacks && !self.mirror.lock().unwrap().contains_key(key)
     }
 
     /// Hide `key`'s row now, on the strength of a kill we are only about to
@@ -2198,6 +2257,9 @@ impl RemoteBackend {
         key: &SessionKey,
         cleanup: CleanupPolicy,
     ) -> KillOutcome {
+        if let Some((tower, id)) = self.tower_session(key) {
+            return tower.kill(&id).await;
+        }
         let key = key.clone();
         let Some((reply, sent_at)) = self.enqueue(|req_id| ClientFrame::KillSession {
             req_id,
@@ -2232,6 +2294,9 @@ impl RemoteBackend {
     }
 
     fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
+        if let Some((tower, id)) = self.tower_session(key) {
+            return tokio::runtime::Handle::current().block_on(tower.set_flags(&id, flags));
+        }
         let key = key.clone();
         matches!(
             self.request(|req_id| ClientFrame::SetSessionFlags { req_id, key, flags }),
@@ -2242,8 +2307,17 @@ impl RemoteBackend {
     /// Ask the server to start a launcher inside its pty pool, then build the
     /// plan for a *local* window that attaches to it. Blocks on the round-trip,
     /// so an async caller should wrap this in `block_in_place`.
+    /// The Tower that runs the session `key` names, and its id there.
+    fn tower_session(&self, key: &SessionKey) -> Option<(&tower_remote::TowerLink, String)> {
+        let tower = self.tower.as_deref()?;
+        Some((tower, tower.id(key)?))
+    }
+
     #[cfg(test)]
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
+        if let Some(tower) = &self.tower {
+            return tokio::runtime::Handle::current().block_on(tower.open(spec.clone()));
+        }
         let spec = spec.clone();
         let inherit_env = crate::config::get().remote.inherit_env.clone();
         self.opened_plan(
@@ -2344,6 +2418,9 @@ impl Drop for RemoteBackend {
         }
         if let Some(task) = self.connection_task.get() {
             task.abort();
+        }
+        if let Some(tower) = &self.tower {
+            tower.stop();
         }
     }
 }

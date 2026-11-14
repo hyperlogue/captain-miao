@@ -193,10 +193,17 @@ Set `CAPTAIN_MIAO_TOWER=1` before starting `miao` to run local sessions on
 [Tower](https://github.com/hyperlogue/tower)'s launcher instead of the built-in
 one. New and restarted local sessions then start on Tower.
 Sessions started earlier keep running and show `↻` after their status; restart
-an idle one to move it to Tower. Sessions on SSH hosts show `↻` too, but still
-run on `miao-server`: Tower does not reach remote hosts yet.
-Unset the variable to return to the built-in launcher. Sessions still on Tower
-are then the ones marked.
+an idle one to move it to Tower.
+
+On SSH hosts, new sessions run under the Tower daemon on the host. Install Tower
+there so `tower-cli` is on the login shell's `PATH`; it starts the daemon when
+needed. `miao-server` still serves the rest of the host (resume list, directory
+picker, vitals, VCS), and its sessions show `↻`. A remote Tower session's window
+runs `tower-cli attach`.
+
+Unset the variable to return to the built-in launcher. Local sessions still on
+Tower are then the ones marked; remote Tower sessions keep running but are not
+listed until the variable is set again.
 
 ## License
 

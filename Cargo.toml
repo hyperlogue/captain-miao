@@ -47,6 +47,7 @@ cm-core = { path = "crates/cm-core" }
 # One revision for both, so the launcher and its contract cannot drift.
 tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "b361a1681fbfdaf0666bb52372ebdc4d43dc5d1d" }
 tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "b361a1681fbfdaf0666bb52372ebdc4d43dc5d1d" }
+tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "b361a1681fbfdaf0666bb52372ebdc4d43dc5d1d" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
