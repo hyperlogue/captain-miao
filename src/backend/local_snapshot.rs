@@ -20,7 +20,7 @@ impl LocalHost {
         self.snapshot = Some(LocalSnapshot {
             reader: Arc::new(Mutex::new(reader)),
             pending: None,
-            rows: self.inner.list_sessions(),
+            rows: Self::read_sessions(&self.inner),
             index: self.inner.session_index(),
             again: false,
         });
@@ -53,7 +53,7 @@ impl LocalHost {
         snapshot.pending = Some(rx);
         tokio::task::spawn_blocking(move || {
             let mut reader = reader.lock().unwrap();
-            let rows = reader.list_sessions();
+            let rows = Self::read_sessions(&reader);
             let index = reader.session_index();
             let _ = tx.send((rows, index));
             changed.store(true, Ordering::Relaxed);
@@ -81,5 +81,73 @@ impl Backend {
         if let Self::Local(host) = self {
             host.refresh_background_reads();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_reads_preserve_the_selected_launcher() {
+        const CHILD: &str = "CM_TEST_TOWER_SNAPSHOT";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::local_snapshot::tests::background_reads_preserve_the_selected_launcher",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+                .env(crate::tower::FLAG, "1")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated snapshot fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut row = LauncherState::for_test(
+            crate::agent::AgentKind::Claude,
+            crate::state::SessionStatus::Idle,
+        );
+        row.launcher_pid = std::process::id();
+        state::create_dir_all_private(&state::sessions_dir()).unwrap();
+        row.write().unwrap();
+        let Backend::Local(mut host) = Backend::local() else {
+            unreachable!()
+        };
+        assert!(host.list_sessions()[0].needs_restart);
+        host.enable_background_reads();
+        assert!(
+            host.list_sessions()[0].needs_restart,
+            "the initial background snapshot bypassed launcher selection"
+        );
+        host.refresh_background_reads();
+        // Wait for the actual worker reply, not an assumed scan duration.
+        let snapshot = host.snapshot.as_mut().unwrap();
+        let (rows, index) =
+            tokio::time::timeout(Duration::from_secs(60), snapshot.pending.take().unwrap())
+                .await
+                .expect("awaiting background session scan")
+                .unwrap();
+        snapshot.rows = rows;
+        snapshot.index = index;
+        assert!(
+            host.list_sessions()[0].needs_restart,
+            "the refreshed background snapshot bypassed launcher selection"
+        );
     }
 }

@@ -473,23 +473,10 @@ impl LocalHost {
     /// *unknown*, which the UI resolves to "free to take": every pooled row on
     /// this machine looked available whether or not someone was working in it.
     fn list_sessions(&self) -> Vec<LauncherState> {
-        let mut rows = self
-            .snapshot
-            .as_ref()
-            .map_or_else(|| self.inner.list_sessions(), |snapshot| snapshot.rows());
-        // Both launchers' sessions are listed whichever one is selected, so
-        // switching never hides a running session. Those on the launcher that
-        // new sessions no longer use are marked for a restart.
-        if self.snapshot.is_none() {
-            let tower = crate::tower::enabled();
-            let mut theirs = crate::tower::rows(self.inner.home());
-            for (rows, stale) in [(&mut rows, tower), (&mut theirs, !tower)] {
-                for row in rows.iter_mut() {
-                    row.needs_restart = stale;
-                }
-            }
-            rows.extend(theirs);
-        }
+        let mut rows = self.snapshot.as_ref().map_or_else(
+            || Self::read_sessions(&self.inner),
+            |snapshot| snapshot.rows(),
+        );
         // Nothing on this machine is pooled → nothing to ask the daemon, and no
         // reason to have opened a socket to it. This is the gate that keeps the
         // watch off a laptop entirely (§10.1): the default population never has
@@ -504,6 +491,23 @@ impl LocalHost {
                 row.attached = attached.get(pool).copied();
             }
         }
+        rows
+    }
+
+    /// The complete local scan, shared with the background worker. Keep Tower
+    /// reads here so enabling background reads neither hides its sessions nor
+    /// moves filesystem/process inspection back onto the UI thread.
+    fn read_sessions(reader: &LocalBackend) -> Vec<LauncherState> {
+        let tower = crate::tower::enabled();
+        let mut rows = reader.list_sessions();
+        let mut theirs = crate::tower::rows(reader.home());
+        // Switching launchers never hides the other one's running sessions.
+        for (rows, stale) in [(&mut rows, tower), (&mut theirs, !tower)] {
+            for row in rows.iter_mut() {
+                row.needs_restart = stale;
+            }
+        }
+        rows.extend(theirs);
         rows
     }
 }
