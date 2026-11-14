@@ -291,7 +291,9 @@ pub(crate) async fn launch(agent: AgentKind, args: Vec<String>) -> anyhow::Resul
 
 fn status(status: &str, phase: Option<&str>) -> SessionStatus {
     match status {
-        "starting" => SessionStatus::Starting,
+        // A spawned agent is `unknown` until Tower observes its first event.
+        // Native Codex can defer SessionStart until the first prompt.
+        "starting" | "unknown" => SessionStatus::Starting,
         "compacting" => SessionStatus::Compacting,
         "waiting_approval" => SessionStatus::WaitingForApproval,
         "waiting_input" => SessionStatus::WaitingForDecision,
@@ -596,6 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unobserved_tower_session_is_not_active() {
+        let mut since = HashMap::new();
+        let mut fresh = record("unknown", 5_000);
+        fresh.native_session_id = None;
+        fresh.status_detail = None;
+        let fresh = row(fresh, "/home/miao", &mut since);
+        assert_eq!(fresh.status, SessionStatus::Starting);
+        assert_eq!(fresh.active_since, None);
+        assert!(since.is_empty());
+
+        // Losing observation of a running turn also clears its busy timer.
+        row(record("working", 6_000), "/home/miao", &mut since);
+        let unknown = row(record("unknown", 7_000), "/home/miao", &mut since);
+        assert_eq!(unknown.status, SessionStatus::Starting);
+        assert_eq!(unknown.active_since, None);
+        assert!(since.is_empty());
+    }
+
+    #[test]
     fn only_tower_commands_reach_the_helper() {
         let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         assert!(helper(&args(&["hook", "Stop", "--agent=codex"])).is_none());
@@ -607,6 +628,7 @@ mod tests {
     fn tower_statuses_map_to_dashboard_statuses() {
         for (tower, phase, want) in [
             ("starting", None, SessionStatus::Starting),
+            ("unknown", None, SessionStatus::Starting),
             ("working", None, SessionStatus::Active),
             ("waiting_tool", None, SessionStatus::Active),
             ("compacting", None, SessionStatus::Compacting),
