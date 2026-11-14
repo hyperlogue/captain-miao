@@ -1207,6 +1207,11 @@ pub struct LauncherState {
     /// keying can disambiguate a remote pid from a local one. Defaults `local`.
     #[serde(skip)]
     pub host: HostId,
+    /// The session runs on a backend the dashboard has stopped launching
+    /// into, so it keeps working but should be restarted onto the current one.
+    /// Stamped by the dashboard, like `host`; no launcher or server writes it.
+    #[serde(skip)]
+    pub needs_restart: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1262,6 +1267,7 @@ impl LauncherState {
             flags: None,
             attached: None,
             host: HostId::local(),
+            needs_restart: false,
         }
     }
 }

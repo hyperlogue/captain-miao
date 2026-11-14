@@ -14,6 +14,7 @@ mod server_payload;
 mod sleep;
 mod ssh_forward;
 mod terminal;
+mod tower;
 
 // Core modules re-exported at the crate root so the dashboard's `crate::state`,
 // `crate::agent`, `crate::protocol`, `crate::init_tracing` paths resolve unchanged.
@@ -171,6 +172,12 @@ enum ClipboardAction {
 }
 
 fn main() -> Result<()> {
+    // Tower's launcher and the hooks it injects call this executable with
+    // Tower's own arguments, which are not `miao` commands.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = tower::helper(&args) {
+        return Ok(result?);
+    }
     let cli = Cli::parse();
 
     // The clipboard server wants a **current-thread** runtime, so it is
@@ -351,7 +358,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                         .join(", ")
                 )
             })?;
-            cm_core::cli::run_launch(backend, args).await
+            if tower::requested(&args) {
+                tower::launch(backend, args).await
+            } else {
+                cm_core::cli::run_launch(backend, args).await
+            }
         }
         None => app::run().await,
     }

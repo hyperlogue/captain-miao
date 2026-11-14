@@ -38,7 +38,12 @@ async fn process_exited(pid: u32) {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         if fd >= 0 {
             let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-            if let Ok(fd) = tokio::io::unix::AsyncFd::new(fd)
+            // SAFETY: the `AsyncFd` owns the pidfd, so the descriptor stays
+            // open for as long as it is registered.
+            let fd = unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
+            };
+            if let Ok(fd) = fd
                 && fd.readable().await.is_ok()
             {
                 return;

@@ -441,12 +441,25 @@ pub(crate) struct LocalHost {
     /// [`BackendEvents`]. Held here so the watcher outlives `subscribe`.
     changed: Arc<AtomicBool>,
     watcher: Option<notify::RecommendedWatcher>,
+    /// The same signal for the sessions Tower runs, which keep their records
+    /// in a tree of their own. Unset while Tower has never run one here.
+    tower_watcher: Option<notify::RecommendedWatcher>,
     /// The one fact about this machine's sessions that is *not* in a file: the
     /// pool's attached bit. See [`PoolWatch`].
     pool: PoolWatch,
 }
 
 impl LocalHost {
+    /// How to start `spec` here: on Tower when it is on, else on the launcher
+    /// this binary has always carried.
+    fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
+        if crate::tower::enabled() {
+            crate::tower::open_plan(spec, self.inner.home())
+        } else {
+            self.inner.open_session(spec)
+        }
+    }
+
     /// This host's sessions, with the pool's attached bit stamped onto the ones
     /// that are in it.
     ///
@@ -463,6 +476,19 @@ impl LocalHost {
             .snapshot
             .as_ref()
             .map_or_else(|| self.inner.list_sessions(), |snapshot| snapshot.rows());
+        // Both launchers' sessions are listed whichever one is selected, so
+        // switching never hides a running session. Those on the launcher that
+        // new sessions no longer use are marked for a restart.
+        if self.snapshot.is_none() {
+            let tower = crate::tower::enabled();
+            let mut theirs = crate::tower::rows(self.inner.home());
+            for (rows, stale) in [(&mut rows, tower), (&mut theirs, !tower)] {
+                for row in rows.iter_mut() {
+                    row.needs_restart = stale;
+                }
+            }
+            rows.extend(theirs);
+        }
         // Nothing on this machine is pooled → nothing to ask the daemon, and no
         // reason to have opened a socket to it. This is the gate that keeps the
         // watch off a laptop entirely (§10.1): the default population never has
@@ -892,7 +918,7 @@ impl Backend {
     pub(crate) fn manages_conversation(&self, agent: crate::agent::AgentKind, id: &str) -> bool {
         let matches = |s: &LauncherState| s.agent == agent && s.session_id.as_deref() == Some(id);
         match self {
-            Self::Local(host) => host.inner.list_sessions().iter().any(matches),
+            Self::Local(host) => host.list_sessions().iter().any(matches),
             Self::Remote(remote) => remote.mirror.lock().unwrap().values().any(matches),
         }
     }
@@ -900,7 +926,6 @@ impl Backend {
     pub(crate) fn binding_presence(&self, token: &str) -> BindingPresence {
         let status = match self {
             Self::Local(host) => host
-                .inner
                 .list_sessions()
                 .into_iter()
                 .find(|row| row.binding_token() == Some(token))
@@ -929,6 +954,7 @@ impl Backend {
             }),
             changed,
             watcher: None,
+            tower_watcher: None,
             pool: PoolWatch::default(),
         }))
     }
@@ -1013,6 +1039,14 @@ impl Backend {
             Backend::Local(h) => {
                 if h.watcher.is_none() {
                     h.watcher = start_local_watcher(h.changed.clone());
+                    if crate::tower::enabled() || crate::tower::has_records() {
+                        let changed = h.changed.clone();
+                        h.tower_watcher = crate::tower::watch(move || {
+                            changed.store(true, Ordering::Relaxed);
+                        })
+                        .inspect_err(|error| tracing::warn!("could not watch Tower: {error}"))
+                        .ok();
+                    }
                     // Whatever the watcher's fate, the first pass must reload.
                     h.changed.store(true, Ordering::Relaxed);
                 }
@@ -1126,7 +1160,16 @@ impl Backend {
     pub(crate) fn list_sessions(&self) -> Vec<LauncherState> {
         match self {
             Backend::Local(h) => h.list_sessions(),
-            Backend::Remote(b) => b.list_sessions(),
+            Backend::Remote(b) => {
+                let mut rows = b.list_sessions();
+                // A `miao-server` is one of the backends Tower replaces.
+                if crate::tower::enabled() {
+                    for row in &mut rows {
+                        row.needs_restart = true;
+                    }
+                }
+                rows
+            }
         }
     }
 
@@ -1169,6 +1212,16 @@ impl Backend {
                 None => {
                     let key = key.clone();
                     tokio::task::spawn_blocking(move || {
+                        // Whichever launcher runs the session ends it.
+                        if let Some(stopped) = crate::tower::stop(&key) {
+                            return match stopped {
+                                Ok(()) => KillOutcome::Signalled,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    KillOutcome::AlreadyGone
+                                }
+                                Err(error) => KillOutcome::Failed(format!("{error:#}")),
+                            };
+                        }
                         match LocalBackend::kill_session(&key, cleanup) {
                             Ok(SessionRemoval::Signalled) => KillOutcome::Signalled,
                             Ok(SessionRemoval::AlreadyGone) => KillOutcome::AlreadyGone,
@@ -1207,6 +1260,7 @@ impl Backend {
                                 !state::read_all_launcher_states()
                                     .iter()
                                     .any(|row| row.key() == key)
+                                    && !crate::tower::runs(&key)
                             })
                             .await
                             .unwrap_or(false)
@@ -1290,7 +1344,8 @@ impl Backend {
     /// the same operation over RPC; false means the write was unsuccessful.
     pub(crate) fn set_session_flags(&self, key: &SessionKey, flags: SessionFlags) -> bool {
         match self {
-            Backend::Local(h) => h.inner.set_session_flags(key, flags),
+            Backend::Local(h) => crate::tower::set_flags(key, flags)
+                .unwrap_or_else(|| h.inner.set_session_flags(key, flags)),
             Backend::Remote(b) => tokio::task::block_in_place(|| b.set_session_flags(key, flags)),
         }
     }
@@ -1298,7 +1353,7 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
         match self {
-            Backend::Local(host) => host.inner.open_session(spec),
+            Backend::Local(host) => host.open_session(spec),
             Backend::Remote(remote) => remote.open_session(spec),
         }
     }
@@ -1312,7 +1367,7 @@ impl Backend {
     {
         match self {
             Backend::Local(host) => {
-                let plan = host.inner.open_session(&spec);
+                let plan = host.open_session(&spec);
                 Box::pin(async move { plan })
             }
             Backend::Remote(remote) => {

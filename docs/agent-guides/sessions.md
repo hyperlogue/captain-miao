@@ -69,6 +69,28 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
   that is a directory, seed it in the real home (Kimi's `credentials/`) so temp
   files and renames both land there and cannot form a shadow.
 
+## Tower backend
+
+`CAPTAIN_MIAO_TOWER` selects Tower's embedded launcher for this machine's
+sessions. `src/tower.rs` is the only module that names Tower.
+
+- The older launcher, its hooks and `miao-server` stay in place and unchanged.
+  Both launchers' sessions are always listed, stopped and flagged; the flag
+  only selects the launcher for new sessions. Rows on the other one, and
+  remote rows while Tower is selected, get `needs_restart`; the dashboard
+  stamps it, like `host`.
+- A window does not inherit the dashboard's environment. The launch argv
+  carries `--tower`, so the flag need only be set where the dashboard starts.
+- Tower calls this binary as `hook <harness> <event>` and `__agent env`.
+  `main` answers those before clap parses anything; neither takes an option,
+  which is what tells them from `miao hook <event> --agent …`.
+- A Tower row keeps the launcher pid as its `SessionKey` and the dashboard's
+  launch id as its Tower session id and binding token. Tower's records live
+  below `tower/` in the state root; the launcher removes its own on exit.
+- Pin and follow-up are Tower tags on those sessions, not `session-flags.json`
+  entries. Tower sessions get no automatic flag transitions yet.
+- Remote hosts still use `miao-server`; only their rows are marked.
+
 ## Backend and transport boundaries
 
 - `SessionKey` is opaque above `Backend`. The owning host resolves it to a pid

@@ -691,14 +691,23 @@ impl App {
                 Span::styled(status_text, Style::default().fg(status_fg)),
             ]),
             Line::from(vec![label("Session"), Span::raw(sid)]),
-            Line::from(vec![
-                label("PID"),
-                Span::raw(
-                    s.child_pid
-                        .map_or_else(|| "—".to_string(), |p| p.to_string()),
-                ),
-            ]),
         ];
+        if s.needs_restart {
+            lines.push(Line::from(vec![
+                label("Backend"),
+                Span::styled(
+                    "Previous backend; restart to move it",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+        lines.extend([Line::from(vec![
+            label("PID"),
+            Span::raw(
+                s.child_pid
+                    .map_or_else(|| "—".to_string(), |p| p.to_string()),
+            ),
+        ])]);
         lines.extend(diagnostic_lines());
         lines.push(Line::from(vec![label("Dir"), Span::raw(cwd)]));
         lines.extend(worktree);
@@ -1088,6 +1097,12 @@ impl App {
                     let mut status_spans =
                         override_indicator_spans(follow_up, important, detached_kind);
                     status_spans.push(Span::styled(status_text, Style::default().fg(status_fg)));
+                    if s.needs_restart {
+                        status_spans.push(Span::styled(
+                            NEEDS_RESTART_MARK,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
+                    }
                     let status_cell = Cell::from(Line::from(status_spans));
                     let name_cell = if search_active {
                         // Cancel the row-level DIM so the name column stays bright.
@@ -1227,8 +1242,15 @@ impl App {
         // automatically resizes the column — behind the override indicator it
         // carries as an indent (`override_indicator_spans`, which emits exactly
         // that many cells).
+        // …and, while any row is marked for a restart, by that mark.
+        let restart_width = if self.sessions.iter().any(|s| s.needs_restart) {
+            unicode_width::UnicodeWidthStr::width(NEEDS_RESTART_MARK) as u16
+        } else {
+            0
+        };
         let status_width = (SessionStatus::max_label_width() as u16).max("Status".len() as u16)
-            + OVERRIDE_COL_WIDTH;
+            + OVERRIDE_COL_WIDTH
+            + restart_width;
 
         // Status / context / elapsed are fixed-width (their content is
         // bounded), so they get hard `Length` constraints. Name and prompt
@@ -1874,6 +1896,10 @@ pub(super) fn connecting_row_label(hosts: &[HostId]) -> Option<String> {
 /// purpose and lit for most of the cycle: this says "hold on", not "look here",
 /// so the cloud must still read as a steady header glyph out of the corner of an
 /// eye — a fast or half-dark blink turns a routine handshake into an alarm.
+/// Follows the status of a session that runs on a backend the dashboard no
+/// longer launches into.
+const NEEDS_RESTART_MARK: &str = " \u{21bb}"; // ↻
+
 const CONNECT_BLINK_LIT: Duration = Duration::from_millis(900);
 const CONNECT_BLINK_DARK: Duration = Duration::from_millis(500);
 

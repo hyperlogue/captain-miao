@@ -45,7 +45,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # `bundled` statically compiles SQLite into the binary, so reading Codex's
 # state_5.sqlite for session renames needs no `sqlite3` CLI at runtime.
-# libsqlite3-sys uses `cfg_select!`, setting the workspace's Rust 1.95 floor.
+# libsqlite3-sys uses `cfg_select!`, which needs Rust 1.95.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]

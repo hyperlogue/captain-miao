@@ -187,6 +187,17 @@ To detach instead, set `[remote] on_window_close = "detach"` in `~/.config/capta
   The server streams status updates over SSH. If the network drops, the agent
   continues running. Press `Enter` on the session to reconnect.
 
+### Tower backend (experimental)
+
+Set `CAPTAIN_MIAO_TOWER=1` before starting `miao` to run local sessions on
+[Tower](https://github.com/hyperlogue/tower)'s launcher instead of the built-in
+one. New and restarted local sessions then start on Tower.
+Sessions started earlier keep running and show `↻` after their status; restart
+an idle one to move it to Tower. Sessions on SSH hosts show `↻` too, but still
+run on `miao-server`: Tower does not reach remote hosts yet.
+Unset the variable to return to the built-in launcher. Sessions still on Tower
+are then the ones marked.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

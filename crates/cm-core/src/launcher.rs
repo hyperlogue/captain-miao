@@ -104,6 +104,7 @@ pub async fn run(
         flags: None,
         attached: None,
         host: HostId::local(),
+        needs_restart: false,
     };
     launcher_state.write()?;
 
