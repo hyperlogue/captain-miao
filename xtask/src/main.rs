@@ -41,6 +41,9 @@ const SERVER_BIN: &str = "miao-server";
 /// step with the constant of the same name there.
 const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 
+/// The same, for the Tower binaries a `--tower` build carries.
+const TOWER_MANIFEST_ENV: &str = "CM_TOWER_PAYLOAD_MANIFEST";
+
 /// The feature a dashboard needs to reach an embedded server at all. A bundled
 /// build implies it: the deploy path lives behind the remote-hosts gate, so a
 /// server carried without it would be dead weight by construction.
@@ -426,6 +429,11 @@ struct DistArgs {
     /// cross-built on an arm64 runner.
     #[arg(long, value_name = "TRIPLE")]
     target: Option<String>,
+    /// Also carry Tower for each server target a variant carries, built from
+    /// the Tower revision the dashboard links. With `CAPTAIN_MIAO_TOWER` set,
+    /// the dashboard deploys it to hosts that need it.
+    #[arg(long)]
+    tower: bool,
     #[command(flatten)]
     servers: ServerArgs,
 }
@@ -458,6 +466,11 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         .flat_map(|v| v.servers.iter().copied())
         .collect();
     let servers = args.servers.resolve(ws, &needed)?;
+    let towers = if args.tower {
+        obtain_towers(ws, &needed)?
+    } else {
+        Vec::new()
+    };
 
     let dist_dir = ws.root.join("dist");
     std::fs::create_dir_all(&dist_dir)
@@ -474,8 +487,18 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
     for v in &wanted {
         println!("\n▶ {}", v.label());
         let payloads = pick_payloads(&servers, v.servers)?;
+        let tower: Vec<&(String, &str, server::Payload)> = towers
+            .iter()
+            .filter(|(target, _, _)| v.servers.contains(&target.as_str()))
+            .collect();
+        if args.tower && tower.is_empty() {
+            println!(
+                "  ! {} carries no server target, so no Tower either",
+                v.label()
+            );
+        }
 
-        build_dashboard(ws, v, &payloads, args.target.as_deref())?;
+        build_dashboard(ws, v, &payloads, &tower, args.target.as_deref())?;
 
         let to = dist_dir.join(v.artifact());
         // Copy rather than rename: every variant's build reuses the same
@@ -511,10 +534,34 @@ fn pick_payloads<'a>(
         .collect()
 }
 
+/// Build Tower for every target, once each.
+fn obtain_towers(
+    ws: &Workspace,
+    targets: &BTreeSet<&str>,
+) -> Result<Vec<(String, &'static str, server::Payload)>> {
+    let source = server::tower_source(&ws.root).map_err(|e| anyhow!("{e}"))?;
+    let host = server::host_triple().map_err(|e| anyhow!("{e}"))?;
+    let tools = server::Tools::detect();
+    let dir = ws.target_dir.join("cm-tower-build");
+    let mut out = Vec::new();
+    for target in targets {
+        println!("▶ tower for {target} (from {})", source.display());
+        for (binary, payload) in
+            server::build_tower(&source, &dir, target, &host, &tools).map_err(|e| anyhow!("{e}"))?
+        {
+            println!("  {binary}:");
+            report(&payload);
+            out.push((target.to_string(), binary, payload));
+        }
+    }
+    Ok(out)
+}
+
 fn build_dashboard(
     ws: &Workspace,
     v: &Variant,
     payloads: &[&server::Payload],
+    towers: &[&(String, &str, server::Payload)],
     target: Option<&str>,
 ) -> Result<()> {
     let features = v.cargo_features();
@@ -535,6 +582,7 @@ fn build_dashboard(
     }
 
     let manifest = write_manifest(ws, v, payloads)?;
+    let tower_manifest = write_tower_manifest(ws, v, towers)?;
     println!("  {} {}", cargo(), argv.join(" "));
     let status = Command::new(cargo())
         .args(&argv)
@@ -543,6 +591,7 @@ fn build_dashboard(
         // from the caller's environment would otherwise decide what a variant
         // carries, and a plain `miao` would quietly stop being plain.
         .env(MANIFEST_ENV, &manifest)
+        .env(TOWER_MANIFEST_ENV, &tower_manifest)
         .status()
         .context("spawning cargo")?;
     if !status.success() {
@@ -592,6 +641,39 @@ fn write_manifest(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) ->
     Ok(path)
 }
 
+/// Write the Tower manifest `build.rs` reads, like [`write_manifest`]:
+/// `<target>\t<binary>\t<sha256>\t<archive>` per line, empty for a variant
+/// carrying none.
+fn write_tower_manifest(
+    ws: &Workspace,
+    v: &Variant,
+    towers: &[&(String, &str, server::Payload)],
+) -> Result<PathBuf> {
+    let dir = ws.target_dir.join("cm-server-payloads");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!(
+        "{}.tower.tsv",
+        if v.name.is_empty() { "plain" } else { v.name }
+    ));
+    let mut text = String::new();
+    for (target, binary, p) in towers {
+        text.push_str(&format!(
+            "{target}\t{binary}\t{}\t{}\n",
+            p.sha256,
+            p.packed_path.display()
+        ));
+        println!(
+            "  embedding tower {binary} for {target} ({})",
+            server::human(p.packed_len)
+        );
+    }
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|old| old == text);
+    if !unchanged {
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(path)
+}
+
 fn list() {
     println!("variants (cargo xtask dist --variant <name>):");
     for v in VARIANTS {
@@ -607,6 +689,7 @@ fn list() {
     println!("\ndefault: {}", defaults.join(", "));
     println!("\nservers come from --from build (default) or --from release[:<version>],");
     println!("or one at a time from --server <target>=<path>.");
+    println!("--tower also carries Tower for each of a variant's server targets.");
 }
 
 fn find_variant(name: &str) -> Result<&'static Variant> {

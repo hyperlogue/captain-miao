@@ -7,8 +7,8 @@
 //! host's shared ssh connection: `tower-cli events` streams the daemon's
 //! session records, `tower-cli rpc` opens, stops and tags sessions, and an
 //! attach window runs `tower-cli attach`. The CLI starts the daemon when it
-//! is not running, so nothing is provisioned here; Tower must be installed
-//! on the host, on its login shell's `PATH`.
+//! is not running. A dashboard built carrying Tower deploys it first (see
+//! [`DEPLOY_REL`]); otherwise Tower must be on the host's login `PATH`.
 //!
 //! `miao-server` keeps serving everything else for the host: its sessions
 //! (marked for a restart), resume candidates, directory queries, vitals and
@@ -58,6 +58,9 @@ pub(crate) struct TowerLink {
     dirty: Arc<AtomicBool>,
     log: Arc<ConnLog>,
     task: OnceLock<tokio::task::AbortHandle>,
+    /// The build whose deploy last failed, and when, so a host that refuses
+    /// it is not sent tens of megabytes on every reconnect.
+    refused: Mutex<Option<(String, Instant)>>,
 }
 
 /// Why a CLI call failed. `unreachable` means the command may never have
@@ -91,6 +94,7 @@ impl TowerLink {
             dirty,
             log,
             task: OnceLock::new(),
+            refused: Mutex::default(),
         })
     }
 
@@ -250,6 +254,127 @@ impl TowerLink {
         })
     }
 
+    /// Make sure the host runs the Tower this dashboard carries, uploading it
+    /// when it has another build or none. A host this dashboard carries no
+    /// Tower for keeps using the one on its `PATH`.
+    async fn deploy(&self) -> Result<(), String> {
+        if !crate::server_payload::carries_tower() {
+            return Ok(());
+        }
+        let (status, stdout, stderr) = self.shell(&probe_script(), None).await?;
+        if !status.success() {
+            return Err(format!("probing the host failed: {}", stderr.trim()));
+        }
+        let mut lines = stdout.lines();
+        let platform = lines.next().unwrap_or_default().trim().to_string();
+        let current = lines.next().unwrap_or_default().trim().to_string();
+        let candidates: Vec<_> = crate::server_payload::target_candidates(&platform)
+            .iter()
+            .filter_map(|target| {
+                crate::server_payload::tower_bundle(target)
+                    .map(|(digest, bundle)| (*target, digest, bundle))
+            })
+            .collect();
+        if candidates.is_empty() {
+            self.log.info(format!(
+                "this dashboard carries no Tower for {platform:?}; using {CLI} on the host's PATH"
+            ));
+            return Ok(());
+        }
+        if candidates.iter().any(|(_, digest, _)| *digest == current) {
+            return Ok(());
+        }
+        let key: String = candidates
+            .iter()
+            .map(|(_, digest, _)| digest.as_str())
+            .collect();
+        if let Some((refused, at)) = &*self.refused.lock().unwrap()
+            && *refused == key
+            && at.elapsed() < DEPLOY_COOLDOWN
+        {
+            return Err("the last deploy of this Tower failed; retrying later".into());
+        }
+        let mut reasons = Vec::new();
+        for (target, digest, bundle) in candidates {
+            self.log
+                .info(format!("deploying Tower {digest} for {target}"));
+            match self.upload(&digest, &bundle).await {
+                Ok(()) => {
+                    self.log.info(format!("deployed Tower {digest} ({target})"));
+                    return Ok(());
+                }
+                Err(reason) => reasons.push(format!("{target}: {reason}")),
+            }
+        }
+        *self.refused.lock().unwrap() = Some((key, Instant::now()));
+        Err(format!("could not deploy Tower: {}", reasons.join("; ")))
+    }
+
+    async fn upload(
+        &self,
+        digest: &str,
+        bundle: &[&crate::server_payload::TowerPayload],
+    ) -> Result<(), String> {
+        for (i, payload) in bundle.iter().enumerate() {
+            let bytes = payload.decompress().map_err(|e| e.to_string())?;
+            let (status, _, stderr) = self
+                .shell(&stage_script(digest, payload.binary, i == 0), Some(bytes))
+                .await?;
+            if !status.success() {
+                return Err(format!("sending {}: {}", payload.binary, stderr.trim()));
+            }
+        }
+        let (status, _, stderr) = self.shell(&publish_script(digest), None).await?;
+        if !status.success() {
+            return Err(format!("the host cannot run it: {}", stderr.trim()));
+        }
+        Ok(())
+    }
+
+    /// Run a `/bin/sh` script on the host, feeding it `stdin`.
+    async fn shell(
+        &self,
+        script: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<(std::process::ExitStatus, String, String), String> {
+        let mut child = Command::new("ssh")
+            .args(&self.opts)
+            .arg("-T")
+            .arg(&self.target)
+            .arg(login_shell_safe(script))
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("could not run ssh: {error}"))?;
+        // Written from a task while the output drains: one task doing both
+        // deadlocks once a pipe fills.
+        let writer = match (child.stdin.take(), stdin) {
+            (Some(mut pipe), Some(bytes)) => Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                pipe.write_all(&bytes).await?;
+                pipe.shutdown().await
+            })),
+            _ => None,
+        };
+        let output = tokio::time::timeout(DEPLOY_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+            .await
+            .map_err(|_| format!("timed out after {}s", DEPLOY_TIMEOUT.as_secs()))?
+            .map_err(|error| format!("ssh failed: {error}"))?;
+        if let Some(writer) = writer
+            && output.0.success()
+            && !matches!(writer.await, Ok(Ok(())))
+        {
+            return Err("the upload was cut short".into());
+        }
+        Ok(output)
+    }
+
     /// An ssh command running the host's CLI with `args`.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new("ssh");
@@ -352,16 +477,67 @@ fn cli_args<'a>(enabled: bool, args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// The remote command running `tower-cli args` in the account's login shell,
-/// which is where a user's `PATH` is complete.
+/// which is where a user's `PATH` is complete, and so the environment a
+/// daemon the CLI starts hands its agents. The Tower this dashboard deployed
+/// wins over one on `PATH`.
 fn remote_command(args: &[&str]) -> String {
-    let command = std::iter::once(format!("exec {CLI}"))
+    let command = std::iter::once("exec \"$CM_TOWER_CLI\"".to_string())
         .chain(args.iter().map(|arg| login_shell_quote_arg(arg)))
         .collect::<Vec<_>>()
         .join(" ");
+    let script = format!(
+        "c=\"$HOME/{DEPLOY_REL}/current/{CLI}\"; [ -x \"$c\" ] || c={CLI}; \
+         export CM_TOWER_CLI=\"$c\"; exec \"${{SHELL:-/bin/sh}}\" -l -c \"$0\""
+    );
     format!(
         "{} {}",
-        login_shell_safe("exec \"${SHELL:-/bin/sh}\" -l -c \"$0\""),
+        login_shell_safe(&script),
         login_shell_quote_arg(&command)
+    )
+}
+
+// =============================================================================
+// Deploying the Tower this dashboard carries
+// =============================================================================
+
+/// Where deployed Tower builds live on a host, relative to `$HOME`: one
+/// directory per build, named by its digest, and `current` linking to the one
+/// in use. A build is never replaced in place, so a daemon already running
+/// from an older one keeps its files.
+const DEPLOY_REL: &str = ".cache/captain-miao/tower";
+
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a failed deploy of one build is not retried.
+const DEPLOY_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// What a host reports before a deploy: its platform, and the build its
+/// `current` link names.
+fn probe_script() -> String {
+    format!("uname -sm; readlink \"$HOME/{DEPLOY_REL}/current\" || true")
+}
+
+/// Stream one binary into the build's staging directory. The first binary
+/// clears whatever an interrupted attempt left there.
+fn stage_script(digest: &str, binary: &str, first: bool) -> String {
+    let clear = if first { "rm -rf \"$d\"; " } else { "" };
+    format!(
+        "set -e; d=\"$HOME/{DEPLOY_REL}/{digest}.incoming\"; {clear}mkdir -p \"$d\"; \
+         cat > \"$d/{binary}\"; chmod 0755 \"$d/{binary}\""
+    )
+}
+
+/// Check the host can run the staged build, publish it, point `current` at
+/// it, and remove builds no process runs from.
+fn publish_script(digest: &str) -> String {
+    format!(
+        "set -e; r=\"$HOME/{DEPLOY_REL}\"; d=\"$r/{digest}\"; \
+         \"$d.incoming/{CLI}\" --version; \
+         rm -rf \"$d\"; mv \"$d.incoming\" \"$d\"; ln -sfn {digest} \"$r/current\"; \
+         for o in \"$r\"/*; do \
+           case \"$o\" in \"$d\"|\"$r/current\") continue;; esac; \
+           if ls -l /proc/[0-9]*/exe 2>/dev/null | grep -qF \"$o/\"; then continue; fi; \
+           rm -rf \"$o\"; \
+         done"
     )
 }
 
@@ -426,6 +602,9 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
         if enabled {
             this.log
                 .info(format!("following Tower sessions with `{CLI} events`"));
+        }
+        if enabled && let Err(reason) = this.deploy().await {
+            this.log.error(format!("Tower: {reason}"));
         }
         let outcome = follow_once(&this).await;
         let was_up = this.reported();
@@ -604,39 +783,126 @@ mod tests {
         assert_ne!(key, launcher_key("ag-2"));
     }
 
-    #[test]
-    fn the_cli_runs_in_the_login_shell_with_its_arguments_intact() {
+    fn executable(path: &std::path::Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let script = |name: &str, body: &str| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path
-        };
-        // A login shell that runs its `-c` command, and a CLI that prints
-        // each argument on its own line.
-        let shell = script(
-            "login",
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Run `script` as ssh would hand it to the host's login shell.
+    fn on_host(
+        home: &std::path::Path,
+        bin: &std::path::Path,
+        script: &str,
+        stdin: &[u8],
+    ) -> std::process::Output {
+        use std::io::Write;
+        // A login shell that runs its `-c` command.
+        let shell = bin.join("login");
+        executable(
+            &shell,
             r#"[ "$1" = -l ] && [ "$2" = -c ] && exec /bin/sh -c "$3""#,
         );
-        script("tower-cli", r#"for arg; do echo "$arg"; done"#);
-        let params = r#"{"cwd":"~/it's \ $HOME"}"#;
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", &remote_command(&["rpc", "session.open", params])])
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env("HOME", home)
             .env("SHELL", &shell)
-            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-            .output()
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn the_cli_runs_in_the_login_shell_with_its_arguments_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        // A CLI on PATH that prints each argument on its own line.
+        executable(&bin.join("tower-cli"), r#"for arg; do echo "$arg"; done"#);
+        let params = r#"{"cwd":"~/it's \ $HOME"}"#;
+        let run = || {
+            on_host(
+                &home,
+                &bin,
+                &remote_command(&["rpc", "session.open", params]),
+                b"",
+            )
+        };
+        let out = run();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             format!("rpc\nsession.open\n{params}\n"),
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // A deployed build wins over the one on PATH.
+        executable(
+            &home.join(DEPLOY_REL).join("current/tower-cli"),
+            r#"echo deployed "$1""#,
+        );
+        assert_eq!(String::from_utf8_lossy(&run().stdout), "deployed rpc\n");
         assert_eq!(
             json_in("motd\n{\"id\":\"ag-1\"}\n"),
             Some(serde_json::json!({"id": "ag-1"}))
+        );
+    }
+
+    #[test]
+    fn a_deploy_publishes_a_new_build_beside_the_ones_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        let root = home.join(DEPLOY_REL);
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        std::fs::create_dir_all(root.join("gone.incoming")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let stage = |digest: &str, binary: &str, first: bool, body: &str| {
+            let out = on_host(
+                &home,
+                &bin,
+                &login_shell_safe(&stage_script(digest, binary, first)),
+                format!("#!/bin/sh\n{body}\n").as_bytes(),
+            );
+            assert!(out.status.success(), "{out:?}");
+        };
+        stage("d1", "tower-cli", true, "echo tower-cli 0.1.0");
+        stage("d1", "tower", false, "exit 0");
+        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .nth(1)
+                .is_none_or(str::is_empty)
+        );
+        let out = on_host(&home, &bin, &login_shell_safe(&publish_script("d1")), b"");
+        assert!(out.status.success(), "{out:?}");
+        assert!(root.join("d1/tower-cli").is_file() && root.join("d1/tower").is_file());
+        assert!(!root.join("d1.incoming").exists());
+        // Builds no process runs from are removed; `current` names the new one.
+        assert!(!root.join("old").exists() && !root.join("gone.incoming").exists());
+        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).lines().nth(1),
+            Some("d1")
+        );
+
+        // A build the host cannot run is never published.
+        stage("d2", "tower-cli", true, "exit 1");
+        let out = on_host(&home, &bin, &login_shell_safe(&publish_script("d2")), b"");
+        assert!(!out.status.success());
+        assert!(!root.join("d2").exists());
+        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).lines().nth(1),
+            Some("d1")
         );
     }
 }

@@ -446,6 +446,125 @@ pub fn build(
     )
 }
 
+/// The binaries a Tower install consists of, in the order the dashboard
+/// expects them (`server_payload::TOWER_BINARIES`).
+pub const TOWER_BINARIES: &[&str] = &["tower-cli", "tower", "tower-terminal-pool"];
+
+/// The package in Tower's workspace that builds [`TOWER_BINARIES`].
+const TOWER_PKG: &str = "tower";
+
+/// Cross-build Tower for `target` from `source`, the checkout of the Tower
+/// revision the dashboard links, and pack each of [`TOWER_BINARIES`].
+///
+/// Built with Tower's own `release` profile and lockfile, into `build_dir`,
+/// with the same strategy choice as a server: zigbuild pins the glibc floor.
+pub fn build_tower(
+    source: &Path,
+    build_dir: &Path,
+    target: &str,
+    host: &str,
+    tools: &Tools,
+) -> Result<Vec<(&'static str, Payload)>, String> {
+    let strategy = choose_strategy(target, host, tools)?;
+    let (program, verb, triple) = match strategy {
+        Strategy::Native => (cargo(), "build", target.to_string()),
+        Strategy::Zigbuild => (cargo(), "zigbuild", zig_target(target)),
+        Strategy::Cross => ("cross".to_string(), "build", target.to_string()),
+    };
+    let args: Vec<String> = [
+        verb,
+        "--release",
+        "--locked",
+        // The package's own manifest rather than `-p`: Tower's workspace also
+        // depends on an unrelated crate named `tower`, which makes `-p` ambiguous.
+        "--manifest-path",
+        &source
+            .join("crates")
+            .join(TOWER_PKG)
+            .join("Cargo.toml")
+            .display()
+            .to_string(),
+        "--target",
+        &triple,
+        "--target-dir",
+        &build_dir.display().to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    println!("  {} {}", program, args.join(" "));
+    run(source, &program, &args, &cross_build_env(target, host))?;
+
+    TOWER_BINARIES
+        .iter()
+        .map(|binary| {
+            let artifact = build_dir.join(target).join("release").join(binary);
+            let raw = std::fs::read(&artifact).map_err(|e| {
+                format!(
+                    "reading {} after a successful build: {e}",
+                    artifact.display()
+                )
+            })?;
+            verify_arch(&raw, target, &artifact.display().to_string())?;
+            let payload = pack_binary(
+                &build_dir.join("packed").join(binary),
+                target,
+                &artifact,
+                &raw,
+                Provenance::Built(strategy),
+            )?;
+            Ok((*binary, payload))
+        })
+        .collect()
+}
+
+/// The root of the Tower checkout the dashboard at `root` depends on, from
+/// `cargo metadata`: the workspace holding its `tower-launcher` package. So a
+/// bundled Tower is always the revision `Cargo.lock` pins for the library.
+pub fn tower_source(root: &Path) -> Result<PathBuf, String> {
+    let out = Command::new(cargo())
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--manifest-path",
+        ])
+        .arg(root.join("Cargo.toml"))
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("running `cargo metadata`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("`cargo metadata` failed ({})", out.status));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("reading `cargo metadata`: {e}"))?;
+    let manifest = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|package| package["name"] == "tower-launcher")
+        .and_then(|package| package["manifest_path"].as_str())
+        .ok_or("the dashboard does not depend on tower-launcher")?;
+    // `<root>/crates/tower-launcher/Cargo.toml`
+    let source = Path::new(manifest)
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| format!("unexpected tower-launcher manifest {manifest}"))?;
+    if !source
+        .join("crates")
+        .join(TOWER_PKG)
+        .join("Cargo.toml")
+        .is_file()
+    {
+        return Err(format!(
+            "{} holds no `{TOWER_PKG}` package to build",
+            source.display()
+        ));
+    }
+    Ok(source.to_path_buf())
+}
+
 /// Pack a server binary the caller already has.
 ///
 /// The escape hatch for anything the other two sources don't cover — a binary

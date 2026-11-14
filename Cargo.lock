@@ -3642,6 +3642,7 @@ dependencies = [
  "clap",
  "liblzma",
  "lzma-rs",
+ "serde_json",
  "sha2 0.11.0",
 ]
 

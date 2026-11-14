@@ -34,6 +34,8 @@ liblzma = { version = "0.4", features = ["static"] }
 # The digest that rides to the remote host as the deployed-build marker. Same
 # major as cm-core's, so the workspace carries one copy.
 sha2 = "0.11"
+# Reads `cargo metadata` to find the Tower source the dashboard links against.
+serde_json = "1"
 
 # The decoder the *dashboard* ships, so `pack`'s output can be round-tripped
 # against it here. This is the only place both codecs exist, and the only place

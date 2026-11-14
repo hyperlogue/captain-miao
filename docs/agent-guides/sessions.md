@@ -95,7 +95,15 @@ owns the local side and the record-to-row mapping both sides use;
   `miao-server` connection. It runs the host's `tower-cli` over the shared
   ssh master in the login shell: `events --topics agents` for records, `rpc`
   for `session.open` (deferred until the first attach), `session.kill` and
-  `session.tags.patch`, and `attach` in the window. Nothing is provisioned.
+  `session.tags.patch`, and `attach` in the window.
+- With the flag on and Tower embedded (`server_payload::TOWER_PAYLOADS`), the
+  link probes `uname -sm` and the `current` link under
+  `~/.cache/captain-miao/tower/` before following, and uploads the build for
+  the first candidate target that `tower-cli --version` accepts. Builds are
+  never replaced in place: each lives in a directory named by its digest, so a
+  running daemon keeps its files; the deploy removes only builds no process
+  runs from. The remote command runs `current/tower-cli` when present, else
+  the one on `PATH`. A failed build is not re-sent for five minutes.
 - `miao-server` still serves resume candidates, directory queries, vitals,
   Codex config and VCS. Its rows are merged with Tower's and marked.
 - A remote Tower row is keyed by a hash of its Tower id with the high bit

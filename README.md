@@ -195,9 +195,12 @@ one. New and restarted local sessions then start on Tower.
 Sessions started earlier keep running and show `↻` after their status; restart
 an idle one to move it to Tower.
 
-On SSH hosts, new sessions run under the Tower daemon on the host. Install Tower
-there so `tower-cli` is on the login shell's `PATH`; it starts the daemon when
-needed. `miao-server` still serves the rest of the host (resume list, directory
+On SSH hosts, new sessions run under the Tower daemon on the host. A `miao`
+built with `cargo xtask dist --tower` carries Tower and uploads it to each host
+that runs a different build, under `~/.cache/captain-miao/tower/`; otherwise
+install Tower there so `tower-cli` is on the login shell's `PATH`. A deployed
+build wins over the one on `PATH`, and `tower-cli` starts the daemon when
+needed. A daemon already running keeps running its own build. `miao-server` still serves the rest of the host (resume list, directory
 picker, vitals, VCS), and its sessions show `↻`. A remote Tower session's window
 runs `tower-cli attach`.
 

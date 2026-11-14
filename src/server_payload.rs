@@ -59,6 +59,71 @@ impl ServerPayload {
     }
 }
 
+/// One embedded Tower binary. A host needs [`TOWER_BINARIES`] from one target;
+/// `tower-cli` starts the other two from beside itself.
+pub(crate) struct TowerPayload {
+    pub(crate) target: &'static str,
+    /// The file name it is deployed under.
+    pub(crate) binary: &'static str,
+    /// Hex sha256 of the decompressed bytes.
+    pub(crate) sha256: &'static str,
+    /// The xz-compressed binary, packed like [`ServerPayload::packed`].
+    pub(crate) packed: &'static [u8],
+}
+
+impl TowerPayload {
+    pub(crate) fn decompress(&self) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        lzma_rs::xz_decompress(&mut &self.packed[..], &mut out).map_err(|e| {
+            std::io::Error::other(format!("unpacking {} {}: {e}", self.binary, self.target))
+        })?;
+        Ok(out)
+    }
+}
+
+/// What a Tower install consists of. `tower-cli` comes first: it is what the
+/// dashboard runs, and what a deploy checks the host can execute.
+pub(crate) const TOWER_BINARIES: &[&str] = &["tower-cli", "tower", "tower-terminal-pool"];
+
+/// The Tower this binary carries for `target`, complete or not at all, and
+/// the digest naming that build: the first 16 hex digits of the sha256 over
+/// each binary's own digest, in [`TOWER_BINARIES`] order.
+pub(crate) fn tower_bundle(target: &str) -> Option<(String, Vec<&'static TowerPayload>)> {
+    tower_bundle_in(TOWER_PAYLOADS, target)
+}
+
+fn tower_bundle_in(
+    table: &'static [TowerPayload],
+    target: &str,
+) -> Option<(String, Vec<&'static TowerPayload>)> {
+    use sha2::{Digest, Sha256};
+    let bundle = TOWER_BINARIES
+        .iter()
+        .map(|binary| {
+            table
+                .iter()
+                .find(|p| p.target == target && p.binary == *binary)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut hash = Sha256::new();
+    for payload in &bundle {
+        hash.update(payload.sha256.as_bytes());
+        hash.update(b"\n");
+    }
+    let digest: String = hash
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some((digest, bundle))
+}
+
+/// Whether this binary carries any Tower at all.
+pub(crate) fn carries_tower() -> bool {
+    !TOWER_PAYLOADS.is_empty()
+}
+
 // The table `build.rs` generates: one `ServerPayload` per line of the manifest,
 // each `packed` an `include_bytes!` of the archive. Empty — a `&[]` costing nothing —
 // whenever `CM_SERVER_PAYLOAD_MANIFEST` was unset, which is every ordinary build.
@@ -363,7 +428,37 @@ pub(crate) fn embedded_targets() -> Vec<&'static str> {
 /// absence of payloads reads as an answer rather than as an old build that
 /// doesn't report. The digest is what distinguishes two same-version builds.
 pub(crate) fn describe() -> String {
-    describe_table(payloads())
+    let mut out = describe_table(payloads());
+    out.push_str(&describe_towers(TOWER_PAYLOADS));
+    out
+}
+
+/// The Tower half of [`describe`]. Pure.
+fn describe_towers(table: &'static [TowerPayload]) -> String {
+    let mut targets: Vec<&str> = Vec::new();
+    for payload in table {
+        if !targets.contains(&payload.target) {
+            targets.push(payload.target);
+        }
+    }
+    if targets.is_empty() {
+        return "\nembedded tower: none (`cargo xtask dist --tower` builds a bundled miao)".into();
+    }
+    let mut out = String::from("\nembedded tower:");
+    for target in targets {
+        let size: usize = table
+            .iter()
+            .filter(|p| p.target == target)
+            .map(|p| p.packed.len())
+            .sum();
+        let digest = tower_bundle_in(table, target)
+            .map_or_else(|| "incomplete".to_string(), |(digest, _)| digest);
+        out.push_str(&format!(
+            "\n  {target:<28} {:>8}  {digest}",
+            format!("{:.1} MiB", size as f64 / (1u64 << 20) as f64),
+        ));
+    }
+    out
 }
 
 /// [`describe`] over an injected table, so both branches are testable in a
@@ -759,5 +854,55 @@ mod tests {
             before,
             "duplicate target in the payload table"
         );
+    }
+}
+
+#[cfg(test)]
+mod tower_tests {
+    use super::*;
+
+    static TABLE: &[TowerPayload] = &[
+        TowerPayload {
+            target: "x86_64-unknown-linux-gnu",
+            binary: "tower-cli",
+            sha256: "a",
+            packed: b"",
+        },
+        TowerPayload {
+            target: "x86_64-unknown-linux-gnu",
+            binary: "tower",
+            sha256: "b",
+            packed: b"",
+        },
+        TowerPayload {
+            target: "x86_64-unknown-linux-gnu",
+            binary: "tower-terminal-pool",
+            sha256: "c",
+            packed: b"",
+        },
+        TowerPayload {
+            target: "aarch64-unknown-linux-gnu",
+            binary: "tower-cli",
+            sha256: "a",
+            packed: b"",
+        },
+    ];
+
+    #[test]
+    fn a_tower_is_deployed_whole_or_not_at_all() {
+        let (digest, bundle) = tower_bundle_in(TABLE, "x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(digest.len(), 16);
+        assert_eq!(
+            bundle.iter().map(|p| p.binary).collect::<Vec<_>>(),
+            TOWER_BINARIES
+        );
+        assert!(tower_bundle_in(TABLE, "aarch64-unknown-linux-gnu").is_none());
+        assert!(tower_bundle_in(TABLE, "riscv64").is_none());
+        let text = describe_towers(TABLE);
+        assert!(
+            text.contains(&digest) && text.contains("incomplete"),
+            "{text}"
+        );
+        assert!(describe_towers(&[]).contains("none"));
     }
 }

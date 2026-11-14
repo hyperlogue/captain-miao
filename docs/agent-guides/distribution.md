@@ -15,6 +15,12 @@ CI changes. [Crate split](../crate-split.md) owns the architecture; the
   `ALL_SERVER_VARIANT` is the extra GitHub-only download with all four servers.
   Shipping a plain build under `miao-v…` removes auto-deployment for its users;
   `no_default_variant_is_the_plain_build` pins this distinction.
+- `CM_TOWER_PAYLOAD_MANIFEST` embeds Tower the same way, one line per
+  binary (`tower-cli`, `tower`, `tower-terminal-pool`). Only `dist --tower`
+  sets it non-empty: Tower is built from the checkout of the revision
+  `Cargo.lock` pins for `tower-launcher`, with Tower's own lockfile and
+  `release` profile, for each server target of the variant. A target carries
+  all three binaries or none.
 - Install executables on a fresh inode using xtask's `install`. Copying over a
   previously run file breaks macOS vnode-bound signatures and subsequent execs
   die with `SIGKILL (Code Signature Invalid)`.
@@ -24,6 +30,7 @@ cargo build --workspace
 cargo build --no-default-features   # local-only dashboard
 cargo xtask dist --list
 cargo xtask dist                    # default: shipping variants
+cargo xtask dist --variant bundle-linux-x86_64 --tower   # also carries Tower
 cargo xtask prepare-servers --out dist/servers
 miao --version                     # reports embedded servers
 ```
