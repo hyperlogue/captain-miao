@@ -447,16 +447,26 @@ pub fn build(
 }
 
 /// The binaries a Tower install consists of, in the order the dashboard
-/// expects them (`server_payload::TOWER_BINARIES`).
+/// expects them (`tower_archive::BINARIES`).
 pub const TOWER_BINARIES: &[&str] = &["tower-cli", "tower", "tower-terminal-pool"];
 
 /// The package in Tower's workspace that builds [`TOWER_BINARIES`].
 const TOWER_PKG: &str = "tower";
 
+const TOWER_PROFILE: &str = "tower-release";
+const TOWER_XZ_PRESET: u32 = 9;
+
+// Tower owns a writable database. Keep STAT4's query-planner statistics and
+// SQLite's built-in JSON and hooks; trim only facilities Tower does not use.
+const TOWER_SQLITE_TRIM: &str = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS \
+    -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB \
+    -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_LOAD_EXTENSION \
+    -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE";
+
 /// Cross-build Tower for `target` from `source`, the checkout of the Tower
-/// revision the dashboard links, and pack each of [`TOWER_BINARIES`].
+/// revision the dashboard links, and pack [`TOWER_BINARIES`] together.
 ///
-/// Built with Tower's own `release` profile and lockfile, into `build_dir`,
+/// Built with a distribution-only profile and Tower's lockfile, into `build_dir`,
 /// with the same strategy choice as a server: zigbuild pins the glibc floor.
 pub fn build_tower(
     source: &Path,
@@ -464,8 +474,55 @@ pub fn build_tower(
     target: &str,
     host: &str,
     tools: &Tools,
-) -> Result<Vec<(&'static str, Payload)>, String> {
+) -> Result<Payload, String> {
     let strategy = choose_strategy(target, host, tools)?;
+    let (program, args) = tower_build_argv(strategy, source, build_dir, target);
+    let mut env = cross_build_env(target, host);
+    env.push(("LIBSQLITE3_FLAGS".into(), TOWER_SQLITE_TRIM.into()));
+    println!("  {} {}", program, args.join(" "));
+    run(source, &program, &args, &env)?;
+
+    let mut binaries = Vec::new();
+    for binary in TOWER_BINARIES {
+        let artifact = build_dir.join(target).join(TOWER_PROFILE).join(binary);
+        let raw = std::fs::read(&artifact).map_err(|e| {
+            format!(
+                "reading {} after a successful build: {e}",
+                artifact.display()
+            )
+        })?;
+        verify_arch(&raw, target, &artifact.display().to_string())?;
+        binaries.push((*binary, raw));
+    }
+    let raw = tower_tar(&binaries)?;
+    let artifact = build_dir.join(target).join(TOWER_PROFILE).join("tower.tar");
+    if !std::fs::read(&artifact).is_ok_and(|old| old == raw) {
+        std::fs::write(&artifact, &raw).map_err(|e| e.to_string())?;
+    }
+    let sha256 = hex(&Sha256::digest(&raw));
+    // These combined payloads exceed preset 6's 8 MiB dictionary. Preset 9
+    // shares up to 64 MiB across companions; the dashboard pays that memory
+    // cost only while unpacking a deployment.
+    let (packed_path, packed_len, repacked) =
+        pack_with_preset(build_dir, target, &raw, &sha256, TOWER_XZ_PRESET)?;
+    Ok(Payload {
+        target: target.into(),
+        sha256,
+        bin_path: artifact,
+        packed_path,
+        raw_len: raw.len() as u64,
+        packed_len,
+        provenance: Provenance::Built(strategy),
+        repacked,
+    })
+}
+
+fn tower_build_argv(
+    strategy: Strategy,
+    source: &Path,
+    build_dir: &Path,
+    target: &str,
+) -> (String, Vec<String>) {
     let (program, verb, triple) = match strategy {
         Strategy::Native => (cargo(), "build", target.to_string()),
         Strategy::Zigbuild => (cargo(), "zigbuild", zig_target(target)),
@@ -473,7 +530,20 @@ pub fn build_tower(
     };
     let args: Vec<String> = [
         verb,
-        "--release",
+        "--profile",
+        TOWER_PROFILE,
+        "--config",
+        "profile.tower-release.inherits=\"release\"",
+        "--config",
+        "profile.tower-release.opt-level=3",
+        "--config",
+        "profile.tower-release.lto=\"fat\"",
+        "--config",
+        "profile.tower-release.codegen-units=1",
+        "--config",
+        "profile.tower-release.strip=true",
+        "--config",
+        "profile.tower-release.panic=\"unwind\"",
         "--locked",
         // The package's own manifest rather than `-p`: Tower's workspace also
         // depends on an unrelated crate named `tower`, which makes `-p` ambiguous.
@@ -492,30 +562,22 @@ pub fn build_tower(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    println!("  {} {}", program, args.join(" "));
-    run(source, &program, &args, &cross_build_env(target, host))?;
+    (program, args)
+}
 
-    TOWER_BINARIES
-        .iter()
-        .map(|binary| {
-            let artifact = build_dir.join(target).join("release").join(binary);
-            let raw = std::fs::read(&artifact).map_err(|e| {
-                format!(
-                    "reading {} after a successful build: {e}",
-                    artifact.display()
-                )
-            })?;
-            verify_arch(&raw, target, &artifact.display().to_string())?;
-            let payload = pack_binary(
-                &build_dir.join("packed").join(binary),
-                target,
-                &artifact,
-                &raw,
-                Provenance::Built(strategy),
-            )?;
-            Ok((*binary, payload))
-        })
-        .collect()
+/// Fixed names, order and metadata make identity independent of build mtimes.
+fn tower_tar(binaries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, bytes) in binaries {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, bytes.as_slice())
+            .map_err(|e| e.to_string())?;
+    }
+    archive.into_inner().map_err(|e| e.to_string())
 }
 
 /// The root of the Tower checkout the dashboard at `root` depends on, from
@@ -784,6 +846,16 @@ fn pack(
     raw: &[u8],
     sha256: &str,
 ) -> Result<(PathBuf, u64, bool), String> {
+    pack_with_preset(build_dir, target, raw, sha256, XZ_PRESET)
+}
+
+fn pack_with_preset(
+    build_dir: &Path,
+    target: &str,
+    raw: &[u8],
+    sha256: &str,
+    preset: u32,
+) -> Result<(PathBuf, u64, bool), String> {
     let dir = build_dir.join("packed");
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let packed_path = dir.join(format!("{target}.xz"));
@@ -792,13 +864,14 @@ fn pack(
     // The stamp records the digest of the *binary* the archive was made from, so
     // a cache hit means the bytes we are about to embed are the bytes cargo just
     // produced — not merely that some archive exists.
-    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == sha256)
+    let identity = format!("{sha256}\nxz-preset={preset}\n");
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s == identity)
         && let Ok(meta) = std::fs::metadata(&packed_path)
     {
         return Ok((packed_path, meta.len(), false));
     }
 
-    let mut enc = XzEncoder::new(Vec::new(), XZ_PRESET);
+    let mut enc = XzEncoder::new(Vec::new(), preset);
     enc.write_all(raw).map_err(|e| format!("xz: {e}"))?;
     let packed = enc.finish().map_err(|e| format!("xz: {e}"))?;
 
@@ -808,8 +881,7 @@ fn pack(
     let tmp = dir.join(format!(".{target}.xz.tmp"));
     std::fs::write(&tmp, &packed).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &packed_path).map_err(|e| format!("renaming {}: {e}", tmp.display()))?;
-    std::fs::write(&stamp, format!("{sha256}\n"))
-        .map_err(|e| format!("writing {}: {e}", stamp.display()))?;
+    std::fs::write(&stamp, identity).map_err(|e| format!("writing {}: {e}", stamp.display()))?;
 
     Ok((packed_path, packed.len() as u64, true))
 }
@@ -904,6 +976,94 @@ pub fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tower_profile_preserves_speed_and_unwinding_for_every_strategy() {
+        for strategy in [Strategy::Native, Strategy::Zigbuild, Strategy::Cross] {
+            let (_, args) = tower_build_argv(
+                strategy,
+                Path::new("/source"),
+                Path::new("/build"),
+                "x86_64-unknown-linux-gnu",
+            );
+            let profile = args.windows(2).find(|pair| pair[0] == "--profile").unwrap();
+            assert_eq!(profile[1], TOWER_PROFILE);
+            for setting in [
+                "profile.tower-release.opt-level=3",
+                "profile.tower-release.lto=\"fat\"",
+                "profile.tower-release.codegen-units=1",
+                "profile.tower-release.panic=\"unwind\"",
+            ] {
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "--config" && pair[1] == setting)
+                );
+            }
+        }
+        for retained in ["STAT4", "JSON", "HOOK"] {
+            assert!(!TOWER_SQLITE_TRIM.contains(retained));
+        }
+    }
+
+    #[test]
+    fn tower_archive_round_trips_through_the_deployment_decoder() {
+        assert_eq!(TOWER_BINARIES, crate::tower_archive::BINARIES);
+        let dir = std::env::temp_dir().join(format!("cm-tower-pack-{}", std::process::id()));
+        let binaries: Vec<_> = TOWER_BINARIES
+            .iter()
+            .map(|name| (*name, name.as_bytes().repeat(4096)))
+            .collect();
+        let raw = tower_tar(&binaries).unwrap();
+        assert_eq!(raw, tower_tar(&binaries).unwrap());
+        let sha = hex(&Sha256::digest(&raw));
+        let (path, len, _) = pack_with_preset(&dir, "t", &raw, &sha, TOWER_XZ_PRESET).unwrap();
+        let packed = std::fs::read(&path).unwrap();
+        assert!(len < raw.len() as u64 / 4);
+        assert_eq!(
+            crate::tower_archive::decode(&packed, &sha).unwrap(),
+            binaries
+        );
+        assert!(crate::tower_archive::decode(&packed, &"0".repeat(64)).is_err());
+        assert!(crate::tower_archive::decode(&packed[..packed.len() / 2], &sha).is_err());
+        let (_, _, repacked) = pack_with_preset(&dir, "t", &raw, &sha, TOWER_XZ_PRESET).unwrap();
+        assert!(!repacked);
+        let (_, _, changed_recipe) = pack_with_preset(&dir, "t", &raw, &sha, 6).unwrap();
+        assert!(changed_recipe);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tower_decoder_rejects_incomplete_duplicate_and_unexpected_members() {
+        fn rejects(raw: Vec<u8>) {
+            let sha = hex(&Sha256::digest(&raw));
+            let mut encoder = XzEncoder::new(Vec::new(), TOWER_XZ_PRESET);
+            encoder.write_all(&raw).unwrap();
+            assert!(crate::tower_archive::decode(&encoder.finish().unwrap(), &sha).is_err());
+        }
+        let binaries: Vec<_> = TOWER_BINARIES
+            .iter()
+            .map(|name| (*name, b"binary".to_vec()))
+            .collect();
+        rejects(tower_tar(&binaries[..2]).unwrap());
+        let mut duplicate = binaries.clone();
+        duplicate.push(binaries[0].clone());
+        rejects(tower_tar(&duplicate).unwrap());
+        let mut unexpected = binaries.clone();
+        unexpected[0].0 = "other";
+        rejects(tower_tar(&unexpected).unwrap());
+        unexpected[0].0 = "directory/tower-cli";
+        rejects(tower_tar(&unexpected).unwrap());
+        let mut empty = binaries;
+        empty[0].1.clear();
+        rejects(tower_tar(&empty).unwrap());
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        tar.append_link(&mut header, "tower-cli", "/outside")
+            .unwrap();
+        rejects(tar.into_inner().unwrap());
+    }
 
     const HOST: &str = "x86_64-unknown-linux-gnu";
     const OTHER: &str = "aarch64-unknown-linux-gnu";

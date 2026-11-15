@@ -15,12 +15,16 @@ CI changes. [Crate split](../crate-split.md) owns the architecture; the
   `ALL_SERVER_VARIANT` is the extra GitHub-only download with all four servers.
   Shipping a plain build under `miao-v…` removes auto-deployment for its users;
   `no_default_variant_is_the_plain_build` pins this distinction.
-- `CM_TOWER_PAYLOAD_MANIFEST` embeds Tower the same way, one line per
-  binary (`tower-cli`, `tower`, `tower-terminal-pool`). Only `dist --tower`
-  sets it non-empty: Tower is built from the checkout of the revision
-  `Cargo.lock` pins for `tower-launcher`, with Tower's own lockfile and
-  `release` profile, for each server target of the variant. A target carries
-  all three binaries or none.
+- `CM_TOWER_PAYLOAD_MANIFEST` embeds one complete tar/XZ archive per target
+  (`tower-cli`, `tower`, `tower-terminal-pool`). Only `dist --tower` sets it
+  non-empty. Tower comes from the revision `Cargo.lock` pins for
+  `tower-launcher`, using Tower's own lockfile. The nested `tower-release`
+  profile keeps optimization level 3 and unwinding, with fat LTO, one codegen
+  unit and stripping. Its SQLite trim preserves STAT4, JSON and hooks.
+  Preset 9 shares a 64 MiB dictionary across companions; decoding happens on
+  the dashboard before uploading plain binaries. The manifest names the target,
+  SHA-256 of the deterministic tar, and archive path. Validate the digest and
+  all three regular members before uploading any of them.
 - Install executables on a fresh inode using xtask's `install`. Copying over a
   previously run file breaks macOS vnode-bound signatures and subsequent execs
   die with `SIGKILL (Code Signature Invalid)`.

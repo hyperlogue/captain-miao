@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 /// The manifest naming what to embed. Written by `cargo xtask`.
 const MANIFEST_ENV: &str = "CM_SERVER_PAYLOAD_MANIFEST";
 
-/// The manifest naming Tower binaries to embed: `<target>\t<binary>\t<sha256>\t
-/// <path to .xz>` per line. Written by `cargo xtask dist --tower`; unset embeds
+/// The manifest naming Tower bundles to embed: `<target>\t<sha256>\t
+/// <path to .tar.xz>` per line. Written by `cargo xtask dist --tower`; unset embeds
 /// none, exactly like [`MANIFEST_ENV`].
 const TOWER_MANIFEST_ENV: &str = "CM_TOWER_PAYLOAD_MANIFEST";
 
@@ -48,7 +48,7 @@ fn main() {
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let entries = match std::env::var(MANIFEST_ENV) {
-        Ok(path) if !path.trim().is_empty() => read_manifest(Path::new(path.trim())),
+        Ok(path) if !path.trim().is_empty() => read_manifest(Path::new(path.trim()), MANIFEST_ENV),
         _ => Vec::new(),
     };
 
@@ -75,18 +75,20 @@ fn main() {
     generated.push_str("];\n");
 
     let towers = match std::env::var(TOWER_MANIFEST_ENV) {
-        Ok(path) if !path.trim().is_empty() => read_tower_manifest(Path::new(path.trim())),
+        Ok(path) if !path.trim().is_empty() => {
+            read_manifest(Path::new(path.trim()), TOWER_MANIFEST_ENV)
+        }
         _ => Vec::new(),
     };
     generated.push_str("pub(crate) static TOWER_PAYLOADS: &[TowerPayload] = &[\n");
-    for (i, (target, binary, sha256, packed)) in towers.iter().enumerate() {
+    for (i, (target, sha256, packed)) in towers.iter().enumerate() {
         println!("cargo::rerun-if-changed={}", packed.display());
         let staged = out.join(format!("tower-payload-{i}.xz"));
         std::fs::copy(packed, &staged).unwrap_or_else(|e| {
             panic!("copying {} to {}: {e}", packed.display(), staged.display())
         });
         generated.push_str(&format!(
-            "    TowerPayload {{ target: {target:?}, binary: {binary:?}, sha256: {sha256:?}, \
+            "    TowerPayload {{ target: {target:?}, sha256: {sha256:?}, \
              packed: include_bytes!({:?}) }},\n",
             staged.display().to_string()
         ));
@@ -104,16 +106,17 @@ fn main() {
 /// the lenient reading would produce a dashboard that silently carries nothing
 /// while every sign says it should. The quiet path is the variable being unset,
 /// which never reaches here.
-fn read_manifest(path: &Path) -> Vec<(String, String, PathBuf)> {
+fn read_manifest(path: &Path, manifest_env: &str) -> Vec<(String, String, PathBuf)> {
     println!("cargo::rerun-if-changed={}", path.display());
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
-            "{MANIFEST_ENV} names {}, which cannot be read: {e}",
+            "{manifest_env} names {}, which cannot be read: {e}",
             path.display()
         )
     });
 
     let mut out = Vec::new();
+    let mut targets = std::collections::HashSet::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -131,6 +134,9 @@ fn read_manifest(path: &Path) -> Vec<(String, String, PathBuf)> {
         if target.is_empty() {
             bad("empty target triple");
         }
+        if !targets.insert(target.to_string()) {
+            bad("duplicate target triple");
+        }
         // The digest rides to the remote host as the deployed-build marker, so a
         // malformed one would be written there and compared against forever.
         if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -141,61 +147,6 @@ fn read_manifest(path: &Path) -> Vec<(String, String, PathBuf)> {
             bad("no such archive");
         }
         out.push((target.to_string(), sha256.to_string(), packed));
-    }
-    out
-}
-
-/// Parse the Tower manifest, or die saying why — fatal for the same reason
-/// [`read_manifest`] is.
-fn read_tower_manifest(path: &Path) -> Vec<(String, String, String, PathBuf)> {
-    println!("cargo::rerun-if-changed={}", path.display());
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!(
-            "{TOWER_MANIFEST_ENV} names {}, which cannot be read: {e}",
-            path.display()
-        )
-    });
-    let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let bad = |why: &str| -> ! {
-            panic!("{}:{}: {why}\n  {line}", path.display(), n + 1);
-        };
-        let mut fields = line.split('\t');
-        let (Some(target), Some(binary), Some(sha256), Some(packed), None) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
-            bad("expected four tab-separated fields: <target> <binary> <sha256> <path>");
-        };
-        if target.is_empty() || binary.is_empty() {
-            bad("empty target or binary");
-        }
-        if !binary
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            bad("a binary name is letters, digits and dashes");
-        }
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bad("sha256 must be 64 hex digits");
-        }
-        let packed = PathBuf::from(packed);
-        if !packed.is_file() {
-            bad("no such archive");
-        }
-        out.push((
-            target.to_string(),
-            binary.to_string(),
-            sha256.to_string(),
-            packed,
-        ));
     }
     out
 }

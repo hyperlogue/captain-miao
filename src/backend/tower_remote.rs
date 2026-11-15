@@ -298,7 +298,7 @@ impl TowerLink {
         for (target, digest, bundle) in candidates {
             self.log
                 .info(format!("deploying Tower {digest} for {target}"));
-            match self.upload(&digest, &bundle).await {
+            match self.upload(&digest, bundle).await {
                 Ok(()) => {
                     self.log.info(format!("deployed Tower {digest} ({target})"));
                     return Ok(());
@@ -313,15 +313,18 @@ impl TowerLink {
     async fn upload(
         &self,
         digest: &str,
-        bundle: &[&crate::server_payload::TowerPayload],
+        bundle: &'static crate::server_payload::TowerPayload,
     ) -> Result<(), String> {
-        for (i, payload) in bundle.iter().enumerate() {
-            let bytes = payload.decompress().map_err(|e| e.to_string())?;
+        let binaries = tokio::task::spawn_blocking(move || bundle.decompress())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        for (i, (binary, bytes)) in binaries.into_iter().enumerate() {
             let (status, _, stderr) = self
-                .shell(&stage_script(digest, payload.binary, i == 0), Some(bytes))
+                .shell(&stage_script(digest, binary, i == 0), Some(bytes))
                 .await?;
             if !status.success() {
-                return Err(format!("sending {}: {}", payload.binary, stderr.trim()));
+                return Err(format!("sending {binary}: {}", stderr.trim()));
             }
         }
         let (status, _, stderr) = self.shell(&publish_script(digest), None).await?;

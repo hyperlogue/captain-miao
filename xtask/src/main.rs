@@ -21,6 +21,10 @@
 
 mod server;
 
+#[cfg(test)]
+#[path = "../../src/tower_archive.rs"]
+mod tower_archive;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -487,9 +491,9 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
     for v in &wanted {
         println!("\n▶ {}", v.label());
         let payloads = pick_payloads(&servers, v.servers)?;
-        let tower: Vec<&(String, &str, server::Payload)> = towers
+        let tower: Vec<&server::Payload> = towers
             .iter()
-            .filter(|(target, _, _)| v.servers.contains(&target.as_str()))
+            .filter(|p| v.servers.contains(&p.target.as_str()))
             .collect();
         if args.tower && tower.is_empty() {
             println!(
@@ -507,7 +511,8 @@ fn dist(ws: &Workspace, args: &DistArgs) -> Result<()> {
         let from = built_dashboard(&ws.target_dir, args.target.as_deref());
         install(&from, &to)?;
 
-        verify(&to, &payloads, runnable)?;
+        let embedded: Vec<_> = payloads.iter().chain(&tower).copied().collect();
+        verify(&to, &embedded, runnable)?;
         built.push((v.artifact(), std::fs::metadata(&to).map(|m| m.len())?));
     }
 
@@ -535,10 +540,7 @@ fn pick_payloads<'a>(
 }
 
 /// Build Tower for every target, once each.
-fn obtain_towers(
-    ws: &Workspace,
-    targets: &BTreeSet<&str>,
-) -> Result<Vec<(String, &'static str, server::Payload)>> {
+fn obtain_towers(ws: &Workspace, targets: &BTreeSet<&str>) -> Result<Vec<server::Payload>> {
     let source = server::tower_source(&ws.root).map_err(|e| anyhow!("{e}"))?;
     let host = server::host_triple().map_err(|e| anyhow!("{e}"))?;
     let tools = server::Tools::detect();
@@ -546,13 +548,10 @@ fn obtain_towers(
     let mut out = Vec::new();
     for target in targets {
         println!("▶ tower for {target} (from {})", source.display());
-        for (binary, payload) in
-            server::build_tower(&source, &dir, target, &host, &tools).map_err(|e| anyhow!("{e}"))?
-        {
-            println!("  {binary}:");
-            report(&payload);
-            out.push((target.to_string(), binary, payload));
-        }
+        let payload = server::build_tower(&source, &dir, target, &host, &tools)
+            .map_err(|e| anyhow!("{e}"))?;
+        report(&payload);
+        out.push(payload);
     }
     Ok(out)
 }
@@ -561,7 +560,7 @@ fn build_dashboard(
     ws: &Workspace,
     v: &Variant,
     payloads: &[&server::Payload],
-    towers: &[&(String, &str, server::Payload)],
+    towers: &[&server::Payload],
     target: Option<&str>,
 ) -> Result<()> {
     let features = v.cargo_features();
@@ -642,12 +641,12 @@ fn write_manifest(ws: &Workspace, v: &Variant, payloads: &[&server::Payload]) ->
 }
 
 /// Write the Tower manifest `build.rs` reads, like [`write_manifest`]:
-/// `<target>\t<binary>\t<sha256>\t<archive>` per line, empty for a variant
+/// `<target>\t<sha256>\t<archive>` per line, empty for a variant
 /// carrying none.
 fn write_tower_manifest(
     ws: &Workspace,
     v: &Variant,
-    towers: &[&(String, &str, server::Payload)],
+    towers: &[&server::Payload],
 ) -> Result<PathBuf> {
     let dir = ws.target_dir.join("cm-server-payloads");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -656,14 +655,16 @@ fn write_tower_manifest(
         if v.name.is_empty() { "plain" } else { v.name }
     ));
     let mut text = String::new();
-    for (target, binary, p) in towers {
+    for p in towers {
         text.push_str(&format!(
-            "{target}\t{binary}\t{}\t{}\n",
+            "{}\t{}\t{}\n",
+            p.target,
             p.sha256,
             p.packed_path.display()
         ));
         println!(
-            "  embedding tower {binary} for {target} ({})",
+            "  embedding tower for {} ({})",
+            p.target,
             server::human(p.packed_len)
         );
     }
@@ -773,7 +774,10 @@ fn verify(artifact: &Path, payloads: &[&server::Payload], runnable: bool) -> Res
     }
     let text = String::from_utf8_lossy(&out.stdout);
     for p in payloads {
-        if !text.contains(&p.target) {
+        if !text
+            .lines()
+            .any(|line| line.contains(&p.target) && line.contains(&p.sha256[..12]))
+        {
             bail!(
                 "{} was built to carry {} but does not report it:\n{}",
                 artifact.display(),

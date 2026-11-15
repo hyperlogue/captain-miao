@@ -15,6 +15,7 @@ mod sleep;
 mod ssh_forward;
 mod terminal;
 mod tower;
+mod tower_archive;
 
 // Core modules re-exported at the crate root so the dashboard's `crate::state`,
 // `crate::agent`, `crate::protocol`, `crate::init_tracing` paths resolve unchanged.

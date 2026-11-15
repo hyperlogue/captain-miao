@@ -2,6 +2,9 @@
 members = ["crates/cm-core", "crates/cm-server", "crates/cm-client", "xtask"]
 exclude = ["vendor/libshpool"]
 
+[workspace.dependencies]
+tar = { version = "0.4", default-features = false }
+
 [patch.crates-io]
 # Adds an optional per-session restore-spool factory; see vendor/libshpool/PATCH.md.
 libshpool = { path = "vendor/libshpool" }
@@ -42,6 +45,7 @@ path = "src/main.rs"
 cc = "1"
 
 [dependencies]
+tar.workspace = true
 cm-core = { path = "crates/cm-core" }
 # Tower runs local sessions when `CAPTAIN_MIAO_TOWER` is set (src/tower.rs).
 # One revision for both, so the launcher and its contract cannot drift.
