@@ -814,8 +814,8 @@ impl SessionStatus {
     }
 
     /// Whether the session is at rest **enough to be torn down and brought
-    /// back**: the whitelist both the restart commands and a server upgrade
-    /// gate on, so the two can't drift apart on which states they'll act over.
+    /// back during a server upgrade**. Explicit session restarts do not require
+    /// an at-rest status.
     ///
     /// Deliberately not `!is_busy()`. That split only asks whether the agent is
     /// mid-turn, so `Starting` and both `Waiting*` states pass it while being
@@ -1329,9 +1329,9 @@ impl std::fmt::Display for SessionKey {
 }
 
 impl LauncherState {
-    /// Disconnected app-server clients can be explicitly restarted even though
-    /// their last observation maps to Starting. The owning launcher must still
-    /// acknowledge cleanup before the replacement resumes the saved thread.
+    /// Disconnected app-server clients can be restarted during an upgrade even
+    /// though their last observation maps to Starting. The owning launcher must
+    /// still acknowledge cleanup before the replacement resumes the saved thread.
     pub fn is_restartable(&self) -> bool {
         self.status.is_restartable()
             || (self.agent == AgentKind::Codex
@@ -2205,9 +2205,8 @@ mod tests {
     }
 
     /// `is_restartable` is deliberately narrower than `!is_busy()`, and the
-    /// gap on each side is the point. Both restart commands and the server
-    /// upgrade share it, so a variant sliding across this line changes what
-    /// those will tear down.
+    /// gap on each side is the point. Server upgrades use it to avoid
+    /// interrupting work; explicit restart commands accept any status.
     #[test]
     fn restartable_is_at_rest_without_being_the_inverse_of_busy() {
         use SessionStatus as S;

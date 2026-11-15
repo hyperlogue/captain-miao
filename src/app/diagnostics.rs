@@ -72,7 +72,7 @@ pub(super) fn session_diagnostics(
             } else {
                 "Codex terminal has exited; launcher retained for cleanup".to_string()
             };
-            if state.is_restartable()
+            if state.session_id.is_some()
                 && let Some(key) = keys.primary_key(Command::RestartSelected)
             {
                 next.push_str(&format!("; {key}: restart saved conversation"));

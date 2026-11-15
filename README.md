@@ -165,9 +165,12 @@ Configure rules in **Preferences → Idle tasks**:
 Patterns match complete command strings. Use `*` as a wildcard and `\\` to escape
 literal characters. Custom rules override defaults across all hosts.
 
-Restart waits for the previous session to stop before resuming.
-If removal cannot be confirmed, the dashboard displays an error.
-Resume rejects sessions that remain active on the host.
+Restart selected (`Space e`) and restart all (`Space E`) work in any session
+status after confirmation, including while an agent is working or waiting for
+input. A saved conversation id is required. Restart waits for the previous
+session to end before its replacement resumes the conversation. If the host
+cannot confirm removal, the dashboard reports an error. Resume also refuses
+conversations still managed on the selected host.
 
 ## Remote sessions
 

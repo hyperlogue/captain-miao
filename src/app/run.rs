@@ -3302,14 +3302,21 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::ConfigureCodex { host, config } => {
                         if let Some(backend) = app.backend_for(&host) {
                             let task = backend.set_codex_config(config);
-                            app.start_operation(format!("codex-config:{}", host.0), format!("Saving Codex settings…\n{}", host.0), None,
+                            app.start_operation(
+                                format!("codex-config:{}", host.0),
+                                format!("Saving Codex settings…\n{}", host.0),
+                                None,
                                 async move { task.await.map_err(anyhow::Error::msg) },
                                 |app, config| {
                                     if let Some(panel) = &mut app.host_edit {
-                                        panel.message = Some(format!("Codex: {}. Restart idle sessions to migrate existing ones.", config.mode.label()));
+                                        panel.message = Some(format!(
+                                            "Codex: {}. Restart sessions to migrate existing ones.",
+                                            config.mode.label()
+                                        ));
                                     }
                                     app.refresh_host_codex_settings();
-                                });
+                                },
+                            );
                         }
                     }
                     Action::RestartSession(spec) => {

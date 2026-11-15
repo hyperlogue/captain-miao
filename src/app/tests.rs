@@ -3926,8 +3926,7 @@ fn an_upgrade_refuses_a_busy_host_and_one_held_by_another_client() {
     // A parked server and a session blocked on a human review do *not*: the
     // agent's turn ended in both, so there is no work in flight to lose, and
     // refusing left a host un-upgradeable over a shell the user had already
-    // walked away from. Same whitelist the restart commands use
-    // (`SessionStatus::is_restartable`).
+    // walked away from.
     for status in [SessionStatus::Idle, SessionStatus::Idle] {
         let mut d = TestDashboard::new(120, 12);
         d.set_sessions(vec![
@@ -11403,30 +11402,17 @@ fn disconnected_codex_sessions_can_restart_selected_and_all() {
 }
 
 #[test]
-fn codex_restarts_still_require_disconnection_identity_and_cleanup_control() {
-    use cm_core::agents::codex::CodexMode;
-
-    for key in ['e', 'E'] {
-        for missing in ["disconnection", "identity", "control", "app-server mode"] {
+fn restart_requires_a_saved_session_id_in_every_status() {
+    for status in SessionStatus::ALL {
+        for key in ['e', 'E'] {
             let mut d = TestDashboard::new(120, 20);
-            let mut row = session(1, "/path/to/project", SessionStatus::Starting);
-            row.agent = crate::agent::AgentKind::Codex;
-            row.codex_mode = CodexMode::AppServer;
-            row.codex_connected = Some(false);
-            row.codex_control = true;
-            match missing {
-                "disconnection" => row.codex_connected = Some(true),
-                "identity" => row.session_id = None,
-                "control" => row.codex_control = false,
-                "app-server mode" => row.codex_mode = CodexMode::Native,
-                _ => unreachable!(),
-            }
+            let mut row = session(1, "/path/to/project", status.clone());
+            row.session_id = None;
             d.set_sessions(vec![row]);
             d.press(KeyCode::Char(' '));
             d.press(KeyCode::Char(key));
-            assert_eq!(d.app.input_mode, InputMode::Normal, "missing {missing}");
-            assert!(d.app.confirmation.is_none(), "missing {missing}");
-            assert!(d.app.status_is_error, "missing {missing}");
+            assert!(d.app.confirmation.is_none(), "{status:?}, {key}");
+            assert!(d.app.status_is_error);
         }
     }
 }
@@ -11461,43 +11447,24 @@ fn space_e_on_idle_session_confirms_then_restarts() {
 }
 
 #[test]
-fn space_e_on_active_session_is_rejected() {
-    let mut d = TestDashboard::new(120, 20);
-    d.set_sessions(vec![session(1, "/home/test/proj", SessionStatus::Active)]);
-
-    d.press(KeyCode::Char(' '));
-    let action = d.press(KeyCode::Char('e'));
-    assert!(action.is_none());
-    assert_eq!(
-        d.app.input_mode,
-        InputMode::Normal,
-        "should not enter Confirm when session is busy"
-    );
-    assert!(d.app.confirmation.is_none());
-    assert!(d.app.status_is_error);
-    let msg = d.app.status_msg.as_deref().unwrap_or("");
-    assert!(
-        msg.contains("idle"),
-        "status should mention idle requirement: {msg}"
-    );
-}
-
-/// Approval/Decision states count as "busy" too — the user is being asked
-/// something and a restart would silently throw that prompt away.
-#[test]
-fn space_e_on_waiting_session_is_rejected() {
-    let mut d = TestDashboard::new(120, 20);
-    d.set_sessions(vec![session(
-        1,
-        "/home/test/proj",
-        SessionStatus::WaitingForApproval,
-    )]);
-
-    d.press(KeyCode::Char(' '));
-    d.press(KeyCode::Char('e'));
-    assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.confirmation.is_none());
-    assert!(d.app.status_is_error);
+fn restart_selected_and_all_accept_every_status_after_confirmation() {
+    for status in SessionStatus::ALL {
+        for key in ['e', 'E'] {
+            let mut d = TestDashboard::new(120, 20);
+            d.set_sessions(vec![session(1, "/path/to/project", status.clone())]);
+            d.press(KeyCode::Char(' '));
+            assert!(d.press(KeyCode::Char(key)).is_none());
+            assert!(d.app.confirmation.is_some(), "{status:?}, {key}");
+            let specs = match d.press(KeyCode::Char('y')) {
+                Some(Action::RestartSession(spec)) => vec![spec],
+                Some(Action::RestartAll { sessions }) => sessions,
+                other => panic!("expected restart for {status:?}, {key}: {other:?}"),
+            };
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].session_id, "sess-1");
+            assert!(specs[0].kill_old);
+        }
+    }
 }
 
 #[test]
@@ -11586,7 +11553,7 @@ fn space_shift_e_restarts_all_when_all_idle() {
 }
 
 #[test]
-fn space_shift_e_rejects_when_any_session_busy() {
+fn space_shift_e_restarts_mixed_idle_and_active_sessions() {
     let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![
         session(1, "/home/test/a", SessionStatus::Idle),
@@ -11596,8 +11563,11 @@ fn space_shift_e_rejects_when_any_session_busy() {
     let action = d.press(KeyCode::Char('E'));
     assert!(action.is_none());
     assert_eq!(d.app.input_mode, InputMode::Normal);
-    assert!(d.app.confirmation.is_none());
-    assert!(d.app.status_is_error);
+    assert!(d.app.confirmation.is_some());
+    match d.press(KeyCode::Char('y')) {
+        Some(Action::RestartAll { sessions }) => assert_eq!(sessions.len(), 2),
+        other => panic!("expected both sessions to restart, got {other:?}"),
+    }
 }
 
 /// User-idled tasks restart like any other Idle session.
@@ -11621,8 +11591,7 @@ fn space_e_and_space_shift_e_treat_user_idled_tasks_as_idle() {
         ));
     }
 
-    // …and neither holds up a restart-all, which refuses on *any* non-resting
-    // row.
+    // User-idled sessions are also included in restart-all.
     let mut d = TestDashboard::new(120, 20);
     d.set_sessions(vec![
         session(1, "/home/test/a", SessionStatus::Idle),

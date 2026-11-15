@@ -4487,9 +4487,8 @@ impl App {
     /// session another terminal is attached to would be taken from whoever is
     /// using it rather than restored to them.
     ///
-    /// Eligibility is [`LauncherState::is_restartable`] — the same predicate the
-    /// restart commands gate on, since an upgrade *is* a restart of every
-    /// session on the host and the two must agree on what may be torn down.
+    /// Eligibility is [`LauncherState::is_restartable`]. Explicit session
+    /// restarts can interrupt work; server upgrades still require rest.
     pub(super) fn upgrade_blocker(&self, host: &HostId) -> Option<String> {
         let mine: Vec<&LauncherState> = self.sessions.iter().filter(|s| &s.host == host).collect();
         let busy = mine.iter().filter(|s| !s.is_restartable()).count();
@@ -5051,23 +5050,14 @@ impl App {
     // Restart
     // =============================================================================
 
-    /// Build the spec to restart `s`, or the user-facing reason it can't be: a
-    /// session that isn't at rest, or one missing the window/session id.
-    /// `request_restart_selected` surfaces the `Err` verbatim; the restart-all
-    /// path just filters on `.ok()`.
-    ///
-    /// Eligibility is [`LauncherState::is_restartable`], shared with
-    /// `upgrade_blocker`: an upgrade is a restart of every session on the host,
-    /// so the two must agree on what a restart is allowed to take.
+    /// Build a restart spec for any status, provided a live session id is known.
+    /// Selected restart surfaces the error; restart-all skips missing ids.
     pub(super) fn restart_spec_for(&self, s: &LauncherState) -> Result<RestartSpec, &'static str> {
         // Restart is kill + reopen **on the row's own host** — the seam already
         // carries `resume: (session_id, fork)`, so the old local-only gate was
         // never a limitation of the design, just a gap in the plumbing (§9).
         // A remote restart lands in that host's pool and auto-attaches like any
         // open.
-        if !s.is_restartable() {
-            return Err("Cannot restart: session must be idle (not active or waiting)");
-        }
         let Some(session_id) = self.index_of(s).live_session_id(s).map(str::to_string) else {
             // Not "yet": nothing promises the id ever arrives — a backend can
             // lose its id path wholesale (opencode's first cut named none) —
@@ -5092,15 +5082,12 @@ impl App {
     }
 
     /// Queue a confirmation to restart the currently-selected session. Returns
-    /// without queuing if no session is selected, the session is busy, or it
-    /// lacks the metadata we need (no window id / no live session id).
+    /// without queuing if no session is selected or no live session id is known.
     pub(super) fn request_restart_selected(&mut self) {
         let Some(s) = self.selected_session() else {
             return;
         };
-        // `restart_spec_for` owns the remote / not-idle / missing-metadata gates
-        // and returns the reason, so we surface it directly instead of repeating
-        // the checks here.
+        // Surface missing metadata directly from the spec builder.
         let spec = match self.restart_spec_for(&s) {
             Ok(spec) => spec,
             Err(reason) => {
@@ -5121,22 +5108,10 @@ impl App {
         );
     }
 
-    /// Queue a confirmation to restart every session. Refuses if any session
-    /// is currently busy — partial restarts would leave the dashboard in a
-    /// state where some agents picked up the new claude binary and others
-    /// didn't, which is the exact problem this command exists to avoid.
+    /// Queue a confirmation to restart every session with a known live id.
     pub(super) fn request_restart_all(&mut self) {
         if self.sessions.is_empty() {
             self.set_status("No sessions to restart".to_string(), false);
-            return;
-        }
-        // Restart-all exists to get every agent onto a new binary at once, so a
-        // partial run defeats the point: refuse while anything is busy.
-        if self.sessions.iter().any(|s| !s.is_restartable()) {
-            self.set_status(
-                "Cannot restart all: every session must be idle".to_string(),
-                true,
-            );
             return;
         }
         let specs: Vec<RestartSpec> = self
@@ -5146,7 +5121,7 @@ impl App {
             .collect();
         if specs.is_empty() {
             self.set_status(
-                "No restartable sessions (need window id and session id)".to_string(),
+                "No restartable sessions (need session id)".to_string(),
                 true,
             );
             return;
