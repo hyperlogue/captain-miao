@@ -58,7 +58,9 @@ miao
 
 Press `o` to start a session with the selected host, directory, and agent.
 If no session is selected, `o` opens the directory picker.
-Press `O` to open the directory picker directly.
+Press `O` to open the directory picker with the selected session's directory,
+agent, and host preselected. With no session selected, it uses your saved
+agent and host defaults.
 
 Slow actions run in the background. If an action exceeds 0.8 seconds,
 a bottom-right progress notification appears. The notification clears

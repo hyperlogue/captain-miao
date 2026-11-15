@@ -398,14 +398,17 @@ pub(super) enum PickerKind {
     },
     /// Launch a new session. The picker shows recent cwds and also accepts
     /// a free-form path; Tab completes against the filesystem. `agent` is the
-    /// backend this launch will use — seeded from the persistent default and
+    /// backend this launch will use — seeded from the focused row or default and
     /// overridable with `Ctrl-o`'s selector or `Ctrl-t` (per-launch only).
     Workdir {
         agent: AgentKind,
-        /// Host this launch will open on — seeded from the default, chosen via
-        /// `Ctrl-o` or cycled with `Ctrl-h` (per-launch only). A remote host
-        /// opens the session in that host's pty pool and attaches over ssh (§8).
+        /// Host this launch will open on — seeded from the focused row or
+        /// default, chosen via `Ctrl-o` or cycled with `Ctrl-h` (per-launch only).
+        /// A remote host opens the session in its pty pool and attaches over ssh (§8).
         host: HostId,
+        /// Focused directory captured on open. Offer it on its own host even
+        /// before recents arrive or when the host has never recorded it.
+        session_dir: Option<(HostId, String)>,
         /// `Some` to launch into a fresh git worktree instead of the cwd
         /// itself, armed in-picker with `Ctrl-g` (per-launch only, never
         /// persisted — unlike the agent and host defaults, isolation is a
@@ -417,10 +420,9 @@ pub(super) enum PickerKind {
         /// dropped at launch.
         worktree: Option<WorktreeArm>,
         /// The workdir the cursor wants to be on, in the host-canonical `~`
-        /// form. Seeded from the focused row's cwd
-        /// ([`App::preselect_workdir`]) and re-pinned by any cursor movement
-        /// ([`App::repin_workdir_from_cursor`]) — never by typing, which only
-        /// re-ranks a list `Ctrl-h` is about to clear anyway.
+        /// form. Seeded from the focused row's cwd on open and re-pinned by
+        /// cursor movement ([`App::repin_workdir_from_cursor`]), never by typing,
+        /// which only re-ranks a list `Ctrl-h` is about to clear anyway.
         ///
         /// It deliberately survives a host switch *unresolved*: a dir the new
         /// host doesn't have leaves the cursor at the top without disturbing
@@ -5572,15 +5574,23 @@ impl App {
     /// [`SessionsLayout`] (`resolve_spawn_target`), not by the selected window.
     pub(super) fn open_workdir_picker(&mut self) {
         self.workdir_generation = self.workdir_generation.wrapping_add(1);
-        // New sessions target the persisted default host; `Ctrl-h` cycles
-        // per-launch, re-seeding the list from that machine.
-        let host = self.default_host_or_local();
-
-        // Seed the launch backend from the persistent default; `Ctrl-t` in the
-        // picker overrides it for this launch only. No title: the agent and
-        // host it would have named are the popup's own status line (§9), a row
-        // the eye is already on because `Ctrl-t`/`Ctrl-h` change it there.
-        let agent = self.new_session_agent;
+        // Start from the focused row, including a launch still in progress.
+        // Saved defaults apply only when the dashboard has no selection.
+        let host = self
+            .selected_host()
+            .cloned()
+            .unwrap_or_else(|| self.default_host_or_local());
+        let agent = self
+            .launches
+            .selected()
+            .map(|p| p.request.agent)
+            .or_else(|| self.selected_session_ref().map(|s| s.agent))
+            .unwrap_or(self.new_session_agent);
+        let cwd = self
+            .selected_cwd()
+            .filter(|cwd| !cwd.is_empty())
+            .map(|cwd| self.shorten_path(&cwd).into_owned());
+        let session_dir = cwd.clone().map(|cwd| (host.clone(), cwd));
         let picker = Picker::new("", Vec::new())
             .with_placeholder("Type a path or pick a recent one…")
             .with_size(70, 70)
@@ -5596,8 +5606,9 @@ impl App {
             kind: PickerKind::Workdir {
                 agent,
                 host,
+                session_dir,
                 worktree: None,
-                pinned: None,
+                pinned: cwd,
             },
         });
         self.sync_workdir_picker_list();
@@ -5686,12 +5697,24 @@ impl App {
         let Some(active) = self.picker.as_ref() else {
             return;
         };
-        let PickerKind::Workdir { host, .. } = &active.kind else {
+        let PickerKind::Workdir {
+            host, session_dir, ..
+        } = &active.kind
+        else {
             return;
         };
         let host = host.clone();
+        let session_dir = session_dir.clone();
         let typed = active.picker.input.text().to_string();
-        let recents = self.host_recent_dirs(&host);
+        let mut recents = self.host_recent_dirs(&host);
+        if let Some((session_host, cwd)) = session_dir
+            && session_host == host
+            && !recents
+                .iter()
+                .any(|recent| recent.trim_end_matches('/') == cwd.trim_end_matches('/'))
+        {
+            recents.push(cwd);
+        }
         let items = self.ranked_workdir_items(&recents, typed.trim(), &host);
         if let Some(active) = self.picker.as_mut() {
             active.picker.items = items;
@@ -5704,29 +5727,14 @@ impl App {
         }
     }
 
-    /// Settle the workdir picker's cursor on its pinned dir, seeding the pin
-    /// from the **focused row's** cwd the first time there is nothing pinned.
+    /// Settle the workdir picker's cursor on its pinned dir.
     /// Run on open, after every `Ctrl-h` re-seed, and when a host's directory
     /// inventory arrives in the background.
     ///
-    /// Opening the picker while looking at a session is nearly always "another
-    /// one of these", so the cursor starts on that row's cwd and a bare Enter
-    /// launches it; without the seed it would sit on the most-recent dir, which
-    /// is the same directory only when the focused row happens to be the newest
-    /// launch.
-    ///
-    /// The seed is host-gated (§8: branch on host, never on locality) because
-    /// the focused row's cwd is a path on *its* machine: the same spelling under
-    /// another home is a different directory. The pin, once taken, is not —
-    /// it's the user's answer to "which dir", and `Ctrl-h` re-asks it of each
-    /// host in turn.
-    ///
-    /// A dir the host's list doesn't hold leaves both the ranking and the pin
-    /// alone. Nothing is injected: the recents are that host's own list, and a
-    /// cwd absent from it (a hand-launched absolute path, an agent-made
-    /// worktree) is not something the picker was offering there.
+    /// The focused directory is offered on its original host even without a
+    /// recent entry. On another host, resolve the pin only against that host's
+    /// list: the same spelling need not name an existing directory there.
     pub(super) fn preselect_workdir(&mut self) {
-        self.seed_pinned_workdir();
         let Some(active) = self.picker.as_ref() else {
             return;
         };
@@ -5744,44 +5752,9 @@ impl App {
             items[i]
                 .payload
                 .as_deref()
-                .is_some_and(|p| p.trim_end_matches('/') == key)
+                .is_some_and(|p| p.trim_end_matches('/') == key.trim_end_matches('/'))
         }) {
             active.picker.cursor = pos;
-        }
-    }
-
-    /// Take the pin from the focused session's cwd, if there is nothing pinned
-    /// yet and that row lives on the host this launch would land on. Splits out
-    /// of [`App::preselect_workdir`] only because the pin outlives any one
-    /// host: seeding asks about the focused row, resolving asks about the list.
-    fn seed_pinned_workdir(&mut self) {
-        let Some(active) = self.picker.as_ref() else {
-            return;
-        };
-        let PickerKind::Workdir { host, pinned, .. } = &active.kind else {
-            return;
-        };
-        if pinned.is_some() {
-            return;
-        }
-        let Some(session) = self.selected_session_ref() else {
-            return;
-        };
-        if &session.host != host {
-            return;
-        }
-        // Both sides to the host-canonical `~` form the items carry (§3): a row
-        // launched from this picker already matches, while one launched by hand
-        // (`miao launch claude .`) recorded an absolute cwd on its state file.
-        let key = self.shorten_path(&session.cwd);
-        let key = key.trim_end_matches('/').to_string();
-        if key.is_empty() {
-            return;
-        }
-        if let Some(active) = self.picker.as_mut()
-            && let PickerKind::Workdir { pinned, .. } = &mut active.kind
-        {
-            *pinned = Some(key);
         }
     }
 
@@ -5806,7 +5779,8 @@ impl App {
         }
     }
 
-    /// The first panel row owns the default for `O`, a bare `o`, and `r`.
+    /// The first panel row owns the default for `r`, and for `o` / `O` when
+    /// no dashboard row is selected.
     /// A suspended or removed default falls back to this machine. A temporarily
     /// unreachable host still has a backend and retains its default status.
     pub(super) fn default_host_or_local(&self) -> HostId {
@@ -5854,8 +5828,7 @@ impl App {
                 app.recent_dirs_cache.insert(host.clone(), cwds);
                 if matches!(app.picker.as_ref().map(|p| &p.kind), Some(PickerKind::Workdir { host: current, .. }) if current == &host) {
                     app.sync_workdir_picker_list();
-                    // On the first open the inventory was empty when the pin
-                    // was seeded. Resolve it now that the host's rows arrived.
+                    // Keep the chosen directory as the host's rows arrive.
                     app.preselect_workdir();
                 }
             },
@@ -5961,6 +5934,14 @@ impl App {
             return;
         }
 
+        if let Some(active) = self.picker.as_mut()
+            && let PickerKind::Workdir { session_dir, .. } = &mut active.kind
+            && session_dir.as_ref().is_some_and(|(session_host, cwd)| {
+                session_host == &host && cwd.trim_end_matches('/') == key
+            })
+        {
+            *session_dir = None;
+        }
         self.sync_workdir_picker_list();
         if let Some(active) = self.picker.as_mut() {
             let n = active.picker.filtered().len();

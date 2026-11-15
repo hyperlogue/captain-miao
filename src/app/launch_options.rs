@@ -353,6 +353,7 @@ impl App {
                             host,
                             worktree,
                             pinned,
+                            ..
                         } = &mut active.kind
                     {
                         let host_changed = *host != options.host;

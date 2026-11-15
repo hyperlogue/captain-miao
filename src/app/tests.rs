@@ -538,6 +538,12 @@ async fn pending_enter_waits_for_confirmation_and_respects_later_input() {
             matches!(d.press(KeyCode::Char('o')), Some(Action::NewSessionSplit { host: h, cwd, agent, .. })
             if h == host && cwd == "/work/project" && agent == crate::agent::AgentKind::Codex)
         );
+        d.press(KeyCode::Char('O'));
+        assert_eq!(workdir_highlighted(&d.app), "/work/project");
+        assert!(matches!(&d.app.picker.as_ref().unwrap().kind,
+            super::PickerKind::Workdir { host: h, agent: crate::agent::AgentKind::Codex, .. }
+            if h == &host));
+        d.press(KeyCode::Esc);
         match next {
             "no-enter" => {}
             "double-click" => {
@@ -2060,9 +2066,8 @@ fn message_wheel_scroll_can_extend_selection_across_entries() {
 fn space_a_picker_sets_default_new_session_backend() {
     use crate::agent::AgentKind;
     let mut d = TestDashboard::new(120, 10);
-    d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
 
-    // Default backend is Claude: header cluster and directory picker use it.
+    // With no focused session, the header and picker use the saved default.
     assert_eq!(d.app.new_session_agent, AgentKind::Claude);
     assert!(d.render().contains("Default agent: Claude"));
     d.press(KeyCode::Char('O'));
@@ -6252,9 +6257,48 @@ fn workdir_picker_starts_on_the_focused_sessions_cwd() {
     }
 }
 
-/// The first open waits for the host inventory; later opens use the cache.
+#[test]
+fn workdir_picker_starts_with_the_focused_sessions_agent_and_host() {
+    use crate::{agent::AgentKind, state::HostId};
+
+    for host in [HostId::local(), HostId("box".into())] {
+        let mut d = dashboard_with_three_hosts(
+            &["~/alpha", "~/beta"],
+            &["~/gamma", "~/beta"],
+            &["~/delta"],
+        );
+        d.app.new_session_agent = AgentKind::Claude;
+        d.app.extra_prefs.host_order = Some(vec!["cloud".into(), "box".into(), "local".into()]);
+        let mut selected = session(1, "~/beta", SessionStatus::Active);
+        selected.host = host.clone();
+        selected.agent = AgentKind::Codex;
+        let mut other = session(2, "~/alpha", SessionStatus::Idle);
+        other.agent = AgentKind::Kimi;
+        d.set_sessions(vec![other, selected.clone()]);
+        d.app.reselect(&super::flag_key(&selected));
+
+        d.press(KeyCode::Char('O'));
+        assert_eq!(workdir_highlighted(&d.app), "~/beta");
+        assert!(picker_input_text(&d.app).is_empty());
+        assert!(matches!(&d.app.picker.as_ref().unwrap().kind,
+            super::PickerKind::Workdir { agent: AgentKind::Codex, host: chosen, worktree: None, .. }
+            if chosen == &host));
+        d.press_ctrl(KeyCode::Char('o'));
+        let out = d.render();
+        assert!(
+            out.contains(&format!("Selected: Codex · {}", host.0)),
+            "{out}"
+        );
+        assert!(out.contains("Directory: ~/beta"), "{out}");
+        assert_eq!(d.app.new_session_agent, AgentKind::Claude);
+        assert_eq!(d.app.default_host_or_local(), HostId("cloud".into()));
+    }
+}
+
+/// The focused directory is usable before the host inventory arrives.
 #[tokio::test(start_paused = true)]
 async fn workdir_picker_first_open_selects_cwd_after_delayed_reply() {
+    use crate::agent::AgentKind;
     use crate::backend::{Backend, test_support};
     use crate::protocol::{ClientFrame, ServerFrame};
     use crate::state::HostId;
@@ -6264,9 +6308,9 @@ async fn workdir_picker_first_open_selects_cwd_after_delayed_reply() {
     let host = HostId("box".into());
     let (remote, mut peer) = test_support::connected(host.clone());
     d.app.backends.push(Backend::Remote(remote));
-    d.app.extra_prefs.host_order = Some(vec![host.0.clone()]);
     let mut selected = session(1, "~/beta", SessionStatus::Active);
-    selected.host = host;
+    selected.host = host.clone();
+    selected.agent = AgentKind::Codex;
     selected.pool_session = Some("cm-1".into());
     d.set_sessions(vec![selected]);
 
@@ -6277,7 +6321,12 @@ async fn workdir_picker_first_open_selects_cwd_after_delayed_reply() {
     let ClientFrame::ListRecentDirs { req_id } = request else {
         panic!("expected directory request")
     };
-    assert!(d.app.picker.as_ref().unwrap().picker.items.is_empty());
+    assert_eq!(workdir_highlighted(&d.app), "~/beta");
+    assert!(
+        matches!(d.press(KeyCode::Enter), Some(Action::ValidateWorkdir {
+        agent: AgentKind::Codex, host: chosen, cwd, ..
+    }) if chosen == host && cwd == "~/beta")
+    );
     tokio::time::advance(Duration::from_secs(2)).await;
     reply
         .send(ServerFrame::RecentDirs {
@@ -6312,40 +6361,37 @@ fn workdir_picker_preselect_matches_an_absolute_session_cwd() {
     }
 }
 
-/// A cwd the host's list doesn't hold leaves the ranking alone — the recents
-/// are the host's own list, and nothing is injected to make the miss look like
-/// a hit.
 #[test]
-fn workdir_picker_preselect_is_a_noop_when_the_cwd_is_not_listed() {
+fn workdir_picker_offers_the_focused_directory_when_absent_from_recents() {
     let mut d = TestDashboard::new(120, 15);
     d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
     d.set_sessions(vec![session(1, "/var/log/archive", SessionStatus::Active)]);
 
     d.press(KeyCode::Char('O'));
     match d.press(KeyCode::Enter) {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/alpha"),
+        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "/var/log/archive"),
         other => panic!("expected NewSessionSplit, got {other:?}"),
     }
+    assert_eq!(d.app.recent_cwds, ["~/alpha", "~/beta"]);
 }
 
-/// The list belongs to the host the launch lands on, so the same spelling under
-/// another machine's home is a different directory: a focused *remote* row must
-/// not move the cursor of a picker pointed at this machine.
 #[test]
-fn workdir_picker_preselect_is_host_gated() {
+fn workdir_picker_offers_the_focused_directory_only_on_its_host() {
     use crate::state::HostId;
-    let mut d = TestDashboard::new(120, 15);
-    d.app.recent_cwds = vec!["~/alpha".to_string(), "~/beta".to_string()];
+    let mut d = dashboard_with_three_hosts(&["~/alpha"], &["~/gamma"], &["~/delta"]);
     let mut s = session(1, "~/beta", SessionStatus::Active);
     s.host = HostId("box".into());
     s.pool_session = Some("cm-1".to_string());
     d.set_sessions(vec![s]);
 
     d.press(KeyCode::Char('O'));
-    match d.press(KeyCode::Enter) {
-        Some(Action::NewSessionSplit { cwd, .. }) => assert_eq!(cwd, "~/alpha"),
-        other => panic!("expected NewSessionSplit, got {other:?}"),
-    }
+    assert_eq!(workdir_highlighted(&d.app), "~/beta");
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_visible_paths(&d.app), ["~/delta"]);
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_visible_paths(&d.app), ["~/alpha"]);
+    press_ctrl(&mut d, 'h');
+    assert_eq!(workdir_highlighted(&d.app), "~/beta");
 }
 
 /// The pin follows the user, not the host. Cycling `Ctrl-h` onto a host that
@@ -6419,7 +6465,7 @@ fn workdir_picker_pins_a_cwd_the_current_host_does_not_list() {
     d.set_sessions(vec![session(1, "~/aaa", SessionStatus::Active)]);
 
     d.press(KeyCode::Char('O'));
-    assert_eq!(workdir_highlighted(&d.app), "~/other");
+    assert_eq!(workdir_highlighted(&d.app), "~/aaa");
 
     press_ctrl(&mut d, 'h');
     assert_eq!(workdir_highlighted(&d.app), "~/aaa");
@@ -11277,6 +11323,9 @@ async fn workdir_picker_ctrl_d_forgets_on_the_targeted_host() {
     );
     // The local list is untouched throughout: it is a different host's.
     d.app.recent_cwds = vec!["/home/test/alpha".to_string()];
+    let mut selected = session(1, "~/alpha", SessionStatus::Idle);
+    selected.host = host.clone();
+    d.set_sessions(vec![selected]);
 
     d.press(KeyCode::Char('O'));
     d.app
@@ -11284,6 +11333,8 @@ async fn workdir_picker_ctrl_d_forgets_on_the_targeted_host() {
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
 
+    // Rebuilding must not reintroduce the focused directory after deletion.
+    d.app.sync_workdir_picker_list();
     let picker = &d.app.picker.as_ref().unwrap().picker;
     assert_eq!(picker.items.len(), 1);
     assert_eq!(picker.items[0].payload.as_deref(), Some("~/beta"));
