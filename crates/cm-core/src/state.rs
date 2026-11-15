@@ -716,11 +716,15 @@ impl std::fmt::Display for HostId {
 /// doc says which evidence produces it.
 pub enum SessionStatus {
     Starting,
+    /// The backend has no current activity observation. This is neither
+    /// evidence of work nor evidence that the session is safe to restart.
+    Unknown,
     Active,
     Compacting,
     Compacted,
     /// The turn ended. Launchers emit this when no background work remains;
-    /// dashboards also use it for tasks matching the user's Idle command list.
+    /// dashboards also use it for tasks matching the user's Idle command list
+    /// and fresh native Codex processes awaiting their first Tower hook.
     ///
     /// The **only** rest status the agent's own session file may promote back to
     /// `Active` on its own word (`launcher::reconcile_activity`). It has to be:
@@ -751,6 +755,7 @@ impl SessionStatus {
     /// Add new variants here when extending the enum.
     pub const ALL: &'static [SessionStatus] = &[
         SessionStatus::Starting,
+        SessionStatus::Unknown,
         SessionStatus::Active,
         SessionStatus::Compacting,
         SessionStatus::Compacted,
@@ -764,6 +769,7 @@ impl SessionStatus {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Starting => "Starting",
+            Self::Unknown => "Unknown",
             Self::Active => "Active",
             Self::Compacting => "Compacting",
             Self::Compacted => "Compacted",
@@ -2211,11 +2217,15 @@ mod tests {
         for st in [S::Idle, S::Compacted] {
             assert!(st.is_restartable(), "{st:?} must be restartable");
         }
-        // `Starting` and the Waiting* states pass `!is_busy()` and must still
-        // be refused: a launch cut off before it has a session id, a permission
-        // prompt silently thrown away.
-        for st in [S::Starting, S::WaitingForApproval, S::WaitingForDecision] {
-            assert!(!st.is_busy(), "{st:?} should be at rest by the busy test");
+        // Starting, unknown activity and Waiting* pass `!is_busy()` but do
+        // not establish that a restart is safe.
+        for st in [
+            S::Starting,
+            S::Unknown,
+            S::WaitingForApproval,
+            S::WaitingForDecision,
+        ] {
+            assert!(!st.is_busy(), "{st:?} should not claim active work");
             assert!(!st.is_restartable(), "{st:?} must not be restartable");
         }
         for st in [

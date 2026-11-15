@@ -291,17 +291,34 @@ pub(crate) async fn launch(agent: AgentKind, args: Vec<String>) -> anyhow::Resul
 
 fn status(status: &str, phase: Option<&str>) -> SessionStatus {
     match status {
-        // A spawned agent is `unknown` until Tower observes its first event.
-        // Native Codex can defer SessionStart until the first prompt.
-        "starting" | "unknown" => SessionStatus::Starting,
+        "starting" => SessionStatus::Starting,
+        "working" | "waiting_tool" => SessionStatus::Active,
         "compacting" => SessionStatus::Compacting,
         "waiting_approval" => SessionStatus::WaitingForApproval,
         "waiting_input" => SessionStatus::WaitingForDecision,
         "idle" if phase == Some("background") => SessionStatus::BackgroundActive,
         "idle" => SessionStatus::Idle,
-        // `working`, `waiting_tool` and anything a newer launcher adds.
-        _ => SessionStatus::Active,
+        _ => SessionStatus::Unknown,
     }
+}
+
+/// Native Codex can defer SessionStart until the first prompt. Treat a spawned
+/// process with no session identity or activity as idle for display; this is
+/// not a readiness signal. An observed/resumed session losing status remains
+/// unknown, and app-server mode must supply its own activity observation.
+fn awaiting_first_codex_prompt(record: &AgentRecord, detail: &AgentDetail) -> bool {
+    record.harness == "codex"
+        && record.mode.as_deref() == Some("native")
+        && record.status == "unknown"
+        && record.pid.is_some()
+        && record.native_session_id.is_none()
+        && detail.last_prompt.is_none()
+        && detail.last_tool.is_none()
+        && detail.error.is_none()
+        && detail.phase.is_none()
+        && detail.context_tokens.is_none()
+        && detail.background_jobs.unwrap_or(0) == 0
+        && detail.background_commands.is_empty()
 }
 
 /// When each session was first seen working. Tower records the last change,
@@ -361,9 +378,14 @@ pub(crate) fn row(
 ) -> LauncherState {
     let detail: AgentDetail = record
         .status_detail
+        .as_ref()
         .and_then(|detail| serde_json::from_value(serde_json::to_value(detail).ok()?).ok())
         .unwrap_or_default();
-    let status = status(&record.status, detail.phase.as_deref());
+    let status = if awaiting_first_codex_prompt(&record, &detail) {
+        SessionStatus::Idle
+    } else {
+        status(&record.status, detail.phase.as_deref())
+    };
     // Tower counts milliseconds; the dashboard counts seconds.
     let updated_at = record.updated_at / 1000;
     let active_since = if status == SessionStatus::Active {
@@ -598,20 +620,90 @@ mod tests {
     }
 
     #[test]
+    fn fresh_native_codex_is_idle_until_its_first_hook() {
+        let mut since = HashMap::new();
+        let fresh = fresh_native_codex_record();
+        let idle = row(fresh.clone(), "/home/miao", &mut since);
+        assert_eq!(idle.status, SessionStatus::Idle);
+        assert_eq!(idle.active_since, None);
+        assert!(since.is_empty());
+
+        let mut starting = fresh.clone();
+        starting.status = "starting".into();
+        assert_eq!(
+            row(starting, "/home/miao", &mut since).status,
+            SessionStatus::Starting
+        );
+
+        let mut observed = fresh;
+        observed.status = "working".into();
+        observed.native_session_id = Some("thread-1".into());
+        let working = row(observed.clone(), "/home/miao", &mut since);
+        assert_eq!(working.status, SessionStatus::Active);
+        assert!(working.active_since.is_some());
+
+        observed.status = "unknown".into();
+        let unknown = row(observed, "/home/miao", &mut since);
+        assert_eq!(unknown.status, SessionStatus::Unknown);
+        assert_eq!(unknown.active_since, None);
+        assert!(since.is_empty());
+    }
+
+    fn fresh_native_codex_record() -> AgentRecord {
+        let mut fresh = record("unknown", 5_000);
+        fresh.mode = Some("native".into());
+        fresh.native_session_id = None;
+        fresh.status_detail = None;
+        fresh
+    }
+
+    #[test]
+    fn only_unobserved_spawned_native_codex_is_assumed_idle() {
+        use serde_json::json;
+        for patch in [
+            json!({"harness": "claude-code"}),
+            json!({"mode": "app-server"}),
+            json!({"mode": null}),
+            json!({"pid": null}),
+            json!({"native_session_id": "resumed-thread"}),
+            json!({"status_detail": {"last_prompt": "work"}}),
+            json!({"status_detail": {"last_tool": "Bash"}}),
+            json!({"status_detail": {"error": "connection lost"}}),
+            json!({"status_detail": {"phase": "compacting"}}),
+            json!({"status_detail": {"context_tokens": 100}}),
+            json!({"status_detail": {"background_jobs": 1}}),
+            json!({"status_detail": {"background_commands": ["sleep 60"]}}),
+        ] {
+            let mut fresh = serde_json::to_value(fresh_native_codex_record()).unwrap();
+            fresh
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let row = row(
+                serde_json::from_value(fresh).unwrap(),
+                "/home/miao",
+                &mut HashMap::new(),
+            );
+            assert_eq!(row.status, SessionStatus::Unknown, "{patch}");
+            assert_eq!(row.active_since, None, "{patch}");
+        }
+    }
+
+    #[test]
     fn an_unobserved_tower_session_is_not_active() {
         let mut since = HashMap::new();
         let mut fresh = record("unknown", 5_000);
         fresh.native_session_id = None;
         fresh.status_detail = None;
         let fresh = row(fresh, "/home/miao", &mut since);
-        assert_eq!(fresh.status, SessionStatus::Starting);
+        assert_eq!(fresh.status, SessionStatus::Unknown);
         assert_eq!(fresh.active_since, None);
         assert!(since.is_empty());
 
         // Losing observation of a running turn also clears its busy timer.
         row(record("working", 6_000), "/home/miao", &mut since);
         let unknown = row(record("unknown", 7_000), "/home/miao", &mut since);
-        assert_eq!(unknown.status, SessionStatus::Starting);
+        assert_eq!(unknown.status, SessionStatus::Unknown);
         assert_eq!(unknown.active_since, None);
         assert!(since.is_empty());
     }
@@ -628,7 +720,8 @@ mod tests {
     fn tower_statuses_map_to_dashboard_statuses() {
         for (tower, phase, want) in [
             ("starting", None, SessionStatus::Starting),
-            ("unknown", None, SessionStatus::Starting),
+            ("unknown", None, SessionStatus::Unknown),
+            ("future_status", None, SessionStatus::Unknown),
             ("working", None, SessionStatus::Active),
             ("waiting_tool", None, SessionStatus::Active),
             ("compacting", None, SessionStatus::Compacting),

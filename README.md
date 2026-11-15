@@ -195,6 +195,12 @@ one. New and restarted local sessions then start on Tower.
 Sessions started earlier keep running and show `↻` after their status; restart
 an idle one to move it to Tower.
 
+Fresh native Codex sessions show **Idle** once the process has started and
+before its first hook reports activity: Codex can defer that hook until the
+first prompt. This display convention does not confirm startup has finished.
+Other Tower `unknown` statuses show **Unknown**; **Starting** is reserved for
+Tower's explicit startup status.
+
 On SSH hosts, new sessions run under the Tower daemon on the host. A `miao`
 built with `cargo xtask dist --tower` carries Tower and uploads it to each host
 that runs a different build, under `~/.cache/captain-miao/tower/`; otherwise

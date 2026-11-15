@@ -877,7 +877,7 @@ fn shows_tool_name_when_active() {
 
 #[test]
 fn shows_all_status_variants() {
-    let mut d = TestDashboard::new(130, 15);
+    let mut d = TestDashboard::new(130, 18);
     d.set_sessions(vec![
         session(1, "/home/test/a", SessionStatus::Starting),
         session(2, "/home/test/b", SessionStatus::Active),
@@ -888,9 +888,11 @@ fn shows_all_status_variants() {
         session(7, "/home/test/h", SessionStatus::BackgroundActive),
         session(8, "/home/test/i", SessionStatus::Idle),
         session(9, "/home/test/j", SessionStatus::FailedToStart),
+        session(10, "/home/test/k", SessionStatus::Unknown),
     ]);
     let out = d.render();
-    assert!(out.contains("9 sessions"));
+    assert!(out.contains("10 sessions"));
+    assert!(out.contains("Unknown"));
     assert!(out.contains("Starting"));
     assert!(out.contains("Active"));
     assert!(out.contains("Compacting"));
