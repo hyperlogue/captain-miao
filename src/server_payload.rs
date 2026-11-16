@@ -234,7 +234,8 @@ pub(crate) fn env_names_for(target: &str) -> [String; 2] {
 /// developer can point one straight at the other.
 pub(crate) fn cache_path_for(target: &str) -> Option<std::path::PathBuf> {
     Some(
-        dirs::cache_dir()?
+        crate::roots::current()
+            .cache_home()?
             .join(CACHE_REL)
             .join(env!("CARGO_PKG_VERSION"))
             .join(target)

@@ -450,8 +450,7 @@ async fn fetch_to_path(fmt: Format, final_path: &Path) -> Result<Option<PathBuf>
 
 /// `$HOME`-relative path on *this* machine, or `None` with no `$HOME`.
 fn home_rel(rel: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-    Some(Path::new(&home).join(rel))
+    crate::roots::current().in_home(rel)
 }
 
 #[cfg(test)]

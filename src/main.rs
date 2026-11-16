@@ -20,7 +20,7 @@ mod tower_archive;
 // Core modules re-exported at the crate root so the dashboard's `crate::state`,
 // `crate::agent`, `crate::protocol`, `crate::init_tracing` paths resolve unchanged.
 pub use cm_core::logging::init_tracing;
-pub use cm_core::{agent, protocol, state};
+pub use cm_core::{agent, protocol, roots, state};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

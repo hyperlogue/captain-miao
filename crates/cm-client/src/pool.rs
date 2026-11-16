@@ -218,8 +218,8 @@ fn attach_pty(_name: &str, _force: bool) -> Result<()> {
 
 /// Replace a leading `$HOME` with `~` for a shorter, readable path.
 fn abbreviate_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => match path.strip_prefix(&home) {
+    match cm_core::roots::home().map(|home| home.to_string_lossy().into_owned()) {
+        Some(home) if !home.is_empty() => match path.strip_prefix(&home) {
             Some(rest) => format!("~{rest}"),
             None => path.to_string(),
         },
@@ -337,9 +337,9 @@ mod tests {
 
     #[test]
     fn abbreviate_home_collapses_prefix() {
-        // SAFETY: single-threaded test; we set HOME just for this assertion.
-        unsafe { std::env::set_var("HOME", "/home/miao") };
-        assert_eq!(abbreviate_home("/home/miao/projects/x"), "~/projects/x");
+        let root = std::path::Path::new("/srv");
+        let _roots = cm_core::roots::install_for_test(cm_core::roots::Roots::under(root));
+        assert_eq!(abbreviate_home("/srv/home/projects/x"), "~/projects/x");
         assert_eq!(abbreviate_home("/etc/hosts"), "/etc/hosts");
     }
 

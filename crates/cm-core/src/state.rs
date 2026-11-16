@@ -68,28 +68,10 @@ fn harden_dir(dir: &Path) {
     }
 }
 
-/// The directory `var` names, honouring the XDG rule that an **empty** value is
-/// unset rather than a relative path — the one line of spec compliance all four
-/// XDG lookups here and in [`crate::config`] share, and the one worth having in
-/// a single place. What to fall back to is deliberately *not* part of it: each
-/// caller's fallback is a different decision, documented where it is made.
-pub fn xdg_dir(var: &str) -> Option<PathBuf> {
-    std::env::var(var)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
-
 /// `~/.local/state/captain-miao`, honouring `XDG_STATE_HOME`. Created `0700` by
 /// [`create_dir_all_private`] wherever it is written to, never here.
 pub fn state_dir() -> PathBuf {
-    xdg_dir("XDG_STATE_HOME")
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("captain-miao")
+    crate::roots::current().state_home().join("captain-miao")
 }
 
 /// Where sockets and other runtime-lifetime files live.
@@ -115,7 +97,8 @@ pub fn state_dir() -> PathBuf {
 /// live under a much tighter path-length limit, and ssh re-establishes a
 /// control master whose socket went missing.)
 pub fn runtime_dir() -> PathBuf {
-    xdg_dir("XDG_RUNTIME_DIR")
+    crate::roots::current()
+        .runtime()
         .map(|d| d.join("captain-miao"))
         .unwrap_or_else(|| state_dir().join("run"))
 }
@@ -210,7 +193,8 @@ pub fn pool_socket_path() -> PathBuf {
 /// whose socket went missing. `$XDG_RUNTIME_DIR` (short on Linux:
 /// `/run/user/<uid>`) is used when present.
 pub fn ssh_sock_dir() -> PathBuf {
-    xdg_dir("XDG_RUNTIME_DIR")
+    crate::roots::current()
+        .runtime()
         .map(|d| d.join("miao"))
         .unwrap_or_else(|| {
             let uid = unsafe { libc::getuid() };
@@ -2297,8 +2281,14 @@ mod tests {
             Some(xdg) => assert_eq!(dir, PathBuf::from(xdg).join("captain-miao")),
             None => assert_eq!(dir, state_dir().join("run")),
         }
+        // Test processes run with private roots under the temp tree (see
+        // `test_isolation`), so the temp tree is only wrong when it was not
+        // reached through one of those roots.
+        let roots = ["XDG_RUNTIME_DIR", "XDG_STATE_HOME", "HOME"]
+            .map(|var| std::env::var_os(var).map(PathBuf::from));
         assert!(
-            !dir.starts_with(std::env::temp_dir()),
+            !dir.starts_with(std::env::temp_dir())
+                || roots.iter().flatten().any(|root| dir.starts_with(root)),
             "runtime dir is back under the OS temp tree: {}",
             dir.display()
         );

@@ -830,10 +830,11 @@ fn dispatch_event(state: &mut LauncherState, mut msg: HookMessage) {
 /// to look, which [`list_resumable_cached`] answers as an empty list rather than an
 /// error.
 fn sessions_root() -> Option<PathBuf> {
-    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".omp/agent")))?;
+    let roots = crate::roots::current();
+    let agent_dir = match roots.agent_var("PI_CODING_AGENT_DIR") {
+        Some(dir) => dir.to_path_buf(),
+        None => roots.in_home(".omp/agent")?,
+    };
     Some(agent_dir.join("sessions"))
 }
 

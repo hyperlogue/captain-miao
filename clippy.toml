@@ -1,0 +1,12 @@
+# User directories resolve only in `cm_core::roots`, so tests and callers can
+# redirect them in one place.
+disallowed-methods = [
+    { path = "dirs::home_dir", reason = "use cm_core::roots" },
+    { path = "dirs::config_dir", reason = "use cm_core::roots" },
+    { path = "dirs::state_dir", reason = "use cm_core::roots" },
+    { path = "dirs::data_dir", reason = "use cm_core::roots" },
+    { path = "dirs::data_local_dir", reason = "use cm_core::roots" },
+    { path = "dirs::cache_dir", reason = "use cm_core::roots" },
+    { path = "dirs::runtime_dir", reason = "use cm_core::roots" },
+    { path = "std::env::home_dir", reason = "use cm_core::roots" },
+]

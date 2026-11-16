@@ -29,6 +29,7 @@ pub mod logging;
 pub mod paths;
 pub mod protocol;
 pub mod resume;
+pub mod roots;
 pub mod session_flags;
 pub mod state;
 pub mod terminal;

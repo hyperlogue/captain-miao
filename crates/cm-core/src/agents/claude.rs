@@ -34,9 +34,10 @@ pub(crate) const BIN: &str = "claude";
 /// Mirrors [`codex_home`](super::codex)'s `CODEX_HOME` handling, including
 /// treating an empty value as unset.
 fn claude_home() -> Option<PathBuf> {
+    let roots = crate::roots::current();
     resolve_claude_home(
-        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        dirs::home_dir(),
+        roots.agent_var("CLAUDE_CONFIG_DIR").map(Path::to_path_buf),
+        roots.home().map(Path::to_path_buf),
     )
 }
 

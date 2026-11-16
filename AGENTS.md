@@ -63,8 +63,10 @@ time. Keep UI behavior tests independent of subprocess speed, with separate
 integration coverage. Real-I/O watchdogs must exceed the production deadline
 and identify the awaited phase on failure. Exercise timing fixes with delayed
 replies or processes; an unloaded local pass alone does not cover a CI flake.
-Tests that write through global state paths need a child process with private
-XDG roots, isolated from parallel tests and running applications.
+Cargo runs every test binary through `.cargo/test-runner`, which gives it a
+private `HOME` and XDG roots. Resolve user directories through
+`cm_core::roots`; a test needing roots of its own uses `roots::install_for_test`
+or a child process with private roots.
 
 For documentation or skill-only changes, check links, examples, instruction
 consistency and skill frontmatter; Rust tests add no coverage to prose. Changes

@@ -6,3 +6,8 @@
 # rather than being eaten by `cargo run`.
 [alias]
 xtask = "run --package xtask --"
+
+# Every binary cargo runs goes through `.cargo/test-runner`, which gives test
+# binaries a private HOME and XDG directories and runs anything else as is.
+[target.'cfg(all())']
+runner = ".cargo/test-runner"

@@ -129,13 +129,11 @@ pub(crate) const BIN: &str = "reasonix";
 /// This is what the synthetic home mirrors; it is *not* what the launched agent
 /// is handed (see [`ensure_synth_home`]).
 fn reasonix_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("REASONIX_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
+    let roots = crate::roots::current();
+    match roots.agent_var("REASONIX_HOME") {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => roots.in_home(".reasonix"),
     }
-    dirs::home_dir().map(|h| h.join(".reasonix"))
 }
 
 /// The real **state** root — `sessions/`, `archive/`, `memory/`, `projects/`,
@@ -143,13 +141,10 @@ fn reasonix_home() -> Option<PathBuf> {
 /// Passed through verbatim so a captain-miao session writes its transcripts
 /// where every other Reasonix session writes them.
 fn state_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("REASONIX_STATE_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
+    match crate::roots::current().agent_var("REASONIX_STATE_HOME") {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => reasonix_home(),
     }
-    reasonix_home()
 }
 
 /// The real **cache** root — the rebuildable session / history / usage / task
@@ -160,19 +155,14 @@ fn state_home() -> Option<PathBuf> {
 /// substitute the `~/.reasonix` default and send the cache somewhere Reasonix
 /// would never have put it.
 fn cache_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("REASONIX_CACHE_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
+    let roots = crate::roots::current();
+    if let Some(dir) = roots.agent_var("REASONIX_CACHE_HOME") {
+        return Some(dir.to_path_buf());
     }
-    if let Some(h) = std::env::var_os("REASONIX_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p.join("cache"));
-        }
+    if let Some(dir) = roots.agent_var("REASONIX_HOME") {
+        return Some(dir.join("cache"));
     }
-    dirs::cache_dir().map(|c| c.join("reasonix"))
+    roots.cache_home().map(|c| c.join("reasonix"))
 }
 
 /// Where Reasonix keeps its transcripts: `<state>/sessions/<id>.jsonl`, each

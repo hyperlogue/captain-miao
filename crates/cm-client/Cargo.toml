@@ -33,6 +33,9 @@ rmp-serde = "1"
 # still builds where libshpool can't (macOS): list-only, attach declines.
 libshpool = { version = "0.11", optional = true }
 
+[dev-dependencies]
+cm-core = { path = "../cm-core", features = ["test-support"] }
+
 [features]
 default = ["pty-pool"]
 pty-pool = ["dep:libshpool"]

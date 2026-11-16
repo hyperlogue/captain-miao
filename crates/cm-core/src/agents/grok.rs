@@ -95,13 +95,11 @@ const HOOKS_FILE: &str = "captain-miao.json";
 
 /// `$GROK_HOME` if set, else `~/.grok` (`17-sessions.md`).
 fn grok_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("GROK_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
+    let roots = crate::roots::current();
+    match roots.agent_var("GROK_HOME") {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => roots.in_home(".grok"),
     }
-    dirs::home_dir().map(|h| h.join(".grok"))
 }
 
 /// Where Grok keeps its sessions: `$GROK_HOME/sessions/<cwd-key>/<id>/`, each

@@ -124,7 +124,7 @@ impl VitalsSampler {
         let now = Instant::now();
         let cpu_percent = self.sample_cpu_at(now, read_cpu_ticks());
         let (mem_used_bytes, mem_total_bytes) = read_memory();
-        let disk = dirs::home_dir().and_then(|home| read_disk(&home));
+        let disk = crate::roots::home().and_then(|home| read_disk(&home));
         HostVitals {
             cpu_percent,
             mem_used_bytes,

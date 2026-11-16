@@ -75,7 +75,9 @@ pub fn local_socket_path() -> PathBuf {
 pub fn shim_socket_candidates() -> Vec<PathBuf> {
     candidates_in(
         &crate::state::runtime_dir(),
-        std::env::var("HOME").ok().as_deref(),
+        crate::roots::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .as_deref(),
     )
 }
 

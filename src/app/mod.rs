@@ -815,26 +815,6 @@ impl ClipboardSupervisor {
     }
 }
 
-/// Redirect `state_dir()` to a per-process tempdir before any test touches
-/// disk. Without this, `commit_dir_edit` etc. would clobber the user's real
-/// `~/.local/state/captain-miao/` files, and [`App::new`] would dial every
-/// host in the user's real `hosts.json`.
-#[cfg(test)]
-pub(super) fn redirect_state_dir_for_tests() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("captain-miao-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // SAFETY: ONCE serializes the set; every caller blocks here until
-        // set_var returns, so no concurrent reader observes a half-written
-        // value. After this point the var is read-only.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &dir);
-        }
-    });
-}
-
 /// Under test this executable is the libtest harness, which would read
 /// `clipboard serve` as test filters and rerun every matching test, each
 /// spawning its own server again.
@@ -1764,10 +1744,7 @@ impl App {
     // =============================================================================
 
     pub(super) fn new() -> Self {
-        // Before anything reads `hosts.json`, which the reconcile below dials.
-        #[cfg(test)]
-        redirect_state_dir_for_tests();
-        let home_dir = dirs::home_dir()
+        let home_dir = crate::roots::home()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_default();
         // Give the backends somewhere to ask about downloads before any of them

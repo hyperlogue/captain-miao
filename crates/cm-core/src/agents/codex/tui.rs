@@ -116,9 +116,10 @@ pub(crate) fn reattach_prime(kitty_keyboard: bool) -> crate::state::ReattachPrim
 /// back to Codex at launch, so creating the profile and loading it cannot
 /// disagree when the agent's cwd differs from the launcher's.
 pub(super) fn codex_home() -> Option<PathBuf> {
+    let roots = crate::roots::current();
     resolve_codex_home(
-        std::env::var_os("CODEX_HOME").map(PathBuf::from),
-        dirs::home_dir(),
+        roots.agent_var("CODEX_HOME").map(Path::to_path_buf),
+        roots.home().map(Path::to_path_buf),
         std::env::current_dir().ok(),
     )
 }

@@ -14,14 +14,12 @@ mod resume_options;
 // Test harness
 // =============================================================================
 
-use super::redirect_state_dir_for_tests;
-
 /// Serialises the tests that read `window-bindings.json` back off disk.
 ///
-/// `redirect_state_dir_for_tests` gives the whole test *process* one state dir,
-/// so every test shares that file while cargo runs them on parallel threads. A
-/// test that writes it and then reads it back can otherwise observe another
-/// test's projection — which fails in both directions: a missing precondition,
+/// The test runner (`.cargo/test-runner`) gives the whole test *process* one
+/// state dir, so every test shares that file while cargo runs them on parallel
+/// threads. A test that writes it and then reads it back can otherwise observe
+/// another test's projection — which fails in both directions: a missing precondition,
 /// or worse, a post-condition that passes because someone else's write happened
 /// to omit the token being asserted about.
 fn bindings_file_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -38,7 +36,6 @@ struct TestDashboard {
 
 impl TestDashboard {
     fn new(width: u16, height: u16) -> Self {
-        redirect_state_dir_for_tests();
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();

@@ -65,7 +65,9 @@ pub fn expand_home(path: &str, home: &str) -> String {
 /// This host's `$HOME`, or empty when unset (then `~` is never expanded or
 /// produced and paths stay absolute — the degraded-but-correct behavior).
 pub fn host_home() -> String {
-    std::env::var("HOME").unwrap_or_default()
+    crate::roots::home()
+        .map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Splice a host-canonical path into a POSIX shell command line so the remote

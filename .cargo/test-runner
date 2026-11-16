@@ -1,0 +1,34 @@
+#!/bin/sh
+# Cargo runs every binary it executes through this script (see
+# `.cargo/config.toml`). A test binary (one under `deps/`) gets a private HOME
+# and XDG directories, removed when it exits, so no test can read or write the
+# developer's own captain-miao config, state, sockets or agent homes, however
+# it was written. Anything else, such as `cargo run`, runs untouched.
+case "$1" in
+*/deps/*) ;;
+*) exec "$@" ;;
+esac
+
+# /tmp rather than $TMPDIR: macOS's is long enough to push socket paths
+# under the runtime directory past the sockaddr_un limit.
+root=$(mktemp -d /tmp/cm-test.XXXXXX) || exit 1
+trap 'rm -rf "$root"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for dir in home config state data cache run; do
+	mkdir -m 700 "$root/$dir" || exit 1
+done
+export CAPTAIN_MIAO_TEST_ROOT="$root"
+export HOME="$root/home"
+export XDG_CONFIG_HOME="$root/config"
+export XDG_STATE_HOME="$root/state"
+export XDG_DATA_HOME="$root/data"
+export XDG_CACHE_HOME="$root/cache"
+export XDG_RUNTIME_DIR="$root/run"
+# The agents' directory overrides (cm_core::roots::AGENT_VARS) and Tower's
+# socket would otherwise lead back to the developer's files.
+unset CLAUDE_CONFIG_DIR CODEX_HOME GROK_HOME KIMI_CODE_HOME OPENCODE_CONFIG_DIR \
+	PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR REASONIX_HOME \
+	REASONIX_STATE_HOME REASONIX_CACHE_HOME TOWER_SOCKET CAPTAIN_MIAO_TOWER
+"$@"

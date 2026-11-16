@@ -31,12 +31,8 @@ pub fn get() -> Arc<CoreConfig> {
 /// Path to `config.toml`. Public so the dashboard's fuller loader reuses it
 /// rather than duplicating the XDG resolution.
 pub fn config_path() -> PathBuf {
-    crate::state::xdg_dir("XDG_CONFIG_HOME")
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/"))
-                .join(".config")
-        })
+    crate::roots::current()
+        .config_home()
         .join("captain-miao")
         .join("config.toml")
 }

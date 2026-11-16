@@ -21,7 +21,7 @@ pub(super) fn list_resumable(
         vec![root]
     } else {
         let Some(agent_dir) = env_path("PI_CODING_AGENT_DIR")
-            .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
+            .or_else(|| crate::roots::current().in_home(".pi/agent"))
         else {
             return Ok(Vec::new());
         };
@@ -64,7 +64,8 @@ pub(super) fn list_resumable(
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
-    let value = std::env::var_os(name).filter(|value| !value.is_empty())?;
+    let roots = crate::roots::current();
+    let value = roots.agent_var(name)?.as_os_str();
     Some(PathBuf::from(crate::paths::expand_home(
         &value.to_string_lossy(),
         &crate::paths::host_home(),

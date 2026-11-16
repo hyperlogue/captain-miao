@@ -108,7 +108,7 @@ const HOOK_NAME: &str = "captain-miao";
 
 /// The real `~/.gemini` — Antigravity's root for both its config and its state.
 fn gemini_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".gemini"))
+    crate::roots::current().in_home(".gemini")
 }
 
 /// Where the CLI keeps its state: `brain/<id>/` (transcripts and artifacts),

@@ -134,13 +134,11 @@ pub(crate) const BIN: &str = "kimi";
 /// This is what the synthetic home mirrors; it is *not* what the launched agent
 /// is handed (see [`ensure_synth_home`]).
 fn kimi_home() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("KIMI_CODE_HOME") {
-        let p = PathBuf::from(h);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
+    let roots = crate::roots::current();
+    match roots.agent_var("KIMI_CODE_HOME") {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => roots.in_home(".kimi-code"),
     }
-    dirs::home_dir().map(|h| h.join(".kimi-code"))
 }
 
 /// A single shared synthetic `$KIMI_CODE_HOME` for every Kimi session: the real

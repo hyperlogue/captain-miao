@@ -234,7 +234,8 @@ const DIRECT_HOOKS: &[(&str, HookEvent)] = &[
 /// globals independently, before project config; mirroring globals here would
 /// load them again *after* the project and reverse that precedence.
 fn custom_config_dir(cwd: &Path) -> Result<Option<PathBuf>> {
-    let Some(value) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|v| !v.is_empty()) else {
+    let roots = crate::roots::current();
+    let Some(value) = roots.agent_var("OPENCODE_CONFIG_DIR") else {
         return Ok(None);
     };
     let path =
