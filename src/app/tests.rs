@@ -14,23 +14,7 @@ mod resume_options;
 // Test harness
 // =============================================================================
 
-/// Redirect `state_dir()` to a per-process tempdir before any test touches
-/// disk. Without this, `commit_dir_edit` etc. would clobber the user's real
-/// `~/.local/state/captain-miao/` files.
-fn redirect_state_dir_for_tests() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("captain-miao-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // SAFETY: ONCE serializes the set; every TestDashboard::new caller
-        // blocks here until set_var returns, so no concurrent reader observes
-        // a half-written value. After this point the var is read-only.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", &dir);
-        }
-    });
-}
+use super::redirect_state_dir_for_tests;
 
 /// Serialises the tests that read `window-bindings.json` back off disk.
 ///

@@ -815,8 +815,39 @@ impl ClipboardSupervisor {
     }
 }
 
+/// Redirect `state_dir()` to a per-process tempdir before any test touches
+/// disk. Without this, `commit_dir_edit` etc. would clobber the user's real
+/// `~/.local/state/captain-miao/` files, and [`App::new`] would dial every
+/// host in the user's real `hosts.json`.
+#[cfg(test)]
+pub(super) fn redirect_state_dir_for_tests() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("captain-miao-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: ONCE serializes the set; every caller blocks here until
+        // set_var returns, so no concurrent reader observes a half-written
+        // value. After this point the var is read-only.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &dir);
+        }
+    });
+}
+
+/// Under test this executable is the libtest harness, which would read
+/// `clipboard serve` as test filters and rerun every matching test, each
+/// spawning its own server again.
+#[cfg(test)]
+fn spawn_clipboard_server() -> std::io::Result<tokio::process::Child> {
+    Err(std::io::Error::other(
+        "tests never re-execute the test harness as a clipboard server",
+    ))
+}
+
 /// Spawn `miao clipboard serve` — this same binary, so there is nothing to
 /// install or find.
+#[cfg(not(test))]
 fn spawn_clipboard_server() -> std::io::Result<tokio::process::Child> {
     let exe = std::env::current_exe()?;
     // Truncated on every spawn, exactly like the ssh-forward log: this file is
@@ -1733,6 +1764,9 @@ impl App {
     // =============================================================================
 
     pub(super) fn new() -> Self {
+        // Before anything reads `hosts.json`, which the reconcile below dials.
+        #[cfg(test)]
+        redirect_state_dir_for_tests();
         let home_dir = dirs::home_dir()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_default();
@@ -2740,7 +2774,9 @@ impl App {
     /// the server binary isn't installed we fall back to the direct-local
     /// backend rather than leaving the user with an empty dashboard.
     fn this_machine_backend() -> Backend {
-        if !crate::config::get().launcher.pooled {
+        // A test never starts this machine's real daemon and Tower, whatever
+        // the developer's `config.toml` says.
+        if cfg!(test) || !crate::config::get().launcher.pooled {
             return Backend::local();
         }
         if let Err(e) = ensure_local_daemon() {
