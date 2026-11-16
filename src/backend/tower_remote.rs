@@ -1,7 +1,10 @@
-//! Sessions on an ssh host's Tower daemon, behind [`crate::tower::FLAG`].
+//! Sessions on a host's Tower daemon, behind [`crate::tower::FLAG`].
 //!
 //! With the flag set, a remote host's new sessions run under the Tower
-//! installed there. With it unset, sessions an earlier run started there
+//! installed there. Under pooled-localhost (`[launcher] pooled`) this
+//! machine is such a host too: its link runs the same CLI through a local
+//! login shell instead of ssh, so the dashboard here and one reaching this
+//! machine over ssh share one daemon and see each other's sessions. With it unset, sessions an earlier run started there
 //! stay listed and operable, but no daemon is started and nothing new runs
 //! on Tower. The dashboard drives that host's `tower-cli` over the
 //! host's shared ssh connection: `tower-cli events` streams the daemon's
@@ -45,12 +48,18 @@ const HEALTHY: Duration = Duration::from_secs(30);
 /// was found absent or idle.
 const RETRY_DORMANT: Duration = Duration::from_secs(600);
 
+/// How a link reaches its host's shell.
+enum Via {
+    /// `ssh target`, sharing the connection `miao-server` uses.
+    Ssh { target: String, opts: Vec<String> },
+    /// `/bin/sh` on this machine: pooled-localhost.
+    Local,
+}
+
 /// One host's Tower: its live sessions, and how to reach its CLI.
 pub(crate) struct TowerLink {
     host: HostId,
-    target: String,
-    /// The host's ssh options, sharing the connection `miao-server` uses.
-    opts: Vec<String>,
+    via: Via,
     /// Live sessions by Tower id.
     rows: Mutex<HashMap<String, LauncherState>>,
     /// The event stream has delivered its first snapshot and is still up.
@@ -85,10 +94,26 @@ impl TowerLink {
         dirty: Arc<AtomicBool>,
         log: Arc<ConnLog>,
     ) -> Arc<Self> {
+        Self::with(
+            host,
+            Via::Ssh {
+                target: target.to_string(),
+                opts: ssh_common_opts(&state::ssh_control_path(target), ssh_options),
+            },
+            dirty,
+            log,
+        )
+    }
+
+    /// The link for this machine's own Tower, under pooled-localhost.
+    pub(crate) fn local(host: HostId, dirty: Arc<AtomicBool>, log: Arc<ConnLog>) -> Arc<Self> {
+        Self::with(host, Via::Local, dirty, log)
+    }
+
+    fn with(host: HostId, via: Via, dirty: Arc<AtomicBool>, log: Arc<ConnLog>) -> Arc<Self> {
         Arc::new(Self {
             host,
-            target: target.to_string(),
-            opts: ssh_common_opts(&state::ssh_control_path(target), ssh_options),
+            via,
             rows: Mutex::default(),
             mirrored: AtomicBool::new(false),
             dirty,
@@ -137,11 +162,16 @@ impl TowerLink {
 
     /// The argv for a window attached to session `id`.
     pub(crate) fn attach_argv(&self, id: &str) -> Vec<String> {
-        let mut argv = vec!["ssh".to_string(), "-t".to_string()];
-        argv.extend(self.opts.iter().cloned());
-        argv.push(self.target.clone());
-        argv.push(remote_command(&["attach", id]));
-        argv
+        let command = remote_command(&["attach", id]);
+        match &self.via {
+            Via::Ssh { target, opts } => {
+                let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+                argv.extend(opts.iter().cloned());
+                argv.extend([target.clone(), command]);
+                argv
+            }
+            Via::Local => vec!["/bin/sh".into(), "-c".into(), command],
+        }
     }
 
     /// Reserve a session for `spec`; it starts when its window attaches, so
@@ -229,12 +259,12 @@ impl TowerLink {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| unreachable(format!("could not run ssh: {error}")))?;
+            .map_err(|error| unreachable(format!("could not run {}: {error}", self.runner())))?;
         let (status, stdout, stderr) =
             tokio::time::timeout(RPC_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
                 .await
                 .map_err(|_| unreachable(format!("`{CLI} rpc {method}` timed out")))?
-                .map_err(|error| unreachable(format!("ssh failed: {error}")))?;
+                .map_err(|error| unreachable(format!("{} failed: {error}", self.runner())))?;
         if !status.success() {
             let message = stderr.trim().to_string();
             let message = if message.is_empty() {
@@ -340,11 +370,8 @@ impl TowerLink {
         script: &str,
         stdin: Option<Vec<u8>>,
     ) -> Result<(std::process::ExitStatus, String, String), String> {
-        let mut child = Command::new("ssh")
-            .args(&self.opts)
-            .arg("-T")
-            .arg(&self.target)
-            .arg(login_shell_safe(script))
+        let mut child = self
+            .shell_command(login_shell_safe(script))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -354,7 +381,7 @@ impl TowerLink {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| format!("could not run ssh: {error}"))?;
+            .map_err(|error| format!("could not run {}: {error}", self.runner()))?;
         // Written from a task while the output drains: one task doing both
         // deadlocks once a pipe fills.
         let writer = match (child.stdin.take(), stdin) {
@@ -368,7 +395,7 @@ impl TowerLink {
         let output = tokio::time::timeout(DEPLOY_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
             .await
             .map_err(|_| format!("timed out after {}s", DEPLOY_TIMEOUT.as_secs()))?
-            .map_err(|error| format!("ssh failed: {error}"))?;
+            .map_err(|error| format!("{} failed: {error}", self.runner()))?;
         if let Some(writer) = writer
             && output.0.success()
             && !matches!(writer.await, Ok(Ok(())))
@@ -378,17 +405,38 @@ impl TowerLink {
         Ok(output)
     }
 
-    /// An ssh command running the host's CLI with `args`.
+    /// A command running the host's CLI with `args`.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new("ssh");
+        let mut command =
+            self.shell_command(remote_command(&cli_args(crate::tower::enabled(), args)));
+        command.stdin(Stdio::null());
         command
-            .args(&self.opts)
-            .arg("-T")
-            .arg(&self.target)
-            .arg(remote_command(&cli_args(crate::tower::enabled(), args)))
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+    }
+
+    /// A command handing `line` to the host's shell.
+    fn shell_command(&self, line: String) -> Command {
+        let mut command = match &self.via {
+            Via::Ssh { target, opts } => {
+                let mut command = Command::new("ssh");
+                command.args(opts).arg("-T").arg(target).arg(line);
+                command
+            }
+            Via::Local => {
+                let mut command = Command::new("/bin/sh");
+                command.arg("-c").arg(line);
+                command
+            }
+        };
+        command.kill_on_drop(true);
         command
+    }
+
+    /// What runs the host's commands, for error messages.
+    fn runner(&self) -> &'static str {
+        match self.via {
+            Via::Ssh { .. } => "ssh",
+            Via::Local => "the shell",
+        }
     }
 
     /// Fold one event into the rows.
@@ -638,9 +686,9 @@ async fn follow_once(link: &TowerLink) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("could not run ssh: {error}"))?;
-    let stdout = child.stdout.take().ok_or("ssh has no stdout")?;
-    let stderr = child.stderr.take().ok_or("ssh has no stderr")?;
+        .map_err(|error| format!("could not run {}: {error}", link.runner()))?;
+    let stdout = child.stdout.take().ok_or("the CLI has no stdout")?;
+    let stderr = child.stderr.take().ok_or("the CLI has no stderr")?;
     let errors = tokio::spawn(async move {
         let mut text = String::new();
         let _ = stderr.take(4096).read_to_string(&mut text).await;
@@ -857,6 +905,51 @@ mod tests {
             json_in("motd\n{\"id\":\"ag-1\"}\n"),
             Some(serde_json::json!({"id": "ag-1"}))
         );
+    }
+
+    /// Pooled-localhost reaches this machine's Tower the way ssh reaches a
+    /// host's: the same CLI through the account's login shell, so both
+    /// dashboards talk to one daemon.
+    #[tokio::test]
+    async fn a_local_link_runs_the_cli_in_this_machines_login_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        executable(&bin.join("tower-cli"), r#"for arg; do echo "$arg"; done"#);
+        let shell = bin.join("login");
+        executable(
+            &shell,
+            r#"[ "$1" = -l ] && [ "$2" = -c ] && exec /bin/sh -c "$3""#,
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let link = TowerLink::local(HostId("desk".into()), Arc::default(), Arc::default());
+
+        let out = link
+            .command(&["rpc", "session.kill", r#"{"id":"ag-1"}"#])
+            .env("HOME", &home)
+            .env("SHELL", &shell)
+            .env("PATH", &path)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.ends_with("rpc\nsession.kill\n{\"id\":\"ag-1\"}\n"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // An attach window runs here, without ssh.
+        let argv = link.attach_argv("ag-1");
+        assert_eq!(argv[..2], ["/bin/sh", "-c"]);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("HOME", &home)
+            .env("SHELL", &shell)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "attach\nag-1\n");
     }
 
     #[test]

@@ -91,6 +91,11 @@ owns the local side and the record-to-row mapping both sides use;
   below `tower/` in the state root; the launcher removes its own on exit.
 - Pin and follow-up are Tower tags on those sessions, not `session-flags.json`
   entries. Tower sessions get no automatic flag transitions yet.
+- Under pooled-localhost, this machine's `RemoteBackend` holds a local
+  `TowerLink` (`RemoteBackend::connect_this_machine`) that runs the same CLI
+  through `/bin/sh` and the login shell, so it shares one daemon with
+  dashboards reaching this machine over SSH. Embedded Tower sessions started
+  in direct-local mode are not listed there. Other socket hosts get no link.
 - On an SSH host, `RemoteBackend` holds a `TowerLink` beside its
   `miao-server` connection. It runs the host's `tower-cli` over the shared
   ssh master in the login shell: `events --topics agents` for records, `rpc`

@@ -214,7 +214,11 @@ first prompt. This display convention does not confirm startup has finished.
 Other Tower `unknown` statuses show **Unknown**; **Starting** is reserved for
 Tower's explicit startup status.
 
-On SSH hosts, new sessions run under the Tower daemon on the host. A `miao`
+On SSH hosts, new sessions run under the Tower daemon on the host. With
+`[launcher] pooled = true`, this machine's new sessions also run under its own
+Tower daemon, so a machine used both as a desktop and as an SSH host shows the
+same Tower sessions to its own dashboard and to remote ones. Embedded Tower
+sessions started without pooling are not listed in pooled mode. A `miao`
 built with `cargo xtask dist --tower` carries Tower and uploads it to each host
 that runs a different build, under `~/.cache/captain-miao/tower/`; otherwise
 install Tower there so `tower-cli` is on the login shell's `PATH`. A deployed

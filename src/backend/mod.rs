@@ -1742,7 +1742,8 @@ pub(crate) struct RemoteBackend {
     log: Arc<ConnLog>,
     /// The host's Tower, which runs its new sessions while
     /// [`crate::tower::FLAG`] is set and keeps the ones it runs operable
-    /// when it is not. `None` for a socket transport.
+    /// when it is not. Over a socket only this machine's own daemon has one
+    /// ([`Self::connect_this_machine`]).
     tower: Option<Arc<tower_remote::TowerLink>>,
 }
 
@@ -1802,16 +1803,23 @@ impl RemoteBackend {
     /// sessions); the task then retries with backoff, re-snapshotting on each
     /// reconnect, until the backend is dropped.
     pub(crate) fn connect(transport: Transport, host: HostId) -> Arc<Self> {
-        Self::start(transport, host, false)
+        Self::start(transport, host, false, false)
+    }
+
+    /// Pooled-localhost: this machine's own daemon at `sock`, with this
+    /// machine's Tower beside it, so sessions a dashboard reaching this
+    /// machine over ssh runs on Tower are this dashboard's sessions too.
+    pub(crate) fn connect_this_machine(sock: PathBuf, host: HostId) -> Arc<Self> {
+        Self::start(Transport::LocalSocket(sock), host, false, true)
     }
 
     /// A deliberate reconnect must not inherit the SSH master that just failed.
     pub(crate) fn connect_fresh(transport: Transport, host: HostId) -> Arc<Self> {
-        Self::start(transport, host, true)
+        Self::start(transport, host, true, false)
     }
 
-    fn start(transport: Transport, host: HostId, fresh: bool) -> Arc<Self> {
-        let (backend, shared, requests) = Self::build(&transport, host);
+    fn start(transport: Transport, host: HostId, fresh: bool, this_machine: bool) -> Arc<Self> {
+        let (backend, shared, requests) = Self::build_with(&transport, host, this_machine);
         if fresh && matches!(transport, Transport::Ssh { .. }) {
             backend.log.info("fresh SSH connection requested by you");
         }
@@ -1895,9 +1903,22 @@ impl RemoteBackend {
     /// Everything a [`RemoteBackend`] and its connection task share, built but
     /// not yet wired to one. Split out of [`connect`] so a test can hold the
     /// task's half instead of running one.
+    #[cfg(test)]
     fn build(
         transport: &Transport,
         host: HostId,
+    ) -> (
+        Arc<Self>,
+        ConnectionShared,
+        mpsc::UnboundedReceiver<PendingRequest>,
+    ) {
+        Self::build_with(transport, host, false)
+    }
+
+    fn build_with(
+        transport: &Transport,
+        host: HostId,
+        this_machine: bool,
     ) -> (
         Arc<Self>,
         ConnectionShared,
@@ -1961,7 +1982,12 @@ impl RemoteBackend {
                 dirty.clone(),
                 log.clone(),
             )),
-            _ => None,
+            Transport::LocalSocket(_) if this_machine => Some(tower_remote::TowerLink::local(
+                host.clone(),
+                dirty.clone(),
+                log.clone(),
+            )),
+            Transport::LocalSocket(_) => None,
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let next_req_id = Arc::new(AtomicU64::new(1));

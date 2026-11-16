@@ -2787,8 +2787,8 @@ impl App {
         // backend and `is_local()` gates behaviour that no longer applies (these
         // sessions *are* pooled, so they detach, reattach, and can be stolen).
         let host = HostId(local_host_label());
-        Backend::Remote(RemoteBackend::connect(
-            Transport::LocalSocket(state::server_sock_path()),
+        Backend::Remote(RemoteBackend::connect_this_machine(
+            state::server_sock_path(),
             host,
         ))
     }
