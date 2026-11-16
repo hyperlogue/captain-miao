@@ -8,6 +8,49 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 const AGENT_SESSION_SCRIPT: &str = "echo \"$HOME\"; echo \"$SSH_AUTH_SOCK\"; exec cat >/dev/null";
 
 impl RemoteBackend {
+    pub(crate) async fn vcs_status_within(
+        &self,
+        within: Duration,
+        cwd: String,
+        refresh_remote: bool,
+    ) -> Option<cm_core::vcs::VcsSnapshot> {
+        let started = Instant::now();
+        let reply = self
+            .vcs_request_within(within, refresh_remote, |req_id, ssh_auth_sock| {
+                ClientFrame::GetVcsStatus {
+                    req_id,
+                    cwd: cwd.clone(),
+                    refresh_remote,
+                    ssh_auth_sock,
+                }
+            })
+            .await;
+        match reply {
+            Ok(Some(ServerFrame::VcsStatus { snapshot, .. })) => Some(snapshot),
+            Err(_) if refresh_remote => {
+                // A failed agent connection must not hide local checkout state.
+                // The local-only fallback shares the original request budget.
+                let remaining = within.saturating_sub(started.elapsed());
+                match self
+                    .request_within(remaining, |req_id| ClientFrame::GetVcsStatus {
+                        req_id,
+                        cwd,
+                        refresh_remote: false,
+                        ssh_auth_sock: None,
+                    })
+                    .await
+                {
+                    Some(ServerFrame::VcsStatus { mut snapshot, .. }) => {
+                        snapshot.remote_check = cm_core::vcs::RemoteCheck::Failed;
+                        Some(snapshot)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) async fn prepare_push_within(
         &self,
         within: Duration,

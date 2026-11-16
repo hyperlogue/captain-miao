@@ -223,6 +223,7 @@ pub fn execute_push_with_agent(
     let ssh_auth_sock = ssh_auth_sock.as_deref();
     let _guard = lock_until(deadline).map_err(failure)?;
     let cwd = expand(cwd).canonicalize().map_err(|_| CHANGED)?;
+    super::refresh::invalidate(&cwd, deadline);
     let expected = &prepared.expected;
     let checkout = validate(&cwd, expected, true, deadline)?;
     let tracking: Vec<_> = checkout
@@ -307,6 +308,7 @@ pub fn execute_pull_with_agent(
     let ssh_auth_sock = ssh_auth_sock.as_deref();
     let _guard = lock_until(deadline).map_err(failure)?;
     let cwd = expand(cwd).canonicalize().map_err(|_| CHANGED)?;
+    super::refresh::invalidate(&cwd, deadline);
     let expected = &prepared.expected;
     let checkout = validate(&cwd, expected, false, deadline)?;
     let tracking: Vec<_> = checkout
@@ -650,7 +652,7 @@ fn valid_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn remote_tip(
+pub(super) fn remote_tip(
     cwd: &Path,
     url: &str,
     target: &str,
@@ -731,7 +733,7 @@ fn line_optional(cwd: &Path, args: &[&str], deadline: Instant) -> Result<Option<
     ))
 }
 
-fn line(cwd: &Path, args: &[&str], deadline: Instant) -> Result<String, String> {
+pub(super) fn line(cwd: &Path, args: &[&str], deadline: Instant) -> Result<String, String> {
     let output = run_git(cwd, args, deadline).map_err(failure)?;
     if !output.status_ok {
         return Err("could not resolve Git command target".into());
@@ -970,6 +972,10 @@ exec sh -c "$last"
         let cwd = repo.work.to_str().unwrap();
         let process_agent = std::env::var_os("SSH_AUTH_SOCK");
         std::fs::write(&expected, "/tmp/agent-first.sock").unwrap();
+        let refreshed =
+            super::super::dashboard_status(cwd, true, Some("/tmp/agent-first.sock"), deadline());
+        assert_eq!(refreshed.behind, 1);
+        assert_eq!(refreshed.remote_check.label(), None);
         let pull = prepare_pull_with_agent(cwd, Some("/tmp/agent-first.sock"), deadline()).unwrap();
         // Preparation authenticates both ls-remote and fetch. Execution uses a
         // replacement connection's agent and keeps the same prepared commit.
@@ -1218,6 +1224,74 @@ exec sh -c "$last"
             git(&peer, &["rev-parse", "HEAD"])
         );
         assert_eq!(repo.run_pull(&repo.pull()).unwrap(), "pulled 0 commits");
+    }
+
+    #[test]
+    fn dashboard_refresh_detects_remote_commits_without_changing_checkout_refs() {
+        let repo = Repo::new();
+        repo.publish();
+        let head = git(&repo.work, &["rev-parse", "HEAD"]);
+        repo.advance_remote();
+        let cwd = repo.work.to_str().unwrap();
+        assert_eq!(super::super::status(cwd).behind, 0);
+        let refreshed = super::super::dashboard_status(cwd, true, None, deadline());
+        assert_eq!(refreshed.behind, 1);
+        assert_eq!(refreshed.remote_check.label(), None);
+        assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&repo.work, &["rev-parse", "origin/main"]), head);
+        assert!(!repo.work.join(".git/FETCH_HEAD").exists());
+
+        // A second directory/worktree shares the network cooldown. Removing the
+        // remote makes any accidental network request fail deterministically.
+        let worktree = repo.root.join("linked");
+        git(
+            &repo.work,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        git(&worktree, &["branch", "--set-upstream-to=origin/main"]);
+        std::fs::rename(&repo.remote, repo.root.join("offline")).unwrap();
+        let cached =
+            super::super::dashboard_status(worktree.to_str().unwrap(), true, None, deadline());
+        assert_eq!(cached.behind, 1);
+        assert_eq!(cached.remote_check.label(), None);
+        // Counts still follow local commits between network checks.
+        git(
+            &repo.work,
+            &["commit", "-q", "--allow-empty", "-m", "local"],
+        );
+        let changed = super::super::dashboard_status(cwd, false, None, deadline());
+        assert_eq!((changed.ahead, changed.behind), (1, 1));
+        assert_eq!(changed.remote_check.label(), None);
+    }
+
+    #[test]
+    fn dashboard_failed_refresh_preserves_local_state_and_retries_are_throttled() {
+        let repo = Repo::new();
+        repo.publish();
+        let offline = repo.root.join("offline");
+        std::fs::rename(&repo.remote, &offline).unwrap();
+        let cwd = repo.work.to_str().unwrap();
+        let failed = super::super::dashboard_status(cwd, true, None, deadline());
+        assert_eq!(failed.outcome, VcsOutcome::Ready);
+        assert_eq!(failed.remote_check, super::super::RemoteCheck::Failed);
+        std::fs::rename(&offline, &repo.remote).unwrap();
+        let throttled = super::super::dashboard_status(cwd, true, None, deadline());
+        assert_eq!(throttled.remote_check, super::super::RemoteCheck::Failed);
+        // Changing upstream identity cannot inherit another remote's evidence.
+        git(
+            &repo.work,
+            &["remote", "set-url", "origin", offline.to_str().unwrap()],
+        );
+        let unknown = super::super::dashboard_status(cwd, false, None, deadline());
+        assert_eq!(unknown.remote_check, super::super::RemoteCheck::NotChecked);
     }
 
     #[test]

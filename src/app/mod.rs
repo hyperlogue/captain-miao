@@ -865,6 +865,7 @@ impl HostTally {
 /// One checkout's version-control answer, plus whether a probe is out.
 #[derive(Debug, Default)]
 pub(super) struct VcsSlot {
+    pub(super) remote_asked: Option<Instant>,
     pub(super) view: VcsView,
     pub(super) asked: Option<Instant>,
     pub(super) inflight: bool,

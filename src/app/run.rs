@@ -198,23 +198,25 @@ fn remote_reach(app: &App, host: &HostId) -> RemoteReach {
     }
 }
 
-async fn read_vcs(remote: RemoteReach, cwd: String) -> Option<cm_core::vcs::VcsSnapshot> {
+async fn read_vcs(
+    remote: RemoteReach,
+    cwd: String,
+    refresh_remote: bool,
+) -> Option<cm_core::vcs::VcsSnapshot> {
     let deadline = Instant::now() + cm_core::vcs::STATUS_LIMIT;
     match remote {
         RemoteReach::Down => None,
-        RemoteReach::Up(remote) => match remote
-            .request_within(VCS_RPC_TIMEOUT, |req_id| {
-                cm_core::protocol::ClientFrame::GetVcsStatus { req_id, cwd }
+        RemoteReach::Up(remote) => {
+            remote
+                .vcs_status_within(VCS_RPC_TIMEOUT, cwd, refresh_remote)
+                .await
+        }
+        RemoteReach::Local => Some(
+            tokio::task::spawn_blocking(move || {
+                cm_core::vcs::dashboard_status(&cwd, refresh_remote, None, deadline)
             })
             .await
-        {
-            Some(cm_core::protocol::ServerFrame::VcsStatus { snapshot, .. }) => Some(snapshot),
-            _ => None,
-        },
-        RemoteReach::Local => Some(
-            tokio::task::spawn_blocking(move || cm_core::vcs::status_with_deadline(&cwd, deadline))
-                .await
-                .unwrap_or_default(),
+            .unwrap_or_default(),
         ),
     }
 }
@@ -302,6 +304,7 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
     let host = session.host.clone();
     let cwd = session.cwd.clone();
     let interval = VCS_DETAIL_POLL;
+    let refresh_remote;
     {
         let slot = app.vcs.entry((host.clone(), cwd.clone())).or_default();
         if slot.inflight {
@@ -311,6 +314,18 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
             return;
         }
         slot.asked = Some(Instant::now());
+        // Client and host cooldowns start at different instants. Retry an
+        // expired successful check on the next poll rather than waiting a
+        // second whole minute when the host just missed its cooldown.
+        let stale = matches!(&slot.view, super::VcsView::Snapshot(snapshot)
+            if snapshot.remote_check.label() == Some("stale"));
+        refresh_remote = stale
+            || slot
+                .remote_asked
+                .is_none_or(|asked| asked.elapsed() >= cm_core::vcs::REMOTE_REFRESH_INTERVAL);
+        if refresh_remote {
+            slot.remote_asked = Some(Instant::now());
+        }
         slot.inflight = true;
     }
     let remote = match remote_reach(app, &host) {
@@ -327,7 +342,7 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
     let report_cwd = cwd.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let snapshot = read_vcs(remote, cwd).await;
+        let snapshot = read_vcs(remote, cwd, refresh_remote).await;
         let _ = tx.send(VcsMsg::Status {
             host,
             cwd: report_cwd,
@@ -344,6 +359,7 @@ fn finish_vcs_command(app: &mut App, host: HostId, cwd: String, ok: bool, messag
     let key = (host.clone(), cwd.clone());
     if let Some(slot) = app.vcs.get_mut(&key) {
         slot.asked = None;
+        slot.remote_asked = None;
         slot.inflight = false;
     }
     let level = if ok { Level::Success } else { Level::Error };

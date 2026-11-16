@@ -69,6 +69,14 @@ Errors remain until dismissed. Dismissing progress does not cancel the action.
 Press `x` to dismiss notifications, oldest first. Press `Esc` to close panels,
 clear input, and dismiss notifications.
 
+The Git detail panel checks the configured upstream when opened and about once
+per minute while viewed. Checks fetch history without moving branches or changing
+the working tree; local changes refresh every 15 seconds. Sync counts describe
+the last checked upstream. A check mark requires a recent successful check;
+`not checked`, `stale`, and `check failed` identify unverified or older results.
+Remote-host checks use the same scoped SSH-agent forwarding as Git pull.
+
+
 On macOS, system wake or network changes trigger an immediate connection check.
 The check waits three seconds before reconnecting stalled links.
 Recovery requires active Wi-Fi or VPN.

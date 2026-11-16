@@ -917,11 +917,11 @@ async fn handle_conn(
                             .and_then(|()| cm_core::config::read_codex());
                         write_frame(&mut wr, &codex_config_reply(req_id, result)).await?;
                     }
-                    ClientFrame::GetVcsStatus { req_id, cwd } => {
+                    ClientFrame::GetVcsStatus { req_id, cwd, refresh_remote, ssh_auth_sock } => {
                         let deadline = std::time::Instant::now() + cm_core::vcs::STATUS_LIMIT;
                         let tx = replies_tx.clone();
                         tokio::spawn(async move {
-                            let snapshot = tokio::task::spawn_blocking(move || cm_core::vcs::status_with_deadline(&cwd, deadline))
+                            let snapshot = tokio::task::spawn_blocking(move || cm_core::vcs::dashboard_status(&cwd, refresh_remote, ssh_auth_sock.as_deref(), deadline))
                                 .await
                                 .unwrap_or_else(|_| cm_core::vcs::VcsSnapshot {
                                     outcome: cm_core::vcs::VcsOutcome::Error,

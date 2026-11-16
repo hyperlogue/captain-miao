@@ -2109,8 +2109,12 @@ fn vcs_sync_line(
         spans.push(Span::styled("—", dim));
         return Line::from(spans);
     }
+    let freshness = snap.remote_check.label();
     if snap.ahead == 0 && snap.behind == 0 {
-        spans.push(Span::styled("✓", dim));
+        spans.push(Span::styled(
+            freshness.unwrap_or("✓"),
+            if freshness.is_some() { attention } else { dim },
+        ));
         return Line::from(spans);
     }
     let diverged = snap.ahead > 0 && snap.behind > 0;
@@ -2124,6 +2128,9 @@ fn vcs_sync_line(
             spans.push(Span::raw(" "));
         }
         spans.push(Span::styled(format!("↓{}", snap.behind), behind_style));
+    }
+    if let Some(label) = freshness {
+        spans.push(Span::styled(format!(" · {label}"), attention));
     }
     Line::from(spans)
 }
@@ -2184,5 +2191,45 @@ fn vcs_outcome_label(snap: &cm_core::vcs::VcsSnapshot) -> String {
         VcsOutcome::NoTool => "git is not on PATH".to_string(),
         VcsOutcome::Error => "git failed".to_string(),
         VcsOutcome::Ready => "ready".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod vcs_sync_tests {
+    use super::*;
+
+    #[test]
+    fn a_check_mark_requires_recent_remote_evidence() {
+        use cm_core::vcs::{RemoteCheck, VcsSnapshot};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (check, expected) in [
+            (RemoteCheck::NotChecked, "not checked"),
+            (RemoteCheck::Failed, "check failed"),
+            (RemoteCheck::Checked { at: now - 61 }, "stale"),
+            (RemoteCheck::Checked { at: now }, "✓"),
+        ] {
+            let snapshot = VcsSnapshot {
+                upstream: Some("origin/main".into()),
+                remote_check: check,
+                ..Default::default()
+            };
+            let line = vcs_sync_line(
+                &snapshot,
+                Style::default(),
+                Style::default(),
+                Style::default(),
+                Style::default(),
+            );
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.ends_with(expected), "{text}");
+            assert_eq!(text.contains('✓'), expected == "✓");
+        }
     }
 }

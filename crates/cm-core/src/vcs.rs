@@ -22,11 +22,13 @@ use serde::{Deserialize, Serialize};
 
 mod command;
 mod process;
+mod refresh;
 pub use command::{
     PreparedVcsPull, PreparedVcsPush, VcsCommit, execute_pull, execute_pull_with_agent,
     execute_push, execute_push_with_agent, prepare_pull, prepare_pull_with_agent, prepare_push,
 };
 use process::{GitOut, RunFail, run_git, run_git_read};
+pub use refresh::{REMOTE_REFRESH_INTERVAL, RemoteCheck, dashboard_status};
 
 pub const STATUS_LIMIT: Duration = Duration::from_secs(30);
 const FOLLOWUP_LIMIT: Duration = Duration::from_secs(2);
@@ -70,6 +72,9 @@ pub struct VcsSnapshot {
     /// Commits the upstream has that are not here. Zero when there is no upstream.
     #[serde(default)]
     pub behind: u32,
+    /// Evidence from the last network check; absent on older servers.
+    #[serde(default)]
+    pub remote_check: RemoteCheck,
     /// `"merge"`, `"rebase"`, and so on, when one is in progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
@@ -99,6 +104,7 @@ impl VcsSnapshot {
             upstream_gone: false,
             ahead: 0,
             behind: 0,
+            remote_check: RemoteCheck::default(),
             operation: None,
             workspace: None,
             dirty: false,

@@ -121,7 +121,14 @@ pub enum ClientFrame {
     },
     /// Version-control status of `cwd`. Reply: `VcsStatus`. Pulled, not pushed:
     /// the dashboard asks while it is showing the answer.
-    GetVcsStatus { req_id: u64, cwd: String },
+    GetVcsStatus {
+        req_id: u64,
+        cwd: String,
+        #[serde(default)]
+        refresh_remote: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_auth_sock: Option<String>,
+    },
     /// Legacy request; current servers refuse it because it lacks a confirmed target.
     VcsPush { req_id: u64, cwd: String },
     /// Legacy request; current servers refuse it because it lacks a confirmed target.
@@ -628,5 +635,24 @@ mod tests {
         let mut slice: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
         let r: std::io::Result<Option<ClientFrame>> = read_frame(&mut slice).await;
         assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod vcs_status_compatibility {
+    use super::*;
+
+    #[test]
+    fn old_status_requests_do_not_start_network_work() {
+        let frame: ClientFrame =
+            serde_json::from_str(r#"{"frame":"GetVcsStatus","req_id":1,"cwd":"~/repo"}"#).unwrap();
+        assert!(matches!(
+            frame,
+            ClientFrame::GetVcsStatus {
+                refresh_remote: false,
+                ssh_auth_sock: None,
+                ..
+            }
+        ));
     }
 }
