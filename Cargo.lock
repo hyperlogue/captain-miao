@@ -2956,7 +2956,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 [[package]]
 name = "tower-agents"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2975,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "tower-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
@@ -2991,7 +2991,7 @@ dependencies = [
 [[package]]
 name = "tower-launcher"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -3011,7 +3011,7 @@ dependencies = [
 [[package]]
 name = "tower-pal"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "fs2",
  "libc",
@@ -3027,7 +3027,7 @@ dependencies = [
 [[package]]
 name = "tower-pool-proto"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "serde",
  "serde_json",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "tower-protocol"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "serde",
 ]
@@ -3046,7 +3046,7 @@ dependencies = [
 [[package]]
 name = "tower-sessions"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=9878b32501f82d33288764b6787fdf309bbb8451#9878b32501f82d33288764b6787fdf309bbb8451"
+source = "git+https://github.com/hyperlogue/tower?rev=b62cc3ac6edaed342aa50c676214ae408c101503#b62cc3ac6edaed342aa50c676214ae408c101503"
 dependencies = [
  "serde",
  "serde_json",
