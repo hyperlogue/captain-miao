@@ -10473,7 +10473,7 @@ fn space_v_p_prepares_a_push_and_the_detail_panel_shows_the_checkout() {
             d.app.sessions[0].cwd.clone(),
         ),
         super::VcsSlot {
-            view: super::VcsView::Snapshot(rebasing),
+            view: super::VcsView::Snapshot(rebasing.clone()),
             ..Default::default()
         },
     );
@@ -10482,9 +10482,34 @@ fn space_v_p_prepares_a_push_and_the_detail_panel_shows_the_checkout() {
     assert!(!out.contains("Operation"), "{out}");
     assert_eq!(value_style(&d, "Tree").fg, Some(ui.error_fg));
     assert!(
-        out.contains('✓'),
-        "nothing to push or pull is a check: {out}"
+        out.contains("not checked"),
+        "zero ahead and behind without a remote check stays unverified: {out}"
     );
+    assert!(!out.contains('✓'), "{out}");
+
+    let mut checked = rebasing;
+    checked.remote_check = cm_core::vcs::RemoteCheck::Checked {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(checked),
+            ..Default::default()
+        },
+    );
+    let out = d.render();
+    assert!(
+        out.contains('✓'),
+        "nothing to push or pull after a recent check is a check: {out}"
+    );
+    assert!(!out.contains("not checked"), "{out}");
 }
 
 #[test]
