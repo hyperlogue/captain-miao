@@ -189,7 +189,6 @@ const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 /// `[launcher]` in `config.toml`: how a launched session is run.
 pub struct LauncherConfig {
     /// Executable invoked by the terminal for direct-local dashboard launches.
-    #[serde(alias = "wrapper")]
     pub local_wrapper: Option<String>,
     /// Dashboard environment variables copied to the direct-local wrapper.
     pub local_wrapper_passthrough_env: Vec<String>,
@@ -361,8 +360,12 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn legacy_wrapper_keeps_its_path_and_forwards_no_dashboard_variables() {
+    fn only_local_wrapper_sets_the_launcher_wrapper() {
         let config: super::LauncherConfig = toml::from_str(r#"wrapper = "~/bin/enter""#).unwrap();
+        assert!(config.local_wrapper.is_none());
+
+        let config: super::LauncherConfig =
+            toml::from_str(r#"local_wrapper = "~/bin/enter""#).unwrap();
         assert_eq!(config.local_wrapper.as_deref(), Some("~/bin/enter"));
         assert!(config.local_wrapper_passthrough_env.is_empty());
     }
