@@ -456,7 +456,12 @@ async fn run_capture_with_limit(
         .await
         .with_context(|| format!("{label} timed out; its outcome may be unknown"))?
         .with_context(|| format!("Failed to run {label}"))?;
-    tracing::debug!("{label} {} took {:?}", args.join(" "), started.elapsed());
+    // Launch arguments can include environment values supplied to a local wrapper.
+    tracing::debug!(
+        "{label} {} took {:?}",
+        args.first().copied().unwrap_or_default(),
+        started.elapsed()
+    );
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

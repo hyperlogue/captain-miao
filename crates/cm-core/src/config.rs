@@ -189,7 +189,10 @@ const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 /// `[launcher]` in `config.toml`: how a launched session is run.
 pub struct LauncherConfig {
     /// Executable invoked by the terminal for direct-local dashboard launches.
-    pub wrapper: Option<String>,
+    #[serde(alias = "wrapper")]
+    pub local_wrapper: Option<String>,
+    /// Dashboard environment variables copied to the direct-local wrapper.
+    pub local_wrapper_passthrough_env: Vec<String>,
     pub approval_grace_secs: u64,
     pub max_recent_cwds: usize,
     /// How many resumable sessions the `r` picker asks a host for, most-recent
@@ -236,7 +239,8 @@ pub struct LauncherConfig {
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
-            wrapper: None,
+            local_wrapper: None,
+            local_wrapper_passthrough_env: Vec::new(),
             approval_grace_secs: 2,
             max_recent_cwds: 50,
             resume_list_limit: 50,
@@ -356,6 +360,13 @@ impl AgentConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_wrapper_keeps_its_path_and_forwards_no_dashboard_variables() {
+        let config: super::LauncherConfig = toml::from_str(r#"wrapper = "~/bin/enter""#).unwrap();
+        assert_eq!(config.local_wrapper.as_deref(), Some("~/bin/enter"));
+        assert!(config.local_wrapper_passthrough_env.is_empty());
+    }
+
     #[test]
     fn codex_settings_preserve_other_config_and_are_owned_by_each_host() {
         use super::*;

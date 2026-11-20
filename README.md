@@ -209,23 +209,28 @@ terminal host can access.
 
 ```toml
 [launcher]
-wrapper = "~/.local/bin/miao-in-dev"
+local_wrapper = "~/.local/bin/miao-in-dev"
+local_wrapper_passthrough_env = ["CONTAINER_ID"]
 ```
 
-For a Distrobox named `dev`, make that script executable with
+Make the script executable with
 `chmod +x ~/.local/bin/miao-in-dev` and give it this content:
 
 ```sh
 #!/bin/sh
-exec distrobox enter dev -- "$MIAO_LAUNCHER" "$@"
+exec distrobox enter "${CONTAINER_ID:?Start miao inside Distrobox}" -- "$MIAO_LAUNCHER" "$@"
 ```
 
-The wrapper inherits the terminal host’s `PATH`. `MIAO_LAUNCHER` names the
-dashboard’s executable inside the container. The arguments begin with `launch`
-and include the agent, project directory, and any session options.
+The wrapper inherits the terminal host’s environment. List names in
+`local_wrapper_passthrough_env` to copy their values from the dashboard. The
+list defaults to empty. Unset names are skipped, and empty values are preserved.
+These values travel in the terminal launch command and can be visible in
+process listings. `MIAO_LAUNCHER` always names the dashboard’s executable
+inside the container. The arguments begin with `launch` and include the agent,
+project directory, and any session options.
 
 To enter the same box in a work tab, edit **localhost → Work tab command** in
-the hosts panel and enter `distrobox enter dev`. Pressing `w` opens the tab in
+the hosts panel and enter `distrobox enter dev` (replace `dev` with your box name). Pressing `w` opens the tab in
 the project directory. As on SSH hosts, the command receives `MIAO_WORKDIR`
 and the stable `MIAO_WORKSPACE` name. Success closes the tab, and failure
 opens a login shell. Clear the field to use the default shell.

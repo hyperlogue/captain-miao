@@ -38,24 +38,35 @@ pub(super) struct WindowLaunch {
 
 impl WindowLaunch {
     pub fn prepare(&self, plan: LaunchPlan) -> (String, SpawnSpec) {
-        self.prepare_with_wrapper(plan, crate::config::get().launcher.wrapper.as_deref())
+        self.prepare_with_wrapper(plan, &crate::config::get().launcher)
     }
 
-    fn prepare_with_wrapper(&self, plan: LaunchPlan, wrapper: Option<&str>) -> (String, SpawnSpec) {
+    fn prepare_with_wrapper(
+        &self,
+        plan: LaunchPlan,
+        config: &crate::config::LauncherConfig,
+    ) -> (String, SpawnSpec) {
         let (token, cwd, command) = match plan {
             LaunchPlan::SpawnLocal { mut argv } => {
                 argv.extend(["--launch-id".into(), self.local_token.clone()]);
-                let command = if let Some(wrapper) = wrapper.filter(|w| !w.trim().is_empty()) {
-                    let launcher = format!("MIAO_LAUNCHER={}", argv[0]);
-                    argv.splice(
-                        ..1,
-                        [
-                            "/usr/bin/env".into(),
-                            launcher,
-                            cm_core::paths::expand_home(wrapper, &self.home),
-                        ],
-                    );
-                    SpawnCommand::TerminalExec(argv)
+                let command = if let Some(wrapper) = config
+                    .local_wrapper
+                    .as_deref()
+                    .filter(|w| !w.trim().is_empty())
+                {
+                    let mut wrapped =
+                        vec!["/usr/bin/env".into(), format!("MIAO_LAUNCHER={}", argv[0])];
+                    for name in &config.local_wrapper_passthrough_env {
+                        if name != "MIAO_LAUNCHER"
+                            && cm_core::config::is_valid_env_name(name)
+                            && let Ok(value) = std::env::var(name)
+                        {
+                            wrapped.push(format!("{name}={value}"));
+                        }
+                    }
+                    wrapped.push(cm_core::paths::expand_home(wrapper, &self.home));
+                    wrapped.extend(argv.into_iter().skip(1));
+                    SpawnCommand::TerminalExec(wrapped)
                 } else {
                     SpawnCommand::Exec(argv)
                 };
@@ -777,8 +788,31 @@ mod tests {
 
     #[test]
     fn local_and_pooled_window_plans_preserve_launch_and_attach_contracts() {
+        const CHILD: &str = "MIAO_TEST_LOCAL_WRAPPER_ENV";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("app::launch::tests::local_and_pooled_window_plans_preserve_launch_and_attach_contracts")
+                .env(CHILD, "1")
+                .env("CONTAINER_ID", "dev box='$box'")
+                .env("EMPTY_VALUE", "")
+                .env("MIAO_LAUNCHER", "stale")
+                .env_remove("MISSING_VALUE")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
         let launch = request("remote", "L1").window;
-        let (token, spec) = launch.prepare_with_wrapper(plan("pool-a"), Some("/bin/wrapper"));
+        let config: crate::config::LauncherConfig = toml::from_str(
+            r#"
+            local_wrapper = "~/my scripts/enter"
+            local_wrapper_passthrough_env = [
+                "CONTAINER_ID", "EMPTY_VALUE", "MIAO_LAUNCHER", "not=a=name", "MISSING_VALUE"
+            ]
+        "#,
+        )
+        .unwrap();
+        let (token, spec) = launch.prepare_with_wrapper(plan("pool-a"), &config);
         assert_eq!(token, "pool-a");
         assert_eq!(spec.cwd, "/work/local");
         assert!(!spec.hold && !spec.take_focus && spec.stack);
@@ -816,7 +850,7 @@ mod tests {
                 "quoted '$id'".into(),
             ],
         };
-        let (_, spec) = launch.prepare_with_wrapper(plan, Some("~/my scripts/enter"));
+        let (_, spec) = launch.prepare_with_wrapper(plan, &config);
         let SpawnCommand::TerminalExec(argv) = spec.command else {
             panic!("expected terminal PATH")
         };
@@ -825,6 +859,8 @@ mod tests {
             [
                 "/usr/bin/env",
                 "MIAO_LAUNCHER=/container/bin/miao",
+                "CONTAINER_ID=dev box='$box'",
+                "EMPTY_VALUE=",
                 "/work/local/my scripts/enter",
                 "launch",
                 "codex",
