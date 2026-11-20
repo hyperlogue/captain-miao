@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-20
+
+Thanks to @bwets for reporting the Distrobox launch issue and suggesting a wrapper ([#11](https://github.com/hyperlogue/captain-miao/issues/11)).
+
+### New
+
+- **Session management** gains an experimental [Tower](https://github.com/hyperlogue/tower) backend for local and SSH sessions. In the next release, we plan to move all session management and monitoring to this backend.
+- **Development containers** can use `launcher.local_wrapper` for direct-local launches, resumes, and restarts, with `local_wrapper_passthrough_env` forwarding selected dashboard variables such as `CONTAINER_ID`.
+- **Localhost work tabs** can run a configured command when you press `w`, such as opening a shell inside a development container.
+- **Directory picker** opens with the selected session’s directory, agent, and host preselected when you press `O`.
+- **Session restart** works in any status for sessions with a saved conversation ID, individually with `Space e` or in bulk with `Space E`.
+
+### Fixed
+
+- **Git sync status** checks the configured upstream while the detail panel is open and shows a check mark only after a recent successful check.
+
 ## [0.17.1] - 2026-11-13
 
 Thanks to @TomGrozev for fixing omp waiting states
@@ -932,7 +948,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/hyperlogue/captain-miao/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/hyperlogue/captain-miao/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/hyperlogue/captain-miao/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/hyperlogue/captain-miao/compare/v0.15.0...v0.16.0
