@@ -91,8 +91,8 @@ use super::applescript::{
     shell_quote,
 };
 use super::{
-    Capabilities, SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget,
-    Terminal, WindowId, tail_lines, wrap_env,
+    Capabilities, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
+    tail_lines,
 };
 
 // =============================================================================
@@ -343,7 +343,7 @@ fn parse_snapshot(out: &str) -> Vec<Tab> {
 /// - **the title**, as an OSC 0 escape, because both scripted setters are broken
 ///   (module doc). `printf`'s format is a fixed literal and the title is an
 ///   *argument*, so a title containing `%s` can't reformat anything.
-/// - **`PATH`**, via the shared [`wrap_env`] — the same fix zellij and tmux
+/// - **`PATH`**, via the shared [`super::wrap_env`] — the same fix zellij and tmux
 ///   apply for the same reason, that the spawning server's environment is not
 ///   the dashboard's.
 ///
@@ -362,21 +362,23 @@ fn spawn_payload(spec: &SpawnSpec) -> String {
             shell_quote(title)
         ));
     }
-    let argv = match &spec.command {
-        SpawnCommand::Exec(argv) if !argv.is_empty() => {
-            wrap_env(argv, std::env::var("PATH").ok().as_deref())
-        }
-        // `SpawnCommand::Shell` and a degenerate empty argv both mean "the
-        // user's shell". iTerm2's own default would be the profile's command,
-        // but taking that would cost the cd and the title above — so the shell
-        // is named explicitly, from the dashboard's own environment, the way its
-        // `PATH` is. `-l` because a terminal window is a login shell everywhere
-        // else.
-        _ => vec![
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-            "-l".to_string(),
-        ],
-    };
+    let argv = spec
+        .command
+        .argv()
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| {
+            super::wrap_env(
+                argv,
+                spec.command
+                    .forwarded_path(std::env::var("PATH").ok().as_deref()),
+            )
+        })
+        .unwrap_or_else(|| {
+            vec![
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+                "-l".to_string(),
+            ]
+        });
     let cmd = argv
         .iter()
         .map(|a| shell_quote(a))
@@ -662,6 +664,7 @@ impl Terminal for ItermTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::SpawnCommand;
 
     fn spec(command: SpawnCommand) -> SpawnSpec {
         SpawnSpec {

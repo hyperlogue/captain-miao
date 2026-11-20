@@ -122,8 +122,12 @@ impl HostEditState {
         let Some(row) = self.rows.get(self.cursor) else {
             return;
         };
-        let focus = if row.is_local {
-            HostField::CodexMode
+        let focus = if row.is_local && !focus.visible_for(row) {
+            if row.codex.is_some() {
+                HostField::CodexMode
+            } else {
+                HostField::ShellCommand
+            }
         } else {
             focus
         };
@@ -235,6 +239,11 @@ pub(crate) struct HostRow {
 }
 
 impl HostRow {
+    pub(in crate::app) fn work_tab_command(&self) -> Option<String> {
+        let command = self.shell_command.text();
+        (!command.trim().is_empty()).then(|| command.to_owned())
+    }
+
     /// Localhost is synthetic; incomplete rows and the reserved local label
     /// never become remote connection records.
     pub(in crate::app) fn config(&self) -> Option<hosts::HostConfig> {
@@ -256,8 +265,7 @@ impl HostRow {
             disabled: self.disabled,
             clipboard: self.clipboard,
             options: hosts::split_options(self.options.text()),
-            shell_command: (!self.shell_command.text().trim().is_empty())
-                .then(|| self.shell_command.text().to_string()),
+            shell_command: self.work_tab_command(),
             forwards: self.forwards.clone(),
         };
         config.migrate_forwards();
@@ -332,7 +340,8 @@ impl HostField {
     fn visible_for(self, row: &HostRow) -> bool {
         match self {
             Self::Forwards => !row.is_local && !row.is_socket && row.config().is_some(),
-            Self::Options | Self::ShellCommand => !row.is_local && !row.is_socket,
+            Self::ShellCommand => !row.is_socket,
+            Self::Options => !row.is_local && !row.is_socket,
             Self::CodexMode => row.codex.is_some(),
             Self::CodexEndpoint => row
                 .codex
@@ -916,9 +925,8 @@ impl App {
                 column_width,
             );
         }
-        let mut services = Vec::new();
+        let mut services = heading("Services");
         if !row.is_local {
-            services = heading("Services");
             field(
                 &mut services,
                 "Clipboard",
@@ -938,16 +946,18 @@ impl App {
                         )
                     },
                 );
-                field(
-                    &mut services,
-                    "Work tabs",
-                    if row.shell_command.text().trim().is_empty() {
-                        "Default shell".into()
-                    } else {
-                        row.shell_command.text().to_owned()
-                    },
-                );
             }
+        }
+        if HostField::ShellCommand.visible_for(row) {
+            field(
+                &mut services,
+                "Work tabs",
+                if row.shell_command.text().trim().is_empty() {
+                    "Default shell".into()
+                } else {
+                    row.shell_command.text().to_owned()
+                },
+            );
         }
         if columns {
             for (left, right) in [(transport, codex), (resources, services)] {

@@ -188,6 +188,8 @@ const LEGACY_RESUME_TAB_TITLE: &str = "Claude (resume)";
 #[serde(default)]
 /// `[launcher]` in `config.toml`: how a launched session is run.
 pub struct LauncherConfig {
+    /// Executable invoked by the terminal for direct-local dashboard launches.
+    pub wrapper: Option<String>,
     pub approval_grace_secs: u64,
     pub max_recent_cwds: usize,
     /// How many resumable sessions the `r` picker asks a host for, most-recent
@@ -234,6 +236,7 @@ pub struct LauncherConfig {
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
+            wrapper: None,
             approval_grace_secs: 2,
             max_recent_cwds: 50,
             resume_list_limit: 50,

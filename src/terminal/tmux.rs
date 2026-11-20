@@ -71,8 +71,8 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use super::{
-    Capabilities, SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget,
-    Terminal, WindowId, tail_lines, wrap_env,
+    Capabilities, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
+    tail_lines,
 };
 
 // =============================================================================
@@ -369,13 +369,7 @@ impl Terminal for TmuxTerminal {
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnResult> {
-        let exec: Option<String> = match &spec.command {
-            SpawnCommand::Shell => None,
-            SpawnCommand::Exec(argv) => Some(quote_argv(&wrap_env(
-                argv,
-                std::env::var("PATH").ok().as_deref(),
-            ))),
-        };
+        let exec = spec.command.env_argv().map(|argv| quote_argv(&argv));
 
         match &spec.target {
             SpawnTarget::NewTab => {}
@@ -606,6 +600,7 @@ fn parse_window_name(reply: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::SpawnCommand;
 
     fn terminal() -> TmuxTerminal {
         TmuxTerminal {

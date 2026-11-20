@@ -11,8 +11,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use super::{
-    SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
-    tail_lines,
+    SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId, tail_lines,
 };
 use crate::config;
 
@@ -227,10 +226,10 @@ fn launch_argv(
         }
         SpawnTarget::Floating => unreachable!("rejected above"),
     }
-    if let Some(path) = path {
+    if let Some(path) = spec.command.forwarded_path(path) {
         args.push(format!("--env=PATH={path}"));
     }
-    if let SpawnCommand::Exec(cmd) = &spec.command {
+    if let Some(cmd) = spec.command.argv() {
         for c in cmd {
             args.push(c.clone());
         }
@@ -533,9 +532,10 @@ impl Terminal for KittyTerminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProbeOutcome, SpawnCommand, SpawnSpec, SpawnTarget, TabId, WindowId, diagnose, launch_argv,
-        match_id, work_tab_anchor,
+        ProbeOutcome, SpawnSpec, SpawnTarget, TabId, WindowId, diagnose, launch_argv, match_id,
+        work_tab_anchor,
     };
+    use crate::terminal::SpawnCommand;
 
     fn spec(target: SpawnTarget) -> SpawnSpec {
         SpawnSpec {
@@ -552,6 +552,15 @@ mod tests {
     /// Every configuration failure has to name the config block that fixes it —
     /// the dashboard prints this once and exits, so a message that only says
     /// "remote control failed" strands the user.
+    #[test]
+    fn terminal_host_command_uses_kittys_path() {
+        let mut launch = spec(SpawnTarget::NewTab);
+        launch.command = SpawnCommand::TerminalExec(vec!["/host/wrapper script".into()]);
+        let args = launch_argv(&launch, None, None, Some("/container/bin"), None).unwrap();
+        assert!(!args.iter().any(|arg| arg.starts_with("--env=PATH=")));
+        assert_eq!(args.last().unwrap(), "/host/wrapper script");
+    }
+
     #[test]
     fn diagnosis_carries_the_setup_fix() {
         for outcome in [

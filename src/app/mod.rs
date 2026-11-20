@@ -2932,6 +2932,12 @@ impl App {
             HostRow {
                 is_local: true,
                 label: picker::TextInput::with_text("localhost"),
+                shell_command: picker::TextInput::with_text(
+                    self.extra_prefs
+                        .local_shell_command
+                        .clone()
+                        .unwrap_or_default(),
+                ),
                 ..HostRow::default()
             },
         );
@@ -3055,6 +3061,11 @@ impl App {
             })
             .collect();
         self.extra_prefs.host_order = Some(state.host_order());
+        self.extra_prefs.local_shell_command = state
+            .rows
+            .iter()
+            .find(|row| row.is_local)
+            .and_then(HostRow::work_tab_command);
         self.save_overrides();
         hosts::save_hosts(&configs);
         self.reconcile_backends_from(&configs, fresh);

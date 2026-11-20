@@ -3229,17 +3229,24 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         arm_settle_reload(&mut settle_reload_at);
                     }
                     Action::OpenShellTab { host, cwd } => {
+                        let shell_command = if app
+                            .backends
+                            .first()
+                            .is_some_and(|local| local.host_id() == host)
+                        {
+                            app.extra_prefs.local_shell_command.as_deref()
+                        } else {
+                            app.host_shell_commands.get(&host).map(String::as_str)
+                        };
                         let plan = app
                             .backend_for(&host)
                             .ok_or_else(|| anyhow::anyhow!("unknown host {}", host.0))
-                            .and_then(|b| {
-                                b.shell_plan(
-                                    &cwd,
-                                    app.host_shell_commands.get(&host).map(String::as_str),
-                                )
-                            });
+                            .and_then(|backend| backend.shell_plan(&cwd, shell_command));
                         let (command, spawn_cwd) = match plan {
-                            Ok(ShellPlan::InProcess { cwd }) => (SpawnCommand::Shell, cwd),
+                            Ok(ShellPlan::Local { cwd, argv }) => (
+                                argv.map_or(SpawnCommand::Shell, SpawnCommand::TerminalExec),
+                                cwd,
+                            ),
                             Ok(ShellPlan::Spawn { argv }) => {
                                 (SpawnCommand::Exec(argv), app.home_dir.clone())
                             }

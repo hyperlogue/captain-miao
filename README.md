@@ -200,6 +200,36 @@ To detach instead, set `[remote] on_window_close = "detach"` in `~/.config/capta
   The server streams status updates over SSH. If the network drops, the agent
   continues running. Press `Enter` on the session to reconnect.
 
+### Launching inside a development container
+
+When the dashboard runs inside a container and the terminal runs on the host,
+set an executable wrapper in `config.toml` for direct-local session launches,
+resumes, and restarts. Choose a script path and project directory that the
+terminal host can access.
+
+```toml
+[launcher]
+wrapper = "~/.local/bin/miao-in-dev"
+```
+
+For a Distrobox named `dev`, make that script executable with
+`chmod +x ~/.local/bin/miao-in-dev` and give it this content:
+
+```sh
+#!/bin/sh
+exec distrobox enter dev -- "$MIAO_LAUNCHER" "$@"
+```
+
+The wrapper inherits the terminal host’s `PATH`. `MIAO_LAUNCHER` names the
+dashboard’s executable inside the container. The arguments begin with `launch`
+and include the agent, project directory, and any session options.
+
+To enter the same box in a work tab, edit **localhost → Work tab command** in
+the hosts panel and enter `distrobox enter dev`. Pressing `w` opens the tab in
+the project directory. As on SSH hosts, the command receives `MIAO_WORKDIR`
+and the stable `MIAO_WORKSPACE` name. Success closes the tab, and failure
+opens a login shell. Clear the field to use the default shell.
+
 ### Tower backend (experimental)
 
 Set `CAPTAIN_MIAO_TOWER=1` before starting `miao` to run local sessions on

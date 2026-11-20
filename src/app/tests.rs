@@ -8974,6 +8974,11 @@ fn host_order_survives_rename_and_removing_the_default_promotes_the_next_row() {
 fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     use cm_core::agents::codex::{CodexConfig, CodexMode};
     let mut d = TestDashboard::new(120, 30);
+    let dir = tempfile::tempdir().unwrap();
+    d.app.dashboard_state = super::dashboard_state::DashboardState::new(
+        dir.path().join("dashboard-overrides.json"),
+        env!("CARGO_PKG_VERSION"),
+    );
     d.app.open_host_edit();
     let panel = d.app.host_edit.as_mut().unwrap();
     assert!(panel.rows[0].is_local);
@@ -8999,13 +9004,16 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     let rendered = d.render();
     assert!(rendered.contains("Codex connection [native]"));
     assert!(!rendered.contains("Codex endpoint"));
-    for key in [KeyCode::Tab, KeyCode::BackTab] {
-        d.press(key);
-        assert_eq!(
-            d.app.host_edit.as_ref().unwrap().focus(),
-            Some(super::HostField::CodexMode)
-        );
-    }
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::ShellCommand)
+    );
+    d.press(KeyCode::BackTab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(super::HostField::CodexMode)
+    );
     d.press(KeyCode::Char(' '));
     assert!(d.render().contains("Codex endpoint"));
     d.press(KeyCode::Esc);
@@ -9027,13 +9035,24 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
-        Some(super::HostField::CodexMode)
+        Some(super::HostField::ShellCommand)
     );
+    for ch in "distrobox enter dev".chars() {
+        d.press(KeyCode::Char(ch));
+    }
     let Some(Action::ConfigureCodex { host, config }) = d.press(KeyCode::Enter) else {
         panic!("expected host setting action")
     };
     assert_eq!(host, crate::state::HostId::local());
     assert_eq!(config.mode, CodexMode::AppServer);
+    d.app.extra_prefs = d.app.dashboard_state.load().unwrap().prefs;
+    d.app.open_host_edit_from(vec![]);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[0]
+            .shell_command
+            .text(),
+        "distrobox enter dev"
+    );
     assert_eq!(config.endpoint, "unix://");
     assert!(
         !super::hosts::load_hosts()

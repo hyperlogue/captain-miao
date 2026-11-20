@@ -50,8 +50,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use super::{
-    SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
-    tail_lines, wrap_env,
+    SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId, tail_lines,
 };
 
 // =============================================================================
@@ -411,10 +410,7 @@ impl Terminal for ZellijTerminal {
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnResult> {
-        let exec: Option<Vec<String>> = match &spec.command {
-            SpawnCommand::Shell => None,
-            SpawnCommand::Exec(argv) => Some(wrap_env(argv, std::env::var("PATH").ok().as_deref())),
-        };
+        let exec = spec.command.env_argv();
 
         let result = match &spec.target {
             SpawnTarget::NewTab => {
@@ -594,6 +590,7 @@ impl Terminal for ZellijTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::SpawnCommand;
 
     /// Trimmed from a real `zellij action list-tabs -a -j` on 0.44.3.
     const LIST_TABS: &str = r#"[

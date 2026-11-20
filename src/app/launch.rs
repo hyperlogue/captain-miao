@@ -38,27 +38,45 @@ pub(super) struct WindowLaunch {
 
 impl WindowLaunch {
     pub fn prepare(&self, plan: LaunchPlan) -> (String, SpawnSpec) {
-        let mut argv = plan.argv().to_vec();
-        let (token, cwd) = match plan {
-            LaunchPlan::SpawnLocal { .. } => {
+        self.prepare_with_wrapper(plan, crate::config::get().launcher.wrapper.as_deref())
+    }
+
+    fn prepare_with_wrapper(&self, plan: LaunchPlan, wrapper: Option<&str>) -> (String, SpawnSpec) {
+        let (token, cwd, command) = match plan {
+            LaunchPlan::SpawnLocal { mut argv } => {
                 argv.extend(["--launch-id".into(), self.local_token.clone()]);
+                let command = if let Some(wrapper) = wrapper.filter(|w| !w.trim().is_empty()) {
+                    let launcher = format!("MIAO_LAUNCHER={}", argv[0]);
+                    argv.splice(
+                        ..1,
+                        [
+                            "/usr/bin/env".into(),
+                            launcher,
+                            cm_core::paths::expand_home(wrapper, &self.home),
+                        ],
+                    );
+                    SpawnCommand::TerminalExec(argv)
+                } else {
+                    SpawnCommand::Exec(argv)
+                };
                 (
                     self.local_token.clone(),
                     cm_core::paths::expand_home(&self.cwd, &self.home),
+                    command,
                 )
             }
-            LaunchPlan::AttachRemote { session_name, .. } => {
+            LaunchPlan::AttachRemote { session_name, argv } => {
                 // The local attach window starts at home; the remote cwd is
                 // interpreted only by its host. Use the same exit reporting
                 // and held-error wrapper as attaching an existing session.
                 let exe = crate::backend::reporter_exe();
-                argv = crate::backend::report_on_exit_argv(
+                let argv = crate::backend::report_on_exit_argv(
                     argv,
                     exe.as_deref(),
                     &self.host.0,
                     &session_name,
                 );
-                (session_name, self.home.clone())
+                (session_name, self.home.clone(), SpawnCommand::Exec(argv))
             }
         };
         (
@@ -66,7 +84,7 @@ impl WindowLaunch {
             SpawnSpec {
                 cwd,
                 target: self.target.clone(),
-                command: SpawnCommand::Exec(argv),
+                command,
                 title: Some(self.title.clone()),
                 // The launcher/wrapper holds failures itself. Terminal hold
                 // can leave an untracked local shell after an SSH disconnect.
@@ -760,7 +778,7 @@ mod tests {
     #[test]
     fn local_and_pooled_window_plans_preserve_launch_and_attach_contracts() {
         let launch = request("remote", "L1").window;
-        let (token, spec) = launch.prepare(plan("pool-a"));
+        let (token, spec) = launch.prepare_with_wrapper(plan("pool-a"), Some("/bin/wrapper"));
         assert_eq!(token, "pool-a");
         assert_eq!(spec.cwd, "/work/local");
         assert!(!spec.hold && !spec.take_focus && spec.stack);
@@ -787,5 +805,35 @@ mod tests {
             panic!("expected exec")
         };
         assert_eq!(&argv[argv.len() - 2..], ["--launch-id", "L1"]);
+
+        let plan = LaunchPlan::SpawnLocal {
+            argv: vec![
+                "/container/bin/miao".into(),
+                "launch".into(),
+                "codex".into(),
+                "/project with spaces".into(),
+                "--resume".into(),
+                "quoted '$id'".into(),
+            ],
+        };
+        let (_, spec) = launch.prepare_with_wrapper(plan, Some("~/my scripts/enter"));
+        let SpawnCommand::TerminalExec(argv) = spec.command else {
+            panic!("expected terminal PATH")
+        };
+        assert_eq!(
+            argv,
+            [
+                "/usr/bin/env",
+                "MIAO_LAUNCHER=/container/bin/miao",
+                "/work/local/my scripts/enter",
+                "launch",
+                "codex",
+                "/project with spaces",
+                "--resume",
+                "quoted '$id'",
+                "--launch-id",
+                "L1"
+            ]
+        );
     }
 }

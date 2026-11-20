@@ -126,6 +126,33 @@ pub enum SpawnCommand {
     Shell,
     /// An explicit argv.
     Exec(Vec<String>),
+    /// Resolve commands with the terminal host's PATH (e.g. a container wrapper).
+    TerminalExec(Vec<String>),
+}
+
+impl SpawnCommand {
+    fn argv(&self) -> Option<&[String]> {
+        match self {
+            Self::Shell => None,
+            Self::Exec(argv) | Self::TerminalExec(argv) => Some(argv),
+        }
+    }
+
+    fn forwarded_path<'a>(&self, dashboard_path: Option<&'a str>) -> Option<&'a str> {
+        match self {
+            Self::TerminalExec(_) => None,
+            _ => dashboard_path,
+        }
+    }
+
+    fn env_argv(&self) -> Option<Vec<String>> {
+        self.argv().map(|argv| {
+            wrap_env(
+                argv,
+                self.forwarded_path(std::env::var("PATH").ok().as_deref()),
+            )
+        })
+    }
 }
 
 /// Destination tab for [`move_window_to_tab`](Terminal::move_window_to_tab).
@@ -472,8 +499,7 @@ fn tail_lines(s: &str, n: usize) -> &str {
 /// a pane command inherits the **server**'s environment (whatever shell started
 /// zellij, or a tmux server that may predate this shell by days), not the
 /// caller's, so a bare `miao …` argv may not resolve. `/usr/bin/env` is
-/// POSIX-placed and needs no PATH itself. Kitty doesn't need it — it spawns from
-/// the process that asked.
+/// POSIX-placed and needs no PATH itself. Kitty passes the environment via launch options.
 fn wrap_env(argv: &[String], path: Option<&str>) -> Vec<String> {
     let Some(path) = path else {
         return argv.to_vec();

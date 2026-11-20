@@ -100,8 +100,7 @@ use super::applescript::{
     shell_quote,
 };
 use super::{
-    Capabilities, SpawnCommand, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget,
-    Terminal, WindowId,
+    Capabilities, SpawnResult, SpawnSpec, SpawnTarget, Tab, TabId, TabTarget, Terminal, WindowId,
 };
 
 // =============================================================================
@@ -494,7 +493,7 @@ fn spawn_config_script(spec: &SpawnSpec) -> String {
             applescript_string(&spec.cwd)
         ));
     }
-    if let SpawnCommand::Exec(argv) = &spec.command
+    if let Some(argv) = spec.command.argv()
         && !argv.is_empty()
     {
         let joined = argv
@@ -515,7 +514,10 @@ fn spawn_config_script(spec: &SpawnSpec) -> String {
     // handed the GUI — not the dashboard's. So a bare `miao …` argv may not
     // resolve, the same failure both multiplexer backends fix with
     // `/usr/bin/env PATH=…`; here the configuration carries it natively.
-    if let Ok(path) = std::env::var("PATH") {
+    if let Some(path) = spec
+        .command
+        .forwarded_path(std::env::var("PATH").ok().as_deref())
+    {
         s.push_str(&format!(
             "  set environment variables of cfg to {{{}}}\n",
             applescript_string(&format!("PATH={path}"))
@@ -747,6 +749,7 @@ impl Terminal for GhosttyTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::SpawnCommand;
 
     #[test]
     fn ids_of_every_shape_ghostty_mints_are_accepted() {

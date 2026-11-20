@@ -870,9 +870,11 @@ pub(crate) struct BackendCaps {
 
 /// How the client opens a shell on a host for the `w` work tab.
 pub(crate) enum ShellPlan {
-    /// Run the user's own shell locally in `cwd` (the terminal backend does it;
-    /// there is no argv).
-    InProcess { cwd: String },
+    /// Open a terminal in the selected local directory, optionally running a command.
+    Local {
+        cwd: String,
+        argv: Option<Vec<String>>,
+    },
     /// Spawn this argv — an `ssh -t <target>` that cds into the host's cwd.
     Spawn { argv: Vec<String> },
 }
@@ -1446,19 +1448,15 @@ impl Backend {
     }
 
     /// How to open an interactive login shell on this host in `cwd` (the `w`
-    /// work tab): in process for this machine, over ssh for a remote. An SSH
-    /// host may run a configured command in an interactive login shell instead.
+    /// work tab): locally for this machine, over ssh for a remote. The optional
+    /// work-tab command runs in an interactive login shell.
     pub(crate) fn shell_plan(
         &self,
         cwd: &str,
         shell_command: Option<&str>,
     ) -> anyhow::Result<ShellPlan> {
         match self {
-            Backend::Local(h) => Ok(ShellPlan::InProcess {
-                // The row's cwd is host-canonical; a local chdir needs the real
-                // path, and this backend's own home is the one to expand it by.
-                cwd: cm_core::paths::expand_home(cwd, h.inner.home()),
-            }),
+            Backend::Local(h) => Ok(local_shell_plan(cwd, h.inner.home(), shell_command)),
             Backend::Remote(b) => match b.attach_target.as_deref() {
                 Some(target) => Ok(ShellPlan::Spawn {
                     argv: remote_shell_argv(target, &b.ssh_options, cwd, shell_command),
@@ -1467,9 +1465,11 @@ impl Backend {
                 // shell is the ordinary local one. `$HOME` never crosses the
                 // wire, so the expansion uses *our* home — correct precisely
                 // because this transport is local-only by contract.
-                None if b.transport_is_local => Ok(ShellPlan::InProcess {
-                    cwd: cm_core::paths::expand_home(cwd, &cm_core::paths::host_home()),
-                }),
+                None if b.transport_is_local => Ok(local_shell_plan(
+                    cwd,
+                    &cm_core::paths::host_home(),
+                    shell_command,
+                )),
                 None => anyhow::bail!(
                     "cannot open a shell on {}: it is reached over a socket with no ssh target",
                     b.host.0
@@ -2739,6 +2739,34 @@ fn resolve_local_attach_exe<'a>(
     None
 }
 
+const WORK_TAB_SCRIPT: &str = concat!(
+    "export MIAO_WORKDIR=\"$PWD\" MIAO_WORKSPACE=\"$2\"; ",
+    "\"${SHELL:-/bin/sh}\" -l -i -c \"$1\"; ",
+    "status=$?; ",
+    "if [ \"$status\" -eq 0 ]; then exit 0; fi; ",
+    "echo \"Work tab command exited with status $status\" >&2; ",
+    "exec \"${SHELL:-/bin/sh}\" -l"
+);
+
+fn local_shell_plan(cwd: &str, home: &str, command: Option<&str>) -> ShellPlan {
+    let argv = command
+        .filter(|command| !command.trim().is_empty())
+        .map(|command| {
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                WORK_TAB_SCRIPT.into(),
+                "miao-work-tab".into(),
+                command.into(),
+                work_tab_workspace_name(cwd),
+            ]
+        });
+    ShellPlan::Local {
+        cwd: cm_core::paths::expand_home(cwd, home),
+        argv,
+    }
+}
+
 /// The argv for a window that opens an interactive login shell on a remote host
 /// in `cwd`, over an independent ssh connection (the `w` work tab). Unlike
 /// [`attach_argv`], it follows the user's agent forwarding configuration.
@@ -2775,18 +2803,10 @@ fn remote_shell_argv(
 ) -> Vec<String> {
     let shell_command = shell_command.filter(|command| !command.trim().is_empty());
     let remote_cmd = if let Some(command) = shell_command {
-        let script = concat!(
-            "export MIAO_WORKDIR=\"$PWD\" MIAO_WORKSPACE=\"$2\"; ",
-            "\"${SHELL:-/bin/sh}\" -l -i -c \"$1\"; ",
-            "status=$?; ",
-            "if [ \"$status\" -eq 0 ]; then exit 0; fi; ",
-            "echo \"Work tab command exited with status $status\" >&2; ",
-            "exec \"${SHELL:-/bin/sh}\" -l"
-        );
         let script = if cwd.is_empty() {
-            script.to_string()
+            WORK_TAB_SCRIPT.to_string()
         } else {
-            format!("cd \"$0\" || exit; {script}")
+            format!("cd \"$0\" || exit; {WORK_TAB_SCRIPT}")
         };
         format!(
             "{} {} {} {}",
@@ -4743,6 +4763,42 @@ mod tests {
             ssh_tail(&argv),
             ["box", "/bin/sh -c 'exec \"${SHELL:-/bin/sh}\" -l'"]
         );
+    }
+
+    #[test]
+    fn local_work_tab_runs_in_the_selected_directory_with_workspace_context() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("two words");
+        std::fs::create_dir(&project).unwrap();
+        let home = home.path().to_str().unwrap();
+        let path = "~/two words";
+        let command = r#"printf '%s\n' "$MIAO_WORKDIR" "$MIAO_WORKSPACE""#;
+        let ShellPlan::Local {
+            cwd,
+            argv: Some(argv),
+        } = local_shell_plan(path, home, Some(command))
+        else {
+            panic!("expected local command")
+        };
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .env("SHELL", "/bin/sh")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim_end(),
+            format!(
+                "{}\n{}",
+                project.canonicalize().unwrap().display(),
+                work_tab_workspace_name(path)
+            )
+        );
+        assert!(matches!(
+            local_shell_plan(path, home, Some("  ")),
+            ShellPlan::Local { argv: None, .. }
+        ));
     }
 
     #[test]

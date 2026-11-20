@@ -178,6 +178,8 @@ pub(crate) struct PrefsOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_order: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_shell_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_warning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_critical_tokens: Option<u64>,
@@ -215,6 +217,7 @@ impl PrefsOverrides {
             && self.kitty_rc_password.is_none()
             && self.agents.is_none()
             && self.host_order.is_none()
+            && self.local_shell_command.is_none()
             && self.context_warning_tokens.is_none()
             && self.context_critical_tokens.is_none()
             && self.preview_auto_refresh_secs.is_none()
