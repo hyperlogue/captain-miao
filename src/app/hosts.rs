@@ -73,6 +73,9 @@ pub(super) struct HostConfig {
     /// dies with the connection exactly like a user-typed forward.
     #[serde(default)]
     pub clipboard: bool,
+    /// Use Tower for new SSH sessions when the dashboard enables the integration.
+    #[serde(default)]
+    pub tower: bool,
 }
 
 impl HostConfig {

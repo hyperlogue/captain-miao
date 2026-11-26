@@ -331,6 +331,7 @@ mod tests {
                 options,
                 forwards: vec![],
                 clipboard: false,
+                tower: false,
             },
             HostId("git-test".into()),
         );

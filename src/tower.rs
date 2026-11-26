@@ -29,7 +29,7 @@ use cm_core::agents::codex::CodexMode;
 use cm_core::terminal::WindowId;
 
 /// Set to anything but empty or `0` to run local sessions on Tower.
-pub(crate) const FLAG: &str = "CAPTAIN_MIAO_TOWER";
+pub(crate) const FLAG: &str = "TOWER_INTEGRATION";
 
 /// Marks a `miao launch` argv for Tower. A window does not inherit the
 /// dashboard's environment, so the choice travels in the command.
@@ -44,7 +44,9 @@ pub(crate) const PINNED: &str = "pinned";
 pub(crate) const FOLLOW_UP: &str = "follow-up";
 
 pub(crate) fn enabled() -> bool {
-    std::env::var(FLAG).is_ok_and(|value| !value.is_empty() && value != "0")
+    std::env::var(FLAG)
+        .or_else(|_| std::env::var("CAPTAIN_MIAO_TOWER"))
+        .is_ok_and(|value| !value.is_empty() && value != "0")
 }
 
 /// Whether a `miao launch` argv asks for Tower, by flag or by argument.

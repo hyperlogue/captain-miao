@@ -237,7 +237,7 @@ opens a login shell. Clear the field to use the default shell.
 
 ### Tower backend (experimental)
 
-Set `CAPTAIN_MIAO_TOWER=1` before starting `miao` to run local sessions on
+Set `TOWER_INTEGRATION=1` (or the older `CAPTAIN_MIAO_TOWER=1`) before starting `miao` to run local sessions on
 [Tower](https://github.com/hyperlogue/tower)'s launcher instead of the built-in
 one. New and restarted local sessions then start on Tower.
 Sessions started earlier keep running and show `↻` after their status; restart
@@ -249,12 +249,15 @@ first prompt. This display convention does not confirm startup has finished.
 Other Tower `unknown` statuses show **Unknown**; **Starting** is reserved for
 Tower's explicit startup status.
 
-On SSH hosts, new sessions run under the Tower daemon on the host. With
+SSH hosts default to the built-in launcher. To use Tower on an SSH host, edit
+that host in the hosts panel, toggle **Tower integration** with Space, and
+press Enter to save. With the environment flag on, new and restarted sessions
+on that host use its Tower daemon. With
 `[launcher] pooled = true`, this machine's new sessions also run under its own
 Tower daemon, so a machine used both as a desktop and as an SSH host shows the
 same Tower sessions to its own dashboard and to remote ones. Embedded Tower
 sessions started without pooling are not listed in pooled mode. A `miao`
-built with `cargo xtask dist --tower` carries Tower and uploads it to each host
+built with `cargo xtask dist --tower` carries Tower and uploads it to each enabled host
 that runs a different build, under `~/.cache/captain-miao/tower/`; otherwise
 install Tower there so `tower-cli` is on the login shell's `PATH`. A deployed
 build wins over the one on `PATH`, and `tower-cli` starts the daemon when

@@ -236,6 +236,7 @@ pub(crate) struct HostRow {
     /// own state — `[off]` is visible in the form, where a list key was only
     /// discoverable from the footer.
     pub(in crate::app) clipboard: bool,
+    pub(in crate::app) tower: bool,
 }
 
 impl HostRow {
@@ -264,6 +265,7 @@ impl HostRow {
             ssh: (!self.is_socket).then(|| target.to_string()),
             disabled: self.disabled,
             clipboard: self.clipboard,
+            tower: self.tower,
             options: hosts::split_options(self.options.text()),
             shell_command: self.work_tab_command(),
             forwards: self.forwards.clone(),
@@ -294,6 +296,7 @@ pub(crate) enum HostField {
     Icon,
     /// A toggle — see [`HostRow::clipboard`].
     Clipboard,
+    Tower,
     CodexMode,
     CodexEndpoint,
     Forwards,
@@ -303,7 +306,7 @@ pub(crate) enum HostField {
 impl HostField {
     /// Form order. All supported fields share one scrolling form, grouped by
     /// purpose; Tab walks them without changing views.
-    const ORDER: [HostField; 9] = [
+    const ORDER: [HostField; 10] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
@@ -313,13 +316,16 @@ impl HostField {
         HostField::Clipboard,
         HostField::Forwards,
         HostField::ShellCommand,
+        HostField::Tower,
     ];
 
     fn section(self) -> HostSection {
         match self {
             Self::Label | Self::Target | Self::Options | Self::Icon => HostSection::Connection,
             Self::CodexMode | Self::CodexEndpoint => HostSection::Codex,
-            Self::Clipboard | Self::Forwards | Self::ShellCommand => HostSection::Services,
+            Self::Tower | Self::Clipboard | Self::Forwards | Self::ShellCommand => {
+                HostSection::Services
+            }
         }
     }
 
@@ -332,6 +338,7 @@ impl HostField {
             Self::Forwards => "Port forwards",
             Self::Icon => "Icon",
             Self::Clipboard => "Clipboard",
+            Self::Tower => "Tower integration",
             Self::CodexMode => "Codex connection",
             Self::CodexEndpoint => "Codex endpoint",
         }
@@ -341,7 +348,7 @@ impl HostField {
         match self {
             Self::Forwards => !row.is_local && !row.is_socket && row.config().is_some(),
             Self::ShellCommand => !row.is_socket,
-            Self::Options => !row.is_local && !row.is_socket,
+            Self::Tower | Self::Options => !row.is_local && !row.is_socket,
             Self::CodexMode => row.codex.is_some(),
             Self::CodexEndpoint => row
                 .codex
@@ -935,6 +942,11 @@ impl App {
             if !row.is_socket {
                 field(
                     &mut services,
+                    "Tower integration",
+                    if row.tower { "On" } else { "Off" }.into(),
+                );
+                field(
+                    &mut services,
                     "Port forwards",
                     if row.forwards.is_empty() {
                         "None configured".into()
@@ -1176,6 +1188,9 @@ impl App {
                             ));
                         }
                         lines
+                    }
+                    HostField::Tower => {
+                        vec![vec![Span::raw(if r.tower { "[on]" } else { "[off]" })]]
                     }
                     HostField::Clipboard => {
                         vec![vec![Span::raw(if r.clipboard { "[on]" } else { "[off]" })]]
@@ -1593,10 +1608,17 @@ impl App {
                 // Toggle fields use Space or arrows; Enter commits the draft
                 // consistently across the whole form.
                 KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                    if focus == HostField::Clipboard && !ctrl && !alt =>
+                    if matches!(focus, HostField::Tower | HostField::Clipboard)
+                        && !ctrl
+                        && !alt =>
                 {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
-                        r.clipboard = !r.clipboard;
+                        let value = if focus == HostField::Tower {
+                            &mut r.tower
+                        } else {
+                            &mut r.clipboard
+                        };
+                        *value = !*value;
                     }
                     return None;
                 }
@@ -1607,7 +1629,10 @@ impl App {
                 // toggle a setting or commit a draft.
                 if matches!(
                     focus,
-                    HostField::Clipboard | HostField::CodexMode | HostField::Forwards
+                    HostField::Tower
+                        | HostField::Clipboard
+                        | HostField::CodexMode
+                        | HostField::Forwards
                 ) {
                     return None;
                 }
@@ -1646,7 +1671,10 @@ impl App {
                 // Nothing to type into: its own keys are handled above, and a key
                 // none of them claim is dropped rather than falling through to a
                 // `TextInput` this field does not have.
-                HostField::Clipboard | HostField::CodexMode | HostField::Forwards => {}
+                HostField::Tower
+                | HostField::Clipboard
+                | HostField::CodexMode
+                | HostField::Forwards => {}
                 HostField::CodexEndpoint => {
                     r.codex_endpoint.handle_key(key);
                 }
@@ -1877,6 +1905,7 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::Forwards => Some("  Enter manage; apply host edits first"),
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Name whose clipboard is offered, as well as the toggle key.
+        HostField::Tower => Some("  Space toggle · requires TOWER_INTEGRATION"),
         HostField::Clipboard => Some("  Space toggle · offer the local clipboard"),
     }
 }

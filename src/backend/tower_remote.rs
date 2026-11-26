@@ -1,10 +1,10 @@
 //! Sessions on a host's Tower daemon, behind [`crate::tower::FLAG`].
 //!
-//! With the flag set, a remote host's new sessions run under the Tower
+//! With the flag set and an SSH host opted in, its new sessions run under the Tower
 //! installed there. Under pooled-localhost (`[launcher] pooled`) this
 //! machine is such a host too: its link runs the same CLI through a local
 //! login shell instead of ssh, so the dashboard here and one reaching this
-//! machine over ssh share one daemon and see each other's sessions. With it unset, sessions an earlier run started there
+//! machine over ssh share one daemon and see each other's sessions. When Tower is disabled for a host, sessions an earlier run started there
 //! stay listed and operable, but no daemon is started and nothing new runs
 //! on Tower. The dashboard drives that host's `tower-cli` over the
 //! host's shared ssh connection: `tower-cli events` streams the daemon's
@@ -58,6 +58,7 @@ enum Via {
 
 /// One host's Tower: its live sessions, and how to reach its CLI.
 pub(crate) struct TowerLink {
+    pub(super) enabled: bool,
     host: HostId,
     via: Via,
     /// Live sessions by Tower id.
@@ -91,6 +92,7 @@ impl TowerLink {
         host: HostId,
         target: &str,
         ssh_options: &[String],
+        enabled: bool,
         dirty: Arc<AtomicBool>,
         log: Arc<ConnLog>,
     ) -> Arc<Self> {
@@ -100,6 +102,7 @@ impl TowerLink {
                 target: target.to_string(),
                 opts: ssh_common_opts(&state::ssh_control_path(target), ssh_options),
             },
+            enabled,
             dirty,
             log,
         )
@@ -107,11 +110,18 @@ impl TowerLink {
 
     /// The link for this machine's own Tower, under pooled-localhost.
     pub(crate) fn local(host: HostId, dirty: Arc<AtomicBool>, log: Arc<ConnLog>) -> Arc<Self> {
-        Self::with(host, Via::Local, dirty, log)
+        Self::with(host, Via::Local, crate::tower::enabled(), dirty, log)
     }
 
-    fn with(host: HostId, via: Via, dirty: Arc<AtomicBool>, log: Arc<ConnLog>) -> Arc<Self> {
+    fn with(
+        host: HostId,
+        via: Via,
+        enabled: bool,
+        dirty: Arc<AtomicBool>,
+        log: Arc<ConnLog>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            enabled,
             host,
             via,
             rows: Mutex::default(),
@@ -162,7 +172,7 @@ impl TowerLink {
 
     /// The argv for a window attached to session `id`.
     pub(crate) fn attach_argv(&self, id: &str) -> Vec<String> {
-        let command = remote_command(&["attach", id]);
+        let command = remote_command(&cli_args(self.enabled, &["attach", id]));
         match &self.via {
             Via::Ssh { target, opts } => {
                 let mut argv = vec!["ssh".to_string(), "-t".to_string()];
@@ -407,8 +417,7 @@ impl TowerLink {
 
     /// A command running the host's CLI with `args`.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command =
-            self.shell_command(remote_command(&cli_args(crate::tower::enabled(), args)));
+        let mut command = self.shell_command(remote_command(&cli_args(self.enabled, args)));
         command.stdin(Stdio::null());
         command
     }
@@ -649,7 +658,7 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
         let started = Instant::now();
         // With the flag unset, a host without Tower or without a running
         // daemon is the normal case, not worth a line in the log.
-        let enabled = crate::tower::enabled();
+        let enabled = this.enabled;
         if enabled {
             this.log
                 .info(format!("following Tower sessions with `{CLI} events`"));
@@ -772,6 +781,7 @@ mod tests {
             HostId("box".into()),
             "box",
             &[],
+            false,
             Arc::default(),
             Arc::default(),
         )
@@ -949,7 +959,10 @@ mod tests {
             .env("PATH", &path)
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "attach\nag-1\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            cli_args(crate::tower::enabled(), &["attach", "ag-1"]).join("\n") + "\n"
+        );
     }
 
     #[test]

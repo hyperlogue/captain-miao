@@ -1378,7 +1378,7 @@ impl Backend {
             Backend::Remote(remote) => {
                 let remote = Arc::clone(remote);
                 Box::pin(async move {
-                    if let Some(tower) = remote.tower.as_ref().filter(|_| crate::tower::enabled()) {
+                    if let Some(tower) = remote.tower.as_ref().filter(|tower| tower.enabled) {
                         return tower.open(spec).await;
                     }
                     let inherit_env = crate::config::get().remote.inherit_env.clone();
@@ -1568,6 +1568,7 @@ pub(crate) enum Transport {
         /// `-R` alongside the user's own forwards. See
         /// [`clipboard_forward`].
         clipboard: bool,
+        tower: bool,
     },
 }
 
@@ -1741,7 +1742,7 @@ pub(crate) struct RemoteBackend {
     /// panel's `l` view. See [`ConnLog`].
     log: Arc<ConnLog>,
     /// The host's Tower, which runs its new sessions while
-    /// [`crate::tower::FLAG`] is set and keeps the ones it runs operable
+    /// [`crate::tower::FLAG`] and the host preference allow it, and keeps its sessions operable
     /// when it is not. Over a socket only this machine's own daemon has one
     /// ([`Self::connect_this_machine`]).
     tower: Option<Arc<tower_remote::TowerLink>>,
@@ -1975,10 +1976,11 @@ impl RemoteBackend {
         // Kept with the flag unset too, so sessions it once started stay
         // listed and operable; the link then never starts a daemon.
         let tower = match transport {
-            Transport::Ssh { target, .. } => Some(tower_remote::TowerLink::new(
+            Transport::Ssh { target, tower, .. } => Some(tower_remote::TowerLink::new(
                 host.clone(),
                 target,
                 &ssh_options,
+                *tower && crate::tower::enabled(),
                 dirty.clone(),
                 log.clone(),
             )),
@@ -2140,7 +2142,7 @@ impl RemoteBackend {
     /// is done to them.
     fn list_sessions(&self) -> Vec<LauncherState> {
         let mut rows = self.all_rows();
-        let enabled = crate::tower::enabled();
+        let enabled = self.tower.as_ref().is_some_and(|tower| tower.enabled);
         for row in &mut rows {
             let on_tower = self
                 .tower
@@ -2348,7 +2350,7 @@ impl RemoteBackend {
 
     #[cfg(test)]
     fn open_session(&self, spec: &OpenSpec) -> anyhow::Result<LaunchPlan> {
-        if let Some(tower) = self.tower.as_ref().filter(|_| crate::tower::enabled()) {
+        if let Some(tower) = self.tower.as_ref().filter(|tower| tower.enabled) {
             return tokio::runtime::Handle::current().block_on(tower.open(spec.clone()));
         }
         let spec = spec.clone();
@@ -4150,6 +4152,39 @@ mod tests {
         assert!(!backend.awaiting_sessions());
         // This machine reads its state files synchronously; it is never loading.
         assert!(!Backend::local().awaiting_sessions());
+    }
+
+    #[test]
+    fn tower_selection_requires_remote_opt_in_and_defaults_to_local() {
+        let host = HostId("example".into());
+        let socket = Transport::LocalSocket(PathBuf::new());
+        for opt_in in [false, true] {
+            let transport = Transport::Ssh {
+                target: "example".into(),
+                local_sock: PathBuf::new(),
+                options: vec![],
+                forwards: vec![],
+                clipboard: false,
+                tower: opt_in,
+            };
+            let (backend, _, _) = RemoteBackend::build(&transport, host.clone());
+            let link = backend.tower.as_ref().unwrap();
+            assert_eq!(link.enabled, crate::tower::enabled() && opt_in);
+            assert_eq!(
+                link.attach_argv("id")
+                    .last()
+                    .unwrap()
+                    .contains("--no-start"),
+                !link.enabled
+            );
+        }
+        let (pooled, _, _) = RemoteBackend::build_with(&socket, HostId::local(), true);
+        assert_eq!(
+            pooled.tower.as_ref().unwrap().enabled,
+            crate::tower::enabled()
+        );
+        let (forwarded, _, _) = RemoteBackend::build(&socket, host);
+        assert!(forwarded.tower.is_none());
     }
 
     fn test_state(pid: u32) -> LauncherState {

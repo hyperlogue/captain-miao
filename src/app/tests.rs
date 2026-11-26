@@ -8661,6 +8661,8 @@ fn host_editor_scrolls_long_values_and_keeps_help_visible() {
     );
     assert!(!out.contains("[3 Services]"));
     d.press(KeyCode::Tab);
+    assert!(d.render().contains("Tower integration"));
+    d.press(KeyCode::Tab);
     let out = d.render();
     assert!(
         out.contains("Label") && out.contains("Target"),
@@ -9094,11 +9096,16 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::Tower)
+    );
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::Label)
     );
-    d.press(KeyCode::BackTab);
-    d.press(KeyCode::BackTab);
-    d.press(KeyCode::BackTab);
+    for _ in 0..4 {
+        d.press(KeyCode::BackTab);
+    }
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::CodexMode)
@@ -9300,6 +9307,31 @@ fn work_tab_command_edits_apply_without_replacing_the_connection() {
     };
     let new = App::dialled_identities(&[changed], &Default::default());
     assert_eq!(App::plan_reconcile(&old, &new), vec![Some(0)]);
+}
+
+#[test]
+fn tower_host_editor_round_trips_remote_opt_in() {
+    use super::{HostField, hosts::HostConfig};
+    let mut d = TestDashboard::new(120, 36);
+    let legacy = serde_json::json!({"label": "example", "ssh": "example", "disabled": true});
+    d.app
+        .open_host_edit_from(vec![serde_json::from_value(legacy).unwrap()]);
+    let panel = d.app.host_edit.as_mut().unwrap();
+    panel.cursor = 1;
+    assert!(!panel.rows[1].tower);
+    panel.begin_edit(HostField::Tower);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Esc);
+    let panel = d.app.host_edit.as_mut().unwrap();
+    assert!(!panel.rows[1].tower);
+    panel.begin_edit(HostField::Tower);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Enter);
+    let host = d.app.host_edit.as_ref().unwrap().rows[1].config().unwrap();
+    let saved: HostConfig = serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+    assert!(saved.tower);
+    d.app.open_host_edit_from(vec![saved]);
+    assert!(d.app.host_edit.as_ref().unwrap().rows[1].tower);
 }
 
 #[test]
@@ -9769,10 +9801,14 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
     assert_eq!(focus(&d), Some(Clipboard));
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(ShellCommand));
+    d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(Tower));
     // The form is a ring, so the last field steps to the first.
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(Label));
 
+    d.press(KeyCode::BackTab);
+    assert_eq!(focus(&d), Some(Tower));
     d.press(KeyCode::BackTab);
     assert_eq!(focus(&d), Some(ShellCommand));
     d.press(KeyCode::BackTab);
@@ -12456,6 +12492,7 @@ fn only_a_changed_connection_string_reconnects() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard: false,
+        tower: false,
         shell_command: None,
     };
     let none = HashSet::new();
@@ -12478,6 +12515,7 @@ fn only_a_changed_connection_string_reconnects() {
             options: Vec::new(),
             forwards: Vec::new(),
             clipboard: false,
+            tower: false,
             shell_command: None,
         }])
     );
@@ -12544,6 +12582,7 @@ fn reconciling_hosts_touches_only_the_hosts_that_changed() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard: false,
+        tower: false,
         shell_command: None,
     };
     let none = HashSet::new();
@@ -12592,6 +12631,7 @@ fn the_clipboard_server_runs_only_when_a_host_wants_it() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard,
+        tower: false,
         shell_command: None,
     };
     assert!(!App::any_host_wants_clipboard(&[]));

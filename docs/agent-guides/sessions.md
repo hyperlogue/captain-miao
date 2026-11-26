@@ -71,8 +71,8 @@ Unix socket. The launcher writes session JSON; the dashboard re-reads it on
 
 ## Tower backend
 
-`CAPTAIN_MIAO_TOWER` selects Tower's embedded launcher for this machine's
-sessions and each SSH host's Tower daemon for its sessions. `src/tower.rs`
+`TOWER_INTEGRATION` (formerly `CAPTAIN_MIAO_TOWER`, still accepted) selects
+Tower locally. SSH hosts also require the per-host Tower toggle in `hosts.json`. `src/tower.rs`
 owns the local side and the record-to-row mapping both sides use;
 `src/backend/tower_remote.rs` owns the remote side.
 
