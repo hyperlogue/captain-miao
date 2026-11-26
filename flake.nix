@@ -90,7 +90,9 @@
         # them in — see `nix/server-payloads.nix` for why that is the better trade here.
         src = let
           root = ./.;
-          isAsset = path: lib.hasPrefix "${toString root}/assets/" path;
+          isAsset = path:
+            lib.hasPrefix "${toString root}/assets/" path
+            || lib.hasPrefix "${toString root}/vendor/libshpool/src/daemon/shell_inject/" path;
         in
           lib.cleanSourceWith {
             src = lib.cleanSource root;

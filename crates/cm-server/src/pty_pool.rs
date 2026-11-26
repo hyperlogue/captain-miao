@@ -461,6 +461,10 @@ impl libshpool::SessionSpool for ModeSpool {
         self.0.process(bytes);
     }
 
+    fn window_title(&self) -> Option<&[u8]> {
+        None
+    }
+
     fn restore_buffer(&self) -> Vec<u8> {
         self.0.restore_buffer()
     }
@@ -749,7 +753,9 @@ mod tests {
                 last_connected_at_unix_ms: None,
                 last_disconnected_at_unix_ms: None,
                 status: SessionStatus::Attached,
+                shell_pid: 123,
                 attachments: Vec::new(),
+                window_title: None,
             }],
         };
         let mut buf: Vec<u8> = Vec::new();

@@ -11,3 +11,7 @@ xtask = "run --package xtask --"
 # binaries a private HOME and XDG directories and runs anything else as is.
 [target.'cfg(all())']
 runner = ".cargo/test-runner"
+
+# Keep new registry releases out of dependency resolution for one week.
+[registry]
+global-min-publish-age = "7 days"

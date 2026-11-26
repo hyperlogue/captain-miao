@@ -4,6 +4,18 @@ Use for build scripts, server payloads, packaging, executable installation and
 CI changes. [Crate split](../crate-split.md) owns the architecture; the
 [release skill](../../.claude/skills/release/SKILL.md) owns release execution.
 
+## Dependency updates
+
+Allow seven full days after publication before adopting a dependency.
+Run `nix develop -c cargo update` to apply the registry cooldown from
+`.cargo/config.toml`. For Git dependencies and flake inputs, select revisions
+from upstream history at the cutoff. For nixpkgs, use a published
+`nixos-unstable` channel snapshot. Check transitive flake inputs too.
+After updating Fenix, match `rust-toolchain.toml` to the shell's `rustc --version`.
+Before running the workspace tests with a new Cargo, verify its test executable
+layout still invokes private roots with
+`nix develop -c cargo test -p cm-core --lib --locked roots::tests::tests_run_with_private_roots -- --exact`.
+
 ## Embedded server payloads
 
 - `CM_SERVER_PAYLOAD_MANIFEST` is the only switch for embedding servers.

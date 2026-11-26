@@ -16,7 +16,9 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
-    fs, io, net,
+    fs, io,
+    io::Write,
+    net,
     ops::Add,
     os,
     os::unix::{
@@ -32,7 +34,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use nix::unistd;
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use shpool_protocol::{
     AttachHeader, AttachReplyHeader, AttachStatus, Attachment, ConnectHeader, DetachReply,
@@ -48,8 +49,8 @@ use crate::{
     config::MotdDisplayMode,
     consts,
     daemon::{
-        etc_environment, events, exit_notify::ExitNotifier, hooks, pager, pager::PagerError, shell,
-        shell_inject, show_motd, ttl_reaper,
+        etc_environment, events, exit_notify::ExitNotifier, hooks, pager, pager::PagerError, peer,
+        shell, shell_inject, show_motd, ttl_reaper,
     },
     protocol, test_hooks, tty, user,
 };
@@ -63,6 +64,14 @@ const DEFAULT_PROMPT_PREFIX: &str = "shpool:$SHPOOL_SESSION_NAME ";
 // for the shell->client thread since session message calls are made with the
 // global session table lock held.
 const SESSION_MSG_TIMEOUT: time::Duration = time::Duration::from_millis(500);
+
+// The largest connect header we are willing to read. We have to parse the
+// connect header before we can check the peer's credentials, so the bytes
+// are untrusted and we need to make sure a hostile peer can't make us buffer
+// an unbounded amount of data. Real headers are only a few hundred bytes,
+// but they contain user controlled strings such as the session name and
+// the `--cmd` command line, so we leave lots of headroom.
+const MAX_CONNECT_HEADER_SIZE: u64 = 1024 * 1024;
 
 pub struct Server {
     config: config::Manager,
@@ -206,7 +215,7 @@ impl Server {
 
         let header = parse_connect_header(&mut stream).context("parsing connect header")?;
 
-        let peer_pid = match check_peer(&stream) {
+        let peer_pid = match peer::check(&stream) {
             Ok(peer_pid) => peer_pid,
             Err(err) => {
                 if let ConnectHeader::Attach(_) = header {
@@ -368,10 +377,11 @@ impl Server {
                     }
                 }
 
-                // The child shell has exited, so the shell->client thread should
-                // attempt to read from its stdout and get an error, causing
-                // it to exit. That means we should be safe to join. We use
-                // a separate if statement to avoid holding the shells lock
+                // The child shell has exited, so the shell->client thread
+                // should attempt to read from its stdout and
+                // get an error, causing it to exit. That means
+                // we should be safe to join. We use a separate
+                // if statement to avoid holding the shells lock
                 // while we join the old thread.
                 if let Some(h) = inner.shell_to_client_join_h.take() {
                     h.join()
@@ -379,7 +389,8 @@ impl Server {
                         .context("within shell->client thread after child exit")?;
                 }
             } else {
-                // Client disconnected but shell is still running - set last_disconnected_at
+                // Client disconnected but shell is still running - set
+                // last_disconnected_at
                 {
                     let _s = span!(Level::INFO, "disconnect_lock(shells)").entered();
                     let shells = self.shells.lock();
@@ -434,19 +445,24 @@ impl Server {
                 if let Some(mut inner) = session.inner.try_lock_arc() {
                     let _s = span!(Level::INFO, "aquired_lock(session.inner)", s = header.name)
                         .entered();
-                    // We have an existing session in our table, but the subshell
-                    // proc might have exited in the meantime, for example if the
-                    // user typed `exit` right before the connection dropped there
+                    // We have an existing session in our table, but the
+                    // subshell proc might have exited in
+                    // the meantime, for example if the user
+                    // typed `exit` right before the connection dropped there
                     // could be a zombie entry in our session table. We need to
-                    // re-check whether the subshell has exited before taking this over.
+                    // re-check whether the subshell has exited before taking
+                    // this over.
                     //
-                    // N.B. this is still technically a race, but in practice it does
-                    // not ever cause problems, and there is no real way to avoid some
-                    // sort of race without just always creating a new session when
-                    // a shell exits, which would break `exit` typed at the shell prompt.
+                    // N.B. this is still technically a race, but in practice it
+                    // does not ever cause problems, and
+                    // there is no real way to avoid some
+                    // sort of race without just always creating a new session
+                    // when a shell exits, which would break
+                    // `exit` typed at the shell prompt.
                     match session.child_exit_notifier.wait(Some(time::Duration::from_millis(0))) {
                         None => {
-                            // the channel is still open so the subshell is still running
+                            // the channel is still open so the subshell is
+                            // still running
                             info!("taking over existing session inner");
                             inner.client_stream = Some(stream.try_clone()?);
                             session.lifecycle.record_attached(Attachment {
@@ -465,7 +481,8 @@ impl Server {
                                 );
                             } else {
                                 // Reattach confirmed; the create path won't run
-                                // and clobber the entry, so it's safe to publish.
+                                // and clobber the entry, so it's safe to
+                                // publish.
                                 self.events_bus.publish(&events::Event::SessionAttached);
                                 if let Err(err) = self.hooks.on_reattach(&header.name) {
                                     warn!("reattach hook: {:?}", err);
@@ -485,7 +502,8 @@ impl Server {
                             }
                         }
                         Some(exit_status) => {
-                            // the channel is closed so we know the subshell exited
+                            // the channel is closed so we know the subshell
+                            // exited
                             info!(
                                 "stale inner, (child exited with status {}) clobbering with new subshell",
                                 exit_status
@@ -510,7 +528,8 @@ impl Server {
                     // fallthrough to bidi streaming
                 } else {
                     info!("busy shell session, doing nothing");
-                    // The stream is busy, so we just inform the client and close the stream.
+                    // The stream is busy, so we just inform the client and
+                    // close the stream.
                     write_reply(&mut stream, AttachReplyHeader { status: AttachStatus::Busy })?;
                     stream.shutdown(net::Shutdown::Both).context("closing stream")?;
                     if let Err(err) = self.hooks.on_busy(&header.name) {
@@ -598,7 +617,8 @@ impl Server {
                     .context("locking down permissions for sessions dir")?;
             }
 
-            let _ = fs::remove_file(&symlink); // clean up the link if it exists already
+            let _ = fs::remove_file(&symlink); // clean up the link if it exists
+                                               // already
             os::unix::fs::symlink(ssh_auth_sock, &symlink).context(format!(
                 "could not symlink '{symlink:?}' to point to '{ssh_auth_sock:?}'"
             ))?;
@@ -612,16 +632,30 @@ impl Server {
     #[instrument(skip_all)]
     fn populate_session_env_file(&self, header: &AttachHeader) -> anyhow::Result<()> {
         let session_name = PathBuf::from(&header.name);
-        fs::create_dir_all(self.session_dir(session_name.clone()))
-            .context("creating session dir")?;
+        let session_dir = self.session_dir(session_name.clone());
+        fs::create_dir_all(&session_dir).context("creating session dir")?;
 
         let session_env_file = self.session_env_file(session_name);
         info!("populating {:?}", session_env_file);
-        fs::write(
-            session_env_file,
-            header.local_env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n"),
-        )
-        .context("writing session env")?;
+        let mut tmp_env_file = tempfile::Builder::new()
+            .prefix("shpool_session_env")
+            .tempfile_in(&session_dir)
+            .context("creating tmp env file")?;
+        // When SSH_AUTH_SOCK symlinking is active (the default), the shell's
+        // SSH_AUTH_SOCK points at the stable per-session symlink updated on
+        // each attach; exporting the client's raw socket path into forward.env
+        // would overwrite that symlink on the next prompt and leave a stale
+        // path after a subsequent reattach.
+        let skip_ssh_auth_sock = !self.config.get().nosymlink_ssh_auth_sock.unwrap_or(false);
+        let content = format_forward_env(&header.local_env, skip_ssh_auth_sock);
+        tmp_env_file.write_all(content.as_bytes()).context("writing tmp env file")?;
+        tmp_env_file.persist(&session_env_file).context("persisting env file")?;
+
+        // Remove the stamp file if present so shells with 1-second timestamp
+        // resolution (e.g. bash 3.2 on macOS) reload unconditionally on
+        // reattach without needing a full second to elapse.
+        let stamp_file = format!("{}.stamp", session_env_file.display());
+        let _ = fs::remove_file(stamp_file);
 
         Ok(())
     }
@@ -791,8 +825,9 @@ impl Server {
                 if let Some(s) = shells.get(&session) {
                     s.kill().context("killing shell proc")?;
 
-                    // we don't need to wait since the dedicated reaping thread is active
-                    // even when a tty is not attached
+                    // we don't need to wait since the dedicated reaping thread
+                    // is active even when a tty is not
+                    // attached
                     to_remove.push(session);
                 } else {
                     not_found_sessions.push(session);
@@ -815,38 +850,84 @@ impl Server {
 
     #[instrument(skip_all)]
     fn handle_list(&self, mut stream: UnixStream) -> anyhow::Result<()> {
-        let _s = span!(Level::INFO, "lock(shells)").entered();
-        let shells = self.shells.lock();
-        let sessions: anyhow::Result<Vec<Session>> = shells
-            .iter()
-            .map(|(k, v)| {
-                let status = match v.inner.try_lock() {
-                    Some(_) => SessionStatus::Disconnected,
-                    None => SessionStatus::Attached,
-                };
+        // None if the session's shell->client thread has exited.
+        type Reply = Option<crossbeam_channel::Receiver<shell::SessionMetadata>>;
 
-                let lifecycle_state = v.lifecycle.snapshot();
-                let last_connected_at_unix_ms = lifecycle_state
-                    .last_connected_at
-                    .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
-                    .transpose()?;
-                let last_disconnected_at_unix_ms = lifecycle_state
-                    .last_disconnected_at
-                    .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
-                    .transpose()?;
+        // Ask every session for its metadata up front, so the shell->client
+        // threads work on their answers in parallel. Asking never blocks, so it
+        // is safe under the shells lock.
+        let sessions: anyhow::Result<Vec<(Session, Reply)>> = {
+            let _s = span!(Level::INFO, "lock(shells)").entered();
+            let shells = self.shells.lock();
+            shells
+                .iter()
+                .map(|(session_name, session)| {
+                    let status = match session.inner.try_lock() {
+                        Some(_) => SessionStatus::Disconnected,
+                        None => SessionStatus::Attached,
+                    };
 
-                Ok(Session {
-                    name: k.to_string(),
-                    started_at_unix_ms: v.started_at.duration_since(time::UNIX_EPOCH)?.as_millis()
-                        as i64,
-                    last_connected_at_unix_ms,
-                    last_disconnected_at_unix_ms,
-                    status,
-                    attachments: lifecycle_state.attachment.into_iter().collect(),
+                    let lifecycle_state = session.lifecycle.snapshot();
+                    let last_connected_at_unix_ms = lifecycle_state
+                        .last_connected_at
+                        .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
+                        .transpose()?;
+                    let last_disconnected_at_unix_ms = lifecycle_state
+                        .last_disconnected_at
+                        .map(|t| t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64))
+                        .transpose()?;
+
+                    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+                    let reply = session.fetch_metadata.send(reply_tx).ok().map(|()| reply_rx);
+
+                    Ok((
+                        Session {
+                            name: session_name.to_string(),
+                            started_at_unix_ms: session
+                                .started_at
+                                .duration_since(time::UNIX_EPOCH)?
+                                .as_millis() as i64,
+                            last_connected_at_unix_ms,
+                            last_disconnected_at_unix_ms,
+                            status,
+                            shell_pid: session.child_pid,
+                            attachments: lifecycle_state.attachment.into_iter().collect(),
+                            window_title: None,
+                        },
+                        reply,
+                    ))
                 })
+                .collect()
+        };
+        let sessions = sessions.context("collecting running session metadata")?;
+
+        // The lock is released by now, so we can wait. A busy shell->client
+        // thread (e.g. one building a large restore buffer for a reattach) may
+        // miss the deadline, in which case its session is listed without its
+        // metadata.
+        let deadline = Instant::now() + SESSION_MSG_TIMEOUT;
+        let sessions = sessions
+            .into_iter()
+            .map(|(mut session, reply)| {
+                match reply.map(|reply| reply.recv_deadline(deadline)) {
+                    Some(Ok(shell::SessionMetadata { window_title })) => {
+                        session.window_title = window_title
+                    }
+                    Some(Err(crossbeam_channel::RecvTimeoutError::Timeout)) => {
+                        info!(
+                            "listing {} without metadata, which it did not report in time",
+                            session.name
+                        )
+                    }
+                    None | Some(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => info!(
+                        "listing {} without metadata, since its shell->client thread has exited",
+                        session.name
+                    ),
+                }
+                session
             })
             .collect();
-        let sessions = sessions.context("collecting running session metadata")?;
+
         write_reply(&mut stream, ListReply { sessions })?;
         Ok(())
     }
@@ -1074,12 +1155,13 @@ impl Server {
         // as a handle to the child process, and the pty fd which allows us to
         // do IO on it. The child watcher thread only needs the child pid.
         //
-        // Just cloning the fork and directly calling wait_for_exit() on it would
-        // be simpler, but it would be wrong because then the destructor for the
-        // cloned fork object would close the pty fd earlier than we want as the
-        // child watcher thread exits. This can cause the shell->client thread
-        // to read the wrong file (for example, the config file contents if the
-        // config watcher reloads).
+        // Just cloning the fork and directly calling wait_for_exit() on it
+        // would be simpler, but it would be wrong because then the
+        // destructor for the cloned fork object would close the pty fd
+        // earlier than we want as the child watcher thread exits. This
+        // can cause the shell->client thread to read the wrong file
+        // (for example, the config file contents if the config watcher
+        // reloads).
         let waitable_child_pid = fork.child_pid().ok_or(anyhow!("missing child pid"))?;
         let session_name = header.name.clone();
         let notifiable_child_exit_notifier = Arc::clone(&child_exit_notifier);
@@ -1129,9 +1211,9 @@ impl Server {
             && !does_not_support_sentinels(&shell);
         info!("supports_sentianls={}", supports_sentinels);
 
-        // Inject the prompt prefix, if any. For custom commands, avoid doing this
-        // since we have no idea what the command is so the shell code probably won't
-        // work.
+        // Inject the prompt prefix, if any. For custom commands, avoid doing
+        // this since we have no idea what the command is so the shell
+        // code probably won't work.
         if supports_sentinels {
             info!("injecting prompt prefix");
             let prompt_prefix = self
@@ -1140,11 +1222,13 @@ impl Server {
                 .prompt_prefix
                 .clone()
                 .unwrap_or(String::from(DEFAULT_PROMPT_PREFIX));
+            let session_dir = self.session_dir(&header.name);
             if let Err(err) = shell_inject::maybe_setup(
                 &mut fork,
                 &prompt_prefix,
                 header.start_cmd.as_ref().map(|c| c.as_ref()).unwrap_or(""),
                 &header.name,
+                &session_dir,
             ) {
                 warn!("issue injecting prefix: {:?}", err);
             }
@@ -1165,6 +1249,9 @@ impl Server {
         // We make this buffered to avoid blocking during a broadcast. There is
         // no ack chan so we can afford to buffer a bit.
         let (maybe_switch_tx, maybe_switch_rx) = crossbeam_channel::bounded(10);
+
+        // Unbounded so that sending a metadata request never blocks.
+        let (fetch_metadata_tx, fetch_metadata_rx) = crossbeam_channel::unbounded();
 
         let shell_to_client_ctl = Arc::new(Mutex::new(shell::ShellToClientCtl {
             next_heartbeat_id: std::sync::atomic::AtomicU64::new(0),
@@ -1211,6 +1298,8 @@ impl Server {
                 heartbeat_ack: heartbeat_ack_tx,
                 maybe_switch: maybe_switch_rx,
                 child_exit_notifier: shell_to_client_child_exit_notifier,
+                fetch_metadata: fetch_metadata_rx,
+                events_bus: Arc::clone(&self.events_bus),
             })?);
 
         if let Some(ttl_secs) = header.ttl_secs {
@@ -1227,6 +1316,7 @@ impl Server {
             child_exit_notifier,
             started_at: time::SystemTime::now(),
             lifecycle: shell::SessionLifecycle::default(),
+            fetch_metadata: fetch_metadata_tx,
             inner: Arc::new(Mutex::new(session_inner)),
         })
     }
@@ -1351,6 +1441,34 @@ impl Server {
     }
 }
 
+fn format_forward_env<'a, I>(env_vars: I, skip_ssh_auth_sock: bool) -> String
+where
+    I: IntoIterator<Item = &'a (String, String)>,
+{
+    let mut content = String::new();
+    for (k, v) in env_vars {
+        if skip_ssh_auth_sock && k == "SSH_AUTH_SOCK" {
+            continue;
+        }
+        if is_valid_env_key(k) {
+            content.push_str(&format!("export {k}='{}'\n", v.replace('\'', "'\\''")));
+        } else {
+            warn!("skipping invalid environment variable key: {k}");
+        }
+    }
+    content
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
 // HACK: this is not a good way to detect shells that don't support our
 // sentinel injection approach, but it is better than just hanging when a
 // user tries to start one.
@@ -1360,8 +1478,19 @@ fn does_not_support_sentinels(shell: &str) -> bool {
 
 #[instrument(skip_all)]
 fn parse_connect_header(stream: &mut UnixStream) -> anyhow::Result<ConnectHeader> {
-    let header: ConnectHeader = protocol::decode_from(stream).context("parsing header")?;
-    Ok(header)
+    // Deliberately parse through a `Take` adapter so a malicious peer that
+    // just streams bytes at us hits an early EOF rather than making us
+    // allocate without bound.
+    let mut limited = io::Read::take(&mut *stream, MAX_CONNECT_HEADER_SIZE);
+    match protocol::decode_from(&mut limited) {
+        Ok(header) => Ok(header),
+        // We can only run out of budget if the peer sent us a header that
+        // is too big, so give a more actionable error than the EOF that
+        // the deserializer reports.
+        Err(err) if limited.limit() == 0 => Err(err)
+            .context(format!("connect header exceeded {MAX_CONNECT_HEADER_SIZE} byte limit")),
+        Err(err) => Err(err).context("parsing header"),
+    }
 }
 
 #[instrument(skip_all)]
@@ -1381,98 +1510,6 @@ where
     Ok(())
 }
 
-/// check_peer makes sure that a process dialing in on the shpool control socket
-/// has the same UID as the current user and that both have the same executable
-/// path. Returns the peer's pid, which the kernel captures at connect time and
-/// keeps fixed for the life of the connection.
-#[cfg(target_os = "linux")]
-fn check_peer(sock: &UnixStream) -> anyhow::Result<libc::pid_t> {
-    use nix::sys::socket;
-
-    let peer_creds = socket::getsockopt(sock, socket::sockopt::PeerCredentials)
-        .context("could not get peer creds from socket")?;
-    let peer_uid = unistd::Uid::from_raw(peer_creds.uid());
-    let self_uid = unistd::Uid::current();
-    if peer_uid != self_uid {
-        return Err(anyhow!("shpool prohibits connections across users"));
-    }
-
-    let peer_pid = unistd::Pid::from_raw(peer_creds.pid());
-    let self_pid = unistd::Pid::this();
-    let peer_exe = exe_for_pid(peer_pid).context("could not resolve exe from the pid")?;
-    let self_exe = exe_for_pid(self_pid).context("could not resolve our own exe")?;
-    if peer_exe != self_exe {
-        warn!("attach binary differs from daemon binary");
-    }
-
-    Ok(peer_creds.pid())
-}
-
-#[cfg(target_os = "macos")]
-fn check_peer(sock: &UnixStream) -> anyhow::Result<libc::pid_t> {
-    use std::os::unix::io::AsRawFd;
-
-    let mut peer_uid: libc::uid_t = 0;
-    let mut peer_gid: libc::gid_t = 0;
-    // Safety: getpeereid is standard BSD FFI, all pointers are valid
-    unsafe {
-        if libc::getpeereid(sock.as_raw_fd(), &mut peer_uid, &mut peer_gid) != 0 {
-            return Err(anyhow!(
-                "could not get peer uid from socket: {}",
-                io::Error::last_os_error()
-            ));
-        }
-    }
-    let peer_uid = unistd::Uid::from_raw(peer_uid);
-    let self_uid = unistd::Uid::current();
-    if peer_uid != self_uid {
-        return Err(anyhow!("shpool prohibits connections across users"));
-    }
-
-    let mut peer_pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // Safety: getsockopt is standard POSIX FFI, all pointers and sizes are valid
-    unsafe {
-        if libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            &mut peer_pid as *mut _ as *mut libc::c_void,
-            &mut len,
-        ) != 0
-        {
-            return Err(anyhow!(
-                "could not get peer pid from socket: {}",
-                io::Error::last_os_error()
-            ));
-        }
-    }
-
-    let self_pid = unistd::Pid::this();
-    let peer_exe = exe_for_pid(unistd::Pid::from_raw(peer_pid))
-        .context("could not resolve exe from the pid")?;
-    let self_exe = exe_for_pid(self_pid).context("could not resolve our own exe")?;
-    if peer_exe != self_exe {
-        warn!("attach binary differs from daemon binary");
-    }
-
-    Ok(peer_pid)
-}
-
-#[cfg(target_os = "linux")]
-fn exe_for_pid(pid: unistd::Pid) -> anyhow::Result<PathBuf> {
-    let path = std::fs::read_link(format!("/proc/{pid}/exe"))?;
-    Ok(path)
-}
-
-#[cfg(target_os = "macos")]
-fn exe_for_pid(pid: unistd::Pid) -> anyhow::Result<PathBuf> {
-    use libproc::proc_pid::pidpath;
-    let path = pidpath(pid.as_raw())
-        .map_err(|e| anyhow!("could not get exe path for pid {}: {:?}", pid, e))?;
-    Ok(PathBuf::from(path))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellSelectionError {
     BusyShellSession,
@@ -1486,3 +1523,121 @@ impl std::fmt::Display for ShellSelectionError {
 }
 
 impl std::error::Error for ShellSelectionError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_forward_env_basic() {
+        let vars = vec![
+            (String::from("FOO"), String::from("bar")),
+            (String::from("SPACES"), String::from("hello world")),
+            (String::from("QUOTES"), String::from("don't stop")),
+            (String::from("SPECIAL"), String::from("$(evil) `evil` $VAR")),
+            (String::from("MULTILINE"), String::from("line1\nline2")),
+        ];
+        let res = format_forward_env(&vars, true);
+        assert_eq!(
+            res,
+            "export FOO='bar'\n\
+             export SPACES='hello world'\n\
+             export QUOTES='don'\\''t stop'\n\
+             export SPECIAL='$(evil) `evil` $VAR'\n\
+             export MULTILINE='line1\nline2'\n"
+        );
+    }
+
+    #[test]
+    fn test_format_forward_env_invalid_keys() {
+        let vars = vec![
+            (String::from("GOOD_KEY_1"), String::from("val")),
+            (String::from("_ALSO_GOOD"), String::from("val")),
+            (String::from("1BAD_KEY"), String::from("val")),
+            (String::from("BAD-DASH"), String::from("val")),
+            (String::from("BAD KEY"), String::from("val")),
+            (String::from(""), String::from("val")),
+        ];
+        let res = format_forward_env(&vars, true);
+        assert_eq!(
+            res,
+            "export GOOD_KEY_1='val'\n\
+             export _ALSO_GOOD='val'\n"
+        );
+    }
+
+    #[test]
+    fn test_format_forward_env_ssh_auth_sock() {
+        let vars = vec![
+            (String::from("FOO"), String::from("bar")),
+            (String::from("SSH_AUTH_SOCK"), String::from("/tmp/agent.sock")),
+        ];
+        assert_eq!(format_forward_env(&vars, true), "export FOO='bar'\n");
+        assert_eq!(
+            format_forward_env(&vars, false),
+            "export FOO='bar'\nexport SSH_AUTH_SOCK='/tmp/agent.sock'\n"
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_header_ok() -> anyhow::Result<()> {
+        let (mut client, mut server) = UnixStream::pair()?;
+
+        protocol::encode_to(
+            &ConnectHeader::Attach(AttachHeader {
+                name: String::from("sh1"),
+                ..Default::default()
+            }),
+            &mut client,
+        )?;
+        // Write a second message to make sure that bounding the header parse
+        // does not make us over-read and eat into the rest of the stream.
+        protocol::encode_to(&ConnectHeader::List, &mut client)?;
+
+        assert!(matches!(
+            parse_connect_header(&mut server)?,
+            ConnectHeader::Attach(h) if h.name == "sh1"
+        ));
+        assert!(matches!(parse_connect_header(&mut server)?, ConnectHeader::List));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_connect_header_too_big() -> anyhow::Result<()> {
+        let (mut client, mut server) = UnixStream::pair()?;
+
+        let writer = thread::spawn(move || {
+            // Claim a str of the largest length msgpack allows, then start
+            // streaming the body at the daemon. Without a cap the daemon
+            // would happily buffer all of it.
+            client.write_all(&[0xdb, 0xff, 0xff, 0xff, 0xff])?;
+
+            // Push a good deal more than the cap, but stop well short of the
+            // length we claimed so that the test can't spin forever if the
+            // cap ever regresses. Writes start failing as soon as the header
+            // parse bails out and drops its end of the socket.
+            let chunk = vec![b'A'; consts::BUF_SIZE];
+            let mut written = 0u64;
+            while written < MAX_CONNECT_HEADER_SIZE * 4 {
+                if client.write_all(&chunk).is_err() {
+                    return Ok::<_, io::Error>(written);
+                }
+                written += chunk.len() as u64;
+            }
+            Ok(written)
+        });
+
+        let err = parse_connect_header(&mut server).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeded"), "expected a size limit error: {err:#}");
+        drop(server);
+
+        let written = writer.join().unwrap()?;
+        assert!(
+            written < MAX_CONNECT_HEADER_SIZE * 4,
+            "the daemon should have hung up on us, but it swallowed {written} bytes"
+        );
+
+        Ok(())
+    }
+}

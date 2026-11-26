@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "libshpool"
-version = "0.11.4"
+version = "0.11.7"
 authors = ["Ethan Pailes <pailes@google.com>"]
 build = false
 autolib = false
@@ -66,7 +66,7 @@ version = "1"
 version = "0.2"
 
 [dependencies.libproc]
-version = "0.14.8"
+version = "0.15.0"
 
 [dependencies.log]
 version = "0.4"
@@ -90,7 +90,7 @@ features = [
 ]
 
 [dependencies.notify]
-version = "7"
+version = "8"
 features = ["crossbeam-channel"]
 
 [dependencies.parking_lot]
@@ -113,13 +113,13 @@ version = "1"
 version = "1"
 
 [dependencies.shpool-protocol]
-version = "0.4.2"
+version = "0.4.4"
 
 [dependencies.shpool-vterm]
-version = "0.2.2"
+version = "0.2.8"
 
 [dependencies.shpool_pty]
-version = "0.4.0"
+version = "0.5.0"
 
 [dependencies.shpool_vt100]
 version = "0.1.3"

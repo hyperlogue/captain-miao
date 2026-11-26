@@ -42,7 +42,8 @@ use tracing::{debug, error, info, instrument, span, trace, warn, Level};
 use crate::{
     common, consts,
     daemon::{
-        config, exit_notify::ExitNotifier, keybindings, pager::PagerCtl, shell_inject, show_motd,
+        config, events, exit_notify::ExitNotifier, keybindings, pager::PagerCtl, shell_inject,
+        show_motd,
     },
     protocol,
     protocol::ChunkExt as _,
@@ -124,6 +125,10 @@ pub struct Session {
     pub child_pid: libc::pid_t,
     pub child_exit_notifier: Arc<ExitNotifier>,
     pub shell_to_client_ctl: Arc<Mutex<ShellToClientCtl>>,
+    /// Asks the shell->client thread for the session's [`SessionMetadata`]. It
+    /// is kept here rather than in [`ShellToClientCtl`] so that requesters
+    /// don't wait for that lock.
+    pub fetch_metadata: crossbeam_channel::Sender<MetadataRequest>,
     pub pager_ctl: Arc<Mutex<Option<PagerCtl>>>,
     /// Mutable state with the lock held by the servicing handle_attach thread
     /// while a tty is attached to the session. Probing the mutex can be used
@@ -255,6 +260,29 @@ pub enum ClientConnectionMsg {
     Disconnect,
 }
 
+/// What the shell->client thread returns in response to a
+/// [`Session::fetch_metadata`] request.
+#[derive(Debug, Clone)]
+pub struct SessionMetadata {
+    /// The window title. Any non-UTF-8 bytes are replaced with U+FFFD.
+    pub window_title: Option<String>,
+}
+
+/// A request on [`Session::fetch_metadata`]. It is its own reply channel, so
+/// each requester gets a fresh private channel.
+pub type MetadataRequest = crossbeam_channel::Sender<SessionMetadata>;
+
+/// Reply to a [`Session::fetch_metadata`] request.
+fn handle_fetch_metadata(spool: &dyn session_restore::SessionSpool, request: MetadataRequest) {
+    let metadata = SessionMetadata {
+        window_title: spool
+            .window_title()
+            .map(|window_title| String::from_utf8_lossy(window_title).into_owned()),
+    };
+    // Nobody needs the reply if the requester has stopped waiting.
+    let _ = request.send(metadata);
+}
+
 pub struct ShellToClientArgs {
     pub session_spool: Option<Box<dyn session_restore::SessionSpool + Send>>,
     pub conn_id: usize,
@@ -271,6 +299,10 @@ pub struct ShellToClientArgs {
     // true if the client is still live, false if it has hung up on us.
     pub heartbeat_ack: crossbeam_channel::Sender<(u64, bool)>,
     pub child_exit_notifier: Arc<ExitNotifier>,
+    // The only sending end is the Session's fetch_metadata field, so this
+    // closes when the Session is dropped.
+    pub fetch_metadata: crossbeam_channel::Receiver<MetadataRequest>,
+    pub events_bus: Arc<events::EventBus>,
 }
 
 /// The PTY master stays nonblocking across attachments. Both ordinary input
@@ -343,17 +375,38 @@ impl SessionInner {
                 Some(spool) => spool as Box<dyn session_restore::SessionSpool>,
                 None => session_restore::new(config, &args.tty_size, args.scrollback_lines, &name),
             };
+            // Swapped for `never` once the Session is dropped. A closed channel
+            // is always selectable, so the wait for the initial `client_conn`
+            // below would spin, and the main loop's select would waste turns on
+            // it. The thread itself keeps running because its control channels
+            // can outlive the Session.
+            let mut fetch_metadata = args.fetch_metadata;
+            // The window title as of the last session.window_title_changed
+            // event, so that we can detect (and only fire a new event) when the
+            // output actually changes the title.
+            let mut published_window_title: Option<Vec<u8>> = None;
             let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
             let mut poll_fds = [poll::PollFd::new(
                 watchable_master.borrow_fd(),
                 PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
             )];
 
-            // block until we get the first connection attached so that we don't drop
-            // the initial prompt on the floor
+            // block until we get the first connection attached so that we don't
+            // drop the initial prompt on the floor
             info!("waiting for initial client connection");
-            let mut client_conn: ClientConnectionMsg =
-                args.client_connection.recv().context("waiting for initial client connection")?;
+            let mut client_conn: ClientConnectionMsg = loop {
+                crossbeam_channel::select! {
+                    recv(args.client_connection) -> client_conn => {
+                        break client_conn.context("waiting for initial client connection")?;
+                    }
+                    // The session is already in `shells`, so metadata requests
+                    // can arrive before its first client.
+                    recv(fetch_metadata) -> request => match request {
+                        Ok(request) => handle_fetch_metadata(&*output_spool, request),
+                        Err(crossbeam_channel::RecvError) => fetch_metadata = crossbeam_channel::never(),
+                    },
+                }
+            };
             args.client_connection_ack
                 .send(ClientConnectionStatus::New)
                 .context("sending initial client connection ack")?;
@@ -475,23 +528,34 @@ impl SessionInner {
                     recv(args.heartbeat) -> request_id => {
                         let client_present = if let ClientConnectionMsg::New(conn) = &mut client_conn {
                             let chunk = Chunk { kind: ChunkKind::Heartbeat, buf: &[] };
-                            match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
+                            let write_result = if test_hooks::maybe_fail("heartbeat-write") {
+                                Err(io::Error::from_raw_os_error(libc::ECONNRESET))
+                            } else {
+                                chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush())
+                            };
+                            match write_result {
                                 Ok(_) => {
                                     trace!("wrote heartbeat");
                                     true
                                 }
-                                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                                    trace!("client hangup: {:?}", e);
-                                    false
-                                }
                                 Err(e) => {
-                                    error!("unexpected IO error while writing heartbeat: {}", e);
-                                    return Err(e).context("writing heartbeat")?;
+                                    info!("heartbeat write err, assuming hangup: {:?}", e);
+                                    // A failed client write must not terminate the
+                                    // session's long-lived output worker. Shut down
+                                    // every clone so client->shell also wakes up.
+                                    if let Err(err) = shutdown_socket(&conn.stream, net::Shutdown::Both) {
+                                        warn!("shutting down client after heartbeat error: {:?}", err);
+                                    }
+                                    false
                                 }
                             }
                         } else {
                             false
                         };
+
+                        if !client_present {
+                            client_conn = ClientConnectionMsg::Disconnect;
+                        }
 
                         test_hooks::emit("daemon-wrote-heartbeat");
 
@@ -521,19 +585,33 @@ impl SessionInner {
                         }
 
                         let chunk = Chunk { kind: ChunkKind::MaybeSwitch, buf: &encoded[..] };
-                        match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
+                        let write_result = if test_hooks::maybe_fail("maybe-switch-write") {
+                            Err(io::Error::from_raw_os_error(libc::ECONNRESET))
+                        } else {
+                            chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush())
+                        };
+                        match write_result {
                             Ok(_) => {
                                 trace!("wrote MaybeSwitch");
                             }
-                            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                                trace!("writing MaybeSwitch: client hangup: {:?}", e);
-                            }
                             Err(e) => {
-                                error!("unexpected IO error while writing heartbeat: {}", e);
-                                return Err(e).context("writing MaybeSwitch")?;
+                                info!("MaybeSwitch write err, assuming hangup: {:?}", e);
+                                if let Err(err) = shutdown_socket(&conn.stream, net::Shutdown::Both) {
+                                    warn!("shutting down client after MaybeSwitch error: {:?}", err);
+                                }
+                                client_conn = ClientConnectionMsg::Disconnect;
                             }
                         }
                     }
+                    recv(fetch_metadata) -> request => match request {
+                        Ok(request) => {
+                            handle_fetch_metadata(&*output_spool, request);
+                            // Skip the poll so a burst of requests is handled
+                            // without intervening polls.
+                            continue;
+                        }
+                        Err(crossbeam_channel::RecvError) => fetch_metadata = crossbeam_channel::never(),
+                    },
 
                     // make this select non-blocking so we spend most of our time parked
                     // in poll
@@ -566,9 +644,10 @@ impl SessionInner {
                         (!restore_buf.is_empty(), &mut client_conn)
                     {
                         trace!("restore chunk='{}'", String::from_utf8_lossy(&restore_buf[..]));
-                        // send the restore buffer, broken up into chunks so that we don't make
-                        // the client allocate too much
-                        for block in restore_buf.as_slice().chunks(consts::BUF_SIZE) {
+                        // send the restore buffer, broken up into chunks so
+                        // that we don't make the client
+                        // allocate too much
+                        for block in restore_buf.chunks(consts::BUF_SIZE) {
                             let chunk = Chunk { kind: ChunkKind::Data, buf: block };
 
                             if let Err(err) = chunk.write_to(&mut conn.sink) {
@@ -585,8 +664,9 @@ impl SessionInner {
                 // set up a restore chunk? It looks like we will just drop the
                 // data as things are now.
 
-                // Block until the shell has some data for us so we can be sure our reads
-                // always succeed. We don't want to end up blocked forever on a read while
+                // Block until the shell has some data for us so we can be sure
+                // our reads always succeed. We don't want to
+                // end up blocked forever on a read while
                 // a client is trying to attach.
                 let nready = match poll::poll(&mut poll_fds, SHELL_TO_CLIENT_POLL_MS) {
                     Ok(n) => n,
@@ -609,8 +689,8 @@ impl SessionInner {
                 if hangup {
                     info!("pty master hung up, exiting shell->client thread");
 
-                    // If we have an attached client conn, make a best effort attempt
-                    // to forward the exit status.
+                    // If we have an attached client conn, make a best effort
+                    // attempt to forward the exit status.
                     if let ClientConnectionMsg::New(mut conn) = client_conn {
                         if let Some(exit_status) =
                             args.child_exit_notifier.wait(Some(SHELL_EXIT_WAIT_DUR))
@@ -639,7 +719,8 @@ impl SessionInner {
                     for (i, byte) in buf.iter().enumerate() {
                         if prompt_sentinel_scanner.transition(*byte) {
                             info!("saw prompt sentinel");
-                            // This will cause us to start actually sending data frames back to
+                            // This will cause us to start actually sending data
+                            // frames back to
                             // the client.
                             has_seen_prompt_sentinel = true;
 
@@ -651,6 +732,13 @@ impl SessionInner {
 
                 if has_seen_prompt_sentinel {
                     output_spool.process(buf);
+
+                    // If the window title has changed, publish an event.
+                    let window_title = output_spool.window_title();
+                    if window_title != published_window_title.as_deref() {
+                        published_window_title = window_title.map(<[u8]>::to_vec);
+                        args.events_bus.publish(&events::Event::SessionWindowTitleChanged);
+                    }
                 }
 
                 let mut reset_client_conn = false;
@@ -659,8 +747,9 @@ impl SessionInner {
                 {
                     let chunk = Chunk { kind: ChunkKind::Data, buf };
 
-                    // If we still need to do an initial motd dump, it means we have just finished
-                    // dropping all the prompt setup stuff, we should dump the motd now before we
+                    // If we still need to do an initial motd dump, it means we
+                    // have just finished dropping all the
+                    // prompt setup stuff, we should dump the motd now before we
                     // write the first chunk.
                     if needs_initial_motd_dump {
                         needs_initial_motd_dump = false;
@@ -904,7 +993,8 @@ impl SessionInner {
                 let mut master_writer = PtyInputWriter { master: pty_master, stop };
 
                 let mut snip_sections = vec![]; // (<len>, <end offset>)
-                let mut keep_sections = vec![]; // (<start offset>, <end offset>)
+                let mut keep_sections = vec![]; // (<start offset>, <end
+                                                // offset>)
                 let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
                 let mut partial_keybinding = vec![];
                 let mut input_timeout = None;
@@ -915,9 +1005,10 @@ impl SessionInner {
                         return Ok(());
                     }
 
-                    // N.B. we don't need to muck about with chunking or anything
-                    // in this direction, because there is only one input stream
-                    // to the shell subprocess and we don't need to worry about
+                    // N.B. we don't need to muck about with chunking or
+                    // anything in this direction, because
+                    // there is only one input stream to the
+                    // shell subprocess and we don't need to worry about
                     // heartbeating to detect hangup or anything like that.
                     //
                     // Also, note that we don't access through the mutex because reads
@@ -949,9 +1040,10 @@ impl SessionInner {
                     test_hooks::emit("daemon-read-c2s-chunk");
                     trace!("read client len={}: '{}'", len, String::from_utf8_lossy(&buf[..len]),);
 
-                    // We might be able to gain some perf by doing this scanning in
-                    // a background thread (though maybe not given the need to copy
-                    // the data), but just doing it inline doesn't seem have have
+                    // We might be able to gain some perf by doing this scanning
+                    // in a background thread (though maybe
+                    // not given the need to copy the data),
+                    // but just doing it inline doesn't seem have have
                     // a major perf impact, and this way is simpler.
                     snip_sections.clear();
                     for (i, byte) in buf[0..len].iter().enumerate() {
@@ -961,8 +1053,10 @@ impl SessionInner {
                                 if !partial_keybinding.is_empty()
                                     && i < partial_keybinding.len() =>
                             {
-                                // it turned out the partial keybinding match was not
-                                // a real match, so flush it to the output stream
+                                // it turned out the partial keybinding match
+                                // was not
+                                // a real match, so flush it to the output
+                                // stream
                                 debug!(
                                     "flushing partial keybinding_len={} i={}",
                                     partial_keybinding.len(),
@@ -975,7 +1069,8 @@ impl SessionInner {
                                         .context("writing partial keybinding")?;
                                 }
                                 if i > 0 {
-                                    // snip the leading part of the input chunk that
+                                    // snip the leading part of the input chunk
+                                    // that
                                     // was part of this keybinding
                                     snip_sections.push((i, i - 1));
                                 }
@@ -991,7 +1086,8 @@ impl SessionInner {
                                 info!("{:?} keybinding action fired", action);
                                 let keybinding_len = partial_keybinding.len() + 1;
                                 if keybinding_len < i {
-                                    // this keybinding is wholly contained in buf
+                                    // this keybinding is wholly contained in
+                                    // buf
                                     debug!("snipping keybinding_len={} i={}", keybinding_len, i);
                                     snip_sections.push((keybinding_len, i));
                                 } else {
@@ -1079,17 +1175,18 @@ impl SessionInner {
                             .heartbeat
                             .send_timeout(request_id, SHELL_TO_CLIENT_CTL_TIMEOUT)
                         {
-                            // If the channel is disconnected, it means that the shell exited and
-                            // the shell->client process exited cleanly. We should not raise a
-                            // ruckus.
+                            // If the channel is disconnected, it means that the
+                            // shell exited and the shell->client process exited
+                            // cleanly. We should not raise a ruckus.
                             Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
                                 return Ok(())
                             }
-                            // If we get a timeout it doesn't necessarily mean that the
-                            // shell->client thread is unhealthy. It might just be busy
-                            // doing other stuff. In particular, this comes up when the
-                            // shell->client thread is generating a particularly large
-                            // session restore buffer, which can take a minute.
+                            // If we get a timeout it doesn't necessarily mean
+                            // that the shell->client thread is unhealthy. It
+                            // might just be busy doing other stuff. In
+                            // particular, this comes up when the shell->client
+                            // thread is generating a particularly large session
+                            // restore buffer, which can take a minute.
                             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                                 continue;
                             }
@@ -1100,16 +1197,17 @@ impl SessionInner {
                                 .heartbeat_ack
                                 .recv_timeout(SHELL_TO_CLIENT_CTL_TIMEOUT)
                             {
-                                // If the channel is disconnected, it means that the shell exited
-                                // and the shell->client process exited cleanly. We should not
-                                // raise a ruckus.
+                                // If the channel is disconnected, it means that
+                                // the shell exited and the shell->client
+                                // process exited cleanly. We should not raise a
+                                // ruckus.
                                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                                     return Ok(())
                                 }
-                                // Like the send timeout above, a slow ack just means
-                                // the shell->client thread is busy, not that the
-                                // client is gone. A dead client still gets noticed
-                                // when the write to it fails.
+                                // Like the send timeout above, a slow ack just
+                                // means the shell->client thread is busy, not
+                                // that the client is gone. A dead client still
+                                // gets noticed when the write to it fails.
                                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                                     continue 'heartbeat
                                 }
@@ -1159,8 +1257,8 @@ impl SessionInner {
                             child_done.store(true, Ordering::Release);
 
                             // we don't need to worry about the ExitStatus frame
-                            // because the shell->client thread cleanup should handle
-                            // that.
+                            // because the shell->client thread cleanup should
+                            // handle that.
                             return Ok(());
                         }
                         None => {

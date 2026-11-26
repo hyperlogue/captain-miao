@@ -1,11 +1,13 @@
 #!/bin/sh
 # Cargo runs every binary it executes through this script (see
-# `.cargo/config.toml`). A test binary (one under `deps/`) gets a private HOME
+# `.cargo/config.toml`). A test binary gets a private HOME
 # and XDG directories, removed when it exits, so no test can read or write the
 # developer's own captain-miao config, state, sockets or agent homes, however
 # it was written. Anything else, such as `cargo run`, runs untouched.
+# Test executables carry a 16-character unit hash. Cargo 1.100 moved them
+# from deps/ to build/<package>/<hash>/out/, so recognize both layouts.
 case "$1" in
-*/deps/*) ;;
+*/deps/* | */build/*/*/out/*-????????????????) ;;
 *) exec "$@" ;;
 esac
 
@@ -30,5 +32,5 @@ export XDG_RUNTIME_DIR="$root/run"
 # socket would otherwise lead back to the developer's files.
 unset CLAUDE_CONFIG_DIR CODEX_HOME GROK_HOME KIMI_CODE_HOME OPENCODE_CONFIG_DIR \
 	PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR REASONIX_HOME \
-	REASONIX_STATE_HOME REASONIX_CACHE_HOME TOWER_SOCKET CAPTAIN_MIAO_TOWER
+	REASONIX_STATE_HOME REASONIX_CACHE_HOME TOWER_SOCKET CAPTAIN_MIAO_TOWER TOWER_INTEGRATION
 "$@"

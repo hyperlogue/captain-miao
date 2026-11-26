@@ -298,7 +298,9 @@ mod tests {
                     last_connected_at_unix_ms: None,
                     last_disconnected_at_unix_ms: None,
                     status: SessionStatus::Attached,
+                    shell_pid: 123,
                     attachments: Vec::new(),
+                    window_title: None,
                 },
                 Session {
                     name: "cm-codex-2-2".into(),
@@ -306,7 +308,9 @@ mod tests {
                     last_connected_at_unix_ms: None,
                     last_disconnected_at_unix_ms: None,
                     status: SessionStatus::Disconnected,
+                    shell_pid: 123,
                     attachments: Vec::new(),
+                    window_title: None,
                 },
             ],
         };

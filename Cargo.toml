@@ -16,8 +16,8 @@ version = "0.18.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hyperlogue/captain-miao"
-# The Tower crates the dashboard embeds set this floor.
-rust-version = "1.98.1"
+# Cargo 1.100 enforces the seven-day registry cooldown in .cargo/config.toml.
+rust-version = "1.100"
 
 [package]
 name = "captain-miao"

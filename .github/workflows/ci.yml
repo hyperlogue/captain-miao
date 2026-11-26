@@ -43,6 +43,10 @@ jobs:
           lfs: true
           persist-credentials: false # nothing here pushes
 
+      - name: Check flake inputs have aged seven days
+        run: |
+          jq -e 'all(.nodes[] | select(.locked); (.locked.lastModified // error("missing input timestamp")) <= (now - 7 * 86400))' flake.lock
+
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
