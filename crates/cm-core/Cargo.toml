@@ -46,7 +46,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # `bundled` statically compiles SQLite into the binary, so reading Codex's
 # state_5.sqlite for session renames needs no `sqlite3` CLI at runtime.
 # libsqlite3-sys uses `cfg_select!`, which needs Rust 1.95.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 [dev-dependencies]
 # Exercise deferred title refreshes with a paused clock, without wall sleeps.
