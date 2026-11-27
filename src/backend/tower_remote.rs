@@ -9,9 +9,10 @@
 //! on Tower. The dashboard drives that host's `tower-cli` over the
 //! host's shared ssh connection: `tower-cli events` streams the daemon's
 //! session records, `tower-cli rpc` opens, stops and tags sessions, and an
-//! attach window runs `tower-cli attach`. The CLI starts the daemon when it
-//! is not running. A dashboard built carrying Tower deploys it first (see
-//! [`DEPLOY_REL`]); otherwise Tower must be on the host's login `PATH`.
+//! attach window runs `tower-cli attach`. The CLI never starts a daemon:
+//! [`TowerLink::ready`] settles which Tower the host runs first, and starts
+//! the one this dashboard carries only when none of it is running (see
+//! [`DEPLOY_REL`]).
 //!
 //! `miao-server` keeps serving everything else for the host: its sessions
 //! (marked for a restart), resume candidates, directory queries, vitals and
@@ -71,6 +72,11 @@ pub(crate) struct TowerLink {
     /// The build whose deploy last failed, and when, so a host that refuses
     /// it is not sent tens of megabytes on every reconnect.
     refused: Mutex<Option<(String, Instant)>>,
+    /// The host's `tower-cli`, once [`Self::ready`] found its Tower running.
+    cli: Mutex<Option<String>>,
+    /// Held while [`Self::ready`] inspects or starts the host's Tower, so a
+    /// launch waits for an upload already under way instead of racing it.
+    preparing: tokio::sync::Mutex<()>,
 }
 
 /// Why a CLI call failed. `unreachable` means the command may never have
@@ -130,6 +136,8 @@ impl TowerLink {
             log,
             task: OnceLock::new(),
             refused: Mutex::default(),
+            cli: Mutex::default(),
+            preparing: tokio::sync::Mutex::default(),
         })
     }
 
@@ -172,7 +180,7 @@ impl TowerLink {
 
     /// The argv for a window attached to session `id`.
     pub(crate) fn attach_argv(&self, id: &str) -> Vec<String> {
-        let command = remote_command(&cli_args(self.enabled, &["attach", id]));
+        let command = remote_command(self.cli().as_deref(), &cli_args(&["attach", id]));
         match &self.via {
             Via::Ssh { target, opts } => {
                 let mut argv = vec!["ssh".to_string(), "-t".to_string()];
@@ -187,6 +195,9 @@ impl TowerLink {
     /// Reserve a session for `spec`; it starts when its window attaches, so
     /// the agent meets the real terminal.
     pub(crate) async fn open(&self, spec: OpenSpec) -> anyhow::Result<LaunchPlan> {
+        self.ready()
+            .await
+            .map_err(|reason| anyhow::anyhow!("Tower on {}: {reason}", self.host))?;
         let harness = crate::tower::harness(spec.agent)
             .ok_or_else(|| anyhow::anyhow!(crate::agent::UNKNOWN_AGENT_REFUSAL))?;
         let args = spec
@@ -294,37 +305,151 @@ impl TowerLink {
         })
     }
 
-    /// Make sure the host runs the Tower this dashboard carries, uploading it
-    /// when it has another build or none. A host this dashboard carries no
-    /// Tower for keeps using the one on its `PATH`.
-    async fn deploy(&self) -> Result<(), String> {
-        if !crate::server_payload::carries_tower() {
-            return Ok(());
+    /// The host's `tower-cli`, once its Tower is known to be running.
+    fn cli(&self) -> Option<String> {
+        self.cli.lock().unwrap().clone()
+    }
+
+    /// Settle which Tower the host runs, starting this dashboard's when none
+    /// of it is: find a working `tower-cli` (login `PATH`, then
+    /// [`DEPLOY_REL`]), uploading this dashboard's build when there is none;
+    /// ask it about the daemon and pool; use both when they run and speak
+    /// this build's protocols; upload and start both when neither runs.
+    /// Anything in between is left to the user. Returns the CLI to use.
+    pub(crate) async fn ready(&self) -> Result<String, String> {
+        let _preparing = self.preparing.lock().await;
+        if let Some(cli) = self.cli() {
+            return Ok(cli);
         }
-        let (status, stdout, stderr) = self.shell(&probe_script(), None).await?;
+        let cli = self.prepare().await?;
+        self.log.info(format!("using Tower through {cli}"));
+        *self.cli.lock().unwrap() = Some(cli.clone());
+        Ok(cli)
+    }
+
+    /// Forget the CLI [`Self::ready`] settled, so the next call looks again.
+    fn forget(&self) {
+        self.cli.lock().unwrap().take();
+    }
+
+    async fn prepare(&self) -> Result<String, String> {
+        let probe = self.probe().await?;
+        let bundles = Bundles::for_platform(&probe.platform);
+        let deployed = format!("{}/{DEPLOY_REL}/current/{CLI}", probe.home);
+        let (cli, installed) = match &probe.cli {
+            Some(cli) => (cli.clone(), false),
+            None => {
+                self.install(&bundles, &probe.current)
+                    .await
+                    .map_err(|reason| format!("the host has no working {CLI}, and {reason}"))?;
+                (deployed.clone(), true)
+            }
+        };
+        match self.status(&cli).await {
+            Ok(info) => compatible(&info).map(|()| cli),
+            Err(reason) if probe.daemon || probe.pool => Err(format!(
+                "{} running, but `{cli} daemon status` failed ({reason}); \
+                 this needs manual care on the host",
+                probe.running()
+            )),
+            Err(_) => {
+                if !installed {
+                    self.install(&bundles, &probe.current)
+                        .await
+                        .map_err(|reason| {
+                            format!("Tower is not running on the host, and {reason}")
+                        })?;
+                }
+                self.launch(&deployed).await?;
+                Ok(deployed)
+            }
+        }
+    }
+
+    /// What the host has: its platform, the deployed build, a working CLI,
+    /// and whether a Tower daemon or pool runs under this account.
+    async fn probe(&self) -> Result<Probe, String> {
+        let (status, stdout, stderr) = self.shell(login_shell_safe(&probe_script()), None).await?;
         if !status.success() {
             return Err(format!("probing the host failed: {}", stderr.trim()));
         }
-        let mut lines = stdout.lines();
-        let platform = lines.next().unwrap_or_default().trim().to_string();
-        let current = lines.next().unwrap_or_default().trim().to_string();
-        let candidates: Vec<_> = crate::server_payload::target_candidates(&platform)
-            .iter()
-            .filter_map(|target| {
-                crate::server_payload::tower_bundle(target)
-                    .map(|(digest, bundle)| (*target, digest, bundle))
-            })
-            .collect();
-        if candidates.is_empty() {
-            self.log.info(format!(
-                "this dashboard carries no Tower for {platform:?}; using {CLI} on the host's PATH"
+        Probe::parse(&stdout).ok_or_else(|| "probing the host printed no report".into())
+    }
+
+    /// The daemon's report, through `cli`, without starting it.
+    async fn status(&self, cli: &str) -> Result<tower_protocol::DaemonInfo, String> {
+        let mut command = self.shell_command(remote_command(
+            Some(cli),
+            &cli_args(&["--json", "daemon", "status"]),
+        ));
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not run {}: {error}", self.runner()))?;
+        let (status, stdout, stderr) =
+            tokio::time::timeout(RPC_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
+                .await
+                .map_err(|_| format!("`{CLI} daemon status` timed out"))?
+                .map_err(|error| format!("{} failed: {error}", self.runner()))?;
+        if !status.success() {
+            let message = host_text_safe(stderr.trim());
+            return Err(if message.is_empty() {
+                format!("rc={:?}", status.code())
+            } else {
+                message
+            });
+        }
+        json_in(&stdout)
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or_else(|| format!("`{CLI} daemon status` printed no report"))
+    }
+
+    /// Start the deployed daemon and pool, detached, from the login shell so
+    /// their sessions get its environment, and wait until both answer.
+    async fn launch(&self, cli: &str) -> Result<(), String> {
+        self.log.info("starting Tower on the host");
+        let line = format!(
+            "{} {}",
+            login_shell_safe(&launch_script()),
+            login_shell_quote_arg(LAUNCH_COMMAND)
+        );
+        let (status, _, stderr) = self.shell(line, None).await?;
+        if !status.success() {
+            return Err(format!(
+                "starting Tower failed: {}",
+                host_text_safe(stderr.trim())
             ));
+        }
+        let deadline = Instant::now() + LAUNCH_TIMEOUT;
+        loop {
+            let last = match self.status(cli).await {
+                Ok(info) if info.pool.running => return compatible(&info),
+                Ok(_) => "its pool is not running".to_string(),
+                Err(reason) => reason,
+            };
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Tower did not come up within {}s: {last}",
+                    LAUNCH_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(LAUNCH_POLL).await;
+        }
+    }
+
+    /// Make the deployed build this dashboard's, uploading it unless
+    /// `current` already names it.
+    async fn install(&self, bundles: &Bundles, current: &str) -> Result<(), String> {
+        if bundles.0.is_empty() {
+            return Err("this dashboard carries no Tower for the host".into());
+        }
+        if bundles.0.iter().any(|(_, digest, _)| digest == current) {
             return Ok(());
         }
-        if candidates.iter().any(|(_, digest, _)| *digest == current) {
-            return Ok(());
-        }
-        let key: String = candidates
+        let key: String = bundles
+            .0
             .iter()
             .map(|(_, digest, _)| digest.as_str())
             .collect();
@@ -332,13 +457,13 @@ impl TowerLink {
             && *refused == key
             && at.elapsed() < DEPLOY_COOLDOWN
         {
-            return Err("the last deploy of this Tower failed; retrying later".into());
+            return Err("the last deploy of its Tower failed; retrying later".into());
         }
         let mut reasons = Vec::new();
-        for (target, digest, bundle) in candidates {
+        for (target, digest, bundle) in &bundles.0 {
             self.log
                 .info(format!("deploying Tower {digest} for {target}"));
-            match self.upload(&digest, bundle).await {
+            match self.upload(digest, bundle).await {
                 Ok(()) => {
                     self.log.info(format!("deployed Tower {digest} ({target})"));
                     return Ok(());
@@ -347,7 +472,10 @@ impl TowerLink {
             }
         }
         *self.refused.lock().unwrap() = Some((key, Instant::now()));
-        Err(format!("could not deploy Tower: {}", reasons.join("; ")))
+        Err(format!(
+            "deploying its Tower failed: {}",
+            reasons.join("; ")
+        ))
     }
 
     async fn upload(
@@ -361,27 +489,32 @@ impl TowerLink {
             .map_err(|e| e.to_string())?;
         for (i, (binary, bytes)) in binaries.into_iter().enumerate() {
             let (status, _, stderr) = self
-                .shell(&stage_script(digest, binary, i == 0), Some(bytes))
+                .shell(
+                    login_shell_safe(&stage_script(digest, binary, i == 0)),
+                    Some(bytes),
+                )
                 .await?;
             if !status.success() {
                 return Err(format!("sending {binary}: {}", stderr.trim()));
             }
         }
-        let (status, _, stderr) = self.shell(&publish_script(digest), None).await?;
+        let (status, _, stderr) = self
+            .shell(login_shell_safe(&publish_script(digest)), None)
+            .await?;
         if !status.success() {
             return Err(format!("the host cannot run it: {}", stderr.trim()));
         }
         Ok(())
     }
 
-    /// Run a `/bin/sh` script on the host, feeding it `stdin`.
+    /// Hand `line` to the host's shell, feeding it `stdin`.
     async fn shell(
         &self,
-        script: &str,
+        line: String,
         stdin: Option<Vec<u8>>,
     ) -> Result<(std::process::ExitStatus, String, String), String> {
         let mut child = self
-            .shell_command(login_shell_safe(script))
+            .shell_command(line)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -417,7 +550,8 @@ impl TowerLink {
 
     /// A command running the host's CLI with `args`.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = self.shell_command(remote_command(&cli_args(self.enabled, args)));
+        let mut command =
+            self.shell_command(remote_command(self.cli().as_deref(), &cli_args(args)));
         command.stdin(Stdio::null());
         command
     }
@@ -527,28 +661,31 @@ fn launcher_key(id: &str) -> u32 {
 
 /// The CLI's arguments. With the flag unset the dashboard only follows
 /// sessions Tower already runs, so it must never start a daemon.
-fn cli_args<'a>(enabled: bool, args: &[&'a str]) -> Vec<&'a str> {
-    let mut all = Vec::with_capacity(args.len() + 1);
-    if !enabled {
-        all.push("--no-start");
-    }
-    all.extend_from_slice(args);
-    all
+/// The CLI never starts a daemon: [`TowerLink::ready`] decides whether one
+/// may be started, and which build.
+fn cli_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    std::iter::once("--no-start")
+        .chain(args.iter().copied())
+        .collect()
 }
 
-/// The remote command running `tower-cli args` in the account's login shell,
-/// which is where a user's `PATH` is complete, and so the environment a
-/// daemon the CLI starts hands its agents. The Tower this dashboard deployed
-/// wins over one on `PATH`.
-fn remote_command(args: &[&str]) -> String {
-    let command = std::iter::once("exec \"$CM_TOWER_CLI\"".to_string())
+/// The remote command running `cli args` in the account's login shell, where
+/// a user's `PATH` and environment are complete. Before [`TowerLink::ready`]
+/// settles a CLI, as when Tower is not enabled for the host, the deployed
+/// build wins over one on `PATH`.
+fn remote_command(cli: Option<&str>, args: &[&str]) -> String {
+    let program = cli.map_or_else(|| "\"$CM_TOWER_CLI\"".to_string(), login_shell_quote_arg);
+    let command = std::iter::once(format!("exec {program}"))
         .chain(args.iter().map(|arg| login_shell_quote_arg(arg)))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!(
-        "c=\"$HOME/{DEPLOY_REL}/current/{CLI}\"; [ -x \"$c\" ] || c={CLI}; \
-         export CM_TOWER_CLI=\"$c\"; exec \"${{SHELL:-/bin/sh}}\" -l -c \"$0\""
-    );
+    let script = match cli {
+        Some(_) => "exec \"${SHELL:-/bin/sh}\" -l -c \"$0\"".to_string(),
+        None => format!(
+            "c=\"$HOME/{DEPLOY_REL}/current/{CLI}\"; [ -x \"$c\" ] || c={CLI}; \
+             export CM_TOWER_CLI=\"$c\"; exec \"${{SHELL:-/bin/sh}}\" -l -c \"$0\""
+        ),
+    };
     format!(
         "{} {}",
         login_shell_safe(&script),
@@ -570,10 +707,141 @@ const DEPLOY_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a failed deploy of one build is not retried.
 const DEPLOY_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// What a host reports before a deploy: its platform, and the build its
-/// `current` link names.
+/// How long a Tower this dashboard started has to answer.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCH_POLL: Duration = Duration::from_millis(250);
+
+/// What a host reports, one `key=value` line each: its platform, `$HOME`,
+/// the build `current` names, the first `tower-cli` that runs (login `PATH`,
+/// then the deployed one), and whether this account runs a Tower daemon or
+/// pool. A `PATH` entry may be a wrapper around a build that is gone, so a
+/// CLI counts only when `--version` succeeds. The process patterns bracket a
+/// letter so they never match this script's own command line.
 fn probe_script() -> String {
-    format!("uname -sm; readlink \"$HOME/{DEPLOY_REL}/current\" || true")
+    format!(
+        "echo platform=$(uname -sm); echo home=$HOME; \
+         echo current=$(readlink \"$HOME/{DEPLOY_REL}/current\" 2>/dev/null); \
+         cli=; for c in \"$(\"${{SHELL:-/bin/sh}}\" -l -c \"command -v {CLI}\" </dev/null 2>/dev/null | tail -n 1)\" \
+           \"$HOME/{DEPLOY_REL}/current/{CLI}\"; do \
+           case \"$c\" in /*) ;; *) continue;; esac; \
+           if [ -x \"$c\" ] && \"$c\" --version </dev/null >/dev/null 2>&1; then cli=$c; break; fi; \
+         done; echo cli=$cli; \
+         u=$(id -u); \
+         pgrep -u \"$u\" -f \"^[^ ]*[t]ower( |$)\" >/dev/null 2>&1 && echo daemon=1; \
+         pgrep -u \"$u\" -f \"^[^ ]*[t]ower-terminal-pool( |$)\" >/dev/null 2>&1 && echo pool=1; \
+         true"
+    )
+}
+
+/// What [`probe_script`] reported.
+#[derive(Debug, Default, PartialEq)]
+struct Probe {
+    platform: String,
+    home: String,
+    current: String,
+    cli: Option<String>,
+    daemon: bool,
+    pool: bool,
+}
+
+impl Probe {
+    /// The report in `output`, skipping anything a login script printed.
+    fn parse(output: &str) -> Option<Self> {
+        let mut probe = Self::default();
+        let mut seen = false;
+        for line in output.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            match key {
+                "platform" => {
+                    seen = true;
+                    probe.platform = value;
+                }
+                "home" => probe.home = value,
+                "current" => probe.current = value,
+                "cli" => probe.cli = Some(value).filter(|cli| !cli.is_empty()),
+                "daemon" => probe.daemon = value == "1",
+                "pool" => probe.pool = value == "1",
+                _ => {}
+            }
+        }
+        (seen && !probe.home.is_empty()).then_some(probe)
+    }
+
+    /// Which of Tower's processes run, for an error message.
+    fn running(&self) -> &'static str {
+        match (self.daemon, self.pool) {
+            (true, true) => "a Tower daemon and pool are",
+            (true, false) => "a Tower daemon is",
+            _ => "a Tower terminal pool is",
+        }
+    }
+}
+
+/// The Tower builds this dashboard carries for a platform, best first.
+struct Bundles(
+    Vec<(
+        &'static str,
+        String,
+        &'static crate::server_payload::TowerPayload,
+    )>,
+);
+
+impl Bundles {
+    fn for_platform(platform: &str) -> Self {
+        Self(
+            crate::server_payload::target_candidates(platform)
+                .iter()
+                .filter_map(|target| {
+                    crate::server_payload::tower_bundle(target)
+                        .map(|(digest, bundle)| (*target, digest, bundle))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Whether a running daemon and pool are ones this dashboard can drive: the
+/// daemon speaks this build's protocol major and its pool runs this build's
+/// pool protocol.
+fn compatible(info: &tower_protocol::DaemonInfo) -> Result<(), String> {
+    let theirs = info.protocol_version.major;
+    let ours = tower_protocol::PROTOCOL_VERSION.major;
+    if theirs != ours {
+        return Err(format!(
+            "the host's Tower {} speaks protocol {theirs}, not {ours}; \
+             this needs manual care on the host",
+            info.version
+        ));
+    }
+    match info.pool.proto_version.as_ref().map(|v| v.major) {
+        Some(major) if major == tower_pool_proto::VERSION => Ok(()),
+        Some(major) => Err(format!(
+            "the host's Tower terminal pool speaks protocol {major}, not {}; \
+             this needs manual care on the host",
+            tower_pool_proto::VERSION
+        )),
+        None => Err(format!(
+            "the host's Tower {} runs without its terminal pool; \
+             this needs manual care on the host",
+            info.version
+        )),
+    }
+}
+
+/// The deployed build's pool, then its daemon, each detaching itself. Runs
+/// in the login shell with `CM_TOWER_DIR` naming the build.
+const LAUNCH_COMMAND: &str =
+    "\"$CM_TOWER_DIR/tower-terminal-pool\" run --detach && \"$CM_TOWER_DIR/tower\" run --detach";
+
+/// Run [`LAUNCH_COMMAND`], passed as `$0`, in the account's login shell.
+fn launch_script() -> String {
+    format!(
+        "set -e; export CM_TOWER_DIR=\"$HOME/{DEPLOY_REL}/current\"; \
+         exec \"${{SHELL:-/bin/sh}}\" -l -c \"$0\" </dev/null"
+    )
 }
 
 /// Stream one binary into the build's staging directory. The first binary
@@ -663,10 +931,15 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
             this.log
                 .info(format!("following Tower sessions with `{CLI} events`"));
         }
-        if enabled && let Err(reason) = this.deploy().await {
-            this.log.error(format!("Tower: {reason}"));
-        }
-        let outcome = follow_once(&this).await;
+        let outcome = match enabled {
+            true => match this.ready().await {
+                Ok(_) => follow_once(&this).await,
+                Err(reason) => Err(reason),
+            },
+            false => follow_once(&this).await,
+        };
+        // The daemon may be gone with the stream; look again before reuse.
+        this.forget();
         let was_up = this.reported();
         if enabled || was_up {
             match outcome {
@@ -830,9 +1103,8 @@ mod tests {
     }
 
     #[test]
-    fn without_the_flag_the_cli_never_starts_a_daemon() {
-        assert_eq!(cli_args(false, &["events"]), ["--no-start", "events"]);
-        assert_eq!(cli_args(true, &["events"]), ["events"]);
+    fn the_cli_never_starts_a_daemon() {
+        assert_eq!(cli_args(&["events"]), ["--no-start", "events"]);
     }
 
     #[test]
@@ -894,7 +1166,7 @@ mod tests {
             on_host(
                 &home,
                 &bin,
-                &remote_command(&["rpc", "session.open", params]),
+                &remote_command(None, &["rpc", "session.open", params]),
                 b"",
             )
         };
@@ -911,6 +1183,16 @@ mod tests {
             r#"echo deployed "$1""#,
         );
         assert_eq!(String::from_utf8_lossy(&run().stdout), "deployed rpc\n");
+        // A CLI the link settled on runs as named, whatever else is there.
+        let settled = dir.path().join("it's here/tower-cli");
+        executable(&settled, r#"echo settled "$1""#);
+        let out = on_host(
+            &home,
+            &bin,
+            &remote_command(Some(settled.to_str().unwrap()), &["rpc"]),
+            b"",
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "settled rpc\n");
         assert_eq!(
             json_in("motd\n{\"id\":\"ag-1\"}\n"),
             Some(serde_json::json!({"id": "ag-1"}))
@@ -961,7 +1243,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            cli_args(crate::tower::enabled(), &["attach", "ag-1"]).join("\n") + "\n"
+            cli_args(&["attach", "ag-1"]).join("\n") + "\n"
         );
     }
 
@@ -984,34 +1266,170 @@ mod tests {
         };
         stage("d1", "tower-cli", true, "echo tower-cli 0.1.0");
         stage("d1", "tower", false, "exit 0");
-        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
-        assert!(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .nth(1)
-                .is_none_or(str::is_empty)
-        );
+        assert_eq!(probe(&home, &bin).current, "");
         let out = on_host(&home, &bin, &login_shell_safe(&publish_script("d1")), b"");
         assert!(out.status.success(), "{out:?}");
         assert!(root.join("d1/tower-cli").is_file() && root.join("d1/tower").is_file());
         assert!(!root.join("d1.incoming").exists());
         // Builds no process runs from are removed; `current` names the new one.
         assert!(!root.join("old").exists() && !root.join("gone.incoming").exists());
-        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).lines().nth(1),
-            Some("d1")
-        );
+        assert_eq!(probe(&home, &bin).current, "d1");
 
         // A build the host cannot run is never published.
         stage("d2", "tower-cli", true, "exit 1");
         let out = on_host(&home, &bin, &login_shell_safe(&publish_script("d2")), b"");
         assert!(!out.status.success());
         assert!(!root.join("d2").exists());
-        let out = on_host(&home, &bin, &login_shell_safe(&probe_script()), b"");
+        assert_eq!(probe(&home, &bin).current, "d1");
+    }
+
+    fn probe(home: &std::path::Path, bin: &std::path::Path) -> Probe {
+        let out = on_host(home, bin, &login_shell_safe(&probe_script()), b"");
+        assert!(out.status.success(), "{out:?}");
+        Probe::parse(&String::from_utf8_lossy(&out.stdout)).expect("a probe report")
+    }
+
+    /// A `PATH` wrapper around a build that is gone is no CLI, so the
+    /// deployed one is found instead; a working one on `PATH` comes first.
+    #[test]
+    fn the_probe_finds_a_cli_that_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let found = probe(&home, &bin);
+        assert_eq!(found.cli, None);
+        assert_eq!(found.home, home.to_str().unwrap());
+        assert!(!found.platform.is_empty());
+
+        executable(&bin.join("tower-cli"), "exit 127");
+        assert_eq!(probe(&home, &bin).cli, None);
+        let deployed = home.join(DEPLOY_REL).join("current/tower-cli");
+        executable(&deployed, "exit 0");
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).lines().nth(1),
-            Some("d1")
+            probe(&home, &bin).cli.as_deref(),
+            deployed.to_str(),
+            "the deployed CLI stands in for a broken one on PATH"
+        );
+        executable(&bin.join("tower-cli"), "exit 0");
+        assert_eq!(
+            probe(&home, &bin).cli.as_deref(),
+            bin.join("tower-cli").to_str()
+        );
+    }
+
+    /// The probe sees this account's Tower processes by their program name.
+    #[test]
+    fn the_probe_sees_a_running_daemon_and_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        let build = dir.path().join("build");
+        // Processes whose command lines name a deployed build's programs.
+        let mut running: Vec<_> = ["tower", "tower-terminal-pool"]
+            .into_iter()
+            .map(|name| {
+                std::process::Command::new("bash")
+                    .args(["-c", r#"exec -a "$0" bash -c "sleep 30; true""#])
+                    .arg(build.join(name))
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // They are seen once `exec` has renamed them; allow far longer.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            let found = probe(&home, &bin);
+            if (found.daemon && found.pool) || Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        for child in &mut running {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            found.daemon && found.pool,
+            "the probe never saw both processes: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_report_survives_a_chatty_login() {
+        let probe = Probe::parse(
+            "Welcome\nplatform=Linux x86_64\nhome=/h\ncurrent=\ncli=/h/bin/tower-cli\npool=1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            probe,
+            Probe {
+                platform: "Linux x86_64".into(),
+                home: "/h".into(),
+                current: String::new(),
+                cli: Some("/h/bin/tower-cli".into()),
+                daemon: false,
+                pool: true,
+            }
+        );
+        assert!(Probe::parse("motd only\n").is_none());
+    }
+
+    fn info(protocol: u16, pool: Option<u16>) -> tower_protocol::DaemonInfo {
+        serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "protocol_version": {"major": protocol, "minor": 0},
+            "pid": 7, "host_id": "h", "node_name": "n", "mode": "local",
+            "pool": {"running": pool.is_some(),
+                     "proto_version": pool.map(|major| serde_json::json!({"major": major, "minor": 0}))},
+            "allgather": {"connected": false, "policy_revision": null},
+            "startup": "detached",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_daemon_and_pool_speaking_this_builds_protocols_are_used() {
+        let ours = tower_protocol::PROTOCOL_VERSION.major;
+        let pool = tower_pool_proto::VERSION;
+        assert!(compatible(&info(ours, Some(pool))).is_ok());
+        for (theirs, reason) in [
+            (info(ours + 1, Some(pool)), "speaks protocol"),
+            (info(ours, Some(pool + 1)), "pool speaks protocol"),
+            (info(ours, None), "without its terminal pool"),
+        ] {
+            let error = compatible(&theirs).unwrap_err();
+            assert!(
+                error.contains(reason) && error.contains("manual care"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The deployed pool and daemon both start, in the login shell, each
+    /// asked to detach.
+    #[test]
+    fn a_launch_starts_the_deployed_pool_and_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        let current = home.join(DEPLOY_REL).join("current");
+        let log = dir.path().join("log");
+        for name in ["tower-terminal-pool", "tower"] {
+            executable(
+                &current.join(name),
+                &format!(r#"echo "{name} $*" >> "{}""#, log.display()),
+            );
+        }
+        let line = format!(
+            "{} {}",
+            login_shell_safe(&launch_script()),
+            login_shell_quote_arg(LAUNCH_COMMAND)
+        );
+        let out = on_host(&home, &bin, &line, b"");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "tower-terminal-pool run --detach\ntower run --detach\n"
         );
     }
 }

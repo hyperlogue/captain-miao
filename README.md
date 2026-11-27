@@ -256,12 +256,14 @@ on that host use its Tower daemon. With
 `[launcher] pooled = true`, this machine's new sessions also run under its own
 Tower daemon, so a machine used both as a desktop and as an SSH host shows the
 same Tower sessions to its own dashboard and to remote ones. Embedded Tower
-sessions started without pooling are not listed in pooled mode. A `miao`
-built with `cargo xtask dist --tower` carries Tower and uploads it to each enabled host
-that runs a different build, under `~/.cache/captain-miao/tower/`; otherwise
-install Tower there so `tower-cli` is on the login shell's `PATH`. A deployed
-build wins over the one on `PATH`, and `tower-cli` starts the daemon when
-needed. A daemon already running keeps running its own build. `miao-server` still serves the rest of the host (resume list, directory
+sessions started without pooling are not listed in pooled mode. Before
+launching there, Miao finds a working `tower-cli` on the host (login shell
+`PATH`, then `~/.cache/captain-miao/tower/`). A daemon and terminal pool already
+running are used when they speak this Miao's Tower protocols. When neither
+runs, a `miao` built with `cargo xtask dist --tower` uploads the Tower it
+carries to `~/.cache/captain-miao/tower/` and starts both, detached. Any other
+state, such as a daemon without its pool or an incompatible build, fails the
+launch with a message and is left to you. `miao-server` still serves the rest of the host (resume list, directory
 picker, vitals, VCS), and its sessions show `↻`. A remote Tower session's window
 runs `tower-cli attach`.
 

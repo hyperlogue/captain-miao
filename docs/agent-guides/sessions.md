@@ -101,14 +101,22 @@ owns the local side and the record-to-row mapping both sides use;
   ssh master in the login shell: `events --topics agents` for records, `rpc`
   for `session.open` (deferred until the first attach), `session.kill` and
   `session.tags.patch`, and `attach` in the window.
-- With the flag on and Tower embedded (`server_payload::TOWER_PAYLOADS`), the
-  link probes `uname -sm` and the `current` link under
-  `~/.cache/captain-miao/tower/` before following, and uploads the build for
-  the first candidate target that `tower-cli --version` accepts. Builds are
-  never replaced in place: each lives in a directory named by its digest, so a
-  running daemon keeps its files; the deploy removes only builds no process
-  runs from. The remote command runs `current/tower-cli` when present, else
-  the one on `PATH`. A failed build is not re-sent for five minutes.
+- With the flag on, `TowerLink::ready` settles the host's Tower before
+  events are followed and before each launch, which waits for it. One probe
+  reports the platform, the `current` link under `~/.cache/captain-miao/tower/`,
+  the first `tower-cli` whose `--version` runs (login `PATH`, then
+  `current`), and whether this account runs `tower` or `tower-terminal-pool`.
+  Without a working CLI, the embedded build (`server_payload::TOWER_PAYLOADS`,
+  all three binaries) is uploaded. `daemon status` through that CLI decides:
+  a daemon on this build's protocol major whose pool speaks this build's
+  `tower_pool_proto::VERSION` is used; with neither process running, the
+  embedded build is deployed if `current` is another, its pool and daemon are
+  started with `run --detach` from the login shell, and the link waits for
+  both. Any other state is an error for the user to resolve, never a restart.
+- Builds are never replaced in place: each lives in a directory named by its
+  digest, and the deploy removes only builds no process runs from. A failed
+  build is not re-sent for five minutes. Every CLI call passes `--no-start`,
+  so only `ready` starts Tower; a lost event stream makes it look again.
 - `miao-server` still serves resume candidates, directory queries, vitals,
   Codex config and VCS. Its rows are merged with Tower's and marked.
 - A remote Tower row is keyed by a hash of its Tower id with the high bit
@@ -119,8 +127,8 @@ owns the local side and the record-to-row mapping both sides use;
   display only, every restart is the user's, and neither launcher removes the
   other's hooks (Grok's live in separate files; each hook routes only through
   its own launcher's environment). With the flag unset the link still
-  follows each host's Tower, passing `--no-start`, so its sessions stay
-  operable without starting a daemon; new sessions go to `miao-server`.
+  follows each host's Tower, with no deploy or start, so its sessions stay
+  operable; new sessions go to `miao-server`.
 - `tower-cli` treats a caller with `CLAUDE_CODE_SESSION_ID` or
   `CODEX_THREAD_ID` set as an agent and refuses admin calls; ssh does not
   forward them by default.

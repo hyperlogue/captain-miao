@@ -82,11 +82,6 @@ pub(crate) fn tower_bundle(target: &str) -> Option<(String, &'static TowerPayloa
         .map(|p| (p.sha256[..16].to_string(), p))
 }
 
-/// Whether this binary carries any Tower at all.
-pub(crate) fn carries_tower() -> bool {
-    !TOWER_PAYLOADS.is_empty()
-}
-
 // The table `build.rs` generates: one `ServerPayload` per line of the manifest,
 // each `packed` an `include_bytes!` of the archive. Empty — a `&[]` costing nothing —
 // whenever `CM_SERVER_PAYLOAD_MANIFEST` was unset, which is every ordinary build.
