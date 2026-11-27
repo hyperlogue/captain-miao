@@ -49,9 +49,9 @@ tar.workspace = true
 cm-core = { path = "crates/cm-core" }
 # Tower runs local sessions when `CAPTAIN_MIAO_TOWER` is set (src/tower.rs).
 # One revision for both, so the launcher and its contract cannot drift.
-tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
-tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
-tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
+tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "65005d761806faa2b4a0bb42f6fd6909fae0963c" }
+tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "65005d761806faa2b4a0bb42f6fd6909fae0963c" }
+tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "65005d761806faa2b4a0bb42f6fd6909fae0963c" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
