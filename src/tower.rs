@@ -39,9 +39,9 @@ const RESUME: &str = "--tower-resume";
 /// Continue [`RESUME`] as a new conversation.
 const FORK: &str = "--tower-fork";
 
-/// The tags that hold a session's dashboard flags.
+/// The tag that holds a session's pin. Follow-up is Tower's own
+/// `needs_attention`, which the daemon raises and only a client clears.
 pub(crate) const PINNED: &str = "pinned";
-pub(crate) const FOLLOW_UP: &str = "follow-up";
 
 pub(crate) fn enabled() -> bool {
     std::env::var(FLAG)
@@ -403,7 +403,7 @@ pub(crate) fn row(
     };
     let flags = SessionFlags {
         pinned: record.tags.contains(PINNED),
-        follow_up: record.tags.contains(FOLLOW_UP),
+        follow_up: record.needs_attention,
     };
     LauncherState {
         agent: Harness::parse(&record.harness).map_or(AgentKind::Unknown, agent),
@@ -479,8 +479,9 @@ pub(crate) fn stop(key: &SessionKey) -> Option<io::Result<()>> {
     }
 }
 
-/// Stores `flags` as tags on the session `key` names. `None` means Tower
-/// runs no such session.
+/// Stores `flags` on the session `key` names: the pin as a tag, and a
+/// cleared follow-up as an acknowledged attention. Tower alone raises
+/// attention. `None` means Tower runs no such session.
 pub(crate) fn set_flags(key: &SessionKey, flags: SessionFlags) -> Option<bool> {
     if !has_records() {
         return None;
@@ -488,12 +489,10 @@ pub(crate) fn set_flags(key: &SessionKey, flags: SessionFlags) -> Option<bool> {
     let local = local().ok()?;
     let id = find(&local, key).ok()??;
     let (mut add, mut remove) = (Vec::new(), Vec::new());
-    for (tag, set) in [(PINNED, flags.pinned), (FOLLOW_UP, flags.follow_up)] {
-        if set { &mut add } else { &mut remove }.push(tag.to_string());
-    }
+    if flags.pinned { &mut add } else { &mut remove }.push(PINNED.to_string());
     Some(
         local
-            .patch_tags(&id, &add, &remove, false)
+            .patch_tags(&id, &add, &remove, !flags.follow_up)
             .inspect_err(|error| tracing::warn!("could not store session flags: {error}"))
             .is_ok(),
     )
@@ -613,11 +612,14 @@ mod tests {
         // A later event in the same turn keeps the turn's start.
         let later = super::row(record("working", 9_000_000), "/home/miao", &mut since);
         assert_eq!((later.updated_at, later.active_since), (9_000, Some(5_000)));
-        let idle = super::row(record("idle", 9_500_000), "/home/miao", &mut since);
+        let mut finished = record("idle", 9_500_000);
+        finished.needs_attention = true;
+        let idle = super::row(finished, "/home/miao", &mut since);
         assert_eq!(
             (idle.status, idle.active_since),
             (SessionStatus::Idle, None)
         );
+        assert!(idle.flags.is_some_and(|flags| flags.follow_up));
         assert!(since.is_empty());
     }
 

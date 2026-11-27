@@ -89,8 +89,11 @@ owns the local side and the record-to-row mapping both sides use;
 - A Tower row keeps the launcher pid as its `SessionKey` and the dashboard's
   launch id as its Tower session id and binding token. Tower's records live
   below `tower/` in the state root; the launcher removes its own on exit.
-- Pin and follow-up are Tower tags on those sessions, not `session-flags.json`
-  entries. Tower sessions get no automatic flag transitions yet.
+- A pin is a Tower tag on those sessions, not a `session-flags.json` entry.
+  Follow-up is Tower's `needs_attention`: the daemon raises it on its own
+  transitions (a finished turn, a wait, an error, an unrequested exit) and
+  miao only clears it (`session.attention.clear`), so turning it on by hand
+  has no effect on a Tower session.
 - Under pooled-localhost, this machine's `RemoteBackend` holds a local
   `TowerLink` (`RemoteBackend::connect_this_machine`) that runs the same CLI
   through `/bin/sh` and the login shell, so it shares one daemon with

@@ -246,23 +246,34 @@ impl TowerLink {
     }
 
     pub(crate) async fn set_flags(&self, id: &str, flags: SessionFlags) -> bool {
-        let (mut add, mut remove) = (Vec::new(), Vec::new());
-        for (tag, set) in [
-            (crate::tower::PINNED, flags.pinned),
-            (crate::tower::FOLLOW_UP, flags.follow_up),
-        ] {
-            if set { &mut add } else { &mut remove }.push(tag);
-        }
-        self.rpc(
-            "session.tags.patch",
-            serde_json::json!({"id": id, "add": add, "remove": remove}),
-        )
-        .await
-        .inspect_err(|failure| {
-            self.log
-                .error(format!("Tower could not tag {id}: {failure}"))
-        })
-        .is_ok()
+        let pin = crate::tower::PINNED;
+        let (add, remove): (&[&str], &[&str]) = if flags.pinned {
+            (&[pin], &[])
+        } else {
+            (&[], &[pin])
+        };
+        let tagged = self
+            .rpc(
+                "session.tags.patch",
+                serde_json::json!({"id": id, "add": add, "remove": remove}),
+            )
+            .await
+            .inspect_err(|failure| {
+                self.log
+                    .error(format!("Tower could not tag {id}: {failure}"))
+            })
+            .is_ok();
+        // Tower alone raises attention, so only a cleared follow-up is sent.
+        let acknowledged = flags.follow_up
+            || self
+                .rpc("session.attention.clear", serde_json::json!({"id": id}))
+                .await
+                .inspect_err(|failure| {
+                    self.log
+                        .error(format!("Tower could not clear {id}'s attention: {failure}"))
+                })
+                .is_ok();
+        tagged && acknowledged
     }
 
     /// Call one of the daemon's methods through the host's CLI.
@@ -1014,7 +1025,7 @@ mod tests {
                      "reply_path": false, "steer": false},
             "pool_session": "p", "attach_count": 1, "sources": [],
             "registered_at": 1, "updated_at": 2000, "last_seen": 1,
-            "revision": 1, "tags": ["follow-up"], "sync_state": "synced",
+            "revision": 1, "tags": [], "needs_attention": true, "sync_state": "synced",
         })
     }
 
