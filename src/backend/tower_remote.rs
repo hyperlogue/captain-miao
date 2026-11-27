@@ -363,9 +363,10 @@ impl TowerLink {
                 }
                 Err(failure) => return Err(failure),
             };
-            let handle = connection.handle();
-            drop(connection);
-            match handle.call(method, &params).await {
+            // Hold the connection through the call: the follower releasing
+            // this endpoint (a lagged subscription, say) must not cut off a
+            // request already on a healthy socket.
+            match connection.handle().call(method, &params).await {
                 Ok(result) => {
                     return serde_json::to_value(result).map_err(|e| Failure {
                         unreachable: false,
@@ -1460,6 +1461,34 @@ mod tests {
             .unwrap();
         assert_eq!(tower.calls("session.open"), 1);
         assert_eq!(tower.calls("hello"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_released_endpoint_lets_a_call_in_flight_finish() {
+        let tower = MockTower::start(vec![], vec![], &[]);
+        let link = tower.link();
+        let (generation, connection) = link.connection().await.unwrap();
+        drop(connection);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let event = serde_json::json!({"jsonrpc":"2.0","method":"agent.changed","params":{
+            "id":"ag-pending","seq":2,"record":record("ag-pending","working","owned")}});
+        *tower.delayed_open.lock().unwrap() = Some(DelayedOpen {
+            event,
+            release: wait,
+        });
+        let open = tokio::spawn({
+            let link = link.clone();
+            async move { link.rpc("session.open", serde_json::json!({})).await }
+        });
+        until("session.open reaching the daemon", || {
+            tower.calls("session.open") == 1
+        })
+        .await;
+        // What the follower does when its subscription ends on a live socket.
+        link.release(generation).await;
+        release.send(()).unwrap();
+        assert_eq!(open.await.unwrap().unwrap()["id"], "ag-new");
+        assert_eq!(tower.calls("session.open"), 1);
     }
 
     #[tokio::test]
