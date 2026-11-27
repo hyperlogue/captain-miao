@@ -313,9 +313,10 @@ impl TowerLink {
     /// Settle which Tower the host runs, starting this dashboard's when none
     /// of it is: find a working `tower-cli` (login `PATH`, then
     /// [`DEPLOY_REL`]), uploading this dashboard's build when there is none;
-    /// ask it about the daemon and pool; use both when they run and speak
-    /// this build's protocols; upload and start both when neither runs.
-    /// Anything in between is left to the user. Returns the CLI to use.
+    /// ask it about the daemon; use a daemon that speaks this build's
+    /// protocol; upload and start this build's when no daemon runs. Anything
+    /// else is left to the user. The terminal pool is the daemon's business:
+    /// it starts the one beside its own binary. Returns the CLI to use.
     pub(crate) async fn ready(&self) -> Result<String, String> {
         let _preparing = self.preparing.lock().await;
         if let Some(cli) = self.cli() {
@@ -347,10 +348,9 @@ impl TowerLink {
         };
         match self.status(&cli).await {
             Ok(info) => compatible(&info).map(|()| cli),
-            Err(reason) if probe.daemon || probe.pool => Err(format!(
-                "{} running, but `{cli} daemon status` failed ({reason}); \
-                 this needs manual care on the host",
-                probe.running()
+            Err(reason) if probe.daemon => Err(format!(
+                "a Tower daemon is running, but `{cli} daemon status` failed \
+                 ({reason}); this needs manual care on the host"
             )),
             Err(_) => {
                 if !installed {
@@ -367,7 +367,7 @@ impl TowerLink {
     }
 
     /// What the host has: its platform, the deployed build, a working CLI,
-    /// and whether a Tower daemon or pool runs under this account.
+    /// and whether a Tower daemon runs under this account.
     async fn probe(&self) -> Result<Probe, String> {
         let (status, stdout, stderr) = self.shell(login_shell_safe(&probe_script()), None).await?;
         if !status.success() {
@@ -406,8 +406,8 @@ impl TowerLink {
             .ok_or_else(|| format!("`{CLI} daemon status` printed no report"))
     }
 
-    /// Start the deployed daemon and pool, detached, from the login shell so
-    /// their sessions get its environment, and wait until both answer.
+    /// Start the deployed daemon, detached, from the login shell so its
+    /// sessions get that environment, and wait until it answers.
     async fn launch(&self, cli: &str) -> Result<(), String> {
         self.log.info("starting Tower on the host");
         let line = format!(
@@ -425,8 +425,7 @@ impl TowerLink {
         let deadline = Instant::now() + LAUNCH_TIMEOUT;
         loop {
             let last = match self.status(cli).await {
-                Ok(info) if info.pool.running => return compatible(&info),
-                Ok(_) => "its pool is not running".to_string(),
+                Ok(info) => return compatible(&info),
                 Err(reason) => reason,
             };
             if Instant::now() >= deadline {
@@ -713,10 +712,9 @@ const LAUNCH_POLL: Duration = Duration::from_millis(250);
 
 /// What a host reports, one `key=value` line each: its platform, `$HOME`,
 /// the build `current` names, the first `tower-cli` that runs (login `PATH`,
-/// then the deployed one), and whether this account runs a Tower daemon or
-/// pool. A `PATH` entry may be a wrapper around a build that is gone, so a
-/// CLI counts only when `--version` succeeds. The process patterns bracket a
-/// letter so they never match this script's own command line.
+/// then the deployed one), and whether this account runs a Tower daemon. A `PATH` entry may be a wrapper around a build that is gone, so a
+/// CLI counts only when `--version` succeeds. The process pattern brackets a
+/// letter so it never matches this script's own command line.
 fn probe_script() -> String {
     format!(
         "echo platform=$(uname -sm); echo home=$HOME; \
@@ -728,7 +726,6 @@ fn probe_script() -> String {
          done; echo cli=$cli; \
          u=$(id -u); \
          pgrep -u \"$u\" -f \"^[^ ]*[t]ower( |$)\" >/dev/null 2>&1 && echo daemon=1; \
-         pgrep -u \"$u\" -f \"^[^ ]*[t]ower-terminal-pool( |$)\" >/dev/null 2>&1 && echo pool=1; \
          true"
     )
 }
@@ -741,7 +738,6 @@ struct Probe {
     current: String,
     cli: Option<String>,
     daemon: bool,
-    pool: bool,
 }
 
 impl Probe {
@@ -763,20 +759,10 @@ impl Probe {
                 "current" => probe.current = value,
                 "cli" => probe.cli = Some(value).filter(|cli| !cli.is_empty()),
                 "daemon" => probe.daemon = value == "1",
-                "pool" => probe.pool = value == "1",
                 _ => {}
             }
         }
         (seen && !probe.home.is_empty()).then_some(probe)
-    }
-
-    /// Which of Tower's processes run, for an error message.
-    fn running(&self) -> &'static str {
-        match (self.daemon, self.pool) {
-            (true, true) => "a Tower daemon and pool are",
-            (true, false) => "a Tower daemon is",
-            _ => "a Tower terminal pool is",
-        }
     }
 }
 
@@ -803,9 +789,8 @@ impl Bundles {
     }
 }
 
-/// Whether a running daemon and pool are ones this dashboard can drive: the
-/// daemon speaks this build's protocol major and its pool runs this build's
-/// pool protocol.
+/// Whether a running daemon is one this dashboard can drive: it speaks this
+/// build's protocol major.
 fn compatible(info: &tower_protocol::DaemonInfo) -> Result<(), String> {
     let theirs = info.protocol_version.major;
     let ours = tower_protocol::PROTOCOL_VERSION.major;
@@ -816,25 +801,13 @@ fn compatible(info: &tower_protocol::DaemonInfo) -> Result<(), String> {
             info.version
         ));
     }
-    match info.pool.proto_version.as_ref().map(|v| v.major) {
-        Some(major) if major == tower_pool_proto::VERSION => Ok(()),
-        Some(major) => Err(format!(
-            "the host's Tower terminal pool speaks protocol {major}, not {}; \
-             this needs manual care on the host",
-            tower_pool_proto::VERSION
-        )),
-        None => Err(format!(
-            "the host's Tower {} runs without its terminal pool; \
-             this needs manual care on the host",
-            info.version
-        )),
-    }
+    Ok(())
 }
 
-/// The deployed build's pool, then its daemon, each detaching itself. Runs
-/// in the login shell with `CM_TOWER_DIR` naming the build.
-const LAUNCH_COMMAND: &str =
-    "\"$CM_TOWER_DIR/tower-terminal-pool\" run --detach && \"$CM_TOWER_DIR/tower\" run --detach";
+/// The deployed build's daemon, detaching itself. It starts the terminal
+/// pool beside its own binary when a session first needs one. Runs in the
+/// login shell with `CM_TOWER_DIR` naming the build.
+const LAUNCH_COMMAND: &str = "exec \"$CM_TOWER_DIR/tower\" run --detach";
 
 /// Run [`LAUNCH_COMMAND`], passed as `$0`, in the account's login shell.
 fn launch_script() -> String {
@@ -1318,15 +1291,15 @@ mod tests {
         );
     }
 
-    /// The probe sees this account's Tower processes by their program name.
+    /// The probe sees this account's Tower daemon by its program name.
     #[test]
-    fn the_probe_sees_a_running_daemon_and_pool() {
+    fn the_probe_sees_a_running_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
         std::fs::create_dir_all(&home).unwrap();
         let build = dir.path().join("build");
-        // Processes whose command lines name a deployed build's programs.
-        let mut running: Vec<_> = ["tower", "tower-terminal-pool"]
+        // A process whose command line names a deployed build's daemon.
+        let mut running: Vec<_> = ["tower"]
             .into_iter()
             .map(|name| {
                 std::process::Command::new("bash")
@@ -1340,7 +1313,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let found = loop {
             let found = probe(&home, &bin);
-            if (found.daemon && found.pool) || Instant::now() >= deadline {
+            if found.daemon || Instant::now() >= deadline {
                 break found;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1349,16 +1322,13 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        assert!(
-            found.daemon && found.pool,
-            "the probe never saw both processes: {found:?}"
-        );
+        assert!(found.daemon, "the probe never saw the daemon: {found:?}");
     }
 
     #[test]
     fn a_probe_report_survives_a_chatty_login() {
         let probe = Probe::parse(
-            "Welcome\nplatform=Linux x86_64\nhome=/h\ncurrent=\ncli=/h/bin/tower-cli\npool=1\n",
+            "Welcome\nplatform=Linux x86_64\nhome=/h\ncurrent=\ncli=/h/bin/tower-cli\ndaemon=1\n",
         )
         .unwrap();
         assert_eq!(
@@ -1368,53 +1338,46 @@ mod tests {
                 home: "/h".into(),
                 current: String::new(),
                 cli: Some("/h/bin/tower-cli".into()),
-                daemon: false,
-                pool: true,
+                daemon: true,
             }
         );
         assert!(Probe::parse("motd only\n").is_none());
     }
 
-    fn info(protocol: u16, pool: Option<u16>) -> tower_protocol::DaemonInfo {
+    fn info(protocol: u16) -> tower_protocol::DaemonInfo {
         serde_json::from_value(serde_json::json!({
             "version": "0.1.0",
             "protocol_version": {"major": protocol, "minor": 0},
             "pid": 7, "host_id": "h", "node_name": "n", "mode": "local",
-            "pool": {"running": pool.is_some(),
-                     "proto_version": pool.map(|major| serde_json::json!({"major": major, "minor": 0}))},
+            "pool": {"running": false, "proto_version": null},
             "allgather": {"connected": false, "policy_revision": null},
             "startup": "detached",
         }))
         .unwrap()
     }
 
+    /// A daemon on this build's protocol is used whether or not its pool
+    /// has started yet.
     #[test]
-    fn only_a_daemon_and_pool_speaking_this_builds_protocols_are_used() {
+    fn only_a_daemon_speaking_this_builds_protocol_is_used() {
         let ours = tower_protocol::PROTOCOL_VERSION.major;
-        let pool = tower_pool_proto::VERSION;
-        assert!(compatible(&info(ours, Some(pool))).is_ok());
-        for (theirs, reason) in [
-            (info(ours + 1, Some(pool)), "speaks protocol"),
-            (info(ours, Some(pool + 1)), "pool speaks protocol"),
-            (info(ours, None), "without its terminal pool"),
-        ] {
-            let error = compatible(&theirs).unwrap_err();
-            assert!(
-                error.contains(reason) && error.contains("manual care"),
-                "{error}"
-            );
-        }
+        assert!(compatible(&info(ours)).is_ok());
+        let error = compatible(&info(ours + 1)).unwrap_err();
+        assert!(
+            error.contains("speaks protocol") && error.contains("manual care"),
+            "{error}"
+        );
     }
 
-    /// The deployed pool and daemon both start, in the login shell, each
-    /// asked to detach.
+    /// Only the deployed daemon starts, in the login shell, asked to detach.
     #[test]
-    fn a_launch_starts_the_deployed_pool_and_daemon() {
+    fn a_launch_starts_the_deployed_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
         let current = home.join(DEPLOY_REL).join("current");
         let log = dir.path().join("log");
         for name in ["tower-terminal-pool", "tower"] {
+            // A pool there is the daemon's to start, never the launch's.
             executable(
                 &current.join(name),
                 &format!(r#"echo "{name} $*" >> "{}""#, log.display()),
@@ -1429,7 +1392,7 @@ mod tests {
         assert!(out.status.success(), "{out:?}");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "tower-terminal-pool run --detach\ntower run --detach\n"
+            "tower run --detach\n"
         );
     }
 }

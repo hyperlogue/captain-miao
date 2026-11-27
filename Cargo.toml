@@ -52,8 +52,6 @@ cm-core = { path = "crates/cm-core" }
 tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
 tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
 tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
-# A remote host's running pool must speak the version this Tower build does.
-tower-pool-proto = { git = "https://github.com/hyperlogue/tower", rev = "0a489826a7a63fa82665cba80fdf7be94e8f42e8" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }

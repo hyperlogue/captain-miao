@@ -105,14 +105,16 @@ owns the local side and the record-to-row mapping both sides use;
   events are followed and before each launch, which waits for it. One probe
   reports the platform, the `current` link under `~/.cache/captain-miao/tower/`,
   the first `tower-cli` whose `--version` runs (login `PATH`, then
-  `current`), and whether this account runs `tower` or `tower-terminal-pool`.
-  Without a working CLI, the embedded build (`server_payload::TOWER_PAYLOADS`,
-  all three binaries) is uploaded. `daemon status` through that CLI decides:
-  a daemon on this build's protocol major whose pool speaks this build's
-  `tower_pool_proto::VERSION` is used; with neither process running, the
-  embedded build is deployed if `current` is another, its pool and daemon are
-  started with `run --detach` from the login shell, and the link waits for
-  both. Any other state is an error for the user to resolve, never a restart.
+  `current`), and whether this account runs a `tower` daemon. Without a
+  working CLI, the embedded build (`server_payload::TOWER_PAYLOADS`, all three
+  binaries) is uploaded. `daemon status` through that CLI decides: a daemon on
+  this build's protocol major is used; with no daemon running, the embedded
+  build is deployed if `current` is another, its daemon is started with
+  `run --detach` from the login shell, and the link waits for it. Any other
+  state is an error for the user to resolve, never a restart.
+- miao talks to Tower only through the daemon's RPC and ignores the terminal
+  pool: the daemon starts the `tower-terminal-pool` beside its own binary
+  when a session first needs it, so a deployed daemon runs its own pool.
 - Builds are never replaced in place: each lives in a directory named by its
   digest, and the deploy removes only builds no process runs from. A failed
   build is not re-sent for five minutes. Every CLI call passes `--no-start`,

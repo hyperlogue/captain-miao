@@ -271,7 +271,6 @@ dependencies = [
  "toml",
  "tower-agents",
  "tower-launcher",
- "tower-pool-proto",
  "tower-protocol",
  "tracing",
  "unicode-segmentation",
