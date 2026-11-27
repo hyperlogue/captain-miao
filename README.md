@@ -263,9 +263,11 @@ when it speaks this Miao's Tower protocol. When none runs, a `miao` built with
 `cargo xtask dist --tower` uploads the Tower it carries to
 `~/.cache/captain-miao/tower/` and starts its daemon, detached; that daemon
 starts its own terminal pool. Any other state, such as an incompatible daemon,
-fails the launch with a message and is left to you. `miao-server` still serves the rest of the host (resume list, directory
-picker, vitals, VCS), and its sessions show `↻`. A remote Tower session's window
-runs `tower-cli attach`.
+fails the launch with a message and is left to you. Miao then talks to the
+daemon over one forwarded socket for live session updates and commands. `miao-server`
+still serves the rest of the host (resume list, directory picker, vitals, VCS),
+and its sessions show `↻`. A remote Tower session's window runs
+`tower-cli attach`.
 
 Trying Tower changes nothing about sessions already running: they are only
 marked, never stopped or restarted unless you ask. Unset the variable to return

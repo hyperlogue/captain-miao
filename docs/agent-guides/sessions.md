@@ -95,15 +95,26 @@ owns the local side and the record-to-row mapping both sides use;
   miao only clears it (`session.attention.clear`), so turning it on by hand
   has no effect on a Tower session.
 - Under pooled-localhost, this machine's `RemoteBackend` holds a local
-  `TowerLink` (`RemoteBackend::connect_this_machine`) that runs the same CLI
-  through `/bin/sh` and the login shell, so it shares one daemon with
-  dashboards reaching this machine over SSH. Embedded Tower sessions started
+  `TowerLink` (`RemoteBackend::connect_this_machine`) that reaches this
+  machine's Tower socket directly and runs the same CLI through `/bin/sh` and
+  the login shell, so it shares one daemon with dashboards reaching this
+  machine over SSH. Embedded Tower sessions started
   in direct-local mode are not listed there. Other socket hosts get no link.
 - On an SSH host, `RemoteBackend` holds a `TowerLink` beside its
-  `miao-server` connection. It runs the host's `tower-cli` over the shared
-  ssh master in the login shell: `events --topics agents` for records, `rpc`
-  for `session.open` (deferred until the first attach), `session.kill` and
-  `session.tags.patch`, and `attach` in the window.
+  `miao-server` connection. It forwards the Tower daemon's socket over the
+  shared ssh master (`forward_unix_socket`, as `miao-server`'s is, onto
+  `state::tower_forward_sock`) and speaks Tower's protocol there through
+  `tower-client`. One connection carries the `agents` subscription and session
+  calls. A daemon predating `requests.concurrent.v1` pauses events during a call.
+  Miao retries an unsent request once. If a sent request loses its reply,
+  only kill, tag patch and attention clear can repeat. Opening a session
+  reserves it. A call timeout leaves the connection usable. Connection loss
+  releases that generation's forward and socket path. The window runs `tower-cli attach`.
+- The socket path comes from the daemon's `daemon status` report (`socket`),
+  or, for a daemon that predates it and for hosts where Tower is disabled,
+  from the probe: the login shell's `TOWER_SOCKET`, else
+  `$XDG_STATE_HOME/tower/run/towerd.sock`, as `tower_pal::Paths::discover`
+  places it.
 - With the flag on, `TowerLink::ready` settles the host's Tower before
   events are followed and before each launch, which waits for it. One probe
   reports the platform, the `current` link under `~/.cache/captain-miao/tower/`,
@@ -120,8 +131,9 @@ owns the local side and the record-to-row mapping both sides use;
   when a session first needs it, so a deployed daemon runs its own pool.
 - Builds are never replaced in place: each lives in a directory named by its
   digest, and the deploy removes only builds no process runs from. A failed
-  build is not re-sent for five minutes. Every CLI call passes `--no-start`,
-  so only `ready` starts Tower; a lost event stream makes it look again.
+  build is not re-sent for five minutes. Every CLI call passes `--no-start`
+  and socket connections never start a daemon, so only `ready` starts Tower;
+  a lost event stream makes it look again.
 - `miao-server` still serves resume candidates, directory queries, vitals,
   Codex config and VCS. Its rows are merged with Tower's and marked.
 - A remote Tower row is keyed by a hash of its Tower id with the high bit
@@ -134,9 +146,10 @@ owns the local side and the record-to-row mapping both sides use;
   its own launcher's environment). With the flag unset the link still
   follows each host's Tower, with no deploy or start, so its sessions stay
   operable; new sessions go to `miao-server`.
-- `tower-cli` treats a caller with `CLAUDE_CODE_SESSION_ID` or
-  `CODEX_THREAD_ID` set as an agent and refuses admin calls; ssh does not
-  forward them by default.
+- Socket calls carry an empty caller context, so Tower treats the dashboard
+  as a person even when it runs inside an agent session. The attach window's
+  `tower-cli` still treats a caller with `CLAUDE_CODE_SESSION_ID` or
+  `CODEX_THREAD_ID` set as an agent; ssh does not forward them by default.
 
 ## Backend and transport boundaries
 

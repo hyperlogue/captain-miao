@@ -6,26 +6,30 @@
 //! login shell instead of ssh, so the dashboard here and one reaching this
 //! machine over ssh share one daemon and see each other's sessions. When Tower is disabled for a host, sessions an earlier run started there
 //! stay listed and operable, but no daemon is started and nothing new runs
-//! on Tower. The dashboard drives that host's `tower-cli` over the
-//! host's shared ssh connection: `tower-cli events` streams the daemon's
-//! session records, `tower-cli rpc` opens, stops and tags sessions, and an
-//! attach window runs `tower-cli attach`. The CLI never starts a daemon:
-//! [`TowerLink::ready`] settles which Tower the host runs first, and starts
-//! the one this dashboard carries only when none of it is running (see
-//! [`DEPLOY_REL`]).
+//! on Tower. The dashboard speaks Tower's protocol on the daemon's own
+//! socket, forwarded over the host's shared ssh connection like
+//! `miao-server`'s (reached directly under pooled-localhost): one connection
+//! follows the session records and opens, stops and tags sessions. Daemons
+//! predating `requests.concurrent.v1` pause events while handling a call. Only
+//! an attach window runs `tower-cli attach`. Nothing here starts a daemon
+//! except [`TowerLink::ready`], which settles which Tower the host runs first,
+//! and starts the one this dashboard carries only when none of it is running
+//! (see [`DEPLOY_REL`]). The socket's path comes from the daemon's report, or
+//! for a daemon that predates it, from the login shell's environment.
 //!
 //! `miao-server` keeps serving everything else for the host: its sessions
 //! (marked for a restart), resume candidates, directory queries, vitals and
 //! VCS. Rows from both are merged by [`super::RemoteBackend`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tower_client::{Connection, Error};
 use tower_protocol::AgentRecord;
 
 use super::{
@@ -37,10 +41,9 @@ use crate::state::{self, HostId, LauncherState, SessionFlags, SessionKey};
 /// Tower's command-line client, found on the host's login `PATH`.
 const CLI: &str = "tower-cli";
 
-/// The largest event line accepted. The first one carries every record.
-const MAX_EVENT_BYTES: usize = 32 * 1024 * 1024;
-
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many times a new forward's local socket is looked for.
+const FORWARD_ATTEMPTS: u32 = 8;
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// A stream that lasted this long was healthy, so its loss retries promptly.
@@ -69,6 +72,7 @@ pub(crate) struct TowerLink {
     dirty: Arc<AtomicBool>,
     log: Arc<ConnLog>,
     task: OnceLock<tokio::task::AbortHandle>,
+    stopped: AtomicBool,
     /// The build whose deploy last failed, and when, so a host that refuses
     /// it is not sent tens of megabytes on every reconnect.
     refused: Mutex<Option<(String, Instant)>>,
@@ -77,6 +81,25 @@ pub(crate) struct TowerLink {
     /// Held while [`Self::ready`] inspects or starts the host's Tower, so a
     /// launch waits for an upload already under way instead of racing it.
     preparing: tokio::sync::Mutex<()>,
+    /// The daemon's socket on the host, once known.
+    socket: Mutex<Option<String>>,
+    /// Serializes connection setup and teardown for this host's forward.
+    endpoint: tokio::sync::Mutex<Option<Endpoint>>,
+    #[cfg(test)]
+    probe_socket: OnceLock<PathBuf>,
+    generation: AtomicU64,
+}
+
+/// The local socket a link connects to: the daemon's own under
+/// pooled-localhost, or a forward of it.
+struct Endpoint {
+    connection: Option<Arc<Connection>>,
+    local: PathBuf,
+    remote: String,
+    generation: u64,
+    /// The `-N` child that asked for the forward; see
+    /// [`super::forward_unix_socket`].
+    _forward: Option<tokio::process::Child>,
 }
 
 /// Why a CLI call failed. `unreachable` means the command may never have
@@ -84,7 +107,34 @@ pub(crate) struct TowerLink {
 #[derive(Debug)]
 struct Failure {
     unreachable: bool,
+    /// Tower's error code, for a call the daemon refused.
+    code: Option<String>,
     message: String,
+}
+
+impl Failure {
+    fn call(method: &str, error: Error) -> Self {
+        if let Error::Rpc(rpc) = error {
+            return Self {
+                unreachable: false,
+                message: format!("{}: {}", rpc.data.code, rpc.message),
+                code: Some(rpc.data.code),
+            };
+        }
+        Self {
+            unreachable: false,
+            code: None,
+            message: format!("`{method}` failed: {error}"),
+        }
+    }
+
+    fn unreachable(message: impl Into<String>) -> Self {
+        Self {
+            unreachable: true,
+            code: None,
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for Failure {
@@ -135,9 +185,15 @@ impl TowerLink {
             dirty,
             log,
             task: OnceLock::new(),
+            stopped: AtomicBool::new(false),
             refused: Mutex::default(),
             cli: Mutex::default(),
             preparing: tokio::sync::Mutex::default(),
+            socket: Mutex::default(),
+            endpoint: tokio::sync::Mutex::default(),
+            #[cfg(test)]
+            probe_socket: OnceLock::new(),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -147,9 +203,19 @@ impl TowerLink {
         let _ = self.task.set(task.abort_handle());
     }
 
-    pub(crate) fn stop(&self) {
+    pub(crate) fn stop(self: &Arc<Self>) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if let Some(task) = self.task.get() {
             task.abort();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let link = self.clone();
+            runtime.spawn(async move {
+                let mut slot = link.endpoint.lock().await;
+                link.clear_endpoint(&mut slot).await;
+            });
         }
     }
 
@@ -238,7 +304,7 @@ impl TowerLink {
         {
             Ok(_) => KillOutcome::Signalled,
             Err(failure) if failure.unreachable => KillOutcome::Unreachable,
-            Err(failure) if failure.message.to_lowercase().contains("not found") => {
+            Err(failure) if failure.code.as_deref() == Some("not_found") => {
                 KillOutcome::AlreadyGone
             }
             Err(failure) => KillOutcome::Failed(failure.message),
@@ -276,44 +342,154 @@ impl TowerLink {
         tagged && acknowledged
     }
 
-    /// Call one of the daemon's methods through the host's CLI.
+    /// Repeat an unsent request once. After delivery, only idempotent
+    /// methods can be retried: session.open reserves a new session.
     async fn rpc(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, Failure> {
-        let unreachable = |message: String| Failure {
-            unreachable: true,
-            message,
-        };
-        let child = self
-            .command(&["rpc", method, &params.to_string()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| unreachable(format!("could not run {}: {error}", self.runner())))?;
-        let (status, stdout, stderr) =
-            tokio::time::timeout(RPC_TIMEOUT, capped_output(child, REMOTE_OUTPUT_CAP))
-                .await
-                .map_err(|_| unreachable(format!("`{CLI} rpc {method}` timed out")))?
-                .map_err(|error| unreachable(format!("{} failed: {error}", self.runner())))?;
-        if !status.success() {
-            let message = stderr.trim().to_string();
-            let message = if message.is_empty() {
-                format!("`{CLI} rpc {method}` failed (rc={:?})", status.code())
-            } else {
-                message
+        let idempotent = matches!(
+            method,
+            "session.kill" | "session.tags.patch" | "session.attention.clear"
+        );
+        let mut retried = false;
+        loop {
+            let (generation, connection) = match self.connection().await {
+                Ok(connected) => connected,
+                Err(failure) if failure.unreachable && !retried => {
+                    retried = true;
+                    continue;
+                }
+                Err(failure) => return Err(failure),
             };
-            // ssh itself exits 255; the shell reports a missing CLI as 127.
-            return Err(Failure {
-                unreachable: matches!(status.code(), Some(255 | 127) | None),
-                message,
-            });
+            let handle = connection.handle();
+            drop(connection);
+            match handle.call(method, &params).await {
+                Ok(result) => {
+                    return serde_json::to_value(result).map_err(|e| Failure {
+                        unreachable: false,
+                        code: None,
+                        message: format!("`{method}` answered unreadably: {e}"),
+                    });
+                }
+                Err(error @ (Error::NotSent(_) | Error::Disconnected(_))) => {
+                    self.release(generation).await;
+                    if !retried && (matches!(error, Error::NotSent(_)) || idempotent) {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(Failure::unreachable(format!("`{method}` failed: {error}")));
+                }
+                Err(error) => return Err(Failure::call(method, error)),
+            }
         }
-        json_in(&stdout).ok_or_else(|| Failure {
-            unreachable: false,
-            message: format!("`{CLI} rpc {method}` printed no JSON"),
+    }
+
+    async fn connection(&self) -> Result<(u64, Arc<Connection>), Failure> {
+        let mut slot = self.endpoint.lock().await;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(Failure::unreachable("Tower link has stopped"));
+        }
+        if slot.is_none() {
+            *slot = Some(self.open_endpoint().await?);
+        }
+        let endpoint = slot.as_mut().expect("endpoint just opened");
+        if let Some(connection) = &endpoint.connection {
+            return Ok((endpoint.generation, connection.clone()));
+        }
+        match Connection::connect_at(&endpoint.local, Default::default()).await {
+            Ok(connection) => {
+                let connection = Arc::new(connection);
+                endpoint.connection = Some(connection.clone());
+                Ok((endpoint.generation, connection))
+            }
+            Err(error) => {
+                self.clear_endpoint(&mut slot).await;
+                Err(match error {
+                    Error::NotSent(_) | Error::Disconnected(_) => {
+                        Failure::unreachable(format!("cannot reach Tower's socket: {error}"))
+                    }
+                    other => Failure::call("hello", other),
+                })
+            }
+        }
+    }
+
+    async fn open_endpoint(&self) -> Result<Endpoint, Failure> {
+        let remote = self.socket_path().await.map_err(Failure::unreachable)?;
+        let (local, forward) = match &self.via {
+            Via::Local => (PathBuf::from(&remote), None),
+            Via::Ssh { target, opts } => {
+                let local = state::tower_forward_sock(&self.host.0);
+                let forward =
+                    super::forward_unix_socket(opts, target, &local, &remote, "tower-forward")
+                        .await
+                        .ok_or_else(|| Failure::unreachable("could not forward Tower's socket"))?;
+                // The master binds the local socket shortly after the request.
+                for delay in super::connect_retry_delays(FORWARD_ATTEMPTS) {
+                    if local.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                (local, Some(forward))
+            }
+        };
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(Endpoint {
+            connection: None,
+            local,
+            remote,
+            generation,
+            _forward: forward,
         })
+    }
+
+    async fn release(&self, generation: u64) {
+        let mut slot = self.endpoint.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.generation == generation)
+        {
+            self.clear_endpoint(&mut slot).await;
+        }
+    }
+
+    // Keep the slot locked through cancellation: every generation forwards
+    // onto the same local path, so an old cancel must finish before rebinding.
+    async fn clear_endpoint(&self, slot: &mut Option<Endpoint>) {
+        self.socket.lock().unwrap().take();
+        if let Some(mut endpoint) = slot.take() {
+            endpoint.connection.take();
+            let cancel = self.cancel(&endpoint);
+            if let Some(cancel) = cancel {
+                cancel.await;
+            }
+        }
+    }
+
+    /// Cancelling `endpoint`'s forward, when it has one.
+    fn cancel(&self, endpoint: &Endpoint) -> Option<impl Future<Output = ()> + use<>> {
+        let Via::Ssh { target, opts } = &self.via else {
+            return None;
+        };
+        let (opts, target) = (opts.clone(), target.clone());
+        let (local, remote) = (endpoint.local.clone(), endpoint.remote.clone());
+        Some(async move {
+            super::cancel_unix_forward(&opts, &target, &local, &remote).await;
+            let _ = std::fs::remove_file(&local);
+        })
+    }
+
+    /// The daemon's socket on the host: as it last reported, or as the
+    /// login shell's environment places it.
+    async fn socket_path(&self) -> Result<String, String> {
+        if let Some(socket) = self.socket.lock().unwrap().clone() {
+            return Ok(socket);
+        }
+        let socket = self.probe().await?.socket();
+        Ok(self.socket.lock().unwrap().get_or_insert(socket).clone())
     }
 
     /// The host's `tower-cli`, once its Tower is known to be running.
@@ -384,7 +560,10 @@ impl TowerLink {
         if !status.success() {
             return Err(format!("probing the host failed: {}", stderr.trim()));
         }
-        Probe::parse(&stdout).ok_or_else(|| "probing the host printed no report".into())
+        let probe = Probe::parse(&stdout)
+            .ok_or_else(|| "probing the host printed no report".to_string())?;
+        self.socket.lock().unwrap().get_or_insert(probe.socket());
+        Ok(probe)
     }
 
     /// The daemon's report, through `cli`, without starting it.
@@ -412,9 +591,13 @@ impl TowerLink {
                 message
             });
         }
-        json_in(&stdout)
+        let info: tower_protocol::DaemonInfo = json_in(&stdout)
             .and_then(|value| serde_json::from_value(value).ok())
-            .ok_or_else(|| format!("`{CLI} daemon status` printed no report"))
+            .ok_or_else(|| format!("`{CLI} daemon status` printed no report"))?;
+        if let Some(socket) = &info.socket {
+            *self.socket.lock().unwrap() = Some(socket.clone());
+        }
+        Ok(info)
     }
 
     /// Start the deployed daemon, detached, from the login shell so its
@@ -558,14 +741,6 @@ impl TowerLink {
         Ok(output)
     }
 
-    /// A command running the host's CLI with `args`.
-    fn command(&self, args: &[&str]) -> Command {
-        let mut command =
-            self.shell_command(remote_command(self.cli().as_deref(), &cli_args(args)));
-        command.stdin(Stdio::null());
-        command
-    }
-
     /// A command handing `line` to the host's shell.
     fn shell_command(&self, line: String) -> Command {
         let mut command = match &self.via {
@@ -580,6 +755,10 @@ impl TowerLink {
                 command
             }
         };
+        #[cfg(test)]
+        if let Some(socket) = self.probe_socket.get() {
+            command.env("TOWER_SOCKET", socket);
+        }
         command.kill_on_drop(true);
         command
     }
@@ -723,7 +902,9 @@ const LAUNCH_POLL: Duration = Duration::from_millis(250);
 
 /// What a host reports, one `key=value` line each: its platform, `$HOME`,
 /// the build `current` names, the first `tower-cli` that runs (login `PATH`,
-/// then the deployed one), and whether this account runs a Tower daemon. A `PATH` entry may be a wrapper around a build that is gone, so a
+/// then the deployed one), whether this account runs a Tower daemon, and the
+/// login shell's `TOWER_SOCKET` and `XDG_STATE_HOME`, which place the
+/// daemon's socket. A `PATH` entry may be a wrapper around a build that is gone, so a
 /// CLI counts only when `--version` succeeds. The process pattern brackets a
 /// letter so it never matches this script's own command line.
 fn probe_script() -> String {
@@ -737,6 +918,8 @@ fn probe_script() -> String {
          done; echo cli=$cli; \
          u=$(id -u); \
          pgrep -u \"$u\" -f \"^[^ ]*[t]ower( |$)\" >/dev/null 2>&1 && echo daemon=1; \
+         \"${{SHELL:-/bin/sh}}\" -l -c env </dev/null 2>/dev/null \
+           | sed -n -e \"s/^TOWER_SOCKET=/tower_socket=/p\" -e \"s/^XDG_STATE_HOME=/state_home=/p\"; \
          true"
     )
 }
@@ -749,6 +932,8 @@ struct Probe {
     current: String,
     cli: Option<String>,
     daemon: bool,
+    tower_socket: Option<String>,
+    state_home: Option<String>,
 }
 
 impl Probe {
@@ -770,10 +955,25 @@ impl Probe {
                 "current" => probe.current = value,
                 "cli" => probe.cli = Some(value).filter(|cli| !cli.is_empty()),
                 "daemon" => probe.daemon = value == "1",
+                "tower_socket" => probe.tower_socket = Some(value),
+                "state_home" => probe.state_home = Some(value),
                 _ => {}
             }
         }
         (seen && !probe.home.is_empty()).then_some(probe)
+    }
+
+    /// Where Tower puts its daemon's socket in that environment, as
+    /// `tower_pal::Paths::discover` does: `TOWER_SOCKET`, else under the
+    /// state directory. A relative value is ignored, as Tower ignores it.
+    /// Retain this fallback until all hosts report the socket in daemon status.
+    fn socket(&self) -> String {
+        let absolute = |value: &Option<String>| value.clone().filter(|v| v.starts_with('/'));
+        absolute(&self.tower_socket).unwrap_or_else(|| {
+            let state =
+                absolute(&self.state_home).unwrap_or_else(|| format!("{}/.local/state", self.home));
+            format!("{state}/tower/run/towerd.sock")
+        })
     }
 }
 
@@ -869,7 +1069,7 @@ enum Event {
     Removed(String),
 }
 
-/// One line of `tower-cli events`, or `None` for a line that is not a
+/// One event notification, as JSON, or `None` for one that is not a
 /// session event.
 fn event(line: &[u8]) -> Option<Event> {
     #[derive(serde::Deserialize)]
@@ -912,8 +1112,7 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
         // daemon is the normal case, not worth a line in the log.
         let enabled = this.enabled;
         if enabled {
-            this.log
-                .info(format!("following Tower sessions with `{CLI} events`"));
+            this.log.info("following Tower sessions on its socket");
         }
         let outcome = match enabled {
             true => match this.ready().await {
@@ -946,66 +1145,34 @@ async fn follow(link: std::sync::Weak<TowerLink>) {
     }
 }
 
+/// Subscribe to the host's session records and fold them into the rows
+/// until the connection fails.
 async fn follow_once(link: &TowerLink) -> Result<(), String> {
-    let mut child = link
-        .command(&["events", "--topics", "agents"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not run {}: {error}", link.runner()))?;
-    let stdout = child.stdout.take().ok_or("the CLI has no stdout")?;
-    let stderr = child.stderr.take().ok_or("the CLI has no stderr")?;
-    let errors = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.take(4096).read_to_string(&mut text).await;
-        text
-    });
-    let mut reader = BufReader::new(stdout);
-    let mut since = HashMap::new();
-    let read = loop {
-        match read_line(&mut reader).await {
-            Ok(Some(line)) => {
-                if let Some(event) = event(&line) {
-                    link.apply(event, &mut since);
-                }
-            }
-            Ok(None) => break Ok(()),
-            Err(error) => break Err(error.to_string()),
-        }
-    };
-    let status = child.wait().await.ok();
-    let errors = errors.await.unwrap_or_default();
-    let errors = host_text_safe(errors.trim());
-    match (read, status) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Some(status)) if !status.success() && !errors.is_empty() => Err(errors),
-        (Ok(()), Some(status)) if !status.success() => {
-            Err(format!("`{CLI} events` exited (rc={:?})", status.code()))
-        }
-        (Ok(()), _) => Ok(()),
-    }
+    let (generation, connection) = link.connection().await.map_err(|failure| failure.message)?;
+    let result = follow_events(link, &connection).await;
+    drop(connection);
+    link.release(generation).await;
+    result
 }
 
-/// One newline-terminated line, bounded by [`MAX_EVENT_BYTES`].
-async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
+async fn follow_events(link: &TowerLink, connection: &Connection) -> Result<(), String> {
+    let (subscribed, mut events) = connection
+        .subscribe(&tower_protocol::SubscribeParams {
+            topics: vec!["agents".into()],
+            approval_id: None,
+        })
+        .await
+        .map_err(|error| format!("subscribing failed: {error}"))?;
+    let mut since = HashMap::new();
+    link.apply(Event::Snapshot(subscribed.agents), &mut since);
     loop {
-        let bytes = reader.fill_buf().await?;
-        if bytes.is_empty() {
-            return Ok((!line.is_empty()).then_some(line));
-        }
-        let end = bytes.iter().position(|b| *b == b'\n');
-        let take = end.map_or(bytes.len(), |at| at + 1);
-        if line.len() + take > MAX_EVENT_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "a Tower event exceeds the size limit",
-            ));
-        }
-        line.extend_from_slice(&bytes[..take]);
-        reader.consume(take);
-        if end.is_some() {
-            return Ok(Some(line));
+        let notification = events
+            .next()
+            .await
+            .map_err(|error| format!("the event stream failed: {error}"))?;
+        let line = serde_json::to_vec(&notification).map_err(|e| e.to_string())?;
+        if let Some(event) = event(&line) {
+            link.apply(event, &mut since);
         }
     }
 }
@@ -1031,6 +1198,314 @@ mod tests {
 
     fn line(method: &str, params: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"method": method, "params": params})).unwrap()
+    }
+
+    /// A stand-in Tower daemon on a private socket. It answers `hello`,
+    /// `subscribe` (with `snapshot`, then pushes `pushed`), `session.open`
+    /// (`ag-new`) and acknowledges other calls, except: `session.kill`
+    /// refuses with `not_found`, and the first call named in `hangup` on a
+    /// connection that has already answered a call closes that connection
+    /// unanswered. Every method it receives is recorded.
+    struct MockTower {
+        socket: std::path::PathBuf,
+        calls: Arc<Mutex<Vec<String>>>,
+        delayed_open: Arc<Mutex<Option<DelayedOpen>>>,
+        snapshots: Arc<tokio::sync::Semaphore>,
+        _dir: tempfile::TempDir,
+    }
+
+    struct DelayedOpen {
+        event: serde_json::Value,
+        release: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl MockTower {
+        fn start(
+            snapshot: Vec<serde_json::Value>,
+            pushed: Vec<serde_json::Value>,
+            hangup: &'static [&'static str],
+        ) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("towerd.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let delayed_open = Arc::new(Mutex::new(None::<DelayedOpen>));
+            let snapshots = Arc::new(tokio::sync::Semaphore::new(1));
+            let delay = delayed_open.clone();
+            let permits = snapshots.clone();
+            let recorded = calls.clone();
+            let hung = Arc::new(Mutex::new(std::collections::HashSet::new()));
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (snapshot, pushed) = (snapshot.clone(), pushed.clone());
+                    let (delay, permits) = (delay.clone(), permits.clone());
+                    let (recorded, hung) = (recorded.clone(), hung.clone());
+                    tokio::spawn(async move {
+                        let mut reader = tokio::io::BufReader::new(stream);
+                        let mut answered = 0;
+                        while let Ok(Some(frame)) =
+                            tower_protocol::framing::read_frame(&mut reader).await
+                        {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&frame).unwrap();
+                            let method = request["method"].as_str().unwrap().to_string();
+                            recorded.lock().unwrap().push(method.clone());
+                            if answered > 0
+                                && hangup.contains(&method.as_str())
+                                && hung.lock().unwrap().insert(method.clone())
+                            {
+                                return;
+                            }
+                            let _snapshot = if method == "subscribe" {
+                                Some(permits.acquire().await.unwrap())
+                            } else {
+                                None
+                            };
+                            if method == "session.open" {
+                                let held = delay.lock().unwrap().take();
+                                if let Some(DelayedOpen { event, release }) = held {
+                                    tower_protocol::framing::write_frame(reader.get_mut(), &event)
+                                        .await
+                                        .unwrap();
+                                    release.await.unwrap();
+                                }
+                            }
+                            let body = match method.as_str() {
+                                "hello" => serde_json::json!({"result": {
+                                    "protocol_version": tower_protocol::PROTOCOL_VERSION,
+                                    "capabilities": [],
+                                }}),
+                                "subscribe" => serde_json::json!({"result": {
+                                    "subscription_id": "s", "cursor": 1, "agents": snapshot,
+                                }}),
+                                "session.open" => serde_json::json!({"result": {
+                                    "id": "ag-new", "mode": null,
+                                }}),
+                                "session.kill" => serde_json::json!({"error": {
+                                    "code": -32000, "message": "Session not found",
+                                    "data": {"code": "not_found"},
+                                }}),
+                                _ => serde_json::json!({"result": {}}),
+                            };
+                            let mut reply = body;
+                            reply["jsonrpc"] = "2.0".into();
+                            reply["id"] = request["id"].clone();
+                            let write = reader.get_mut();
+                            tower_protocol::framing::write_frame(write, &reply)
+                                .await
+                                .unwrap();
+                            if method == "fixture.close_after_reply" {
+                                return;
+                            }
+                            answered += 1;
+                            if method == "subscribe" {
+                                for event in &pushed {
+                                    tower_protocol::framing::write_frame(write, event)
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                socket,
+                calls,
+                delayed_open,
+                snapshots,
+                _dir: dir,
+            }
+        }
+
+        /// A local link that reaches this daemon, its Tower already settled.
+        fn link(&self) -> Arc<TowerLink> {
+            let link = TowerLink::with(
+                HostId("desk".into()),
+                Via::Local,
+                false,
+                Arc::default(),
+                Arc::default(),
+            );
+            link.probe_socket.set(self.socket.clone()).unwrap();
+            *link.socket.lock().unwrap() = Some(self.socket.to_string_lossy().into_owned());
+            *link.cli.lock().unwrap() = Some("tower-cli".into());
+            link
+        }
+
+        fn calls(&self, method: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == method)
+                .count()
+        }
+    }
+
+    /// Wait, within a watchdog well past any real delay, for `done`.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_socket_feeds_the_rows_and_answers_calls() {
+        let tower = MockTower::start(
+            vec![record("ag-1", "idle", "owned")],
+            vec![serde_json::json!({"jsonrpc": "2.0", "method": "agent.hook",
+                "params": {"seq": 2, "id": "ag-2", "record": record("ag-2", "working", "owned")}})],
+            &[],
+        );
+        let link = tower.link();
+        let follower = tokio::spawn({
+            let link = link.clone();
+            async move { follow_once(&link).await }
+        });
+        until("the snapshot and the pushed record", || {
+            link.reported() && link.rows().len() == 2
+        })
+        .await;
+
+        let spec = OpenSpec {
+            agent: crate::agent::AgentKind::Claude,
+            cwd: "~/work".into(),
+            resume: None,
+            worktree: None,
+        };
+        match link.open(spec).await.unwrap() {
+            LaunchPlan::AttachRemote { session_name, .. } => assert_eq!(session_name, "ag-new"),
+            LaunchPlan::SpawnLocal { .. } => panic!("a Tower session attaches"),
+        }
+        assert!(matches!(link.kill("ag-9").await, KillOutcome::AlreadyGone));
+        assert!(
+            link.set_flags("ag-1", SessionFlags::default()).await,
+            "tagging and acknowledging succeed"
+        );
+        // The mock advertises no concurrency capability.
+        assert_eq!(tower.calls("hello"), 1);
+        follower.abort();
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_is_replaced_and_only_safe_calls_repeat() {
+        let tower = MockTower::start(vec![], vec![], &["session.kill", "session.open"]);
+        let link = tower.link();
+        link.rpc("session.attention.clear", serde_json::json!({"id": "ag-1"}))
+            .await
+            .unwrap();
+        // The connection dies under a call that is safe to repeat: it is
+        // repeated once on a new connection.
+        assert!(matches!(link.kill("ag-1").await, KillOutcome::AlreadyGone));
+        assert_eq!(tower.calls("session.kill"), 2);
+        // One that reserves a session is not repeated.
+        let failure = link
+            .rpc("session.open", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(failure.unreachable, "{failure}");
+        assert_eq!(tower.calls("session.open"), 1);
+        // The next call reconnects.
+        link.rpc("session.open", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(tower.calls("hello"), 3);
+    }
+
+    #[tokio::test]
+    async fn an_event_updates_rows_before_the_open_reply() {
+        let tower = MockTower::start(vec![], vec![], &[]);
+        let link = tower.link();
+        let follower = tokio::spawn({
+            let link = link.clone();
+            async move { follow_once(&link).await }
+        });
+        until("subscription snapshot", || link.reported()).await;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let event = serde_json::json!({"jsonrpc":"2.0","method":"agent.changed","params":{
+            "id":"ag-pending","seq":2,"record":record("ag-pending","working","owned")}});
+        *tower.delayed_open.lock().unwrap() = Some(DelayedOpen {
+            event,
+            release: wait,
+        });
+        let open = tokio::spawn({
+            let link = link.clone();
+            async move { link.rpc("session.open", serde_json::json!({})).await }
+        });
+        until("row delivered while session.open awaits its reply", || {
+            link.owns("ag-pending")
+        })
+        .await;
+        assert_eq!(tower.calls("hello"), 1);
+        release.send(()).unwrap();
+        assert_eq!(open.await.unwrap().unwrap()["id"], "ag-new");
+        follower.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unsent_open_reconnects_and_reserves_once() {
+        let tower = MockTower::start(vec![], vec![], &[]);
+        let link = tower.link();
+        let (_, first) = link.connection().await.unwrap();
+        link.rpc("fixture.close_after_reply", serde_json::json!({}))
+            .await
+            .unwrap();
+        first.closed().await;
+        link.rpc("session.open", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(tower.calls("session.open"), 1);
+        assert_eq!(tower.calls("hello"), 2);
+    }
+
+    #[tokio::test]
+    async fn follower_clears_rows_and_reloads_after_disconnect() {
+        let tower = MockTower::start(vec![record("ag-1", "idle", "owned")], vec![], &[]);
+        let link = tower.link();
+        link.start();
+        until("first snapshot", || link.owns("ag-1")).await;
+        let hold = tower.snapshots.acquire().await.unwrap();
+        link.rpc("fixture.close_after_reply", serde_json::json!({}))
+            .await
+            .unwrap();
+        until("reconnected follower awaiting snapshot", || {
+            tower.calls("subscribe") == 2
+        })
+        .await;
+        assert!(!link.reported());
+        assert!(link.rows().is_empty());
+        drop(hold);
+        until("replacement snapshot", || link.owns("ag-1")).await;
+        assert_eq!(tower.calls("hello"), 2);
+        link.stop();
+    }
+
+    #[tokio::test]
+    async fn an_absent_daemon_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = TowerLink::local(HostId("desk".into()), Arc::default(), Arc::default());
+        link.probe_socket
+            .set(dir.path().join("absent.sock"))
+            .unwrap();
+        *link.socket.lock().unwrap() = Some(
+            dir.path()
+                .join("absent.sock")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(matches!(link.kill("ag-1").await, KillOutcome::Unreachable));
+        // A failed connection forgets the socket; name it again.
+        *link.socket.lock().unwrap() = Some(
+            dir.path()
+                .join("absent.sock")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(follow_once(&link).await.is_err());
     }
 
     fn link() -> Arc<TowerLink> {
@@ -1183,11 +1658,10 @@ mod tests {
         );
     }
 
-    /// Pooled-localhost reaches this machine's Tower the way ssh reaches a
-    /// host's: the same CLI through the account's login shell, so both
-    /// dashboards talk to one daemon.
-    #[tokio::test]
-    async fn a_local_link_runs_the_cli_in_this_machines_login_shell() {
+    /// Pooled-localhost attaches to this machine's Tower the way ssh attaches
+    /// to a host's: the same CLI through the account's login shell.
+    #[test]
+    fn a_local_link_runs_the_cli_in_this_machines_login_shell() {
         let dir = tempfile::tempdir().unwrap();
         let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
         std::fs::create_dir_all(&home).unwrap();
@@ -1200,22 +1674,6 @@ mod tests {
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let link = TowerLink::local(HostId("desk".into()), Arc::default(), Arc::default());
 
-        let out = link
-            .command(&["rpc", "session.kill", r#"{"id":"ag-1"}"#])
-            .env("HOME", &home)
-            .env("SHELL", &shell)
-            .env("PATH", &path)
-            .output()
-            .await
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.ends_with("rpc\nsession.kill\n{\"id\":\"ag-1\"}\n"),
-            "{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-
-        // An attach window runs here, without ssh.
         let argv = link.attach_argv("ag-1");
         assert_eq!(argv[..2], ["/bin/sh", "-c"]);
         let out = std::process::Command::new(&argv[0])
@@ -1271,6 +1729,28 @@ mod tests {
         let out = on_host(home, bin, &login_shell_safe(&probe_script()), b"");
         assert!(out.status.success(), "{out:?}");
         Probe::parse(&String::from_utf8_lossy(&out.stdout)).expect("a probe report")
+    }
+
+    /// The socket is placed from the login shell's environment, as Tower
+    /// places it: `TOWER_SOCKET` first, then the state directory.
+    #[test]
+    fn the_probe_places_the_socket_as_tower_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let expected = match std::env::var("XDG_STATE_HOME") {
+            Ok(state) if state.starts_with('/') => format!("{state}/tower/run/towerd.sock"),
+            _ => format!("{}/.local/state/tower/run/towerd.sock", home.display()),
+        };
+        assert_eq!(probe(&home, &bin).socket(), expected);
+
+        let named =
+            Probe::parse("platform=Linux\nhome=/h\ntower_socket=/run/t.sock\nstate_home=/s\n")
+                .unwrap();
+        assert_eq!(named.socket(), "/run/t.sock");
+        let relative = Probe::parse("platform=Linux\nhome=/h\nstate_home=s\n").unwrap();
+        assert_eq!(relative.socket(), "/h/.local/state/tower/run/towerd.sock");
     }
 
     /// A `PATH` wrapper around a build that is gone is no CLI, so the
@@ -1339,7 +1819,8 @@ mod tests {
     #[test]
     fn a_probe_report_survives_a_chatty_login() {
         let probe = Probe::parse(
-            "Welcome\nplatform=Linux x86_64\nhome=/h\ncurrent=\ncli=/h/bin/tower-cli\ndaemon=1\n",
+            "Welcome\nplatform=Linux x86_64\nhome=/h\ncurrent=\ncli=/h/bin/tower-cli\ndaemon=1\n\
+             state_home=/h/state\n",
         )
         .unwrap();
         assert_eq!(
@@ -1350,8 +1831,11 @@ mod tests {
                 current: String::new(),
                 cli: Some("/h/bin/tower-cli".into()),
                 daemon: true,
+                tower_socket: None,
+                state_home: Some("/h/state".into()),
             }
         );
+        assert_eq!(probe.socket(), "/h/state/tower/run/towerd.sock");
         assert!(Probe::parse("motd only\n").is_none());
     }
 

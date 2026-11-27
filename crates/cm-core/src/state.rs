@@ -222,6 +222,12 @@ pub fn remote_forward_sock(host_label: &str) -> PathBuf {
     ssh_sock_dir().join(format!("r{}.sock", short_hash(host_label)))
 }
 
+/// Local socket the dashboard forwards a remote host's Tower daemon onto (one
+/// per host), kept short like [`remote_forward_sock`].
+pub fn tower_forward_sock(host_label: &str) -> PathBuf {
+    ssh_sock_dir().join(format!("t{}.sock", short_hash(host_label)))
+}
+
 /// ssh `ControlMaster` socket path for `target`. Hashed (the full target) so two
 /// targets never share a control connection, and under the flat [`ssh_sock_dir`]
 /// so it + ssh's ~17-char random suffix stays within the socket-path limit.

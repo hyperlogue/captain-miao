@@ -3304,7 +3304,7 @@ const CONNECT_RETRY_CEILING: Duration = Duration::from_millis(400);
 /// sleeping through them — the budget being the number a reader actually wants,
 /// because it is what every failing attempt adds to the reconnect backoff before
 /// the backoff has even started.
-fn connect_retry_delays(attempts: u32) -> impl Iterator<Item = Duration> {
+pub(super) fn connect_retry_delays(attempts: u32) -> impl Iterator<Item = Duration> {
     (0..attempts.saturating_sub(1)).scan(CONNECT_RETRY_FLOOR, |d, _| {
         let this = *d;
         *d = (*d * 2).min(CONNECT_RETRY_CEILING);
@@ -3512,6 +3512,21 @@ async fn setup_ssh(
     log.info(format!("daemon is up, socket {remote_sock}"));
     tracing::debug!(target: "captain_miao::ssh", "{target}: remote daemon socket = {remote_sock}");
 
+    forward_unix_socket(&opts, target, local_sock, &remote_sock, "ssh-forward").await
+}
+
+/// Forward `remote_sock` on `target` to `local_sock` here, as a `-L` forward
+/// held by the host's ControlMaster, and return the `-N` child that asked for
+/// it. That child may exit as soon as the master holds the forward, so its
+/// exit is no sign of loss; the protocol stream on the socket is. ssh's
+/// diagnostics go to `logs/<log_name>-<target>.log`.
+pub(super) async fn forward_unix_socket(
+    opts: &[String],
+    target: &str,
+    local_sock: &Path,
+    remote_sock: &str,
+    log_name: &str,
+) -> Option<tokio::process::Child> {
     // The persistent ControlMaster can retain a *stale forward* for this local
     // socket path from an earlier connection whose slave was SIGKILL'd (the
     // forward child's `kill_on_drop`), so it never told the master to tear the
@@ -3521,15 +3536,7 @@ async fn setup_ssh(
     // master. Cancel any such stale forward first; it's a quiet no-op when none
     // exists (or no master is up). Verified against a real host: without this the
     // forward socket never appears; with it, it binds on the first try.
-    let mut cancel = detached("ssh");
-    cancel
-        .args(&opts)
-        .arg("-O")
-        .arg("cancel")
-        .arg("-L")
-        .arg(format!("{}:{}", local_sock.display(), remote_sock))
-        .arg(target);
-    bounded_status(cancel, MUX_CONTROL_TIMEOUT).await;
+    cancel_unix_forward(opts, target, local_sock, remote_sock).await;
     // Clear any stale local socket and ensure its parent dir exists.
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -3549,12 +3556,12 @@ async fn setup_ssh(
         .collect();
     let err_path = state::state_dir()
         .join("logs")
-        .join(format!("ssh-forward-{safe}.log"));
+        .join(format!("{log_name}-{safe}.log"));
     let stderr = std::fs::File::create(&err_path)
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
     let mut cmd = detached("ssh");
-    cmd.args(&opts)
+    cmd.args(opts)
         .arg("-L")
         .arg(format!("{}:{}", local_sock.display(), remote_sock))
         .arg("-N");
@@ -3563,6 +3570,25 @@ async fn setup_ssh(
         .kill_on_drop(true)
         .spawn()
         .ok()
+}
+
+/// Ask the host's ControlMaster to drop the `-L` forward of `remote_sock` to
+/// `local_sock`; a quiet no-op when it holds none or no master is up.
+pub(super) async fn cancel_unix_forward(
+    opts: &[String],
+    target: &str,
+    local_sock: &Path,
+    remote_sock: &str,
+) {
+    let mut cancel = detached("ssh");
+    cancel
+        .args(opts)
+        .arg("-O")
+        .arg("cancel")
+        .arg("-L")
+        .arg(format!("{}:{}", local_sock.display(), remote_sock))
+        .arg(target);
+    bounded_status(cancel, MUX_CONTROL_TIMEOUT).await;
 }
 
 /// Make the host's clipboard socket path bindable: create its parent dir and
