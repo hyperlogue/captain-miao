@@ -64,6 +64,10 @@ pub(crate) struct TowerLink {
     via: Via,
     /// Live sessions by Tower id.
     rows: Mutex<HashMap<String, LauncherState>>,
+    /// Every conversation the host's Tower holds, ended ones included, by
+    /// harness and native session id: Tower refuses to open a second session
+    /// on one, so its resume goes through the session already holding it.
+    held: Mutex<HashMap<(String, String), Held>>,
     /// The event stream has delivered its first snapshot and is still up.
     mirrored: AtomicBool,
     dirty: Arc<AtomicBool>,
@@ -77,6 +81,13 @@ pub(crate) struct TowerLink {
     /// Held while [`Self::ready`] inspects or starts the host's Tower, so a
     /// launch waits for an upload already under way instead of racing it.
     preparing: tokio::sync::Mutex<()>,
+}
+
+/// The Tower session holding a conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    id: String,
+    ended: bool,
 }
 
 /// Why a CLI call failed. `unreachable` means the command may never have
@@ -131,6 +142,7 @@ impl TowerLink {
             host,
             via,
             rows: Mutex::default(),
+            held: Mutex::default(),
             mirrored: AtomicBool::new(false),
             dirty,
             log,
@@ -205,6 +217,20 @@ impl TowerLink {
             .as_deref()
             .and_then(|name| spec.agent.worktree_args(Some(name)))
             .unwrap_or_default();
+        // Tower holds each conversation in one session, ended or not: resume
+        // that session rather than open another on it.
+        let conversation = match &spec.resume {
+            Some((native, false)) => Some(native.clone()),
+            _ => None,
+        };
+        let held = || {
+            conversation
+                .as_deref()
+                .and_then(|native| self.holder(harness.id(), native))
+        };
+        if let Some(held) = held() {
+            return self.reopen(held).await;
+        }
         let params = serde_json::json!({
             "harness": harness.id(),
             "cwd": spec.cwd,
@@ -215,10 +241,15 @@ impl TowerLink {
             })),
             "terminal": {"defer": true},
         });
-        let opened = self
-            .rpc("session.open", params)
-            .await
-            .map_err(|failure| anyhow::anyhow!("Tower on {}: {failure}", self.host))?;
+        let opened = match self.rpc("session.open", params).await {
+            Ok(opened) => opened,
+            // The event stream had not yet reported the holder.
+            Err(failure) if failure.message.contains(ALREADY_MANAGED) => match held() {
+                Some(held) => return self.reopen(held).await,
+                None => anyhow::bail!("Tower on {}: {failure}", self.host),
+            },
+            Err(failure) => anyhow::bail!("Tower on {}: {failure}", self.host),
+        };
         let id = opened
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -228,6 +259,35 @@ impl TowerLink {
         Ok(LaunchPlan::AttachRemote {
             argv: self.attach_argv(&id),
             session_name: id,
+        })
+    }
+
+    /// The session holding `native`, `harness`'s conversation, if any.
+    fn holder(&self, harness: &str, native: &str) -> Option<Held> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(&(harness.to_string(), native.to_string()))
+            .cloned()
+    }
+
+    /// Bring back the session holding a conversation: resume it if it
+    /// ended, then attach. One still running is only attached.
+    async fn reopen(&self, held: Held) -> anyhow::Result<LaunchPlan> {
+        if held.ended {
+            match self
+                .rpc("session.resume", serde_json::json!({"id": held.id}))
+                .await
+            {
+                Ok(_) => self.log.info(format!("Tower resumed session {}", held.id)),
+                // It came back meanwhile, as from another dashboard.
+                Err(failure) if failure.message.contains("already_running") => {}
+                Err(failure) => anyhow::bail!("Tower on {}: {failure}", self.host),
+            }
+        }
+        Ok(LaunchPlan::AttachRemote {
+            argv: self.attach_argv(&held.id),
+            session_name: held.id,
         })
     }
 
@@ -595,10 +655,13 @@ impl TowerLink {
     /// Fold one event into the rows.
     fn apply(&self, event: Event, since: &mut HashMap<String, u64>) {
         let mut rows = self.rows.lock().unwrap();
+        let mut held = self.held.lock().unwrap();
         match event {
             Event::Snapshot(records) => {
                 rows.clear();
+                held.clear();
                 for record in records {
+                    hold(&mut held, &record);
                     if let Some(row) = self.row(record, since) {
                         rows.insert(row.0, row.1);
                     }
@@ -607,10 +670,13 @@ impl TowerLink {
             }
             Event::Removed(id) => {
                 rows.remove(&id);
+                held.retain(|_, held| held.id != id);
                 since.remove(&id);
             }
             Event::Record(record) => {
                 let id = record.id.clone();
+                held.retain(|_, held| held.id != id);
+                hold(&mut held, &record);
                 match self.row(*record, since) {
                     Some((id, row)) => rows.insert(id, row),
                     None => rows.remove(&id),
@@ -642,6 +708,7 @@ impl TowerLink {
     }
 
     fn lost(&self) {
+        self.held.lock().unwrap().clear();
         let was = self.mirrored.swap(false, Ordering::Relaxed);
         let mut rows = self.rows.lock().unwrap();
         if was || !rows.is_empty() {
@@ -649,6 +716,27 @@ impl TowerLink {
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// The error code of a `session.open` on a conversation Tower already holds.
+const ALREADY_MANAGED: &str = "already_managed";
+
+/// Note which conversation `record` holds. Only sessions Tower runs can be
+/// resumed through it.
+fn hold(held: &mut HashMap<(String, String), Held>, record: &AgentRecord) {
+    let Some(native) = record.native_session_id.as_ref() else {
+        return;
+    };
+    if record.ownership != "owned" {
+        return;
+    }
+    held.insert(
+        (record.harness.clone(), native.clone()),
+        Held {
+            id: record.id.clone(),
+            ended: matches!(record.status.as_str(), "exited" | "lost"),
+        },
+    );
 }
 
 /// Whether `key` names a Tower session; see [`launcher_key`].
@@ -1084,6 +1172,48 @@ mod tests {
         ));
         assert!(link.rows().is_empty());
         assert!(event(b"Welcome to the host\n").is_none());
+    }
+
+    #[test]
+    fn ended_sessions_still_hold_their_conversations() {
+        let link = link();
+        let mut since = HashMap::new();
+        let mut feed = |bytes: Vec<u8>| link.apply(event(&bytes).unwrap(), &mut since);
+        let conversation = |id: &str, status: &str, ownership: &str, native: &str| {
+            let mut record = record(id, status, ownership);
+            record["native_session_id"] = native.into();
+            record
+        };
+        feed(line(
+            "snapshot",
+            serde_json::json!({"subscription_id": "s", "cursor": 1, "agents": [
+                conversation("ag-1", "exited", "owned", "c-1"),
+                conversation("ag-2", "idle", "owned", "c-2"),
+                conversation("ag-3", "exited", "registered", "c-3"),
+            ]}),
+        ));
+        let held = |id: &str, ended| {
+            Some(Held {
+                id: id.into(),
+                ended,
+            })
+        };
+        assert_eq!(link.holder("claude", "c-1"), held("ag-1", true));
+        assert_eq!(link.holder("claude", "c-2"), held("ag-2", false));
+        assert_eq!(link.holder("claude", "c-3"), None);
+        assert_eq!(link.holder("codex", "c-1"), None);
+
+        feed(line(
+            "agent.hook",
+            serde_json::json!({"seq": 2, "id": "ag-1",
+                               "record": conversation("ag-1", "working", "owned", "c-1")}),
+        ));
+        assert_eq!(link.holder("claude", "c-1"), held("ag-1", false));
+        feed(line(
+            "agent.removed",
+            serde_json::json!({"seq": 3, "id": "ag-2"}),
+        ));
+        assert_eq!(link.holder("claude", "c-2"), None);
     }
 
     #[test]
