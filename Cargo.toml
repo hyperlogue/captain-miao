@@ -49,11 +49,11 @@ tar.workspace = true
 cm-core = { path = "crates/cm-core" }
 # Tower runs local sessions when `CAPTAIN_MIAO_TOWER` is set (src/tower.rs).
 # One revision for both, so the launcher and its contract cannot drift.
-tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "1ac971d88f1404bfe0cf67018fc5616ed64db515" }
-tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "1ac971d88f1404bfe0cf67018fc5616ed64db515" }
-tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "1ac971d88f1404bfe0cf67018fc5616ed64db515", features = ["framing"] }
+tower-launcher = { git = "https://github.com/hyperlogue/tower", rev = "239e6a49b69f27e120e195c69ca083353b74e71b" }
+tower-agents = { git = "https://github.com/hyperlogue/tower", rev = "239e6a49b69f27e120e195c69ca083353b74e71b" }
+tower-protocol = { git = "https://github.com/hyperlogue/tower", rev = "239e6a49b69f27e120e195c69ca083353b74e71b", features = ["framing"] }
 # The dashboard speaks to a host's Tower over its (forwarded) socket.
-tower-client = { git = "https://github.com/hyperlogue/tower", rev = "1ac971d88f1404bfe0cf67018fc5616ed64db515" }
+tower-client = { git = "https://github.com/hyperlogue/tower", rev = "239e6a49b69f27e120e195c69ca083353b74e71b" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }

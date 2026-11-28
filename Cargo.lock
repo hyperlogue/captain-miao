@@ -152,7 +152,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -711,7 +711,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -761,7 +761,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2149,7 +2149,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2552,10 +2552,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2833,7 +2833,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 [[package]]
 name = "tower-agents"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2852,7 +2852,7 @@ dependencies = [
 [[package]]
 name = "tower-client"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "serde",
  "serde_json",
@@ -2865,7 +2865,7 @@ dependencies = [
 [[package]]
 name = "tower-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -2881,7 +2881,7 @@ dependencies = [
 [[package]]
 name = "tower-launcher"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2901,7 +2901,7 @@ dependencies = [
 [[package]]
 name = "tower-pal"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "libc",
  "libproc",
@@ -2916,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "tower-pool-proto"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "serde",
  "serde_json",
@@ -2927,7 +2927,7 @@ dependencies = [
 [[package]]
 name = "tower-protocol"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "serde",
  "serde_json",
@@ -2937,7 +2937,7 @@ dependencies = [
 [[package]]
 name = "tower-sessions"
 version = "0.1.0"
-source = "git+https://github.com/hyperlogue/tower?rev=1ac971d88f1404bfe0cf67018fc5616ed64db515#1ac971d88f1404bfe0cf67018fc5616ed64db515"
+source = "git+https://github.com/hyperlogue/tower?rev=239e6a49b69f27e120e195c69ca083353b74e71b#239e6a49b69f27e120e195c69ca083353b74e71b"
 dependencies = [
  "serde",
  "serde_json",
@@ -3301,7 +3301,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
